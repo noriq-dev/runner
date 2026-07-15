@@ -53,6 +53,14 @@ export {
   type DeviceCodeResponse,
 } from './auth-device';
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
+export {
+  DEFAULT_PARKED_PATH,
+  DEFAULT_PARK_TTL_HOURS,
+  ParkedStore,
+  expiredParks,
+  resumePrompt,
+  type ParkedRun,
+} from './parked';
 export { detectTools } from './tools';
 export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
 export {
