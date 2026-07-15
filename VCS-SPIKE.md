@@ -6,26 +6,33 @@ indirection — and what it costs.**
 
 Top-level answer, up front:
 
-> **The operation set generalises. The default-safe OFF switch does not.**
+> **The operation set generalises. The isolation model is the split.**
 >
 > Every git operation this daemon performs can be restated as an outcome that Perforce and
 > Diversion can satisfy — including the one that matters most, *land on a working branch and ask
 > a human to merge*, which maps onto Perforce's pre-commit review model closely.
 >
-> What does **not** port is the position where nothing leaves the machine. With `[land]`
-> unconfigured — the default — a git runner writes to no server, ever. Perforce has no such
-> setting at any configuration: `p4 shelve` *is* its checkpoint primitive, so isolating a run and
-> making its work durable are themselves depot writes. That is the finding, and it is narrower
-> than the one this document originally claimed.
+> What does not port is **free isolation**. Git isolates in *space*: a worktree costs approximately
+> nothing, so every Run gets its own. Perforce and Diversion cannot pay that — their repos are
+> large by design (that is what they are *for*), and the workspace is server-side state, so
+> minting one per Run is not on the table. They isolate in **time**: the working space is the
+> working space, and runs take turns in it.
 >
-> **Corrected after review.** The first draft argued that a server-backed VCS moves enforcement
-> outside the daemon, from *cannot* to *is configured not to*. Montana pointed out that this
-> compares Perforce against a guarantee we had already traded away: RUN-27's `autoPush` gave the
-> daemon a push credential, and RUN-28 moved the human boundary from `git push` to *approving the
-> merge* — on purpose, because freeing humans from per-run approval is the point of the product.
-> Once autoPush is on, git's boundary is *already* the daemon's own code plus the forge's branch
-> protection, and GitHub branch protection is exactly as external and untestable as Perforce's
-> protections table. The dramatic version of §5 was measuring Perforce against v1.
+> The invariant survives *verbatim* — "one workspace per Run; never two runs in one checkout".
+> What changes is the **pool**: git mints on demand and destroys; Perforce and Diversion lease
+> from a fixed pool (default: one) and clean. Concurrency stops being a free lunch and becomes an
+> operator's disk budget. That is the whole difference, and it is an honest one.
+>
+> **Two corrections, both from review, both narrowing this document.** (1) The first draft argued
+> a server-backed VCS moves enforcement outside the daemon, from *cannot* to *is configured not
+> to*. That compared Perforce against a guarantee we traded away at RUN-27: `autoPush` gave the
+> daemon a push credential and RUN-28 moved the human boundary from `git push` to *approving the
+> merge*, on purpose, because freeing humans from per-run approval is the point of the product.
+> Once autoPush is on, git's boundary is already the daemon's own code plus the forge's branch
+> protection — exactly as external and untestable as Perforce's protections table. (2) The
+> surviving "no OFF switch" finding was then **accepted rather than solved** (RUN-48): these
+> systems work live, that is what they are for, and there is nothing a daemon can do about it.
+> It is a fact to document, not a risk to mitigate.
 
 ---
 
@@ -181,7 +188,7 @@ This is the invariant, correctly stated, and it ports. Git: land on `[land].bran
 `gh pr create` → a human merges. Perforce: submit into the working **stream** → shelve + a **Swarm
 pre-commit review** → a human submits to mainline. Same shape, same boundary, same human.
 
-### The OFF switch — **does not survive, and this is the real finding**
+### The OFF switch — **does not survive; accepted, not mitigated** (RUN-48)
 
 With `[land]` unconfigured — **the default** — a git runner writes to no server at all. The work
 lives in a local worktree on a local throwaway branch, and if the box dies, nothing anywhere else
@@ -193,16 +200,52 @@ only way to make a run's work durable beyond the process — and it writes the d
 users can read it. Isolation itself (a client workspace) is server-side state. There is no
 configuration in which an agent's output stays on the machine.
 
-So the honest statement is not "the security model collapses". It is: **a Perforce runner has no
-safe default, and no dry-run.** Whatever the boundary, you are trusting it from the first run,
-because the first run already wrote to the depot. That is a smaller claim than the first draft
-made, and unlike that one, it is true.
+**The decision (RUN-48) is to accept this and say so.** These systems work live; that is not a
+deficiency to be engineered around, it is what they are *for*, and a daemon has no standing to
+pretend otherwise. So a Perforce runner has no dry-run: you trust the boundary from the first run,
+because the first run already wrote to the depot. We document that and stop there. Explicit
+isolation, if it is ever wanted, comes from **containers** — a different layer, a future
+endeavour, and notably *not* a VCS feature.
 
-### "One worktree per Run; never two runs in one checkout." — **survives, renamed**
+This is why the split belongs in the daemon rather than in a compatibility shim: git's local-first
+model and Perforce's live model are answers to different questions, and flattening either into the
+other produces a bad version of both.
 
-Becomes "one workspace per Run". Real and cheap on all three. Cost: on Perforce the workspace is a
-server-side object, so per-run isolation means per-run server writes, and a crashed daemon leaves
-*server* litter rather than local litter.
+### "One worktree per Run; never two runs in one checkout." — **survives verbatim; the pool changes**
+
+This is the invariant the live model actually touches, and the interesting result is that its
+*wording* needs no change at all.
+
+Git isolates in **space** because it can: a worktree is cheap, so `create` mints one per Run and
+`remove` destroys it. Perforce and Diversion cannot — the repos are large by design and the
+workspace is server-side state, so per-Run duplication is exactly the thing not to do. They
+isolate in **time**: runs take turns in the working space.
+
+Both are the same operation under one honest name — **lease a workspace, exclusively, for this
+Run**:
+
+| | git | Perforce / Diversion |
+|---|---|---|
+| pool size | unbounded, minted on demand | fixed; **default 1** (the workspace that exists) |
+| on acquire | create worktree + throwaway branch | wait for the lease, sync to target |
+| on release | destroy | clean (revert unopened, delete the changelist) |
+| concurrency per repo | as many as the operator's `maxConcurrent` | **the pool size** |
+
+"Never two runs in one checkout" holds under both — it is what the exclusive lease *means*. What
+the operator loses is the free lunch: on Perforce, a second concurrent run costs a second full
+workspace, in disk, on a repo that is large on purpose. That is their call to make, not ours to
+make for them, and the honest default is **1**.
+
+Two consequences worth naming, because neither is obvious:
+
+- **Serialization becomes load-bearing.** Today `maxConcurrent` is a throttle. On a pool-of-1
+  backend it is the isolation mechanism, so the lease must be a real mutex with a real queue —
+  including across daemon restarts, since the workspace outlives the process.
+- **Read-only scope runs get *cheaper*, not dearer.** This one inverts. Git must `chmod` a whole
+  tree (`setReadOnly`) to make a scope run read-only. Perforce's default (`noallwrite`) already
+  makes unopened files read-only on disk and only `p4 edit` flips the write bit — so a scope run
+  is read-only by *not doing anything*, enforced by the OS, on the backend we assumed would be
+  hostile. ([P4 workspace file management](https://help.perforce.com/helix-core/server-apps/cmdref/current/Content/P4Guide/configuration.workspace.manage-files.html))
 
 ### "Git is the registry" (`reapOrphans` needs no external state) — **does not survive**
 
@@ -217,6 +260,13 @@ This one *relaxes*. On git the worktree may hold the only copy, so the reaper re
 On Perforce a checkpoint is already on the server, so the work is recoverable by definition. The
 invariant stays (it costs nothing) but stops being load-bearing — the mirror image of the OFF-switch
 finding, and the one place where "everything is on the server" helps.
+
+It helps more than that, and this is the payoff for accepting the live model. A pool-of-1 backend
+cannot do what git's reaper does — *keep the litter and warn* — because the litter is sitting in
+the one workspace the next Run needs. But it does not have to: the reaper **shelves** the orphaned
+changelist and then cleans. The work becomes durable, reachable from another machine, and
+attributable to its run id — strictly better than a worktree kept on a dead laptop's disk. The
+primitive we spent the first draft calling the problem is the one that makes crash recovery good.
 
 ### "Verify ran on exactly the tree that lands" — **survives on all three**
 
@@ -245,19 +295,26 @@ a git-first design would fuse them and Perforce would find out later.
    covering fast-forward *and* submit, are genuine generalisations that hold on a backend with
    neither git verb. **Do the git-only extraction first** — it proves the interface against the
    backend we understand, at zero risk, and it is the task with the best ratio here.
-2. **The blocker is smaller than the first draft said, and it is a product question, not a
-   security one.** Not *"what enforces the boundary"* — the answer is the same as git's today, once
-   autoPush is on. The real question is: **what does a Perforce runner do on the first run, given
-   there is no configuration where its output stays on the machine?** git's `[land]`-unconfigured
-   default is a dry-run mode Perforce cannot offer.
-3. **Diversion second, Perforce third — or never.** Diversion is the cheap seam-finder: it breaks
+2. **There is no blocker. RUN-48 is decided: the live model is accepted.** Not *"what enforces the
+   boundary"* — the answer is the same as git's today, once autoPush is on. And not "what replaces
+   the dry-run" — nothing does, because Perforce and Diversion work live by design and a daemon
+   does not get a vote. Document it; do not engineer around it. Explicit isolation, if wanted
+   later, is **containers**, at a layer below the VCS.
+3. **Model the split as isolation, not as VCS.** The abstraction that pays is `acquire`/`release`
+   of an exclusively-leased workspace, with the **pool** as the backend's business: unbounded and
+   minted-on-demand for git, fixed and default-1 for the live backends. Design that seam and the
+   nine outcomes sit on top of it unchanged. Design nine VCS verbs *without* it and the first live
+   backend rewrites the supervisor's concurrency model instead.
+4. **Diversion second, Perforce third — or never.** Diversion is the cheap seam-finder: it breaks
    the model in the same place at a fraction of the setup cost, and it settles whether `checkpoint`
    crossing the network is survivable in practice before Perforce makes that question expensive.
-4. **`share`/push stays git-only.** Do not generalise an operation that is a no-op on two of three
+5. **`share`/push stays git-only.** Do not generalise an operation that is a no-op on two of three
    backends; let the interface admit git has a publishing step the others don't need.
-5. **Perforce's price is not the security model — it is the missing off switch, the server-side
-   registry (`reapOrphans` needs connectivity), and team-visible per-run state.** All three are
-   real, none is fatal, and none of them is what the first draft was alarmed about.
+6. **Perforce's price, stated plainly: concurrency, not security.** A pool-of-1 default means one
+   agent at a time per workspace, and a second costs a full second copy of a deliberately large
+   repo. Add the server-side registry (`reapOrphans` needs connectivity), team-visible per-run
+   state, and no dry-run. All four are real, all four are the price of a live system working as
+   designed, and none of them is what the first draft was alarmed about.
 
 ### Suggested implementation tasks (to be split *after* this is accepted)
 

@@ -77,12 +77,20 @@ moment autoPush is on, and GitHub's branch protection is exactly as far outside 
 Perforce's protections table. Perforce even has a close analogue of RUN-28's shape — its
 **pre-commit review model**: shelve the pending changelist, open a Swarm review, a human submits.
 
-**The one thing that genuinely does not port is the OFF switch.** With `[land]` unconfigured — the
-default — a git runner writes nothing to any server, ever. Perforce has no such setting at any
-configuration, because `p4 shelve` *is* its checkpoint primitive: isolating a run and making its
-work durable are themselves depot writes. "Nothing an agent writes leaves this machine" is true of a
-default git install and unreachable on Perforce at any setting. See [VCS-SPIKE.md](VCS-SPIKE.md) §5
-(RUN-44).
+**The one thing that genuinely does not port is the OFF switch — and we accept that rather than
+fight it** (RUN-48). With `[land]` unconfigured — the default — a git runner writes nothing to any
+server, ever. Perforce has no such setting at any configuration, because `p4 shelve` *is* its
+checkpoint primitive: isolating a run and making its work durable are themselves depot writes.
+"Nothing an agent writes leaves this machine" is true of a default git install and unreachable on
+Perforce at any setting.
+
+That is not a defect to mitigate. Perforce and Diversion **work live** — that is what they are for,
+and a daemon has no standing to pretend otherwise. So the honest statement to an operator of one is:
+**a live-VCS runner has no dry-run.** You are trusting the boundary from the first run, because the
+first run already wrote to the depot. Everything else in this document still holds there; only the
+try-it-safely position is gone, and it is gone for reasons that predate us. If explicit isolation is
+ever wanted on those backends it comes from **containers**, at a layer below the VCS — not from
+pretending a server-backed system is local. See [VCS-SPIKE.md](VCS-SPIKE.md) §5 (RUN-44).
 
 ## Auto-landing (`[land]`) — an explicit trade
 
