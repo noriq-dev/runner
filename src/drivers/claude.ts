@@ -38,6 +38,8 @@ export interface SdkUserMessage {
 export interface SdkAssistantMessage {
   type: 'assistant';
   message: { content: SdkContentBlock[]; usage?: SdkUsage };
+  /** Every SDK message carries it; it is what `resume` takes (RUN-30). */
+  session_id?: string;
 }
 /** The SDK's per-model aggregate (sdk.d.ts `ModelUsage`). The only complete record of what a run
  *  spent — `usage` describes one model's path and silently omits sub-agents. See
@@ -59,12 +61,13 @@ export interface SdkResultMessage {
   /** Keyed by model id, e.g. 'claude-opus-4-8[1m]' and 'claude-haiku-4-5-20251001'. */
   modelUsage?: Record<string, SdkModelUsage>;
   stop_reason?: string | null;
+  session_id?: string;
 }
 export type SdkMessage =
   | SdkAssistantMessage
   | SdkResultMessage
-  | { type: 'system'; subtype?: string }
-  | { type: string };
+  | { type: 'system'; subtype?: string; session_id?: string }
+  | { type: string; session_id?: string };
 
 export interface SdkQuery extends AsyncIterable<SdkMessage> {
   interrupt(): Promise<unknown>;
@@ -90,6 +93,15 @@ export interface SdkQueryOptions {
   mcpServers?: Record<string, SdkMcpHttpServer>;
   /** Ignore all ambient MCP config (user settings, .mcp.json, plugins). */
   strictMcpConfig?: boolean;
+  /**
+   * Session id to resume — loads that conversation's history (RUN-30).
+   *
+   * Measured, because the failure mode is silent (a resume that doesn't take just starts fresh,
+   * losing exactly the context this exists to save): a closed streaming-input session resumes
+   * with its context intact and KEEPS THE SAME session id rather than forking. So one persisted
+   * id resumes any number of times.
+   */
+  resume?: string;
 }
 export type QueryFn = (args: {
   prompt: AsyncIterable<SdkUserMessage>;
@@ -290,6 +302,9 @@ export class ClaudeDriver implements AgentDriver {
         // plugins) — their connectors, their credentials, none of it in the manifest.
         strictMcpConfig: true,
         ...(opts.budget?.maxUsd != null ? { maxBudgetUsd: opts.budget.maxUsd } : {}),
+        // Bring a parked run's context back rather than starting over (RUN-30). Same cwd, so
+        // the session's own worktree is where it left it.
+        ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
       },
     });
 
@@ -307,9 +322,12 @@ export class ClaudeDriver implements AgentDriver {
         /* already gone */
       }
     };
-    const finish = (exit: DriverExit) => {
+    const finish = (raw: DriverExit) => {
       if (finished) return;
       finished = true;
+      // Carry the session id out on the exit: parking happens BECAUSE the session ended, so the
+      // supervisor's only chance to learn what to resume is the exit itself (RUN-30).
+      const exit: DriverExit = { ...raw, sessionId: session.sessionId ?? null };
       // multiTurn keeps the session alive past its first result so the caller can hand work back
       // (RUN-29's verify feedback loop, RUN-30's resume). The caller then owns it and must stop()
       // — an open query keeps the event loop alive, so this is opt-in and never the default.
@@ -325,6 +343,11 @@ export class ClaudeDriver implements AgentDriver {
     const consume = async () => {
       try {
         for await (const msg of query) {
+          // Every message carries it, and resuming keeps the SAME id, so the first one to
+          // arrive is the one to remember (RUN-30). Read off the union rather than per-branch:
+          // the id shows up on system messages too, i.e. before the first assistant turn.
+          const sid = (msg as { session_id?: string }).session_id;
+          if (sid) session.sessionId = sid;
           if (msg.type === 'assistant') {
             const am = msg as SdkAssistantMessage;
             const text = extractText(am.message.content ?? []);
@@ -397,10 +420,11 @@ export class ClaudeDriver implements AgentDriver {
         finish({ outcome: 'failed', isError: true, reason: (err as Error).message, telemetry: { ...live } });
       }
     };
-    void consume();
-
-    return {
+    const session: DriverSession = {
       runId: opts.runId,
+      // Assigned as soon as the stream says it (see consume). Seeded with what we asked to
+      // resume so a resumed session has an id before its first message even lands.
+      sessionId: opts.resumeSessionId ?? null,
       pushInput: (text: string): boolean => input.push(userTurn(text)),
       // Only meaningful under multiTurn; the contract marks it optional for exactly that reason.
       continueWith: opts.multiTurn
@@ -427,5 +451,8 @@ export class ClaudeDriver implements AgentDriver {
       },
       done: () => donePromise,
     };
+    // Start consuming only once `session` exists — consume() writes the session id onto it.
+    void consume();
+    return session;
   }
 }

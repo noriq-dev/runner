@@ -8,6 +8,7 @@ import { resolveLandBranch } from './land';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { openMergeRequest } from './merge-request';
+import { ParkedStore } from './parked';
 import { buildRegistration } from './registration';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
@@ -120,6 +121,10 @@ export class Daemon {
     // effect on the next dispatch instead of waiting for someone to restart the daemon.
     const manifests = new ManifestStore({ logger: this.log });
     for (const r of repos) manifests.seed(r.root, r.manifest);
+    // Runs parked on a human (RUN-30). On disk, because that is the point: the answer may come
+    // tomorrow, and a daemon that forgot across a restart would strand both the run and the
+    // worktree holding its work.
+    const parked = new ParkedStore();
     const held: { ws?: WsClient } = {};
     // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
     // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
@@ -182,6 +187,11 @@ export class Daemon {
       // the one that can register runners and reach every project this human can.
       createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
       resolveTask: (taskId) => client.getTask(taskId),
+      // Parking (RUN-30). The server is the authority on whether a run asked a human something —
+      // the agent calls request_input over its own MCP transport, straight past the daemon — so
+      // the daemon asks the row rather than trying to observe the call.
+      getParkState: (runId) => client.getParkState(runId),
+      parked,
       steering,
       logger: this.log,
     });
@@ -223,11 +233,21 @@ export class Daemon {
             this.log.warn('merge request failed', { err: String(err) }),
           );
         },
+        onResume: (m) => {
+          // A human answered the question a run parked on (RUN-30). The fast path — the same
+          // answer is durable in `signals`, and reconcileParked() below re-asks on every
+          // reconnect, so this frame arriving is a bonus and never the thing correctness rests on.
+          this.log.info('a parked run was answered', { runId: m.runId });
+          void resumeRun(m.runId, m.answer);
+        },
         onReconnect: () => {
           this.log.info('ws reconnected — reconciling live runs');
           // The durable half (RUN-28): a plan can complete while this box is off or the socket is
           // down, and the frame above would simply never arrive. Ask.
           void reconcileOwedMerges();
+          // Same shape for parked runs (RUN-30): a human answering while the box is off is the
+          // normal case, not the edge one, and nothing else would ever bring that run back.
+          void reconcileParked();
         },
       },
       logger: this.log,
@@ -269,6 +289,56 @@ export class Daemon {
      * conflict the forge should show in the PR, where a human resolves it with full context. The
      * daemon does not rewrite shared history to make its own PR openable.
      */
+    /**
+     * Bring one parked run back (RUN-30). Takes a slot, like any other run — a resumed agent is a
+     * live process, and pretending otherwise would let parked runs quietly exceed the concurrency
+     * the operator set.
+     *
+     * Concurrency-safe against itself: the supervisor's resume() unparks before it does anything
+     * else, so if the WS frame and the reconnect sweep both fire for one answer, the second finds
+     * nothing and no-ops rather than starting a rival process in the same worktree.
+     */
+    const resumeRun = async (runId: string, answer: string): Promise<void> => {
+      if (this.active.has(runId)) return; // already coming back
+      this.active.add(runId);
+      try {
+        await supervisor.resume(runId, answer);
+      } catch (err) {
+        this.log.error('resuming a parked run threw', { runId, err: String(err) });
+      } finally {
+        this.active.delete(runId);
+      }
+    };
+
+    /**
+     * Ask about every run this box has parked (RUN-30) — the durable half.
+     *
+     * The `run.resume` frame is fire-and-forget: a human answering a question at 9am, while the
+     * laptop that parked it was closed at 5pm, would hit a socket that does not exist. Without
+     * this sweep that run waits forever, and so does the worktree holding its work.
+     */
+    const reconcileParked = async (): Promise<void> => {
+      for (const p of await parked.list()) {
+        const state = await client.getParkState(p.run.id).catch((err) => {
+          this.log.debug('could not check a parked run', { runId: p.run.id, err: String(err) });
+          return null;
+        });
+        if (!state) continue;
+        if (state.answer) {
+          await resumeRun(p.run.id, state.answer);
+        } else if (!state.blocked) {
+          // The server no longer thinks it is parked — cancelled, or failed while we were away.
+          // Drop the entry: resuming into a run the server considers finished would report work
+          // against a lifecycle that already closed.
+          this.log.info('a parked run is no longer blocked server-side — forgetting it', {
+            runId: p.run.id,
+            status: state.status,
+          });
+          await parked.unpark(p.run.id);
+        }
+      }
+    };
+
     const reconcileOwedMerges = async (): Promise<void> => {
       const owed = await client.owedMerges(runner.id).catch((err) => {
         this.log.debug('could not ask for owed merge requests', { err: String(err) });
@@ -329,6 +399,15 @@ export class Daemon {
     // plan.completed frame is for the box to have been OFF when it fired — and a daemon that
     // only reconciles on RE-connect never reconciles its own first connect.
     void reconcileOwedMerges();
+
+    // Same reasoning for parked runs (RUN-30), plus one of its own: a park pins a worktree and a
+    // branch while the base moves under it, and its agent's token expires at 7 days — so give up
+    // on the ones nobody answered, before asking about the rest.
+    void supervisor
+      .expireStaleParks()
+      .then((n) => n && this.log.warn(`${n} parked run(s) expired unanswered`))
+      .then(() => reconcileParked())
+      .catch((err) => this.log.warn('could not reconcile parked runs', { err: String(err) }));
 
     const stop = async (): Promise<void> => {
       // SIGTERM live agents BEFORE the socket closes. A spawned claude/codex isn't in the

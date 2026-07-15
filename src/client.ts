@@ -61,6 +61,23 @@ export interface RunAgent {
   expiresIn: number;
 }
 
+/**
+ * Whether a Run is parked on a human, and what they said (RUN-30).
+ *
+ * The daemon cannot work this out locally: the agent calls `request_input` over its own MCP
+ * transport, straight to the server, with the daemon nowhere in that path. The row is the only
+ * place the truth exists.
+ */
+export interface ParkState {
+  status: string;
+  /** The run is waiting on a human right now. */
+  blocked: boolean;
+  signalId: string | null;
+  question: string | null;
+  /** Non-null only once a human actually responded — the cue to resume, and the text to send. */
+  answer: string | null;
+}
+
 /** A plan that finished and still owes a merge request (RUN-28). */
 export interface OwedMerge {
   planId: string;
@@ -148,6 +165,18 @@ export class NoriqClient {
     opts: { label?: string; role?: 'orchestrator' | 'worker' } = {},
   ): Promise<RunAgent> {
     return (await this.request('POST', `/api/runs/${runId}/agent`, opts)) as RunAgent;
+  }
+
+  /**
+   * Is this Run parked on a human, and have they answered? (RUN-30)
+   *
+   * Asked at two moments: when an agent's session ends (is this "finished" or "asked a question
+   * and stopped"? — only the row knows, and it is already authoritative, since request_input
+   * commits the park before returning to the agent), and on reconnect for every run this daemon
+   * has parked (a human can answer while the box is off — the normal case, not the edge one).
+   */
+  async getParkState(runId: string): Promise<ParkState> {
+    return (await this.request('GET', `/api/runs/${runId}/park`)) as ParkState;
   }
 
   /**

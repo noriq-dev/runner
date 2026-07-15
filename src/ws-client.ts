@@ -40,6 +40,10 @@ export interface WsHandlers {
    *  path only: the server also records it, and the daemon reconciles on connect, because a plan
    *  can complete while nothing is listening. */
   onPlanCompleted?: (msg: { planId: string; planKey: string; planTitle: string; projectId: string }) => void;
+  /** A human answered the question a run parked on (RUN-30) — bring its agent back. The fast
+   *  path only: the answer is durable server-side, and the daemon re-asks on reconnect, because
+   *  a question answered while the box was off is the normal case rather than the edge one. */
+  onResume?: (msg: { runId: string; signalId: string; question: string | null; answer: string }) => void;
   /** Fired on every reconnect (not the first connect) — a hook for supervision reconcile. */
   onReconnect?: () => void;
 }
@@ -154,6 +158,13 @@ export class WsClient {
     // — exactly the stranding this class exists to prevent.
     const sent = this.sendRaw(msg);
     if (terminal && sent) this.liveRuns.delete(runId);
+    // A parked run must NOT be re-asserted (RUN-30). liveRuns exists to say "this box still has a
+    // live process for this run" after a blip; a parked run has no process, and its durable record
+    // is the parked store, which reconnect reconciles separately. Re-asserting it would be
+    // actively wrong: if a human answered while the socket was down, the server has already moved
+    // the run back to running, and running → blocked is a LEGAL transition — so the re-assert
+    // would silently re-park a run that was just answered.
+    else if (status === 'blocked') this.liveRuns.delete(runId);
     else this.liveRuns.set(runId, msg); // keep it: a reconnect must re-assert it
   }
 
@@ -269,6 +280,14 @@ export class WsClient {
           planKey: msg.planKey,
           planTitle: msg.planTitle,
           projectId: msg.projectId,
+        });
+        return;
+      case 'run.resume':
+        this.opts.handlers?.onResume?.({
+          runId: msg.runId,
+          signalId: msg.signalId,
+          question: msg.question,
+          answer: msg.answer,
         });
         return;
       case 'steer':

@@ -1,6 +1,6 @@
 import type { PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import type { RunAgent } from '../src/client';
+import type { ParkState, RunAgent } from '../src/client';
 import type {
   AgentDriver,
   DriverExit,
@@ -9,6 +9,7 @@ import type {
   DriverTelemetry,
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { ParkedRun } from '../src/parked';
 import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget } from '../src/supervisor';
 import type { WorktreeInfo } from '../src/worktree';
 
@@ -16,6 +17,10 @@ import type { WorktreeInfo } from '../src/worktree';
 // wrapped onExit (superviseBudget resolves its done from it).
 class FakeDriver implements AgentDriver {
   opts?: DriverStartOptions;
+  /** The session id this driver reports — what a park persists and a resume takes (RUN-30). */
+  sessionId: string | null = 'sess-fake';
+  /** Every start(), in order. A resumed run must reuse the session, not open a fresh one. */
+  starts: DriverStartOptions[] = [];
   /** Turns handed back by the supervisor (RUN-29's verify feedback loop). */
   continuations: string[] = [];
   /** Outcome of each continueWith, in order. Defaults to 'done' — the agent fixed it. */
@@ -25,8 +30,10 @@ class FakeDriver implements AgentDriver {
   constructor(readonly tool: 'claude' | 'codex') {}
   start(opts: DriverStartOptions): DriverSession {
     this.opts = opts;
+    this.starts.push(opts);
     return {
       runId: opts.runId,
+      sessionId: this.sessionId,
       pushInput: () => true,
       interrupt: async () => {},
       stop: async () => {
@@ -232,6 +239,11 @@ function harness(
     stillConflicted?: string[];
     /** true → the landing branch moved under the run. */
     landRaces?: boolean;
+    /** What the server says when asked whether the run parked (RUN-30). */
+    parkState?: Partial<ParkState>;
+    /** true → asking the server throws, modelling a server the daemon cannot reach. */
+    parkStateFails?: boolean;
+    parkTtlHours?: number;
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -246,6 +258,11 @@ function harness(
   const codex = new FakeDriver('codex');
   let verifyRan = false;
   let verifyCalls = 0;
+  const parked = new FakeParked();
+  const parkChecks: string[] = [];
+  // Mutable, because the real thing is: once a human answers, the server marks the signal
+  // answered and moves the run back to running, so the NEXT check says "not blocked".
+  const park = { state: over.parkState };
   const supervisor = new RunSupervisor({
     drivers: over.drivers ?? { claude, codex },
     worktrees,
@@ -271,6 +288,20 @@ function harness(
     createRunAgent: async () => testAgent(),
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
+    parked,
+    parkTtlHours: over.parkTtlHours,
+    getParkState: async (runId) => {
+      parkChecks.push(runId);
+      if (over.parkStateFails) throw new Error('server unreachable');
+      return {
+        status: park.state?.blocked ? 'blocked' : 'running',
+        blocked: false,
+        signalId: null,
+        question: null,
+        answer: null,
+        ...park.state,
+      };
+    },
   });
   return {
     supervisor,
@@ -279,8 +310,30 @@ function harness(
     comments,
     claude,
     codex,
+    parked,
+    parkChecks,
+    /** Model the human answering: the server stops calling the run blocked. */
+    answerIt: () => {
+      park.state = { blocked: false };
+    },
     verifyRan: () => verifyRan,
     verifyCalls: () => verifyCalls,
+  };
+}
+
+/** The parked store, in memory. Its on-disk behaviour is pinned in parked.test.ts; here it is
+ *  just the thing supervise() hands a park to and resume() takes one from. */
+class FakeParked {
+  entries = new Map<string, ParkedRun>();
+  park = async (e: ParkedRun): Promise<void> => {
+    this.entries.set(e.run.id, e);
+  };
+  get = async (id: string): Promise<ParkedRun | null> => this.entries.get(id) ?? null;
+  list = async (): Promise<ParkedRun[]> => [...this.entries.values()];
+  unpark = async (id: string): Promise<ParkedRun | null> => {
+    const e = this.entries.get(id) ?? null;
+    this.entries.delete(id);
+    return e;
   };
 }
 
@@ -1268,5 +1321,262 @@ describe('a run says what it is DOING, not just that it is alive (RUN-31)', () =
     h.claude.complete('done');
     await done;
     expect(phases(h)).toEqual(['agent']);
+  });
+});
+
+describe('parking a run on a human (RUN-30)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const asked = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
+
+  it('a session ending is ambiguous — so it ASKS the server before finalizing', async () => {
+    // An agent that asked a question ends its turn exactly like one that finished. The daemon
+    // cannot tell them apart locally: request_input goes over the agent's own MCP transport,
+    // straight to the server, with the daemon nowhere in that path.
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.parkChecks).toEqual(['run_1']);
+  });
+
+  it('parks instead of finishing: reports blocked, KEEPS the worktree, skips the gate', async () => {
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    expect(h.reports.at(-1)?.status).toBe('blocked');
+    // The two things that make a park recoverable at all. The worktree holds the work; reaping
+    // it (as a finished run does) is what today throws away everything the agent understood.
+    expect(h.worktrees.removed).toEqual([]);
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake');
+    // And it is NOT graded: a run that stopped to ask a question has not finished the job.
+    expect(h.verifyCalls()).toBe(0);
+  });
+
+  it('remembers what resume needs: session, worktree, identity, credential, spend', async () => {
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(await h.parked.get('run_1')).toMatchObject({
+      sessionId: 'sess-fake',
+      worktreePath: '/wt/run_1',
+      worktreeBranch: 'noriq/run/run_1',
+      agentId: 'agt_run1',
+      // Persisted, not re-minted: RUN-43 made the run→agent credential deliberately
+      // non-reissuable, and a park is the same process later, not a second one.
+      mcpToken: 'plnrt_bound_to_agt_run1',
+      question: 'Approach A or B?',
+    });
+  });
+
+  it('does NOT park a run the server says is not blocked', async () => {
+    const h = harness({ verifyResults: [true] }); // default: not blocked
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(await h.parked.list()).toEqual([]);
+    expect(h.verifyCalls()).toBe(1); // gated normally
+  });
+
+  it('finalizes rather than parking when it cannot reach the server', async () => {
+    // Parking on a guess would strand a FINISHED run as blocked forever, waiting for an answer
+    // to a question nobody asked. Falling back to the pre-RUN-30 behaviour is the safe side.
+    const h = harness({ parkStateFails: true, verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(await h.parked.list()).toEqual([]);
+  });
+
+  it('does not park a run that FAILED, even with a question open', async () => {
+    // A budget breach or a crash is terminal. Resuming it would hand it a fresh ceiling —
+    // the spend loophole in reverse.
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    expect((await done).outcome).toBe('failed');
+    expect(await h.parked.list()).toEqual([]);
+  });
+
+  it('refuses to park when the tool has no resumable session', async () => {
+    // Parking it would promise a return the daemon cannot deliver: reported blocked, resumable
+    // never. Fail it loudly with its worktree intact instead.
+    const h = harness({ parkState: asked });
+    h.claude.sessionId = null;
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(await h.parked.list()).toEqual([]);
+    expect(h.reports.at(-1)?.status).not.toBe('blocked');
+  });
+});
+
+describe('resuming a parked run (RUN-30)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const asked = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
+
+  /** Park a run, then hand back a harness whose store holds it. */
+  const parkFirst = async (over: Parameters<typeof harness>[0] = {}) => {
+    const h = harness({ parkState: asked, ...over });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    return h;
+  };
+
+  it('comes back in the SAME session and the SAME worktree — the whole point', async () => {
+    // Not a fresh run re-reading the repo: the agent returns with everything it had already
+    // worked out still in context. That is the difference between collaborating and starting over.
+    const h = await parkFirst({ verifyResults: [true] });
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    await resumed;
+
+    const second = h.claude.starts.at(-1)!;
+    expect(second.resumeSessionId).toBe('sess-fake');
+    expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
+    expect(h.worktrees.created).toHaveLength(1); // only the original
+  });
+
+  it('the prompt is the ANSWER, not a fresh briefing', async () => {
+    const h = await parkFirst({ verifyResults: [true] });
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B, and mind the cache.');
+    await flush();
+    h.claude.complete('done');
+    await resumed;
+
+    const prompt = h.claude.starts.at(-1)!.prompt;
+    expect(prompt).toContain('Use B, and mind the cache.');
+    expect(prompt).toContain('Approach A or B?'); // its own question back
+    expect(prompt).not.toContain('ship the thing'); // NOT the original brief — it has the context
+  });
+
+  it('runs the gate it skipped when it parked', async () => {
+    // A run that asked for help is not a run that gets to skip the gate.
+    const h = await parkFirst({ verifyResults: [true] });
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    expect((await resumed)?.outcome).toBe('done');
+    expect(h.verifyCalls()).toBe(1);
+    // Kept, but for the ordinary reason rather than the park: this repo has no [land], so the
+    // diff is still on its branch and a human has to look at it. Resume rejoins the normal
+    // pipeline — it does not get its own cleanup rules.
+    expect(h.worktrees.removed).toEqual([]);
+  });
+
+  it('inherits the REMAINING budget, never a fresh one', async () => {
+    // Otherwise "ask a question" is a way to buy more budget, and a run could park its way past
+    // any ceiling.
+    const h = await parkFirst({ defaultBudget: { maxTokens: 1000, maxUsd: 5, maxDurationSeconds: 600 } });
+    h.answerIt();
+    const parked = await h.parked.get('run_1');
+    expect(parked!.spent.tokens).toBe(42); // what the fake driver burned
+
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    await resumed;
+    expect(h.claude.starts.at(-1)!.budget).toMatchObject({ maxTokens: 1000 - 42 });
+  });
+
+  it('does not charge the run for the time a human took to answer', async () => {
+    // Wall-clock counts ACTIVE time only. Charging the wait would mean every question answered
+    // after lunch returns to a run that is already dead — a slower way to lose the work.
+    const h = await parkFirst({ defaultBudget: { maxTokens: null, maxUsd: null, maxDurationSeconds: 600 } });
+    h.answerIt();
+    const parked = await h.parked.get('run_1');
+    expect(parked!.activeSeconds).toBeLessThan(5); // the test's own runtime, not a wall-clock age
+
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    await resumed;
+    // Still ~the full 600s: the park cost it nothing.
+    expect(h.claude.starts.at(-1)!.budget!.maxDurationSeconds).toBeGreaterThan(590);
+  });
+
+  it('reports the RUN’s total spend, not just this sitting’s', async () => {
+    const h = await parkFirst();
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    const exit = await resumed;
+    // 42 before the park + 42 after. A dashboard that reset the number at resume would make
+    // the second half of a run look free.
+    expect(exit!.telemetry.outputTokens + exit!.telemetry.inputTokens).toBe(84);
+  });
+
+  it('is idempotent — the WS frame and the reconnect sweep can both fire', async () => {
+    const h = await parkFirst({ verifyResults: [true] });
+    h.answerIt();
+    const first = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    // The second resume finds nothing: unpark() removed the entry before anything started.
+    expect(await h.supervisor.resume('run_1', 'Use B.')).toBeNull();
+    h.claude.complete('done');
+    await first;
+    expect(h.claude.starts).toHaveLength(2); // the original + ONE resume, not two
+  });
+
+  it('resuming a run that was never parked is a no-op, not a crash', async () => {
+    const h = harness();
+    expect(await h.supervisor.resume('run_nope', 'hello?')).toBeNull();
+  });
+
+  it('can park AGAIN — a second question is worth as much as the first', async () => {
+    const h = await parkFirst();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done'); // still blocked per parkState → parks again
+    await resumed;
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake');
+    // And the spend accumulated across BOTH sittings.
+    expect((await h.parked.get('run_1'))?.spent.tokens).toBe(84);
+  });
+});
+
+describe('expiring a park nobody answered (RUN-30)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  const parkOne = async (parkTtlHours?: number) => {
+    const h = harness({ parkState: { blocked: true, signalId: 's', question: 'A or B?' }, parkTtlHours });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    return h;
+  };
+
+  it('fails a park past its TTL but KEEPS the worktree', async () => {
+    const h = await parkOne(0); // any age at all is past a zero TTL
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await h.supervisor.expireStaleParks()).toBe(1);
+
+    expect(h.reports.at(-1)).toMatchObject({ status: 'failed', exit: { reason: 'park_expired' } });
+    expect(await h.parked.list()).toEqual([]);
+    // The one thing the daemon never does: the worktree holds work that exists nowhere else.
+    expect(h.worktrees.removed).toEqual([]);
+  });
+
+  it('leaves a fresh park alone', async () => {
+    const h = await parkOne(72);
+    expect(await h.supervisor.expireStaleParks()).toBe(0);
+    expect(await h.parked.list()).toHaveLength(1);
   });
 });

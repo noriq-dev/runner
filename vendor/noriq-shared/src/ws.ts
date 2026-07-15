@@ -64,6 +64,21 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
     projectId: z.string(),
   }),
 
+  // A human answered the question a Run parked on (RUN-30) — bring its agent back.
+  //
+  // Fast path only, exactly like plan.completed: the answer is durable in `signals`, and the
+  // daemon re-asks (GET /api/runs/:id/park) for every run it has parked whenever it reconnects.
+  // A question can easily be answered while the box is off — that is the normal case, not the
+  // edge one — and a fire-and-forget resume would strand the run and the worktree holding its
+  // work.
+  z.object({
+    type: z.literal('run.resume'),
+    runId: z.string(),
+    signalId: z.string(),
+    question: z.string().nullable().default(null),
+    answer: z.string(),
+  }),
+
   // Kill a Run. hard=true → SIGTERM the process now; false → let it wind down.
   z.object({
     type: z.literal('run.cancel'),

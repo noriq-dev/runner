@@ -8,9 +8,10 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
-import type { RunAgent } from './client';
-import { superviseBudget } from './drivers/budget';
+import type { ParkState, RunAgent } from './client';
+import { superviseBudget, totalTokens } from './drivers/budget';
 import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry, NoriqMcp } from './drivers/types';
+import { zeroTelemetry } from './drivers/types';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -20,6 +21,7 @@ import {
   resolveLandBranch,
 } from './land';
 import { logger as defaultLogger } from './logger';
+import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import {
   MAX_VERIFY_FIXES,
   type VerifyExec,
@@ -48,7 +50,8 @@ export interface ResolvedRepo {
 }
 
 export interface RunReport {
-  status: 'running' | 'done' | 'failed';
+  /** `blocked` = parked on a human (RUN-30). Non-terminal and resumable → running. */
+  status: 'running' | 'blocked' | 'done' | 'failed';
   worktreePath?: string | null;
   /** The agent working this Run. The wire has always carried this slot and it was always
    *  null, because the daemon never knew the identity its child invented for itself — the
@@ -114,6 +117,18 @@ export interface RunSupervisorDeps {
   // its human can. Agents now get a per-run token bound to one identity, from createRunAgent.
   /** Resolve an anchor task's title/body so the prompt can inline it (→ NoriqClient.getTask). */
   resolveTask?: (taskId: string) => Promise<AnchorTask | null>;
+  /**
+   * Is this Run parked on a human, and have they answered? (→ NoriqClient.getParkState, RUN-30)
+   *
+   * The server is the authority: only it saw the `request_input`, because the agent reaches
+   * Noriq over MCP directly and the daemon is not in that path. Omitted → parking is off and a
+   * session that ends is simply finished, exactly as before RUN-30.
+   */
+  getParkState?: (runId: string) => Promise<ParkState>;
+  /** Where parked runs are remembered across restarts (RUN-30). Omitted → parking is off. */
+  parked?: Pick<ParkedStore, 'park' | 'get' | 'unpark' | 'list'>;
+  /** How long a park may sit before the daemon fails it (RUN-30). Default: DEFAULT_PARK_TTL_HOURS. */
+  parkTtlHours?: number;
   /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
   steering?: {
     register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
@@ -145,6 +160,37 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
     maxDurationSeconds: runBudget?.maxDurationSeconds ?? fallback?.maxDurationSeconds ?? null,
   };
 }
+
+/**
+ * What a resumed run may still spend (RUN-30).
+ *
+ * Tokens and USD carry over as plain remainders: a run that parks and resumes has one budget for
+ * its whole life, not one per sitting. Wall-clock does NOT — `activeSeconds` counts only time the
+ * agent was actually running, because the wait for a human is not the run's fault and charging it
+ * would mean any question answered after a lunch break returns to a run that is already dead.
+ *
+ * Floors at 1 rather than 0: a remainder of exactly zero would read as "no limit" to the budget
+ * supervisor, turning an exhausted run into an unlimited one — the precise inversion of intent.
+ */
+export function remainingBudget(budget: RunBudget | null, spent: ParkedRun): RunBudget | undefined {
+  if (!budget) return undefined;
+  const left = (max: number | null, used: number) => (max == null ? null : Math.max(1, max - used));
+  return {
+    maxTokens: left(budget.maxTokens, spent.spent.tokens),
+    maxUsd: budget.maxUsd == null ? null : Math.max(0.01, budget.maxUsd - spent.spent.usd),
+    maxDurationSeconds: left(budget.maxDurationSeconds, spent.activeSeconds),
+  };
+}
+
+/** Fold a park's prior spend into a live tick, so the dashboard shows the RUN's total. */
+export const addSpent = (t: DriverTelemetry, spent: ParkedRun['spent']): DriverTelemetry => ({
+  ...t,
+  // Prior tokens land in inputTokens: the split across the four buckets is not recoverable from
+  // the park (it stores one total), and the figure that matters — and that the budget reads — is
+  // the sum. Better one honest total than four invented components.
+  inputTokens: t.inputTokens + spent.tokens,
+  costUsd: t.costUsd + spent.usd,
+});
 
 /** The anchor task's human-readable content, inlined into the prompt. */
 export interface AnchorTask {
@@ -504,6 +550,245 @@ export class RunSupervisor {
     }
   }
 
+  /** The anchor task's text, best-effort: a lookup failure degrades to the bare id (the prompt
+   *  renders it) rather than sinking the run. */
+  private async resolveAnchorTask(taskId: string): Promise<AnchorTask | null> {
+    if (!this.deps.resolveTask) return null;
+    return this.deps.resolveTask(taskId).catch((err) => {
+      this.log.warn('anchor task lookup failed — prompting with the bare id', {
+        taskId,
+        err: String(err),
+      });
+      return null;
+    });
+  }
+
+  /**
+   * Park a run whose agent stopped to ask a human something (RUN-30) — or don't, and let the
+   * caller finalize it. Returns the exit to report iff the run parked.
+   *
+   * The check is a server read, not a pushed frame, and that is the whole trick: `raiseSignal`
+   * commits `status='blocked'` before the `request_input` MCP call returns to the agent, so by
+   * the time the agent's turn can possibly end, the row already says so. A frame racing that same
+   * instant would sometimes lose — and losing means finalizing the run and reaping the worktree,
+   * which is the exact failure this task exists to fix, except intermittent.
+   */
+  private async parkIfBlocked(ctx: {
+    run: Run;
+    repo: ResolvedRepo;
+    worktree: WorktreeInfo;
+    exit: DriverExit;
+    session: DriverSession;
+    runAgent: RunAgent;
+    activeSeconds: number;
+    /** The run's trailing output, so the park report carries the last thing it said — usually
+     *  the question itself, which is what a human opening the dashboard wants to read. */
+    tail: string;
+  }): Promise<DriverExit | null> {
+    const { run, exit } = ctx;
+    if (!this.deps.parked || !this.deps.getParkState) return null;
+    // A budget breach or a crash is terminal even if a question is open: resuming a run that was
+    // killed for overspending would hand it a fresh ceiling, which is the loophole in reverse.
+    if (exit.outcome !== 'done') return null;
+
+    const state = await this.deps.getParkState(run.id).catch((err) => {
+      // Can't tell → finalize, the pre-RUN-30 behaviour. Parking on a guess would strand a
+      // finished run as blocked forever, waiting for an answer to a question nobody asked.
+      this.log.warn('could not check whether the run parked — treating it as finished', {
+        runId: run.id,
+        err: String(err),
+      });
+      return null;
+    });
+    if (!state?.blocked) return null;
+
+    const sessionId = ctx.session.sessionId ?? exit.sessionId ?? null;
+    if (!sessionId) {
+      // Nothing to resume: this run can be reported blocked but never brought back, so parking
+      // it would be a promise the daemon cannot keep. Fail it loudly with its context intact.
+      this.log.warn('run asked a human but its tool has no resumable session — cannot park', {
+        runId: run.id,
+        tool: run.agentTool,
+      });
+      return null;
+    }
+
+    await this.deps.parked.park({
+      run,
+      sessionId,
+      agentId: ctx.runAgent.agentId,
+      agentLabel: ctx.runAgent.label,
+      mcpToken: ctx.runAgent.token,
+      worktreePath: ctx.worktree.path,
+      worktreeBranch: ctx.worktree.branch,
+      repoRoot: ctx.repo.root,
+      spent: { tokens: totalTokens(exit.telemetry), usd: exit.telemetry.costUsd },
+      activeSeconds: ctx.activeSeconds,
+      parkedAt: new Date().toISOString(),
+      question: state.question,
+    });
+    // The server already moved the row to blocked when the agent asked; reporting it back is what
+    // makes the daemon's view and the dashboard's agree, and it carries the final spend.
+    this.deps.report(run.id, { status: 'blocked', telemetry: exit.telemetry, logTail: ctx.tail });
+    this.log.info('run parked on a human — session ended, worktree kept', {
+      runId: run.id,
+      question: state.question?.slice(0, 80) ?? null,
+    });
+    // NOT terminal, and the worktree is deliberately left alone: it holds the work, and the
+    // resumed session expects to find it exactly where it was.
+    return { ...exit, outcome: 'done', isError: false, reason: 'parked', sessionId };
+  }
+
+  /**
+   * Bring a parked run back with the human's answer (RUN-30).
+   *
+   * The payoff of the whole feature is here: the agent returns with everything it had already
+   * worked out still in context, rather than a fresh run re-reading the repo to re-derive it.
+   * Same worktree, same session, same identity — only the answer is new.
+   *
+   * Idempotent by construction: unpark() removes the entry before anything else, so a duplicate
+   * resume (the WS frame AND the reconnect sweep can both fire for one answer) finds nothing and
+   * returns null rather than starting a second process in the same worktree.
+   */
+  async resume(runId: string, answer: string): Promise<DriverExit | null> {
+    const entry = await this.deps.parked?.unpark(runId);
+    if (!entry) return null;
+    const { run } = entry;
+    const kind = run.kind as RunKind;
+
+    const fail = (reason: string): DriverExit => {
+      this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
+      this.log.warn('could not resume a parked run', { runId, reason });
+      return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
+    };
+
+    const repo = await this.deps.resolveRepo(run.repoRef);
+    if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
+    const driver = this.deps.drivers[run.agentTool as AgentTool];
+    if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+    if (!entry.sessionId) return fail('parked run has no session to resume');
+
+    // The worktree is REUSED, never recreated: it holds the work the agent did before it asked,
+    // and the session it is about to resume expects to find it exactly as it left it.
+    const worktree: WorktreeInfo = {
+      runId: run.id,
+      repoRoot: entry.repoRoot,
+      path: entry.worktreePath,
+      branch: entry.worktreeBranch,
+      readOnly: kind === 'scope',
+      baseSha: '',
+    };
+    const runAgent: RunAgent = {
+      agentId: entry.agentId,
+      label: entry.agentLabel,
+      token: entry.mcpToken,
+      projectId: run.projectId,
+      // The park stores no expiry and nothing downstream reads one; what actually bounds this
+      // token's usefulness is DEFAULT_PARK_TTL_HOURS, kept well inside its real 7-day life.
+      expiresIn: 0,
+    };
+    const noriqMcp: NoriqMcp = {
+      url: `${this.deps.server.replace(/\/+$/, '')}/mcp`,
+      token: entry.mcpToken,
+    };
+
+    this.deps.report(run.id, { status: 'running', phase: 'agent' });
+    this.log.info('resuming a parked run', { runId, agentId: entry.agentId, session: entry.sessionId });
+
+    let verifyText = '';
+    let tail = '';
+    const startedAt = Date.now();
+    const budgetRun = superviseBudget(driver, {
+      runId: run.id,
+      kind,
+      cwd: worktree.path,
+      // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
+      // all of it, and re-sending it would both waste the context and confuse a conversation
+      // that is mid-thought.
+      prompt: resumePrompt(entry.question, answer),
+      resumeSessionId: entry.sessionId,
+      permission: repo.manifest.permissions[kind],
+      noriqMcp,
+      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
+      // budget, and a run could park its way past any limit.
+      budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
+      handlers: {
+        onTelemetry: (t) =>
+          this.deps.report(run.id, { status: 'running', telemetry: addSpent(t, entry.spent), logTail: tail }),
+        onText: (t) => {
+          verifyText += t;
+          tail = (tail + t).slice(-LOG_TAIL_CAP);
+        },
+      },
+    });
+    this.deps.steering?.register(run.id, budgetRun.session, budgetRun.stop);
+    let exit: DriverExit;
+    try {
+      exit = await budgetRun.done;
+    } finally {
+      this.deps.steering?.unregister(run.id);
+    }
+    // Spend is cumulative across the park — the run's totals are the run's, not this sitting's.
+    exit = { ...exit, telemetry: addSpent(exit.telemetry, entry.spent) };
+
+    // It can park AGAIN. An agent given an answer may well have a second question, and there is
+    // no reason the second one is worth less than the first.
+    const reparked = await this.parkIfBlocked({
+      run,
+      repo,
+      worktree,
+      exit,
+      session: budgetRun.session,
+      runAgent,
+      activeSeconds: entry.activeSeconds + (Date.now() - startedAt) / 1000,
+      tail,
+    });
+    if (reparked) return reparked;
+
+    return this.afterDriver({
+      run,
+      repo,
+      worktree,
+      driver,
+      permission: repo.manifest.permissions[kind],
+      noriqMcp,
+      task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
+      runAgent,
+      session: budgetRun.session,
+      stopSession: budgetRun.stop,
+      exit,
+      verifyText,
+      tail,
+    });
+  }
+
+  /**
+   * Fail the parks that have waited too long to be worth resuming (RUN-30).
+   *
+   * Called on daemon start. A park pins a worktree and a branch while the base moves on
+   * underneath it, and its agent's token expires at 7 days — so a park that sits forever is a
+   * run that will resume into a world it does not recognise, holding a credential that no longer
+   * works. The worktree is deliberately NOT reaped: it holds work that exists nowhere else.
+   */
+  async expireStaleParks(now = new Date()): Promise<number> {
+    const all = (await this.deps.parked?.list()) ?? [];
+    const stale = expiredParks(all, now, this.deps.parkTtlHours);
+    for (const p of stale) {
+      await this.deps.parked?.unpark(p.run.id);
+      this.deps.report(p.run.id, {
+        status: 'failed',
+        exit: { outcome: 'failed', reason: 'park_expired' },
+      });
+      this.log.warn('parked run expired — nobody answered in time; its worktree is kept', {
+        runId: p.run.id,
+        parkedAt: p.parkedAt,
+        worktree: p.worktreePath,
+      });
+    }
+    return stale.length;
+  }
+
   /** Run one dispatched Run to completion. Never throws — failures are reported. */
   async supervise(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
@@ -567,17 +852,8 @@ export class RunSupervisor {
 
     // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
     // a lookup failure degrades to the bare id rather than sinking the run.
-    let task: AnchorTask | null = null;
-    if (run.anchor?.type === 'task' && this.deps.resolveTask) {
-      task = await this.deps.resolveTask(run.anchor.taskId).catch((err) => {
-        this.log.warn('anchor task lookup failed — prompting with the bare id', {
-          runId: run.id,
-          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
-          err: String(err),
-        });
-        return null;
-      });
-    }
+    const task: AnchorTask | null =
+      run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null;
 
     // The agent's identity AND its Noriq access, in one step (RUN-43). The daemon creates
     // the agent up front and receives a token bound to it: the process cannot be anyone
@@ -631,6 +907,9 @@ export class RunSupervisor {
     });
     let verifyText = ''; // accumulated agent output — the verify verdict is parsed from it
     let tail = ''; // rolling tail of the same output, capped, for the live dashboard (RUN-22)
+    // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
+    // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
+    const startedAt = Date.now();
     const budgetRun = superviseBudget(driver, {
       runId: run.id,
       kind,
@@ -662,6 +941,66 @@ export class RunSupervisor {
     } finally {
       this.deps.steering?.unregister(run.id);
     }
+
+    // The session ending is ambiguous (RUN-30): an agent that asked a human a question ends its
+    // turn exactly like one that finished. Only the server knows which, so ask it before treating
+    // this as terminal — everything below destroys context that a parked run still needs.
+    const parked = await this.parkIfBlocked({
+      run,
+      repo,
+      worktree,
+      exit,
+      session: budgetRun.session,
+      runAgent,
+      activeSeconds: (Date.now() - startedAt) / 1000,
+      tail,
+    });
+    if (parked) return parked;
+
+    return this.afterDriver({
+      run,
+      repo,
+      worktree,
+      driver,
+      permission,
+      noriqMcp,
+      task,
+      runAgent,
+      session: budgetRun.session,
+      stopSession: budgetRun.stop,
+      exit,
+      verifyText,
+      tail,
+    });
+  }
+
+  /**
+   * The pipeline AFTER the agent stops talking: commit → land → verify → report → reap.
+   *
+   * Its own method because a parked run re-enters here (RUN-30). `supervise` runs it once for a
+   * run that finished in one sitting; `resume` runs it for one that stopped to ask a question and
+   * came back — possibly days later, in a different daemon process. Both must gate identically:
+   * a run that asked for help is not a run that gets to skip the gate.
+   */
+  private async afterDriver(ctx: {
+    run: Run;
+    repo: ResolvedRepo;
+    worktree: WorktreeInfo;
+    driver: AgentDriver;
+    permission: PermissionProfile;
+    noriqMcp?: NoriqMcp;
+    task: AnchorTask | null;
+    runAgent: RunAgent;
+    session: DriverSession;
+    stopSession: () => Promise<void>;
+    exit: DriverExit;
+    verifyText: string;
+    tail: string;
+  }): Promise<DriverExit> {
+    const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, verifyText, tail } = ctx;
+    const kind = run.kind as RunKind;
+    const budgetRun = { session: ctx.session, stop: ctx.stopSession };
+    let exit = ctx.exit;
     // Whether the DRIVER succeeded — drives worktree retention (a build with a diff
     // is kept for the human even if verify then fails).
     let driverSucceeded = exit.outcome === 'done';

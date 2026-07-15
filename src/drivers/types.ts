@@ -29,6 +29,9 @@ export interface DriverExit {
   isError: boolean;
   reason: string | null;
   telemetry: DriverTelemetry;
+  /** The tool's own session id, when it has one (RUN-30) — what `resume` takes to bring a
+   *  parked run's context back. Null on a driver that has no resumable session. */
+  sessionId?: string | null;
 }
 
 export interface DriverHandlers {
@@ -68,6 +71,14 @@ export interface DriverStartOptions {
    * `finally { stop() }` should ask for this.
    */
   multiTurn?: boolean;
+  /**
+   * Resume a parked run's session instead of starting a new one (RUN-30).
+   *
+   * This is what makes a blocked run cheap to answer: the agent comes back with everything it
+   * had already worked out still in context, rather than a fresh process re-deriving it from
+   * the repo. Ignored by drivers with no resumable session.
+   */
+  resumeSessionId?: string | null;
   runId: string;
   kind: RunKind;
   /** The Run's isolated git worktree (RUN-11). */
@@ -86,6 +97,14 @@ export interface DriverStartOptions {
 
 export interface DriverSession {
   readonly runId: string;
+  /**
+   * The tool's session id, once it has told us one (RUN-30).
+   *
+   * Not readonly and not available at start(): the SDK assigns it, and we only learn it when the
+   * first message comes back. A caller that needs it to park a run reads it at that point, not
+   * before — which is fine, because a run cannot park before it has said anything.
+   */
+  sessionId?: string | null;
   /** Steer: push a user turn into the live session (soft — next-turn injection).
    *  @returns false when the session's input is already closed, i.e. the turn was NOT
    *  delivered. Steering depends on this: acking `via:'runtime'` for a message the
