@@ -61,6 +61,16 @@ export interface RunAgent {
   expiresIn: number;
 }
 
+/** A plan that finished and still owes a merge request (RUN-28). */
+export interface OwedMerge {
+  planId: string;
+  planKey: string | null;
+  planTitle: string;
+  projectId: string;
+  /** The repo whose working branch holds the plan's work — this runner landed it. */
+  repoRef: string | null;
+}
+
 export interface HeartbeatInput {
   freeSlots: number;
   /** 'offline' is the clean-shutdown goodbye (RUN-35) — see Daemon.stop. */
@@ -138,6 +148,33 @@ export class NoriqClient {
     opts: { label?: string; role?: 'orchestrator' | 'worker' } = {},
   ): Promise<RunAgent> {
     return (await this.request('POST', `/api/runs/${runId}/agent`, opts)) as RunAgent;
+  }
+
+  /**
+   * Merge requests this runner still owes (RUN-28).
+   *
+   * The durable half of plan completion: the WS `plan.completed` frame is only the fast path. A
+   * plan can finish while this box is off, while the runner is offboarded, or while the socket is
+   * reconnecting — and a fire-and-forget push would drop the merge request silently and forever.
+   * So the daemon asks on connect and reconciles.
+   */
+  async owedMerges(runnerId: string): Promise<OwedMerge[]> {
+    const out = (await this.request('GET', `/api/runners/${runnerId}/owed-merges`)) as { owed: OwedMerge[] };
+    return out.owed ?? [];
+  }
+
+  /** Report what happened to an owed merge request — opened, or failed with a reason. Recorded
+   *  either way: marking only successes leaves a failure invisible and the plan owed forever, so
+   *  the daemon retries the same broken thing on every reconnect and nobody learns why. */
+  async reportMerge(
+    runnerId: string,
+    report: { planId: string; url?: string | null; failed?: string | null },
+  ): Promise<void> {
+    await this.request('POST', `/api/runners/${runnerId}/owed-merges/report`, {
+      planId: report.planId,
+      url: report.url ?? null,
+      failed: report.failed ?? null,
+    });
   }
 
   /** Call an MCP tool as the daemon's actor, returning the tool's text payload parsed

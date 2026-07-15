@@ -49,6 +49,21 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   // Run entity; the daemon prepares a worktree and spawns the agent process.
   z.object({ type: z.literal('run.assigned'), run: Run }),
 
+  // A plan finished, so its working branch is ready to become a merge request (RUN-28).
+  //
+  // Completion is a SERVER fact — the daemon only ever sees Runs, never the plan's task graph —
+  // so the server computes it and tells the runner that landed the work. This frame is the FAST
+  // path only: the completion is also recorded (plan_landings), because a plan can finish while
+  // no runner is listening (box off, runner offboarded, socket mid-reconnect) and a
+  // fire-and-forget push would drop the MR silently, forever. The daemon re-asks on reconnect.
+  z.object({
+    type: z.literal('plan.completed'),
+    planId: z.string(),
+    planKey: z.string(),
+    planTitle: z.string(),
+    projectId: z.string(),
+  }),
+
   // Kill a Run. hard=true → SIGTERM the process now; false → let it wind down.
   z.object({
     type: z.literal('run.cancel'),

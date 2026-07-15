@@ -15,6 +15,26 @@ export type LandFailure =
   | 'race' // the branch moved mid-landing; retry
   | 'error'; // git itself refused
 
+/**
+ * The branch this run lands on (RUN-28).
+ *
+ * `[land].branch` may contain `<planKey>` — "noriq/plan-<planKey>" — giving each plan its own
+ * working branch. That is what makes a merge request mean anything: a human reviews one coherent
+ * plan's worth of work, rather than a click per run or a surprise on main.
+ *
+ * A run with no plan (a one-off dispatch) must NOT land on a branch literally called
+ * "noriq/plan-<planKey>", so the placeholder and any separator clinging to it are stripped. The
+ * result is the sensible fallback — "noriq/plan-<planKey>" becomes "noriq/plan", one shared
+ * branch for one-offs — rather than a branch named after a template.
+ */
+export function resolveLandBranch(template: string, planKey: string | null): string {
+  if (!template.includes('<planKey>')) return template;
+  if (planKey) return template.replaceAll('<planKey>', planKey);
+  // Strip the placeholder AND a trailing separator, so "noriq/plan-<planKey>" → "noriq/plan"
+  // rather than "noriq/plan-".
+  return template.replaceAll('<planKey>', '').replace(/[-_/]+$/, '') || template;
+}
+
 export interface LandOutcome {
   landed: boolean;
   branch: string;

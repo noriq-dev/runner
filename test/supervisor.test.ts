@@ -165,6 +165,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   projectId: 'prj_p',
   runnerId: 'rnr_1',
   agentId: null,
+  // No plan by default: a one-off dispatch. The per-plan branch (RUN-28) is opt-in on both
+  // sides — a `<planKey>` template AND a run that actually belongs to a plan.
+  planKey: null,
   kind: 'scope',
   anchor: null,
   verifiesRunId: null,
@@ -764,6 +767,7 @@ const LANDING = (over: Partial<ProjectManifest['land']> = {}) =>
     // silently pushed would be exactly the accident RUN-27 exists to prevent.
     land: {
       branch: 'noriq/integration',
+      mergeTarget: null,
       onlyWhenVerifyPasses: true,
       resolveConflicts: true,
       autoPush: false,

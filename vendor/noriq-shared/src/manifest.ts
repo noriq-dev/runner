@@ -75,7 +75,18 @@ export type VerifySpec = z.infer<typeof VerifySpec>;
 export const LandPolicy = z.object({
   // The integration branch; created from defaultBranch if it doesn't exist. NO default,
   // on purpose: auto-landing is opt-in per repo and must never silently choose `main`.
+  //
+  // May contain `<planKey>` (RUN-28) — e.g. "noriq/plan-<planKey>" — giving each plan its own
+  // working branch, which is what makes a merge request mean something: a human reviews one
+  // coherent plan's worth of work rather than a click per run or a surprise on main. A run with
+  // no plan (a one-off dispatch) falls back to the literal branch with the placeholder stripped,
+  // so a template never produces a branch called "plan-<planKey>".
   branch: z.string().min(1),
+  // Where the working branch's merge request goes when its plan completes (RUN-28). NO default
+  // and null = no MR: the protected branch is named by the REPO, never inferred and never chosen
+  // by whoever dispatched. Requires autoPush — a merge request cannot exist without the branch
+  // reaching the remote.
+  mergeTarget: z.string().min(1).nullable().default(null),
   // Land only if the deterministic verify passes on the REBASED result. Off means an
   // unverified diff reaches `branch` — permitted, never assumed.
   onlyWhenVerifyPasses: z.boolean().default(true),

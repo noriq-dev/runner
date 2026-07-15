@@ -4,8 +4,10 @@ import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
+import { resolveLandBranch } from './land';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
+import { openMergeRequest } from './merge-request';
 import { buildRegistration } from './registration';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
@@ -206,7 +208,20 @@ export class Daemon {
           // fallback doesn't double-deliver (dedup guard).
           void steering.applySteer(steer).then((result) => held.ws?.sendSteerAck(result));
         },
-        onReconnect: () => this.log.info('ws reconnected — reconciling live runs'),
+        onPlanCompleted: (m) => {
+          // A nudge, not the payload: go ask the server what is owed. The frame carries no repo,
+          // and making it carry one would be a second source of truth to keep in sync.
+          this.log.info('a plan completed', { planId: m.planId, plan: m.planTitle });
+          void reconcileOwedMerges().catch((err) =>
+            this.log.warn('merge request failed', { err: String(err) }),
+          );
+        },
+        onReconnect: () => {
+          this.log.info('ws reconnected — reconciling live runs');
+          // The durable half (RUN-28): a plan can complete while this box is off or the socket is
+          // down, and the frame above would simply never arrive. Ask.
+          void reconcileOwedMerges();
+        },
       },
       logger: this.log,
     });
@@ -231,6 +246,82 @@ export class Daemon {
       updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);
       updateTimer.unref();
     }
+
+    /**
+     * Open a merge request for every plan that finished and still owes one (RUN-28).
+     *
+     * Driven entirely off the server's record, never off the WS frame's payload. `plan.completed`
+     * is a NUDGE — "go ask" — and reconnect asks the same question. One code path, and the
+     * durable store is the only truth: a plan can complete while this box is off, while the
+     * runner is offboarded, or mid-reconnect, and a frame-shaped fast path would drop the merge
+     * request silently and forever. This project has shipped that exact bug twice.
+     *
+     * NO REBASE, deliberately. The working branch is already PUSHED — autoPush is a hard
+     * prerequisite — so rebasing it locally would rewrite published history and need `--force`,
+     * which pushBranch categorically refuses (RUN-27). If main moved under the plan, that is a
+     * conflict the forge should show in the PR, where a human resolves it with full context. The
+     * daemon does not rewrite shared history to make its own PR openable.
+     */
+    const reconcileOwedMerges = async (): Promise<void> => {
+      const owed = await client.owedMerges(runner.id).catch((err) => {
+        this.log.debug('could not ask for owed merge requests', { err: String(err) });
+        return [];
+      });
+      for (const plan of owed) {
+        const repo = plan.repoRef ? reposById.get(plan.repoRef) : undefined;
+        if (!repo) continue; // a plan whose repo this runner no longer has
+        const manifest = await manifests.current(repo.root);
+        const target = manifest?.land?.mergeTarget ?? null;
+        if (!manifest?.land || !target) continue; // the repo never asked for merge requests
+
+        const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
+        // Push again before opening: landing pushed each run as it went, but this is the moment
+        // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
+        const push = await worktrees.pushBranch(repo.root, branch);
+        if (!push.ok) {
+          await client
+            .reportMerge(runner.id, { planId: plan.planId, failed: `push failed: ${push.detail}` })
+            .catch(() => {});
+          continue;
+        }
+        const mr = await openMergeRequest({
+          repoRoot: repo.root,
+          head: branch,
+          base: target,
+          planTitle: plan.planTitle,
+          planKey: plan.planKey ?? plan.planId,
+        });
+        if (mr.ok) {
+          this.log.info('opened a merge request for a completed plan', {
+            planId: plan.planId,
+            plan: plan.planTitle,
+            branch,
+            target,
+            url: mr.url,
+          });
+        } else {
+          this.log.warn('could not open the merge request — run it by hand', {
+            planId: plan.planId,
+            detail: mr.detail,
+            command: mr.command,
+          });
+        }
+        // Reported either way. Recording only successes leaves a failure invisible and the plan
+        // owed forever, so every reconnect retries the same broken thing and nobody learns why.
+        await client
+          .reportMerge(runner.id, {
+            planId: plan.planId,
+            url: mr.url ?? null,
+            failed: mr.ok ? null : (mr.detail ?? 'failed'),
+          })
+          .catch((err) => this.log.warn('could not report the merge result', { err: String(err) }));
+      }
+    };
+
+    // Ask once at startup, not only on reconnect (RUN-28): the likeliest way to miss a
+    // plan.completed frame is for the box to have been OFF when it fired — and a daemon that
+    // only reconciles on RE-connect never reconciles its own first connect.
+    void reconcileOwedMerges();
 
     const stop = async (): Promise<void> => {
       // SIGTERM live agents BEFORE the socket closes. A spawned claude/codex isn't in the

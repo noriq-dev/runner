@@ -82,6 +82,10 @@ export const Run = z.object({
   // is about nothing. Distinct from `anchor`, which stays the TASK: that is where findings
   // are posted, so a verify run needs both.
   verifiesRunId: z.string().nullable().default(null),
+  // The plan this run serves, resolved SERVER-side at dispatch (RUN-28). The daemon cannot work
+  // it out: a task-anchored run knows only its task, and plan membership lives in phase_tasks.
+  // Null = a one-off dispatch belonging to no plan. Drives the per-plan working branch.
+  planKey: z.string().nullable().default(null),
   brief: z.string().default(''), // the dispatch intent; may be empty for anchored runs
   repoRef: z.string(), // id of a RunnerRepo advertised by the owning runner
   agentTool: AgentTool,

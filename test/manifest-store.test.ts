@@ -148,7 +148,15 @@ describe('changedSections', () => {
     expect(
       changedSections(
         m(),
-        m({ land: { branch: 'main', onlyWhenVerifyPasses: true, resolveConflicts: true, autoPush: false } }),
+        m({
+          land: {
+            branch: 'main',
+            mergeTarget: null,
+            onlyWhenVerifyPasses: true,
+            resolveConflicts: true,
+            autoPush: false,
+          },
+        }),
       ),
     ).toEqual(['land']);
   });

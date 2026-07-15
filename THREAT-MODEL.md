@@ -96,6 +96,22 @@ has to be chosen, never inferred.
 Leave `autoPush` out and none of this happens: landed work waits on the operator's disk, exactly
 as before.
 
+## Merge requests (`[land].mergeTarget`) — the daemon acts as you
+
+`autoPush` publishes bytes. This opens a pull request **as the operator**, under their name, in
+their org — a bigger step, and it earns its own row rather than sliding in as an implementation
+detail of the one above.
+
+| | |
+|---|---|
+| **When** | Every task in a plan is done (or cancelled). Completion is a SERVER fact — the daemon only sees Runs, never the plan's task graph. |
+| **Whose credentials** | The operator's `gh`, already on the box and already authed — same choice as `autoPush` reusing their git credentials. The alternative was a GitHub token in `runner.toml`: a genuinely new secret on the machine, a new thing to leak, and a second auth path to keep alive. The agent gets none of it; this runs in the daemon, after the gate. |
+| **Requires** | `autoPush`. A merge request cannot exist without the branch reaching the remote. |
+| **Who names the target** | The REPO, via `[land].mergeTarget`. Never inferred, never chosen by whoever dispatched — the protected branch is the repo owner's decision. Omit it and no merge request is ever opened. |
+| **What it never does** | Rebase the working branch to make the PR openable. That branch is already pushed, so rebasing means rewriting published history and force-pushing — which `pushBranch` refuses. If main moved, the forge shows the conflict in the PR, where a human resolves it with full context. |
+| **If it fails** | Nothing is lost: the work is landed AND pushed. The daemon records why and hands over the exact `gh pr create` command. |
+| **Durability** | Completion is recorded server-side, not just pushed down a socket. A plan can finish while the box is off, the runner is offboarded, or the socket is reconnecting — a fire-and-forget notification would drop the merge request silently, forever. The daemon asks on startup and on every reconnect; the record makes it idempotent, so re-asking cannot open a second PR. |
+
 ## Updating the daemon (`[update]`) — why it only checks
 
 `[update]` tells this box to notice when it is behind. It does **not** replace anything, and the

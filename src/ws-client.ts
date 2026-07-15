@@ -36,6 +36,10 @@ export interface WsHandlers {
   onCancel?: (msg: { runId: string; hard: boolean; reason: string | null }) => void;
   /** A human's steer to inject into the running process (RUN-16). */
   onSteer?: (steer: SteerMsg) => void;
+  /** A plan finished — its working branch is ready to become a merge request (RUN-28). The FAST
+   *  path only: the server also records it, and the daemon reconciles on connect, because a plan
+   *  can complete while nothing is listening. */
+  onPlanCompleted?: (msg: { planId: string; planKey: string; planTitle: string; projectId: string }) => void;
   /** Fired on every reconnect (not the first connect) — a hook for supervision reconcile. */
   onReconnect?: () => void;
 }
@@ -251,6 +255,14 @@ export class WsClient {
       case 'run.cancel':
         this.liveRuns.delete(msg.runId);
         this.opts.handlers?.onCancel?.({ runId: msg.runId, hard: msg.hard, reason: msg.reason });
+        return;
+      case 'plan.completed':
+        this.opts.handlers?.onPlanCompleted?.({
+          planId: msg.planId,
+          planKey: msg.planKey,
+          planTitle: msg.planTitle,
+          projectId: msg.projectId,
+        });
         return;
       case 'steer':
         this.opts.handlers?.onSteer?.({

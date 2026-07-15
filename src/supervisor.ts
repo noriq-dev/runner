@@ -10,7 +10,13 @@ import type {
 import type { RunAgent } from './client';
 import { superviseBudget } from './drivers/budget';
 import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry, NoriqMcp } from './drivers/types';
-import { type LandOutcome, assembleConflictPrompt, landFailureComment, parseResolution } from './land';
+import {
+  type LandOutcome,
+  assembleConflictPrompt,
+  landFailureComment,
+  parseResolution,
+  resolveLandBranch,
+} from './land';
 import { logger as defaultLogger } from './logger';
 import { type VerifyExec, runVerify, verifyFailureComment } from './verify';
 import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
@@ -237,7 +243,11 @@ export class RunSupervisor {
     budget?: RunBudget;
   }): Promise<LandOutcome> {
     const { run, repo, worktree, policy } = ctx;
-    const branch = policy.branch;
+    // Per-plan working branch (RUN-28): `[land].branch` may template `<planKey>`, so each plan
+    // accumulates on its own branch and its merge request is one coherent body of work. The plan
+    // is resolved server-side and frozen on the Run at dispatch — the daemon cannot work it out,
+    // since a task-anchored run only knows its task and plan membership lives in phase_tasks.
+    const branch = resolveLandBranch(policy.branch, run.planKey);
     const wt = this.deps.worktrees;
 
     // First landing into this branch: fork it from the repo's declared main so the

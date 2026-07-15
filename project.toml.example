@@ -44,10 +44,18 @@ cmd = "npm run typecheck && npm test"
 # auto-deploying, or watched by CI and you have handed agents production. Omit this whole
 # section and nothing auto-lands — every diff waits on its own branch for you.
 # [land]
-# branch = "noriq/integration"
+# branch = "noriq/integration"  # may template <planKey> — "noriq/plan-<planKey>" gives each plan
+#                               # its own working branch, which is what makes a merge request mean
+#                               # something. A one-off dispatch (no plan) strips it → "noriq/plan".
 # onlyWhenVerifyPasses = true   # false = an unverified diff reaches `branch`. Allowed, never assumed.
 # resolveConflicts = true       # let the build agent fix MECHANICAL rebase conflicts;
 #                               # anything needing a decision still bails to a human.
+# mergeTarget = "main"          # open a merge request from `branch` to this, when the PLAN those
+#                               # runs belong to is finished — so a human reviews one coherent
+#                               # plan's worth of work, not a click per run. Needs autoPush (a PR
+#                               # can't exist without the branch being pushed) and `gh` on PATH.
+#                               # The daemon opens it AS YOU. Omit → no merge requests.
+#                               # Pair with a per-plan branch: branch = "noriq/plan-<planKey>"
 # autoPush = false              # push `branch` to its remote after a landing. DEFAULT FALSE, and
 #                               # think before flipping it: with it off, nothing an agent writes
 #                               # leaves this machine, and `git log origin/main..main` is your
