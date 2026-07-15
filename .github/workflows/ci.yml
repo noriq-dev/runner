@@ -33,3 +33,26 @@ jobs:
       - run: npm run lint
       - run: npm run test
       - run: npm run build
+
+      # Install the real tarball and run the real binary. This is the ONLY step here that
+      # exercises the path a stranger takes, and v0.2.0 proves it has to exist: it shipped a
+      # binary that printed nothing and exited 0 for every command, because the entry guard
+      # compared `import.meta.url` against a raw `process.argv[1]` and npm's bin is a SYMLINK.
+      #
+      # Every other step above was green. 365 unit tests were green. They import `run()`
+      # directly — for them the guard is *supposed* to be false — and `npm run dev` passes a
+      # real path, so the one line that decides whether the CLI runs at all was covered by
+      # nothing, on the only path that ships.
+      #
+      # Assert on OUTPUT, never on the exit code: the bug WAS exit 0.
+      - name: Smoke-test the packed binary (as a stranger installs it)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --silent
+          npm install -g ./noriq-dev-runner-*.tgz
+          got=$(noriq-runner version)
+          want=$(node -p "require('./package.json').version")
+          echo "installed binary reported: '${got}' (want '${want}')"
+          test "${got}" = "${want}"
+          noriq-runner help | grep -q 'noriq-runner <command>'

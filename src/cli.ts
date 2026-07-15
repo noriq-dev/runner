@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { type AuthMode, authorize, resolveMode } from './auth';
 import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
@@ -228,10 +229,35 @@ export async function run(argv: string[]): Promise<number> {
   }
 }
 
-// Entry point when invoked as the binary — guarded so importing `run` in tests
-// does not execute the CLI.
-const invokedDirectly = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
+/**
+ * Is this module the script node was asked to run? Guards `run()` so importing it from a test
+ * does not execute the CLI.
+ *
+ * **Compare REAL paths, not the ones we were handed.** `process.argv[1]` is the path the user
+ * invoked, and for a global install that is npm's bin symlink
+ * (`…/bin/noriq-runner` → `…/lib/node_modules/@noriq-dev/runner/dist/cli.js`), while
+ * `import.meta.url` is always the resolved target — node follows symlinks when it resolves a
+ * module. So comparing them raw is `false` for **every `npm i -g` install on every platform**,
+ * and the CLI parses its args, matches its command, and exits 0 having printed nothing.
+ *
+ * v0.2.0 shipped exactly that: `npm i -g @noriq-dev/runner && noriq-runner version` printed
+ * nothing and exited 0. Nothing in the test suite or CI could see it — tests import `run`
+ * directly (so the guard is supposed to be false) and `npm run dev` passes a real path. The
+ * bug lives *only* on the path a stranger takes, which is the path we never took.
+ *
+ * Symlink layers stack, so a second one hides behind the first: on Fedora Atomic `/home` is a
+ * symlink to `/var/home`, which breaks the raw comparison on its own even with no npm bin link.
+ */
+export function invokedDirectly(metaUrl: string, argv1: string | undefined): boolean {
+  if (!argv1) return false; // `node -e`, a REPL, an import — nobody asked for a script
+  try {
+    return metaUrl === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    return false; // argv[1] names nothing on disk, so it isn't us
+  }
+}
+
+if (invokedDirectly(import.meta.url, process.argv[1])) {
   run(process.argv.slice(2)).then((code) => {
     process.exitCode = code;
   });
