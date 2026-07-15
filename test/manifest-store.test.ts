@@ -148,7 +148,7 @@ describe('changedSections', () => {
     expect(
       changedSections(
         m(),
-        m({ land: { branch: 'main', onlyWhenVerifyPasses: true, resolveConflicts: true } }),
+        m({ land: { branch: 'main', onlyWhenVerifyPasses: true, resolveConflicts: true, autoPush: false } }),
       ),
     ).toEqual(['land']);
   });

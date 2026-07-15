@@ -48,11 +48,21 @@ cmd = "npm run typecheck && npm test"
 # onlyWhenVerifyPasses = true   # false = an unverified diff reaches `branch`. Allowed, never assumed.
 # resolveConflicts = true       # let the build agent fix MECHANICAL rebase conflicts;
 #                               # anything needing a decision still bails to a human.
+# autoPush = false              # push `branch` to its remote after a landing. DEFAULT FALSE, and
+#                               # think before flipping it: with it off, nothing an agent writes
+#                               # leaves this machine, and `git log origin/main..main` is your
+#                               # "what did the agents do while I wasn't looking?" check. On, an
+#                               # agent's diff reaches whatever watches that branch — CI, or a
+#                               # deploy. The daemon pushes ONE branch, never --force. See
+#                               # THREAT-MODEL.md.
 
 # ── Per-kind permission profiles ─────────────────────────────────────────────
 # The security floor per Run kind. Defaults (if omitted) are already safe: scope
 # and verify are READ-ONLY, build gets worktree WRITE. No agent ever gets push
-# credentials — that's enforced by the daemon and is not expressible here.
+# credentials — that's enforced by the daemon and is not expressible here. (Still
+# true with [land].autoPush: the DAEMON pushes, after the gate, on the branch the
+# gate passed. A build agent running `git push` in its worktree has no credentials
+# and no way to get them.)
 #   write   : may the agent edit files in its worktree?
 #   network : "restricted" (default) | "none" | "full" — egress policy the driver
 #             maps onto the CLI sandbox.

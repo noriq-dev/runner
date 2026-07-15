@@ -38,9 +38,10 @@ that contain it. Security here is load-bearing, not polish.
 
 ## What the daemon never does
 
-- **Never pushes.** Nothing an agent writes leaves this machine. `git push` is the
-  human boundary and the daemon has no path across it — that is the invariant the
-  rest of this model rests on.
+- **Never pushes unless a repo asked** (`[land].autoPush`, default false — see below).
+  With it off, nothing an agent writes leaves this machine and `git push` remains the
+  human boundary. This was once stated as an absolute, and the honest version is
+  narrower: the daemon has a path across that boundary now, and a repo opens it.
 - Never merges into any branch except the one `[land].branch` names, and only after
   that Run's diff passed the gate *rebased onto it* (see below).
 - Never grants an agent's shell the Noriq token or cloud/git credentials.
@@ -68,6 +69,32 @@ system exists to remove. The trade, stated plainly:
 
 Omit `[land]` entirely and none of this happens: every run's diff waits on its own
 branch for a human, exactly as before.
+
+## Pushing (`[land].autoPush`) — the boundary this model rested on
+
+`[land]` lands work on a local branch. `autoPush` sends that branch to its remote. **Default
+false**, and unlike most defaults this one is the feature.
+
+Read the section above: *"nothing an agent writes leaves this machine"* was the invariant the
+rest of this document leaned on. Auto-landing was defensible **because** `git push` stayed human
+— an agent could write to a branch on the operator's disk, and a person still decided what
+reached a remote, CI, or production. `git log origin/main..main` was the operator's *"what did
+the agents do while I wasn't looking?"* check. `autoPush` deletes that checkpoint.
+
+That is a legitimate thing to want — it is the prerequisite for merge requests (RUN-28) — but it
+has to be chosen, never inferred.
+
+| | |
+|---|---|
+| **What it does** | After a landing succeeds, pushes exactly that branch: `git push origin <branch>:<branch>`. One refspec, named explicitly. |
+| **What it never does** | `--force`, `--all`, `--tags`, or a bare `git push` that a `push.default` config could steer somewhere else. A non-fast-forward means the remote has commits this machine has not seen — that is a human's problem, and rewriting someone's history so a robot's push succeeds is not a trade the daemon makes. |
+| **The sharp edge** | Point `[land].branch` at something CI watches and an agent's diff reaches CI; at something that deploys, and it reaches production. `autoPush` is the difference between "agents write to a branch on my laptop" and "agents publish". |
+| **Whose credentials** | The DAEMON's, i.e. the operator's existing git setup. Deliberately not the agent's: `sanitizedAgentEnv` strips tokens and sets `GIT_ASKPASS=/bin/false` + an empty credential helper for every **spawned agent**, and it is not applied to the daemon's own git. So a build agent that runs `git push` inside its allowlist still has no credentials and no way to get them — the push happens in the daemon, after the gate, on the branch the gate passed. |
+| **When it does NOT push** | The landing failed or raced; the verify gate refused the build; nothing landed. Nothing unverified reaches a remote. |
+| **A failed push is not a failed run** | The work is landed locally either way. Failing the run would send someone hunting for a diff that is sitting on the branch. It is reported and left for a human to push. |
+
+Leave `autoPush` out and none of this happens: landed work waits on the operator's disk, exactly
+as before.
 
 ## Updating the daemon (`[update]`) — why it only checks
 

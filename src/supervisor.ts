@@ -64,6 +64,7 @@ export interface RunSupervisorDeps {
     | 'continueRebase'
     | 'abortRebase'
     | 'landFastForward'
+    | 'pushBranch'
   >;
   /** repoRef → local repo root + the manifest to run under. May be async: the daemon
    *  re-reads the committed marker per Run so a config edit needs no restart. */
@@ -308,7 +309,28 @@ export class RunSupervisor {
       // there, which is exactly what happened the first time this ran against `main`.
       return { landed: false, branch, reason: ff.reason, detail: ff.detail, resolvedByAgent };
     }
-    return { landed: true, branch, sha: ff.sha, resolvedByAgent };
+
+    // The work is landed. Everything below is about whether it also LEAVES this machine —
+    // opt-in, default false, because it crosses the boundary the rest of the model rests on
+    // (RUN-27). A failure here must never fail the run: the diff is on the branch either way,
+    // and reporting "failed" would send someone hunting for work that is right there.
+    if (!ctx.policy.autoPush) return { landed: true, branch, sha: ff.sha, resolvedByAgent };
+    const push = await wt.pushBranch(ctx.repo.root, branch);
+    if (!push.ok) {
+      this.log.warn('landed, but the push failed — the work is on the branch locally', {
+        runId: ctx.run.id,
+        branch,
+        detail: push.detail,
+      });
+    }
+    return {
+      landed: true,
+      branch,
+      sha: ff.sha,
+      resolvedByAgent,
+      pushed: push.ok,
+      ...(push.ok ? {} : { pushDetail: push.detail }),
+    };
   }
 
   /** Give the build agent one bounded turn to resolve its own conflict, in place. */

@@ -373,6 +373,37 @@ export class WorktreeManager {
   }
 
   /**
+   * Push the landing branch to its remote (RUN-27, `[land].autoPush`).
+   *
+   * Deliberately narrow, because this is the one boundary the daemon otherwise has:
+   *
+   *  - **one refspec, named explicitly** (`branch:branch`) — never `--all`, never `--tags`,
+   *    never a bare `git push` that could follow a `push.default` config into pushing something
+   *    else. The daemon pushes the branch it just landed on, and nothing else exists as far as
+   *    this command is concerned.
+   *  - **never `--force`**, and `--force-with-lease` is not a compromise either: a non-fast-
+   *    forward means the remote has commits this machine has not seen, which is a human's
+   *    problem. Rewriting someone else's history to make a robot's push succeed is not a trade
+   *    the daemon gets to make.
+   *
+   * Returns rather than throws: the work is ALREADY landed locally when this runs, so a failed
+   * push is news, not a failure. Treating it as one would mark a run failed whose diff is safely
+   * on the branch — and send someone hunting for work that is right there.
+   */
+  async pushBranch(
+    repoRoot: string,
+    branch: string,
+    remote = 'origin',
+  ): Promise<{ ok: true } | { ok: false; detail: string }> {
+    try {
+      await this.git(['push', remote, `${branch}:${branch}`], repoRoot);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, detail: (err as Error).message };
+    }
+  }
+
+  /**
    * Crash-safe cleanup: on a fresh daemon start every local process is gone, so any
    * leftover noriq/run/* worktree is orphaned (the server reconcile fails its Run).
    * Reap them — EXCEPT any that still holds unsaved work.

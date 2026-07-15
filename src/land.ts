@@ -26,6 +26,14 @@ export interface LandOutcome {
   conflicts?: string[];
   /** Whether an agent was asked to resolve, and whether it did. */
   resolvedByAgent?: boolean;
+  /**
+   * `[land].autoPush` only (RUN-27). Undefined = not attempted (autoPush off, or nothing
+   * landed). true = the branch reached its remote. false = it did not — and the run is still a
+   * SUCCESS, because the work is landed locally; only its trip to the remote failed.
+   */
+  pushed?: boolean;
+  /** Why the push failed, when pushed === false. */
+  pushDetail?: string;
 }
 
 /**

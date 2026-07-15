@@ -82,6 +82,13 @@ export const LandPolicy = z.object({
   // Let the build agent resolve a rebase conflict in its own worktree, under the same
   // permission floor, when the conflict is mechanical. Structural ones still fail out.
   resolveConflicts: z.boolean().default(true),
+  // Push `branch` to its remote after a successful landing (RUN-27). DEFAULT FALSE, and the
+  // default is the point: this crosses the one boundary the daemon otherwise has. Every other
+  // defence rests on "nothing an agent writes leaves this machine" — auto-landing was
+  // defensible precisely because `git push` stayed human, and `git log origin/main..main` was
+  // the operator's "what did the agents do while I wasn't looking?" check. This removes that
+  // checkpoint, so it must be chosen, never inferred. See THREAT-MODEL.md.
+  autoPush: z.boolean().default(false),
 });
 export type LandPolicy = z.infer<typeof LandPolicy>;
 

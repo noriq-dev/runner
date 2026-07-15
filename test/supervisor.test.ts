@@ -129,6 +129,20 @@ class FakeWorktrees {
   };
   /** Non-empty → git refuses the landing with this message (e.g. a checked-out branch). */
   landRefuses = '';
+
+  /** Every push the supervisor made. Empty is the assertion that matters most: `autoPush`
+   *  defaults false, and a landing must not reach a remote unless a repo asked (RUN-27). */
+  pushes: Array<{ root: string; branch: string }> = [];
+  /** Non-empty → the push fails with this message. The run must still be a SUCCESS: the work
+   *  is landed locally, and only its trip to the remote failed. */
+  pushFails = '';
+  pushBranch = async (
+    root: string,
+    branch: string,
+  ): Promise<{ ok: true } | { ok: false; detail: string }> => {
+    this.pushes.push({ root, branch });
+    return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
+  };
 }
 
 const perm = (write: boolean): PermissionProfile => ({ write, network: 'restricted', allow: [], deny: [] });
@@ -746,8 +760,81 @@ describe('a verify run can actually SEE the diff it judges', () => {
 const LANDING = (over: Partial<ProjectManifest['land']> = {}) =>
   manifest({
     defaultBranch: 'main',
-    land: { branch: 'noriq/integration', onlyWhenVerifyPasses: true, resolveConflicts: true, ...over },
+    // autoPush defaults FALSE — the fixture says so explicitly, because a landing fixture that
+    // silently pushed would be exactly the accident RUN-27 exists to prevent.
+    land: {
+      branch: 'noriq/integration',
+      onlyWhenVerifyPasses: true,
+      resolveConflicts: true,
+      autoPush: false,
+      ...over,
+    },
   });
+
+// RUN-27: `[land].autoPush`. This crosses the one boundary the rest of the security model rests
+// on — "nothing an agent writes leaves this machine" — so the default is the feature. Auto-landing
+// was defensible precisely because `git push` stayed human, and `git log origin/main..main` was the
+// operator's "what did the agents do while I wasn't looking?" check.
+describe('[land].autoPush (RUN-27)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('does NOT push by default — a landing stays on this machine', async () => {
+    // The single most important assertion in this file. Every repo already using [land] must not
+    // start pushing because a new field appeared; consent has to be re-given, not inherited.
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.worktrees.landings).toHaveLength(1); // it DID land…
+    expect(h.worktrees.pushes).toEqual([]); // …and went nowhere
+  });
+
+  it('pushes the landed branch when a repo opts in', async () => {
+    const h = harness({ manifest: LANDING({ autoPush: true }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.worktrees.pushes).toEqual([{ root: '/repos/repo_a', branch: 'noriq/integration' }]);
+  });
+
+  it('a failed push does not fail the run — the work IS landed', async () => {
+    // The diff is on the branch either way; only its trip to the remote failed. Marking the run
+    // failed would send someone hunting for work that is sitting right there.
+    const h = harness({ manifest: LANDING({ autoPush: true }) });
+    h.worktrees.pushFails = 'remote rejected: protected branch';
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // the run SUCCEEDED
+    expect(h.worktrees.pushes).toHaveLength(1); // it tried
+    expect(h.worktrees.landings).toHaveLength(1); // and the work is on the branch regardless
+  });
+
+  it('pushes nothing when the landing itself failed', async () => {
+    // Nothing landed → there is nothing to publish. Pushing here would put a branch on the
+    // remote that the gate never passed.
+    const h = harness({ manifest: LANDING({ autoPush: true }) });
+    h.worktrees.landRaces = true;
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.landings).toEqual([]);
+    expect(h.worktrees.pushes).toEqual([]);
+  });
+
+  it('pushes nothing when the verify gate refused the build', async () => {
+    const h = harness({ manifest: LANDING({ autoPush: true }), verifyPasses: false });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.pushes).toEqual([]);
+  });
+});
 
 describe('landing a passing build (no human per run)', () => {
   const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
