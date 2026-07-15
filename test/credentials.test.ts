@@ -36,7 +36,12 @@ describe('credentials', () => {
     expect(await loadCredentials(p)).toEqual(creds());
   });
 
-  it('writes the secret 0600 under a 0700 dir', async () => {
+  // POSIX-only, and skipped rather than softened (RUN-42). Windows has no POSIX mode bits —
+  // Node ignores `mode` there apart from the read-only flag — so this asserts a guarantee the
+  // platform does not offer, and a `mode & 0o777` assertion that passed on Windows would only
+  // mean the test had been weakened until it agreed. The guarantee itself is POSIX-only and
+  // THREAT-MODEL.md now says so instead of claiming it everywhere.
+  it.skipIf(process.platform === 'win32')('writes the secret 0600 under a 0700 dir', async () => {
     const p = path.join(dir, 'perms', 'credentials.json');
     await saveCredentials(creds(), p);
     // This file is a live credential — group/other must not be able to read it.

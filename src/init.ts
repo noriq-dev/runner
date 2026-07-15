@@ -60,6 +60,28 @@ export const defaultLabel = (hostname: string = os.hostname()): string =>
     .replace(/[^a-z0-9-]/g, '-')
     .slice(0, 40) || 'my-runner';
 
+/**
+ * Escape a value for a TOML basic (double-quoted) string.
+ *
+ * The backslash is the load-bearing one (RUN-42). TOML basic strings treat `\` as an escape
+ * introducer, so an unescaped Windows path does not merely look odd — it makes the file
+ * UNPARSEABLE: `C:\Users\…` reads `\U` as a unicode escape and dies with "invalid non-hex
+ * character in unicode escape". `noriq init` therefore wrote a runner.toml the daemon then
+ * refused to start with, on the exact first run of the exact command that exists so a stranger
+ * can get started. Found by the windows-latest CI leg.
+ *
+ * Order matters: backslashes FIRST, or the escaping of `"` gets re-escaped.
+ */
+export const tomlString = (v: string): string =>
+  `"${v
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    // TOML forbids raw control characters in basic strings; a tab is plausible in a path on a
+    // bad day, and the rest cost nothing to handle correctly.
+    .replace(/\t/g, '\\t')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')}"`;
+
 /** Serialize a RunnerConfig to TOML by hand — a whole encoder dependency to emit six keys would
  *  be silly, and the shape is fixed. Comments are the point: this file is meant to be edited. */
 export function renderConfig(cfg: {
@@ -68,15 +90,15 @@ export function renderConfig(cfg: {
   scanRoots: string[];
   concurrency: number;
 }): string {
-  const roots = cfg.scanRoots.map((r) => `"${r.replace(/"/g, '\\"')}"`).join(', ');
+  const roots = cfg.scanRoots.map(tomlString).join(', ');
   return `# Noriq Runner — machine-local config, written by \`noriq-runner init\`.
 # Never commit this file. Edit freely; the daemon re-reads it on start.
 
 # Shown in the dashboard's Runners panel.
-label = "${cfg.label.replace(/"/g, '\\"')}"
+label = ${tomlString(cfg.label)}
 
 # The Noriq server this runner dials.
-server = "${cfg.server.replace(/"/g, '\\"')}"
+server = ${tomlString(cfg.server)}
 
 # Directories walked to find repos. A repo opts in by committing .noriq/project.toml —
 # there is no central list, so adding a repo means dropping a marker in it.

@@ -5,8 +5,9 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import { describe, expect, it } from 'vitest';
-import { defaultLabel, normalizeServer, renderConfig, runInit } from '../src/init';
+import { defaultLabel, normalizeServer, renderConfig, runInit, tomlString } from '../src/init';
 
 const tmp = () => mkdtemp(path.join(os.tmpdir(), 'noriq-init-'));
 
@@ -191,5 +192,58 @@ describe('runInit', () => {
     } finally {
       Object.defineProperty(process.stdin, 'isTTY', { value: isTTY, configurable: true });
     }
+  });
+});
+
+describe('the config it writes is actually parseable (RUN-42)', () => {
+  // `init` exists so a stranger can get started, and on Windows it wrote a runner.toml the
+  // daemon then refused to load. Backslash is an ESCAPE INTRODUCER in a TOML basic string, so
+  // `C:\Users\…` read `\U` as a unicode escape and the file died on parse. Round-tripping
+  // through a real TOML parser is the assertion — eyeballing the string is what missed this.
+  const roundTrip = (cfg: Parameters<typeof renderConfig>[0]) => parseToml(renderConfig(cfg));
+
+  it('round-trips Windows paths through a real TOML parser', () => {
+    const parsed = roundTrip({
+      label: 'my-box',
+      server: 'https://noriq.example',
+      scanRoots: ['C:\\Users\\runneradmin\\git', 'D:\\work\\repos'],
+      concurrency: 2,
+    });
+    // Not merely "it parsed" — the paths must survive intact, unescaped, as the daemon will
+    // then hand them to fs.
+    expect(parsed.scanRoots).toEqual(['C:\\Users\\runneradmin\\git', 'D:\\work\\repos']);
+  });
+
+  it('round-trips POSIX paths exactly as before', () => {
+    const parsed = roundTrip({
+      label: 'linux-box',
+      server: 'https://noriq.example',
+      scanRoots: ['/home/mtuska/git'],
+      concurrency: 1,
+    });
+    expect(parsed.scanRoots).toEqual(['/home/mtuska/git']);
+  });
+
+  it('survives a label with quotes and backslashes in it', () => {
+    const parsed = roundTrip({
+      label: 'my "weird" C:\\box',
+      server: 'https://noriq.example',
+      scanRoots: ['/tmp'],
+      concurrency: 1,
+    });
+    expect(parsed.label).toBe('my "weird" C:\\box');
+  });
+});
+
+describe('tomlString', () => {
+  it('escapes backslashes BEFORE quotes — order matters', () => {
+    // Escaping quotes first would leave the added backslash to be escaped again on the second
+    // pass, producing `\\"` — a literal backslash followed by a string terminator.
+    expect(tomlString('a"b\\c')).toBe('"a\\"b\\\\c"');
+    expect(parseToml(`v = ${tomlString('a"b\\c')}`).v).toBe('a"b\\c');
+  });
+
+  it('escapes control characters TOML forbids raw', () => {
+    expect(parseToml(`v = ${tomlString('a\tb\nc')}`).v).toBe('a\tb\nc');
   });
 });

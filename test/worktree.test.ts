@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +9,21 @@ import { WorktreeManager, runBranch } from '../src/worktree';
 
 const execFileP = promisify(execFile);
 const git = (args: string[], cwd: string) => execFileP('git', args, { cwd });
+
+/**
+ * Compare a git-REPORTED path with a Node-COMPUTED one (RUN-42).
+ *
+ * On Windows the two spellings of one directory differ twice over: git says `C:/Users/…` while
+ * path.join says `C:\Users\…`, and os.tmpdir() hands back the 8.3 short form
+ * (`C:\Users\RUNNER~1\…`) where git resolves the long one (`runneradmin`). Neither difference
+ * means the paths are different.
+ *
+ * A test-only concern, deliberately: the daemon never compares these. It only ever passes a
+ * git-reported path back to git as a cwd, and git (like Node's fs) accepts either form. So this
+ * normalizes for the assertion rather than the product normalizing for no one.
+ */
+const realPath = (p: string) => path.resolve(realpathSync.native(p));
+const samePath = (a: string, b: string) => realPath(a) === realPath(b);
 
 let repo: string;
 let base: string;
@@ -107,7 +122,7 @@ describe('unsaved work survives (real git)', () => {
     const skipped: string[] = [];
     await wm.reapOrphans(repo, { onSkip: (p) => skipped.push(p) });
 
-    expect(skipped).toContain(wt.path);
+    expect(skipped.some((p) => samePath(p, wt.path))).toBe(true);
     expect(existsSync(path.join(wt.path, 'precious.ts'))).toBe(true); // the work is still there
 
     await rm(wt.path, { recursive: true, force: true });
@@ -121,7 +136,7 @@ describe('unsaved work survives (real git)', () => {
 
     const skipped: string[] = [];
     await wm.reapOrphans(repo, { onSkip: (p) => skipped.push(p) });
-    expect(skipped).toContain(wt.path); // clean tree, but the commit exists nowhere else
+    expect(skipped.some((p) => samePath(p, wt.path))).toBe(true); // clean tree, but the commit exists nowhere else
     expect(existsSync(wt.path)).toBe(true);
 
     await wm.remove(wt);
@@ -144,10 +159,15 @@ describe('landing on a box with NO git identity (RUN-42)', () => {
   // GIT_CONFIG_GLOBAL/SYSTEM=devNull is what makes this reproducible on a developer machine
   // that does have an identity. Without it this test passes everywhere and proves nothing —
   // which is exactly how the bug reached main in the first place.
+  // A path that does not exist, NOT os.devNull: git treats a missing config file as an empty
+  // one (exactly what we want), but on Windows os.devNull is `\\.\nul`, which git cannot open
+  // as config at all — `fatal: unable to access '//./nul'`. My first attempt at this test used
+  // devNull and CI caught it, which is the same lesson as everything else in this task.
+  let noConfig: string;
   const noIdentityGit = (args: string[], cwd: string) =>
     execFileP('git', args, {
       cwd,
-      env: { ...process.env, GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull },
+      env: { ...process.env, GIT_CONFIG_GLOBAL: noConfig, GIT_CONFIG_SYSTEM: noConfig },
     });
 
   let bare: string;
@@ -155,6 +175,7 @@ describe('landing on a box with NO git identity (RUN-42)', () => {
 
   beforeAll(async () => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-noident-'));
+    noConfig = path.join(tmp, 'no-such-gitconfig');
     bare = path.join(tmp, 'repo');
     await execFileP('git', ['init', '-q', '-b', 'main', bare]);
     await writeFile(path.join(bare, 'README.md'), '# hi\n');
@@ -335,7 +356,7 @@ describe('landing onto a branch someone has CHECKED OUT (real git)', () => {
   // ("cannot force update the branch 'main' used by worktree at ..."), so landing has to
   // fast-forward inside that worktree instead, the way `git pull` would.
   it('knows which worktree holds a branch', async () => {
-    expect(await wm.checkoutOf(repo, 'main')).toBe(repo);
+    expect(samePath((await wm.checkoutOf(repo, 'main'))!, repo)).toBe(true);
     expect(await wm.checkoutOf(repo, 'noriq/integration')).toBeNull(); // nobody sits on it
   });
 
