@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
 import { DEFAULT_CREDENTIALS_PATH } from './credentials';
 import { Daemon } from './daemon';
 import { discoverRepos } from './discovery';
+import { runInit } from './init';
 import { logger, setLogLevel } from './logger';
 import { TokenSource } from './token';
 import { VERSION } from './version';
@@ -15,6 +16,7 @@ Usage:
   noriq-runner <command> [options]
 
 Commands:
+  init             Guided setup: config + authorization, then show what it found
   auth             Authorize this machine with Noriq and store its token
   start            Discover repos, register with Noriq, and supervise dispatched runs
   discover         Scan roots for .noriq/project.toml markers and list found repos
@@ -174,6 +176,11 @@ export async function run(argv: string[]): Promise<number> {
         return 0;
       case 'version':
         console.log(VERSION);
+        return 0;
+      case 'init':
+        // Interactive by construction — the opposite of `start`, which must never block on
+        // stdin because it runs under systemd/CI (RUN-40).
+        await runInit({ configPath: args.configPath });
         return 0;
       case 'auth':
         await cmdAuth(args);
