@@ -341,6 +341,26 @@ describe('Noriq MCP wiring', () => {
     expect(verify).not.toContain('mcp__noriq__update_task');
   });
 
+  it('lets EVERY kind reach a human (RUN-32)', () => {
+    // The one capability that is not rationed. An agent that finds something alarming, or needs
+    // a decision, could previously only comment on a task and hope — and a scope agent could not
+    // even do that. Withholding the cheapest, most desirable action an agent can take is how you
+    // get the behaviour the rest of this file exists to prevent: guessing.
+    for (const kind of ['scope', 'build', 'verify'] as const) {
+      const allowed = mapPermission(profile({ write: kind === 'build' }), kind).allowedTools;
+      expect(allowed).toContain('mcp__noriq__raise_alert'); // "this looks wrong"
+      expect(allowed).toContain('mcp__noriq__request_input'); // "I need a decision" → RUN-30
+    }
+  });
+
+  it('reaching a human does not smuggle in authority (RUN-32)', () => {
+    // The notification channel, not the floodgates: a scope agent still cannot claim work.
+    const scope = mapPermission(profile({ write: false }), 'scope').allowedTools;
+    expect(scope).not.toContain('mcp__noriq__claim_task');
+    expect(scope).not.toContain('mcp__noriq__create_project');
+    expect(scope).not.toContain('mcp__noriq__update_task');
+  });
+
   it('never grants a wildcard Noriq rule', () => {
     for (const kind of ['scope', 'build', 'verify'] as const) {
       const allowed = mapPermission(profile({ write: kind === 'build' }), kind).allowedTools;

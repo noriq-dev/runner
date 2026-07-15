@@ -226,8 +226,14 @@ export function assemblePrompt(
   // the model to call set_agent_identity — which made attribution depend on it complying,
   // left the daemon unable to name its own child, and quietly produced anonymous agents
   // whenever the model skipped the step or (as with codex) had no MCP to call.
+  // Every kind can reach a human, so the invitation belongs in the shared identity block
+  // (RUN-32). The allowlist grants the tools; this is what stops them going unused. An agent
+  // that hits an ambiguity with no invitation to ask does not stop — it picks, and hopes.
+  // request_input is not a way to give up: the daemon ends the session, keeps the worktree,
+  // and resumes THIS session with the answer (RUN-30), so asking costs the agent nothing.
   const identity = `You are ${ctx.agent.label} (${ctx.agent.agentId}), a Noriq Runner ${run.kind.toUpperCase()} agent for project ${manifest.key}.
-Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity. You report your own work through Noriq; the daemon supervises only your process.`;
+Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity. You report your own work through Noriq; the daemon supervises only your process.
+If you need a human decision to go on, call request_input and stop — do not guess. Your session is paused, not discarded: you are resumed with your context intact once someone answers. If you find something alarming that does not block you, call raise_alert and keep working.`;
 
   if (run.kind === 'scope') {
     return `${identity}

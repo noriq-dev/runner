@@ -1580,3 +1580,28 @@ describe('expiring a park nobody answered (RUN-30)', () => {
     expect(await h.parked.list()).toHaveLength(1);
   });
 });
+
+describe('the prompt invites an agent to reach a human (RUN-32)', () => {
+  // The allowlist grants the tools; this is what stops them going unused. An agent that hits an
+  // ambiguity with no invitation to ask does not stop — it picks, and hopes.
+  it('tells every kind it can ask, and that asking is not giving up', () => {
+    for (const kind of ['scope', 'build'] as const) {
+      const p = assemblePrompt(makeRun({ kind }), manifest(), { agent: testAgent(), server: 'https://s' });
+      expect(p).toContain('request_input');
+      expect(p).toContain('raise_alert');
+      // The reassurance is the point: an agent that believes asking ends its run will guess
+      // instead. RUN-30 made "paused, not discarded" true — this is what tells it so.
+      expect(p).toMatch(/paused, not discarded/);
+    }
+  });
+
+  it('the verify prompt says it too — it assembles its own and inherits nothing', () => {
+    const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).toContain('raise_alert');
+    expect(p).toContain('request_input');
+    expect(p).toContain('VERDICT:'); // still the adversarial gate it was
+  });
+});

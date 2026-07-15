@@ -25,8 +25,13 @@ export interface VerifyPromptContext {
 /** Build the adversarial verify prompt from the phase specs. */
 export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): string {
   const diffCmd = ctx.diffCmd ?? 'git diff';
+  // The verify kind assembles its own prompt, so RUN-32's invitation has to be repeated here —
+  // it does not inherit assemblePrompt's identity block. A verifier that finds something
+  // alarming but out of scope for its verdict has nowhere else to put it: its output is parsed
+  // for PASS/FAIL, so prose around the verdict is read by nobody.
   return `You are ${ctx.agent.label} (${ctx.agent.agentId}), a Noriq Runner VERIFY agent — an INDEPENDENT, adversarial reviewer. You did NOT write this code; assume nothing about the author's intent beyond the specs below.
 Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity.
+If you find something alarming beyond this diff's verdict, call raise_alert — it does not block you, and your verdict is not the place for it. If you cannot judge the diff without a human decision, call request_input rather than guessing a verdict.
 
 MODE: VERIFY (read-only). Do NOT modify any files.
 Inspect the accumulated diff with \`${diffCmd}\` and read the changed files. Your job is to find why this diff does NOT satisfy the intent — be skeptical. Look especially for:
