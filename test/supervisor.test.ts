@@ -16,6 +16,12 @@ import type { WorktreeInfo } from '../src/worktree';
 // wrapped onExit (superviseBudget resolves its done from it).
 class FakeDriver implements AgentDriver {
   opts?: DriverStartOptions;
+  /** Turns handed back by the supervisor (RUN-29's verify feedback loop). */
+  continuations: string[] = [];
+  /** Outcome of each continueWith, in order. Defaults to 'done' — the agent fixed it. */
+  continueOutcomes: Array<'done' | 'failed'> = [];
+  /** True once stop() was called — a multiTurn session that nobody closes hangs the daemon. */
+  stopped = false;
   constructor(readonly tool: 'claude' | 'codex') {}
   start(opts: DriverStartOptions): DriverSession {
     this.opts = opts;
@@ -23,14 +29,30 @@ class FakeDriver implements AgentDriver {
       runId: opts.runId,
       pushInput: () => true,
       interrupt: async () => {},
-      stop: async () =>
+      stop: async () => {
+        this.stopped = true;
         this.opts?.handlers?.onExit?.({
           outcome: 'failed',
           isError: true,
           reason: 'stopped',
           telemetry: zeroTelemetry(),
-        }),
+        });
+      },
       done: () => new Promise<DriverExit>(() => {}),
+      // Mirrors the real driver: present ONLY under multiTurn, so a test that forgets to ask for
+      // it sees exactly what a scope run sees — no loop.
+      continueWith: opts.multiTurn
+        ? async (text: string): Promise<DriverExit> => {
+            this.continuations.push(text);
+            const outcome = this.continueOutcomes.shift() ?? 'done';
+            return {
+              outcome,
+              isError: outcome === 'failed',
+              reason: outcome === 'failed' ? 'died mid-fix' : null,
+              telemetry: zeroTelemetry(),
+            };
+          }
+        : undefined,
     };
   }
   emitText(text: string): void {
@@ -194,6 +216,8 @@ function harness(
     hasRepo?: boolean;
     drivers?: Partial<Record<'claude' | 'codex', AgentDriver>>;
     verifyPasses?: boolean;
+    /** Per-call verify outcomes, in order — models the agent fixing it (RUN-29). */
+    verifyResults?: boolean[];
     defaultBudget?: RunBudget | null;
     /** false → the agent left the worktree pristine (a no-op run). */
     changed?: boolean;
@@ -218,6 +242,7 @@ function harness(
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
   let verifyRan = false;
+  let verifyCalls = 0;
   const supervisor = new RunSupervisor({
     drivers: over.drivers ?? { claude, codex },
     worktrees,
@@ -227,6 +252,15 @@ function harness(
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
     verifyExec: async () => {
       verifyRan = true;
+      verifyCalls += 1;
+      // `verifyResults` scripts a sequence, so a test can model "fails, agent fixes it, passes" —
+      // the whole point of RUN-29's loop. Falls back to the old fixed behaviour.
+      const scripted = over.verifyResults?.[verifyCalls - 1];
+      if (scripted !== undefined) {
+        return scripted
+          ? { exitCode: 0, output: 'ok', timedOut: false }
+          : { exitCode: 1, output: 'TS2322: type error', timedOut: false };
+      }
       return over.verifyPasses === false
         ? { exitCode: 1, output: 'TS2322: type error', timedOut: false }
         : { exitCode: 0, output: 'ok', timedOut: false };
@@ -235,7 +269,16 @@ function harness(
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
   });
-  return { supervisor, worktrees, reports, comments, claude, codex, verifyRan: () => verifyRan };
+  return {
+    supervisor,
+    worktrees,
+    reports,
+    comments,
+    claude,
+    codex,
+    verifyRan: () => verifyRan,
+    verifyCalls: () => verifyCalls,
+  };
 }
 
 /** The identity the daemon creates for a Run (RUN-43). The old fixture was the bare string
@@ -782,6 +825,92 @@ const LANDING = (over: Partial<ProjectManifest['land']> = {}) =>
 // on — "nothing an agent writes leaves this machine" — so the default is the feature. Auto-landing
 // was defensible precisely because `git push` stayed human, and `git log origin/main..main` was the
 // operator's "what did the agents do while I wasn't looking?" check.
+// RUN-29: the daemon owns verify, and a failure goes back to the LIVE agent.
+//
+// It used to run twice: the build prompt told the agent to run the verify command (tokens, ~62s),
+// then the daemon ran the SAME command itself as the real gate (free). The agent was paying to
+// answer a question that got asked again properly a minute later.
+describe('verify feedback loop (RUN-29)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('does not ask the agent to run the full check itself', () => {
+    // The expensive half of the double-verify. Its allowlist still permits running tests — cheap
+    // and targeted while iterating is fine; burning the suite to grade itself is not.
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).not.toMatch(/Before finishing, run the verify command/);
+    expect(p).toMatch(/run for you after you finish/);
+    expect(p).toContain('npm test'); // it still knows WHAT the gate is
+  });
+
+  it('hands a failing gate back, and passes once the agent fixes it', async () => {
+    // The gate becomes a feedback loop instead of a verdict: the agent gets the exact command,
+    // code and output, in context, without a human re-dispatching and a fresh agent re-deriving
+    // a failure the daemon already had in full.
+    const h = harness({ verifyResults: [false, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('done'); // it recovered — no human, no re-dispatch
+    expect(h.claude.continuations).toHaveLength(1);
+    expect(h.claude.continuations[0]).toContain('npm test');
+    expect(h.claude.continuations[0]).toContain('TS2322: type error'); // the actual output
+    expect(h.verifyCalls()).toBe(2); // failed, then passed
+  });
+
+  it('gives up after a bounded number of tries', async () => {
+    // An agent that cannot fix it in two goes will not on the third — it will keep spending.
+    const h = harness({ verifyPasses: false });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('verify'); // gated to a human
+    expect(h.claude.continuations).toHaveLength(2); // K=2, not forever
+    expect(h.comments.some((c) => c.body.includes('npm test'))).toBe(true); // and said why
+  });
+
+  it('stops pushing turns at a session that died trying', async () => {
+    // The agent errored or breached its budget mid-fix. Its last verdict stands: pushing more
+    // turns at a dead session is how a loop becomes a spend.
+    const h = harness({ verifyPasses: false });
+    h.claude.continueOutcomes = ['failed'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.claude.continuations).toHaveLength(1); // asked once, it died, stop
+  });
+
+  it('closes the session — a multiTurn run that nobody closes hangs the daemon', async () => {
+    // The driver deliberately does NOT self-close under multiTurn (that is the whole feature), so
+    // the supervisor owns it. An open SDK query keeps the event loop alive forever.
+    const h = harness({ verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.claude.stopped).toBe(true);
+  });
+
+  it('a scope run is single-turn — no loop, nothing to close', async () => {
+    // Only a build with a verify command can loop. Everything else wants exactly the old
+    // behaviour: finish on the first result and close.
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope' }));
+    await flush();
+    expect(h.claude.opts?.multiTurn).toBe(false);
+    h.claude.complete('done');
+    await done;
+    expect(h.claude.continuations).toEqual([]);
+  });
+});
+
 describe('[land].autoPush (RUN-27)', () => {
   const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
 

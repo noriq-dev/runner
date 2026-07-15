@@ -19,7 +19,13 @@ import {
   resolveLandBranch,
 } from './land';
 import { logger as defaultLogger } from './logger';
-import { type VerifyExec, runVerify, verifyFailureComment } from './verify';
+import {
+  MAX_VERIFY_FIXES,
+  type VerifyExec,
+  runVerify,
+  verifyFailureComment,
+  verifyFeedbackPrompt,
+} from './verify';
 import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
 import { type WorktreeInfo, type WorktreeManager, runBranch } from './worktree';
 
@@ -181,8 +187,16 @@ Explore the repo to understand the work, then emit a PROPOSED plan via create_pl
 Brief: ${run.brief}${anchor}`;
   }
   if (run.kind === 'build') {
+    // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
+    // ran the SAME command itself as the actual gate — so the agent paid tokens and about a minute
+    // to answer a question that got asked again, properly, right afterwards. Its run was advisory;
+    // the daemon's is authoritative and free. Measured on run_mrlig93q5b574b502963: ~3m24s of agent
+    // time including its own verify, then 62s of daemon verify.
+    //
+    // Its allowlist still permits running tests — iterating on one file while working is cheap and
+    // targeted. What it must not do is burn the full suite to grade itself.
     const verify = manifest.verify
-      ? `\nBefore finishing, run the verify command: ${manifest.verify.cmd}`
+      ? `\nThe full check (\`${manifest.verify.cmd}\`) is run for you after you finish, and its output comes back to you if it fails — so don't spend a turn on it. Run individual tests while you work if they help.`
       : '';
     return `${identity}
 
@@ -242,6 +256,9 @@ export class RunSupervisor {
     permission: PermissionProfile;
     noriqMcp?: NoriqMcp;
     budget?: RunBudget;
+    /** The still-live build session, when the run was started multiTurn — so a gate failure on
+     *  the rebased result can be handed back rather than ending the run (RUN-29). */
+    session?: DriverSession;
   }): Promise<LandOutcome> {
     const { run, repo, worktree, policy } = ctx;
     // Per-plan working branch (RUN-28): `[land].branch` may template `<planKey>`, so each plan
@@ -325,9 +342,19 @@ export class RunSupervisor {
       rebase = { ok: true };
     }
 
-    // The gate, on the REBASED result — the thing that will actually land.
+    // The gate, on the REBASED result — the thing that will actually land. A failure is handed
+    // back to the live agent (RUN-29), which matters most HERE: this verify runs on the rebase, so
+    // the break may be a collision with work that landed while this run was going. That is exactly
+    // the failure an agent can fix in context and a human should not have to re-derive.
     if (policy.onlyWhenVerifyPasses && repo.manifest.verify) {
-      const result = await runVerify(repo.manifest.verify, worktree.path, { exec: this.deps.verifyExec });
+      const result = ctx.session
+        ? await this.verifyWithFeedback({
+            run: ctx.run,
+            spec: repo.manifest.verify,
+            cwd: worktree.path,
+            session: ctx.session,
+          })
+        : await runVerify(repo.manifest.verify, worktree.path, { exec: this.deps.verifyExec });
       if (!result.passed) {
         return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
       }
@@ -363,6 +390,52 @@ export class RunSupervisor {
       pushed: push.ok,
       ...(push.ok ? {} : { pushDetail: push.detail }),
     };
+  }
+
+  /**
+   * Run the gate, and hand a failure back to the LIVE agent to fix (RUN-29).
+   *
+   * The daemon owns the verdict — it always did, for free, on the real thing. What changes is what
+   * happens next: a failing gate used to end the run, so a human re-dispatched and a fresh agent
+   * re-derived a failure whose exact output the daemon already had. Now the same session gets the
+   * command, the code and the output, fixes it, and the gate re-runs.
+   *
+   * Bounded (RUN-21's K=2): an agent that cannot fix it in two tries will not on the third — it
+   * will keep spending. The budget still applies underneath, so a loop cannot outrun its ceiling.
+   */
+  private async verifyWithFeedback(ctx: {
+    run: Run;
+    spec: NonNullable<ProjectManifest['verify']>;
+    cwd: string;
+    session: DriverSession;
+  }) {
+    let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+    // continueWith is absent unless the run was started multiTurn — a run with no live session to
+    // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
+    if (result.passed || !ctx.session.continueWith) return result;
+
+    for (let attempt = 1; attempt <= MAX_VERIFY_FIXES; attempt++) {
+      this.log.info('verify failed — handing it back to the live agent', {
+        runId: ctx.run.id,
+        attempt,
+        exitCode: result.exitCode,
+      });
+      const exit = await ctx.session
+        .continueWith(verifyFeedbackPrompt(ctx.spec, result, attempt))
+        .catch((err): DriverExit | null => {
+          this.log.warn('could not hand the failure back', { runId: ctx.run.id, err: String(err) });
+          return null;
+        });
+      // The agent died, errored, or breached its budget trying to fix it. Its last verdict stands;
+      // pushing more turns at a session that just failed is how a loop becomes a spend.
+      if (!exit || exit.outcome !== 'done') return result;
+      result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+      if (result.passed) {
+        this.log.info('verify passed after the agent fixed it', { runId: ctx.run.id, attempt });
+        return result;
+      }
+    }
+    return result;
   }
 
   /** Give the build agent one bounded turn to resolve its own conflict, in place. */
@@ -550,6 +623,10 @@ export class RunSupervisor {
       prompt,
       permission,
       noriqMcp,
+      // Keep the session alive past its first result ONLY when a feedback loop is possible: a
+      // build, with a verify command to fail. Scope and verify runs want today's behaviour —
+      // finish and close — and a session nobody closes hangs the daemon (see the finally below).
+      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
       budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       handlers: {
         // Each telemetry tick carries the current spend AND the latest log tail, so
@@ -624,6 +701,7 @@ export class RunSupervisor {
           repo,
           worktree,
           policy: landPolicy,
+          session: budgetRun.session,
           task,
           driver,
           permission,
@@ -669,7 +747,12 @@ export class RunSupervisor {
     // Skipped when [land] is configured — the landing pipeline already verified the
     // REBASED result, which is strictly the better question to ask.
     if (kind === 'build' && driverSucceeded && !landPolicy && repo.manifest.verify) {
-      const result = await runVerify(repo.manifest.verify, worktree.path, { exec: this.deps.verifyExec });
+      const result = await this.verifyWithFeedback({
+        run,
+        spec: repo.manifest.verify,
+        cwd: worktree.path,
+        session: budgetRun.session,
+      });
       if (result.passed) {
         this.log.info('deterministic verify passed', { runId: run.id });
       } else {
@@ -688,6 +771,13 @@ export class RunSupervisor {
         exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify' };
       }
     }
+
+    // Every gate that could hand work back has now run, so the session has no more work to do.
+    // It MUST be closed explicitly: a multiTurn run deliberately does not self-close on its first
+    // result (that is the whole point — RUN-29), so nothing else ever shuts the SDK query down,
+    // and an open one keeps the daemon's event loop alive forever. Best-effort: a session that is
+    // already gone is the normal case for every single-turn run.
+    await budgetRun.stop().catch(() => {});
 
     // Independent verify agent (RUN-20): the run's own output IS the verdict. A
     // FAIL (or an ambiguous/absent verdict) gates the phase — the run does not

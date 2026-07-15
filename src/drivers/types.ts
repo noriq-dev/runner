@@ -59,6 +59,15 @@ export interface NoriqMcp {
 }
 
 export interface DriverStartOptions {
+  /**
+   * Keep the session open after its first result so the caller can hand work back (RUN-29/30).
+   *
+   * Opt-in, and the default is off deliberately: every existing path (scope, verify, a build with
+   * no verify command) wants exactly today's behaviour — finish on the first result and close. A
+   * session left open with nobody to close it hangs the daemon, so only a caller that has a
+   * `finally { stop() }` should ask for this.
+   */
+  multiTurn?: boolean;
   runId: string;
   kind: RunKind;
   /** The Run's isolated git worktree (RUN-11). */
@@ -88,6 +97,17 @@ export interface DriverSession {
   stop(): Promise<void>;
   /** Resolves when the run reaches a terminal exit. */
   done(): Promise<DriverExit>;
+  /**
+   * Push a turn and await the NEXT result, with the session still alive (RUN-29/30).
+   *
+   * Only present when the run was started with `multiTurn` — the driver otherwise closes on its
+   * first result, which is the whole reason the verify gate could only ever be a verdict and
+   * never a feedback loop.
+   *
+   * The caller then OWNS the session and must stop() it: nothing else closes the query, and an
+   * open one keeps the daemon's event loop alive forever.
+   */
+  continueWith?(text: string): Promise<DriverExit>;
 }
 
 export interface AgentDriver {

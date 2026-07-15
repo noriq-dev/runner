@@ -254,18 +254,28 @@ export class ClaudeDriver implements AgentDriver {
       settle = resolve;
     });
     let finished = false;
-    const finish = (exit: DriverExit) => {
-      if (finished) return;
-      finished = true;
+    /** Close the SDK session. Idempotent; safe after it is already gone. */
+    const closeSession = () => {
       input.close();
       try {
         query.close?.();
       } catch {
         /* already gone */
       }
+    };
+    const finish = (exit: DriverExit) => {
+      if (finished) return;
+      finished = true;
+      // multiTurn keeps the session alive past its first result so the caller can hand work back
+      // (RUN-29's verify feedback loop, RUN-30's resume). The caller then owns it and must stop()
+      // — an open query keeps the event loop alive, so this is opt-in and never the default.
+      if (!opts.multiTurn) closeSession();
       opts.handlers?.onExit?.(exit);
       settle(exit);
     };
+
+    /** Armed by continueWith: the next `result` belongs to that turn, not to done(). */
+    let awaitingTurn: ((exit: DriverExit) => void) | null = null;
 
     const live = zeroTelemetry();
     const consume = async () => {
@@ -300,13 +310,26 @@ export class ClaudeDriver implements AgentDriver {
             const rm = msg as SdkResultMessage;
             const telemetry = telemetryFromResult(rm);
             opts.handlers?.onTelemetry?.(telemetry);
-            finish({
+            const exit: DriverExit = {
               outcome: rm.is_error ? 'failed' : 'done',
               isError: rm.is_error,
               reason: rm.subtype === 'success' ? null : rm.subtype,
               telemetry,
-            });
-            return;
+            };
+            // A result that belongs to a continueWith turn settles THAT, not the run: the run is
+            // not over, someone handed it more work and is waiting on the answer.
+            const turn = awaitingTurn;
+            awaitingTurn = null;
+            if (turn) {
+              // Someone is waiting on this turn; the run is not over. Keep reading — under
+              // multiTurn more turns may follow.
+              turn(exit);
+            } else {
+              finish(exit);
+              // Single-turn: the session closed with the result, so there is nothing left to
+              // read. Under multiTurn the loop keeps going and stop() is what ends it.
+              if (!opts.multiTurn) return;
+            }
           }
         }
         // Stream ended without a result — treat as failure.
@@ -326,11 +349,27 @@ export class ClaudeDriver implements AgentDriver {
     return {
       runId: opts.runId,
       pushInput: (text: string): boolean => input.push(userTurn(text)),
+      // Only meaningful under multiTurn; the contract marks it optional for exactly that reason.
+      continueWith: opts.multiTurn
+        ? (text: string): Promise<DriverExit> =>
+            new Promise<DriverExit>((resolve, reject) => {
+              if (awaitingTurn) return reject(new Error('a turn is already in flight'));
+              awaitingTurn = resolve;
+              if (!input.push(userTurn(text))) {
+                awaitingTurn = null;
+                reject(new Error('session input is closed — the turn was not delivered'));
+              }
+            })
+        : undefined,
       interrupt: async () => {
         await query.interrupt().catch((err) => this.log.warn('interrupt failed', { err: String(err) }));
       },
       stop: async () => {
         abort.abort();
+        // Close explicitly: under multiTurn, finish() deliberately does NOT, so stop() is the
+        // only thing that ever shuts the query down. Without this a multi-turn run would leave
+        // the SDK session open and the daemon would never exit.
+        closeSession();
         finish({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
       },
       done: () => donePromise,

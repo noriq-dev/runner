@@ -113,3 +113,41 @@ export function verifyFailureComment(spec: VerifySpec, result: VerifyResult): st
   const tail = result.output.slice(-4000);
   return `❌ Deterministic verify failed (${why}) — this build did not pass the floor gate and cannot reach done.\n\n\`${spec.cmd}\`\n\n\`\`\`\n${tail}\n\`\`\``;
 }
+
+/** How many times a failing gate is handed back to the live agent before a human is needed
+ *  (RUN-29; RUN-21's K=2). Bounded because an agent that cannot fix it in two tries is not
+ *  going to on the third — it is going to keep spending. */
+export const MAX_VERIFY_FIXES = 2;
+
+/**
+ * What the agent is told when the gate refuses its work (RUN-29).
+ *
+ * The gate used to be a verdict: verify failed, the run failed, and a human re-dispatched — so
+ * the agent re-derived a failure the daemon already had the exact output for. This makes it a
+ * feedback loop instead: the same live session gets the command, the exit code, and the output,
+ * in context, and fixes it.
+ *
+ * The tail, not the head: a failing suite's useful part is at the end (the assertion, the stack),
+ * and the start is setup noise. Capped because this is a user turn — an unbounded dump would cost
+ * more tokens than the fix.
+ */
+export function verifyFeedbackPrompt(spec: VerifySpec, result: VerifyResult, attempt: number): string {
+  const why = result.timedOut
+    ? `timed out after ${spec.timeoutSeconds ?? DEFAULT_VERIFY_TIMEOUT_SECONDS}s`
+    : `exited ${result.exitCode}`;
+  return [
+    'The check did not pass, so your work is not finished yet.',
+    '',
+    `I ran \`${spec.cmd}\` on your worktree and it ${why}. This is the real gate — the same command`,
+    'decides whether this run lands, so it has to be green.',
+    '',
+    'Output (tail):',
+    '```',
+    result.output.slice(-4000),
+    '```',
+    '',
+    attempt >= MAX_VERIFY_FIXES
+      ? 'This is the last attempt: if it still fails after this, the run stops and a human picks it up.'
+      : 'Fix it and stop when you are done — I will run the check again.',
+  ].join('\n');
+}
