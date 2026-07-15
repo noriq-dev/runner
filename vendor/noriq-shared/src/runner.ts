@@ -37,6 +37,25 @@ const TERMINAL_RUN_STATUSES = ['done', 'failed', 'cancelled'] as const;
 export const isTerminalRunStatus = (s: RunStatus): boolean =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(s);
 
+// What a `running` Run is CURRENTLY doing (RUN-31). A second axis on purpose, not a widened
+// RunStatus — and the reason is not the repo's additive-migration rule:
+//
+// `verifying` and `landing` are sub-phases of running, not peers of `done`. Throughout them the
+// Run holds its slot, is cancellable, and is not terminal. Every liveness query on the server
+// asks `status IN ('dispatched','running','blocked')` — daemon reconciliation, owed-merges,
+// request_input parking. Adding 'verifying' to the enum would silently drop a verifying Run out
+// of all of them (reconcile would conclude the daemon lost it and fail a Run that is mid-gate),
+// and every such site would have to be found by hand, forever, on each new value. A phase cannot
+// cause that class of bug because nothing branches on it: it is a label a human reads.
+//
+// Null = nothing to say: a queued or terminal Run, or a daemon older than this field.
+export const RunPhase = z.enum([
+  'agent', // the coding-agent process is live and burning tokens
+  'verifying', // process gone; the deterministic verify command / verify agent is the gate
+  'landing', // gate passed; rebase → re-verify → fast-forward
+]);
+export type RunPhase = z.infer<typeof RunPhase>;
+
 // What the Run is anchored to. A pure-brief dispatch has no anchor (null) — the
 // agent's first act may be to *emit* the tasks/plan a human then approves.
 export const RunAnchor = z
@@ -96,6 +115,9 @@ export const Run = z.object({
   agentTool: AgentTool,
   budget: RunBudget,
   status: RunStatus,
+  // Sub-state of `running` (RUN-31) — see RunPhase. Cosmetic by construction: nothing
+  // branches on it, so it can never make a liveness query wrong. Cleared on terminal.
+  phase: RunPhase.nullable().default(null),
   exit: RunExit.nullable().default(null),
   // The daemon's isolated git worktree for this Run (branch noriq/run/<id>),
   // reported once the process starts so the server/dashboard can see where the

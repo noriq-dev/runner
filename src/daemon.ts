@@ -138,12 +138,19 @@ export class Daemon {
         return manifest ? { root: r.root, manifest } : null;
       },
       report: (runId, rep) => {
-        // Spend + log tail stream on their own frame (RUN-22) — no transition minted.
-        if (rep.telemetry) {
+        // Spend, log tail, and phase stream on their own frame (RUN-22/31) — no transition
+        // minted. Phase belongs here and NOT on run.status for a concrete reason: the DO's
+        // transition map has no running → running edge, so a phase report sent as a status
+        // would be rejected as an illegal transition and silently dropped.
+        //
+        // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
+        // say "verifying" without claiming the spend is zero.
+        if (rep.telemetry || rep.phase) {
           held.ws?.sendTelemetry(runId, {
-            tokensUsed: totalTokens(rep.telemetry),
-            usdSpent: rep.telemetry.costUsd,
+            tokensUsed: rep.telemetry ? totalTokens(rep.telemetry) : null,
+            usdSpent: rep.telemetry ? rep.telemetry.costUsd : null,
             logTail: rep.logTail ?? null,
+            phase: rep.phase ?? null,
           });
         }
         if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {

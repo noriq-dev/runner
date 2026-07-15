@@ -1,5 +1,5 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
-import type { AgentTool, Run, RunKind, RunStatus } from '@noriq-dev/shared';
+import type { AgentTool, Run, RunKind, RunPhase, RunStatus } from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
 
@@ -161,7 +161,12 @@ export class WsClient {
    *  best-effort telemetry tick, never re-asserted on reconnect (not in liveRuns). */
   sendTelemetry(
     runId: string,
-    t: { tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null },
+    t: {
+      tokensUsed?: number | null;
+      usdSpent?: number | null;
+      logTail?: string | null;
+      phase?: RunPhase | null;
+    },
   ): void {
     this.sendRaw({
       type: 'run.telemetry',
@@ -169,6 +174,8 @@ export class WsClient {
       tokensUsed: t.tokensUsed ?? null,
       usdSpent: t.usdSpent ?? null,
       logTail: t.logTail ?? null,
+      // Null = no news, not "clear it" — the server COALESCEs every field on this frame.
+      phase: t.phase ?? null,
       at: new Date().toISOString(),
     });
   }

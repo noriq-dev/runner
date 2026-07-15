@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Run, RunStatus, RunExit, AgentTool, RunKind, RunnerRepo } from './runner';
+import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo } from './runner';
 
 // ---------------------------------------------------------------------------
 // The runtime channel (RUN plan, Phase 1) — a persistent WebSocket the daemon
@@ -142,6 +142,9 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
   // latest output WITHOUT minting a status transition per tick. The daemon is the
   // only source of this (it owns the process); the server last-writer-wins persists
   // it on the run row. Distinct from run.status so telemetry never gates lifecycle.
+  //
+  // Every field is null-means-no-news, and the server patches only what is present
+  // (COALESCE) — a tick that knows the phase but not the spend must not zero the spend.
   z.object({
     type: z.literal('run.telemetry'),
     runId: z.string(),
@@ -149,6 +152,11 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     usdSpent: z.number().nonnegative().nullable().default(null),
     // Tail of the agent's combined output, tail-capped by the daemon (last wins).
     logTail: z.string().nullable().default(null),
+    // What the Run is doing right now (RUN-31). It rides THIS frame, not run.status,
+    // for the same reason spend does: a phase change is not a lifecycle transition.
+    // run.status would be actively wrong here — the transition map has no running →
+    // running edge, so the server would reject a phase report as an illegal transition.
+    phase: RunPhase.nullable().default(null),
     at: z.string().datetime(),
   }),
 

@@ -200,6 +200,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   agentTool: 'claude',
   budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null },
   status: 'dispatched',
+  // Not yet started, so nothing to report (RUN-31). The daemon sets the phase; the server
+  // only ever reads it back to us.
+  phase: null,
   exit: null,
   worktreePath: null,
   createdBy: 'usr_1',
@@ -1203,5 +1206,67 @@ describe('rebase conflicts', () => {
     const exit = await done;
     expect(exit.reason).toBe('land:conflict');
     expect(h.worktrees.aborted).toBe(1);
+  });
+});
+
+describe('a run says what it is DOING, not just that it is alive (RUN-31)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  /** The phases reported, in order, with consecutive repeats collapsed. */
+  const phases = (h: ReturnType<typeof harness>) =>
+    h.reports.map((r) => r.phase).filter((p, i, all) => p && p !== all[i - 1]);
+
+  it('reports `verifying` while the gate runs — the ~90s that read as a hung agent', async () => {
+    // The bug this task exists for: process gone, spend frozen, dashboard still says "running".
+    const h = harness({ verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(phases(h)).toEqual(['agent', 'verifying']);
+  });
+
+  it('reports `landing` for the rebase → verify → fast-forward', async () => {
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    // Landing is the umbrella: its internal verify is not a separate thing a human can act on,
+    // and renaming it mid-pipeline would make the branch look like it moved twice.
+    expect(phases(h)).toEqual(['agent', 'landing']);
+  });
+
+  it('flips back to `agent` when the gate hands work back — spend must not climb during "verifying"', async () => {
+    // RUN-29's fix turn burns tokens again. Reporting it as `verifying` would recreate this
+    // task's bug with the lie pointing the other way.
+    const h = harness({ verifyResults: [false, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(phases(h)).toEqual(['agent', 'verifying', 'agent', 'verifying']);
+  });
+
+  it('a phase report never claims the spend is zero', async () => {
+    // The phase ticks carry no telemetry. If the daemon or server treated an absent field as
+    // "set it to null", entering the gate would blank the spend on the dashboard — which is
+    // the exact symptom (numbers stop, then lie) this task is fixing.
+    const h = harness({ verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    const gate = h.reports.find((r) => r.phase === 'verifying');
+    expect(gate?.telemetry).toBeUndefined();
+    expect(gate?.status).toBe('running'); // still running: a phase is not a status
+  });
+
+  it('a scope run reports `agent` and nothing else — it has no gate to sit in', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(phases(h)).toEqual(['agent']);
   });
 });

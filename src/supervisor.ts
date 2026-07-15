@@ -6,6 +6,7 @@ import type {
   Run,
   RunBudget,
   RunKind,
+  RunPhase,
 } from '@noriq-dev/shared';
 import type { RunAgent } from './client';
 import { superviseBudget } from './drivers/budget';
@@ -53,6 +54,10 @@ export interface RunReport {
    *  null, because the daemon never knew the identity its child invented for itself — the
    *  daemon creates it now (RUN-43), so it can finally say. */
   agentId?: string | null;
+  /** What this Run is doing right now (RUN-31): the ~90s of verify + land used to report a
+   *  blanket `running` with the spend frozen, which is indistinguishable from a hung agent.
+   *  Rides the telemetry frame, not the status one — a phase change is not a transition. */
+  phase?: RunPhase;
   telemetry?: DriverTelemetry;
   /** Rolling tail of the agent's output for the live dashboard (RUN-22), tail-capped. */
   logTail?: string;
@@ -353,6 +358,7 @@ export class RunSupervisor {
             spec: repo.manifest.verify,
             cwd: worktree.path,
             session: ctx.session,
+            phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
         : await runVerify(repo.manifest.verify, worktree.path, { exec: this.deps.verifyExec });
       if (!result.passed) {
@@ -408,6 +414,9 @@ export class RunSupervisor {
     spec: NonNullable<ProjectManifest['verify']>;
     cwd: string;
     session: DriverSession;
+    /** The phase to return to between fix turns — 'verifying' on the standalone gate,
+     *  'landing' when this runs inside the landing pipeline (RUN-31). */
+    phase: RunPhase;
   }) {
     let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
     // continueWith is absent unless the run was started multiTurn — a run with no live session to
@@ -420,6 +429,9 @@ export class RunSupervisor {
         attempt,
         exitCode: result.exitCode,
       });
+      // Tokens burn again on a fix turn, so the phase has to say 'agent' or the spend appears
+      // to climb during "verifying" — the same lie this task exists to stop telling (RUN-31).
+      this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
       const exit = await ctx.session
         .continueWith(verifyFeedbackPrompt(ctx.spec, result, attempt))
         .catch((err): DriverExit | null => {
@@ -429,6 +441,7 @@ export class RunSupervisor {
       // The agent died, errored, or breached its budget trying to fix it. Its last verdict stands;
       // pushing more turns at a session that just failed is how a loop becomes a spend.
       if (!exit || exit.outcome !== 'done') return result;
+      this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
       if (result.passed) {
         this.log.info('verify passed after the agent fixed it', { runId: ctx.run.id, attempt });
@@ -547,7 +560,9 @@ export class RunSupervisor {
       }
       return fail(`worktree setup failed: ${(err as Error).message}`);
     }
-    this.deps.report(run.id, { status: 'running', worktreePath: worktree.path });
+    // dispatched → running, and the first phase (RUN-31). The status half is the real
+    // transition; the phase half rides the telemetry frame the daemon splits this into.
+    this.deps.report(run.id, { status: 'running', worktreePath: worktree.path, phase: 'agent' });
     this.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.path });
 
     // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
@@ -695,6 +710,10 @@ export class RunSupervisor {
     // branch and two runs interleaving would land untested combinations.
     const landPolicy = kind === 'build' && driverSucceeded ? (repo.manifest.land ?? null) : null;
     if (landPolicy) {
+      // The agent process is gone and the spend stops moving here, so without this the
+      // dashboard shows "running" through a rebase → verify → fast-forward that can take a
+      // minute — and a queue behind the repo lock makes it longer (RUN-31).
+      this.deps.report(run.id, { status: 'running', phase: 'landing' });
       const outcome = await this.withRepoLock(repo.root, () =>
         this.landRun({
           run,
@@ -747,11 +766,16 @@ export class RunSupervisor {
     // Skipped when [land] is configured — the landing pipeline already verified the
     // REBASED result, which is strictly the better question to ask.
     if (kind === 'build' && driverSucceeded && !landPolicy && repo.manifest.verify) {
+      // Same silence as landing, and the longer of the two in practice: the full suite with
+      // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
+      // the agent on a failure, which flips the phase to 'agent' again — see below.
+      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
       const result = await this.verifyWithFeedback({
         run,
         spec: repo.manifest.verify,
         cwd: worktree.path,
         session: budgetRun.session,
+        phase: 'verifying',
       });
       if (result.passed) {
         this.log.info('deterministic verify passed', { runId: run.id });
