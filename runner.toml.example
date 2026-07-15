@@ -30,8 +30,8 @@ concurrency = 2
 # daemon supervising it.
 [update]
 # Check whether this runner is behind, and say so in the log. A public GET against
-# the server's /api/runner/latest (which reads the runner repo). Nothing is
-# downloaded and nothing is replaced.
+# the runner's own repo (package.json on main). Nothing is downloaded, nothing is
+# replaced, and Noriq is not involved.
 check = true
 checkIntervalHours = 24
 # There is deliberately no `apply` key. The daemon does not replace its own

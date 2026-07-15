@@ -216,18 +216,16 @@ export class Daemon {
     // Say when this box is behind (RUN-37). A check, never a self-replace: the daemon holds the
     // operator's token, spawns agents at a permission floor it chooses, and with [land] writes
     // branches — so replacing its own executable is a supply-chain decision that needs
-    // provenance, not a config key. See src/update.ts and THREAT-MODEL.md.
+    // provenance, not a config key. It reads the runner's own public repo; Noriq is not in the
+    // path. See src/update.ts and THREAT-MODEL.md.
     //
     // unref'd on purpose: a version check must never be the reason a daemon won't exit.
     let updateTimer: ReturnType<typeof setInterval> | undefined;
     if (this.config.update.check) {
       const runCheck = async () => {
-        const check = await checkForUpdate(this.config.server);
-        if (check.belowMinimum) {
-          this.log.warn(updateAdvice(check), { current: check.current, minimum: check.latest });
-        } else if (check.behind) {
+        const check = await checkForUpdate();
+        if (check.behind)
           this.log.info(updateAdvice(check), { current: check.current, latest: check.latest });
-        }
       };
       void runCheck();
       updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);

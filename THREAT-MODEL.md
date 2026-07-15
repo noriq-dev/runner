@@ -88,7 +88,7 @@ change; a human running `npm i -g` is exposed to the same artifact, but at a mom
 
 | | |
 |---|---|
-| **What it does** | A public GET to `<server>/api/runner/latest` (which reads `package.json` on the runner repo's `main`), on `checkIntervalHours`. Logs when behind. Nothing is downloaded. |
+| **What it does** | A public GET to `package.json` on the runner repo's `main`, on `checkIntervalHours`. Logs when behind. Nothing is downloaded. Noriq is not in this path — it neither builds nor publishes the runner, so it has no authority over the number. |
 | **What it never does** | Replace its own executable, or download anything at all. |
 | **Why not** | The package has npm's registry signatures — every package does, and they prove *"npm served this"*, not *"this was built from that repo"*. There is **no provenance attestation**. Nothing would verify that an update came from this repo's CI rather than someone's laptop or a hijacked account. |
 | **The other blocker** | The daemon supervises live agents. Swapping under them strands worktrees and orphans runs, and it cannot exec itself cleanly while holding a WS and child processes — it would have to drain (`status: 'draining'` already exists as the hook), exit, and rely on something to restart it. Under `nohup` it would simply stop. |

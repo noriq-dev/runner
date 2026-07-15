@@ -1,6 +1,7 @@
-// RUN-37: knowing whether this runner is behind. Deliberately NOT self-replacement — see
-// src/update.ts for why that is blocked on something real (nothing is published) rather than on
-// taste, and why an inert `apply` config key would repeat RUN-38's mistake.
+// RUN-37: knowing whether this runner is behind. Reads the runner's own public repo — Noriq is
+// not in the path, since it neither builds nor publishes the runner. Deliberately NOT
+// self-replacement: see src/update.ts for why (no provenance; drain/restart unsolved), and why
+// an inert `apply` config key would repeat RUN-38's mistake.
 import { describe, expect, it } from 'vitest';
 import { checkForUpdate, compareVersions, updateAdvice } from '../src/update';
 
@@ -24,15 +25,15 @@ describe('compareVersions', () => {
 
 describe('checkForUpdate', () => {
   it('reports behind when the server is ahead', async () => {
-    const c = await checkForUpdate('https://n.example', {
+    const c = await checkForUpdate({
       current: '0.1.0',
       fetchImpl: fakeFetch(200, { version: '0.2.0', minimum: null }),
     });
-    expect(c).toMatchObject({ current: '0.1.0', latest: '0.2.0', behind: true, belowMinimum: false });
+    expect(c).toMatchObject({ current: '0.1.0', latest: '0.2.0', behind: true });
   });
 
   it('reports current when it matches', async () => {
-    const c = await checkForUpdate('https://n.example', {
+    const c = await checkForUpdate({
       current: '0.2.0',
       fetchImpl: fakeFetch(200, { version: '0.2.0', minimum: null }),
     });
@@ -40,28 +41,19 @@ describe('checkForUpdate', () => {
     expect(updateAdvice(c)).toContain('is current');
   });
 
-  it('flags a runner below the server’s floor', async () => {
-    const c = await checkForUpdate('https://n.example', {
-      current: '0.1.0',
-      fetchImpl: fakeFetch(200, { version: '0.9.0', minimum: '0.5.0' }),
-    });
-    expect(c.belowMinimum).toBe(true);
-    expect(updateAdvice(c)).toContain('BELOW the minimum');
-  });
-
   it('being unable to check is NOT being out of date', async () => {
     // A runner must not fall over — or claim to be stale — because a version endpoint had a bad
     // day. Treating "don't know" as "behind" would be worse than not checking at all.
-    const down = await checkForUpdate('https://n.example', {
+    const down = await checkForUpdate({
       current: '0.1.0',
       fetchImpl: (async () => {
         throw new Error('ECONNREFUSED');
       }) as unknown as typeof fetch,
     });
-    expect(down).toMatchObject({ latest: null, behind: false, belowMinimum: false });
+    expect(down).toMatchObject({ latest: null, behind: false });
     expect(updateAdvice(down)).toContain('could not reach');
 
-    const notFound = await checkForUpdate('https://n.example', {
+    const notFound = await checkForUpdate({
       current: '0.1.0',
       fetchImpl: fakeFetch(404, {}),
     });
@@ -69,7 +61,7 @@ describe('checkForUpdate', () => {
   });
 
   it('survives a version endpoint that answers rubbish', async () => {
-    const c = await checkForUpdate('https://n.example', {
+    const c = await checkForUpdate({
       current: '0.1.0',
       fetchImpl: fakeFetch(200, { version: 42 }),
     });
@@ -80,7 +72,7 @@ describe('checkForUpdate', () => {
   it('names the command instead of running it', async () => {
     // The daemon does not replace its own executable. It tells a human what to do, and they
     // decide — that is the supply-chain boundary, not a missing feature.
-    const c = await checkForUpdate('https://n.example', {
+    const c = await checkForUpdate({
       current: '0.1.0',
       fetchImpl: fakeFetch(200, { version: '0.2.0' }),
     });
