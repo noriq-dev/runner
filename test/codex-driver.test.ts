@@ -1,0 +1,246 @@
+import { PassThrough } from 'node:stream';
+import type { PermissionProfile } from '@noriq-dev/shared';
+import { describe, expect, it } from 'vitest';
+import { AsyncQueue } from '../src/async-queue';
+import {
+  CodexDriver,
+  type CodexEvent,
+  type CodexTransport,
+  type SpawnCodex,
+  mapSandbox,
+  normalizeNotification,
+} from '../src/drivers/codex';
+import type { DriverStartOptions, DriverTelemetry } from '../src/drivers/types';
+
+class FakeTransport implements CodexTransport {
+  readonly events = new AsyncQueue<CodexEvent>();
+  turns: string[] = [];
+  steers: string[] = [];
+  interrupted = 0;
+  closed = false;
+  sandbox = '';
+  sendUserTurn(text: string): void {
+    this.turns.push(text);
+  }
+  /** Mirrors the real transport: nothing to steer once the session is closed. */
+  steer(text: string): boolean {
+    if (this.closed) return false;
+    this.steers.push(text);
+    return true;
+  }
+  interrupt(): void {
+    this.interrupted += 1;
+  }
+  close(): void {
+    this.closed = true;
+    this.events.close();
+  }
+  push(ev: CodexEvent): void {
+    this.events.push(ev);
+  }
+}
+
+const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
+  write: false,
+  network: 'restricted',
+  allow: [],
+  deny: [],
+  ...over,
+});
+
+function harness(startOver: Partial<DriverStartOptions> = {}) {
+  let fake!: FakeTransport;
+  const spawnCodex: SpawnCodex = (opts) => {
+    fake = new FakeTransport();
+    fake.sandbox = opts.sandbox;
+    return fake;
+  };
+  const telemetry: DriverTelemetry[] = [];
+  const texts: string[] = [];
+  const driver = new CodexDriver({ spawnCodex });
+  const session = driver.start({
+    runId: 'run_1',
+    kind: 'build',
+    cwd: '/wt',
+    prompt: 'do the thing',
+    permission: profile({ write: true }),
+    handlers: { onText: (t) => texts.push(t), onTelemetry: (t) => telemetry.push(t) },
+    ...startOver,
+  });
+  return { session, telemetry, texts, getFake: () => fake };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+describe('mapSandbox', () => {
+  it('maps write→workspace-write, read-only otherwise', () => {
+    expect(mapSandbox(profile({ write: false }))).toBe('read-only');
+    expect(mapSandbox(profile({ write: true }))).toBe('workspace-write');
+  });
+});
+
+describe('normalizeNotification (real app-server shapes)', () => {
+  it('maps agentMessageDelta / tokenUsage / turn.completed / error', () => {
+    expect(normalizeNotification('thread/agentMessageDelta', { delta: 'hi' })).toEqual({
+      type: 'text',
+      text: 'hi',
+    });
+    expect(
+      normalizeNotification('thread/tokenUsageUpdated', {
+        tokenUsage: { total: { inputTokens: 30, outputTokens: 12, cachedInputTokens: 4 } },
+      }),
+    ).toEqual({ type: 'usage', inputTokens: 30, outputTokens: 12, cacheReadTokens: 4 });
+    expect(normalizeNotification('turn/completed', {})).toEqual({ type: 'turn_complete' });
+    expect(normalizeNotification('thread/error', { error: { message: 'boom' } })).toEqual({
+      type: 'error',
+      message: 'boom',
+    });
+    expect(normalizeNotification('thread/unknown', {})).toBeNull();
+  });
+});
+
+describe('CodexDriver', () => {
+  it('starts a turn, streams text, sets cumulative telemetry, completes on turn_complete', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    expect(fake.sandbox).toBe('workspace-write'); // build → workspace-write
+    expect(fake.turns).toEqual(['do the thing']); // initial prompt submitted as a turn
+    fake.push({ type: 'text', text: 'patching…' });
+    fake.push({ type: 'usage', inputTokens: 200, outputTokens: 50, cacheReadTokens: 10 });
+    fake.push({ type: 'turn_complete' });
+    const exit = await h.session.done();
+    expect(exit.outcome).toBe('done');
+    expect(exit.telemetry).toMatchObject({
+      inputTokens: 200,
+      outputTokens: 50,
+      cacheReadTokens: 10,
+      numTurns: 1,
+    });
+    expect(h.texts).toContain('patching…');
+    expect(fake.closed).toBe(true);
+  });
+
+  it('maps an error event to a failed outcome', async () => {
+    const h = harness();
+    h.getFake().push({ type: 'error', message: 'sandbox denied write' });
+    const exit = await h.session.done();
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'sandbox denied write' });
+  });
+
+  it('pushInput steers the active turn', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    h.session.pushInput('also fix the tests');
+    expect(fake.steers).toEqual(['also fix the tests']);
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+  });
+
+  it('interrupt() interrupts the transport', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    await h.session.interrupt();
+    expect(fake.interrupted).toBe(1);
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+  });
+
+  it('stop() ends the run as failed(stopped)', async () => {
+    const h = harness();
+    await h.session.stop();
+    expect(await h.session.done()).toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('sets cumulative usage (not accumulated) from repeated usage events', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({ type: 'usage', inputTokens: 10, outputTokens: 2, cacheReadTokens: 0 });
+    fake.push({ type: 'usage', inputTokens: 25, outputTokens: 9, cacheReadTokens: 3 }); // cumulative, replaces
+    await tick();
+    expect(h.telemetry.at(-1)).toMatchObject({ inputTokens: 25, outputTokens: 9, cacheReadTokens: 3 });
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+  });
+
+  it('a stream that ends without completing a turn fails', async () => {
+    const h = harness();
+    h.getFake().events.close();
+    expect(await h.session.done()).toMatchObject({
+      outcome: 'failed',
+      reason: 'codex stream ended without completing a turn',
+    });
+  });
+});
+
+/** A stand-in for the spawned `codex app-server` child: real streams (createInterface
+ *  needs one), a recording stdin, and hand-fired lifecycle events. */
+function makeFakeChild(writes: string[]) {
+  const stdout = new PassThrough();
+  const handlers = new Map<string, (a: unknown) => void>();
+  return {
+    pid: 4242,
+    stdout,
+    stderr: new PassThrough(),
+    stdin: {
+      write: (chunk: string) => {
+        writes.push(chunk.trim());
+        return true;
+      },
+      end: () => {},
+    },
+    on(event: string, cb: (a: unknown) => void) {
+      handlers.set(event, cb);
+      return this;
+    },
+    kill: () => true,
+    emitLine(line: string) {
+      stdout.write(`${line}\n`);
+    },
+    emitError(err: Error) {
+      handlers.get('error')?.(err);
+    },
+  };
+}
+
+describe('defaultSpawnCodex protocol handshake (regressions)', () => {
+  // These cover the REAL transport, which every other codex test replaces with a fake —
+  // which is exactly why both bugs below shipped.
+  it('buffers the first turn until thread/start answers, instead of sending threadId: null', async () => {
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never' },
+      () => fakeChild as never,
+    );
+
+    // The driver calls this immediately, before any stdout has been read.
+    t.sendUserTurn('do the work');
+    const beforeThread = writes.filter((w) => w.includes('turn/start'));
+    expect(beforeThread).toEqual([]); // must NOT have posted a null-threadId turn
+
+    // thread/start's response finally arrives.
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_1' } }));
+    await new Promise((r) => setImmediate(r));
+
+    const turn = writes.find((w) => w.includes('turn/start'));
+    expect(turn).toBeTruthy();
+    expect(JSON.parse(turn as string).params.threadId).toBe('th_1'); // the real id
+  });
+
+  it('turns a missing codex binary into a run failure, not a daemon crash', async () => {
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const fakeChild = makeFakeChild([]);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never' },
+      () => fakeChild as never,
+    );
+    // spawn('codex') → ENOENT emits 'error'. With no listener Node rethrows it and the
+    // WHOLE daemon dies, taking every concurrent Claude run with it.
+    fakeChild.emitError(new Error('spawn codex ENOENT'));
+
+    const seen: string[] = [];
+    for await (const ev of t.events) if (ev.type === 'error') seen.push(ev.message);
+    expect(seen[0]).toContain('ENOENT');
+  });
+});

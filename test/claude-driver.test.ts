@@ -1,0 +1,350 @@
+import type { PermissionProfile } from '@noriq-dev/shared';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AsyncQueue } from '../src/async-queue';
+import {
+  ClaudeDriver,
+  NORIQ_MCP_NAME,
+  type QueryFn,
+  type SdkMessage,
+  type SdkQueryOptions,
+  type SdkUserMessage,
+  mapPermission,
+  noriqToolsFor,
+} from '../src/drivers/claude';
+import type { DriverStartOptions, DriverTelemetry } from '../src/drivers/types';
+
+// A controllable stand-in for the Agent SDK Query: captures the streamed input
+// turns + options, lets the test push scripted stream-json messages, and records
+// interrupt/close.
+class FakeQuery {
+  received: SdkUserMessage[] = [];
+  interrupted = 0;
+  closed = false;
+  options: unknown;
+  private readonly emit = new AsyncQueue<SdkMessage>();
+  constructor(prompt: AsyncIterable<SdkUserMessage>, options: unknown) {
+    this.options = options;
+    void (async () => {
+      for await (const m of prompt) this.received.push(m);
+    })();
+  }
+  push(msg: SdkMessage): void {
+    this.emit.push(msg);
+  }
+  endStream(): void {
+    this.emit.close();
+  }
+  async interrupt(): Promise<unknown> {
+    this.interrupted += 1;
+    return undefined;
+  }
+  close(): void {
+    this.closed = true;
+  }
+  [Symbol.asyncIterator](): AsyncIterator<SdkMessage> {
+    return this.emit[Symbol.asyncIterator]();
+  }
+}
+
+const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
+  write: false,
+  network: 'restricted',
+  allow: [],
+  deny: [],
+  ...over,
+});
+
+function harness(startOver: Partial<DriverStartOptions> = {}) {
+  let fake!: FakeQuery;
+  const queryFn: QueryFn = (args) => {
+    fake = new FakeQuery(args.prompt, args.options);
+    return fake;
+  };
+  const telemetry: DriverTelemetry[] = [];
+  const texts: string[] = [];
+  const driver = new ClaudeDriver({ queryFn });
+  const session = driver.start({
+    runId: 'run_1',
+    kind: 'build',
+    cwd: '/wt',
+    prompt: 'do the thing',
+    permission: profile({ write: true }),
+    handlers: {
+      onText: (t) => texts.push(t),
+      onTelemetry: (t) => telemetry.push(t),
+    },
+    ...startOver,
+  });
+  return { session, telemetry, texts, getFake: () => fake };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('mapPermission', () => {
+  it('scope (read-only) allows read tools, disallows Edit/Bash, dontAsk', () => {
+    const p = mapPermission(profile({ write: false }), 'scope');
+    expect(p.permissionMode).toBe('dontAsk');
+    expect(p.allowedTools).toContain('Read');
+    expect(p.allowedTools).not.toContain('Edit');
+    expect(p.allowedTools).not.toContain('Bash');
+    expect(p.disallowedTools).toContain('Edit');
+    expect(p.disallowedTools).toContain('Bash');
+  });
+
+  it('build allows edit tools + the manifest bash allowlist, never bare Bash', () => {
+    const p = mapPermission(profile({ write: true, allow: ['Bash(npm test:*)'] }), 'build');
+    expect(p.allowedTools).toEqual(expect.arrayContaining(['Read', 'Edit', 'Write', 'Bash(npm test:*)']));
+    expect(p.allowedTools).not.toContain('Bash'); // bare bash is never granted
+    expect(p.disallowedTools).not.toContain('Edit');
+  });
+});
+
+describe('ClaudeDriver', () => {
+  it('runs the brief, streams text, parses result telemetry, resolves done', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: 'working…' }],
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+    });
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 2,
+      total_cost_usd: 0.0123,
+      usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 500 },
+    });
+    const exit = await h.session.done();
+    expect(exit.outcome).toBe('done');
+    expect(exit.isError).toBe(false);
+    expect(exit.telemetry).toEqual({
+      inputTokens: 100,
+      outputTokens: 40,
+      cacheReadTokens: 500,
+      cacheCreationTokens: 0,
+      costUsd: 0.0123,
+      numTurns: 2,
+    });
+    expect(h.texts).toContain('working…');
+    expect(fake.closed).toBe(true); // session closed on finish
+  });
+
+  it('maps an error result to a failed outcome with the subtype as reason', async () => {
+    const h = harness();
+    h.getFake().push({
+      type: 'result',
+      subtype: 'error_max_budget_usd',
+      is_error: true,
+      num_turns: 5,
+      total_cost_usd: 5,
+      usage: { input_tokens: 9, output_tokens: 9 },
+    });
+    const exit = await h.session.done();
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('error_max_budget_usd');
+  });
+
+  it('pushInput delivers a steer turn into the live input stream', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    h.session.pushInput('actually, focus on the auth module');
+    await tick();
+    const contents = fake.received.map((m) => m.message.content);
+    expect(contents[0]).toBe('do the thing'); // initial brief
+    expect(contents).toContain('actually, focus on the auth module'); // steer
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {},
+    });
+    await h.session.done();
+  });
+
+  it('interrupt() calls the query interrupt', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    await h.session.interrupt();
+    expect(fake.interrupted).toBe(1);
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {},
+    });
+    await h.session.done();
+  });
+
+  it('stop() ends the run as failed(stopped)', async () => {
+    const h = harness();
+    await h.session.stop();
+    const exit = await h.session.done();
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('emits incremental telemetry from assistant usage', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'a' }], usage: { input_tokens: 10, output_tokens: 3 } },
+    });
+    fake.push({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'b' }], usage: { input_tokens: 5, output_tokens: 2 } },
+    });
+    await tick();
+    expect(h.telemetry.at(-1)).toMatchObject({ inputTokens: 15, outputTokens: 5, numTurns: 2 });
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 2,
+      total_cost_usd: 0.001,
+      usage: { input_tokens: 15, output_tokens: 5 },
+    });
+    await h.session.done();
+  });
+
+  it('a stream that ends without a result fails', async () => {
+    const h = harness();
+    h.getFake().endStream();
+    const exit = await h.session.done();
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'stream ended without a result' });
+  });
+});
+
+describe('Noriq MCP wiring', () => {
+  const opts = (h: ReturnType<typeof harness>) => h.getFake().options as SdkQueryOptions;
+
+  it('injects the Noriq MCP server with the token on the transport, not the env', () => {
+    const h = harness({ noriqMcp: { url: 'https://noriq.example/mcp', token: 'plnrt_secret' } });
+    const server = opts(h).mcpServers?.[NORIQ_MCP_NAME];
+
+    expect(server).toEqual({
+      type: 'http',
+      url: 'https://noriq.example/mcp',
+      headers: { Authorization: 'Bearer plnrt_secret' },
+    });
+  });
+
+  it("ignores the operator's ambient MCP config", () => {
+    // Without this a supervised agent silently inherits ~/.claude.json, .mcp.json and
+    // plugins — the operator's personal connectors and credentials, none of them in
+    // the project manifest.
+    expect(opts(harness()).strictMcpConfig).toBe(true);
+  });
+
+  it('grants a build agent the Noriq tools it is told to use', () => {
+    // The prompt orders the agent to register + claim + report through Noriq. Under
+    // `dontAsk`, anything unlisted is denied — so without these the run is a no-op.
+    const p = mapPermission(profile({ write: true }), 'build');
+    expect(p.allowedTools).toEqual(
+      expect.arrayContaining([
+        'mcp__noriq__set_agent_identity',
+        'mcp__noriq__get_task',
+        'mcp__noriq__claim_task',
+        'mcp__noriq__release_task',
+        'mcp__noriq__post_comment',
+      ]),
+    );
+  });
+
+  it('scopes Noriq access per kind, not blanket', () => {
+    const scope = mapPermission(profile({ write: false }), 'scope').allowedTools;
+    const build = mapPermission(profile({ write: true }), 'build').allowedTools;
+    const verify = mapPermission(profile({ write: false }), 'verify').allowedTools;
+
+    // A read-only scope agent proposes plans but must not claim or mutate work.
+    expect(scope).toContain('mcp__noriq__create_plan');
+    expect(scope).not.toContain('mcp__noriq__claim_task');
+    expect(scope).not.toContain('mcp__noriq__update_task');
+    // A build agent claims and reports, but does not mint plans.
+    expect(build).toContain('mcp__noriq__claim_task');
+    expect(build).not.toContain('mcp__noriq__create_plan');
+    // The adversarial verifier reads and comments; it never mutates.
+    expect(verify).toContain('mcp__noriq__post_comment');
+    expect(verify).not.toContain('mcp__noriq__claim_task');
+    expect(verify).not.toContain('mcp__noriq__update_task');
+  });
+
+  it('never grants a wildcard Noriq rule', () => {
+    for (const kind of ['scope', 'build', 'verify'] as const) {
+      const allowed = mapPermission(profile({ write: kind === 'build' }), kind).allowedTools;
+      expect(allowed).not.toContain('mcp__noriq__*');
+      expect(allowed.filter((t) => t.startsWith('mcp__'))).toEqual(noriqToolsFor(kind));
+    }
+  });
+
+  it('omits mcpServers entirely when no connection is supplied', () => {
+    expect(opts(harness()).mcpServers).toBeUndefined();
+  });
+});
+
+describe('a read-only kind can execute without being able to edit', () => {
+  it('honours an explicit bash allowlist on a read-only profile', () => {
+    // Regression: `disallowedTools: ['Bash']` was added for EVERY non-write profile, and
+    // deny outranks allow — so a verifier's `Bash(npm test:*)` sat in the manifest doing
+    // nothing, and the adversarial gate could only ever review by eye.
+    const p = mapPermission(profile({ write: false, allow: ['Bash(npm test:*)'] }), 'verify');
+    expect(p.allowedTools).toContain('Bash(npm test:*)');
+    expect(p.disallowedTools).not.toContain('Bash'); // would have killed the rule above
+  });
+
+  it('still denies edit tools to that same profile', () => {
+    // Execute, never edit — a verifier must not be able to "fix" what it judges.
+    const p = mapPermission(profile({ write: false, allow: ['Bash(npm test:*)'] }), 'verify');
+    expect(p.disallowedTools).toEqual(expect.arrayContaining(['Edit', 'Write', 'MultiEdit']));
+    expect(p.allowedTools).not.toContain('Edit');
+  });
+
+  it('still blanket-denies Bash when a read-only profile grants no bash rules', () => {
+    const p = mapPermission(profile({ write: false, allow: [] }), 'scope');
+    expect(p.disallowedTools).toContain('Bash');
+  });
+
+  it('never grants bare Bash, whatever the profile', () => {
+    for (const [write, kind] of [
+      [false, 'verify'],
+      [true, 'build'],
+    ] as const) {
+      const p = mapPermission(profile({ write, allow: ['Bash(npm test:*)'] }), kind);
+      expect(p.allowedTools).not.toContain('Bash');
+      expect(p.permissionMode).toBe('dontAsk'); // never bypassPermissions
+    }
+  });
+});
+
+describe("the agent shell never sees the daemon's secrets", () => {
+  it('passes a sanitized env to the SDK', () => {
+    // Regression: the Claude driver — the DEFAULT tool — passed no `env` at all, so the
+    // spawned `claude` inherited process.env verbatim. codex and verify always sanitized;
+    // only this path made the security model's central claim false.
+    const h = harness();
+    const env = (h.getFake().options as SdkQueryOptions).env;
+
+    expect(env).toBeDefined();
+    expect(env?.NORIQ_TOKEN).toBeUndefined(); // the daemon's OAuth token
+    expect(env?.GITHUB_TOKEN).toBeUndefined();
+    expect(env?.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    // ...and git cannot prompt for, or reach, credentials.
+    expect(env?.GIT_TERMINAL_PROMPT).toBe('0');
+    expect(env?.GIT_ASKPASS).toBe('/bin/false');
+  });
+
+  it('still hands over a usable PATH', () => {
+    // Stripping secrets must not strip the ability to run anything.
+    const env = (harness().getFake().options as SdkQueryOptions).env;
+    expect(env?.PATH).toBeTruthy();
+  });
+});

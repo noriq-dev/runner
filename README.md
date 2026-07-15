@@ -1,0 +1,165 @@
+# @noriq-dev/runner
+
+The **Noriq Runner** — a per-user local daemon that turns Noriq's coordination
+plane into an execution plane. It connects to a Noriq server, discovers your
+repos, spawns and supervises coding-agent processes (Claude / Codex) inside
+isolated git worktrees, and streams status back so you can dispatch, watch,
+steer, and approve work entirely from the dashboard.
+
+This is a **standalone repo** (separate runtime/trust/distribution boundary from
+the Noriq server). It imports only the runtime-neutral slice of `@noriq-dev/shared`
+(pure zod, the wire contract), currently **vendored** under `vendor/noriq-shared`
+until that contract freezes — see `vendor/noriq-shared/README.md`.
+
+## Install & run
+
+```bash
+npx @noriq-dev/runner start          # once published
+# or from a checkout:
+npm install && npm run build     # bundles the CLI to dist/cli.js
+node dist/cli.js start
+```
+
+The Claude driver also needs the `claude` CLI on PATH (`npm i -g @anthropic-ai/claude-code`);
+the Codex driver needs `codex`. During development, skip the build with
+`npm run dev -- <command>` (runs `src/cli.ts` via tsx).
+
+## Authenticate
+
+The daemon dials the Noriq server with **your OAuth token** — the only secret that
+crosses the wire (model + git credentials never leave the box). One command gets one:
+
+```bash
+noriq-runner auth        # opens your browser, approve, done
+```
+
+That's the whole flow on a desktop: it runs OAuth 2.1 authorization-code + PKCE against
+a loopback listener, so the token is minted straight into `~/.noriq/credentials.json`
+(0600) and nothing is ever copy-pasted.
+
+**On a box with no browser** — a runner over SSH, in a container, on CI — `auth`
+detects that and falls back to the **device flow** (RFC 8628): it prints a short code,
+you approve it at that URL from your laptop or phone, and the daemon picks the token up
+by polling. Force either path with `--browser` / `--device`.
+
+```
+  Open:  https://noriq.example/oauth/device?user_code=BCDF-GHJK
+  Code:  BCDF-GHJK
+
+Waiting for approval…
+```
+
+Access tokens last 7 days and the daemon refreshes itself with the stored refresh token
+(90 days, rotated on each use), so `start` keeps working without re-authing. When the
+refresh token finally lapses — or you revoke the connection from *Settings → Agent
+connections* — the daemon says so and `noriq-runner auth` reconnects it.
+
+`NORIQ_TOKEN=…` still overrides everything (CI, short-lived containers); the legacy
+`~/.noriq/token` file is still read too. Neither can refresh — they're static by nature.
+
+The token is a local secret: never commit it, and it is stripped from every spawned
+agent's shell env — the agent reaches Noriq over its own MCP connection, not through the
+environment.
+
+## Configure
+
+Two-file model (see the RUN plan):
+
+- `~/.noriq/runner.toml` — **machine-local** config: label, server, scan roots,
+  concurrency, budget. Never committed. Copy from [`runner.toml.example`](runner.toml.example).
+- `.noriq/project.toml` — **committed** per-repo marker: the project KEY, verify
+  command, tool, and per-kind permission profiles. Travels with the repo. Copy
+  from [`project.toml.example`](project.toml.example) into each repo you want the
+  Runner to work.
+
+Validate the machine config and see what the daemon discovered:
+
+```bash
+noriq-runner config      # load + validate ~/.noriq/runner.toml
+noriq-runner discover    # list the repos found under your scan roots
+```
+
+The KEY in `.noriq/project.toml` is resolved to a `prj_…` id per configured server
+at registration, so a checkout stays portable across instances and forks.
+
+## Commands
+
+| Command            | What it does                                             |
+| ------------------ | -------------------------------------------------------- |
+| `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
+| `noriq-runner start`   | Connect to Noriq and supervise dispatched runs            |
+| `noriq-runner discover`| List repos discovered under the config's scan roots       |
+| `noriq-runner config`  | Load, validate, and print the resolved machine config     |
+| `noriq-runner version` | Print the version                                         |
+| `noriq-runner help`    | Print help                                                |
+
+`auth` takes the server from `~/.noriq/runner.toml`; pass `--server <url>` to authorize
+before that file exists, or to point at another instance.
+
+## Develop
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm run lint        # biome
+npm run test        # vitest
+npm run check       # all three
+```
+
+## Agent drivers
+
+A driver turns a Run into a live, steerable agent process behind one interface
+(`AgentDriver`). The **Claude driver** uses the Claude Agent SDK's streaming-input
+`query()` (not one-shot `claude -p`) so the session stays steerable — push user
+turns mid-run + `interrupt()` — applies the per-kind permission profile, and
+parses stream-json telemetry (tokens / USD) back to the Run.
+
+The Claude Agent SDK is a **normal dependency** (RUN-26 moved the whole repo — and
+the vendored `@noriq-dev/shared` wire contract — to `zod@4`, satisfying the SDK's
+`zod@^4` peer, so it installs with no `ERESOLVE`). It's imported directly; the
+`claude` CLI binary it drives is a separate install (`npm i -g @anthropic-ai/claude-code`).
+Tests inject a fake `queryFn` and never touch the real SDK. The bundle keeps the
+SDK **external** (it spawns a binary and carries its own subtree), so it's resolved
+from `node_modules` at runtime rather than inlined. (The Codex driver is in RUN-13.)
+
+## Landing the work
+
+The point isn't to generate diffs — it's to land them. Add `[land]` to a repo's
+`.noriq/project.toml` and a build that passes the gate lands itself:
+
+```toml
+[land]
+branch = "noriq/integration"   # no default; never inferred; never silently `main`
+```
+
+The daemon rebases the run onto that branch, **re-runs the verify command on the
+rebased result**, fast-forwards it in, and reaps the run's worktree and branch. Work
+accumulates on one integration branch that you merge onward into `main` when you like —
+a batch to review instead of a click per run, and no graveyard of per-run branches.
+
+Verify runs *after* the rebase deliberately: two runs can each be green at their own fork
+point and broken together, and a gate that never sees the combination can't catch it. On
+a rebase conflict the build agent gets one bounded turn to fix it — but only if the fix is
+mechanical; anything needing a *decision* (competing designs, a refactor underneath it, a
+changed contract) bails to a human, and an ambiguous answer counts as bailing.
+
+**The daemon still never pushes.** Agent work reaches your disk and nowhere else, so
+`git push` remains the human boundary — that's what makes auto-landing a reasonable
+trade rather than a leap. Point `branch` at something auto-deploying and you've given
+that up; see the table in [`THREAT-MODEL.md`](THREAT-MODEL.md). Omit `[land]` and nothing
+auto-lands: every diff waits on its own branch, as before.
+
+## Security model
+
+One git worktree per Run on a throwaway branch; scope runs read-only; per-kind
+permission profiles (including which Noriq MCP tools each kind may call); daemon-enforced
+budgets (SIGTERM on breach); **no push credentials for any agent and no push, ever**;
+secrets stay local (only the OAuth token crosses the wire, injected into the agent's MCP
+transport rather than its shell). Full threat model — and the explicit trade auto-landing
+makes — in [`THREAT-MODEL.md`](THREAT-MODEL.md).
+
+## Try it end-to-end
+
+[`DOGFOOD.md`](DOGFOOD.md) is the v1 acceptance runbook: register this machine,
+mark a repo with `.noriq/project.toml`, then dispatch a scope brief → approve the
+proposed plan → run a build → watch verify gate it → steer it live — the full loop
+from the dashboard, both drivers.

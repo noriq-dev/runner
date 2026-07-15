@@ -1,0 +1,73 @@
+# Example COMMITTED per-repo marker for the Noriq Runner.
+#
+# Copy to `.noriq/project.toml` at the root of a repo you want the Runner to work.
+# UNLIKE runner.toml (machine-local), this file IS committed — it travels with the
+# repo and is team-shareable. It carries no secrets. Validated against
+# @noriq-dev/shared's ProjectManifest when the daemon discovers it.
+
+# Committed, portable project identifier (1–8 chars). Resolved to a prj_… id per
+# configured server at registration, so the checkout stays portable across Noriq
+# instances and forks without editing this file. Must match a project KEY you can
+# reach on the server (the key you see in the dashboard, e.g. ACME).
+key = "ACME"
+
+# Default agent driver for this repo. Omit (or null) to use the runner's default.
+# One of: "claude" | "codex".
+tool = "claude"
+
+# The repo's main branch, if the daemon should reference it. Optional.
+defaultBranch = "main"
+
+# ── Deterministic verify floor (zero-token, daemon-run) ──────────────────────
+# After a BUILD run's agent exits clean, the daemon runs this command in the Run's
+# worktree. A non-zero exit (or timeout) GATES the run — it cannot reach `done`.
+# Put tsc here: vitest/esbuild do NOT catch type errors. Omit the whole section
+# for no deterministic verify (the independent verify agent still runs).
+[verify]
+cmd = "npm run typecheck && npm test"
+# timeoutSeconds = 600   # default 600; null = the built-in default
+
+# ── Auto-landing (opt-in) ────────────────────────────────────────────────────
+# Where a passing build's diff goes, so you stop approving every run by hand. The
+# daemon rebases the run onto `branch`, RE-RUNS [verify] on the rebased result, then
+# fast-forwards it in and reaps the run's worktree/branch. Work accumulates on one
+# integration branch; you merge it onward into main on your own schedule, reviewing a
+# batch instead of clicking through runs.
+#
+# Verify runs AFTER the rebase on purpose: two runs can each be green at their own fork
+# point and broken together — a gate that never sees the combination can't catch it.
+#
+# The daemon still NEVER pushes: agent work reaches your disk and nowhere else, so
+# `git push` stays the human boundary.
+#
+# ⚠️ `branch` has no default and is never inferred. Point it at something push-triggered,
+# auto-deploying, or watched by CI and you have handed agents production. Omit this whole
+# section and nothing auto-lands — every diff waits on its own branch for you.
+# [land]
+# branch = "noriq/integration"
+# onlyWhenVerifyPasses = true   # false = an unverified diff reaches `branch`. Allowed, never assumed.
+# resolveConflicts = true       # let the build agent fix MECHANICAL rebase conflicts;
+#                               # anything needing a decision still bails to a human.
+
+# ── Per-kind permission profiles ─────────────────────────────────────────────
+# The security floor per Run kind. Defaults (if omitted) are already safe: scope
+# and verify are READ-ONLY, build gets worktree WRITE. No agent ever gets push
+# credentials — that's enforced by the daemon and is not expressible here.
+#   write   : may the agent edit files in its worktree?
+#   network : "restricted" (default) | "none" | "full" — egress policy the driver
+#             maps onto the CLI sandbox.
+#   allow   : extra allowlist rules handed to the driver, e.g. "Bash(npm test:*)".
+#             Build needs its bash allowlist here — bare `Bash` is NEVER granted.
+#   deny    : explicit deny rules.
+[permissions.scope]
+write = false
+network = "restricted"
+
+[permissions.build]
+write = true
+network = "restricted"
+allow = ["Bash(npm test:*)", "Bash(npm run build:*)", "Bash(npx tsc:*)"]
+
+[permissions.verify]
+write = false
+network = "restricted"

@@ -1,0 +1,26 @@
+# Example machine config for the Noriq Runner daemon.
+# Copy to ~/.noriq/runner.toml and edit. Validated against @noriq-dev/shared's
+# RunnerConfig on startup. This file is machine-local — never commit your real one
+# (the repo .gitignore already excludes runner.toml).
+
+# Human label for this runner, shown in the dashboard's Runners panel.
+label = "device01"
+
+# The Noriq server (control plane) this runner dials.
+server = "https://noriq.example"
+
+# Directories walked to discover repos (a .noriq/project.toml marker). No central
+# list — the daemon finds markers under these roots.
+scanRoots = ["/home/you/code"]
+
+# Max concurrent Runs (→ Runner.capabilities.maxConcurrency). Default 1.
+concurrency = 2
+
+# Optional: pin the installed drivers this runner advertises. Omit to auto-detect.
+# tools = ["claude", "codex"]
+
+# Default budget ceilings applied to Runs that don't carry their own.
+[budget]
+# maxTokens = 500000
+# maxUsd = 5
+# maxDurationSeconds = 1800

@@ -1,0 +1,87 @@
+# Noriq Runner — Threat Model
+
+> This is the **design**: the trust boundaries and the defenses that hold them.
+> It is deliberately not `SECURITY.md` — GitHub reads that filename as a
+> vulnerability-disclosure policy, and a threat model sitting there tells someone
+> who found a hole what we built, not how to reach us.
+
+The Runner runs **autonomous coding agents with a shell on the user's own
+machine**. That is the whole point (it's the execution plane) and also the entire
+risk. This document is the threat model for that surface and the layered defenses
+that contain it. Security here is load-bearing, not polish.
+
+## Trust boundaries
+
+- **The user's machine is trusted; the agent is not.** The daemon is the user's
+  process (their OAuth token, their repos). Each spawned agent is untrusted code
+  driving untrusted model output through a shell.
+- **The Noriq server is the control plane; the daemon is the muscle.** Only the
+  daemon dials out (a WebSocket to `/ws/runner/:id`); the server never dials in.
+- **The only secret that crosses the wire is the Noriq OAuth token.** Model
+  credentials (Anthropic/OpenAI) and git credentials never leave the box.
+
+## Threats & defenses
+
+| Threat | Defense | Where |
+|---|---|---|
+| Agent edits/deletes files outside its task | **One git worktree per Run** on a throwaway branch `noriq/run/<id>`; never two runs in one checkout | `worktree.ts` |
+| A scope (read-only) agent writes anything | **Per-kind permission profile**: scope gets read-only tools (Claude `dontAsk` + read-only allowlist) / `read-only` sandbox (Codex); **plus** the scope worktree is physically `chmod`'d read-only (defense in depth) | `drivers/claude.ts` `mapPermission`, `drivers/codex.ts` `mapSandbox`, `worktree.ts` `setReadOnly` |
+| The verify agent "fixes" the code it is judging | **Execute, never edit.** Verify's profile is `write = false`, so Edit/Write/MultiEdit are denied and its bash rules are enumerated (install + run + `git diff`) — it can exercise the behavior but cannot alter a line of it, nor weaken a test to make its own verdict easy. Its worktree is deliberately **not** `chmod`'d read-only (unlike scope): a verifier that cannot run the suite can only review by eye, which is the weakest form of this gate. The separation that matters is authorship, and that is enforced by the profile | `drivers/claude.ts` `mapPermission`, `.noriq/project.toml` `[permissions.verify]` |
+| A build agent runs arbitrary shell | Build gets edit tools + a **bash allowlist** only (the manifest's `allow` rules, e.g. `Bash(npm test:*)`) — **bare `Bash` is never granted**; Codex confines writes to `workspace-write` | `drivers/claude.ts`, `drivers/codex.ts` |
+| Agent pushes to the remote / merges | **No agent ever gets push credentials.** Output lands as a diff on the throwaway branch that a **human merges** — the daemon never pushes/merges. The spawned process runs under `sanitizedAgentEnv`: `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, and the credential helper is disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them | `security.ts`, `supervisor.ts` |
+| Agent exfiltrates secrets from the environment | `sanitizedAgentEnv` **strips** `NORIQ_TOKEN` and common cloud/git tokens from the child's shell env. The agent reaches Noriq via its **MCP** connection (credential injected at the transport), so `bash` never sees the token | `security.ts` |
+| Agent reads the stored credential off disk | `~/.noriq/credentials.json` is written `0600` under a `0700` dir, and no agent is granted bare `Bash` or unrestricted reads outside its worktree. **Not a hard boundary**: the file is readable by the uid the daemon and the agents share, so this rests on the permission profiles, not on the filesystem. It holds a **90-day refresh token** — a longer-lived secret than the 7-day access token — so revoke the connection (*Settings → Agent connections*) if a box is suspect; rotation makes the stolen pair single-use but does not by itself evict a thief | `credentials.ts`, `token.ts` |
+| A runaway agent burns unbounded tokens/$$ | **Daemon-enforced budget**: token / USD / wall-clock ceilings watched from the telemetry stream; breach → SIGTERM → `failed{budget}`. A Run with a budget can never run unbounded | `drivers/budget.ts` |
+| Agent games the gate (weakens/deletes a test) | Two-stage verify: a **deterministic floor** (zero-token manifest verify cmd) then an **independent adversarial verify agent** (a fresh actor, never the author) — plus **bounded retries (K=2)** then human escalation | `verify.ts`, `verify-agent.ts`, phase gate (server) |
+| Crash leaves a live worktree/branch around | **Crash-safe reap**: a fresh daemon start reaps every orphaned `noriq/run/*` worktree (git is the registry; the run id is in the branch name) | `worktree.ts` `reapOrphans` |
+| Stolen/replayed WS or steer | The WS upgrade is authenticated (owner's OAuth bearer) and the runner must belong to that user; steers are deduped by stable source id | server `/ws/runner`, `runtime_deliveries` |
+
+## What the daemon never does
+
+- **Never pushes.** Nothing an agent writes leaves this machine. `git push` is the
+  human boundary and the daemon has no path across it — that is the invariant the
+  rest of this model rests on.
+- Never merges into any branch except the one `[land].branch` names, and only after
+  that Run's diff passed the gate *rebased onto it* (see below).
+- Never grants an agent's shell the Noriq token or cloud/git credentials.
+- Never runs an agent outside its per-Run worktree.
+- Never runs a build agent with unrestricted `Bash` or a `danger-full-access`
+  sandbox — the permission mapping only ever emits `dontAsk` (Claude) and
+  `read-only` / `workspace-write` (Codex).
+- Never force-deletes a worktree holding work that exists nowhere else.
+
+## Auto-landing (`[land]`) — an explicit trade
+
+Earlier this document said the daemon "never merges". It now merges — *locally*, into
+one opt-in branch — because a human clicking approve on every run is the cost this
+system exists to remove. The trade, stated plainly:
+
+| | |
+|---|---|
+| **What changed** | A build that passes the gate is rebased onto `[land].branch`, **re-verified there**, and fast-forwarded in. No human per run. |
+| **What did NOT change** | The daemon still **never pushes**. Work reaches the operator's disk and nothing else; a human still decides what reaches `main`, a remote, or a deploy. |
+| **What is now load-bearing** | The verify gate is the only thing between an agent and that branch. Its quality *is* the security boundary. |
+| **The sharp edge** | Point `[land].branch` at anything push-triggered, auto-deploying, or watched by CI and you have handed agents production. `branch` has **no default** and is never inferred — auto-landing is opt-in per repo, and pointing it at `main` is a choice you make explicitly. |
+| **Why rebase-then-verify** | Two runs can each be green at their own fork point and broken together. A gate that never sees the combination cannot catch it, so the gate runs on the rebased result — the exact thing that will land. |
+| **Conflicts** | An agent may resolve only *mechanical* collisions, in its own worktree, under the build floor. Anything requiring a decision (competing designs, a refactor under it, a changed contract) must bail to a human — an ambiguous or absent verdict counts as bail. Picking a winner silently discards someone's work. |
+| **Concurrency** | rebase → verify → fast-forward is serialized per repo. A non-fast-forward is reported as a race, never papered over with a merge commit. |
+
+Omit `[land]` entirely and none of this happens: every run's diff waits on its own
+branch for a human, exactly as before.
+
+## Residual risks (accepted / follow-up)
+
+- **Bash allowlist correctness is the manifest author's responsibility.** A
+  manifest that allowlists `Bash(*)` or `git push` reopens the shell. The daemon
+  enforces "no bare Bash by default" and strips push credentials, but a permissive
+  `.noriq/project.toml` is a user choice. Review committed manifests in code review.
+- **Read-only for scope is layered, not absolute.** `chmod` + the driver permission
+  profile both enforce it; a sandbox escape in the agent CLI is out of the Runner's
+  control (it's the CLI vendor's boundary).
+- **Network egress** is `restricted` by profile intent but ultimately governed by
+  the agent CLI's own sandbox — the Runner sets the policy, the CLI enforces it.
+- **The MCP-server credential wiring** (how the agent gets Noriq access without the
+  token in its shell env) is finalized at the dogfood; `sanitizedAgentEnv` already
+  assumes the token reaches the agent over MCP, not the environment.
+
+Report security issues privately to the maintainers rather than opening a public issue.
