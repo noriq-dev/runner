@@ -7,6 +7,7 @@ import { DEFAULT_CREDENTIALS_PATH } from './credentials';
 import { Daemon } from './daemon';
 import { discoverRepos } from './discovery';
 import { runInit } from './init';
+import { runInitProject } from './init-project';
 import { logger, setLogLevel } from './logger';
 import { TokenSource } from './token';
 import { checkForUpdate, updateAdvice } from './update';
@@ -19,6 +20,7 @@ Usage:
 
 Commands:
   init             Guided setup: config + authorization, then show what it found
+  init-project     Guided .noriq/project.toml for the repo you are in (commit it)
   update           Check whether this runner is behind (it will not replace itself)
   auth             Authorize this machine with Noriq and store its token
   start            Discover repos, register with Noriq, and supervise dispatched runs
@@ -203,6 +205,11 @@ export async function run(argv: string[]): Promise<number> {
         // Interactive by construction — the opposite of `start`, which must never block on
         // stdin because it runs under systemd/CI (RUN-40).
         await runInit({ configPath: args.configPath });
+        return 0;
+      case 'init-project':
+        // Marks the repo the user is standing in — cwd is the input, so there is no path
+        // argument to get wrong (RUN-56).
+        await runInitProject({ configPath: args.configPath });
         return 0;
       case 'update':
         return await cmdUpdate();

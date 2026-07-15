@@ -61,6 +61,16 @@ export {
   resumePrompt,
   type ParkedRun,
 } from './parked';
+export {
+  defaultKey,
+  detectEcosystem,
+  renderProjectManifest,
+  runInitProject,
+  scanRootWarning,
+  type Ecosystem,
+  type InitProjectDeps,
+  type InitProjectResult,
+} from './init-project';
 export { detectTools } from './tools';
 export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
 export {

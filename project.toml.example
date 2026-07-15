@@ -1,5 +1,8 @@
 # Example COMMITTED per-repo marker for the Noriq Runner.
 #
+# `noriq-runner init-project` writes one of these for you, from inside the repo — this
+# file is the annotated reference for everything it does not ask about.
+#
 # Copy to `.noriq/project.toml` at the root of a repo you want the Runner to work.
 # UNLIKE runner.toml (machine-local), this file IS committed — it travels with the
 # repo and is team-shareable. It carries no secrets. Validated against
@@ -91,8 +94,10 @@ cmd = "npm run typecheck && npm test"
 # Verify runs AFTER the rebase on purpose: two runs can each be green at their own fork
 # point and broken together — a gate that never sees the combination can't catch it.
 #
-# The daemon still NEVER pushes: agent work reaches your disk and nowhere else, so
-# `git push` stays the human boundary.
+# The daemon never MERGES into your protected branch — it asks. By default it never pushes
+# either, so agent work reaches your disk and nowhere else; `autoPush` below opts it into
+# publishing this one branch, and `mergeTarget` then opens a merge request rather than
+# merging. The human boundary is approving that merge. See THREAT-MODEL.md.
 #
 # ⚠️ `branch` has no default and is never inferred. Point it at something push-triggered,
 # auto-deploying, or watched by CI and you have handed agents production. Omit this whole

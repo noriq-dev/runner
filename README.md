@@ -133,9 +133,24 @@ Two files, and they are split by **who they belong to**:
   for [`runner.toml.example`](runner.toml.example) only to hand-edit or to set up headless.
 - `.noriq/project.toml` — **committed** per-repo marker: the project KEY, verify command, tool,
   `[land]`, and per-kind permission profiles. Travels with the repo, so your teammates' runners
-  agree with yours about what's allowed. Copy [`project.toml.example`](project.toml.example)
-  into each repo you want the Runner to work. **This one is still by hand** — `init` doesn't
-  write it, because it's a decision the repo makes once, not a per-machine setup step.
+  agree with yours about what's allowed. **`init-project` writes this one** — run it from the
+  repo root:
+
+```bash
+cd ~/code/acme
+noriq-runner init-project     # four questions, then commit the result
+git add .noriq/project.toml && git commit -m "Add Noriq marker"
+```
+
+It suggests a verify command from what the repo is built with, and — because bare `Bash` is
+never granted to an agent — gives the build profile the allowlist it needs to actually *run*
+that command. It also tells you whether the repo sits under one of your scan roots, which is
+the one thing you can't easily check yourself: a perfect marker outside them is never
+discovered, never dispatchable, and reports no error anywhere.
+
+Auto-landing stays off unless you name a branch, and it never guesses one.
+[`project.toml.example`](project.toml.example) is the annotated reference for everything
+`init-project` doesn't ask about.
 
 A repo opts in *only* by committing that marker — there's no central list to add yourself to, and
 a runner ignores everything else under your scan roots. `ManifestStore` re-reads it per Run, so
@@ -156,6 +171,7 @@ at registration, so a checkout stays portable across instances and forks.
 | Command            | What it does                                             |
 | ------------------ | -------------------------------------------------------- |
 | `noriq-runner init`    | **Start here.** Guided setup: config + authorization, then shows what it found |
+| `noriq-runner init-project` | Guided `.noriq/project.toml` for the repo you're in (then commit it) |
 | `noriq-runner start`   | Connect to Noriq and supervise dispatched runs            |
 | `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
 | `noriq-runner discover`| List repos discovered under the config's scan roots       |
