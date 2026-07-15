@@ -1,0 +1,18 @@
+# Line endings are LF, everywhere, including on Windows checkouts (RUN-42).
+#
+# Not a preference — a correctness requirement, and CI proved it: Windows defaults
+# `core.autocrlf=true`, so every file checked out with CRLF and biome (which mandates LF)
+# flagged the entire repo, starting with biome.json itself. The lint step cannot pass on a
+# Windows runner without this.
+#
+# `text=auto eol=lf` normalizes to LF in the index and checks LF out on every platform. Modern
+# Windows tooling — including Git for Windows, PowerShell, and Node — handles LF fine; the
+# CRLF default is a compatibility hangover, and letting it win here would mean either a
+# Windows-only lint failure forever or a formatter config that disagrees with itself per OS.
+* text=auto eol=lf
+
+# Binary, so git never guesses at line endings inside them.
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary

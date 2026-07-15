@@ -17,6 +17,24 @@ export const defaultGit: GitRunner = async (args, cwd) => {
   return { stdout, stderr };
 };
 
+/**
+ * Who the daemon commits as, passed per-invocation (RUN-42).
+ *
+ * Per-invocation because the daemon must not depend on — or mutate — the operator's global git
+ * config, and because the authorship should read as the runner's rather than as the human's.
+ *
+ * It is REQUIRED, not cosmetic, on any git command that writes a commit. Git refuses outright
+ * with "Committer identity unknown" when none is configured, and a fresh box has none: that is
+ * the exact machine this project is trying to be installable on. `commitWork` always had this;
+ * `rebase` and `rebase --continue` did not, so on a box with no global identity EVERY landing
+ * failed — RUN-27/28's whole pipeline — and the CI runner, which has no identity, is what
+ * finally said so out loud.
+ */
+const AUTHOR = ['-c', 'user.name=Noriq Runner', '-c', 'user.email=runner@noriq.local'];
+
+/** Hooks belong to the operator, not to this Run — never fire them on its behalf. */
+const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+
 /** Every Run's throwaway branch is namespaced so it's recognizable + reapable. */
 export const WORKTREE_BRANCH_PREFIX = 'noriq/run/';
 export const runBranch = (runId: string): string => `${WORKTREE_BRANCH_PREFIX}${runId}`;
@@ -176,14 +194,9 @@ export class WorktreeManager {
     const { stdout: dirty } = await this.git(['status', '--porcelain'], info.path);
     if (!dirty.trim()) return false; // already committed by the agent, or nothing to save
     await this.git(['add', '-A'], info.path);
-    // Identity is per-invocation: the daemon must not depend on (or mutate) the
-    // operator's global git config, and the authorship should read as the runner's.
     await this.git(
       [
-        '-c',
-        'user.name=Noriq Runner',
-        '-c',
-        'user.email=runner@noriq.local',
+        ...AUTHOR,
         'commit',
         '--no-verify', // hooks are the operator's, not this Run's to trigger
         '-m',
@@ -221,8 +234,10 @@ export class WorktreeManager {
     onto: string,
   ): Promise<{ ok: true } | { ok: false; conflicts: string[] }> {
     try {
-      // Hooks belong to the operator, not to this Run — never fire them on its behalf.
-      await this.git(['-c', 'core.hooksPath=/dev/null', 'rebase', onto], info.path);
+      // AUTHOR because a rebase WRITES commits (it replays them onto a new base), and git
+      // refuses with "Committer identity unknown" when none is configured — which is the
+      // default state of a fresh box, and was of CI.
+      await this.git([...NO_HOOKS, ...AUTHOR, 'rebase', onto], info.path);
       return { ok: true };
     } catch {
       const { stdout } = await this.git(['diff', '--name-only', '--diff-filter=U'], info.path).catch(() => ({
@@ -274,7 +289,9 @@ export class WorktreeManager {
     await this.git(['add', '-A'], info.path);
     try {
       await this.git(
-        ['-c', 'core.hooksPath=/dev/null', '-c', 'core.editor=true', 'rebase', '--continue'],
+        // core.editor=true so `--continue` never opens an editor for the commit message, and
+        // AUTHOR for the same reason as rebaseOnto: this writes the resolved commit.
+        [...NO_HOOKS, ...AUTHOR, '-c', 'core.editor=true', 'rebase', '--continue'],
         info.path,
       );
       return { ok: true };

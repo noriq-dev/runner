@@ -134,6 +134,90 @@ describe('unsaved work survives (real git)', () => {
   });
 });
 
+describe('landing on a box with NO git identity (RUN-42)', () => {
+  // The condition CI runs in, and the condition a fresh install runs in — which is the whole
+  // point of this project. git REFUSES to write a commit with "Committer identity unknown" when
+  // none is configured, so `rebase` (which replays commits) and `rebase --continue` (which
+  // writes the resolved one) failed outright. commitWork always passed an identity; those two
+  // did not, so EVERY landing failed on such a box — RUN-27/28's entire pipeline.
+  //
+  // GIT_CONFIG_GLOBAL/SYSTEM=devNull is what makes this reproducible on a developer machine
+  // that does have an identity. Without it this test passes everywhere and proves nothing —
+  // which is exactly how the bug reached main in the first place.
+  const noIdentityGit = (args: string[], cwd: string) =>
+    execFileP('git', args, {
+      cwd,
+      env: { ...process.env, GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull },
+    });
+
+  let bare: string;
+  let wmBare: WorktreeManager;
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-noident-'));
+    bare = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', bare]);
+    await writeFile(path.join(bare, 'README.md'), '# hi\n');
+    // The FIXTURE still needs an identity to build the repo — the point is what the DAEMON does.
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'add', '.'], bare);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'init'], bare);
+    wmBare = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees'), git: noIdentityGit });
+  }, 30000);
+
+  it('commits a run’s work without borrowing the operator’s identity', async () => {
+    const wt = await wmBare.create(bare, 'noid1');
+    await writeFile(path.join(wt.path, 'a.ts'), 'export const a = 1;\n');
+    expect(await wmBare.commitWork(wt, 'noriq run noid1')).toBe(true);
+    const { stdout } = await noIdentityGit(['log', '-1', '--format=%an <%ae>'], wt.path);
+    // And it reads as the runner, not as a human who never touched it.
+    expect(stdout.trim()).toBe('Noriq Runner <runner@noriq.local>');
+  });
+
+  it('rebases without one too — this is the bug CI caught', async () => {
+    // A rebase REPLAYS commits, so it writes them, so it needs an author. Without one git does
+    // not warn and carry on: it stops.
+    await wmBare.createBranch(bare, 'noriq/integration-noid', 'main');
+    const first = await wmBare.create(bare, 'noid2');
+    await writeFile(path.join(first.path, 'x.ts'), 'export const x = 1;\n');
+    await wmBare.commitWork(first, 'first');
+    const { stdout: head } = await noIdentityGit(['rev-parse', 'HEAD'], first.path);
+    await wmBare.landFastForward(bare, 'noriq/integration-noid', head.trim());
+
+    // A second run, forked from before the first landed → a real rebase, not a no-op.
+    const second = await wmBare.create(bare, 'noid3', { baseRef: 'main' });
+    await writeFile(path.join(second.path, 'y.ts'), 'export const y = 1;\n');
+    await wmBare.commitWork(second, 'second');
+    const rebased = await wmBare.rebaseOnto(second, 'noriq/integration-noid');
+    expect(rebased).toEqual({ ok: true });
+    // The rebased sha, resolved in the WORKTREE — 'HEAD' would resolve in the main checkout,
+    // which is a different commit entirely.
+    const { stdout: tip } = await noIdentityGit(['rev-parse', 'HEAD'], second.path);
+    expect(await wmBare.landFastForward(bare, 'noriq/integration-noid', tip.trim())).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('continues a conflicted rebase without one', async () => {
+    await wmBare.createBranch(bare, 'noriq/integration-conf', 'main');
+    const a = await wmBare.create(bare, 'noid4');
+    await writeFile(path.join(a.path, 'duel.ts'), 'export const v = "a";\n');
+    await wmBare.commitWork(a, 'a');
+    const { stdout: aHead } = await noIdentityGit(['rev-parse', 'HEAD'], a.path);
+    await wmBare.landFastForward(bare, 'noriq/integration-conf', aHead.trim());
+
+    const b = await wmBare.create(bare, 'noid5', { baseRef: 'main' });
+    await writeFile(path.join(b.path, 'duel.ts'), 'export const v = "b";\n');
+    await wmBare.commitWork(b, 'b');
+    const conflicted = await wmBare.rebaseOnto(b, 'noriq/integration-conf');
+    expect(conflicted.ok).toBe(false);
+
+    // The agent "resolves" it; --continue writes the resolved commit, so it needs an author too.
+    await writeFile(path.join(b.path, 'duel.ts'), 'export const v = "resolved";\n');
+    expect((await wmBare.continueRebase(b)).ok).toBe(true);
+    expect(await wmBare.rebaseInProgress(b)).toBe(false);
+  });
+});
+
 describe('landing primitives (real git)', () => {
   const LAND = 'noriq/integration';
 
