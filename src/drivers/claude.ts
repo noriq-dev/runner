@@ -39,6 +39,16 @@ export interface SdkAssistantMessage {
   type: 'assistant';
   message: { content: SdkContentBlock[]; usage?: SdkUsage };
 }
+/** The SDK's per-model aggregate (sdk.d.ts `ModelUsage`). The only complete record of what a run
+ *  spent — `usage` describes one model's path and silently omits sub-agents. See
+ *  telemetryFromResult for the measurements. */
+export interface SdkModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  costUSD?: number;
+}
 export interface SdkResultMessage {
   type: 'result';
   subtype: string; // 'success' | 'error_max_turns' | 'error_max_budget_usd' | 'error_during_execution' | ...
@@ -46,6 +56,8 @@ export interface SdkResultMessage {
   num_turns: number;
   total_cost_usd: number;
   usage: SdkUsage;
+  /** Keyed by model id, e.g. 'claude-opus-4-8[1m]' and 'claude-haiku-4-5-20251001'. */
+  modelUsage?: Record<string, SdkModelUsage>;
   stop_reason?: string | null;
 }
 export type SdkMessage =
@@ -167,12 +179,44 @@ const extractText = (blocks: SdkContentBlock[]): string =>
     .map((b) => b.text)
     .join('');
 
+/**
+ * The run's true totals, from `modelUsage` rather than `usage` (RUN-34).
+ *
+ * `result.usage` describes ONE model's path. `result.modelUsage` is the SDK's per-model aggregate,
+ * and it is the only complete picture — measured on a real 2-message run:
+ *
+ *   summed assistant messages : input 4    output 70  cacheRead 40554  cacheCreate 5332
+ *   result.usage              : input 4    output 79  cacheRead 40554  cacheCreate 5332
+ *   summed modelUsage         : input 540  output 93  cacheRead 40554  cacheCreate 5332
+ *
+ * The 536 missing input tokens are a haiku sub-agent the primary path never mentions. `usage`
+ * cannot see it; `modelUsage` lists it as its own model. The clincher is cost: `total_cost_usd`
+ * (0.076198) equals the sum of modelUsage's per-model costUSD to the last digit, and does NOT
+ * match anything derivable from `usage` alone. So modelUsage is what the SDK itself bills from.
+ *
+ * Reading `usage` therefore UNDER-reports: whole models are silently free. A budget enforced on
+ * that number does not bind, and the dashboard's spend is wrong low.
+ */
 function telemetryFromResult(m: SdkResultMessage): DriverTelemetry {
+  const models = Object.values(m.modelUsage ?? {});
+  if (!models.length) {
+    // No modelUsage (an older SDK, or a result shape we have not seen) — fall back rather than
+    // report zero. Under-reporting beats inventing.
+    return {
+      inputTokens: m.usage.input_tokens ?? 0,
+      outputTokens: m.usage.output_tokens ?? 0,
+      cacheReadTokens: m.usage.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: m.usage.cache_creation_input_tokens ?? 0,
+      costUsd: m.total_cost_usd,
+      numTurns: m.num_turns,
+    };
+  }
   return {
-    inputTokens: m.usage.input_tokens ?? 0,
-    outputTokens: m.usage.output_tokens ?? 0,
-    cacheReadTokens: m.usage.cache_read_input_tokens ?? 0,
-    cacheCreationTokens: m.usage.cache_creation_input_tokens ?? 0,
+    inputTokens: models.reduce((a, u) => a + (u.inputTokens ?? 0), 0),
+    outputTokens: models.reduce((a, u) => a + (u.outputTokens ?? 0), 0),
+    cacheReadTokens: models.reduce((a, u) => a + (u.cacheReadInputTokens ?? 0), 0),
+    cacheCreationTokens: models.reduce((a, u) => a + (u.cacheCreationInputTokens ?? 0), 0),
+    // total_cost_usd is the SDK's own sum of these — verified equal to the last digit.
     costUsd: m.total_cost_usd,
     numTurns: m.num_turns,
   };
@@ -287,18 +331,27 @@ export class ClaudeDriver implements AgentDriver {
             if (text) opts.handlers?.onText?.(text);
             const u = am.message.usage;
             if (u) {
-              // KNOWN BUG — RUN-34. These are SUMMED per assistant message, but each
-              // message's usage describes its own API request, whose input is the entire
-              // conversation so far. So the context gets counted once per turn and `live`
-              // climbs well past the truth, then drops when `result` replaces it with the
-              // SDK's own aggregate (telemetryFromResult, below).
+              // RUN-34, measured rather than assumed. The old comment here claimed this sum
+              // "climbs well past the truth, then drops when result replaces it". A real 2-message
+              // run says otherwise — summing these tracks result.usage almost exactly:
               //
-              // This is not cosmetic: superviseBudget's checkSpend reads totalTokens(live)
-              // and SIGTERMs on maxTokens — so a long run can be killed for a breach that
-              // never happened, and the terminal telemetry will contradict the reason it
-              // died. Do NOT "fix" by guessing: confirm what result.usage and modelUsage
-              // actually aggregate (sdk.d.ts SDKResultMessage) against a real run's frames
-              // first, then make the live figure converge on that definition.
+              //   summed here  : input 4  output 70  cacheRead 40554  cacheCreate 5332
+              //   result.usage : input 4  output 79  cacheRead 40554  cacheCreate 5332
+              //
+              // So the live figure is not inflated. It is INCOMPLETE, in the same way result.usage
+              // is: both see only the primary model's messages, while modelUsage showed a haiku
+              // sub-agent had also burned 536 input / 14 output. The terminal figure now sums
+              // modelUsage (telemetryFromResult), so live is a lower bound that steps UP at the
+              // end rather than a wrong number that drops.
+              //
+              // What that means for the budget: superviseBudget reads totalTokens(live), so a
+              // ceiling binds on primary-model spend and under-counts sub-agents — it enforces
+              // late, never early. A run is not killed for a breach that never happened.
+              //
+              // Still not perfect: cacheRead is summed per message, and each message's cacheRead
+              // is that request's whole context — so a long conversation counts the same cached
+              // context once per turn. That IS what you are billed (each request reads it), and
+              // result.usage agrees, so it is not double-counting — it is what cache reads cost.
               live.inputTokens += u.input_tokens ?? 0;
               live.outputTokens += u.output_tokens ?? 0;
               live.cacheReadTokens += u.cache_read_input_tokens ?? 0;

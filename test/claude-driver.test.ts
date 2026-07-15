@@ -224,6 +224,52 @@ describe('ClaudeDriver', () => {
   });
 });
 
+// RUN-34: what a run actually spent, measured against the real SDK rather than assumed.
+describe('terminal telemetry counts every model (RUN-34)', () => {
+  it('sums modelUsage — `usage` silently omits sub-agent models', async () => {
+    // Real numbers from a real 2-message run (see telemetryFromResult). `usage` reported
+    // input 4 / output 79 while modelUsage showed a haiku sub-agent had ALSO burned 536 input
+    // and 14 output. Reading `usage` makes whole models free.
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 2,
+      total_cost_usd: 0.076198,
+      usage: { input_tokens: 4, output_tokens: 79, cache_read_input_tokens: 40554, cache_creation_input_tokens: 5332 },
+      modelUsage: {
+        'claude-haiku-4-5-20251001': { inputTokens: 536, outputTokens: 14, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.000581 },
+        'claude-opus-4-8[1m]': { inputTokens: 4, outputTokens: 79, cacheReadInputTokens: 40554, cacheCreationInputTokens: 5332, costUSD: 0.075617 },
+      },
+    });
+    const exit = await h.session.done();
+    expect(exit.telemetry.inputTokens).toBe(540); // 4 + 536 — NOT usage's 4
+    expect(exit.telemetry.outputTokens).toBe(93); // 79 + 14
+    expect(exit.telemetry.cacheReadTokens).toBe(40554);
+    // total_cost_usd is the SDK's own sum of the per-model costs — it agreed to the last digit.
+    expect(exit.telemetry.costUsd).toBe(0.076198);
+  });
+
+  it('falls back to `usage` when modelUsage is absent — under-report rather than invent', async () => {
+    // An older SDK, or a result shape we have not seen. Reporting zero would be worse than
+    // reporting the part we can see.
+    const h = harness();
+    h.getFake().push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 11, output_tokens: 22 },
+    });
+    const exit = await h.session.done();
+    expect(exit.telemetry.inputTokens).toBe(11);
+    expect(exit.telemetry.outputTokens).toBe(22);
+  });
+});
+
 describe('Noriq MCP wiring', () => {
   const opts = (h: ReturnType<typeof harness>) => h.getFake().options as SdkQueryOptions;
 
