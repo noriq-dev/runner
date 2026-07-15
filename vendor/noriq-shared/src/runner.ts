@@ -144,6 +144,9 @@ export const Runner = z.object({
   /** When a human cut this runner off (RUN-35). Non-null ⇒ status is 'offboarded' and its
    *  token has been revoked. */
   offboardedAt: z.string().datetime().nullable().default(null),
+  /** The daemon's RELEASE version (RUN-36) — distinct from RUNNER_PROTOCOL_VERSION, which
+   *  answers "can we talk". Null = registered before version reporting existed. */
+  version: z.string().nullable().default(null),
   createdAt: z.string().datetime(),
 });
 export type Runner = z.infer<typeof Runner>;

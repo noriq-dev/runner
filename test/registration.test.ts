@@ -45,3 +45,20 @@ describe('buildRegistration', () => {
     expect(reg.repos).toEqual([]);
   });
 });
+
+describe('version reporting (RUN-36)', () => {
+  it('registration carries the release version, from package.json', async () => {
+    // Not a hand-typed literal. src/version.ts used to hardcode it under a "bump in lockstep"
+    // comment while the build injected nothing, so a published bundle could report a version
+    // the package wasn't. A version that can lie is worse than none: RUN-37 compares against
+    // it, and the server uses it to decide whether a runner is too old to trust.
+    const { VERSION } = await import('../src/version');
+    const pkg = JSON.parse(
+      await (await import('node:fs/promises')).readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { version: string };
+    expect(VERSION).toBe(pkg.version);
+
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, []);
+    expect(reg.version).toBe(pkg.version);
+  });
+});

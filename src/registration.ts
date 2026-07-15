@@ -1,5 +1,6 @@
 import type { AgentTool, RunKind } from '@noriq-dev/shared';
 import type { DiscoveredRepo } from './discovery';
+import { VERSION } from './version';
 
 export interface RegistrationParams {
   label: string;
@@ -16,6 +17,9 @@ export interface RegistrationParams {
 export interface RunnerRegistration {
   runnerId?: string;
   label: string;
+  /** The daemon's RELEASE version (RUN-36) — what code this box is running. Distinct from
+   *  RUNNER_PROTOCOL_VERSION in the WS hello, which answers "can we talk at all". */
+  version: string;
   tools: AgentTool[];
   kinds: RunKind[];
   maxConcurrency: number;
@@ -32,6 +36,11 @@ export function buildRegistration(
   return {
     ...(params.runnerId ? { runnerId: params.runnerId } : {}),
     label: params.label,
+    // What code this box is running (RUN-36). Registration carried tools/kinds/concurrency and
+    // no version, so the dashboard could not show one and the server could not warn about a
+    // runner too old to trust. Distinct from RUNNER_PROTOCOL_VERSION in the WS hello: protocol
+    // is "can we talk", this is "what code is this".
+    version: VERSION,
     tools: params.tools,
     kinds: params.kinds ?? DEFAULT_KINDS,
     maxConcurrency: params.concurrency,

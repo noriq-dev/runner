@@ -42,6 +42,7 @@ describe('NoriqClient', () => {
     });
     const runner = await client.registerRunner({
       label: 'l',
+      version: '1.2.3',
       tools: ['claude'],
       kinds: ['build'],
       maxConcurrency: 1,
