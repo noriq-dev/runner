@@ -15,6 +15,7 @@ import {
   assembleConflictPrompt,
   landFailureComment,
   parseResolution,
+  rejectTargetBranch,
   resolveLandBranch,
 } from './land';
 import { logger as defaultLogger } from './logger';
@@ -247,7 +248,28 @@ export class RunSupervisor {
     // accumulates on its own branch and its merge request is one coherent body of work. The plan
     // is resolved server-side and frozen on the Run at dispatch — the daemon cannot work it out,
     // since a task-anchored run only knows its task and plan membership lives in phase_tasks.
-    const branch = resolveLandBranch(policy.branch, run.planKey);
+    const computed = resolveLandBranch(policy.branch, run.planKey);
+
+    // A dispatch may steer its own landing branch (RUN-41) — but only inside the envelope the
+    // REPO allows. The manifest is the authority: the repo owner and whoever clicked dispatch are
+    // not always the same person, and `[land]` authorises landing *here*, not landing anywhere.
+    //
+    // A refused override FAILS the run rather than quietly landing on the default. Someone asked
+    // for a specific branch; silently doing something else with an agent's diff is how work ends
+    // up somewhere nobody looked.
+    let branch = computed;
+    if (run.targetBranch && run.targetBranch !== computed) {
+      const refusal = rejectTargetBranch(run.targetBranch, policy);
+      if (refusal) {
+        this.log.warn('refusing the dispatch’s branch override', {
+          runId: run.id,
+          target: run.targetBranch,
+          refusal,
+        });
+        return { landed: false, branch: computed, reason: 'error', detail: refusal };
+      }
+      branch = run.targetBranch;
+    }
     const wt = this.deps.worktrees;
 
     // First landing into this branch: fork it from the repo's declared main so the

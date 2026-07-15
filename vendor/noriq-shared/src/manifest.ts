@@ -87,6 +87,16 @@ export const LandPolicy = z.object({
   // by whoever dispatched. Requires autoPush — a merge request cannot exist without the branch
   // reaching the remote.
   mergeTarget: z.string().min(1).nullable().default(null),
+  // What a DISPATCH may override `branch` with (RUN-41). Globs: ["feature/**", "wip/*"].
+  //
+  // EMPTY MEANS NO OVERRIDE, and that default is load-bearing. Today a repo saying
+  // `branch = "agents"` can only ever be written at `agents`; if a per-dispatch branch defaulted
+  // to "anywhere", every existing repo would silently become writable at `main` by anyone who can
+  // dispatch. That is a live security envelope widening because a field appeared — the same
+  // silent widening refused in RUN-38 (a refresh must not broaden scope) and RUN-35 (an offboard
+  // must not evaporate on reconnect). The repo owner and the dispatcher are not always the same
+  // person, so the repo opts into being steerable.
+  allowedBranches: z.array(z.string().min(1)).default([]),
   // Land only if the deterministic verify passes on the REBASED result. Off means an
   // unverified diff reaches `branch` — permitted, never assumed.
   onlyWhenVerifyPasses: z.boolean().default(true),

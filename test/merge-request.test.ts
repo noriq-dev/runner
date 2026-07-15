@@ -77,3 +77,36 @@ describe('openMergeRequest (RUN-28)', () => {
     expect(body).toMatch(/verified there|rebased onto/);
   });
 });
+
+// RUN-41: a dispatch may steer its landing branch — inside the envelope the REPO allows.
+describe('rejectTargetBranch (RUN-41)', () => {
+  const policy = (allowedBranches: string[]) => ({ branch: 'noriq/integration', allowedBranches });
+
+  it('refuses ANY override when the repo has not opted in', async () => {
+    // The load-bearing default. Today a repo saying branch = "agents" can only ever be written at
+    // "agents". If a per-dispatch branch defaulted to "anywhere", every existing repo would
+    // silently become writable at main by anyone who can dispatch — a live security envelope
+    // widening because a field appeared. The repo opts into being steerable.
+    const { rejectTargetBranch } = await import('../src/land');
+    expect(rejectTargetBranch('feature/x', policy([]))).toMatch(/does not allow/);
+    expect(rejectTargetBranch('main', policy([]))).toMatch(/does not allow/);
+  });
+
+  it('allows the repo’s own computed branch even with no allowlist', async () => {
+    // Naming the default explicitly is not an override — it is asking for what would happen
+    // anyway, and refusing it would be pedantry that breaks the obvious UI (prefill the field).
+    const { rejectTargetBranch } = await import('../src/land');
+    expect(rejectTargetBranch('noriq/integration', policy([]))).toBeNull();
+  });
+
+  it('honours the allowlist, and only it', async () => {
+    const { rejectTargetBranch } = await import('../src/land');
+    const p = policy(['feature/**', 'wip/*']);
+    expect(rejectTargetBranch('feature/auth', p)).toBeNull();
+    expect(rejectTargetBranch('feature/auth/deep', p)).toBeNull();
+    expect(rejectTargetBranch('wip/quick', p)).toBeNull();
+    // The point of the allowlist: "feature/** yes, main no".
+    expect(rejectTargetBranch('main', p)).toMatch(/not in this repo/);
+    expect(rejectTargetBranch('wip/too/deep', p)).toMatch(/not in this repo/); // * is one segment
+  });
+});

@@ -152,6 +152,7 @@ describe('changedSections', () => {
           land: {
             branch: 'main',
             mergeTarget: null,
+            allowedBranches: [],
             onlyWhenVerifyPasses: true,
             resolveConflicts: true,
             autoPush: false,

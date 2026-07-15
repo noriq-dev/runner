@@ -50,6 +50,12 @@ cmd = "npm run typecheck && npm test"
 # onlyWhenVerifyPasses = true   # false = an unverified diff reaches `branch`. Allowed, never assumed.
 # resolveConflicts = true       # let the build agent fix MECHANICAL rebase conflicts;
 #                               # anything needing a decision still bails to a human.
+# allowedBranches = ["feature/**", "wip/*"]
+#                               # what a DISPATCH may override `branch` with (globs). OMIT → no
+#                               # override: `branch` is the only place runs land here. That default
+#                               # is deliberate — otherwise adding this feature would silently make
+#                               # every repo writable at `main` by anyone who can dispatch. You and
+#                               # whoever clicks dispatch are not always the same person.
 # mergeTarget = "main"          # open a merge request from `branch` to this, when the PLAN those
 #                               # runs belong to is finished — so a human reviews one coherent
 #                               # plan's worth of work, not a click per run. Needs autoPush (a PR

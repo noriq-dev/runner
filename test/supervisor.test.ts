@@ -168,6 +168,8 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   // No plan by default: a one-off dispatch. The per-plan branch (RUN-28) is opt-in on both
   // sides — a `<planKey>` template AND a run that actually belongs to a plan.
   planKey: null,
+  // No override by default: a dispatch steers its branch only when a human asked (RUN-41).
+  targetBranch: null,
   kind: 'scope',
   anchor: null,
   verifiesRunId: null,
@@ -768,6 +770,7 @@ const LANDING = (over: Partial<ProjectManifest['land']> = {}) =>
     land: {
       branch: 'noriq/integration',
       mergeTarget: null,
+      allowedBranches: [],
       onlyWhenVerifyPasses: true,
       resolveConflicts: true,
       autoPush: false,
@@ -837,6 +840,51 @@ describe('[land].autoPush (RUN-27)', () => {
     h.claude.complete('done');
     await done;
     expect(h.worktrees.pushes).toEqual([]);
+  });
+});
+
+// RUN-41: a dispatch steering its own landing branch.
+describe('per-dispatch target branch (RUN-41)', () => {
+  const buildRun = (over = {}) =>
+    makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, ...over });
+
+  it('lands on the dispatch’s branch when the repo allows it', async () => {
+    const h = harness({ manifest: LANDING({ allowedBranches: ['feature/**'] }) });
+    const done = h.supervisor.supervise(buildRun({ targetBranch: 'feature/risky-refactor' }));
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.worktrees.landings).toEqual([{ branch: 'feature/risky-refactor', fromRef: 'noriq/run/run_1' }]);
+  });
+
+  it('FAILS the run when the repo did not allow the override — it does not quietly use the default', async () => {
+    // Silently landing somewhere other than where a human asked is how an agent's diff ends up
+    // in a place nobody looked. Refuse loudly instead.
+    const h = harness({ manifest: LANDING() }); // no allowedBranches → not steerable
+    const done = h.supervisor.supervise(buildRun({ targetBranch: 'main' }));
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(h.worktrees.landings).toEqual([]); // nothing landed anywhere
+  });
+
+  it('refuses a branch outside the allowlist', async () => {
+    const h = harness({ manifest: LANDING({ allowedBranches: ['feature/**'] }) });
+    const done = h.supervisor.supervise(buildRun({ targetBranch: 'main' }));
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('failed');
+    expect(h.worktrees.landings).toEqual([]);
+  });
+
+  it('no override → the repo’s computed branch, exactly as before', async () => {
+    const h = harness({ manifest: LANDING({ allowedBranches: ['feature/**'] }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.landings).toEqual([{ branch: 'noriq/integration', fromRef: 'noriq/run/run_1' }]);
   });
 });
 

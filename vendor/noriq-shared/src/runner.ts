@@ -86,6 +86,11 @@ export const Run = z.object({
   // it out: a task-anchored run knows only its task, and plan membership lives in phase_tasks.
   // Null = a one-off dispatch belonging to no plan. Drives the per-plan working branch.
   planKey: z.string().nullable().default(null),
+  // A per-dispatch override of the landing branch (RUN-41). Null = whatever [land] computes (the
+  // per-plan working branch, or the static one). Only honoured if the repo's
+  // [land].allowedBranches permits it — a dispatcher must not be able to widen the repo owner's
+  // envelope, and the manifest is the authority.
+  targetBranch: z.string().nullable().default(null),
   brief: z.string().default(''), // the dispatch intent; may be empty for anchored runs
   repoRef: z.string(), // id of a RunnerRepo advertised by the owning runner
   agentTool: AgentTool,

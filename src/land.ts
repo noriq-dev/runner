@@ -35,6 +35,47 @@ export function resolveLandBranch(template: string, planKey: string | null): str
   return template.replaceAll('<planKey>', '').replace(/[-_/]+$/, '') || template;
 }
 
+/**
+ * Does `branch` match one of the repo's allowed globs? (RUN-41)
+ *
+ * Supports the two shapes a human actually writes:
+ *   "feature/**"  → feature/ and anything under it, at any depth
+ *   "wip/*"       → one segment only: wip/foo, but NOT wip/foo/bar
+ *   "exact-name"  → itself
+ *
+ * Hand-rolled rather than a glob dependency: the vocabulary is two wildcards, and the alternative
+ * is pulling a package into a security decision. Escaping everything else means a branch called
+ * `release.v1` cannot be matched by `release+v1` through regex accident.
+ */
+export function branchAllowed(branch: string, globs: string[]): boolean {
+  return globs.some((glob) => {
+    const rx = glob
+      .split(/(\*\*|\*)/)
+      .map((part) =>
+        part === '**' ? '.*' : part === '*' ? '[^/]*' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+      )
+      .join('');
+    return new RegExp(`^${rx}$`).test(branch);
+  });
+}
+
+/** Why a dispatch's branch override was refused (RUN-41). Null = allowed. */
+export function rejectTargetBranch(
+  target: string,
+  policy: { branch: string; allowedBranches: string[] },
+): string | null {
+  // The computed target is always fine — that IS the repo's own choice, and a dispatch naming it
+  // explicitly is asking for the default.
+  if (target === policy.branch) return null;
+  if (!policy.allowedBranches.length) {
+    return 'this repo does not allow a dispatch to choose its landing branch — add [land].allowedBranches to opt in';
+  }
+  if (!branchAllowed(target, policy.allowedBranches)) {
+    return `"${target}" is not in this repo's [land].allowedBranches (${policy.allowedBranches.join(', ')})`;
+  }
+  return null;
+}
+
 export interface LandOutcome {
   landed: boolean;
   branch: string;
