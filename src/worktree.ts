@@ -258,7 +258,12 @@ export class WorktreeManager {
     const { stdout: apply } = await this.git(['rev-parse', '--git-path', 'rebase-apply'], info.path).catch(
       () => ({ stdout: '', stderr: '' }),
     );
-    const resolve = (p: string) => (p.startsWith('/') ? p : `${info.path}/${p}`);
+    // path.isAbsolute, NOT startsWith('/') (RUN-42). `--git-path` returns an absolute path here,
+    // and on Windows that is `C:/…` — which does not start with '/', so it read as RELATIVE and
+    // got mangled into `${info.path}/C:/…`. existsSync then said false and rebaseInProgress()
+    // answered "no rebase in progress" — a WRONG ANSWER rather than an error, silently disabling
+    // the agent conflict-resolution path that resolveConflict exists to provide.
+    const resolve = (p: string) => (path.isAbsolute(p) ? p : path.join(info.path, p));
     return existsSync(resolve(dir.trim())) || existsSync(resolve(apply.trim() || 'x'));
   }
 

@@ -178,7 +178,7 @@ const perm = (write: boolean): PermissionProfile => ({ write, network: 'restrict
 const noModel = (): ModelDefault => ({ model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
-  verify: { cmd: 'npm test', timeoutSeconds: null },
+  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null },
   tool: null,
   defaultBranch: null,
   land: null,

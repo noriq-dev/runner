@@ -58,6 +58,28 @@ defaultBranch = "main"
 [verify]
 cmd = "npm run typecheck && npm test"
 # timeoutSeconds = 600   # default 600; null = the built-in default
+#
+# WHICH SHELL `cmd` RUNS UNDER (RUN-42)
+# Unset = the platform's own: `sh` on macOS/Linux, **cmd.exe on Windows**.
+#
+# That matters because THIS FILE IS COMMITTED: `cmd` travels to teammates on other
+# operating systems. `&&` means the same thing in both shells, so the common
+# `npm run typecheck && npm test` above is portable — but by luck, not design.
+# These are not portable to cmd.exe:
+#
+#   FOO=1 npm test          # env prefix — sh only
+#   npm test 2>&1 | tee f   # redirection/pipes differ
+#   npx tsc src/**/*.ts     # globbing is the shell's job on sh, the app's on Windows
+#   echo "$HOME"            # $VAR vs %VAR%
+#
+# If your verify command needs any of that on a mixed-OS team, pin a shell and get
+# one behaviour everywhere. Git for Windows ships bash, and this daemon already
+# requires git — so `bash` is a safe pin in practice:
+#
+# shell = "bash"
+#
+# Not the default, because a pin that turns out to be absent fails the gate outright,
+# which is worse than cmd.exe handling the common case correctly.
 
 # ── Auto-landing (opt-in) ────────────────────────────────────────────────────
 # Where a passing build's diff goes, so you stop approving every run by hand. The

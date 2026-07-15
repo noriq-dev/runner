@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import type { PermissionProfile, RunEffort } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
+import { killProcessTree, treeSpawnOptions } from '../proc';
 import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, sanitizedAgentEnv } from '../security';
 import { NORIQ_MCP_NAME } from './claude';
 import {
@@ -289,6 +290,9 @@ export const defaultSpawnCodex = (
     cwd: opts.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: opts.noriqMcp ? agentEnvWithMcpToken(opts.noriqMcp.token) : sanitizedAgentEnv(),
+    // Group it with its descendants so close() can reach them all (RUN-42). POSIX-only; on
+    // Windows this is a no-op and taskkill /T walks the tree instead.
+    ...treeSpawnOptions(),
   });
   const events = new AsyncQueue<CodexEvent>();
   let nextId = 1;
@@ -378,11 +382,13 @@ export const defaultSpawnCodex = (
     },
     interrupt: () => send(RPC.turnInterrupt, { threadId, turnId }, true),
     close: () => {
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        /* already gone */
-      }
+      // The tree, not just codex (RUN-42): codex spawns tools of its own, and a stop that leaves
+      // them running leaves the run's worktree locked and its CPU burning under a run the daemon
+      // has already reported terminal. `force: false` keeps the POSIX contract the budget/steering
+      // code was written against — SIGTERM, a chance to clean up. Windows has no equivalent (see
+      // proc.ts): "ask nicely" is a WM_CLOSE a console app may ignore, and kill('SIGTERM') there
+      // is already a hard TerminateProcess, so graceful-then-force is a POSIX-only idea.
+      killProcessTree(child, { force: false });
     },
   };
 };

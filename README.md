@@ -24,6 +24,15 @@ The Claude driver also needs the `claude` CLI on PATH (`npm i -g @anthropic-ai/c
 the Codex driver needs `codex`. During development, skip the build with
 `npm run dev -- <command>` (runs `src/cli.ts` via tsx).
 
+**Platforms:** Linux, macOS, and **native Windows** — no WSL required. Windows is a CI matrix
+leg, not a best-effort claim. Node ≥20 and `git` on PATH everywhere.
+
+One Windows-specific thing to know, because this file is committed and your teammates may not
+share your OS: your repo's `[verify] cmd` runs under **cmd.exe** there, and under `sh`
+elsewhere. `&&` works in both, so the usual `npm run typecheck && npm test` is fine — but env
+prefixes (`FOO=1 npm test`), `2>&1`, `$VAR`, and shell globbing are not. Pin
+`[verify] shell = "bash"` if you need them; see [project.toml.example](project.toml.example).
+
 ## Authenticate
 
 The daemon dials the Noriq server with **your OAuth token** — the only secret that

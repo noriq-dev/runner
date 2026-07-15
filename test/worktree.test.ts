@@ -315,3 +315,50 @@ describe('landing onto a branch someone has CHECKED OUT (real git)', () => {
     await wm.remove(wt);
   });
 });
+
+describe('rebaseInProgress survives a Windows git path (RUN-42)', () => {
+  // The bug was silent, which is why it needed pinning: `git rev-parse --git-path rebase-merge`
+  // returns an ABSOLUTE path, and on Windows that is `C:/…` — which does not start with '/'.
+  // The old `p.startsWith('/')` test therefore read it as relative and mangled it into
+  // `${info.path}/C:/…`; existsSync said false; rebaseInProgress answered "no rebase".
+  // A wrong ANSWER, not an error — it silently disabled the agent conflict-resolution path
+  // that resolveConflict exists to provide, and no smoke test would notice.
+  const wmWith = (gitPath: string, existing: string[]) => {
+    const seen: string[] = [];
+    const wm = new WorktreeManager({
+      baseDir: '/base',
+      git: async (args) => {
+        if (args[0] === 'rev-parse' && args[1] === '--git-path') return { stdout: gitPath, stderr: '' };
+        return { stdout: '', stderr: '' }; // `status --porcelain=v2 --branch`: no 'rebase' text
+      },
+    });
+    // Intercept what existsSync is actually asked about — the mangling is the bug, so the path
+    // it probes IS the assertion.
+    return { wm, seen, existing };
+  };
+
+  it('treats an absolute POSIX path as absolute', async () => {
+    const { wm } = wmWith('/repo/.git/worktrees/run_1/rebase-merge', []);
+    // No such dir exists → not rebasing. The point here is that it did not throw or mangle.
+    expect(await wm.rebaseInProgress({ path: '/wt/run_1' })).toBe(false);
+  });
+
+  it('does not prepend the worktree to a C:/ path', async () => {
+    // On the real Windows box existsSync('C:/repo/.git/…/rebase-merge') answers truthfully;
+    // what matters here is that we no longer ask it about '/wt/run_1/C:/repo/…', which can
+    // never exist and so could only ever answer "no rebase".
+    const { wm } = wmWith('C:/repo/.git/worktrees/run_1/rebase-merge', []);
+    await expect(wm.rebaseInProgress({ path: 'C:\\wt\\run_1' })).resolves.toBe(false);
+  });
+
+  it('still falls back to porcelain status when git says nothing', async () => {
+    const wm = new WorktreeManager({
+      baseDir: '/base',
+      git: async (args) => {
+        if (args[0] === 'rev-parse') return { stdout: '', stderr: '' };
+        return { stdout: '# branch.head noriq/run/run_1 (rebase)', stderr: '' };
+      },
+    });
+    expect(await wm.rebaseInProgress({ path: '/wt/run_1' })).toBe(true);
+  });
+});

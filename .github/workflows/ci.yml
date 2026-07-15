@@ -7,7 +7,18 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Native Windows is a supported platform, not a best-effort one (RUN-42) — so it is a matrix
+    # leg rather than a line in the README. Every break this task fixed produced a WRONG ANSWER
+    # instead of an error (rebaseInProgress silently reporting "no rebase in progress"; a timeout
+    # kill that reaps the shell and orphans the tree it was meant to stop), which is exactly the
+    # class a human smoke test misses and a green Linux run cannot see at all. The platform
+    # branches are unit-tested with an injected platform; this job is what keeps those stubs
+    # honest about the real one.
+    strategy:
+      fail-fast: false # a Windows-only break must show up AS a Windows-only break
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

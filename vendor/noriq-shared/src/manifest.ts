@@ -76,6 +76,21 @@ const defaultPermissions = (): KindPermissions => ({
 export const VerifySpec = z.object({
   cmd: z.string().min(1), // e.g. "cd apps/api && npx tsc --noEmit && npm test"
   timeoutSeconds: z.number().int().positive().nullable().default(null),
+  /**
+   * Pin the shell `cmd` runs under. Null = the platform's own: `sh` on POSIX, **cmd.exe on
+   * Windows** (RUN-42).
+   *
+   * That difference is a real cost, and this field exists to give a repo a way out of it. This
+   * manifest is COMMITTED, so `cmd` travels to teammates on other operating systems. `&&`
+   * happens to mean the same thing in both shells, so the common `npm run check && npm test`
+   * is portable by luck — but `2>&1`, `$VAR`, quoting, and globs are not. A team on mixed OSes
+   * whose verify command needs any of those can pin `shell = "bash"` (Git for Windows ships
+   * one, and this daemon already requires git) and get one behaviour everywhere.
+   *
+   * Not the default, because a pin that is absent fails the gate outright, which is worse than
+   * cmd.exe handling the common case correctly.
+   */
+  shell: z.string().min(1).nullable().default(null),
 });
 export type VerifySpec = z.infer<typeof VerifySpec>;
 

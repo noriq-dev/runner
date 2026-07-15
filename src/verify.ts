@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { killProcessTree, treeSpawnOptions } from './proc';
 import { sanitizedAgentEnv } from './security';
 
 // The deterministic verify floor (RUN-19): after a build run's agent exits, the
@@ -10,6 +11,9 @@ import { sanitizedAgentEnv } from './security';
 export interface VerifySpec {
   cmd: string;
   timeoutSeconds?: number | null;
+  /** Pin the shell `cmd` runs under. Undefined = the platform's own (sh on POSIX, cmd.exe on
+   *  Windows) — see the manifest schema for why a committed manifest may want to pin one. */
+  shell?: string | null;
 }
 
 export interface VerifyResult {
@@ -24,6 +28,7 @@ export type VerifyExec = (
   cmd: string,
   cwd: string,
   timeoutMs: number,
+  shell?: string,
 ) => Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
 
 const MAX_OUTPUT = 16 * 1024; // keep the tail — the failing error is usually last
@@ -31,19 +36,25 @@ const MAX_OUTPUT = 16 * 1024; // keep the tail — the failing error is usually 
 /** How long to wait for the process group to actually die before giving up on it. */
 const KILL_GRACE_MS = 5_000;
 
-const defaultExec: VerifyExec = (cmd, cwd, timeoutMs) =>
+const defaultExec: VerifyExec = (cmd, cwd, timeoutMs, shell) =>
   new Promise((resolve) => {
     // Sanitized env (RUN-24): the verify command runs repo code — no secrets, no push.
     // `detached` puts the shell and everything it spawns in one process group, so the
     // timeout can kill the WHOLE tree. Without it `child.kill()` signals only the
     // `/bin/sh -c …` wrapper: a hung `vitest` grandchild survives, keeps stdout/stderr
     // open, and 'close' — which fires only once all stdio are closed — never arrives.
+    //
+    // POSIX-only, though (RUN-42): on Windows `detached` means "new CONSOLE", not "new process
+    // group" — so it does not buy the above, and it does pop a console window on a daemon that
+    // should be invisible. Windows gets its tree killed by taskkill instead (see killTree).
     const child = spawn(cmd, {
       cwd,
-      shell: true,
+      // A user-written shell one-liner from the COMMITTED manifest. On Windows `true` means
+      // cmd.exe; `[verify] shell` lets a repo pin one instead — see the schema for the trade.
+      shell: shell ?? true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: sanitizedAgentEnv(),
-      detached: true,
+      ...treeSpawnOptions(),
     });
     let output = '';
     let timedOut = false;
@@ -64,18 +75,9 @@ const defaultExec: VerifyExec = (cmd, cwd, timeoutMs) =>
       resolve(r);
     };
 
-    /** Kill the whole group; fall back to the bare child if it has no group (or is gone). */
-    const killTree = () => {
-      try {
-        if (child.pid) process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* already dead */
-        }
-      }
-    };
+    /** Kill the shell AND everything it spawned — see proc.ts for why that differs per platform,
+     *  and why signalling only the wrapper would hang this promise rather than merely leak. */
+    const killTree = () => killProcessTree(child, { force: true });
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -101,7 +103,7 @@ export async function runVerify(
 ): Promise<VerifyResult> {
   const exec = deps.exec ?? defaultExec;
   const timeoutMs = (spec.timeoutSeconds ?? DEFAULT_VERIFY_TIMEOUT_SECONDS) * 1000;
-  const { exitCode, output, timedOut } = await exec(spec.cmd, cwd, timeoutMs);
+  const { exitCode, output, timedOut } = await exec(spec.cmd, cwd, timeoutMs, spec.shell ?? undefined);
   return { passed: !timedOut && exitCode === 0, exitCode, output: output.trim(), timedOut };
 }
 
