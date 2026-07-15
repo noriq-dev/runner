@@ -28,7 +28,7 @@ that contain it. Security here is load-bearing, not polish.
 | A scope (read-only) agent writes anything | **Per-kind permission profile**: scope gets read-only tools (Claude `dontAsk` + read-only allowlist) / `read-only` sandbox (Codex); **plus** the scope worktree is physically `chmod`'d read-only (defense in depth) | `drivers/claude.ts` `mapPermission`, `drivers/codex.ts` `mapSandbox`, `worktree.ts` `setReadOnly` |
 | The verify agent "fixes" the code it is judging | **Execute, never edit.** Verify's profile is `write = false`, so Edit/Write/MultiEdit are denied and its bash rules are enumerated (install + run + `git diff`) — it can exercise the behavior but cannot alter a line of it, nor weaken a test to make its own verdict easy. Its worktree is deliberately **not** `chmod`'d read-only (unlike scope): a verifier that cannot run the suite can only review by eye, which is the weakest form of this gate. The separation that matters is authorship, and that is enforced by the profile | `drivers/claude.ts` `mapPermission`, `.noriq/project.toml` `[permissions.verify]` |
 | A build agent runs arbitrary shell | Build gets edit tools + a **bash allowlist** only (the manifest's `allow` rules, e.g. `Bash(npm test:*)`) — **bare `Bash` is never granted**; Codex confines writes to `workspace-write` | `drivers/claude.ts`, `drivers/codex.ts` |
-| Agent pushes to the remote / merges | **No agent ever gets push credentials.** Output lands as a diff on the throwaway branch that a **human merges** — the daemon never pushes/merges. The spawned process runs under `sanitizedAgentEnv`: `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, and the credential helper is disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them | `security.ts`, `supervisor.ts` |
+| Agent pushes to the remote / merges | **No agent ever gets push credentials.** Output lands as a diff on the throwaway branch that a **human merges** — the daemon never pushes/merges. The spawned process runs under `sanitizedAgentEnv`: `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, and the credential helper is disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them. **This is a GIT property, not a universal one** — see the note below | `security.ts`, `supervisor.ts` |
 | Agent exfiltrates secrets from the environment | `sanitizedAgentEnv` **strips** `NORIQ_TOKEN` and common cloud/git tokens from the child's shell env. The agent reaches Noriq via its **MCP** connection (credential injected at the transport), so `bash` never sees the token | `security.ts` |
 | Agent reads the stored credential off disk | `~/.noriq/credentials.json` is written `0600` under a `0700` dir, and no agent is granted bare `Bash` or unrestricted reads outside its worktree. **Not a hard boundary**: the file is readable by the uid the daemon and the agents share, so this rests on the permission profiles, not on the filesystem. **The mode bits are POSIX-only** — Node ignores `mode` on Windows apart from the read-only flag, so on Windows this file is protected by whatever ACL `%USERPROFILE%` carries (by default: that user, SYSTEM, and Administrators) and *not* by anything this daemon sets. The permission profiles are load-bearing on every platform; on Windows they are the only thing here. It holds a **90-day refresh token** — a longer-lived secret than the 7-day access token — so revoke the connection (*Settings → Agent connections*) if a box is suspect; rotation makes the stolen pair single-use but does not by itself evict a thief | `credentials.ts`, `token.ts` |
 | A runaway agent burns unbounded tokens/$$ | **Daemon-enforced budget**: token / USD / wall-clock ceilings watched from the telemetry stream; breach → SIGTERM → `failed{budget}`. A Run with a budget can never run unbounded | `drivers/budget.ts` |
@@ -52,6 +52,28 @@ that contain it. Security here is load-bearing, not polish.
   sandbox — the permission mapping only ever emits `dontAsk` (Claude) and
   `read-only` / `workspace-write` (Codex).
 - Never force-deletes a worktree holding work that exists nowhere else.
+
+### Everything above assumes git — and that assumption is load-bearing
+
+Every guarantee on this page is enforced by *absence*: the credential is not in the environment,
+so `git push` **cannot** succeed. That works because git makes everything up to publishing local.
+Isolate, commit, rebase, verify — none of it touches a server, so withholding one credential
+cleanly separates "doing the work" from "publishing the work".
+
+**No server-backed VCS has that separation.** In Perforce the only checkpoint primitive
+(`p4 shelve`) writes to the depot and other users can read it, and the credentials that shelve are
+the credentials that submit — the agent needs them for the ordinary work of a run. Diversion is the
+same in substance.
+
+So on such a backend "the daemon never pushes" would stop being something this daemon **enforces**
+and become something the **VCS server is configured** to enforce — by someone else, in a system we
+do not control and cannot test. A guarantee would become a deployment requirement, and its failure
+mode would be silent: an agent submitting straight to main because an admin never restricted the
+runner's user.
+
+Nothing here is stale — the runner is git-only today, and every claim above is true. This note
+exists so nobody adds a second backend without noticing that this page is what it costs.
+See [VCS-SPIKE.md](VCS-SPIKE.md) §5 (RUN-44).
 
 ## Auto-landing (`[land]`) — an explicit trade
 

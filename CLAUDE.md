@@ -78,7 +78,9 @@ and should be updated alongside any change here.
 
 - **The daemon never pushes and never gives an agent push credentials.** `git push` is the human
   boundary. `security.ts` `sanitizedAgentEnv` strips `NORIQ_TOKEN` and cloud/git tokens from the child
-  env and disables the git credential helper/prompt.
+  env and disables the git credential helper/prompt. This is enforced by *absence* and therefore
+  **only works because git keeps everything before publishing local** — see [VCS-SPIKE.md](VCS-SPIKE.md)
+  §5 before adding a server-backed VCS, which would move enforcement outside this codebase.
 - **Bare `Bash` and `danger-full-access` are never granted.** Permission mapping only ever emits
   `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex) — see `mapPermission`, `mapSandbox`.
 - **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
