@@ -3,12 +3,14 @@ import { createInterface } from 'node:readline';
 import type { PermissionProfile } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
-import { sanitizedAgentEnv } from '../security';
+import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, sanitizedAgentEnv } from '../security';
+import { NORIQ_MCP_NAME } from './claude';
 import {
   type AgentDriver,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
+  type NoriqMcp,
   zeroTelemetry,
 } from './types';
 
@@ -51,6 +53,8 @@ export interface CodexSpawnOptions {
   sandbox: CodexSandbox;
   /** Headless — never block on an interactive approval prompt. */
   approvalPolicy: 'never';
+  /** The agent's Noriq connection. Omitted → it cannot report its own work at all. */
+  noriqMcp?: NoriqMcp;
 }
 export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 
@@ -88,6 +92,7 @@ export class CodexDriver implements AgentDriver {
       model: opts.model,
       sandbox: mapSandbox(opts.permission),
       approvalPolicy: 'never',
+      noriqMcp: opts.noriqMcp,
     });
     transport.sendUserTurn(opts.prompt);
 
@@ -227,11 +232,30 @@ export const defaultSpawnCodex = (
   opts: CodexSpawnOptions,
   spawnFn: SpawnChild = spawn as unknown as SpawnChild,
 ): CodexTransport => {
-  // Sanitized env (RUN-24): strip secrets + block git push/credential prompts.
-  const child = spawnFn('codex', ['app-server'], {
+  // Wire the agent's Noriq MCP connection (RUN-43). This was simply ABSENT: the driver
+  // spawned codex with no MCP config while the prompt ordered it to register itself against
+  // a server it had no connection to — so every codex agent was silently anonymous and
+  // un-attributable, and nothing errored.
+  //
+  // `-c` overrides are per-spawn, which matters: `codex mcp add` would write the server into
+  // the user's own ~/.codex/config.toml, so the daemon would be reconfiguring the human's
+  // codex behind their back. The value is parsed as TOML and falls back to a literal string,
+  // which is what a bare URL lands as.
+  const mcpArgs = opts.noriqMcp
+    ? [
+        '-c',
+        `mcp_servers.${NORIQ_MCP_NAME}.url=${opts.noriqMcp.url}`,
+        '-c',
+        `mcp_servers.${NORIQ_MCP_NAME}.bearer_token_env_var=${CODEX_MCP_TOKEN_ENV}`,
+      ]
+    : [];
+  // Sanitized env (RUN-24): strip secrets + block git push/credential prompts. Codex can
+  // only read its bearer token from the environment (no header option), so that one token —
+  // and only when MCP is actually wired — is put back deliberately. See agentEnvWithMcpToken.
+  const child = spawnFn('codex', ['app-server', ...mcpArgs], {
     cwd: opts.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: sanitizedAgentEnv(),
+    env: opts.noriqMcp ? agentEnvWithMcpToken(opts.noriqMcp.token) : sanitizedAgentEnv(),
   });
   const events = new AsyncQueue<CodexEvent>();
   let nextId = 1;

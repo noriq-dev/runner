@@ -9,13 +9,30 @@ import { ManifestStore } from './manifest-store';
 import { buildRegistration } from './registration';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
-import { RunSupervisor } from './supervisor';
+import { type RunReport, RunSupervisor } from './supervisor';
 import { detectTools } from './tools';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient } from './ws-client';
 
 /** How long shutdown waits for stopped runs to report a terminal status. */
 const SHUTDOWN_DRAIN_MS = 5_000;
+
+/**
+ * Is this report worth a `run.status` frame? Status transitions are the point, but a report
+ * that carries NEW FACTS must go too even when the status is unchanged.
+ *
+ * Extracted and exported purely so it can be tested. A change-only test has now silently
+ * dropped a frame twice: once for terminal `finishedAt`, and again for `agentId` — the
+ * supervisor reports `running` with the worktree, then `running` again once the agent is
+ * created, so a naive `changed` check would discard the identity and leave run.status.agentId
+ * null forever. That is the very bug RUN-43 exists to fix, reintroduced one layer down.
+ */
+export function shouldForwardRunStatus(
+  previous: string | undefined,
+  rep: Pick<RunReport, 'status' | 'worktreePath' | 'agentId' | 'exit'>,
+): boolean {
+  return previous !== rep.status || rep.worktreePath != null || rep.exit != null || rep.agentId != null;
+}
 
 export interface DaemonHandle {
   runnerId: string;
@@ -93,8 +110,8 @@ export class Daemon {
 
     // Supervisor composes worktree + driver + budget per dispatched Run. The `held`
     // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
-    // ws's onAssigned drives the supervisor). parentAgentId = the runner (the
-    // daemon's identity) — the spawned agent registers under it via direct MCP.
+    // ws's onAssigned drives the supervisor). Each Run's agent identity is created by the
+    // runner up front (RUN-43) and reached with a token bound to it alone.
     const reposById = new Map(repos.map((r) => [r.id, r]));
     // The committed marker is re-read per Run, so editing .noriq/project.toml takes
     // effect on the next dispatch instead of waiting for someone to restart the daemon.
@@ -126,11 +143,15 @@ export class Daemon {
             logTail: rep.logTail ?? null,
           });
         }
-        // Forward run.status only on a real change (or when it carries worktree/exit).
-        const changed = lastRunStatus.get(runId) !== rep.status;
-        if (changed || rep.worktreePath != null || rep.exit != null) {
+        if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
           lastRunStatus.set(runId, rep.status);
-          held.ws?.sendRunStatus(runId, rep.status, { worktreePath: rep.worktreePath, exit: rep.exit });
+          // agentId finally has a value to carry: the daemon created the identity, so it no
+          // longer has to hope the child announces itself (RUN-43).
+          held.ws?.sendRunStatus(runId, rep.status, {
+            worktreePath: rep.worktreePath,
+            agentId: rep.agentId,
+            exit: rep.exit,
+          });
         }
         if (rep.status === 'done' || rep.status === 'failed') lastRunStatus.delete(runId);
       },
@@ -139,14 +160,17 @@ export class Daemon {
           .postComment(projectId, taskId, body)
           .catch((err) => this.log.warn('verify comment post failed', { err: String(err) }));
       },
-      parentAgentId: runner.id,
       server: this.config.server,
       // runner.toml's `[budget]` — the machine's own ceilings for dispatches that
       // arrive without one. Otherwise such a Run would burn unbounded.
       defaultBudget: this.config.budget,
-      // The agent's Noriq access (injected into its MCP transport) and the anchor
-      // task's text. Without these an agent cannot register, claim, or report.
-      getToken: () => this.getToken(),
+      // The runner creates each Run's Noriq agent and receives a token bound to it, which
+      // is injected into that agent's MCP transport (RUN-43). This replaces two things:
+      // `parentAgentId: runner.id`, which passed a RUNNER id into a field documented as an
+      // agent id and only ever surfaced as prompt text asking the model to register itself;
+      // and `getToken`, which handed every spawned process the DAEMON's own credential —
+      // the one that can register runners and reach every project this human can.
+      createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
       resolveTask: (taskId) => client.getTask(taskId),
       steering,
       logger: this.log,

@@ -13,7 +13,10 @@ export interface VerifyVerdict {
 }
 
 export interface VerifyPromptContext {
-  parentAgentId: string;
+  /** The identity the daemon created for this Run — the agent is told it, not asked to
+   *  invent one (RUN-43). Authorship separation is the point of this gate, so WHICH actor
+   *  filed the verdict has to be a fact the daemon knows, not a claim the model makes. */
+  agent: { agentId: string; label: string };
   server: string;
   /** How the agent inspects the accumulated diff (default: the worktree changes). */
   diffCmd?: string;
@@ -22,8 +25,8 @@ export interface VerifyPromptContext {
 /** Build the adversarial verify prompt from the phase specs. */
 export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): string {
   const diffCmd = ctx.diffCmd ?? 'git diff';
-  return `You are a Noriq Runner VERIFY agent — an INDEPENDENT, adversarial reviewer. You did NOT write this code; assume nothing about the author's intent beyond the specs below.
-Register as a project-local Noriq actor via the MCP server at ${ctx.server} (set_agent_identity with parentAgentId=${ctx.parentAgentId}).
+  return `You are ${ctx.agent.label} (${ctx.agent.agentId}), a Noriq Runner VERIFY agent — an INDEPENDENT, adversarial reviewer. You did NOT write this code; assume nothing about the author's intent beyond the specs below.
+Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity.
 
 MODE: VERIFY (read-only). Do NOT modify any files.
 Inspect the accumulated diff with \`${diffCmd}\` and read the changed files. Your job is to find why this diff does NOT satisfy the intent — be skeptical. Look especially for:

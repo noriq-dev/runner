@@ -7,6 +7,7 @@ import {
   type CodexEvent,
   type CodexTransport,
   type SpawnCodex,
+  defaultSpawnCodex,
   mapSandbox,
   normalizeNotification,
 } from '../src/drivers/codex';
@@ -242,5 +243,47 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const seen: string[] = [];
     for await (const ev of t.events) if (ev.type === 'error') seen.push(ev.message);
     expect(seen[0]).toContain('ENOENT');
+  });
+});
+
+describe('codex Noriq MCP wiring (RUN-43)', () => {
+  // The bug this covers was invisible: the driver spawned codex with NO mcp config while the
+  // prompt ordered it to register against a server it had no connection to. So every codex
+  // agent was anonymous and un-attributable, and nothing errored. Every other codex test
+  // swaps in a fake transport, which is exactly why it survived — so assert the real spawn.
+  const spawnArgs = (noriqMcp?: { url: string; token: string }) => {
+    let seen!: { cmd: string; args: string[]; opts: { env: NodeJS.ProcessEnv } };
+    const spy = ((cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
+      seen = { cmd, args, opts };
+      return makeFakeChild([]) as never;
+    }) as never;
+    defaultSpawnCodex({ cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', noriqMcp }, spy);
+    return seen;
+  };
+
+  it('passes the MCP server as per-spawn -c overrides, never touching the user\u2019s config', () => {
+    const { cmd, args } = spawnArgs({ url: 'https://noriq.example/mcp', token: 'plnrt_run_bound' });
+    expect(cmd).toBe('codex');
+    expect(args[0]).toBe('app-server');
+    expect(args).toContain('mcp_servers.noriq.url=https://noriq.example/mcp');
+    expect(args).toContain('mcp_servers.noriq.bearer_token_env_var=NORIQ_MCP_TOKEN');
+    // `codex mcp add` writes into the human's own ~/.codex/config.toml — the daemon must not
+    // reconfigure their codex behind their back, so the wiring stays per-spawn.
+    expect(args.join(' ')).not.toContain('mcp add');
+  });
+
+  it('gives codex its bearer token in the env, because codex offers no header option', () => {
+    const { opts } = spawnArgs({ url: 'https://noriq.example/mcp', token: 'plnrt_run_bound' });
+    expect(opts.env.NORIQ_MCP_TOKEN).toBe('plnrt_run_bound');
+    // Still the hardened env: the DAEMON's own token and git creds stay out regardless. The
+    // token here is per-run and dies with the run, which is what makes this trade payable.
+    expect(opts.env.NORIQ_TOKEN).toBeUndefined();
+    expect(opts.env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('leaks no Noriq token into the env when there is no MCP to wire', () => {
+    const { args, opts } = spawnArgs(undefined);
+    expect(args).toEqual(['app-server']);
+    expect(opts.env.NORIQ_MCP_TOKEN).toBeUndefined();
   });
 });

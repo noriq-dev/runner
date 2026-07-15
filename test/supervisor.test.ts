@@ -1,5 +1,6 @@
 import type { PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
+import type { RunAgent } from '../src/client';
 import type {
   AgentDriver,
   DriverExit,
@@ -211,31 +212,46 @@ function harness(
         ? { exitCode: 1, output: 'TS2322: type error', timedOut: false }
         : { exitCode: 0, output: 'ok', timedOut: false };
     },
-    parentAgentId: 'agt_daemon',
+    createRunAgent: async () => testAgent(),
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
   });
   return { supervisor, worktrees, reports, comments, claude, codex, verifyRan: () => verifyRan };
 }
 
+/** The identity the daemon creates for a Run (RUN-43). The old fixture was the bare string
+ *  'agt_daemon', which quietly hid a real bug: daemon.ts passed the RUNNER id into a field
+ *  documented as an agent id, and no test could tell the difference. */
+const testAgent = (over: Partial<RunAgent> = {}): RunAgent => ({
+  agentId: 'agt_run1',
+  label: 'build-abc123',
+  projectId: 'prj_test',
+  token: 'plnrt_bound_to_agt_run1',
+  expiresIn: 3600,
+  ...over,
+});
+
 describe('assemblePrompt', () => {
   it('scope prompt is read-only + create_plan, with identity', () => {
     const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
-      parentAgentId: 'agt_daemon',
+      agent: testAgent(),
       server: 'https://s',
     });
     expect(p).toMatch(/SCOPE/);
     expect(p).toMatch(/create_plan/);
     expect(p).toMatch(/proposed:true/); // RUN-23: scope plans must be gated for human approval
     expect(p).toMatch(/Do NOT modify/);
-    expect(p).toContain('parentAgentId=agt_daemon');
+    // The agent is TOLD its identity (RUN-43); it no longer registers itself, so asserting
+    // a set_agent_identity instruction would assert the bug this task removed.
+    expect(p).toContain('agt_run1');
+    expect(p).toMatch(/do NOT call set_agent_identity/);
     expect(p).toContain('https://s');
   });
   it('build prompt is read-write + review diff + verify cmd + anchored task', () => {
     const p = assemblePrompt(
       makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
       manifest(),
-      { parentAgentId: 'agt_daemon', server: 'https://s' },
+      { agent: testAgent(), server: 'https://s' },
     );
     expect(p).toMatch(/BUILD/);
     expect(p).toMatch(/review diff/);
@@ -247,7 +263,7 @@ describe('assemblePrompt', () => {
     // A real run ended with "⚠️ Not committed — a human needs to commit it" 71s AFTER
     // the daemon had already committed it. The prompt never said who commits.
     const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
-      parentAgentId: 'agt_daemon',
+      agent: testAgent(),
       server: 'https://s',
     });
     expect(p).toMatch(/do NOT need to commit/i);
@@ -424,7 +440,7 @@ describe('RunSupervisor', () => {
 
 describe('assemblePrompt inlines the anchor task', () => {
   const run = makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_mrl4r9' } });
-  const ctx = { parentAgentId: 'agt_daemon', server: 'https://s' };
+  const ctx = { agent: testAgent(), server: 'https://s' };
 
   it('gives the agent the actual job, not an opaque id', () => {
     // The first real dispatch handed the agent only `task_mrl4r9kd…` and it correctly

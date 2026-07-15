@@ -4,7 +4,7 @@ import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from '../src/v
 describe('assembleVerifyPrompt', () => {
   it('is adversarial, read-only, names the diff + verdict format + specs', () => {
     const p = assembleVerifyPrompt('The endpoint must reject unauthenticated requests with 401.', {
-      parentAgentId: 'agt_daemon',
+      agent: { agentId: 'agt_verifier', label: 'verify-abc123' },
       server: 'https://s',
       diffCmd: 'git diff main...HEAD',
     });
@@ -18,7 +18,10 @@ describe('assembleVerifyPrompt', () => {
     expect(p).toContain('VERDICT: FAIL');
     expect(p).toContain('/verify skill');
     expect(p).toContain('reject unauthenticated requests'); // the specs
-    expect(p).toContain('parentAgentId=agt_daemon');
+    // Authorship separation is the point of this gate, so WHICH actor filed the verdict must
+    // be a fact the daemon knows — not a name the model was asked to register for itself.
+    expect(p).toContain('agt_verifier');
+    expect(p).toMatch(/do NOT call set_agent_identity/);
   });
 });
 

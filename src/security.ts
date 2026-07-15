@@ -10,6 +10,7 @@
 // raw token has no business in the environment where `bash` can read it.
 const STRIPPED_ENV = [
   'NORIQ_TOKEN', // the daemon's OAuth token — MCP supplies Noriq access, not the shell
+  'NORIQ_MCP_TOKEN', // see agentEnvWithMcpToken: only the codex driver may re-add this
   'GITHUB_TOKEN',
   'GH_TOKEN',
   'GITLAB_TOKEN',
@@ -17,6 +18,9 @@ const STRIPPED_ENV = [
   'AWS_SECRET_ACCESS_KEY',
   'AWS_SESSION_TOKEN',
 ];
+
+/** The env var codex reads its MCP bearer token from (`bearer_token_env_var`). */
+export const CODEX_MCP_TOKEN_ENV = 'NORIQ_MCP_TOKEN';
 
 /**
  * Build the environment a spawned agent process runs under. Strips known secrets
@@ -39,4 +43,30 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
   env.GIT_CONFIG_KEY_0 = 'credential.helper';
   env.GIT_CONFIG_VALUE_0 = '';
   return env;
+}
+
+/**
+ * sanitizedAgentEnv + the one Noriq token codex needs, in the env, deliberately.
+ *
+ * This bends the rule above and it is worth being honest about why. The Claude driver puts
+ * the credential on the MCP transport's Authorization header, so it never touches the shell.
+ * Codex offers no such option: `codex mcp add` exposes only `--bearer-token-env-var`, so a
+ * streamable-HTTP MCP server's token is read from the process environment or codex cannot
+ * authenticate at all. There is no third choice short of a local proxy.
+ *
+ * What makes the trade acceptable is WHICH token this now is (RUN-43). It is minted per Run,
+ * bound to exactly one agent in one project, and revoked by the server the moment the Run
+ * goes terminal — so a build agent that reads it out of its own env gains the ability to act
+ * as itself, in the project it is already working, until its run ends. Before this, codex got
+ * no MCP config at all: every codex agent was anonymous and could not report its work, which
+ * is a worse failure and a silent one. The alternative — passing the DAEMON's token, which
+ * can register runners and reach every project its human can — is the thing this replaces.
+ *
+ * If codex ever grows header support, delete this and use it.
+ */
+export function agentEnvWithMcpToken(
+  token: string,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return { ...sanitizedAgentEnv(base), [CODEX_MCP_TOKEN_ENV]: token };
 }

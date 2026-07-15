@@ -49,6 +49,18 @@ export interface RegisteredRunner {
   createdAt: string;
 }
 
+/** The identity a Run's agent works under, plus the credential that IS that identity. */
+export interface RunAgent {
+  /** The `agt_…` the daemon created — no longer something we hope the model announces. */
+  agentId: string;
+  /** Friendly per-project display name, shown in the dashboard. */
+  label: string;
+  projectId: string;
+  /** Bound to `agentId` alone. Never the runner's own token — see createRunAgent. */
+  token: string;
+  expiresIn: number;
+}
+
 export interface HeartbeatInput {
   freeSlots: number;
   status?: 'online' | 'draining';
@@ -106,6 +118,25 @@ export class NoriqClient {
   /** Report liveness + free capacity. */
   async heartbeat(runnerId: string, input: HeartbeatInput): Promise<void> {
     await this.request('POST', `/api/runners/${runnerId}/heartbeat`, input);
+  }
+
+  /**
+   * Create the Noriq agent for a Run and take its credential (RUN-43).
+   *
+   * The daemon creates the identity; the spawned process inherits it by holding a token that
+   * can only be that agent. Previously the prompt asked the model, in English, to call
+   * set_agent_identity — so identity hinged on the model complying, we never learned the
+   * agt_ it chose, and codex (which had no MCP wiring at all) was silently anonymous.
+   *
+   * The returned token is per-run and least-privilege: unlike the runner's own token it
+   * cannot register runners or reach other projects, and the server revokes it when the Run
+   * reaches a terminal state.
+   */
+  async createRunAgent(
+    runId: string,
+    opts: { label?: string; role?: 'orchestrator' | 'worker' } = {},
+  ): Promise<RunAgent> {
+    return (await this.request('POST', `/api/runs/${runId}/agent`, opts)) as RunAgent;
   }
 
   /** Call an MCP tool as the daemon's actor, returning the tool's text payload parsed

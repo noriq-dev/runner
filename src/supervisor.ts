@@ -7,6 +7,7 @@ import type {
   RunBudget,
   RunKind,
 } from '@noriq-dev/shared';
+import type { RunAgent } from './client';
 import { superviseBudget } from './drivers/budget';
 import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry, NoriqMcp } from './drivers/types';
 import { type LandOutcome, assembleConflictPrompt, landFailureComment, parseResolution } from './land';
@@ -19,8 +20,13 @@ import { type WorktreeInfo, type WorktreeManager, runBranch } from './worktree';
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
 // kind-specific prompt → run the selected driver under the Run budget → stream
 // status/telemetry back → clean up. Composes RUN-11 (worktree), RUN-12/13
-// (drivers), RUN-14 (budget). The spawned agent is its own project-local Noriq
-// actor via direct MCP (parentAgentId = the daemon) — it reports its own work.
+// (drivers), RUN-14 (budget).
+//
+// The daemon creates each Run's Noriq identity up front and hands the process a token bound
+// to it (RUN-43), so the agent reports its own work as an actor the daemon can name. It used
+// to be the reverse: the prompt asked the model to register ITSELF via set_agent_identity, so
+// attribution depended on the model complying and the daemon never learned who its own child
+// was — run.status.agentId was null on every run ever reported.
 
 export interface ResolvedRepo {
   root: string;
@@ -30,6 +36,10 @@ export interface ResolvedRepo {
 export interface RunReport {
   status: 'running' | 'done' | 'failed';
   worktreePath?: string | null;
+  /** The agent working this Run. The wire has always carried this slot and it was always
+   *  null, because the daemon never knew the identity its child invented for itself — the
+   *  daemon creates it now (RUN-43), so it can finally say. */
+  agentId?: string | null;
   telemetry?: DriverTelemetry;
   /** Rolling tail of the agent's output for the live dashboard (RUN-22), tail-capped. */
   logTail?: string;
@@ -60,9 +70,19 @@ export interface RunSupervisorDeps {
   resolveRepo: (repoRef: string) => ResolvedRepo | null | Promise<ResolvedRepo | null>;
   /** Report a Run status transition upstream (→ WsClient.sendRunStatus). */
   report: (runId: string, report: RunReport) => void;
-  /** The daemon's Noriq agent id — becomes the spawned agent's parentAgentId. */
-  parentAgentId: string;
-  /** The Noriq server the spawned agent registers against (direct MCP). */
+  /**
+   * Create this Run's Noriq agent and take its credential (→ NoriqClient.createRunAgent).
+   *
+   * The daemon owns the identity's lifecycle (RUN-43): it exists before the process does,
+   * and the process is authenticated as it by a token bound to it alone. This replaces
+   * `parentAgentId`, which was both wrong and inert — daemon.ts passed the RUNNER id into a
+   * field documented as an agent id, and it only ever reached the model as prompt text
+   * asking it to please register itself.
+   *
+   * Omitted → the agent gets no Noriq identity and no MCP access, which is a no-op run.
+   */
+  createRunAgent?: (runId: string, opts: { label?: string }) => Promise<RunAgent>;
+  /** The Noriq server the spawned agent reaches over direct MCP. */
   server: string;
   /**
    * Machine-local ceilings from runner.toml's `[budget]`, applied per-dimension to a
@@ -70,11 +90,9 @@ export interface RunSupervisorDeps {
    * completely unbounded — no token, USD, or wall-clock ceiling.
    */
   defaultBudget?: RunBudget | null;
-  /**
-   * The daemon's OAuth token, injected into the agent's MCP transport so it can report
-   * its own work. Omitted → the agent gets no Noriq access and every run is a no-op.
-   */
-  getToken?: () => Promise<string>;
+  // `getToken` is gone (RUN-43): it injected the DAEMON's own OAuth token into every spawned
+  // agent's MCP transport — the credential that can register runners and reach every project
+  // its human can. Agents now get a per-run token bound to one identity, from createRunAgent.
   /** Resolve an anchor task's title/body so the prompt can inline it (→ NoriqClient.getTask). */
   resolveTask?: (taskId: string) => Promise<AnchorTask | null>;
   /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
@@ -130,16 +148,21 @@ function renderAnchor(run: Run, task?: AnchorTask | null): string {
 }
 
 /** Assemble the kind-specific prompt. Scope explores read-only and emits a
- *  PROPOSED plan; build implements an approved task into a review diff. Both
- *  register as a project-local Noriq actor whose parent is the daemon. */
+ *  PROPOSED plan; build implements an approved task into a review diff. The agent is
+ *  TOLD who it is (RUN-43) rather than asked to introduce itself. */
 export function assemblePrompt(
   run: Run,
   manifest: ProjectManifest,
-  ctx: { parentAgentId: string; server: string; task?: AnchorTask | null; diffCmd?: string },
+  ctx: { agent: RunAgent; server: string; task?: AnchorTask | null; diffCmd?: string },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
-  const identity = `You are a Noriq Runner ${run.kind.toUpperCase()} agent for project ${manifest.key}.
-Register as a project-local Noriq actor via the MCP server at ${ctx.server} (set_agent_identity with parentAgentId=${ctx.parentAgentId}). You report your own work through Noriq; the daemon supervises only your process.`;
+  // The daemon created this identity before the process existed and handed it a token that
+  // can only be this agent, so there is nothing to register (RUN-43). The old prompt asked
+  // the model to call set_agent_identity — which made attribution depend on it complying,
+  // left the daemon unable to name its own child, and quietly produced anonymous agents
+  // whenever the model skipped the step or (as with codex) had no MCP to call.
+  const identity = `You are ${ctx.agent.label} (${ctx.agent.agentId}), a Noriq Runner ${run.kind.toUpperCase()} agent for project ${manifest.key}.
+Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity. You report your own work through Noriq; the daemon supervises only your process.`;
 
   if (run.kind === 'scope') {
     return `${identity}
@@ -162,7 +185,7 @@ Brief: ${run.brief}${anchor}`;
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer.
   return assembleVerifyPrompt(`${run.brief}${anchor}`, {
-    parentAgentId: ctx.parentAgentId,
+    agent: ctx.agent,
     server: ctx.server,
     diffCmd: ctx.diffCmd,
   });
@@ -414,15 +437,33 @@ export class RunSupervisor {
       });
     }
 
-    // The agent's Noriq access. Without a token it cannot register, claim, or report —
-    // so fail loudly here rather than spawn an agent that can only no-op.
+    // The agent's identity AND its Noriq access, in one step (RUN-43). The daemon creates
+    // the agent up front and receives a token bound to it: the process cannot be anyone
+    // else, and we know who our own child is without scraping its output for an `agt_`.
+    //
+    // This token is per-run and least-privilege. It replaces handing every spawned process
+    // the DAEMON's own token — the credential that can register runners and reach every
+    // project its human can. The server revokes this one when the Run goes terminal.
+    //
+    // Without an identity the agent cannot claim or report, so fail loudly rather than
+    // spawn something that can only no-op.
+    let runAgent: RunAgent | undefined;
     let noriqMcp: NoriqMcp | undefined;
-    if (this.deps.getToken) {
+    if (this.deps.createRunAgent) {
       try {
-        noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: await this.deps.getToken() };
+        runAgent = await this.deps.createRunAgent(run.id, { label: `${run.kind}-${run.id.slice(-6)}` });
+        noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: runAgent.token };
+        // Say who is working this Run as soon as we know — which is now BEFORE the process
+        // starts, rather than never.
+        this.deps.report(run.id, { status: 'running', agentId: runAgent.agentId });
+        this.log.info('run agent created', {
+          runId: run.id,
+          agentId: runAgent.agentId,
+          label: runAgent.label,
+        });
       } catch (err) {
         await this.deps.worktrees.remove(worktree).catch(() => {});
-        return fail(`could not get a Noriq token for the agent: ${(err as Error).message}`);
+        return fail(`could not create the Noriq agent for this run: ${(err as Error).message}`);
       }
     }
 
@@ -434,8 +475,14 @@ export class RunSupervisor {
       ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseSha}...HEAD`
       : undefined;
 
+    // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
+    // which it can only do if the daemon actually made someone.
+    if (!runAgent) {
+      await this.deps.worktrees.remove(worktree).catch(() => {});
+      return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
+    }
     const prompt = assemblePrompt(run, repo.manifest, {
-      parentAgentId: this.deps.parentAgentId,
+      agent: runAgent,
       server: this.deps.server,
       task,
       diffCmd,
@@ -606,6 +653,7 @@ export class RunSupervisor {
 
     this.deps.report(run.id, {
       status: exit.outcome,
+      agentId: runAgent.agentId,
       telemetry: exit.telemetry,
       logTail: tail,
       exit: { outcome: exit.outcome, reason: exit.reason },
