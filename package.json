@@ -1,6 +1,6 @@
 {
   "name": "@noriq-dev/runner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Noriq Runner \u2014 a local daemon that connects to Noriq, spawns and supervises coding-agent processes (Claude/Codex), and streams status back. The execution plane for dispatching tasks/plans to agents from the dashboard.",
   "license": "MIT",
   "type": "module",
