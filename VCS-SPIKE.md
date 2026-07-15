@@ -6,18 +6,26 @@ indirection — and what it costs.**
 
 Top-level answer, up front:
 
-> **The operation set generalises. The security model does not.**
+> **The operation set generalises. The default-safe OFF switch does not.**
 >
 > Every git operation this daemon performs can be restated as an outcome that Perforce and
-> Diversion can satisfy. But "the daemon never pushes" — the load-bearing claim in
-> [THREAT-MODEL.md](THREAT-MODEL.md), the one enforced by *withholding a credential* — has no
-> equivalent on either. On both, the daemon needs write credentials to do the ordinary work of
-> a run. The boundary stops being something the daemon **enforces** and becomes something the
-> **VCS server is configured** to enforce, by someone else, outside this codebase.
+> Diversion can satisfy — including the one that matters most, *land on a working branch and ask
+> a human to merge*, which maps onto Perforce's pre-commit review model closely.
 >
-> That is a category change in the security argument, from *cannot* to *is currently configured
-> not to*. It is not a paragraph edit. **It is the decision this spike exists to surface, and it
-> is a human's to make.**
+> What does **not** port is the position where nothing leaves the machine. With `[land]`
+> unconfigured — the default — a git runner writes to no server, ever. Perforce has no such
+> setting at any configuration: `p4 shelve` *is* its checkpoint primitive, so isolating a run and
+> making its work durable are themselves depot writes. That is the finding, and it is narrower
+> than the one this document originally claimed.
+>
+> **Corrected after review.** The first draft argued that a server-backed VCS moves enforcement
+> outside the daemon, from *cannot* to *is configured not to*. Montana pointed out that this
+> compares Perforce against a guarantee we had already traded away: RUN-27's `autoPush` gave the
+> daemon a push credential, and RUN-28 moved the human boundary from `git push` to *approving the
+> merge* — on purpose, because freeing humans from per-run approval is the point of the product.
+> Once autoPush is on, git's boundary is *already* the daemon's own code plus the forge's branch
+> protection, and GitHub branch protection is exactly as external and untestable as Perforce's
+> protections table. The dramatic version of §5 was measuring Perforce against v1.
 
 ---
 
@@ -80,10 +88,9 @@ were arrived at by being burned:
 For Perforce and Diversion, by the time you have published, the work is already on the server —
 there is no second step, and no separate credential guarding it. `share` would be a no-op.
 
-An interface with a no-op on two of three backends is a tell. It is not fatal (`autoPush` is
-opt-in and git-only in practice), but it is the first thread of the real finding below: the
-local/remote boundary is in a **different place** on each backend, and this daemon's design is
-built on where git puts it.
+An interface with a no-op on two of three backends is a tell — but a milder one than the first
+draft of this document claimed. It says the local/remote boundary sits in a different *place* per
+backend, not that the boundary disappears. `share` is git's way of doing what shelve already did.
 
 ## 3. Perforce: the adversarial mapping
 
@@ -94,12 +101,13 @@ model, or admit we built a git interface.
 |---|---|---|
 | `isolate` | a **client workspace** (client spec) + a pending changelist | ⚠️ the client spec is **server-side state** |
 | `hasWork` | `p4 opened` / `p4 diff -f` | ✅ |
-| `checkpoint` | `p4 shelve` | ❌ **writes to the depot; other users can unshelve it** |
+| `checkpoint` | `p4 shelve` | ⚠️ works, but **writes the depot** — there is no local-only checkpoint |
 | `createTarget` | a stream, or a branch spec + `p4 integrate` | ⚠️ server-side, team-visible |
 | `integrate` | `p4 sync` + `p4 resolve` | ✅ different mechanics, same outcome |
 | `resume/abandon` | continue resolving / `p4 revert` | ✅ |
-| `publish` | `p4 submit` | ✅ **submit rejects when files are out of date → `{race}`** |
-| `share` | — | ❌ nonsensical; submit already published |
+| `publish` (to the working target) | `p4 submit` **into the working stream** | ✅ submit rejects when files are out of date → `{race}` |
+| *the human's merge* | `p4 submit` of the reviewed change **to mainline** | ✅ stays a human's action, as in git |
+| `share` | — | ❌ no-op; the work is already on the server |
 | `dispose` | `p4 client -d` + revert | ⚠️ deletes server-side state |
 | `reapOrphans` | list clients by name pattern | ⚠️ **needs the server**; git needed nothing |
 
@@ -107,11 +115,16 @@ Verified against the P4 docs rather than assumed — `p4 shelve` "stores files f
 changelist **in the depot** without submitting them… the shelved version of files is stored in the
 server", and "other users can **unshelve** the shelved files into their own workspaces."
 
-**Seven of nine survive.** The interface is not a git interface with indirection: the outcomes are
-real, and `publish`'s compare-and-swap shape maps onto `submit` almost exactly. The task's
-prediction — that `{ok:false, reason:'race'}` generalises — holds.
+**Eight of nine survive**, and `publish`'s compare-and-swap shape maps onto `submit` almost
+exactly — the task's prediction that `{ok:false, reason:'race'}` generalises holds.
 
-**The two that fail are the two the security model rests on.**
+**RUN-28's shape survives too, which the first draft missed.** Perforce has a **pre-commit review
+model** built precisely on shelving: shelve the pending changelist, put `#review` in its
+description, and Swarm opens a review that a human ultimately submits. That is RUN-28's merge
+request, in Perforce's vocabulary — *the daemon publishes to a working target and asks; a human
+merges to mainline*. The invariant that actually matters is portable.
+
+The one real casualty is `share`, and it is a no-op rather than a failure.
 
 ## 4. Diversion: the seam-finder
 
@@ -134,66 +147,82 @@ strongest evidence that this is a real seam and not a Perforce quirk.
 
 ## 5. The invariants, and what actually happens to them
 
-From CLAUDE.md, honestly assessed. This is the section that matters.
+From CLAUDE.md, honestly assessed. **This section was wrong in its first draft and is the reason
+this spike went to review rather than done.**
 
-### "The daemon never pushes, and never gives an agent push credentials." — **does not survive**
+### First, the correction — because the original argument compared Perforce to a runner we no longer ship
 
-Git's version is enforced by *absence*: `sanitizedAgentEnv` strips the tokens, the credential
-helper is disabled, and `git push` therefore **cannot** succeed. Everything before publishing is
-local, so withholding one credential cleanly partitions "work" from "publish".
+The first draft said: git enforces "never push" by *absence* (no credential in the environment, so
+`git push` **cannot** succeed), and Perforce cannot, so the guarantee degrades to a deployment
+requirement. That framing measured Perforce against **v1**.
 
-Neither other backend has that partition. In Perforce the agent needs depot credentials to sync,
-edit, and shelve — the *daily work* — and those same credentials submit. Diversion is the same in
-substance.
+It has not been true since RUN-27. `[land].autoPush` gives the daemon a real push credential, and
+RUN-28 makes a completed plan open a merge request. Both were deliberate: **freeing humans from
+per-run approval is the point of the product**, and the human boundary was moved on purpose, from
+`git push` to *approving the merge*. THREAT-MODEL.md's prose said so; its summary table and
+CLAUDE.md's invariant list still said "the daemon never pushes", and this document believed them.
 
-The portable restatement is:
+So the comparison is not *absence-based enforcement vs. server config*. With autoPush on:
 
-> **The daemon never publishes to a shared target.**
-
-…but the *enforcement* changes owner:
-
-| | git | Perforce / Diversion |
+| | git + autoPush | Perforce |
 |---|---|---|
-| enforced by | withholding a credential | the VCS server's own permission model |
-| enforced where | in this daemon | in someone else's server config |
-| failure mode if misconfigured | push fails | **the agent submits to main and nobody notices** |
-| we can test it | yes | no — it is not our system |
+| daemon holds a credential that could write the protected branch | **yes** | yes |
+| what stops it | its own code (`pushBranch` only pushes `[land].branch`; `allowedBranches` empty by default) | its own code |
+| backstop outside the daemon | the forge's **branch protection** | the **protections table** |
+| can the daemon test that backstop | **no** | no |
 
-**This is the finding.** It converts a guarantee into a deployment requirement. THREAT-MODEL.md's
-central claim would become conditional: *true on git; on Perforce, true only if your admin denied
-`submit` to the runner's user in the protections table.* A user who installs the runner and points
-it at their depot with their own credentials gets **none** of the protection the document promises,
-silently.
+**These are the same shape.** GitHub branch protection is exactly as external, as admin-owned, and
+as untestable-from-here as Perforce's protections table. A server-backed VCS introduces nothing new
+on this axis.
 
-Consistent with how `autoPush` was handled (RUN-27), the honest shape is: **opt-in, per-repo,
-loudly documented, and off by default** — a non-git backend should refuse to publish at all unless
-the operator states in the committed manifest that the boundary is enforced server-side.
+### "The daemon never publishes to a protected target — it asks." — **survives**
+
+This is the invariant, correctly stated, and it ports. Git: land on `[land].branch` → push it →
+`gh pr create` → a human merges. Perforce: submit into the working **stream** → shelve + a **Swarm
+pre-commit review** → a human submits to mainline. Same shape, same boundary, same human.
+
+### The OFF switch — **does not survive, and this is the real finding**
+
+With `[land]` unconfigured — **the default** — a git runner writes to no server at all. The work
+lives in a local worktree on a local throwaway branch, and if the box dies, nothing anywhere else
+ever knew. That position is reachable, it is the default, and it is what makes the runner safe to
+try on a repo you care about.
+
+**Perforce has no such position, at any setting.** `p4 shelve` *is* the checkpoint primitive — the
+only way to make a run's work durable beyond the process — and it writes the depot, where other
+users can read it. Isolation itself (a client workspace) is server-side state. There is no
+configuration in which an agent's output stays on the machine.
+
+So the honest statement is not "the security model collapses". It is: **a Perforce runner has no
+safe default, and no dry-run.** Whatever the boundary, you are trusting it from the first run,
+because the first run already wrote to the depot. That is a smaller claim than the first draft
+made, and unlike that one, it is true.
 
 ### "One worktree per Run; never two runs in one checkout." — **survives, renamed**
 
-Becomes "one workspace per Run". Real, and cheap on all three. Note the cost: on Perforce the
-workspace is a server-side object, so per-run isolation means per-run server writes, and a crashed
-daemon leaves *server* litter rather than local litter.
+Becomes "one workspace per Run". Real and cheap on all three. Cost: on Perforce the workspace is a
+server-side object, so per-run isolation means per-run server writes, and a crashed daemon leaves
+*server* litter rather than local litter.
 
 ### "Git is the registry" (`reapOrphans` needs no external state) — **does not survive**
 
 Today crash recovery is beautiful: the run id is in the branch name, so a fresh daemon reconstructs
-everything from the local repo with no database, no lockfile, nothing to get out of sync. On
-Perforce the registry is the **server's client list** — so crash recovery now requires
-connectivity, and an offline daemon cannot clean up after itself.
+everything from the local repo — no database, no lockfile, nothing to get out of sync. On Perforce
+the registry is the **server's client list**, so crash recovery needs connectivity and an offline
+daemon cannot clean up after itself.
 
 ### "Never force-delete work that exists nowhere else" — **gets weaker, and that is fine**
 
 This one *relaxes*. On git the worktree may hold the only copy, so the reaper refuses to touch it.
-On Perforce/Diversion a checkpoint is already on the server, so the work is recoverable by
-definition. The invariant stays (it costs nothing) but it stops being load-bearing.
+On Perforce a checkpoint is already on the server, so the work is recoverable by definition. The
+invariant stays (it costs nothing) but stops being load-bearing — the mirror image of the OFF-switch
+finding, and the one place where "everything is on the server" helps.
 
 ### "Verify ran on exactly the tree that lands" — **survives on all three**
 
 The merge-queue guarantee is the crown jewel and it is portable: git rebases then fast-forwards,
-Diversion merges then fast-forwards, Perforce resolves then submits with an out-of-date check.
-All three can be expressed as *integrate → verify → publish-iff-unmoved*, all three can lose the
-race, and all three can report it honestly.
+Diversion merges then fast-forwards, Perforce resolves then submits with an out-of-date check. All
+three are *integrate → verify → publish-iff-unmoved*; all three can lose the race and say so.
 
 ## 6. A concrete trap, courtesy of RUN-42
 
@@ -211,28 +240,39 @@ a git-first design would fuse them and Perforce would find out later.
 
 ## 7. Recommendation
 
-1. **The interface is viable — build it, and specify it as the nine outcomes above.** It is a real
+1. **The interface is viable — build it, specified as the nine outcomes in §2.** It is a real
    abstraction, not indirection: `integrate` covering rebase *and* 3-way merge, and `publish`
-   covering ff *and* submit, are both genuine generalisations that hold on a backend with neither
-   git verb.
-2. **Do not start with Perforce, and do not start with the driver.** The first task is a
-   THREAT-MODEL decision, not code. Until "what enforces the boundary on a server-backed VCS" has
-   a human's answer, any implementation is building on a security claim that is currently false.
-3. **Diversion second, Perforce third — or never.** Diversion is the cheap seam-finder (it breaks
-   the model in the same place, at a fraction of the setup cost). Perforce is the one with a real
-   market — game studios — and it is the one whose price is a weaker security story.
+   covering fast-forward *and* submit, are genuine generalisations that hold on a backend with
+   neither git verb. **Do the git-only extraction first** — it proves the interface against the
+   backend we understand, at zero risk, and it is the task with the best ratio here.
+2. **The blocker is smaller than the first draft said, and it is a product question, not a
+   security one.** Not *"what enforces the boundary"* — the answer is the same as git's today, once
+   autoPush is on. The real question is: **what does a Perforce runner do on the first run, given
+   there is no configuration where its output stays on the machine?** git's `[land]`-unconfigured
+   default is a dry-run mode Perforce cannot offer.
+3. **Diversion second, Perforce third — or never.** Diversion is the cheap seam-finder: it breaks
+   the model in the same place at a fraction of the setup cost, and it settles whether `checkpoint`
+   crossing the network is survivable in practice before Perforce makes that question expensive.
 4. **`share`/push stays git-only.** Do not generalise an operation that is a no-op on two of three
-   backends; let the interface admit that git has a publishing step others do not.
+   backends; let the interface admit git has a publishing step the others don't need.
+5. **Perforce's price is not the security model — it is the missing off switch, the server-side
+   registry (`reapOrphans` needs connectivity), and team-visible per-run state.** All three are
+   real, none is fatal, and none of them is what the first draft was alarmed about.
 
 ### Suggested implementation tasks (to be split *after* this is accepted)
 
 | | task | why in this order |
 |---|---|---|
-| 1 | **Decide + document the boundary for server-backed VCS.** THREAT-MODEL.md gains the table from §5; the manifest gains an explicit opt-in. | Everything else is unsafe to ship without it |
-| 2 | **Extract the nine outcomes behind `WorktreeManager`'s existing DI seam, git-only.** No behaviour change, no second backend. Pure refactor, fully testable. | Proves the interface against the backend we understand, at zero risk |
-| 3 | **Split `Workspace` into local path + opaque backend location.** | The §6 trap, fixed before a second namespace exists to trip on |
+| 1 | **Extract the nine outcomes behind `WorktreeManager`'s existing DI seam, git-only.** No behaviour change, no second backend. | Proves the interface where we can't get hurt; unblocked today |
+| 2 | **Split `Workspace` into local path + opaque backend location.** | The §6 trap, fixed while there is no second namespace to trip on |
+| 3 | **Decide the safe default for a backend with no OFF switch.** Manifest + THREAT-MODEL. | Cheap to answer, and Perforce is unsafe to ship without it |
 | 4 | **Diversion backend.** | Finds the seams a git-only interface hides |
-| 5 | **Perforce backend** — gated on (1) having been answered. | The one that pays, and the one that costs |
+| 5 | **Perforce backend** — gated on (3). | The one that pays, and the one that costs |
+
+Note this ordering changed after review: the first draft gated *everything* on a
+THREAT-MODEL decision. With the comparison corrected, (1) and (2) are plain refactors that are
+safe and useful regardless of whether a second backend is ever built — so there is no reason to
+hold them behind a decision.
 
 ## 8. What this spike did not settle
 

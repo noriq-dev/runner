@@ -76,11 +76,16 @@ steer mode — most branching in `supervisor.ts` keys off it.
 These are the design, not incidental behavior — [THREAT-MODEL.md](THREAT-MODEL.md) is the authority
 and should be updated alongside any change here.
 
-- **The daemon never pushes and never gives an agent push credentials.** `git push` is the human
-  boundary. `security.ts` `sanitizedAgentEnv` strips `NORIQ_TOKEN` and cloud/git tokens from the child
-  env and disables the git credential helper/prompt. This is enforced by *absence* and therefore
-  **only works because git keeps everything before publishing local** — see [VCS-SPIKE.md](VCS-SPIKE.md)
-  §5 before adding a server-backed VCS, which would move enforcement outside this codebase.
+- **No agent ever gets push credentials, and the daemon never merges into the protected branch.**
+  `security.ts` `sanitizedAgentEnv` strips `NORIQ_TOKEN` and cloud/git tokens from the child env and
+  disables the git credential helper/prompt — so the *agent* half is enforced by absence and is
+  absolute.
+  The *daemon* half is not, and has not been since RUN-27: with `[land].autoPush` a repo opts the
+  daemon into pushing — but only the working branch `[land].branch` names, and RUN-28 then opens a
+  **merge request** rather than merging. The human boundary moved from `git push` to *approving the
+  merge*, deliberately: freeing humans from per-run clicks is the point of the product, and a
+  boundary nobody can move is just a boundary nobody uses.
+  ~~The daemon never pushes~~ was the v1 wording and is simply false now. Do not restore it.
 - **Bare `Bash` and `danger-full-access` are never granted.** Permission mapping only ever emits
   `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex) — see `mapPermission`, `mapSandbox`.
 - **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.

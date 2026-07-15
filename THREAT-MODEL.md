@@ -28,7 +28,8 @@ that contain it. Security here is load-bearing, not polish.
 | A scope (read-only) agent writes anything | **Per-kind permission profile**: scope gets read-only tools (Claude `dontAsk` + read-only allowlist) / `read-only` sandbox (Codex); **plus** the scope worktree is physically `chmod`'d read-only (defense in depth) | `drivers/claude.ts` `mapPermission`, `drivers/codex.ts` `mapSandbox`, `worktree.ts` `setReadOnly` |
 | The verify agent "fixes" the code it is judging | **Execute, never edit.** Verify's profile is `write = false`, so Edit/Write/MultiEdit are denied and its bash rules are enumerated (install + run + `git diff`) — it can exercise the behavior but cannot alter a line of it, nor weaken a test to make its own verdict easy. Its worktree is deliberately **not** `chmod`'d read-only (unlike scope): a verifier that cannot run the suite can only review by eye, which is the weakest form of this gate. The separation that matters is authorship, and that is enforced by the profile | `drivers/claude.ts` `mapPermission`, `.noriq/project.toml` `[permissions.verify]` |
 | A build agent runs arbitrary shell | Build gets edit tools + a **bash allowlist** only (the manifest's `allow` rules, e.g. `Bash(npm test:*)`) — **bare `Bash` is never granted**; Codex confines writes to `workspace-write` | `drivers/claude.ts`, `drivers/codex.ts` |
-| Agent pushes to the remote / merges | **No agent ever gets push credentials.** Output lands as a diff on the throwaway branch that a **human merges** — the daemon never pushes/merges. The spawned process runs under `sanitizedAgentEnv`: `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, and the credential helper is disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them. **This is a GIT property, not a universal one** — see the note below | `security.ts`, `supervisor.ts` |
+| Agent pushes to the remote / merges | **No agent ever gets push credentials**, and this half is absolute: the spawned process runs under `sanitizedAgentEnv` — `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, credential helper disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them. The **daemon** is a separate question: with `[land].autoPush` (opt-in, default off) it pushes the working branch `[land].branch` names, and never anything else | `security.ts`, `supervisor.ts` |
+| The daemon merges its own work into main | **It doesn't — it asks.** A completed plan's working branch becomes a **merge request** (RUN-28, `gh pr create`); a human merges it. The daemon only ever fast-forwards `[land].branch` itself, and only with a diff that passed the gate *rebased onto it*. A dispatch may steer the target only within `[land].allowedBranches` (RUN-41), which is empty by default — so a repo saying `branch = "agents"` can never be written anywhere else. **What backs this is the daemon's own code plus the forge's branch protection, NOT the absence of a credential**: once autoPush is on, the same token that pushes a working branch could push `main`, and what stops it is that the daemon does not try | `land.ts`, `merge-request.ts`, `worktree.ts` `pushBranch` |
 | Agent exfiltrates secrets from the environment | `sanitizedAgentEnv` **strips** `NORIQ_TOKEN` and common cloud/git tokens from the child's shell env. The agent reaches Noriq via its **MCP** connection (credential injected at the transport), so `bash` never sees the token | `security.ts` |
 | Agent reads the stored credential off disk | `~/.noriq/credentials.json` is written `0600` under a `0700` dir, and no agent is granted bare `Bash` or unrestricted reads outside its worktree. **Not a hard boundary**: the file is readable by the uid the daemon and the agents share, so this rests on the permission profiles, not on the filesystem. **The mode bits are POSIX-only** — Node ignores `mode` on Windows apart from the read-only flag, so on Windows this file is protected by whatever ACL `%USERPROFILE%` carries (by default: that user, SYSTEM, and Administrators) and *not* by anything this daemon sets. The permission profiles are load-bearing on every platform; on Windows they are the only thing here. It holds a **90-day refresh token** — a longer-lived secret than the 7-day access token — so revoke the connection (*Settings → Agent connections*) if a box is suspect; rotation makes the stolen pair single-use but does not by itself evict a thief | `credentials.ts`, `token.ts` |
 | A runaway agent burns unbounded tokens/$$ | **Daemon-enforced budget**: token / USD / wall-clock ceilings watched from the telemetry stream; breach → SIGTERM → `failed{budget}`. A Run with a budget can never run unbounded | `drivers/budget.ts` |
@@ -53,27 +54,35 @@ that contain it. Security here is load-bearing, not polish.
   `read-only` / `workspace-write` (Codex).
 - Never force-deletes a worktree holding work that exists nowhere else.
 
-### Everything above assumes git — and that assumption is load-bearing
+### What the boundary actually is, and where it moved
 
-Every guarantee on this page is enforced by *absence*: the credential is not in the environment,
-so `git push` **cannot** succeed. That works because git makes everything up to publishing local.
-Isolate, commit, rebase, verify — none of it touches a server, so withholding one credential
-cleanly separates "doing the work" from "publishing the work".
+The v1 wording — *the daemon never pushes* — was true then and is false now. RUN-27 gave a repo a
+way to opt the daemon into pushing, and RUN-28 made a completed plan open a merge request. That was
+not a regression: **freeing humans from per-run approval is the point of the product**, and the
+boundary moved deliberately, from `git push` to *approving the merge*.
 
-**No server-backed VCS has that separation.** In Perforce the only checkpoint primitive
-(`p4 shelve`) writes to the depot and other users can read it, and the credentials that shelve are
-the credentials that submit — the agent needs them for the ordinary work of a run. Diversion is the
-same in substance.
+So the honest invariant is not about pushing at all. It is:
 
-So on such a backend "the daemon never pushes" would stop being something this daemon **enforces**
-and become something the **VCS server is configured** to enforce — by someone else, in a system we
-do not control and cannot test. A guarantee would become a deployment requirement, and its failure
-mode would be silent: an agent submitting straight to main because an admin never restricted the
-runner's user.
+> **The daemon publishes only where the repo said it may, and never merges into the protected
+> branch — it asks.**
 
-Nothing here is stale — the runner is git-only today, and every claim above is true. This note
-exists so nobody adds a second backend without noticing that this page is what it costs.
-See [VCS-SPIKE.md](VCS-SPIKE.md) §5 (RUN-44).
+Note what backs that, because it is not what backed the v1 claim. With autoPush on, the daemon holds
+a credential that *could* push `main`. What stops it is (1) its own code — `pushBranch` only ever
+pushes `[land].branch`, and `allowedBranches` is empty by default — and (2) the forge's branch
+protection, which is external to this daemon and untestable by it.
+
+**That matters for VCS portability, and it makes the story smaller than it first looks.** A
+server-backed VCS does not introduce external, untestable enforcement: we already have that the
+moment autoPush is on, and GitHub's branch protection is exactly as far outside this codebase as
+Perforce's protections table. Perforce even has a close analogue of RUN-28's shape — its
+**pre-commit review model**: shelve the pending changelist, open a Swarm review, a human submits.
+
+**The one thing that genuinely does not port is the OFF switch.** With `[land]` unconfigured — the
+default — a git runner writes nothing to any server, ever. Perforce has no such setting at any
+configuration, because `p4 shelve` *is* its checkpoint primitive: isolating a run and making its
+work durable are themselves depot writes. "Nothing an agent writes leaves this machine" is true of a
+default git install and unreachable on Perforce at any setting. See [VCS-SPIKE.md](VCS-SPIKE.md) §5
+(RUN-44).
 
 ## Auto-landing (`[land]`) — an explicit trade
 
