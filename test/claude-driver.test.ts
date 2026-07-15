@@ -238,10 +238,27 @@ describe('terminal telemetry counts every model (RUN-34)', () => {
       is_error: false,
       num_turns: 2,
       total_cost_usd: 0.076198,
-      usage: { input_tokens: 4, output_tokens: 79, cache_read_input_tokens: 40554, cache_creation_input_tokens: 5332 },
+      usage: {
+        input_tokens: 4,
+        output_tokens: 79,
+        cache_read_input_tokens: 40554,
+        cache_creation_input_tokens: 5332,
+      },
       modelUsage: {
-        'claude-haiku-4-5-20251001': { inputTokens: 536, outputTokens: 14, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.000581 },
-        'claude-opus-4-8[1m]': { inputTokens: 4, outputTokens: 79, cacheReadInputTokens: 40554, cacheCreationInputTokens: 5332, costUSD: 0.075617 },
+        'claude-haiku-4-5-20251001': {
+          inputTokens: 536,
+          outputTokens: 14,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.000581,
+        },
+        'claude-opus-4-8[1m]': {
+          inputTokens: 4,
+          outputTokens: 79,
+          cacheReadInputTokens: 40554,
+          cacheCreationInputTokens: 5332,
+          costUSD: 0.075617,
+        },
       },
     });
     const exit = await h.session.done();
