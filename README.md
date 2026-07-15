@@ -11,18 +11,69 @@ the Noriq server). It imports only the runtime-neutral slice of `@noriq-dev/shar
 (pure zod, the wire contract), currently **vendored** under `vendor/noriq-shared`
 until that contract freezes — see `vendor/noriq-shared/README.md`.
 
-## Install & run
+## Install & set up
 
 ```bash
-npx @noriq-dev/runner start          # once published
-# or from a checkout:
-npm install && npm run build     # bundles the CLI to dist/cli.js
-node dist/cli.js start
+npm install -g @noriq-dev/runner
+noriq-runner init
 ```
 
-The Claude driver also needs the `claude` CLI on PATH (`npm i -g @anthropic-ai/claude-code`);
-the Codex driver needs `codex`. During development, skip the build with
-`npm run dev -- <command>` (runs `src/cli.ts` via tsx).
+**`init` is the whole setup.** It asks four questions (a label for this machine, your Noriq
+server, where your repos live, how many runs may share the box), then authorizes you and shows
+you what it found:
+
+```
+  Noriq Runner setup
+  ──────────────────
+
+  Label for this machine [my-laptop]:
+  Noriq server URL [https://noriq.example]:
+
+  Checking https://noriq.example …
+  ✓ reachable, and it speaks OAuth
+
+  Where are your repos? (comma-separated) [/home/you/code]:
+  Max concurrent runs [2]:
+
+  ✓ wrote /home/you/.noriq/runner.toml
+
+  Authorizing this runner…
+  You will be asked which projects it may reach — it will not see the others.
+
+  ✓ authorized — credentials in /home/you/.noriq/credentials.json
+
+  Found 2 repos:
+    planar → PLNR   (/home/you/code/planar)
+    runner → RUN    (/home/you/code/runner)
+
+  Drivers detected: claude, codex
+
+  Ready. Start it with:  noriq-runner start
+```
+
+Three things it does deliberately, because each one is a cliff someone already fell off:
+
+- **It checks the server before writing anything.** One round-trip turns "auth mysteriously
+  failed" into "that URL isn't a Noriq server", and nothing lands on disk if it isn't.
+- **It makes you choose which projects the token may reach.** Not an option you can skip — the
+  runner should not be able to see your whole account because setup was in a hurry.
+- **It lists the repos and drivers it found.** This is where you learn your scan roots are wrong
+  — now, rather than after a dispatch and a dashboard that shows nothing.
+
+It never clobbers an existing config without asking, so re-running it is safe.
+
+```bash
+noriq-runner start        # then this, and leave it running
+```
+
+`init` needs a terminal (it's interactive by construction). On a headless box — SSH, container,
+CI — configure by hand instead: copy [`runner.toml.example`](runner.toml.example) to
+`~/.noriq/runner.toml` and run `noriq-runner auth`, whose device flow works without a browser.
+
+**Drivers are a separate install.** The Claude driver needs the `claude` CLI on PATH
+(`npm i -g @anthropic-ai/claude-code`); the Codex driver needs `codex`. `init` tells you which it
+can see. From a checkout, skip the build with `npm run dev -- <command>` (runs `src/cli.ts` via
+tsx); `npm run build` bundles to `dist/cli.js`.
 
 **Platforms:** Linux, macOS, and **native Windows** — no WSL required. Windows is a CI matrix
 leg, not a best-effort claim. Node ≥20 and `git` on PATH everywhere.
@@ -34,6 +85,9 @@ prefixes (`FOO=1 npm test`), `2>&1`, `$VAR`, and shell globbing are not. Pin
 `[verify] shell = "bash"` if you need them; see [project.toml.example](project.toml.example).
 
 ## Authenticate
+
+**`init` already did this** — read on only if you need to re-authorize, point at a second
+server, or you configured by hand.
 
 The daemon dials the Noriq server with **your OAuth token** — the only secret that
 crosses the wire (model + git credentials never leave the box). One command gets one:
@@ -72,14 +126,20 @@ environment.
 
 ## Configure
 
-Two-file model (see the RUN plan):
+Two files, and they are split by **who they belong to**:
 
-- `~/.noriq/runner.toml` — **machine-local** config: label, server, scan roots,
-  concurrency, budget. Never committed. Copy from [`runner.toml.example`](runner.toml.example).
-- `.noriq/project.toml` — **committed** per-repo marker: the project KEY, verify
-  command, tool, and per-kind permission profiles. Travels with the repo. Copy
-  from [`project.toml.example`](project.toml.example) into each repo you want the
-  Runner to work.
+- `~/.noriq/runner.toml` — **machine-local**: label, server, scan roots, concurrency, budget.
+  Never committed; it's about your box, not the project. **`init` writes this for you** — reach
+  for [`runner.toml.example`](runner.toml.example) only to hand-edit or to set up headless.
+- `.noriq/project.toml` — **committed** per-repo marker: the project KEY, verify command, tool,
+  `[land]`, and per-kind permission profiles. Travels with the repo, so your teammates' runners
+  agree with yours about what's allowed. Copy [`project.toml.example`](project.toml.example)
+  into each repo you want the Runner to work. **This one is still by hand** — `init` doesn't
+  write it, because it's a decision the repo makes once, not a per-machine setup step.
+
+A repo opts in *only* by committing that marker — there's no central list to add yourself to, and
+a runner ignores everything else under your scan roots. `ManifestStore` re-reads it per Run, so
+editing it takes effect on the next dispatch with no restart.
 
 Validate the machine config and see what the daemon discovered:
 
@@ -95,15 +155,22 @@ at registration, so a checkout stays portable across instances and forks.
 
 | Command            | What it does                                             |
 | ------------------ | -------------------------------------------------------- |
-| `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
+| `noriq-runner init`    | **Start here.** Guided setup: config + authorization, then shows what it found |
 | `noriq-runner start`   | Connect to Noriq and supervise dispatched runs            |
+| `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
 | `noriq-runner discover`| List repos discovered under the config's scan roots       |
 | `noriq-runner config`  | Load, validate, and print the resolved machine config     |
+| `noriq-runner update`  | Check whether this runner is behind (it will not replace itself) |
 | `noriq-runner version` | Print the version                                         |
 | `noriq-runner help`    | Print help                                                |
 
-`auth` takes the server from `~/.noriq/runner.toml`; pass `--server <url>` to authorize
-before that file exists, or to point at another instance.
+Global options: `--config <path>` (default `~/.noriq/runner.toml`) and `--log-level
+debug|info|warn|error`. `auth` takes the server from the config; pass `--server <url>` to
+authorize before that file exists, or to point at another instance.
+
+**`update` only tells you** — it never replaces itself, and there is no auto-update setting. A
+daemon that silently upgrades itself and then spawns agents with file access is a supply-chain
+path into every repo on the machine, so deciding when to take a new version stays yours.
 
 ## Develop
 
