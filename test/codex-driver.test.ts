@@ -1,5 +1,5 @@
 import { PassThrough } from 'node:stream';
-import type { PermissionProfile } from '@noriq-dev/shared';
+import type { PermissionProfile, RunEffort } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { AsyncQueue } from '../src/async-queue';
 import {
@@ -8,6 +8,7 @@ import {
   type CodexTransport,
   type SpawnCodex,
   defaultSpawnCodex,
+  mapEffort,
   mapSandbox,
   normalizeNotification,
 } from '../src/drivers/codex';
@@ -251,13 +252,19 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
   // prompt ordered it to register against a server it had no connection to. So every codex
   // agent was anonymous and un-attributable, and nothing errored. Every other codex test
   // swaps in a fake transport, which is exactly why it survived — so assert the real spawn.
-  const spawnArgs = (noriqMcp?: { url: string; token: string }) => {
+  const spawnArgs = (
+    noriqMcp?: { url: string; token: string },
+    extra: { model?: string; effort?: RunEffort } = {},
+  ) => {
     let seen!: { cmd: string; args: string[]; opts: { env: NodeJS.ProcessEnv } };
     const spy = ((cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
       seen = { cmd, args, opts };
       return makeFakeChild([]) as never;
     }) as never;
-    defaultSpawnCodex({ cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', noriqMcp }, spy);
+    defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', noriqMcp, ...extra },
+      spy,
+    );
     return seen;
   };
 
@@ -285,5 +292,46 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
     const { args, opts } = spawnArgs(undefined);
     expect(args).toEqual(['app-server']);
     expect(opts.env.NORIQ_MCP_TOKEN).toBeUndefined();
+  });
+
+  it('passes model + effort as per-spawn -c overrides too (RUN-33)', () => {
+    const { args } = spawnArgs(undefined, { model: 'gpt-5.3-codex', effort: 'low' });
+    expect(args).toContain('model=gpt-5.3-codex');
+    expect(args).toContain('model_reasoning_effort=low');
+    // Same reason as the MCP wiring above: writing these to ~/.codex/config.toml would
+    // reconfigure the human's own codex behind their back.
+    expect(args[0]).toBe('app-server');
+  });
+
+  it('says nothing when nobody chose — codex keeps its own default (RUN-33)', () => {
+    // The pre-RUN-33 behaviour, and the assertion that keeps it: an unset run must not be
+    // silently pinned to whatever we would have guessed.
+    const { args } = spawnArgs(undefined, {});
+    expect(args.join(' ')).not.toContain('model=');
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
+  it('clamps an effort codex cannot do, rather than passing it through (RUN-33)', () => {
+    // codex-cli 0.142.4 accepts ANY value for this key at parse time — a bogus one does not
+    // fail the spawn. So passing 'xhigh' through would not error here; it would surface as an
+    // API failure mid-run, after the tokens were spent.
+    const { args } = spawnArgs(undefined, { effort: 'xhigh' });
+    expect(args).toContain('model_reasoning_effort=high');
+    expect(args.join(' ')).not.toContain('xhigh');
+  });
+});
+
+describe('mapEffort: intent → codex\u2019s own scale (RUN-33)', () => {
+  it('passes through what codex shares with the SDK', () => {
+    expect(mapEffort('low')).toBe('low');
+    expect(mapEffort('medium')).toBe('medium');
+    expect(mapEffort('high')).toBe('high');
+  });
+
+  it('clamps the two levels above codex\u2019s ceiling', () => {
+    // "Think as hard as you can" is the honest reading of xhigh/max on a backend whose top is
+    // high — and it is what the Claude SDK itself does for a model that cannot go that far.
+    expect(mapEffort('xhigh')).toBe('high');
+    expect(mapEffort('max')).toBe('high');
   });
 });

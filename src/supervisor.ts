@@ -5,6 +5,7 @@ import type {
   ProjectManifest,
   Run,
   RunBudget,
+  RunEffort,
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
@@ -159,6 +160,29 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
     maxUsd: runBudget?.maxUsd ?? fallback?.maxUsd ?? null,
     maxDurationSeconds: runBudget?.maxDurationSeconds ?? fallback?.maxDurationSeconds ?? null,
   };
+}
+
+/**
+ * Which model + effort a Run actually executes with (RUN-33).
+ *
+ * Three layers, most specific first: the DISPATCH (a human chose, for this run), then the REPO's
+ * per-kind `[defaults]` (a repo said "scope with something strong"), then nothing — the tool's own
+ * default, which is what every run got before this existed.
+ *
+ * Per-field, not whole-object, for the same reason mergeBudget is: a dispatch that names only a
+ * model must still inherit the repo's effort for that kind, or the one field it set would
+ * silently erase the other.
+ */
+export function resolveModel(
+  run: Pick<Run, 'kind' | 'model' | 'effort'>,
+  manifest: ProjectManifest,
+): { model?: string; effort?: RunEffort } {
+  const repo = manifest.defaults?.[run.kind as RunKind];
+  const model = run.model ?? repo?.model ?? null;
+  const effort = run.effort ?? repo?.effort ?? null;
+  // Undefined rather than null: these become DriverStartOptions fields, and the drivers treat
+  // "absent" as "don't pass it", which is what lets the tool apply its own default.
+  return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
 /**
@@ -716,6 +740,10 @@ export class RunSupervisor {
       permission: repo.manifest.permissions[kind],
       noriqMcp,
       multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      // The same model it was running before it parked (RUN-33): the session being resumed is
+      // that model's conversation, and quietly finishing the job on a different one would make
+      // "resumed with its context intact" only half true.
+      ...resolveModel(run, repo.manifest),
       // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
       // budget, and a run could park its way past any limit.
       budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
@@ -927,6 +955,9 @@ export class RunSupervisor {
       // build, with a verify command to fail. Scope and verify runs want today's behaviour —
       // finish and close — and a session nobody closes hangs the daemon (see the finally below).
       multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
+      // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
+      ...resolveModel(run, repo.manifest),
       budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       handlers: {
         // Each telemetry tick carries the current spend AND the latest log tail, so

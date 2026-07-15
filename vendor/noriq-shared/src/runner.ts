@@ -20,6 +20,21 @@ export type RunKind = z.infer<typeof RunKind>;
 export const AgentTool = z.enum(['claude', 'codex']);
 export type AgentTool = z.infer<typeof AgentTool>;
 
+/**
+ * How hard the model should think (RUN-33) — INTENT, not a vendor knob.
+ *
+ * Tool-agnostic in the same way PermissionProfile is: each driver maps this to whatever its
+ * backend calls the idea, and the mapping is the driver's problem. The values match the Claude
+ * Agent SDK's `EffortLevel` because it is the finer-grained of the two we drive, so nothing is
+ * lost in translation; Codex's `model_reasoning_effort` tops out at 'high' and its driver clamps.
+ *
+ * Null = don't ask for one; whatever the tool defaults to. Kinds genuinely differ — a scope run
+ * is exploration and judgment, a conflict-resolution turn is mechanical — so one global default
+ * is wrong for someone no matter which one you pick.
+ */
+export const RunEffort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
+export type RunEffort = z.infer<typeof RunEffort>;
+
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
 // terminal ∈ {done, failed, cancelled}. `blocked` = agent parked on request_input.
 export const RunStatus = z.enum([
@@ -113,6 +128,12 @@ export const Run = z.object({
   brief: z.string().default(''), // the dispatch intent; may be empty for anchored runs
   repoRef: z.string(), // id of a RunnerRepo advertised by the owning runner
   agentTool: AgentTool,
+  // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
+  // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
+  // model names are the vendor's and they change weekly, so pinning them in a wire contract (or
+  // a CHECK constraint) would mean a migration every time a model ships.
+  model: z.string().nullable().default(null),
+  effort: RunEffort.nullable().default(null),
   budget: RunBudget,
   status: RunStatus,
   // Sub-state of `running` (RUN-31) — see RunPhase. Cosmetic by construction: nothing

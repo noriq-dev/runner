@@ -18,6 +18,38 @@ tool = "claude"
 # The repo's main branch, if the daemon should reference it. Optional.
 defaultBranch = "main"
 
+# ── Default model + reasoning effort, per kind (RUN-33) ──────────────────────
+# Optional, and per KIND on purpose: that is where the difference actually lives.
+# A scope run is exploration and judgment, a build is execution, a verify is
+# adversarial reasoning — one repo-wide value gets at least one of them wrong.
+# Say it once here instead of relying on whoever dispatches to remember.
+#
+# Precedence, most specific first:
+#   the dispatch (a human chose, for that run)
+#     → these defaults (this repo, this kind)
+#       → whatever the tool itself defaults to
+#
+# Both fields are optional and independent — wanting a higher effort while
+# inheriting the tool's model is perfectly normal, and so is the reverse.
+#
+#   model  — the vendor's own name, passed through. Deliberately not validated
+#            against a list: model names change constantly, and a stale allowlist
+#            would reject one your CLI supports fine. A wrong name fails fast.
+#   effort — "low" | "medium" | "high" | "xhigh" | "max". Tool-agnostic INTENT;
+#            each driver maps it. Codex's scale tops out at its own "high", so
+#            "xhigh"/"max" clamp there rather than erroring mid-run.
+#
+# [defaults.scope]
+# model = "claude-opus-4-8"    # exploration + judgment: worth the strong model
+# effort = "high"
+#
+# [defaults.build]
+# model = "claude-sonnet-5"    # execution against an approved task
+# effort = "medium"
+#
+# [defaults.verify]
+# effort = "xhigh"             # adversarial reasoning; inherit the tool's model
+
 # ── Deterministic verify floor (zero-token, daemon-run) ──────────────────────
 # After a BUILD run's agent exits clean, the daemon runs this command in the Run's
 # worktree. A non-zero exit (or timeout) GATES the run — it cannot reach `done`.

@@ -136,6 +136,12 @@ describe('changedSections', () => {
       build: { write: true, network: 'restricted', allow: [], deny: [] },
       verify: { write: false, network: 'restricted', allow: [], deny: [] },
     },
+    // No per-kind model/effort: this repo takes whatever the tool defaults to (RUN-33).
+    defaults: {
+      scope: { model: null, effort: null },
+      build: { model: null, effort: null },
+      verify: { model: null, effort: null },
+    },
     ...over,
   });
 

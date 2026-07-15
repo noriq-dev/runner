@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { AgentTool, RunBudget } from './runner';
+import { AgentTool, RunBudget, RunEffort } from './runner';
 
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
@@ -37,6 +37,30 @@ export const KindPermissions = z.object({
   verify: PermissionProfile,
 });
 export type KindPermissions = z.infer<typeof KindPermissions>;
+
+/**
+ * A repo's default model + effort for one kind (RUN-33).
+ *
+ * Per KIND, because that is where the difference actually lives: a scope run is exploration and
+ * judgment, a build is execution, a verify is adversarial reasoning. One repo-wide value gets at
+ * least one of them wrong. This lets a repo say "scope with something strong, build with
+ * something cheap" once, in the commit, rather than every dispatcher remembering to.
+ *
+ * Both nullable and independent: wanting a higher effort while inheriting the tool's model is
+ * an ordinary thing to want, and so is the reverse.
+ */
+export const ModelDefault = z.object({
+  model: z.string().nullable().default(null),
+  effort: RunEffort.nullable().default(null),
+});
+export type ModelDefault = z.infer<typeof ModelDefault>;
+
+export const KindDefaults = z.object({
+  scope: ModelDefault.prefault({}),
+  build: ModelDefault.prefault({}),
+  verify: ModelDefault.prefault({}),
+});
+export type KindDefaults = z.infer<typeof KindDefaults>;
 
 // Security-model defaults: scope/verify are read-only, build gets worktree write.
 // No agent ever gets push credentials (enforced by the daemon, not expressible here).
@@ -127,6 +151,10 @@ export const ProjectManifest = z.object({
   // null = no auto-landing; every run's diff waits on its own branch for a human.
   land: LandPolicy.nullable().default(null),
   permissions: KindPermissions.default(defaultPermissions),
+  // Per-kind model + effort (RUN-33). Empty = whatever the tool defaults to; a dispatch can
+  // still override per run. Not part of the security floor — unlike `permissions`, getting this
+  // wrong costs money or quality, never safety.
+  defaults: KindDefaults.prefault({}),
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
 

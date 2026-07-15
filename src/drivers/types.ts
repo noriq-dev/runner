@@ -1,4 +1,4 @@
-import type { AgentTool, PermissionProfile, RunBudget, RunKind } from '@noriq-dev/shared';
+import type { AgentTool, PermissionProfile, RunBudget, RunEffort, RunKind } from '@noriq-dev/shared';
 
 // The common driver contract — one interface over both the Claude Agent SDK
 // (RUN-12) and the Codex protocol-mode driver (RUN-13). A driver turns a Run into
@@ -88,6 +88,14 @@ export interface DriverStartOptions {
   /** Per-kind permission profile from the repo manifest (scope read-only; build write). */
   permission: PermissionProfile;
   model?: string;
+  /**
+   * How hard the model should think (RUN-33) — tool-agnostic intent, mapped per driver
+   * (`mapEffort` for codex; the Claude SDK takes these values verbatim).
+   *
+   * Absent = don't ask for one, so the tool applies its own default. That is what every run got
+   * before this existed, and it stays the behaviour for any run that does not choose.
+   */
+  effort?: RunEffort;
   /** Ceilings for daemon-side budget enforcement (RUN-14). */
   budget?: RunBudget;
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */

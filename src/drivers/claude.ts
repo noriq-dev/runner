@@ -1,5 +1,5 @@
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
-import type { PermissionProfile, RunKind } from '@noriq-dev/shared';
+import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { sanitizedAgentEnv } from '../security';
@@ -82,6 +82,9 @@ export interface SdkMcpHttpServer {
 export interface SdkQueryOptions {
   cwd?: string;
   model?: string;
+  /** The SDK's own EffortLevel — RunEffort's values match it exactly, which is why the Claude
+   *  driver passes through where the codex one maps (RUN-33). */
+  effort?: RunEffort;
   /** The child's shell env. Mirrors the SDK's `Options.env`. */
   env?: { [envVar: string]: string | undefined };
   permissionMode?: string;
@@ -317,6 +320,9 @@ export class ClaudeDriver implements AgentDriver {
         // inherits the operator's personal MCP config (~/.claude.json, .mcp.json,
         // plugins) — their connectors, their credentials, none of it in the manifest.
         strictMcpConfig: true,
+        // Only when asked (RUN-33): omitting these is what lets the tool apply its own default,
+        // which is what every run got before this existed.
+        ...(opts.effort ? { effort: opts.effort } : {}),
         ...(opts.budget?.maxUsd != null ? { maxBudgetUsd: opts.budget.maxUsd } : {}),
         // Bring a parked run's context back rather than starting over (RUN-30). Same cwd, so
         // the session's own worktree is where it left it.

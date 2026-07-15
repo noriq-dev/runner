@@ -1,4 +1,4 @@
-import type { PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
+import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
 import type {
@@ -10,7 +10,7 @@ import type {
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
-import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget } from '../src/supervisor';
+import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget, resolveModel } from '../src/supervisor';
 import type { WorktreeInfo } from '../src/worktree';
 
 // A driver whose run the test completes by calling complete() — which drives the
@@ -175,6 +175,7 @@ class FakeWorktrees {
 }
 
 const perm = (write: boolean): PermissionProfile => ({ write, network: 'restricted', allow: [], deny: [] });
+const noModel = (): ModelDefault => ({ model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   verify: { cmd: 'npm test', timeoutSeconds: null },
@@ -182,6 +183,9 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   defaultBranch: null,
   land: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
+  // No per-kind model/effort by default: this repo takes whatever the tool defaults to,
+  // which is what every run got before RUN-33 existed.
+  defaults: { scope: noModel(), build: noModel(), verify: noModel() },
   ...over,
 });
 
@@ -205,6 +209,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   brief: 'ship the thing',
   repoRef: 'repo_a',
   agentTool: 'claude',
+  // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
+  model: null,
+  effort: null,
   budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null },
   status: 'dispatched',
   // Not yet started, so nothing to report (RUN-31). The daemon sets the phase; the server
@@ -1603,5 +1610,91 @@ describe('the prompt invites an agent to reach a human (RUN-32)', () => {
     expect(p).toContain('raise_alert');
     expect(p).toContain('request_input');
     expect(p).toContain('VERDICT:'); // still the adversarial gate it was
+  });
+});
+
+describe('choosing a model + effort (RUN-33)', () => {
+  const MODELS = (over: Partial<ProjectManifest['defaults']> = {}): ProjectManifest =>
+    manifest({
+      defaults: {
+        // What the task's own argument asks for: kinds differ, so a repo says so once.
+        scope: { model: 'claude-opus-4-8', effort: 'high' },
+        build: { model: 'claude-sonnet-5', effort: 'medium' },
+        verify: { model: null, effort: 'xhigh' },
+        ...over,
+      },
+    });
+
+  it('the dispatch wins — a human chose, for this run', () => {
+    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: 'max' }, MODELS())).toEqual({
+      model: 'claude-fable-5',
+      effort: 'max',
+    });
+  });
+
+  it('falls back to the repo’s default for THAT kind', () => {
+    // The point of per-kind: scope is exploration and judgment, build is execution.
+    expect(resolveModel({ kind: 'scope', model: null, effort: null }, MODELS())).toEqual({
+      model: 'claude-opus-4-8',
+      effort: 'high',
+    });
+    expect(resolveModel({ kind: 'build', model: null, effort: null }, MODELS())).toEqual({
+      model: 'claude-sonnet-5',
+      effort: 'medium',
+    });
+  });
+
+  it('merges per FIELD — naming only a model keeps the repo’s effort', () => {
+    // Whole-object merge would mean the one field a dispatcher set silently erased the other,
+    // which is the bug mergeBudget already exists to avoid.
+    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: null }, MODELS())).toEqual({
+      model: 'claude-fable-5',
+      effort: 'medium', // the repo's
+    });
+  });
+
+  it('says NOTHING when nobody chose — the tool keeps its own default', () => {
+    // The pre-RUN-33 behaviour, and it must stay reachable: absent, not null, because the
+    // drivers only pass through what is present.
+    expect(resolveModel({ kind: 'build', model: null, effort: null }, manifest())).toEqual({});
+  });
+
+  it('an effort with no model is a normal thing to want', () => {
+    expect(resolveModel({ kind: 'verify', model: null, effort: null }, MODELS())).toEqual({
+      effort: 'xhigh',
+    });
+  });
+
+  it('reaches the driver — the seam that has been dead since RUN-12', () => {
+    // `DriverStartOptions.model` was threaded into query({options:{model}}) from the start and
+    // nothing ever set it, because Run had no field to set it from.
+    const h = harness({ manifest: MODELS() });
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope' }));
+    return flush().then(async () => {
+      h.claude.complete('done');
+      await done;
+      expect(h.claude.opts?.model).toBe('claude-opus-4-8');
+      expect(h.claude.opts?.effort).toBe('high');
+    });
+  });
+
+  it('a resumed run comes back on the SAME model it parked on', async () => {
+    // The session being resumed is that model's conversation; finishing the job on a different
+    // one would make "resumed with its context intact" only half true.
+    const h = harness({
+      manifest: MODELS(),
+      parkState: { blocked: true, signalId: 's', question: 'A or B?' },
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', anchor: { type: 'task', taskId: 't' } }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done');
+    await resumed;
+    expect(h.claude.starts.at(-1)?.model).toBe('claude-sonnet-5');
+    expect(h.claude.starts.at(-1)?.effort).toBe('medium');
   });
 });

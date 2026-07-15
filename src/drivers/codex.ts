@@ -1,6 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { PermissionProfile } from '@noriq-dev/shared';
+import type { PermissionProfile, RunEffort } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, sanitizedAgentEnv } from '../security';
@@ -47,9 +47,16 @@ export interface CodexTransport {
 
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
 
+/** What codex's `model_reasoning_effort` accepts. Its ceiling is `high`; the Claude SDK's
+ *  EffortLevel goes two steps further, which is why RunEffort needs mapping rather than
+ *  passing through. */
+export type CodexEffort = 'minimal' | 'low' | 'medium' | 'high';
+
 export interface CodexSpawnOptions {
   cwd: string;
   model?: string;
+  /** Tool-agnostic intent (RUN-33); mapEffort turns it into codex's own scale. */
+  effort?: RunEffort;
   sandbox: CodexSandbox;
   /** Headless — never block on an interactive approval prompt. */
   approvalPolicy: 'never';
@@ -64,6 +71,24 @@ export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
  *  map 1:1 (Codex gates by sandbox level + approval policy, not per-command). */
 export function mapSandbox(profile: PermissionProfile): CodexSandbox {
   return profile.write ? 'workspace-write' : 'read-only';
+}
+
+/**
+ * RunEffort (intent) → codex's `model_reasoning_effort` (RUN-33). mapSandbox's neighbour, and
+ * the same idea: the shared contract carries what we MEAN, each driver knows its own backend.
+ *
+ * Mapped rather than passed through, because codex tops out at `high` while RunEffort (matching
+ * the Claude SDK, the finer-grained of the two) has `xhigh` and `max` above it. Those clamp:
+ * "think as hard as you can" is the honest reading, and it is what the Claude SDK itself does
+ * when asked for an effort a given model cannot do.
+ *
+ * The clamp is not cosmetic. Verified against codex-cli 0.142.4: `-c model_reasoning_effort=…`
+ * is accepted for ANY value at parse time — a bogus one does not fail the spawn. So passing
+ * `xhigh` straight through would not error here; it would surface later, as an API-level failure
+ * mid-run, after the tokens were spent.
+ */
+export function mapEffort(effort: RunEffort): CodexEffort {
+  return effort === 'xhigh' || effort === 'max' ? 'high' : effort;
 }
 
 export interface CodexDriverDeps {
@@ -90,6 +115,7 @@ export class CodexDriver implements AgentDriver {
     const transport = this.spawnCodex({
       cwd: opts.cwd,
       model: opts.model,
+      effort: opts.effort,
       sandbox: mapSandbox(opts.permission),
       approvalPolicy: 'never',
       noriqMcp: opts.noriqMcp,
@@ -249,10 +275,17 @@ export const defaultSpawnCodex = (
         `mcp_servers.${NORIQ_MCP_NAME}.bearer_token_env_var=${CODEX_MCP_TOKEN_ENV}`,
       ]
     : [];
+  // Model + effort (RUN-33), per-spawn for the same reason as the MCP config above: writing
+  // them to ~/.codex/config.toml would reconfigure the human's own codex behind their back.
+  // Both omitted unless asked for, so an unset Run gets codex's own default exactly as before.
+  const modelArgs = [
+    ...(opts.model ? ['-c', `model=${opts.model}`] : []),
+    ...(opts.effort ? ['-c', `model_reasoning_effort=${mapEffort(opts.effort)}`] : []),
+  ];
   // Sanitized env (RUN-24): strip secrets + block git push/credential prompts. Codex can
   // only read its bearer token from the environment (no header option), so that one token —
   // and only when MCP is actually wired — is put back deliberately. See agentEnvWithMcpToken.
-  const child = spawnFn('codex', ['app-server', ...mcpArgs], {
+  const child = spawnFn('codex', ['app-server', ...mcpArgs, ...modelArgs], {
     cwd: opts.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: opts.noriqMcp ? agentEnvWithMcpToken(opts.noriqMcp.token) : sanitizedAgentEnv(),
