@@ -11,6 +11,7 @@ import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
 import { type RunReport, RunSupervisor } from './supervisor';
 import { detectTools } from './tools';
+import { checkForUpdate, updateAdvice } from './update';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient } from './ws-client';
 
@@ -212,6 +213,27 @@ export class Daemon {
     held.ws = ws;
     ws.start();
 
+    // Say when this box is behind (RUN-37). A check, never a self-replace: the daemon holds the
+    // operator's token, spawns agents at a permission floor it chooses, and with [land] writes
+    // branches — so replacing its own executable is a supply-chain decision that needs
+    // provenance, not a config key. See src/update.ts and THREAT-MODEL.md.
+    //
+    // unref'd on purpose: a version check must never be the reason a daemon won't exit.
+    let updateTimer: ReturnType<typeof setInterval> | undefined;
+    if (this.config.update.check) {
+      const runCheck = async () => {
+        const check = await checkForUpdate(this.config.server);
+        if (check.belowMinimum) {
+          this.log.warn(updateAdvice(check), { current: check.current, minimum: check.latest });
+        } else if (check.behind) {
+          this.log.info(updateAdvice(check), { current: check.current, latest: check.latest });
+        }
+      };
+      void runCheck();
+      updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);
+      updateTimer.unref();
+    }
+
     const stop = async (): Promise<void> => {
       // SIGTERM live agents BEFORE the socket closes. A spawned claude/codex isn't in the
       // daemon's teardown path, so exiting first orphans it: still editing the worktree,
@@ -234,6 +256,7 @@ export class Daemon {
       // operator cannot tell a tidy shutdown from a box that fell over. Best-effort by
       // definition: we are on our way out, and failing to announce it is not worth delaying
       // or failing the shutdown over. The server still reconciles a runner that never says it.
+      if (updateTimer) clearInterval(updateTimer);
       await client
         .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
         .catch((err) =>

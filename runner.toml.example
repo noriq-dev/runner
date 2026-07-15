@@ -24,3 +24,19 @@ concurrency = 2
 # maxTokens = 500000
 # maxUsd = 5
 # maxDurationSeconds = 1800
+
+# Staying current (RUN-37). Machine-local on purpose: updating the daemon is a
+# property of THIS BOX, not of a repo — a repo must never be able to update the
+# daemon supervising it.
+[update]
+# Check whether this runner is behind, and say so in the log. A public GET against
+# the server's /api/runner/latest (which reads the runner repo). Nothing is
+# downloaded and nothing is replaced.
+check = true
+checkIntervalHours = 24
+# There is deliberately no `apply` key. The daemon does not replace its own
+# executable: it holds your OAuth token, spawns agents at a permission floor it
+# chooses, and with [land] can write your branches — so whoever controls the version
+# feed would control all of that, unattended, on every opted-in box. Run
+# `noriq-runner update` to check, and `npm i -g @noriq-dev/runner@latest` to update.
+# See THREAT-MODEL.md.

@@ -8,6 +8,7 @@ import { discoverRepos } from './discovery';
 import { runInit } from './init';
 import { logger, setLogLevel } from './logger';
 import { TokenSource } from './token';
+import { checkForUpdate, updateAdvice } from './update';
 import { VERSION } from './version';
 
 const HELP = `noriq-runner v${VERSION} — Noriq's local execution-plane daemon
@@ -17,6 +18,7 @@ Usage:
 
 Commands:
   init             Guided setup: config + authorization, then show what it found
+  update           Check whether this runner is behind (it will not replace itself)
   auth             Authorize this machine with Noriq and store its token
   start            Discover repos, register with Noriq, and supervise dispatched runs
   discover         Scan roots for .noriq/project.toml markers and list found repos
@@ -95,6 +97,23 @@ async function cmdAuth(args: ParsedArgs): Promise<void> {
     refreshable: Boolean(creds.refreshToken),
   });
   console.log('\n✓ this runner is authorized — run `noriq-runner start`');
+}
+
+/**
+ * Check, report, and tell the human what to run — explicitly NOT a self-replace.
+ *
+ * Exit code carries the answer so a script can use it: 0 current, 1 behind. `update` that
+ * silently exits 0 while you are three releases back is the sort of thing nobody notices.
+ */
+async function cmdUpdate(args: ParsedArgs): Promise<number> {
+  const server = await resolveServer(args);
+  const check = await checkForUpdate(server);
+  console.log(updateAdvice(check));
+  if (check.latest == null) {
+    logger.warn('could not reach the version endpoint — assuming nothing', { server });
+    return 0; // unable to check is NOT out of date
+  }
+  return check.behind || check.belowMinimum ? 1 : 0;
 }
 
 async function cmdConfig(configPath?: string): Promise<void> {
@@ -182,6 +201,8 @@ export async function run(argv: string[]): Promise<number> {
         // stdin because it runs under systemd/CI (RUN-40).
         await runInit({ configPath: args.configPath });
         return 0;
+      case 'update':
+        return await cmdUpdate(args);
       case 'auth':
         await cmdAuth(args);
         return 0;

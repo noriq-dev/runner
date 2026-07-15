@@ -69,6 +69,34 @@ system exists to remove. The trade, stated plainly:
 Omit `[land]` entirely and none of this happens: every run's diff waits on its own
 branch for a human, exactly as before.
 
+## Updating the daemon (`[update]`) — why it only checks
+
+`[update]` tells this box to notice when it is behind. It does **not** replace anything, and the
+absence is the design, not a gap waiting to be filled.
+
+Consider what the daemon's own executable holds:
+
+- the operator's Noriq OAuth token (`~/.noriq/credentials.json`, 90-day refresh),
+- the power to spawn agents at whatever permission floor it chooses,
+- with `[land]`, write access to the repo's branches,
+- with `[land].autoPush`, the ability to push.
+
+So self-update is not a convenience feature — it is a supply-chain decision. **Whoever controls
+the version feed controls every one of those, on every opted-in box, unattended.** Auto-update
+turns one compromised publish into a fleet-wide compromise with nobody present at the moment of
+change; a human running `npm i -g` is exposed to the same artifact, but at a moment they chose.
+
+| | |
+|---|---|
+| **What it does** | A public GET to `<server>/api/runner/latest` (which reads `package.json` on the runner repo's `main`), on `checkIntervalHours`. Logs when behind. Nothing is downloaded. |
+| **What it never does** | Replace its own executable, or download anything at all. |
+| **Why not** | The package has npm's registry signatures — every package does, and they prove *"npm served this"*, not *"this was built from that repo"*. There is **no provenance attestation**. Nothing would verify that an update came from this repo's CI rather than someone's laptop or a hijacked account. |
+| **The other blocker** | The daemon supervises live agents. Swapping under them strands worktrees and orphans runs, and it cannot exec itself cleanly while holding a WS and child processes — it would have to drain (`status: 'draining'` already exists as the hook), exit, and rely on something to restart it. Under `nohup` it would simply stop. |
+| **What would make it defensible** | Publish with `--provenance` from CI so the artifact is verifiable; drain before swapping; keep the previous version and roll back if the new one won't register; report the swap as an event a human can see afterwards. A bad auto-update takes every opted-in runner offline at once. |
+| **Deliberately absent** | There is no `apply`/`enabled` key that does nothing. A stored setting nothing consults reads as working and is worse than an absent one — the same trap RUN-38 had to undo with `oauth_tokens.scope`. |
+
+`noriq-runner update` checks and names the command; a human runs it.
+
 ## Residual risks (accepted / follow-up)
 
 - **Bash allowlist correctness is the manifest author's responsibility.** A
