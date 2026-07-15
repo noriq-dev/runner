@@ -107,7 +107,10 @@ export type Run = z.infer<typeof Run>;
 // (no central list) and advertises them here; the server dispatches Runs to it.
 // ---------------------------------------------------------------------------
 
-export const RunnerStatus = z.enum(['online', 'offline', 'draining']);
+/** `offboarded` is a human's decision, not a liveness state (RUN-35): a heartbeat cannot move a
+ *  runner out of it, and its absence must not make it look merely crashed. "Someone stopped
+ *  this" and "this went quiet" are different facts and the panel has to tell them apart. */
+export const RunnerStatus = z.enum(['online', 'offline', 'draining', 'offboarded']);
 export type RunnerStatus = z.infer<typeof RunnerStatus>;
 
 // A repo the daemon discovered (has a .noriq/project.toml marker) and offers as
@@ -138,6 +141,9 @@ export const Runner = z.object({
   repos: z.array(RunnerRepo).default([]),
   freeSlots: z.number().int().nonnegative().default(0), // maxConcurrency − active runs
   lastHeartbeatAt: z.string().datetime().nullable().default(null),
+  /** When a human cut this runner off (RUN-35). Non-null ⇒ status is 'offboarded' and its
+   *  token has been revoked. */
+  offboardedAt: z.string().datetime().nullable().default(null),
   createdAt: z.string().datetime(),
 });
 export type Runner = z.infer<typeof Runner>;

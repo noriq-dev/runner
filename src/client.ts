@@ -63,7 +63,8 @@ export interface RunAgent {
 
 export interface HeartbeatInput {
   freeSlots: number;
-  status?: 'online' | 'draining';
+  /** 'offline' is the clean-shutdown goodbye (RUN-35) — see Daemon.stop. */
+  status?: 'online' | 'draining' | 'offline';
 }
 
 export interface NoriqClientOptions {

@@ -31,16 +31,31 @@ export type CommentStatus = z.infer<typeof CommentStatus>;
 export const ActorKind = z.enum(['agent', 'human', 'system']);
 export type ActorKind = z.infer<typeof ActorKind>;
 
+/** Which sort of agent (RUN-43 / migration 0026). Distinct from ActorKind above: that one
+ *  answers "agent, human, or system?"; this one answers "which sort of agent?" for a row
+ *  that is already an agent. */
+export const AgentKind = z.enum(['copilot', 'agent']);
+export type AgentKind = z.infer<typeof AgentKind>;
+
 export const Agent = z.object({
   id: z.string(),
   name: z.string().min(1),
+  /** copilot = a human's Claude Code / Codex session: self-created at MCP initialize, may
+   *  hop projects, heartbeat is meaningless (a human is right there). agent = spawned by a
+   *  runner for exactly one run: runner-owned, pinned to one project for life, heartbeat is
+   *  the liveness signal that matters. */
+  kind: AgentKind,
   role: AgentRole,
   status: AgentStatus,
-  scopes: z.array(z.string()).default([]),
+  /** The runner that created it and owns its lifecycle. Non-null iff kind='agent' — the DB
+   *  enforces that pairing with a CHECK, so it is not merely a convention here. */
+  runnerId: z.string().nullable().default(null),
   lastSeenAt: z.string().datetime().nullable(),
   createdAt: z.string().datetime(),
 });
 export type Agent = z.infer<typeof Agent>;
+// `scopes` lived here mirroring a column that took its '[]' default and was named in no
+// query anywhere — retired with the column in 0026, alongside api_key_hash.
 
 export const Project = z.object({
   id: z.string(),

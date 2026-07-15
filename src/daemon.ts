@@ -229,6 +229,16 @@ export class Daemon {
           runs: [...this.active],
         });
       }
+      // Say goodbye (RUN-35). Without a final beat, stopping on purpose and crashing look
+      // identical from the dashboard — both simply stop heartbeating and go stale — so an
+      // operator cannot tell a tidy shutdown from a box that fell over. Best-effort by
+      // definition: we are on our way out, and failing to announce it is not worth delaying
+      // or failing the shutdown over. The server still reconciles a runner that never says it.
+      await client
+        .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
+        .catch((err) =>
+          this.log.debug('goodbye heartbeat failed (shutting down anyway)', { err: String(err) }),
+        );
       ws.stop();
     };
     return { runnerId: runner.id, stop };
