@@ -151,17 +151,20 @@ a rebase conflict the build agent gets one bounded turn to fix it — but only i
 mechanical; anything needing a *decision* (competing designs, a refactor underneath it, a
 changed contract) bails to a human, and an ambiguous answer counts as bailing.
 
-**The daemon still never pushes.** Agent work reaches your disk and nowhere else, so
-`git push` remains the human boundary — that's what makes auto-landing a reasonable
-trade rather than a leap. Point `branch` at something auto-deploying and you've given
-that up; see the table in [`THREAT-MODEL.md`](THREAT-MODEL.md). Omit `[land]` and nothing
-auto-lands: every diff waits on its own branch, as before.
+**The daemon never merges into your protected branch — it asks.** By default it also never
+pushes: work reaches your disk and nowhere else. Add `[land].autoPush` and it publishes the
+one working branch `branch` names — nothing else — and opens a merge request there. The human
+boundary is *approving the merge*, not `git push`; moving it there is the point, not an
+oversight. Point `branch` at something auto-deploying and you've given that up; see the table
+in [`THREAT-MODEL.md`](THREAT-MODEL.md). Omit `[land]` and nothing auto-lands: every diff
+waits on its own branch, as before.
 
 ## Security model
 
 One git worktree per Run on a throwaway branch; scope runs read-only; per-kind
 permission profiles (including which Noriq MCP tools each kind may call); daemon-enforced
-budgets (SIGTERM on breach); **no push credentials for any agent and no push, ever**;
+budgets (SIGTERM on breach); **no push credentials for any agent, ever, and the daemon
+publishes only where the repo opted it in — never merging into the protected branch**;
 secrets stay local (only the OAuth token crosses the wire, injected into the agent's MCP
 transport rather than its shell). Full threat model — and the explicit trade auto-landing
 makes — in [`THREAT-MODEL.md`](THREAT-MODEL.md).

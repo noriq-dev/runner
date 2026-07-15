@@ -2,7 +2,9 @@
 // surface (RUN-24). The load-bearing defenses live elsewhere — per-kind permission
 // profiles (drivers/claude mapPermission, drivers/codex mapSandbox), one throwaway
 // worktree per Run with scope read-only (worktree.ts), daemon-enforced budgets
-// (drivers/budget), and output landing as a review diff a human merges (no push).
+// (drivers/budget), and output landing as a review diff a human merges. Note the daemon
+// may push the working branch when a repo opts in (RUN-27) — the agent never can, which
+// is this module's job: the credential is absent from the child env, not merely unused.
 // This module hardens the PROCESS ENVIRONMENT the spawned agent inherits.
 
 // Env vars that must never reach the agent's shell — the agent reaches Noriq via

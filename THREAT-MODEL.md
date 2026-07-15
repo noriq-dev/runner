@@ -93,7 +93,7 @@ system exists to remove. The trade, stated plainly:
 | | |
 |---|---|
 | **What changed** | A build that passes the gate is rebased onto `[land].branch`, **re-verified there**, and fast-forwarded in. No human per run. |
-| **What did NOT change** | The daemon still **never pushes**. Work reaches the operator's disk and nothing else; a human still decides what reaches `main`, a remote, or a deploy. |
+| **What did NOT change** | The daemon **never merges into the protected branch** — a human still decides what reaches `main`. Without `[land].autoPush` (RUN-27) it also never pushes at all; with it, it publishes only the branch `[land].branch` names and opens a merge request (RUN-28). The boundary moved from `git push` to *approving the merge*, deliberately. |
 | **What is now load-bearing** | The verify gate is the only thing between an agent and that branch. Its quality *is* the security boundary. |
 | **The sharp edge** | Point `[land].branch` at anything push-triggered, auto-deploying, or watched by CI and you have handed agents production. `branch` has **no default** and is never inferred — auto-landing is opt-in per repo, and pointing it at `main` is a choice you make explicitly. |
 | **Why rebase-then-verify** | Two runs can each be green at their own fork point and broken together. A gate that never sees the combination cannot catch it, so the gate runs on the rebased result — the exact thing that will land. |
