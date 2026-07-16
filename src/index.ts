@@ -138,6 +138,7 @@ export {
   type ResolvedRepo,
   type RunReport,
 } from './supervisor';
+export { RunTranscript, nullTranscript, type RunLogRole, type RunLogSegment } from './transcript';
 export {
   runVerify,
   verifyFailureComment,

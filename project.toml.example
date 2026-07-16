@@ -212,11 +212,24 @@ cmd = "npm run typecheck && npm test"
 write = false
 network = "restricted"
 
+# DEP BOOTSTRAP (RUN-56): each Run gets a FRESH worktree, and a fresh worktree has no
+# node_modules — without an install rule, `npm test` is allowed but exits 127 (`tsc:
+# command not found`), so the verify gate can never go green for ANY run on the repo.
+# Allowlist the ecosystem's PINNED install, not its open-ended one:
+#   npm ci      — installs exactly the lockfile (integrity-hashed), refuses on drift,
+#                 never edits package.json/lockfile. The agent chooses WHEN, never WHICH.
+#   npm install — can add arbitrary packages and rewrite the lockfile. Grant it to build
+#                 only if agents changing dependencies is work you actually dispatch.
 [permissions.build]
 write = true
 network = "restricted"
-allow = ["Bash(npm test:*)", "Bash(npm run build:*)", "Bash(npx tsc:*)"]
+allow = ["Bash(npm ci:*)", "Bash(npm test:*)", "Bash(npm run build:*)", "Bash(npx tsc:*)"]
 
 [permissions.verify]
 write = false
 network = "restricted"
+# Verify usually inherits deps from the build worktree it reviews, but a STANDALONE
+# verify run starts fresh too. Exact `Bash(npm ci)` (no `:*`) is the safe grant: it
+# cannot touch tracked files, so "executes but never edits" holds even on a driver
+# whose bash is not confined by the write axis. Never put `npm install` here.
+# allow = ["Bash(npm ci)", "Bash(npm test:*)"]

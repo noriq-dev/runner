@@ -270,6 +270,7 @@ function harness(
   if (over.stillConflicted) worktrees.stillConflicted = over.stillConflicted;
   if (over.landRaces) worktrees.landRaces = true;
   const reports: Array<{ runId: string } & RunReport> = [];
+  const transcript: Array<{ seq: number; role: string; round: number | null; text: string }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
@@ -293,6 +294,7 @@ function harness(
             ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
           },
     report: (runId, r) => reports.push({ runId, ...r }),
+    reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
     verifyExec: async () => {
       verifyRan = true;
@@ -335,6 +337,7 @@ function harness(
     worktrees,
     reports,
     comments,
+    transcript,
     claude,
     codex,
     parked,
@@ -1290,6 +1293,41 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.verifyCalls()).toBe(2); // the fix must re-pass the deterministic floor too
+  });
+
+  it('the TRANSCRIPT carries every voice, in order: build → verify → reviewer → fix → re-review (RUN-74)', async () => {
+    // The dogfood pain this exists for: both builds were refused and the dashboard could not
+    // say why — only the core agent's tail ever reached the server.
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('implementing…');
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('The error path is untested.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('Fixed now.\nVERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+
+    const stream = h.transcript.map((s) => [s.role, s.round] as const);
+    // The builder spoke, the floor passed, reviewer round 1 refused, the report was handed
+    // back, reviewer round 2 passed, and the run closed — each as its own voice, in order.
+    const roleOrder = h.transcript.map((s) => `${s.role}${s.round ? `:${s.round}` : ''}`);
+    expect(roleOrder[0]).toBe('agent');
+    expect(roleOrder).toContain('reviewer:1');
+    expect(roleOrder).toContain('reviewer:2');
+    expect(roleOrder.indexOf('reviewer:1')).toBeLessThan(roleOrder.indexOf('reviewer:2'));
+    const text = h.transcript.map((s) => s.text).join('\n');
+    expect(text).toContain('verify command passed');
+    expect(text).toContain('reviewer verdict: FAIL (round 1)');
+    expect(text).toContain("handing the reviewer's report to the live agent (fix round 1/2)");
+    expect(text).toContain('reviewer verdict: PASS (round 2)');
+    expect(text).toMatch(/run finished: done/);
+    // Seqs are monotonic — the server dedups on them.
+    expect(h.transcript.every((s, i) => i === 0 || s.seq > h.transcript[i - 1]!.seq)).toBe(true);
+    void stream;
   });
 
   it('gates the run when the reviewer still refuses after maxRounds, and posts the report', async () => {

@@ -24,6 +24,7 @@ import {
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { noriqToolNamesFor } from './security';
+import { type RunLogSegment, RunTranscript } from './transcript';
 import type { VcsBackend, Workspace } from './vcs/types';
 import {
   MAX_VERIFY_FIXES,
@@ -119,6 +120,10 @@ export interface RunSupervisorDeps {
   resolveRepo: (repoRef: string) => ResolvedRepo | null | Promise<ResolvedRepo | null>;
   /** Report a Run status transition upstream (→ WsClient.sendRunStatus). */
   report: (runId: string, report: RunReport) => void;
+  /** Stream transcript segments upstream (RUN-74, → WsClient.sendRunLog). The role-labeled
+   *  record of every voice in the run — the "why was it refused" surface. Optional and
+   *  best-effort by construction: a transcript must never gate a run. */
+  reportLog?: (runId: string, segments: RunLogSegment[]) => void;
   /**
    * Create this Run's Noriq agent and take its credential (→ NoriqClient.createRunAgent).
    *
@@ -340,6 +345,21 @@ export class RunSupervisor {
   /** One landing at a time per repo — see withRepoLock. */
   private readonly repoLocks = new Map<string, Promise<unknown>>();
 
+  /** One transcript per run (RUN-74), keyed so an in-process resume CONTINUES the seq
+   *  stream — the server dedups on (runId, seq), and a restarted seq would collide with
+   *  rows already written and be silently dropped. */
+  private readonly transcripts = new Map<string, RunTranscript>();
+
+  private transcript(runId: string): RunTranscript {
+    let t = this.transcripts.get(runId);
+    if (!t) {
+      const sink = this.deps.reportLog;
+      t = new RunTranscript(sink ? (segments) => sink(runId, segments) : () => {});
+      this.transcripts.set(runId, t);
+    }
+    return t;
+  }
+
   constructor(private readonly deps: RunSupervisorDeps) {
     this.log = deps.logger ?? defaultLogger;
   }
@@ -541,6 +561,24 @@ export class RunSupervisor {
    * Bounded (RUN-21's K=2): an agent that cannot fix it in two tries will not on the third — it
    * will keep spending. The budget still applies underneath, so a loop cannot outrun its ceiling.
    */
+  /** The verify command's outcome, in the transcript (RUN-74): a pass is one system line, a
+   *  failure also carries the output tail in the 'verify' voice — the part a human reads. */
+  private recordVerifyOutcome(
+    transcript: RunTranscript,
+    cmd: string,
+    result: { passed: boolean; exitCode: number | null; timedOut: boolean; output: string },
+  ): void {
+    if (result.passed) {
+      transcript.milestone(`verify command passed (\`${cmd}\`)`);
+      return;
+    }
+    transcript.milestone(
+      `verify command FAILED (\`${cmd}\`${result.timedOut ? ', timed out' : `, exit ${result.exitCode}`})`,
+    );
+    transcript.text('verify', result.output.slice(-4000) || '(no output)');
+    transcript.flush();
+  }
+
   private async verifyWithFeedback(ctx: {
     run: Run;
     spec: VerifySpec;
@@ -550,7 +588,9 @@ export class RunSupervisor {
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
   }) {
+    const transcript = this.transcript(ctx.run.id);
     let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+    this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
     // continueWith is absent unless the run was started multiTurn — a run with no live session to
     // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
     if (result.passed || !ctx.session.continueWith) return result;
@@ -575,6 +615,7 @@ export class RunSupervisor {
       if (!exit || exit.outcome !== 'done') return result;
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+      this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
       if (result.passed) {
         this.log.info('verify passed after the agent fixed it', { runId: ctx.run.id, attempt });
         return result;
@@ -611,7 +652,9 @@ export class RunSupervisor {
       : ctx.run.brief;
     const floorCmd = cmdVerify(ctx.repo.manifest.verify);
 
-    let verdict = await this.runReviewer({ ...ctx, intent });
+    const transcript = this.transcript(ctx.run.id);
+    let verdict = await this.runReviewer({ ...ctx, intent, round: 1 });
+    transcript.milestone(reviewVerdictMilestone(verdict, 1));
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
 
     for (let round = 1; round <= maxRounds; round++) {
@@ -625,6 +668,9 @@ export class RunSupervisor {
         round,
         verdict: verdict.verdict,
       });
+      transcript.milestone(
+        `handing the reviewer's report to the live agent (fix round ${round}/${maxRounds})`,
+      );
       // Tokens burn on a fix turn — the phase must say so (RUN-31).
       this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
       const exit = await ctx.session
@@ -656,7 +702,8 @@ export class RunSupervisor {
           };
         }
       }
-      verdict = await this.runReviewer({ ...ctx, intent });
+      verdict = await this.runReviewer({ ...ctx, intent, round: round + 1 });
+      transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       if (verdict.passed) return { ...verdict, rounds: round };
     }
     return { ...verdict, rounds: maxRounds };
@@ -671,6 +718,8 @@ export class RunSupervisor {
     driver: AgentDriver;
     intent: string;
     budget?: RunBudget;
+    /** Which look this is (1 = the first review) — transcript attribution (RUN-74). */
+    round: number;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -719,6 +768,7 @@ export class RunSupervisor {
       handlers: {
         onText: (t) => {
           text += t;
+          this.transcript(ctx.run.id).text('reviewer', t, ctx.round);
         },
         // Same surface the conflict resolver uses: the run's spend keeps moving on the dashboard
         // while a second session burns. (Cross-session totals are RUN-59's problem, not this one.)
@@ -963,6 +1013,7 @@ export class RunSupervisor {
         onText: (t) => {
           verifyText += t;
           tail = (tail + t).slice(-LOG_TAIL_CAP);
+          this.transcript(run.id).text('agent', t);
         },
       },
     });
@@ -1189,6 +1240,7 @@ export class RunSupervisor {
         onText: (t) => {
           verifyText += t;
           tail = (tail + t).slice(-LOG_TAIL_CAP);
+          this.transcript(run.id).text('agent', t);
         },
       },
     });
@@ -1499,6 +1551,20 @@ export class RunSupervisor {
         .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
     }
     this.log.info('run finished', { runId: run.id, outcome: exit.outcome, reason: exit.reason });
+    // Close the transcript with the outcome, so the stream a human reads actually ENDS (RUN-74).
+    const transcript = this.transcripts.get(run.id);
+    if (transcript) {
+      transcript.milestone(`run finished: ${exit.outcome}${exit.reason ? ` — ${exit.reason}` : ''}`);
+      transcript.end();
+      this.transcripts.delete(run.id);
+    }
     return exit;
   }
+}
+
+/** One line per reviewer look, in the transcript's system voice (RUN-74). */
+function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {
+  if (v.passed) return `reviewer verdict: PASS (round ${round})`;
+  if (v.verdict === 'fail') return `reviewer verdict: FAIL (round ${round})`;
+  return `reviewer rendered NO verdict (round ${round}) — stopped, crashed, or wrote no VERDICT line`;
 }

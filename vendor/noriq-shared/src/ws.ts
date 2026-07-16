@@ -175,6 +175,31 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     at: z.string().datetime(),
   }),
 
+  // Run TRANSCRIPT segments (RUN-74): an APPEND-ONLY, role-labeled stream of everything the
+  // run said — the builder's turns, each inline reviewer round, the verify command's output,
+  // and daemon milestones. Exists because logTail above is one last-writer-wins blob from the
+  // core agent only: after a reviewer refusal, the one thing a human needs to read (WHY) never
+  // reached the server. The daemon assigns monotonic seqs per run; the server INSERT OR
+  // IGNOREs on (runId, seq), so redelivery is idempotent, like every daemon frame.
+  z.object({
+    type: z.literal('run.log'),
+    runId: z.string(),
+    segments: z
+      .array(
+        z.object({
+          seq: z.number().int().nonnegative(),
+          // agent = the run's own session (build/scope/verify kinds alike; fix turns ride the
+          // same session, so attribution is automatic). reviewer = the inline reviewer, with
+          // its round. verify = the deterministic cmd's output. system = daemon milestones.
+          role: z.enum(['agent', 'reviewer', 'verify', 'system']),
+          round: z.number().int().positive().nullable().default(null),
+          text: z.string().max(16384),
+          at: z.string().datetime(),
+        }),
+      )
+      .max(64),
+  }),
+
   // The ack contract: sent after the daemon attempts to inject a steer. Echoes
   // steerId (dedup), reports where it landed, and advances the server's per-Run
   // notice cursor so the same steer is not re-surfaced via the MCP notices block.

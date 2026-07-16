@@ -171,6 +171,11 @@ export class Daemon {
         // The repo's detected backend rides along (RUN-60); omitted = the git default.
         return manifest ? { root: r.root, manifest, vcs: backendFor.get(r.root) } : null;
       },
+      // Transcript segments (RUN-74) ride their own frame, same best-effort posture as
+      // telemetry: a batch the socket misses is gone, and that must never gate a run.
+      reportLog: (runId, segments) => {
+        held.ws?.sendRunLog(runId, segments);
+      },
       report: (runId, rep) => {
         // Spend, log tail, and phase stream on their own frame (RUN-22/31) — no transition
         // minted. Phase belongs here and NOT on run.status for a concrete reason: the DO's

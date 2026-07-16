@@ -191,6 +191,17 @@ export class WsClient {
     });
   }
 
+  /** Stream transcript segments for a Run (RUN-74). Best-effort like telemetry: a batch the
+   *  socket misses is simply gone — the server dedups on (runId, seq), so nothing double-writes,
+   *  and logTail remains the fallback surface. */
+  sendRunLog(
+    runId: string,
+    segments: Array<{ seq: number; role: string; round: number | null; text: string; at: string }>,
+  ): void {
+    if (!segments.length) return;
+    this.sendRaw({ type: 'run.log', runId, segments });
+  }
+
   private open(): void {
     void this.openAsync();
   }
