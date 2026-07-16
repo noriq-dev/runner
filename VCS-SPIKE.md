@@ -432,6 +432,9 @@ Either way: **the CLI is a human tool, not a driver surface.** Interactive promp
 launches, exit-0-on-conflict, and string-parsing for outcomes — a backend scripted over it would
 be an ordeal (the exact failure mode RUN-54's checklist item 8 asked about).
 
+*(For the mirror-image result on Perforce — where the whole landing flow runs headless — see
+§10.)*
+
 ### The wins nobody predicted
 
 - **`dv review` is RUN-28, native.** One CLI command from the run branch → a review URL. No forge
@@ -461,6 +464,66 @@ targetExists/createTarget are straightforward; publish needs backend-carried CAS
 either the API's pending-merge surface or the bail-with-URL degradation; share is a no-op; review
 is a bonus primitive git doesn't have. Ordering within the plan stands: Diversion remains the
 cheap seam-finder, and it has already found four seams the paper spike missed.
+
+## 10. Addendum: Perforce, hands-on (RUN-55, 2026-07-16)
+
+Measured against a real `p4d` (2024.2, license-free at this scale — ≤5 users), stood up in a
+scratch directory in about a minute: two `curl`s and one command. **The plan's "long pole" was a
+fear, not a fact.** Everything below ran against two client workspaces on that server.
+
+### The headline: the mechanics are the OPPOSITE of what the ordering assumed
+
+The plan sequenced Diversion before Perforce because Perforce looked expensive and hostile.
+Hands-on, the difficulty INVERTED. Diversion (§9) has no CAS, no scriptable conflicts, and no
+authorship. Perforce has all three, natively, with JSON:
+
+| | Diversion (§9) | Perforce (measured) |
+|---|---|---|
+| publish loses the race honestly | ❌ merges it silently | ✅ `submit` exits 1: "must resolve #2 … Out of date files must be resolved or reverted", per-file |
+| conflict paths, machine-readable | ❌ browser URL, exit 0 | ✅ `resolve -n` lists; `-Mj -ztag` emits clean per-file JSON |
+| agent resolves a conflict headlessly | ❌ no CLI path exists | ✅ `p4 merge3` prints the 3-way merge **with markers** to stdout → agent edits → `resolve -ay` → `submit -c N` retries. The whole landing flow, non-interactive |
+| daemon-controlled authorship | ❌ everything signs as the account | ✅ changes carry the daemon's own `P4USER` (`noriq@ws1`) |
+| read-only scope runs | ❌ nothing; and every write syncs | ✅ `noallwrite` confirmed: synced files are `-r--r--r--` on disk; only `p4 edit` flips the bit |
+| driver surface | REST API (CLI is a human tool) | **the CLI itself** — `client -i`, `change -i`, `resolve -a*` are built for scripting |
+
+### The orphan-recovery shape works exactly as §5 hoped
+
+Shelve the crashed run's pending change (run id in the description) → revert (the workspace is
+clean for the next lease) → **unshelve from a different workspace recovers the work
+byte-for-byte** → `p4 changes -s shelved` is the server-wide registry of every orphan. Better
+than git's keep-and-warn: the work survives the machine, attributably.
+
+### The two namespaces, demonstrated in one line
+
+A single `-Mj` resolve object carries `clientFile` (a filesystem path) and `fromFile`
+(`//depot/shared.txt`) side by side — RUN-50's split, required by data the server actually
+returns, not by theory.
+
+### What a toy server cannot answer, said plainly
+
+- **The real workspace cost** (checklist #1). Client creation and toy-repo sync are instant; the
+  mechanism is a full copy, so cost ∝ tree size. The "pool of 1" default rests on a number this
+  server cannot produce — it needs a depot that is actually large.
+- **Streams vs branch specs** (#2). A fresh server has no organisational history to test
+  against; classic depot paths worked fine for everything above. Still open, still needs a real
+  site's depot.
+- **Swarm** (#8). Pre-commit review (`shelve` + `#review`) requires Swarm *installed* — a
+  separate product a bare `p4d` does not have. So the merge-request analogue on Perforce carries
+  a deployment dependency git and Diversion do not have (Diversion's `dv review` is native, §9).
+  Documented, untested.
+- **Protections** (#7): a fresh server's table is two lines (`write user * *` + super for the
+  first user). A locked-down agent user is ONE path-scoped line — but a real site's table is
+  their own, so the runner documents the line it needs, never the table.
+
+### Recommendation on "or never" — the task's exit question
+
+**Keep RUN-52, in its current position (after RUN-51), and drop the mechanical half of the
+hedge.** The "or never" was driven by two fears: setup cost (collapsed — 20 minutes, two curls)
+and hostile mechanics (inverted — Perforce is mechanically the *easiest* backend after git;
+arguably easier than Diversion, whose backend needs a REST API and backend-carried CAS). What
+legitimately remains of "never" is demand: nobody has asked for Perforce, the real workspace
+cost is unmeasured, and the streams question needs a real site. Those are reasons to *wait*, not
+reasons the backend is hard. If a Perforce user shows up, nothing mechanical blocks them.
 
 ---
 
