@@ -162,8 +162,12 @@ export class NoriqClient {
    */
   async createRunAgent(
     runId: string,
-    opts: { label?: string; role?: 'orchestrator' | 'worker' } = {},
+    opts: { label?: string; role?: 'orchestrator' | 'worker'; allowedTools?: string[] } = {},
   ): Promise<RunAgent> {
+    // allowedTools is the kind's Noriq tool floor (security.ts, RUN-47): the server advertises
+    // exactly this list to the agent over MCP, so the catalogue the model sees and the
+    // allowlist the daemon enforces are two views of one policy. Optional on the wire — an
+    // older server ignores it and the agent sees the full catalogue, the pre-RUN-47 behavior.
     return (await this.request('POST', `/api/runs/${runId}/agent`, opts)) as RunAgent;
   }
 

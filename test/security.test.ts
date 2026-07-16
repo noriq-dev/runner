@@ -1,8 +1,8 @@
-import type { PermissionProfile } from '@noriq-dev/shared';
+import type { PermissionProfile, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { mapPermission } from '../src/drivers/claude';
 import { mapSandbox } from '../src/drivers/codex';
-import { sanitizedAgentEnv } from '../src/security';
+import { noriqToolNamesFor, sanitizedAgentEnv } from '../src/security';
 
 const perm = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -38,6 +38,36 @@ describe('sanitizedAgentEnv', () => {
     expect(env.GIT_CONFIG_COUNT).toBe('1');
     expect(env.GIT_CONFIG_KEY_0).toBe('credential.helper');
     expect(env.GIT_CONFIG_VALUE_0).toBe('');
+  });
+});
+
+describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
+  const KINDS: RunKind[] = ['scope', 'build', 'verify'];
+
+  it('every kind can reach a human and stay alive — the two things curation must never ration', () => {
+    for (const kind of KINDS) {
+      const tools = noriqToolNamesFor(kind);
+      expect(tools).toContain('raise_alert'); // "a human should know" (RUN-32)
+      expect(tools).toContain('request_input'); // "I need a decision" → park/resume (RUN-30)
+      // A build agent that works 40 min without touching Noriq loses its claim silently —
+      // heartbeat is the one tool whose job is "I am still here" (RUN-47's "also").
+      expect(tools).toContain('heartbeat');
+    }
+  });
+
+  it('every kind can orient itself — since RUN-47 the floor is also the ADVERTISED catalogue, so an omission is invisibility, not a denied call', () => {
+    for (const kind of KINDS) {
+      expect(noriqToolNamesFor(kind)).toContain('get_briefing');
+    }
+  });
+
+  it('authority stays rationed: verify cannot move work, scope cannot claim it', () => {
+    const verify = noriqToolNamesFor('verify');
+    expect(verify).not.toContain('claim_task');
+    expect(verify).not.toContain('release_task');
+    expect(verify).not.toContain('update_task');
+    expect(noriqToolNamesFor('scope')).not.toContain('claim_task');
+    expect(noriqToolNamesFor('build')).not.toContain('create_plan');
   });
 });
 

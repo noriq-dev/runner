@@ -23,6 +23,7 @@ import {
 } from './land';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
+import { noriqToolNamesFor } from './security';
 import type { VcsBackend, Workspace } from './vcs/types';
 import {
   MAX_VERIFY_FIXES,
@@ -119,7 +120,7 @@ export interface RunSupervisorDeps {
    *
    * Omitted → the agent gets no Noriq identity and no MCP access, which is a no-op run.
    */
-  createRunAgent?: (runId: string, opts: { label?: string }) => Promise<RunAgent>;
+  createRunAgent?: (runId: string, opts: { label?: string; allowedTools?: string[] }) => Promise<RunAgent>;
   /** The Noriq server the spawned agent reaches over direct MCP. */
   server: string;
   /**
@@ -923,7 +924,13 @@ export class RunSupervisor {
     let noriqMcp: NoriqMcp | undefined;
     if (this.deps.createRunAgent) {
       try {
-        runAgent = await this.deps.createRunAgent(run.id, { label: `${run.kind}-${run.id.slice(-6)}` });
+        // Declare the kind's Noriq tool floor with the identity (RUN-47): the server then
+        // advertises exactly what the driver will permit, so the model never sees a tool it
+        // cannot call. Same list the driver enforces — one policy, two views.
+        runAgent = await this.deps.createRunAgent(run.id, {
+          label: `${run.kind}-${run.id.slice(-6)}`,
+          allowedTools: noriqToolNamesFor(run.kind),
+        });
         noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: runAgent.token };
         // Say who is working this Run as soon as we know — which is now BEFORE the process
         // starts, rather than never.

@@ -10,6 +10,7 @@ import type {
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
+import { noriqToolNamesFor } from '../src/security';
 import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget, resolveModel } from '../src/supervisor';
 import type { Workspace } from '../src/vcs/types';
 
@@ -269,6 +270,7 @@ function harness(
   let verifyCalls = 0;
   const parked = new FakeParked();
   const parkChecks: string[] = [];
+  const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
   // Mutable, because the real thing is: once a human answers, the server marks the signal
   // answered and moves the run back to running, so the NEXT check says "not blocked".
   const park = { state: over.parkState };
@@ -300,7 +302,10 @@ function harness(
         ? { exitCode: 1, output: 'TS2322: type error', timedOut: false }
         : { exitCode: 0, output: 'ok', timedOut: false };
     },
-    createRunAgent: async () => testAgent(),
+    createRunAgent: async (_runId, opts) => {
+      agentCreates.push(opts ?? {});
+      return testAgent();
+    },
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
     parked,
@@ -327,6 +332,7 @@ function harness(
     codex,
     parked,
     parkChecks,
+    agentCreates,
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
       park.state = { blocked: false };
@@ -438,6 +444,23 @@ describe('RunSupervisor', () => {
     const exit = await done;
     expect(exit.outcome).toBe('failed');
     expect(h.worktrees.removed).toEqual(['/wt/run_1']);
+  });
+
+  it('declares the kind’s Noriq tool floor when creating the run agent (RUN-47)', async () => {
+    // The server advertises exactly this list to the agent over MCP, so the catalogue the
+    // model sees and the allowlist the driver enforces are two views of one policy — the
+    // supervisor must send the same list security.ts hands the drivers, not its own copy.
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'verify', verifiesRunId: 'run_0' }));
+    await flush();
+    expect(h.agentCreates).toHaveLength(1);
+    expect(h.agentCreates[0]?.allowedTools).toEqual(noriqToolNamesFor('verify'));
+    // The catalogue-shrinking floor must keep the tools whose absence bites silently.
+    expect(h.agentCreates[0]?.allowedTools).toContain('get_briefing');
+    expect(h.agentCreates[0]?.allowedTools).toContain('heartbeat');
+    expect(h.agentCreates[0]?.allowedTools).not.toContain('claim_task');
+    h.claude.complete('done');
+    await done;
   });
 
   it('selects the driver by agentTool', async () => {

@@ -91,6 +91,14 @@ export function agentEnvWithMcpToken(
 const REACH_A_HUMAN = ['raise_alert', 'request_input'];
 
 /**
+ * Staying alive — also every kind (RUN-47's "also"). Every Noriq call renews a claim, so
+ * heartbeat looks redundant; but a build agent that works 40 minutes without touching Noriq
+ * loses its claim and nothing tells it. Denying the one tool whose whole job is "I am still
+ * here" rations nothing and creates exactly that silent expiry.
+ */
+const STAY_ALIVE = ['heartbeat'];
+
+/**
  * The Noriq tools each kind may call, curated to its job — the per-kind floor extended to
  * Noriq itself, not just the filesystem. A scope agent can propose a plan but not claim work;
  * a build agent can claim/report but not mint plans; verify can read and comment but never
@@ -102,6 +110,14 @@ const REACH_A_HUMAN = ['raise_alert', 'request_input'];
  * driver: the same verify run on codex had all 28 tools, claim_task included. Each driver
  * translates these names into its own enforcement (Claude: the dontAsk allowlist; Codex: the
  * MCP server's enabled_tools) — neither driver decides the list.
+ *
+ * Since RUN-47 this list is also what the agent SEES: the daemon declares it at run-agent
+ * creation and the server advertises exactly these tools over MCP, so the catalogue and the
+ * allowlist are two views of one policy instead of two policies that disagree. That raises
+ * the stakes of an omission — before, a missing tool was advertised-then-denied (a wasted
+ * turn); now it does not exist for the agent at all. Which is why verify has get_briefing:
+ * the server's own contract opens with "call get_briefing first", and a read that orients
+ * the reviewer mutates nothing.
  */
 const NORIQ_TOOLS: Record<RunKind, string[]> = {
   scope: ['set_agent_identity', 'get_briefing', 'get_task', 'get_plans', 'create_plan'],
@@ -117,11 +133,20 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     'attach_ref',
     'update_task',
   ],
-  verify: ['set_agent_identity', 'get_task', 'get_plans', 'post_comment', 'read_open_comments'],
+  verify: [
+    'set_agent_identity',
+    'get_briefing',
+    'get_task',
+    'get_plans',
+    'post_comment',
+    'read_open_comments',
+  ],
 };
 
-/** The BARE Noriq tool names a kind may call — its curated job plus the ability to reach a
- *  human. Drivers add their own prefixes/config shape; the policy is driver-neutral. */
+/** The BARE Noriq tool names a kind may call — its curated job, the ability to reach a human,
+ *  and the ability to stay alive. Drivers add their own prefixes/config shape, and the daemon
+ *  declares this same list to the server at run-agent creation (RUN-47); the policy is
+ *  driver-neutral. */
 export const noriqToolNamesFor = (kind: RunKind): string[] => [
-  ...new Set([...(NORIQ_TOOLS[kind] ?? []), ...REACH_A_HUMAN]),
+  ...new Set([...(NORIQ_TOOLS[kind] ?? []), ...REACH_A_HUMAN, ...STAY_ALIVE]),
 ];
