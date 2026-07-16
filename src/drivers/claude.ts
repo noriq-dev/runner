@@ -2,7 +2,7 @@ import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
-import { sanitizedAgentEnv } from '../security';
+import { noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import {
   type AgentDriver,
   type DriverExit,
@@ -124,49 +124,11 @@ const dedupe = (xs: string[]): string[] => [...new Set(xs)];
 /** The name the daemon's MCP server is registered under → tools are `mcp__noriq__*`. */
 export const NORIQ_MCP_NAME = 'noriq';
 
-/**
- * Reaching a human — available to EVERY kind (RUN-32).
- *
- * Deliberately outside the per-kind curation below, because it is not the same sort of thing.
- * The rest of that list rations *authority* (who may claim work, who may mint a plan); this
- * rations nothing. Notifying a human is the cheapest action an agent can take, it is exactly
- * what we want an uncertain agent to do, and withholding it pushes agents toward guessing —
- * the one behaviour the whole security model exists to prevent. An agent with a permission
- * question and no way to ask does not stop; it decides.
- *
- * - raise_alert    — "this looks wrong and a human should know" (non-blocking; keep working)
- * - request_input  — "I need a decision to continue" → the entry point for RUN-30's park/resume
- */
-const REACH_A_HUMAN = ['raise_alert', 'request_input'];
-
-/**
- * The Noriq tools each kind may call, curated to its job — the per-kind floor extended
- * to Noriq itself, not just the filesystem. A scope agent can propose a plan but not
- * claim work; a build agent can claim/report but not mint plans; verify can read and
- * comment but never mutate. `dontAsk` means anything absent here is denied, so these
- * lists are the whole of an agent's Noriq reach.
- */
-const NORIQ_TOOLS: Record<RunKind, string[]> = {
-  scope: ['set_agent_identity', 'get_briefing', 'get_task', 'get_plans', 'create_plan'],
-  build: [
-    'set_agent_identity',
-    'get_briefing',
-    'get_task',
-    'claim_task',
-    'release_task',
-    'post_comment',
-    'read_open_comments',
-    'resolve_comment',
-    'attach_ref',
-    'update_task',
-  ],
-  verify: ['set_agent_identity', 'get_task', 'get_plans', 'post_comment', 'read_open_comments'],
-};
-
-/** The Noriq MCP tool ids a kind is allowed to call — its curated job, plus the ability to
- *  reach a human, which every kind gets (RUN-32). */
+/** The Noriq MCP tool ids a kind is allowed to call, in the Claude SDK's naming. The LIST is
+ *  policy and lives in security.ts (RUN-46 — for a year it lived here, which quietly made the
+ *  per-kind Noriq floor a Claude-only property); this only applies the SDK's prefix. */
 export const noriqToolsFor = (kind: RunKind): string[] =>
-  dedupe([...(NORIQ_TOOLS[kind] ?? []), ...REACH_A_HUMAN]).map((t) => `mcp__${NORIQ_MCP_NAME}__${t}`);
+  noriqToolNamesFor(kind).map((t) => `mcp__${NORIQ_MCP_NAME}__${t}`);
 
 export function mapPermission(
   profile: PermissionProfile,

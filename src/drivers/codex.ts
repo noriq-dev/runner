@@ -1,10 +1,10 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { PermissionProfile, RunEffort } from '@noriq-dev/shared';
+import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { killProcessTree, treeSpawnOptions } from '../proc';
-import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, sanitizedAgentEnv } from '../security';
+import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import { NORIQ_MCP_NAME } from './claude';
 import {
   type AgentDriver,
@@ -63,6 +63,10 @@ export interface CodexSpawnOptions {
   approvalPolicy: 'never';
   /** The agent's Noriq connection. Omitted → it cannot report its own work at all. */
   noriqMcp?: NoriqMcp;
+  /** The run kind, so the per-kind Noriq tool floor applies HERE too (RUN-46) — without it
+   *  every codex agent got the server's whole tool surface, and a verify agent could
+   *  claim_task the work it was judging. */
+  kind: RunKind;
 }
 export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 
@@ -120,6 +124,7 @@ export class CodexDriver implements AgentDriver {
       sandbox: mapSandbox(opts.permission),
       approvalPolicy: 'never',
       noriqMcp: opts.noriqMcp,
+      kind: opts.kind,
     });
     transport.sendUserTurn(opts.prompt);
 
@@ -274,6 +279,14 @@ export const defaultSpawnCodex = (
         `mcp_servers.${NORIQ_MCP_NAME}.url=${opts.noriqMcp.url}`,
         '-c',
         `mcp_servers.${NORIQ_MCP_NAME}.bearer_token_env_var=${CODEX_MCP_TOKEN_ENV}`,
+        // The per-kind Noriq floor (RUN-46). `enabled_tools` is codex's per-server allowlist —
+        // anything absent is not even advertised to the model. Without this line the floor was
+        // a CLAUDE property: the same verify run on codex had every tool the server exposes,
+        // claim_task included, which is the one thing the adversarial gate exists to prevent
+        // (the reviewer moving the work it judges). JSON.stringify emits a valid TOML string
+        // array, which is how -c values are parsed.
+        '-c',
+        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify(noriqToolNamesFor(opts.kind))}`,
       ]
     : [];
   // Model + effort (RUN-33), per-spawn for the same reason as the MCP config above: writing

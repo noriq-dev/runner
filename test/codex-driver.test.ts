@@ -1,7 +1,8 @@
 import { PassThrough } from 'node:stream';
-import type { PermissionProfile, RunEffort } from '@noriq-dev/shared';
+import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { AsyncQueue } from '../src/async-queue';
+import { noriqToolsFor } from '../src/drivers/claude';
 import {
   CodexDriver,
   type CodexEvent,
@@ -212,7 +213,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const writes: string[] = [];
     const fakeChild = makeFakeChild(writes);
     const t = defaultSpawnCodex(
-      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never' },
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', kind: 'build' },
       () => fakeChild as never,
     );
 
@@ -234,7 +235,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const { defaultSpawnCodex } = await import('../src/drivers/codex');
     const fakeChild = makeFakeChild([]);
     const t = defaultSpawnCodex(
-      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never' },
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'verify' },
       () => fakeChild as never,
     );
     // spawn('codex') → ENOENT emits 'error'. With no listener Node rethrows it and the
@@ -254,7 +255,7 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
   // swaps in a fake transport, which is exactly why it survived — so assert the real spawn.
   const spawnArgs = (
     noriqMcp?: { url: string; token: string },
-    extra: { model?: string; effort?: RunEffort } = {},
+    extra: { model?: string; effort?: RunEffort; kind?: RunKind } = {},
   ) => {
     let seen!: { cmd: string; args: string[]; opts: { env: NodeJS.ProcessEnv } };
     const spy = ((cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
@@ -262,7 +263,14 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
       return makeFakeChild([]) as never;
     }) as never;
     defaultSpawnCodex(
-      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', noriqMcp, ...extra },
+      {
+        cwd: '/wt',
+        sandbox: 'workspace-write',
+        approvalPolicy: 'never',
+        kind: extra.kind ?? 'build',
+        noriqMcp,
+        ...extra,
+      },
       spy,
     );
     return seen;
@@ -333,5 +341,63 @@ describe('mapEffort: intent → codex\u2019s own scale (RUN-33)', () => {
     // high — and it is what the Claude SDK itself does for a model that cannot go that far.
     expect(mapEffort('xhigh')).toBe('high');
     expect(mapEffort('max')).toBe('high');
+  });
+});
+
+describe('the per-kind Noriq tool floor reaches codex (RUN-46)', () => {
+  // Before this, noriqToolsFor lived in drivers/claude.ts and NOTHING else read it — the
+  // per-kind floor was quietly a property of one driver. A codex VERIFY agent had every tool
+  // the server advertises, claim_task included: the reviewer could move the work it judges.
+  const spawnFor = (kind: RunKind) => {
+    let seen!: { args: string[] };
+    const spy = ((_cmd: string, args: string[]) => {
+      seen = { args };
+      return makeFakeChild([]) as never;
+    }) as never;
+    defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        kind,
+        noriqMcp: { url: 'https://noriq.example/mcp', token: 't' },
+      },
+      spy,
+    );
+    return seen.args;
+  };
+
+  const enabledTools = (args: string[]): string[] => {
+    const arg = args.find((a) => a.startsWith('mcp_servers.noriq.enabled_tools='));
+    expect(arg).toBeTruthy();
+    return JSON.parse((arg as string).slice('mcp_servers.noriq.enabled_tools='.length));
+  };
+
+  it('mirrors the claude floor exactly, per kind — one policy, two enforcements', () => {
+    for (const kind of ['scope', 'build', 'verify'] as const) {
+      // noriqToolsFor is claude-prefixed; strip the prefix to compare the POLICY.
+      const claudeFloor = noriqToolsFor(kind).map((t) => t.replace(/^mcp__noriq__/, ''));
+      expect(enabledTools(spawnFor(kind)).sort()).toEqual([...claudeFloor].sort());
+    }
+  });
+
+  it('a verify agent cannot claim, release, or update — the gate it exists to hold', () => {
+    const tools = enabledTools(spawnFor('verify'));
+    for (const denied of ['claim_task', 'release_task', 'update_task', 'create_plan']) {
+      expect(tools).not.toContain(denied);
+    }
+    // But it CAN reach a human (RUN-32) — rationing that pushes agents toward guessing.
+    expect(tools).toContain('raise_alert');
+    expect(tools).toContain('request_input');
+  });
+
+  it('no MCP config → no enabled_tools either (nothing to filter)', () => {
+    let seen!: { args: string[] };
+    const spy = ((_cmd: string, args: string[]) => {
+      seen = { args };
+      return makeFakeChild([]) as never;
+    }) as never;
+    defaultSpawnCodex({ cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'scope' }, spy);
+    expect(seen.args.some((a) => a.includes('enabled_tools'))).toBe(false);
   });
 });

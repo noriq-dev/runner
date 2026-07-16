@@ -1,3 +1,5 @@
+import type { RunKind } from '@noriq-dev/shared';
+
 // Security hardening for the "autonomous agent with a shell on a user machine"
 // surface (RUN-24). The load-bearing defenses live elsewhere — per-kind permission
 // profiles (drivers/claude mapPermission, drivers/codex mapSandbox), one throwaway
@@ -72,3 +74,54 @@ export function agentEnvWithMcpToken(
 ): NodeJS.ProcessEnv {
   return { ...sanitizedAgentEnv(base), [CODEX_MCP_TOKEN_ENV]: token };
 }
+
+/**
+ * Reaching a human — available to EVERY kind (RUN-32).
+ *
+ * Deliberately outside the per-kind curation below, because it is not the same sort of thing.
+ * The rest of that list rations *authority* (who may claim work, who may mint a plan); this
+ * rations nothing. Notifying a human is the cheapest action an agent can take, it is exactly
+ * what we want an uncertain agent to do, and withholding it pushes agents toward guessing —
+ * the one behaviour the whole security model exists to prevent. An agent with a permission
+ * question and no way to ask does not stop; it decides.
+ *
+ * - raise_alert    — "this looks wrong and a human should know" (non-blocking; keep working)
+ * - request_input  — "I need a decision to continue" → the entry point for RUN-30's park/resume
+ */
+const REACH_A_HUMAN = ['raise_alert', 'request_input'];
+
+/**
+ * The Noriq tools each kind may call, curated to its job — the per-kind floor extended to
+ * Noriq itself, not just the filesystem. A scope agent can propose a plan but not claim work;
+ * a build agent can claim/report but not mint plans; verify can read and comment but never
+ * mutate — that last one is the point of the adversarial gate: the reviewer must not be able
+ * to MOVE the work it is judging.
+ *
+ * This lives HERE and not in a driver (RUN-46), because it is a policy about what a run kind
+ * may reach, and the first year it lived in drivers/claude.ts it was quietly a property of one
+ * driver: the same verify run on codex had all 28 tools, claim_task included. Each driver
+ * translates these names into its own enforcement (Claude: the dontAsk allowlist; Codex: the
+ * MCP server's enabled_tools) — neither driver decides the list.
+ */
+const NORIQ_TOOLS: Record<RunKind, string[]> = {
+  scope: ['set_agent_identity', 'get_briefing', 'get_task', 'get_plans', 'create_plan'],
+  build: [
+    'set_agent_identity',
+    'get_briefing',
+    'get_task',
+    'claim_task',
+    'release_task',
+    'post_comment',
+    'read_open_comments',
+    'resolve_comment',
+    'attach_ref',
+    'update_task',
+  ],
+  verify: ['set_agent_identity', 'get_task', 'get_plans', 'post_comment', 'read_open_comments'],
+};
+
+/** The BARE Noriq tool names a kind may call — its curated job plus the ability to reach a
+ *  human. Drivers add their own prefixes/config shape; the policy is driver-neutral. */
+export const noriqToolNamesFor = (kind: RunKind): string[] => [
+  ...new Set([...(NORIQ_TOOLS[kind] ?? []), ...REACH_A_HUMAN]),
+];
