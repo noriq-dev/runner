@@ -203,10 +203,26 @@ describe('runInitProject', () => {
   });
 
   it('takes the land branch only when one is typed', async () => {
-    const res = await run(['ACME', 'claude', 'npm test', 'noriq/integration']);
+    const res = await run(['ACME', 'claude', 'npm test', '', 'noriq/integration']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.land?.branch).toBe('noriq/integration');
     expect(parsed.land?.autoPush).toBe(false); // the daemon must not publish because a wizard ran
+  });
+
+  it('writes the inline reviewer when chosen, with its model (RUN-61)', async () => {
+    const res = await run(['ACME', 'claude', 'npm test', 'y', 'claude-opus-4-8', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.verify?.cmd).toBe('npm test');
+    expect(parsed.verify?.agent?.model).toBe('claude-opus-4-8');
+    expect(parsed.verify?.agent?.maxRounds).toBe(2); // schema default rides through
+  });
+
+  it('reviewer-only is a valid verify stage — no cmd required (RUN-61)', async () => {
+    const res = await run(['ACME', 'claude', '', 'y', '', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.verify?.cmd).toBeNull();
+    expect(parsed.verify?.agent).not.toBeNull();
+    expect(parsed.verify?.agent?.model).toBeNull(); // blank = the driver's default
   });
 
   it('carries the ecosystem allowlist through, so a build agent can run the verify it suggested', async () => {

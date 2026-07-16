@@ -127,7 +127,7 @@ describe('the committed marker is re-read per run (no restart)', () => {
 describe('changedSections', () => {
   const m = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
     key: 'PROJ',
-    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null },
+    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
     tool: null,
     defaultBranch: null,
     land: null,
@@ -150,9 +150,9 @@ describe('changedSections', () => {
   });
 
   it('names each section that actually differs', () => {
-    expect(changedSections(m(), m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null } }))).toEqual(
-      ['verify'],
-    );
+    expect(
+      changedSections(m(), m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null, agent: null } })),
+    ).toEqual(['verify']);
     expect(
       changedSections(
         m(),

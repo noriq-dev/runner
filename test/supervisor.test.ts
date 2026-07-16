@@ -179,7 +179,7 @@ const perm = (write: boolean): PermissionProfile => ({ write, network: 'restrict
 const noModel = (): ModelDefault => ({ model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
-  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null },
+  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
   tool: null,
   defaultBranch: null,
   land: null,
@@ -1216,6 +1216,215 @@ describe('landing a passing build (no human per run)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.worktrees.landings).toHaveLength(1); // landed unverified, as configured
+  });
+});
+
+describe('the inline reviewer (RUN-61)', () => {
+  const REVIEWED = (
+    cmd: string | null = 'npm test',
+    agent: Partial<NonNullable<NonNullable<ProjectManifest['verify']>['agent']>> = {},
+  ) =>
+    manifest({
+      verify: {
+        cmd,
+        timeoutSeconds: null,
+        shell: null,
+        agent: { model: null, effort: null, maxRounds: 2, ...agent },
+      },
+    });
+
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  /** Wait for the Nth driver start to be the reviewer's session. */
+  const onReviewTurn = async (h: ReturnType<typeof harness>, atLeastStarts = 2) => {
+    for (let i = 0; i < 100; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= atLeastStarts) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error('the reviewer session never started');
+  };
+
+  it('spawns a fresh read-only session with NO Noriq credential, and a PASS reaches done', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { model: 'claude-opus-4-8', effort: 'high' }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn
+    await onReviewTurn(h);
+
+    const review = h.claude.starts[1]!;
+    expect(review.runId).toBe('run_1:review');
+    expect(review.kind).toBe('verify'); // executes but never edits — the verify floor
+    expect(review.permission.write).toBe(false);
+    expect(review.noriqMcp).toBeUndefined(); // one run, one credential (RUN-43) — the reviewer has none
+    expect(review.model).toBe('claude-opus-4-8'); // the SET model — the point of the knob
+    expect(review.effort).toBe('high');
+    expect(review.prompt).toContain('git diff base0000...HEAD'); // the diff since the fork
+    expect(review.prompt).toContain('ship the thing'); // the intent it judges against (the brief here)
+
+    h.claude.emitText('Checked the diff against the intent.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(h.verifyRan()).toBe(true); // the cmd floor still ran first
+  });
+
+  it('hands a FAIL report back to the builder, then a FRESH reviewer passes the fix', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('The error path is untested.\nVERDICT: FAIL');
+    h.claude.complete('done'); // reviewer #1 files FAIL
+    await onReviewTurn(h, 3); // fix turn ran (continueWith), floor re-ran, reviewer #2 starts
+    expect(h.claude.continuations.some((c) => c.includes('The error path is untested'))).toBe(true);
+    h.claude.emitText('Fixed now.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(h.verifyCalls()).toBe(2); // the fix must re-pass the deterministic floor too
+  });
+
+  it('gates the run when the reviewer still refuses after maxRounds, and posts the report', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('Not good enough.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('Still not good enough.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.comments.at(-1)?.body).toMatch(/does not satisfy the intent/);
+    expect(h.comments.at(-1)?.body).toContain('Still not good enough');
+    expect(h.worktrees.removed).toEqual([]); // the diff is kept — a human still needs it
+  });
+
+  it('maxRounds 0 is a pure gate: one review, no hand-back', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toEqual([]); // never handed back
+    expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer
+  });
+
+  it('a reviewer with no verdict is a FAIL — the adversarial default', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('It seems mostly fine, I think?');
+    h.claude.complete('done');
+    expect((await done).reason).toBe('review');
+  });
+
+  it('a failing cmd floor screens the work before any reviewer spends a token', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyPasses: false });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('verify'); // the floor's verdict, not the reviewer's
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(0);
+  });
+
+  it('reviewer-only (no cmd): the reviewer IS the gate, and no verify command runs', async () => {
+    const h = harness({ manifest: REVIEWED(null) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    expect(h.claude.starts[1]?.prompt).not.toMatch(/already passed/); // no floor to mention
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.verifyRan()).toBe(false);
+  });
+
+  it('no [verify] at all: no gate, no multiTurn, the human is the boundary', async () => {
+    const h = harness({ manifest: manifest({ verify: null }) });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    expect(h.claude.starts[0]?.multiTurn).toBe(false);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(h.verifyRan()).toBe(false);
+    expect(h.claude.starts).toHaveLength(1);
+  });
+
+  it('with [land]: the reviewer judges intent BEFORE landing, and a PASS lands', async () => {
+    const h = harness({
+      manifest: {
+        ...LANDING(),
+        verify: {
+          cmd: 'npm test',
+          timeoutSeconds: null,
+          shell: null,
+          agent: { model: null, effort: null, maxRounds: 2 },
+        },
+      },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    expect(h.worktrees.landings).toHaveLength(0); // nothing landed yet — review comes first
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(h.worktrees.landings).toHaveLength(1);
+  });
+
+  it('with [land]: a reviewer rejection means nothing lands', async () => {
+    const h = harness({
+      manifest: {
+        ...LANDING(),
+        verify: {
+          cmd: 'npm test',
+          timeoutSeconds: null,
+          shell: null,
+          agent: { model: null, effort: null, maxRounds: 0 },
+        },
+      },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review');
+    expect(h.worktrees.landings).toHaveLength(0);
+    expect(h.worktrees.removed).toEqual([]); // the unlanded diff waits for a human
+  });
+
+  it('the reviewer model falls back to [defaults.verify] when the agent block names none', async () => {
+    const m = REVIEWED();
+    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'xhigh' };
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    expect(h.claude.starts[1]?.model).toBe('claude-sonnet-5');
+    expect(h.claude.starts[1]?.effort).toBe('xhigh');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
   });
 });
 

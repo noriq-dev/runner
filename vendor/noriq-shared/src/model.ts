@@ -92,6 +92,8 @@ export const Task = z.object({
   status: TaskStatus,
   priority: z.number().int().min(0).max(4).default(2),
   estimate: z.number().nullable(),
+  /** Per-task deadline (PLNR-126); overdue = dueAt < now while not done/cancelled. */
+  dueAt: z.string().datetime().nullable().optional(),
   claimedBy: z.string().nullable(),
   claimExpiresAt: z.string().datetime().nullable(),
   openComments: z.number().int().nonnegative().default(0),

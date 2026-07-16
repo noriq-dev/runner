@@ -148,6 +148,8 @@ export function renderProjectManifest(m: {
   key: string;
   tool: string | null;
   verifyCmd: string | null;
+  /** The inline reviewer (RUN-61), when chosen. `model` null = the driver's own default. */
+  reviewer?: { model: string | null } | null;
   landBranch: string | null;
   allow: string[];
 }): string {
@@ -175,13 +177,26 @@ export function renderProjectManifest(m: {
       `cmd = ${tomlString(m.verifyCmd)}`,
       '# shell = "bash"   # pin one if this command is not portable to cmd.exe (mixed-OS teams)',
     );
-  } else {
+  } else if (!m.reviewer) {
     lines.push(
       '',
-      '# No deterministic verify configured — the independent verify agent still runs, but there',
-      '# is no zero-token floor under it. Add one; it is the cheapest gate you have:',
+      '# No verify stage configured — every build lands as a review diff and a human is the',
+      '# gate. Add the zero-token floor when the repo has a check worth running:',
       '# [verify]',
       '# cmd = "npm run typecheck && npm test"',
+    );
+  }
+
+  if (m.reviewer) {
+    lines.push(
+      '',
+      '# Inline reviewer: a FRESH agent (never the builder) judges each diff against the task',
+      '# intent, read-only and holding no credential; its report goes back to the builder to fix.',
+      '[verify.agent]',
+      m.reviewer.model
+        ? `model = ${tomlString(m.reviewer.model)}`
+        : '# model = "claude-opus-4-8"   # blank = the driver\'s default (or [defaults.verify])',
+      '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',
     );
   }
 
@@ -312,6 +327,18 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     }
     const verifyCmd = (await ask('  Verify command (blank for none)', eco.verifyCmd ?? undefined)) || null;
 
+    // The other half of the verify choice (RUN-61). Both halves may be blank — no verify stage
+    // is a legitimate configuration, not a misconfiguration, so neither question presumes.
+    out('');
+    out('  An independent reviewer agent can also judge each build against the task intent —');
+    out('  a fresh read-only session (optionally a stronger model) whose report is handed back');
+    out('  to the builder to fix.');
+    const wantReviewer = (await ask('  Add the inline reviewer? (y/N)', 'N')).toLowerCase();
+    const reviewer =
+      wantReviewer === 'y' || wantReviewer === 'yes'
+        ? { model: (await ask("  Reviewer model (blank = the driver's default)")) || null }
+        : null;
+
     // No default, on purpose. `[land].branch` is never inferred and blank must stay the easy
     // answer — offering "noriq/integration" at a keystroke is the silent envelope-widening
     // RUN-41 refused. Someone who wants auto-landing can type a branch name.
@@ -323,7 +350,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(
       target,
-      renderProjectManifest({ key, tool: tool || null, verifyCmd, landBranch, allow: eco.allow }),
+      renderProjectManifest({ key, tool: tool || null, verifyCmd, reviewer, landBranch, allow: eco.allow }),
       'utf8',
     );
     out('');

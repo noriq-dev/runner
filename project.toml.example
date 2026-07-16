@@ -53,13 +53,42 @@ defaultBranch = "main"
 # [defaults.verify]
 # effort = "xhigh"             # adversarial reasoning; inherit the tool's model
 
-# ── Deterministic verify floor (zero-token, daemon-run) ──────────────────────
-# After a BUILD run's agent exits clean, the daemon runs this command in the Run's
-# worktree. A non-zero exit (or timeout) GATES the run — it cannot reach `done`.
-# Put tsc here: vitest/esbuild do NOT catch type errors. Omit the whole section
-# for no deterministic verify (the independent verify agent still runs).
+# ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
+# What gates a BUILD run after its agent exits clean, decided by what this
+# section contains:
+#
+#   omit [verify] entirely  → no verify stage. The diff still lands as a review
+#                             diff on its branch — a human is the gate.
+#   cmd = "…"               → the deterministic floor: the daemon runs it (zero
+#                             tokens) in the Run's worktree; non-zero exit or
+#                             timeout GATES the run, and the output goes back to
+#                             the live agent to fix (bounded, K=2).
+#   [verify.agent]          → the inline reviewer: a FRESH agent — never the one
+#                             that wrote the code — reviews the diff read-only
+#                             against the task intent and files a verdict; a FAIL
+#                             report is handed back to the builder to fix, then a
+#                             fresh reviewer looks again (bounded by maxRounds).
+#   both                    → floor first (cheap screen), then the reviewer.
+#
+# A [verify] section with NEITHER is a config error, refused at parse — silence
+# must not read as a gate that isn't there.
+#
+# Put tsc in `cmd`: vitest/esbuild do NOT catch type errors.
 [verify]
 cmd = "npm run typecheck && npm test"
+#
+# [verify.agent]                 # the inline reviewer (all fields optional)
+# model = "claude-opus-4-8"      # adversarial review is where a STRONGER model than the
+#                                # builder's earns its cost. Blank = [defaults.verify],
+#                                # then the driver's own default.
+# effort = "high"
+# maxRounds = 2                  # FAIL → fix → re-review rounds before the run stops and a
+#                                # human picks it up. 0 = one review, no hand-back.
+#
+# The reviewer runs under the verify permission profile (read-only, below) on the build's
+# worktree, under the run's budget, and holds NO Noriq credential — its whole output is its
+# report; the daemon parses the verdict and posts the findings. With [land], the reviewer
+# judges intent BEFORE landing; `cmd` still re-runs on the REBASED result (see below).
 # timeoutSeconds = 600   # default 600; null = the built-in default
 #
 # WHICH SHELL `cmd` RUNS UNDER (RUN-42)

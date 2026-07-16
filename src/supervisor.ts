@@ -28,11 +28,13 @@ import type { VcsBackend, Workspace } from './vcs/types';
 import {
   MAX_VERIFY_FIXES,
   type VerifyExec,
+  type VerifySpec,
   runVerify,
   verifyFailureComment,
   verifyFeedbackPrompt,
 } from './verify';
-import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
+import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
+import { assembleReviewerPrompt, reviewerFeedbackPrompt, reviewerRejectionComment } from './verify-reviewer';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -62,7 +64,10 @@ export type SupervisorVcs = Pick<
   | 'publish'
   | 'share'
   | 'disposePreservesWork'
->;
+> &
+  // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
+  // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
+  Partial<Pick<VcsBackend, 'kind'>>;
 
 export interface ResolvedRepo {
   root: string;
@@ -239,6 +244,15 @@ export interface AnchorTask {
   body: string | null;
 }
 
+/**
+ * The RUNNABLE half of `[verify]` (RUN-61). Since the stage became a choice, `cmd` is
+ * nullable — a reviewer-only section has no command — and every caller that shells out
+ * narrows through here instead of trusting the field.
+ */
+export function cmdVerify(verify: ProjectManifest['verify']): VerifySpec | null {
+  return verify?.cmd ? { cmd: verify.cmd, timeoutSeconds: verify.timeoutSeconds, shell: verify.shell } : null;
+}
+
 /** Render the anchor. A bare task id tells the agent nothing — inline the title/body
  *  the daemon already resolved so it starts knowing the job instead of spending its
  *  first turn (and possibly failing) on a get_task round-trip. */
@@ -292,13 +306,18 @@ Brief: ${run.brief}${anchor}`;
     //
     // Its allowlist still permits running tests — iterating on one file while working is cheap and
     // targeted. What it must not do is burn the full suite to grade itself.
-    const verify = manifest.verify
+    const verify = manifest.verify?.cmd
       ? `\nThe full check (\`${manifest.verify.cmd}\`) is run for you after you finish, and its output comes back to you if it fails — so don't spend a turn on it. Run individual tests while you work if they help.`
+      : '';
+    // Fairness, not just information (RUN-61): a builder that learns of the reviewer only from
+    // a rejection reads it as scope creep and argues; one told up front writes for the review.
+    const review = manifest.verify?.agent
+      ? '\nAn independent reviewer agent then examines your diff against the task intent; its report comes back to you if it finds problems.'
       : '';
     return `${identity}
 
 MODE: BUILD (worker, read-write worktree). Implement the work and leave a review diff on this branch (a human merges it — never push).
-You do NOT need to commit: the daemon commits whatever you leave in the worktree onto this Run's branch when you finish, so \`git commit\` being unavailable is expected, not a failure — don't report it as one. Just leave the work in place.${verify}
+You do NOT need to commit: the daemon commits whatever you leave in the worktree onto this Run's branch when you finish, so \`git commit\` being unavailable is expected, not a failure — don't report it as one. Just leave the work in place.${verify}${review}
 
 Brief: ${run.brief}${anchor}`;
   }
@@ -452,16 +471,22 @@ export class RunSupervisor {
     // back to the live agent (RUN-29), which matters most HERE: this verify runs on the rebase, so
     // the break may be a collision with work that landed while this run was going. That is exactly
     // the failure an agent can fix in context and a human should not have to re-derive.
-    if (policy.onlyWhenVerifyPasses && repo.manifest.verify) {
+    //
+    // The CMD half only (RUN-61): the reviewer already judged intent before landing began, and a
+    // rebase does not change what the diff means — it changes whether the COMBINATION still works,
+    // which is precisely the deterministic command's question. Re-running an agent review inside
+    // the repo lock would serialize every other run behind a judgment call that cannot change.
+    const rebaseGate = cmdVerify(repo.manifest.verify);
+    if (policy.onlyWhenVerifyPasses && rebaseGate) {
       const result = ctx.session
         ? await this.verifyWithFeedback({
             run: ctx.run,
-            spec: repo.manifest.verify,
+            spec: rebaseGate,
             cwd: worktree.localPath,
             session: ctx.session,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
-        : await runVerify(repo.manifest.verify, worktree.localPath, { exec: this.deps.verifyExec });
+        : await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec });
       if (!result.passed) {
         return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
       }
@@ -512,7 +537,7 @@ export class RunSupervisor {
    */
   private async verifyWithFeedback(ctx: {
     run: Run;
-    spec: NonNullable<ProjectManifest['verify']>;
+    spec: VerifySpec;
     cwd: string;
     session: DriverSession;
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
@@ -550,6 +575,147 @@ export class RunSupervisor {
       }
     }
     return result;
+  }
+
+  /**
+   * The inline reviewer loop (RUN-61): a FRESH agent judges the diff against the intent; a FAIL
+   * report is handed to the LIVE builder to fix, then a fresh reviewer looks again. Bounded by
+   * `[verify.agent] maxRounds` for the same reason verifyWithFeedback is bounded by K=2, and the
+   * budget still applies underneath.
+   *
+   * Every round gets a NEW reviewer session — never a continuation. A reviewer that has already
+   * said FAIL and then watches the fix arrive is grading its own instructions; a fresh one judges
+   * the work as it stands, which is the property the gate exists for.
+   */
+  private async reviewWithFeedback(ctx: {
+    run: Run;
+    repo: ResolvedRepo;
+    worktree: Workspace;
+    driver: AgentDriver;
+    /** The live build session — the feedback target, NOT the reviewer's. */
+    session: DriverSession;
+    task: AnchorTask | null;
+    budget?: RunBudget;
+  }): Promise<VerifyVerdict & { rounds: number }> {
+    const reviewer = ctx.repo.manifest.verify?.agent;
+    const maxRounds = reviewer?.maxRounds ?? 0;
+    // The same intent a dispatched verify run would get: the anchor task's text, else the brief.
+    const intent = ctx.task
+      ? `${ctx.task.key} — ${ctx.task.title}${ctx.task.body ? `\n\n${ctx.task.body}` : ''}`
+      : ctx.run.brief;
+    const floorCmd = cmdVerify(ctx.repo.manifest.verify);
+
+    let verdict = await this.runReviewer({ ...ctx, intent });
+    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
+
+    for (let round = 1; round <= maxRounds; round++) {
+      this.log.info('reviewer refused the work — handing the report to the live agent', {
+        runId: ctx.run.id,
+        round,
+        verdict: verdict.verdict,
+      });
+      // Tokens burn on a fix turn — the phase must say so (RUN-31).
+      this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+      const exit = await ctx.session
+        .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
+        .catch((err): DriverExit | null => {
+          this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
+          return null;
+        });
+      // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
+      // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
+      if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round };
+      this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
+      // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
+      // deterministic floor re-runs (with its own bounded feedback) before the re-review.
+      if (floorCmd) {
+        const floor = await this.verifyWithFeedback({
+          run: ctx.run,
+          spec: floorCmd,
+          cwd: ctx.worktree.localPath,
+          session: ctx.session,
+          phase: 'verifying',
+        });
+        if (!floor.passed) {
+          return {
+            verdict: 'fail',
+            passed: false,
+            rounds: round,
+            findings: `the fix for the reviewer's findings broke the deterministic check (\`${floorCmd.cmd}\`):\n${floor.output.slice(-4000)}`,
+          };
+        }
+      }
+      verdict = await this.runReviewer({ ...ctx, intent });
+      if (verdict.passed) return { ...verdict, rounds: round };
+    }
+    return { ...verdict, rounds: maxRounds };
+  }
+
+  /** One fresh reviewer session over the build's worktree. Read-only profile, no Noriq
+   *  credential, verdict parsed from its output. */
+  private async runReviewer(ctx: {
+    run: Run;
+    repo: ResolvedRepo;
+    worktree: Workspace;
+    driver: AgentDriver;
+    intent: string;
+    budget?: RunBudget;
+  }): Promise<VerifyVerdict> {
+    const manifest = ctx.repo.manifest;
+    const reviewer = manifest.verify?.agent;
+    // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
+    // dispatched verify run climbs (RUN-33), because this is the same role inlined.
+    const model = reviewer?.model ?? manifest.defaults?.verify?.model ?? null;
+    const effort = reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
+    // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
+    // work, so a bare `git diff` shows nothing — the range is the review. A live backend
+    // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
+    const diffCmd =
+      (this.vcsFor(ctx.repo).kind ?? 'git') === 'git' ? `git diff ${ctx.worktree.baseId}...HEAD` : undefined;
+    let text = '';
+    const session = superviseBudget(ctx.driver, {
+      runId: `${ctx.run.id}:review`,
+      kind: 'verify', // the reviewer IS a verify actor: executes but never edits
+      cwd: ctx.worktree.localPath,
+      prompt: assembleReviewerPrompt({
+        intent: ctx.intent,
+        diffCmd,
+        verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
+      }),
+      permission: manifest.permissions.verify,
+      // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
+      // second inline identity cannot exist — and need not. The reviewer's output IS its report;
+      // the daemon parses the verdict and posts the findings itself. This is also what makes
+      // authorship separation absolute: the reviewer cannot claim, move, or comment as anyone.
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      budget: ctx.budget,
+      handlers: {
+        onText: (t) => {
+          text += t;
+        },
+        // Same surface the conflict resolver uses: the run's spend keeps moving on the dashboard
+        // while a second session burns. (Cross-session totals are RUN-59's problem, not this one.)
+        onTelemetry: (t) => this.deps.report(ctx.run.id, { status: 'running', telemetry: t }),
+      },
+    });
+    // Killable while it reviews, same as the conflict resolver — and unregistered after, for the
+    // same leak (see resolveConflict).
+    this.deps.steering?.register(ctx.run.id, session.session, session.stop);
+    try {
+      const exit = await session.done;
+      if (exit.outcome !== 'done') {
+        // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
+        return {
+          verdict: 'unknown',
+          passed: false,
+          findings: text.trim() || `the reviewer exited ${exit.reason ?? 'without a report'}`,
+        };
+      }
+      return parseVerdict(text);
+    } finally {
+      this.deps.steering?.unregister(ctx.run.id);
+    }
   }
 
   /** Give the build agent one bounded turn to resolve its own conflict, in place. */
@@ -1121,7 +1287,75 @@ export class RunSupervisor {
     // it. Serialized per repo, because rebase→verify→land is a read-modify-write of one
     // branch and two runs interleaving would land untested combinations.
     const landPolicy = kind === 'build' && driverSucceeded ? (repo.manifest.land ?? null) : null;
-    if (landPolicy) {
+    const floorCmd = cmdVerify(repo.manifest.verify);
+
+    // Deterministic verify floor (RUN-19), when NOT landing — the landing pipeline verifies the
+    // REBASED result instead, which is strictly the better question. Runs BEFORE the reviewer
+    // (RUN-61): the command is cheap and deterministic, so it screens out work not worth an
+    // agent's review — the same reason CI runs the linter before the humans arrive.
+    if (kind === 'build' && driverSucceeded && !landPolicy && floorCmd) {
+      // Same silence as landing, and the longer of the two in practice: the full suite with
+      // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
+      // the agent on a failure, which flips the phase to 'agent' again — see below.
+      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
+      const result = await this.verifyWithFeedback({
+        run,
+        spec: floorCmd,
+        cwd: worktree.localPath,
+        session: budgetRun.session,
+        phase: 'verifying',
+      });
+      if (result.passed) {
+        this.log.info('deterministic verify passed', { runId: run.id });
+      } else {
+        this.log.warn('deterministic verify FAILED — run gated (not done)', {
+          runId: run.id,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+        });
+        if (run.anchor?.type === 'task') {
+          this.deps.postComment?.(run.projectId, run.anchor.taskId, verifyFailureComment(floorCmd, result));
+        }
+        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify' };
+      }
+    }
+
+    // Inline reviewer (RUN-61): a FRESH agent judges whether the diff satisfies the INTENT — the
+    // question the command cannot ask. Before landing, deliberately: a rebase changes whether the
+    // combination still builds (the command's question, asked post-rebase inside the lock), never
+    // what the diff means — and an agent review inside the repo lock would serialize every other
+    // run on this repo behind a judgment that cannot change.
+    if (kind === 'build' && driverSucceeded && exit.outcome === 'done' && repo.manifest.verify?.agent) {
+      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
+      const review = await this.reviewWithFeedback({
+        run,
+        repo,
+        worktree,
+        driver,
+        session: budgetRun.session,
+        task,
+        budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+      });
+      if (review.passed) {
+        this.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });
+      } else {
+        this.log.warn('inline reviewer refused the work — run gated (not done)', {
+          runId: run.id,
+          verdict: review.verdict,
+          rounds: review.rounds,
+        });
+        if (run.anchor?.type === 'task') {
+          this.deps.postComment?.(
+            run.projectId,
+            run.anchor.taskId,
+            reviewerRejectionComment(review.findings, review.rounds),
+          );
+        }
+        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review' };
+      }
+    }
+
+    if (landPolicy && exit.outcome === 'done') {
       // The agent process is gone and the spend stops moving here, so without this the
       // dashboard shows "running" through a rebase → verify → fast-forward that can take a
       // minute — and a queue behind the repo lock makes it longer (RUN-31).
@@ -1171,41 +1405,6 @@ export class RunSupervisor {
         exit = { ...exit, outcome: 'failed', isError: true, reason: `land:${outcome.reason}` };
       }
       landed = outcome.landed;
-    }
-
-    // Deterministic verify floor (RUN-19): a build whose agent exited clean must
-    // still pass the manifest verify command (zero tokens) before reaching done.
-    // Skipped when [land] is configured — the landing pipeline already verified the
-    // REBASED result, which is strictly the better question to ask.
-    if (kind === 'build' && driverSucceeded && !landPolicy && repo.manifest.verify) {
-      // Same silence as landing, and the longer of the two in practice: the full suite with
-      // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
-      // the agent on a failure, which flips the phase to 'agent' again — see below.
-      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
-      const result = await this.verifyWithFeedback({
-        run,
-        spec: repo.manifest.verify,
-        cwd: worktree.localPath,
-        session: budgetRun.session,
-        phase: 'verifying',
-      });
-      if (result.passed) {
-        this.log.info('deterministic verify passed', { runId: run.id });
-      } else {
-        this.log.warn('deterministic verify FAILED — run gated (not done)', {
-          runId: run.id,
-          exitCode: result.exitCode,
-          timedOut: result.timedOut,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(
-            run.projectId,
-            run.anchor.taskId,
-            verifyFailureComment(repo.manifest.verify, result),
-          );
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify' };
-      }
     }
 
     // Every gate that could hand work back has now run, so the session has no more work to do.

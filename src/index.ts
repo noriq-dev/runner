@@ -132,6 +132,7 @@ export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from 
 export {
   RunSupervisor,
   assemblePrompt,
+  cmdVerify,
   mergeBudget,
   type RunSupervisorDeps,
   type ResolvedRepo,
@@ -152,6 +153,12 @@ export {
   type Verdict,
   type VerifyVerdict,
 } from './verify-agent';
+export {
+  assembleReviewerPrompt,
+  reviewerFeedbackPrompt,
+  reviewerRejectionComment,
+  type ReviewerPromptContext,
+} from './verify-reviewer';
 export type {
   IntegrateResult,
   LeaseOptions,

@@ -138,7 +138,7 @@ Two files, and they are split by **who they belong to**:
 
 ```bash
 cd ~/code/acme
-noriq-runner init-project     # four questions, then commit the result
+noriq-runner init-project     # a few questions, then commit the result
 git add .noriq/project.toml && git commit -m "Add Noriq marker"
 ```
 
@@ -212,6 +212,28 @@ the vendored `@noriq-dev/shared` wire contract — to `zod@4`, satisfying the SD
 Tests inject a fake `queryFn` and never touch the real SDK. The bundle keeps the
 SDK **external** (it spawns a binary and carries its own subtree), so it's resolved
 from `node_modules` at runtime rather than inlined. (The Codex driver is in RUN-13.)
+
+## The verify stage is a choice
+
+What gates a build after its agent exits clean is decided per repo, by what `[verify]`
+contains:
+
+```toml
+[verify]
+cmd = "npm run typecheck && npm test"   # the deterministic floor: zero tokens, daemon-run
+
+[verify.agent]                # optional: an inline reviewer — a FRESH agent (never the
+model = "claude-opus-4-8"     # builder) reviews the diff read-only against the task intent;
+maxRounds = 2                 # a FAIL report goes back to the builder to fix, bounded, then
+                              # a fresh reviewer looks again
+```
+
+Either half alone works; both means floor-then-reviewer; omit `[verify]` entirely and
+there's no verify stage at all — the diff still lands as a review diff, and you are the
+gate. The reviewer is where a **stronger model than the builder's** earns its cost, and it
+holds no Noriq credential: its whole output is its report, so it can judge work but never
+move it. A failure of either gate comes back to the *live* build session with the output in
+context — no re-dispatch, no fresh agent re-deriving what the daemon already knows.
 
 ## Landing the work
 
