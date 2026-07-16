@@ -35,6 +35,11 @@ const run = (answers: string[], over: Parameters<typeof runInitProject>[0] = {})
     detect: async () => NPM,
     scanRoots: async () => [dir],
     detectVcsFor: async () => undefined, // no dv spawns from tests
+    // Pinned, NOT detected: the canned answers below are positional, so whether the driver
+    // question exists must not depend on which CLIs the host happens to have. Un-pinned, this
+    // suite was green on dev machines (claude installed → question asked) and red on every
+    // GitHub runner (no CLIs → question skipped, every answer shifted one slot).
+    installedTools: () => ['claude'],
     ...over,
   });
 

@@ -33,6 +33,13 @@ export interface InitProjectDeps {
   detect?: (cwd: string) => Promise<Ecosystem>;
   /** Injectable so tests never read the real ~/.noriq/runner.toml. */
   scanRoots?: () => Promise<string[] | null>;
+  /**
+   * Injectable so tests never depend on which CLIs the HOST has (defaults to the real
+   * detectTools). Without this, the "Agent driver" question silently disappears on any box
+   * without `claude`/`codex` on PATH — CI — and every positional test answer shifts one slot:
+   * the suite was green on dev machines and red on every GitHub runner since it landed.
+   */
+  installedTools?: () => string[];
   /** Injectable VCS detection (RUN-60) — tests don't need a real dv registry. */
   detectVcsFor?: (root: string) => Promise<VcsDetection | undefined>;
   configPath?: string;
@@ -308,7 +315,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       else out('  ✗ 1–8 letters or digits, e.g. ACME. It must match a project on your server.');
     }
 
-    const installed = detectTools();
+    const installed = (deps.installedTools ?? detectTools)();
     const tool = installed.length ? await ask(`  Agent driver (${installed.join(' | ')})`, installed[0]) : '';
     if (!installed.length) out('  No drivers found on PATH — install `claude` or `codex` later.');
 

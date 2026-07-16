@@ -1,0 +1,62 @@
+# Publish @noriq-dev/runner to npm via TRUSTED PUBLISHING (OIDC) — no token lives anywhere.
+# npmjs.com is configured (package settings → Trusted Publisher) to accept publishes only from
+# THIS repo + THIS workflow file; the job proves its identity with a GitHub-issued OIDC token
+# and npm mints short-lived credentials for exactly one publish. Provenance is attached
+# automatically, so `npm audit signatures` can tie the artifact back to this run.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  # Fallback for a tag that predates this workflow (a tag-push only runs the workflow that
+  # exists AT the tagged commit) or a re-publish after a transient failure. Publishes whatever
+  # ref it is dispatched on — the version guard below still binds.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # the OIDC exchange IS the credential — this is what "trusted publisher" means
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # 24, not the 20 CI tests against: trusted publishing needs npm >= 11.5.1, which Node 24
+          # bundles. The shipped artifact is the same esbuild bundle either way; CI already proves
+          # it against 20 (package.json engines >= 20).
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # A tag must publish exactly the version its name claims. Catches the classic miss —
+      # tagging before bumping package.json — as a loud failure instead of a mislabeled release.
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          echo "tag=${GITHUB_REF_NAME} package.json=${want}"
+          test "${GITHUB_REF_NAME}" = "${want}"
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+
+      # The 0.2.0 lesson, enforced at the door it ships through: install the real tarball and
+      # assert on the binary's OUTPUT (the bug was exit 0 with no output).
+      - name: Smoke-test the packed binary
+        run: |
+          set -euo pipefail
+          npm pack --silent
+          npm install -g ./noriq-dev-runner-*.tgz
+          got=$(noriq-runner version)
+          want=$(node -p "require('./package.json').version")
+          echo "installed binary reported: '${got}' (want '${want}')"
+          test "${got}" = "${want}"
+
+      # No NODE_AUTH_TOKEN anywhere: with a trusted publisher configured, npm exchanges the
+      # job's OIDC token itself. A missing/misconfigured trust relationship fails loudly here.
+      - run: npm publish
