@@ -138,19 +138,28 @@ The one real casualty is `share`, and it is a no-op rather than a failure.
 Useful precisely because it is *nearly* git, so it isolates which assumptions are about "git-like
 CLIs" and which are about "distributed VCS".
 
+**⚠️ This section was documentation-derived and RUN-54 has since tested it against a real
+server — §9 is the ground truth and corrects two of the three claims below.** Kept as written so
+the delta is visible.
+
 - **No rebase.** Diversion documents 3-way merge with common-ancestor detection; rebase is not
   offered. `integrate` therefore becomes "merge the target into my branch", which still produces a
   tree containing target + my work — which is exactly what verify needs to see, and it leaves the
   target as an ancestor so `publish` can still be a fast-forward. **The outcome survives; the verb
   does not.** This is the single best vindication of naming operations as outcomes.
+  *(§9: half right. The merged tree is real; the fast-forward is not — Diversion never
+  fast-forwards, and worse, its merge does not lose the race.)*
 - **Branches are server-side and team-visible** — Diversion's docs put branch visibility at "all
   team members" and workspaces at "only you". So `noriq/run/<id>`, today a local throwaway nobody
   ever sees, becomes **a branch the whole team watches appear and disappear, once per run.** Git
   gives us disposable branches for free; Diversion charges social cost for them.
+  *(§9: confirmed — branch ids are globally-numbered server objects.)*
 - **`checkpoint` reaches the cloud.** Same shape as Perforce's shelve, milder framing.
+  *(§9: understated. EVERYTHING reaches the cloud, continuously, before any commit.)*
 
 So Diversion breaks the model in the *same place* Perforce does, just more gently. That is the
-strongest evidence that this is a real seam and not a Perforce quirk.
+strongest evidence that this is a real seam and not a Perforce quirk. *(§9: the "more gently" was
+wrong in both directions at once — gentler on isolation cost, harsher on liveness.)*
 
 ## 5. The invariants, and what actually happens to them
 
@@ -333,16 +342,125 @@ hold them behind a decision.
 
 ## 8. What this spike did not settle
 
-- **Whether Diversion's `commit` is local or reaches the cloud.** Its docs are explicit that
-  branches are server-side and workspaces are private, but not about when a commit crosses. It
-  changes how bad the §5 finding is for Diversion specifically. One evening with the CLI settles it;
-  guessing does not.
+- ~~**Whether Diversion's `commit` is local or reaches the cloud.**~~ **Settled by RUN-54, and the
+  question dissolved**: the working tree itself replicates continuously — an uncommitted file is
+  on the server seconds after being written. See §9.
 - **Perforce streams vs branch specs** as the mapping for `createTarget`. Both plausibly work; the
   choice interacts with how a site already organises its depot, which we do not get to pick.
+  (Still open — RUN-55.)
 - **Whether anyone wants this.** The plan sequenced RUN-44 last precisely so this could be judged
   with the full git op set known. It now is — and the answer is that the abstraction is sound but
   its first backend costs the project its clearest security claim. That is worth a deliberate yes,
   not a default one.
+
+## 9. Addendum: Diversion, hands-on (RUN-54, 2026-07-16)
+
+Everything in this section was measured against a real Diversion account (`dv` v1.0.624, Linux),
+in a throwaway repo created for the purpose and deleted after. Where it contradicts §4, this
+section wins.
+
+### The headline: there is no local state. None.
+
+The gating question was "does `commit` reach the cloud?" — the real answer makes the question
+meaningless. **The working tree itself replicates continuously**: a freshly written, *uncommitted*
+file reports `Synced` within seconds. A background agent (`dv --agent`, one per machine, serving
+every workspace) ships every write as it happens. Perforce at least waits for an explicit
+`p4 shelve`; Diversion waits for nothing.
+
+Consequences the runner has to own:
+
+- Every byte a build agent writes is server-visible **before any gate runs** — the verify gate
+  gates what *lands*, and can never gate what *leaks*.
+- A scope run that somehow writes (the read-only chmod is defense-in-depth, not a wall) leaks
+  instantly. There is no "it never left the machine" tier on this backend, not even for failures.
+- Crash recovery inverts from a problem into a gift: a dead machine loses **nothing** — the
+  workspace, uncommitted edits included, survives on the server. `reapOrphans` becomes a server
+  query (`dv workspace`), needing connectivity but protecting more than git's reaper ever could.
+- The sync agent is load-bearing infrastructure the daemon doesn't own. If it dies mid-run,
+  writes stop replicating and the backend's assumptions quietly fail — a Diversion backend must
+  supervise or at least health-check it.
+
+### The lease: the pool-of-1 assumption is WRONG here
+
+A second workspace of the same repo cost **4.4 seconds**, coexists with the first, and checks out
+its own branch — each workspace is a server-side object with its own id. **Diversion supports
+space-isolation like git**: mint a workspace per Run, dispose after. What it charges instead of
+time is *visibility* (every workspace is account-visible server state) and *placement* (`dv`
+refuses to put workspaces in some locations — `/tmp` is forbidden outright — so the runner does
+not get free choice of a worktrees dir). Open: the 4.4s was a toy repo; whether sync is lazy
+enough to keep that flat on a large repo is unmeasured, and Diversion repos are large by design.
+
+### `integrate` survives; `publish` needs the backend to carry the guarantee
+
+- **No rebase — confirmed** (absent from the entire CLI surface, along with any `push`/`pull`;
+  `update` is pull). Merging the target into the run branch produced exactly the combined tree
+  the interface promises. The outcome holds.
+- **Publish never fast-forwards.** Merging the run branch back into an unmoved target minted a
+  NEW commit — but `dv diff` between the verified commit and the landed one: "No changes
+  detected". **The merge-queue guarantee survives at TREE level, not commit level.** Acceptable,
+  and worth stating exactly: what lands is the tree verify saw, under a commit id verify never
+  saw.
+- **Diversion's native merge papers over the race — measured, not feared.** With the target
+  advanced behind the run's back, `dv merge --into main` answered "Merge succeeded", exit 0, and
+  landed a combination no verify ever saw. No out-of-date check exists. So `publish`'s
+  compare-and-swap **cannot be delegated to this backend** — a DiversionBackend must implement it
+  advisorily (record the target head at integrate; re-check before merging; refuse on movement),
+  which carries an honest TOCTOU window between check and merge. Git does not have that window
+  (`--ff-only` is atomic at the ref); this backend does, and THREAT-MODEL.md must say so if
+  RUN-51 proceeds. (Open: whether the REST API offers a precondition the CLI doesn't.)
+
+### Conflicts: the CLI is a dead end, by design
+
+A conflicted merge exits **0**, prints a web URL, and leaves the local workspace CLEAN — no
+markers, no in-progress state, nothing to edit. The conflict lives server-side as a pending-merge
+object (`dv.merge.<uuid>`) resolvable in the browser. `merge-preview` opens a browser too. There
+are no conflict paths in any output, no `--json` anywhere except `tag`, and exit codes that don't
+distinguish success from conflict.
+
+So on this backend, **agent conflict resolution as the landing flow does it (edit the conflicted
+paths in the worktree) does not exist via the CLI.** Two honest options for RUN-51:
+
+1. **Target the REST API, not the CLI.** The CLI is visibly a thin client over an HTTP API plus
+   the sync agent; the pending-merge object presumably exposes its file list and resolution
+   endpoints there. This is the only route to `integrate` returning paths.
+2. **Degrade to bail-with-URL.** "A human must resolve this" is already the interface's answer to
+   non-mechanical conflicts — on Diversion the daemon would post the resolve URL into the task
+   comment and every conflict becomes a human conflict. Honest, shippable, and strictly worse
+   than git.
+
+Either way: **the CLI is a human tool, not a driver surface.** Interactive prompts, browser
+launches, exit-0-on-conflict, and string-parsing for outcomes — a backend scripted over it would
+be an ordeal (the exact failure mode RUN-54's checklist item 8 asked about).
+
+### The wins nobody predicted
+
+- **`dv review` is RUN-28, native.** One CLI command from the run branch → a review URL. No forge
+  credential, no `gh`, no push step — the merge-request boundary ports to Diversion *more*
+  cleanly than to git, using the same account auth as everything else.
+- Shelves exist with a full CLI (`shelf create/show/apply/delete`) — though continuous sync makes
+  them nearly redundant for durability; their use is stashing, not safety.
+
+### The cost nobody predicted
+
+**Everything is authored as the account.** The daemon's commits landed as "Montana Tuska
+<mtuska@frs.llc>" — there is no per-invocation identity like git's `-c user.name` AUTHOR trick,
+and no second credential to withhold: one login is workspace, commit, merge, review, and delete.
+Two things follow. History cannot distinguish the runner's commits from the human's except by
+message convention — the authorship-separation the verify gate leans on ("the verify agent never
+edits") is only *observable* on git. And the "no agent ever gets push credentials" invariant
+degrades here to "the agent's machine holds a credential that can do everything the human can" —
+sanitizedAgentEnv can strip it from the child env exactly as it does the git credential, but the
+sync agent needs it to run at all, so the workspace's writes reach the server regardless of what
+the child process may hold. That is RUN-48's accepted trade, now with its exact Diversion shape.
+
+### Verdict for RUN-51
+
+The nine outcomes survive, **but the implementation surface is the REST API, not the CLI** — that
+is a scope change to RUN-51 and recorded there. Effort-wise: lease/dispose/hasWork/checkpoint/
+targetExists/createTarget are straightforward; publish needs backend-carried CAS; integrate needs
+either the API's pending-merge surface or the bail-with-URL degradation; share is a no-op; review
+is a bonus primitive git doesn't have. Ordering within the plan stands: Diversion remains the
+cheap seam-finder, and it has already found four seams the paper spike missed.
 
 ---
 
