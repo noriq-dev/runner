@@ -15,6 +15,7 @@ import { SteeringBridge } from './steering';
 import { type RunReport, RunSupervisor } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
+import { GitBackend } from './vcs/git';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient } from './ws-client';
 
@@ -80,11 +81,13 @@ export class Daemon {
 
     // Crash-safe cleanup: a fresh start means every prior local process is gone,
     // so any leftover noriq/run/* worktree is orphaned — reap it before we begin.
-    const worktrees = new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR });
+    // The daemon speaks to source control only through the VCS seam (RUN-49); git is the one
+    // backend today, and WorktreeManager is its implementation detail rather than the surface.
+    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
     let reaped = 0;
     const kept: string[] = [];
     for (const r of repos) {
-      reaped += await worktrees.reapOrphans(r.root, { onSkip: (p) => kept.push(p) });
+      reaped += await vcs.reapOrphans(r.root, { onSkip: (p) => kept.push(p) });
     }
     if (reaped) this.log.info(`reaped ${reaped} orphaned worktree(s) from a prior run`);
     // Never silently discard an agent's output: a worktree with unsaved work outlives
@@ -135,7 +138,7 @@ export class Daemon {
         claude: new ClaudeDriver({ logger: this.log }),
         codex: new CodexDriver({ logger: this.log }),
       },
-      worktrees,
+      vcs,
       resolveRepo: async (repoRef) => {
         const r = reposById.get(repoRef);
         if (!r) return null;
@@ -354,7 +357,7 @@ export class Daemon {
         const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
         // Push again before opening: landing pushed each run as it went, but this is the moment
         // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
-        const push = await worktrees.pushBranch(repo.root, branch);
+        const push = await vcs.share(repo.root, branch);
         if (!push.ok) {
           await client
             .reportMerge(runner.id, { planId: plan.planId, failed: `push failed: ${push.detail}` })

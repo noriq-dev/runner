@@ -23,6 +23,7 @@ import {
 } from './land';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
+import type { VcsBackend, Workspace } from './vcs/types';
 import {
   MAX_VERIFY_FIXES,
   type VerifyExec,
@@ -31,7 +32,7 @@ import {
   verifyFeedbackPrompt,
 } from './verify';
 import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
-import { type WorktreeInfo, type WorktreeManager, runBranch } from './worktree';
+import { type WorktreeInfo, runBranch } from './worktree';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -74,19 +75,23 @@ const LOG_TAIL_CAP = 4000;
 export interface RunSupervisorDeps {
   /** One driver per tool (claude/codex). */
   drivers: Partial<Record<AgentTool, AgentDriver>>;
-  worktrees: Pick<
-    WorktreeManager,
-    | 'create'
-    | 'remove'
-    | 'hasChanges'
-    | 'commitWork'
-    | 'refExists'
-    | 'createBranch'
-    | 'rebaseOnto'
-    | 'continueRebase'
-    | 'abortRebase'
-    | 'landFastForward'
-    | 'pushBranch'
+  /** The VCS seam (RUN-49). This Pick is the interface's origin story: its git-verb
+   *  predecessor was how the nine outcomes were DISCOVERED — the supervisor already declared
+   *  exactly what it needs, so the seam was renamed, not designed. Everything except
+   *  reapOrphans, which is the daemon's (crash recovery is not a per-Run concern). */
+  vcs: Pick<
+    VcsBackend,
+    | 'lease'
+    | 'dispose'
+    | 'hasWork'
+    | 'checkpoint'
+    | 'targetExists'
+    | 'createTarget'
+    | 'integrate'
+    | 'resumeIntegrate'
+    | 'abandonIntegrate'
+    | 'publish'
+    | 'share'
   >;
   /** repoRef → local repo root + the manifest to run under. May be async: the daemon
    *  re-reads the committed marker per Run so a config edit needs no restart. */
@@ -368,24 +373,24 @@ export class RunSupervisor {
       }
       branch = run.targetBranch;
     }
-    const wt = this.deps.worktrees;
+    const vcs = this.deps.vcs;
 
     // First landing into this branch: fork it from the repo's declared main so the
     // integration line starts somewhere sane rather than from this run's base.
-    if (!(await wt.refExists(repo.root, branch))) {
+    if (!(await vcs.targetExists(repo.root, branch))) {
       const from = repo.manifest.defaultBranch ?? worktree.baseSha;
-      await wt.createBranch(repo.root, branch, from);
+      await vcs.createTarget(repo.root, branch, from);
       this.log.info('created the landing branch', { branch, from });
     }
 
-    let rebase = await wt.rebaseOnto(worktree, branch);
+    let rebase = await vcs.integrate(worktree, branch);
     let resolvedByAgent: boolean | undefined;
     let agentSaid = '';
 
     if (!rebase.ok) {
       const conflicts = rebase.conflicts;
       if (!policy.resolveConflicts) {
-        await wt.abortRebase(worktree);
+        await vcs.abandonIntegrate(worktree);
         return { landed: false, branch, reason: 'conflict', conflicts };
       }
       this.log.info('rebase conflict — asking the build agent whether it is mechanical', {
@@ -398,7 +403,7 @@ export class RunSupervisor {
       if (!attempt.resolved) {
         // The agent judged it needs a human. That is the correct answer, not a failure —
         // picking a winner would silently discard someone's work.
-        await wt.abortRebase(worktree);
+        await vcs.abandonIntegrate(worktree);
         return {
           landed: false,
           branch,
@@ -408,9 +413,9 @@ export class RunSupervisor {
           detail: agentSaid,
         };
       }
-      const cont = await wt.continueRebase(worktree);
+      const cont = await vcs.resumeIntegrate(worktree);
       if (!cont.ok) {
-        await wt.abortRebase(worktree);
+        await vcs.abandonIntegrate(worktree);
         return {
           landed: false,
           branch,
@@ -443,7 +448,7 @@ export class RunSupervisor {
       this.log.info('verify passed on the rebased result', { runId: run.id, branch });
     }
 
-    const ff = await wt.landFastForward(repo.root, branch, worktree.branch);
+    const ff = await vcs.publish(repo.root, branch, worktree.branch);
     if (!ff.ok) {
       // Distinguish "the branch moved" (retryable) from "git refused" (needs a human) —
       // collapsing both into 'race' sends everyone hunting a concurrency bug that isn't
@@ -456,7 +461,7 @@ export class RunSupervisor {
     // (RUN-27). A failure here must never fail the run: the diff is on the branch either way,
     // and reporting "failed" would send someone hunting for work that is right there.
     if (!ctx.policy.autoPush) return { landed: true, branch, sha: ff.sha, resolvedByAgent };
-    const push = await wt.pushBranch(ctx.repo.root, branch);
+    const push = await vcs.share(ctx.repo.root, branch);
     if (!push.ok) {
       this.log.warn('landed, but the push failed — the work is on the branch locally', {
         runId: ctx.run.id,
@@ -864,9 +869,9 @@ export class RunSupervisor {
     const verifiesRunId = run.kind === 'verify' ? (run.verifiesRunId ?? null) : null;
     const baseRef = verifiesRunId ? runBranch(verifiesRunId) : undefined;
 
-    let worktree: Awaited<ReturnType<WorktreeManager['create']>>;
+    let worktree: Workspace;
     try {
-      worktree = await this.deps.worktrees.create(repo.root, run.id, { readOnly, baseRef });
+      worktree = await this.deps.vcs.lease(repo.root, run.id, { readOnly, baseRef });
     } catch (err) {
       // A verify run whose target branch is gone (reaped, or built on another machine)
       // must fail loudly: silently falling back to HEAD would hand back a confident PASS
@@ -914,7 +919,7 @@ export class RunSupervisor {
           label: runAgent.label,
         });
       } catch (err) {
-        await this.deps.worktrees.remove(worktree).catch(() => {});
+        await this.deps.vcs.dispose(worktree).catch(() => {});
         return fail(`could not create the Noriq agent for this run: ${(err as Error).message}`);
       }
     }
@@ -930,7 +935,7 @@ export class RunSupervisor {
     // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
     // which it can only do if the daemon actually made someone.
     if (!runAgent) {
-      await this.deps.worktrees.remove(worktree).catch(() => {});
+      await this.deps.vcs.dispose(worktree).catch(() => {});
       return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
     }
     const prompt = assemblePrompt(run, repo.manifest, {
@@ -1050,7 +1055,7 @@ export class RunSupervisor {
     // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
     // review as "done" with an empty diff — a silent no-op reported as success.
     if (kind === 'build' && driverSucceeded) {
-      const changed = await this.deps.worktrees.hasChanges(worktree).catch(() => true); // can't tell → assume it worked and let verify decide
+      const changed = await this.deps.vcs.hasWork(worktree).catch(() => true); // can't tell → assume it worked and let verify decide
       if (!changed) {
         this.log.warn('build produced no changes — skipping verify, not a success', { runId: run.id });
         exit = { ...exit, outcome: 'failed', isError: true, reason: 'no_changes' };
@@ -1064,8 +1069,8 @@ export class RunSupervisor {
     // start. Committing here is what makes "a review diff on the branch" true.
     if (kind === 'build' && driverSucceeded) {
       const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
-      await this.deps.worktrees
-        .commitWork(worktree, `noriq run ${run.id}: ${label}`)
+      await this.deps.vcs
+        .checkpoint(worktree, `noriq run ${run.id}: ${label}`)
         .then((committed) => {
           if (committed)
             this.log.info('committed the run diff to its branch', { runId: run.id, branch: worktree.branch });
@@ -1208,8 +1213,8 @@ export class RunSupervisor {
     // weight — reaping them here is what keeps ~/.noriq/worktrees from growing one
     // directory per run forever. Scope/verify and driver failures are cleaned up as before.
     if (!(kind === 'build' && driverSucceeded && !landed)) {
-      await this.deps.worktrees
-        .remove(worktree)
+      await this.deps.vcs
+        .dispose(worktree)
         .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
     }
     this.log.info('run finished', { runId: run.id, outcome: exit.outcome, reason: exit.reason });

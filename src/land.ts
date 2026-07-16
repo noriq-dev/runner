@@ -4,8 +4,9 @@ import type { AnchorTask } from './supervisor';
  * The landing step: a build that cleared the gate is rebased onto the integration
  * branch, re-verified THERE, and fast-forwarded in — no human per run.
  *
- * This module holds the pure bits (prompt + reporting text). The git work lives in
- * WorktreeManager and the orchestration in RunSupervisor.
+ * This module holds the pure bits (prompt + reporting text). The VCS work lives behind the
+ * vcs/ seam (RUN-49; git's implementation is WorktreeManager) and the orchestration in
+ * RunSupervisor.
  */
 
 /** Why a run didn't land. Each maps to a distinct human action, so keep them distinct. */

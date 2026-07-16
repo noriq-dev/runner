@@ -152,6 +152,15 @@ export {
   type Verdict,
   type VerifyVerdict,
 } from './verify-agent';
+export type {
+  IntegrateResult,
+  LeaseOptions,
+  PublishResult,
+  ShareResult,
+  VcsBackend,
+  Workspace,
+} from './vcs/types';
+export { GitBackend, type GitOps } from './vcs/git';
 export {
   WorktreeManager,
   runBranch,

@@ -84,9 +84,9 @@ class FakeWorktrees {
   /** Whether the agent left a diff. Defaults true — most tests model real work. */
   changed = true;
   hasChangesCalls = 0;
-  /** Set to make create() reject, modelling a branch that no longer exists. */
+  /** Set to make lease() reject, modelling a branch that no longer exists. */
   createFails = false;
-  create = async (
+  lease = async (
     root: string,
     runId: string,
     opts: { readOnly?: boolean; baseRef?: string } = {},
@@ -102,16 +102,16 @@ class FakeWorktrees {
       baseSha: 'base0000',
     };
   };
-  hasChanges = async (): Promise<boolean> => {
+  hasWork = async (): Promise<boolean> => {
     this.hasChangesCalls += 1;
     return this.changed;
   };
   commits: Array<{ path: string; message: string }> = [];
-  commitWork = async (info: { path: string }, message: string): Promise<boolean> => {
+  checkpoint = async (info: { path: string }, message: string): Promise<boolean> => {
     this.commits.push({ path: info.path, message });
     return this.changed;
   };
-  remove = async (info: { path: string }): Promise<void> => {
+  dispose = async (info: { path: string }): Promise<void> => {
     this.removed.push(info.path);
   };
 
@@ -121,32 +121,32 @@ class FakeWorktrees {
   createdBranches: Array<{ branch: string; from: string }> = [];
   /** Paths git cannot merge on the next rebase; empty = clean. */
   conflicts: string[] = [];
-  /** Set by continueRebase's outcome — what the "agent" left behind. */
+  /** Set by resumeIntegrate's outcome — what the "agent" left behind. */
   stillConflicted: string[] = [];
   rebases: string[] = [];
   aborted = 0;
   landings: Array<{ branch: string; fromRef: string }> = [];
-  /** Make landFastForward throw, modelling a branch that moved under us. */
+  /** Make publish lose the race, modelling a branch that moved under us. */
   landRaces = false;
 
-  refExists = async (_root: string, ref: string): Promise<boolean> => this.branches.has(ref);
-  createBranch = async (_root: string, branch: string, from: string): Promise<void> => {
+  targetExists = async (_root: string, ref: string): Promise<boolean> => this.branches.has(ref);
+  createTarget = async (_root: string, branch: string, from: string): Promise<void> => {
     this.branches.add(branch);
     this.createdBranches.push({ branch, from });
   };
-  rebaseOnto = async (
+  integrate = async (
     _info: { path: string },
     onto: string,
   ): Promise<{ ok: true } | { ok: false; conflicts: string[] }> => {
     this.rebases.push(onto);
     return this.conflicts.length ? { ok: false, conflicts: this.conflicts } : { ok: true };
   };
-  continueRebase = async (): Promise<{ ok: true } | { ok: false; conflicts: string[] }> =>
+  resumeIntegrate = async (): Promise<{ ok: true } | { ok: false; conflicts: string[] }> =>
     this.stillConflicted.length ? { ok: false, conflicts: this.stillConflicted } : { ok: true };
-  abortRebase = async (): Promise<void> => {
+  abandonIntegrate = async (): Promise<void> => {
     this.aborted += 1;
   };
-  landFastForward = async (
+  publish = async (
     _root: string,
     branch: string,
     fromRef: string,
@@ -165,10 +165,7 @@ class FakeWorktrees {
   /** Non-empty → the push fails with this message. The run must still be a SUCCESS: the work
    *  is landed locally, and only its trip to the remote failed. */
   pushFails = '';
-  pushBranch = async (
-    root: string,
-    branch: string,
-  ): Promise<{ ok: true } | { ok: false; detail: string }> => {
+  share = async (root: string, branch: string): Promise<{ ok: true } | { ok: false; detail: string }> => {
     this.pushes.push({ root, branch });
     return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
   };
@@ -272,7 +269,7 @@ function harness(
   const park = { state: over.parkState };
   const supervisor = new RunSupervisor({
     drivers: over.drivers ?? { claude, codex },
-    worktrees,
+    vcs: worktrees,
     resolveRepo: (repoRef) =>
       over.hasRepo === false ? null : { root: `/repos/${repoRef}`, manifest: over.manifest ?? manifest() },
     report: (runId, r) => reports.push({ runId, ...r }),

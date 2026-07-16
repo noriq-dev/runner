@@ -45,9 +45,12 @@ The dispatch path:
 3. **`ws-client.ts`** `onAssigned` → **`supervisor.ts`** `supervise(run)`, the real orchestrator:
    resolve repo → create worktree → assemble kind-specific prompt → run driver under budget →
    verify/land → clean up.
-4. **`worktree.ts`** gives each Run its own worktree on a throwaway `noriq/run/<id>` branch. Git is the
-   registry: `reapOrphans` on daemon start cleans up post-crash, keeping (and warning about) any
-   worktree with unsaved work.
+4. **`vcs/`** is the source-control seam (RUN-49): `VcsBackend` names the nine outcomes the daemon
+   needs (lease/dispose, hasWork/checkpoint, integrate/publish/share, …) and the supervisor speaks
+   only those. **`worktree.ts`** is git's implementation behind it (`GitBackend` delegates): each
+   Run gets its own worktree on a throwaway `noriq/run/<id>` branch. Git is the registry:
+   `reapOrphans` on daemon start cleans up post-crash, keeping (and warning about) any worktree
+   with unsaved work.
 5. **`drivers/`** — `AgentDriver` (`drivers/types.ts`) is one interface over `claude.ts` (Claude Agent
    SDK streaming `query()`, not one-shot `claude -p`, so the session stays steerable) and `codex.ts`.
    `drivers/budget.ts` wraps a session to enforce token/USD/wall-clock ceilings (breach → SIGTERM).
