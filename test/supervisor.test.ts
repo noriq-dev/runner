@@ -1325,7 +1325,7 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer
   });
 
-  it('a reviewer with no verdict is a FAIL — the adversarial default', async () => {
+  it('a reviewer with no verdict still GATES the run — but as no-judgment, never as a refusal (RUN-72)', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -1333,7 +1333,31 @@ describe('the inline reviewer (RUN-61)', () => {
     await onReviewTurn(h, 2);
     h.claude.emitText('It seems mostly fine, I think?');
     h.claude.complete('done');
-    expect((await done).reason).toBe('review');
+    const exit = await done;
+    // The adversarial default holds — silence must not read as a pass — but the reason and
+    // the comment say the gate never judged, not that the work was found wanting.
+    expect(exit.reason).toBe('review:no-verdict');
+    expect(h.comments.at(-1)?.body).toMatch(/NO verdict/);
+    expect(h.comments.at(-1)?.body).not.toMatch(/does not satisfy the intent/);
+  });
+
+  it('a KILLED reviewer is not a refusal: no fix rounds burn, and the comment blames the gate (RUN-72)', async () => {
+    // The dogfood incident: a human killed a hung codex reviewer, and the daemon logged
+    // "reviewer refused the work — handing the report to the live agent" with verdict
+    // 'unknown' — then spent a builder turn fixing findings that did not exist.
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 2 }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn
+    await onReviewTurn(h, 2);
+    h.claude.complete('failed'); // the reviewer session dies — SIGTERM, crash, budget breach
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:no-verdict');
+    expect(h.claude.continuations).toEqual([]); // NO feedback turn against a non-report
+    expect(h.claude.starts).toHaveLength(2); // build + the one dead reviewer — no re-review either
+    expect(h.comments.at(-1)?.body).toMatch(/rendered NO verdict/);
+    expect(h.worktrees.removed).toEqual([]); // the diff is kept — nothing judged it wanting
   });
 
   it('a failing cmd floor screens the work before any reviewer spends a token', async () => {
@@ -1447,7 +1471,8 @@ describe('the inline reviewer (RUN-61)', () => {
     await flush();
     claudeOnly.complete('done');
     const exit = await done;
-    expect(exit.reason).toBe('review');
+    // A missing driver is the gate failing to exist, not the work failing review (RUN-72).
+    expect(exit.reason).toBe('review:no-verdict');
     expect(h.comments.at(-1)?.body).toMatch(/no such driver/);
     expect(claudeOnly.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(0);
   });

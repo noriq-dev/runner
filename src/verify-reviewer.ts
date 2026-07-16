@@ -72,3 +72,12 @@ export function reviewerRejectionComment(findings: string, rounds: number): stri
   const tried = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : '';
   return `🔍 The inline reviewer found the work does not satisfy the intent${tried} — this run did not pass the gate and cannot reach done.\n\n${findings.slice(-6000)}`;
 }
+
+/** The gate never rendered a judgment (reviewer killed, crashed, budget breach, missing
+ *  driver, no VERDICT line) — categorically different from a rejection (RUN-72): a rejection
+ *  maligns the DIFF, this reports the GATE. The run still fails — silence must not read as a
+ *  gate that isn't there — but the human reads "fix the reviewer setup / re-dispatch", never
+ *  "the work was found wanting". */
+export function reviewerNoVerdictComment(detail: string): string {
+  return `🔍 The inline reviewer rendered NO verdict — it was stopped, crashed, or produced no report, so this run was gated without being judged. The diff stays on its branch; fix the reviewer (or re-dispatch) rather than the work.${detail.trim() ? `\n\n${detail.slice(-6000)}` : ''}`;
+}

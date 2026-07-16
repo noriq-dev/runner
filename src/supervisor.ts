@@ -34,7 +34,12 @@ import {
   verifyFeedbackPrompt,
 } from './verify';
 import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
-import { assembleReviewerPrompt, reviewerFeedbackPrompt, reviewerRejectionComment } from './verify-reviewer';
+import {
+  assembleReviewerPrompt,
+  reviewerFeedbackPrompt,
+  reviewerNoVerdictComment,
+  reviewerRejectionComment,
+} from './verify-reviewer';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -610,6 +615,11 @@ export class RunSupervisor {
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
 
     for (let round = 1; round <= maxRounds; round++) {
+      // Only a clear FAIL is a refusal. 'unknown' means NO JUDGMENT — the reviewer was killed,
+      // crashed, breached its ceiling, or never wrote a VERDICT line (RUN-72's dogfood: a human
+      // killing a hung codex reviewer read as "reviewer refused the work"). There are no
+      // findings to hand the builder, and a fix turn against a non-report is pure spend.
+      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1 };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -1354,7 +1364,7 @@ export class RunSupervisor {
       });
       if (review.passed) {
         this.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });
-      } else {
+      } else if (review.verdict === 'fail') {
         this.log.warn('inline reviewer refused the work — run gated (not done)', {
           runId: run.id,
           verdict: review.verdict,
@@ -1368,6 +1378,25 @@ export class RunSupervisor {
           );
         }
         exit = { ...exit, outcome: 'failed', isError: true, reason: 'review' };
+      } else {
+        // 'unknown' = the gate never rendered a judgment (reviewer killed, crashed, budget
+        // breach, missing driver, no VERDICT line). NOT a refusal — saying "the reviewer
+        // found problems" about a reviewer somebody killed is a lie in both directions: it
+        // maligns the diff and it hides the infrastructure failure. The run still cannot
+        // pass — silence must not read as a gate that isn't there — but the reason and the
+        // comment say what actually happened, and no fix rounds were burned on a non-report.
+        this.log.warn('inline reviewer rendered NO verdict — run gated, not judged', {
+          runId: run.id,
+          rounds: review.rounds,
+        });
+        if (run.anchor?.type === 'task') {
+          this.deps.postComment?.(
+            run.projectId,
+            run.anchor.taskId,
+            reviewerNoVerdictComment(review.findings),
+          );
+        }
+        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review:no-verdict' };
       }
     }
 

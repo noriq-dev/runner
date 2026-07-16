@@ -101,6 +101,39 @@ describe('normalizeNotification (real app-server shapes)', () => {
     });
     expect(normalizeNotification('thread/unknown', {})).toBeNull();
   });
+
+  it('accepts the 0.144.x names too — every notification was RENAMED between minors (RUN-72)', () => {
+    // Verified live against codex-cli 0.144.5. The daemon cannot pick which codex a machine
+    // has installed, so each concept answers to every name it has ever had.
+    expect(normalizeNotification('item/agentMessage/delta', { delta: 'OK' })).toEqual({
+      type: 'text',
+      text: 'OK',
+    });
+    expect(
+      normalizeNotification('thread/tokenUsage/updated', {
+        tokenUsage: { total: { inputTokens: 12851, outputTokens: 12, cachedInputTokens: 0 } },
+      }),
+    ).toEqual({ type: 'usage', inputTokens: 12851, outputTokens: 12, cacheReadTokens: 0 });
+    expect(normalizeNotification('error', { error: { message: 'invalid_request_error' } })).toEqual({
+      type: 'error',
+      message: 'invalid_request_error',
+    });
+  });
+
+  it('a FAILED turn/completed is an error, not success — 0.144.x reports API failures there (RUN-72)', () => {
+    // An API-level failure arrives as turn/completed{status:'failed'}; reading it as success
+    // marked runs `done` whose agent never answered.
+    expect(
+      normalizeNotification('turn/completed', {
+        turn: { status: 'failed', error: { message: 'model not supported' } },
+      }),
+    ).toEqual({ type: 'error', message: 'model not supported' });
+    expect(normalizeNotification('turn/completed', { turn: { status: 'completed' } })).toEqual({
+      type: 'turn_complete',
+    });
+    // 0.142.x sends no status at all — that generation's failures came as thread/error.
+    expect(normalizeNotification('turn/completed', {})).toEqual({ type: 'turn_complete' });
+  });
 });
 
 describe('CodexDriver', () => {
@@ -230,6 +263,85 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const turn = writes.find((w) => w.includes('turn/start'));
     expect(turn).toBeTruthy();
     expect(JSON.parse(turn as string).params.threadId).toBe('th_1'); // the real id
+  });
+
+  it('sends a VERSIONED clientInfo — codex 0.144.x rejects initialize without one (RUN-72)', async () => {
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const { VERSION } = await import('../src/version');
+    const writes: string[] = [];
+    defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'verify' },
+      () => makeFakeChild(writes) as never,
+    );
+    const init = JSON.parse(writes.find((w) => w.includes('"initialize"')) as string);
+    expect(init.params.clientInfo.version).toBe(VERSION);
+    expect(init.params.clientInfo.name).toBe('noriq-runner');
+  });
+
+  it('a JSON-RPC error RESPONSE fails the run instead of hanging it forever (RUN-72)', async () => {
+    // The live failure: 0.144.5 rejected our initialize, thread/start then answered "Not
+    // initialized" — and both rejections vanished, because an error response has neither
+    // `result` nor `method`. threadId stayed null, the buffered turn never flushed, and the
+    // reviewer sat at zero CPU for fifteen minutes while its run hung in `verifying`.
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const fakeChild = makeFakeChild([]);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'verify' },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('review the diff');
+    fakeChild.emitLine(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        error: { code: -32600, message: 'Invalid request: missing field `version`' },
+      }),
+    );
+    for await (const ev of t.events) {
+      expect(ev).toEqual({
+        type: 'error',
+        message: 'codex rejected a request: Invalid request: missing field `version`',
+      });
+      break;
+    }
+  });
+
+  it('captures the 0.144.x thread/start shape ({thread:{id}}) and flushes the buffered turn (RUN-72)', async () => {
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', kind: 'build' },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('do the work');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: 'th_144' } } }));
+    await new Promise((r) => setImmediate(r));
+    const turn = writes.find((w) => w.includes('turn/start'));
+    expect(turn).toBeTruthy();
+    expect(JSON.parse(turn as string).params.threadId).toBe('th_144');
+  });
+
+  it('a rejected STEER is a shrug, not a verdict — the run keeps going (RUN-72)', async () => {
+    // Steering has its own fallback (the notices channel re-delivers), so a steer the
+    // app-server refuses must not fail the whole run the way a rejected handshake does.
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', kind: 'build' },
+      () => fakeChild as never,
+    );
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: 'th_1' } } }));
+    await new Promise((r) => setImmediate(r));
+    expect(t.steer('also do X')).toBe(true);
+    const steerId = JSON.parse(writes.find((w) => w.includes('turn/steer')) as string).id;
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: steerId, error: { message: 'no active turn' } }));
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: {} }));
+    for await (const ev of t.events) {
+      expect(ev).toEqual({ type: 'turn_complete' }); // the steer rejection produced no event
+      break;
+    }
   });
 
   it('turns a missing codex binary into a run failure, not a daemon crash', async () => {

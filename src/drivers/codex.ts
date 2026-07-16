@@ -5,6 +5,7 @@ import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { killProcessTree, treeSpawnOptions } from '../proc';
 import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, noriqToolNamesFor, sanitizedAgentEnv } from '../security';
+import { VERSION } from '../version';
 import { NORIQ_MCP_NAME } from './claude';
 import {
   type AgentDriver,
@@ -212,8 +213,11 @@ export class CodexDriver implements AgentDriver {
 // against an injected fake transport.
 // ---------------------------------------------------------------------------
 
-// JSON-RPC method + notification names (validate against the installed codex at
-// the dogfood; kept as named constants so a version bump is a one-line change).
+// JSON-RPC method + notification names. The app-server protocol RENAMES things between
+// minor releases (RUN-72): every notification the 0.142.x driver knew had a different name
+// by 0.144.5, and the daemon can't pick which codex a machine has installed — so each
+// concept accepts every name it has ever had. Requests are stable so far; notifications
+// are where the churn lives. Validated live against 0.142.4 and 0.144.5.
 const RPC = {
   initialize: 'initialize',
   threadStart: 'thread/start',
@@ -222,10 +226,10 @@ const RPC = {
   turnInterrupt: 'turn/interrupt',
 } as const;
 const NOTIF = {
-  agentMessageDelta: 'thread/agentMessageDelta',
-  tokenUsage: 'thread/tokenUsageUpdated',
-  turnCompleted: 'turn/completed',
-  error: 'thread/error',
+  agentMessageDelta: ['thread/agentMessageDelta', 'item/agentMessage/delta'],
+  tokenUsage: ['thread/tokenUsageUpdated', 'thread/tokenUsage/updated'],
+  turnCompleted: ['turn/completed'],
+  error: ['thread/error', 'error'],
 } as const;
 
 interface TokenBreakdown {
@@ -236,10 +240,10 @@ interface TokenBreakdown {
 
 /** Map a raw app-server JSON-RPC notification to a normalized CodexEvent. */
 export function normalizeNotification(method: string, params: Record<string, unknown>): CodexEvent | null {
-  if (method === NOTIF.agentMessageDelta) {
+  if ((NOTIF.agentMessageDelta as readonly string[]).includes(method)) {
     return { type: 'text', text: String((params as { delta?: unknown }).delta ?? '') };
   }
-  if (method === NOTIF.tokenUsage) {
+  if ((NOTIF.tokenUsage as readonly string[]).includes(method)) {
     const total = ((params as { tokenUsage?: { total?: TokenBreakdown } }).tokenUsage?.total ??
       {}) as TokenBreakdown;
     return {
@@ -249,8 +253,18 @@ export function normalizeNotification(method: string, params: Record<string, unk
       cacheReadTokens: total.cachedInputTokens ?? 0,
     };
   }
-  if (method === NOTIF.turnCompleted) return { type: 'turn_complete' };
-  if (method === NOTIF.error) {
+  if ((NOTIF.turnCompleted as readonly string[]).includes(method)) {
+    // Since 0.144.x the turn carries its own outcome — an API failure arrives as
+    // turn/completed{status:'failed'}, and reading that as success would mark a run
+    // `done` whose agent never answered. Only an explicit 'failed' is a failure:
+    // 0.142.x sends no status at all, and that generation's failures came as thread/error.
+    const turn = (params as { turn?: { status?: string; error?: { message?: string } } }).turn;
+    if (turn?.status === 'failed') {
+      return { type: 'error', message: turn.error?.message ?? 'codex turn failed' };
+    }
+    return { type: 'turn_complete' };
+  }
+  if ((NOTIF.error as readonly string[]).includes(method)) {
     const err = (params as { error?: { message?: string } }).error;
     return { type: 'error', message: err?.message ?? 'codex error' };
   }
@@ -320,6 +334,9 @@ export const defaultSpawnCodex = (
   let turnId: string | null = null;
   /** A turn requested before the thread existed — flushed once thread/start answers. */
   let pendingTurn: string | null = null;
+  /** Requests whose rejection must NOT kill the run: a lost steer already has a fallback
+   *  (the notices channel re-delivers), so its error is a shrug, not a verdict. */
+  const nonFatalIds = new Set<number>();
 
   // A missing `codex` binary emits 'error' on the child. With no listener Node rethrows it
   // as an uncaught exception and the ENTIRE daemon dies — taking every concurrently
@@ -348,17 +365,39 @@ export const defaultSpawnCodex = (
 
   const rl = createInterface({ input: child.stdout });
   rl.on('line', (line) => {
-    let msg: { method?: string; params?: Record<string, unknown>; result?: Record<string, unknown> };
+    let msg: {
+      id?: number;
+      method?: string;
+      params?: Record<string, unknown>;
+      result?: Record<string, unknown>;
+      error?: { message?: string };
+    };
     try {
       msg = JSON.parse(line);
     } catch {
       return;
     }
+    // A JSON-RPC ERROR RESPONSE has neither `result` nor `method` — this branch existing at
+    // all is RUN-72. Without it a rejected initialize/thread/start (which is how a protocol
+    // mismatch presents) vanished: threadId stayed null, the buffered first turn never
+    // flushed, and the run hung forever with codex idle at zero CPU. A rejected request is
+    // a verdict; say so and let the driver fail the run with the reason.
+    if (msg.error) {
+      if (msg.id === undefined || !nonFatalIds.delete(msg.id)) {
+        events.push({
+          type: 'error',
+          message: `codex rejected a request: ${msg.error.message ?? 'unknown error'}`,
+        });
+      }
+      return;
+    }
     // Capture ids from responses so we can steer/interrupt the active turn.
     if (msg.result) {
-      const r = msg.result as { threadId?: string; turn?: { id?: string } };
-      if (r.threadId) {
-        threadId = r.threadId;
+      // 0.142.x answered thread/start with {threadId}; 0.144.x nests it as {thread:{id}}.
+      const r = msg.result as { threadId?: string; thread?: { id?: string }; turn?: { id?: string } };
+      const startedThread = r.threadId ?? r.thread?.id;
+      if (startedThread) {
+        threadId = startedThread;
         // The thread exists now — release the turn that was requested before it did.
         if (pendingTurn !== null) {
           send(RPC.turnStart, { threadId, input: userInput(pendingTurn), cwd: opts.cwd });
@@ -374,8 +413,11 @@ export const defaultSpawnCodex = (
   });
   child.on('exit', () => events.close());
 
-  // Handshake → start the thread with the requested sandbox.
-  send(RPC.initialize, { clientInfo: { name: 'noriq-runner' } });
+  // Handshake → start the thread with the requested sandbox. clientInfo.version became
+  // MANDATORY in codex 0.144.x — without it initialize is rejected outright (and that
+  // rejection used to be swallowed, which is how every codex run silently hung, RUN-72).
+  // Older codex ignores the extra fields.
+  send(RPC.initialize, { clientInfo: { name: 'noriq-runner', title: 'Noriq Runner', version: VERSION } });
   send(RPC.threadStart, {
     cwd: opts.cwd,
     sandbox: opts.sandbox,
@@ -398,7 +440,9 @@ export const defaultSpawnCodex = (
     steer: (text) => {
       // Nothing to steer until the thread + turn exist; report it rather than pretend.
       if (!threadId) return false;
-      return send(RPC.turnSteer, { threadId, expectedTurnId: turnId, input: userInput(text) }) !== null;
+      const id = send(RPC.turnSteer, { threadId, expectedTurnId: turnId, input: userInput(text) });
+      if (id !== null) nonFatalIds.add(id); // a rejected steer must not fail the whole run
+      return id !== null;
     },
     interrupt: () => send(RPC.turnInterrupt, { threadId, turnId }, true),
     close: () => {
