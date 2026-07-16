@@ -1,5 +1,12 @@
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { detectVcs, parseDvRepoList } from '../src/vcs/detect';
+
+/** detectVcs probes `path.join(root, '.git')`, which on Windows produces backslashes — a fake
+ *  that string-compares against '/root/.git' silently never matches there, and the root falls
+ *  through to the dv registry. Compare what the OS's own join produces (RUN-42's lesson,
+ *  re-learned in a test fixture). */
+const gitDirOf = (root: string) => path.join(root, '.git');
 
 // Real `dv repo` output, verbatim from the machine this first ran on — including the header
 // lines and the empty "Other:" section the parser must ignore.
@@ -31,7 +38,7 @@ describe('parseDvRepoList', () => {
 
 describe('detectVcs', () => {
   const deps = (over: { git?: string[]; dv?: string | Error }) => ({
-    exists: (p: string) => (over.git ?? []).some((root) => p === `${root}/.git`),
+    exists: (p: string) => (over.git ?? []).some((root) => p === gitDirOf(root)),
     realpath: atomicRealpath,
     dvRepoList: async () => {
       if (over.dv instanceof Error) throw over.dv;
@@ -42,7 +49,7 @@ describe('detectVcs', () => {
   it('.git at the root → git, without ever spawning dv', async () => {
     let dvAsked = false;
     const map = await detectVcs(['/repos/app'], {
-      exists: (p) => p === '/repos/app/.git',
+      exists: (p) => p === gitDirOf('/repos/app'),
       realpath: (p) => p,
       dvRepoList: async () => {
         dvAsked = true;
