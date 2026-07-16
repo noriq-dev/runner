@@ -71,7 +71,18 @@ export interface LeaseOptions {
   fromRunId?: string;
 }
 
-export type IntegrateResult = { ok: true } | { ok: false; conflicts: string[] };
+export type IntegrateResult =
+  | { ok: true }
+  | {
+      ok: false;
+      conflicts: string[];
+      /**
+       * Where a human resolves this, when the backend's conflicts live server-side (Diversion:
+       * the pending-merge page). Git never sets it — its conflicts are files an agent can edit.
+       * A backend that sets it is saying "agent resolution is not possible here; send a person".
+       */
+      resolveUrl?: string;
+    };
 
 export type PublishResult =
   | { ok: true; sha: string }

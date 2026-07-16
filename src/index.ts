@@ -162,6 +162,17 @@ export type {
 } from './vcs/types';
 export { GitBackend, type GitOps } from './vcs/git';
 export {
+  DiversionBackend,
+  DV_API_BASE,
+  dvMergeUrl,
+  dvStoredToken,
+  realDvHttp,
+  type DiversionBackendOpts,
+  type DvCli,
+  type DvHttp,
+  type DvHttpResponse,
+} from './vcs/diversion';
+export {
   WorktreeManager,
   runBranch,
   setReadOnly,

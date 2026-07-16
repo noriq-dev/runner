@@ -92,6 +92,21 @@ try-it-safely position is gone, and it is gone for reasons that predate us. If e
 ever wanted on those backends it comes from **containers**, at a layer below the VCS — not from
 pretending a server-backed system is local. See [VCS-SPIKE.md](VCS-SPIKE.md) §5 (RUN-44).
 
+### The Diversion backend, specifically (RUN-51 — measured, not assumed)
+
+Every claim here was measured against a real server (VCS-SPIKE.md §9) and is what the shipped
+backend actually does:
+
+| | git | Diversion |
+|---|---|---|
+| **What leaves the machine, when** | nothing, until the repo opts into `autoPush` | **every write, within seconds, continuously** — before any commit, any gate, any verify. The verify gate gates what *lands*; nothing can gate what *leaks*. A scope run that somehow writes has already leaked. |
+| **"Verify ran on exactly the tree that lands"** | commit-level (`--ff-only` is atomic) | **tree-level, with a window**: Diversion never fast-forwards and its own merge silently absorbs races, so the backend carries the compare-and-swap itself — re-merge target→branch ("already current" = proof of no movement), then land. A commit to the target **between those two calls** lands unverified. Small, real, and unlike git, not zero. |
+| **Conflicts** | files an agent may mechanically resolve in its own worktree | **server-side objects with no API resolve surface** — every conflict is a human conflict; the run fails with the app URL where a person resolves it. |
+| **Authorship** | the daemon commits as "Noriq Runner" | the CLI signs everything **as the operator's account** — runner-vs-human is a message convention. (The API's `commit-on-behalf` could fix this, but requires repo Admin; not used.) |
+| **Crash recovery** | reaper keeps local litter and warns | **nothing to lose** — uncommitted edits included, the work is already on the server. Leftover run branches are durable, team-visible history; the daemon reports them and deletes nothing. |
+| **Isolation** | one worktree per run, minted freely | **pool-of-1 lease on the repo's workspace, in-process**: runs take turns. Two daemons on one workspace are not defended against — one daemon per machine is the operating assumption (one `dv` sync agent per machine enforces the same). |
+| **Load-bearing infrastructure** | the `git` binary | the **`dv` sync agent** (a background process the daemon does not own) plus the operator's stored OAuth token, which is one credential for *everything* — workspace, commit, merge, review, delete. There is nothing to withhold. |
+
 ## Auto-landing (`[land]`) — an explicit trade
 
 Earlier this document said the daemon "never merges". It now merges — *locally*, into

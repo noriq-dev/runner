@@ -388,9 +388,13 @@ export class RunSupervisor {
 
     if (!rebase.ok) {
       const conflicts = rebase.conflicts;
-      if (!policy.resolveConflicts) {
+      // A backend whose conflicts live server-side (Diversion) names the page a human
+      // resolves them on. Its presence also means agent resolution CANNOT work there — the
+      // conflict is not in the files — so it routes straight to the human path.
+      const resolveUrl = rebase.resolveUrl;
+      if (!policy.resolveConflicts || resolveUrl) {
         await vcs.abandonIntegrate(worktree);
-        return { landed: false, branch, reason: 'conflict', conflicts };
+        return { landed: false, branch, reason: 'conflict', conflicts, detail: resolveUrl };
       }
       this.log.info('rebase conflict — asking the build agent whether it is mechanical', {
         runId: run.id,
