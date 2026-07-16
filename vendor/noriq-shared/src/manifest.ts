@@ -90,6 +90,15 @@ const defaultPermissions = (): KindPermissions => ({
  * builds with; both fall back to `[defaults.verify]`, then the tool's own default.
  */
 export const VerifyReviewer = z.object({
+  /**
+   * Run the reviewer on a DIFFERENT driver than the builder (RUN-70) — the strongest form of
+   * its independence: not just a fresh session, a different vendor's model judging the work.
+   * Null = the run's own driver, today's behavior. When set, `[defaults.verify].model` is NOT
+   * inherited (model names are vendor-specific and the repo default may name the other
+   * vendor's) — name `model` here or take the tool's own default. A tool with no driver on the
+   * machine fails the gate loudly rather than silently reviewing with the builder's vendor.
+   */
+  tool: AgentTool.nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
   // How many FAIL→fix→re-review rounds before the run stops and a human picks it up. Same

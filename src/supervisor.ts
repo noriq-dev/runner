@@ -664,9 +664,24 @@ export class RunSupervisor {
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
+    // The reviewer's driver (RUN-70): the repo may put a different VENDOR's model in judgment —
+    // the strongest form of the reviewer's independence. Fail-closed when the named tool has no
+    // driver here: silently reviewing with the builder's own vendor would defeat the choice, the
+    // same reasoning that makes an absent `shell` pin fail the cmd gate outright (RUN-42).
+    const driver = reviewer?.tool ? this.deps.drivers[reviewer.tool] : ctx.driver;
+    if (!driver) {
+      return {
+        verdict: 'unknown',
+        passed: false,
+        findings: `the manifest asks for a '${reviewer?.tool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent].tool`,
+      };
+    }
     // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
-    // dispatched verify run climbs (RUN-33), because this is the same role inlined.
-    const model = reviewer?.model ?? manifest.defaults?.verify?.model ?? null;
+    // dispatched verify run climbs (RUN-33), because this is the same role inlined. EXCEPT when
+    // the reviewer names its own tool: model names are vendor-specific and [defaults.verify]
+    // may name the other vendor's, so the fallback is severed and the tool's own default holds.
+    // Effort still falls through — it is tool-agnostic intent, mapped per driver.
+    const model = reviewer?.model ?? (reviewer?.tool ? null : (manifest.defaults?.verify?.model ?? null));
     const effort = reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
     // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
     // work, so a bare `git diff` shows nothing — the range is the review. A live backend
@@ -674,7 +689,7 @@ export class RunSupervisor {
     const diffCmd =
       (this.vcsFor(ctx.repo).kind ?? 'git') === 'git' ? `git diff ${ctx.worktree.baseId}...HEAD` : undefined;
     let text = '';
-    const session = superviseBudget(ctx.driver, {
+    const session = superviseBudget(driver, {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
       cwd: ctx.worktree.localPath,

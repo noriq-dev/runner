@@ -1235,7 +1235,7 @@ describe('the inline reviewer (RUN-61)', () => {
         cmd,
         timeoutSeconds: null,
         shell: null,
-        agent: { model: null, effort: null, maxRounds: 2, ...agent },
+        agent: { tool: null, model: null, effort: null, maxRounds: 2, ...agent },
       },
     });
 
@@ -1378,7 +1378,7 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
-          agent: { model: null, effort: null, maxRounds: 2 },
+          agent: { tool: null, model: null, effort: null, maxRounds: 2 },
         },
       },
     });
@@ -1402,7 +1402,7 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
-          agent: { model: null, effort: null, maxRounds: 0 },
+          agent: { tool: null, model: null, effort: null, maxRounds: 0 },
         },
       },
     });
@@ -1416,6 +1416,54 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.reason).toBe('review');
     expect(h.worktrees.landings).toHaveLength(0);
     expect(h.worktrees.removed).toEqual([]); // the unlanded diff waits for a human
+  });
+
+  it('runs the reviewer on a DIFFERENT driver when [verify.agent].tool says so (RUN-70)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { tool: 'codex', model: 'gpt-5.6-sol' }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn, on claude
+    for (let i = 0; i < 100 && h.codex.opts?.runId !== 'run_1:review'; i++) await flush();
+    // A different vendor's model judging the work — the strongest form of independence.
+    const review = h.codex.opts;
+    expect(review?.runId).toBe('run_1:review');
+    expect(review?.kind).toBe('verify');
+    expect(review?.model).toBe('gpt-5.6-sol');
+    expect(review?.noriqMcp).toBeUndefined(); // no credential on ANY driver
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(0);
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  it('a reviewer tool with no driver fails CLOSED — never a silent same-vendor review', async () => {
+    const claudeOnly = new FakeDriver('claude');
+    const h = harness({
+      manifest: REVIEWED('npm test', { tool: 'codex' }),
+      drivers: { claude: claudeOnly },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    claudeOnly.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review');
+    expect(h.comments.at(-1)?.body).toMatch(/no such driver/);
+    expect(claudeOnly.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(0);
+  });
+
+  it('naming a tool severs the [defaults.verify].model fallback — model names are vendor-specific', async () => {
+    const m = REVIEWED('npm test', { tool: 'codex' });
+    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'high' }; // the OTHER vendor's model
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    for (let i = 0; i < 100 && h.codex.opts?.runId !== 'run_1:review'; i++) await flush();
+    expect(h.codex.opts?.model).toBeUndefined(); // codex's own default, not claude-sonnet-5
+    expect(h.codex.opts?.effort).toBe('high'); // effort is tool-agnostic intent; it survives
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    await done;
   });
 
   it('the reviewer model falls back to [defaults.verify] when the agent block names none', async () => {

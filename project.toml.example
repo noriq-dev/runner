@@ -78,10 +78,17 @@ defaultBranch = "main"
 cmd = "npm run typecheck && npm test"
 #
 # [verify.agent]                 # the inline reviewer (all fields optional)
+# tool = "codex"                 # review on a DIFFERENT driver than the builder (RUN-70) —
+#                                # the strongest form of the reviewer's independence: another
+#                                # vendor's model judging the work. Blank = the run's driver.
+#                                # A tool with no driver on the machine FAILS the gate rather
+#                                # than silently reviewing with the builder's own vendor.
 # model = "claude-opus-4-8"      # adversarial review is where a STRONGER model than the
-#                                # builder's earns its cost. Blank = [defaults.verify],
-#                                # then the driver's own default.
-# effort = "high"
+#                                # builder's earns its cost. Blank = [defaults.verify], then
+#                                # the driver's own default — EXCEPT when `tool` is set: model
+#                                # names are vendor-specific, so naming a tool severs the
+#                                # [defaults.verify] fallback (name the model here instead).
+# effort = "high"                # tool-agnostic intent; falls through regardless of `tool`.
 # maxRounds = 2                  # FAIL → fix → re-review rounds before the run stops and a
 #                                # human picks it up. 0 = one review, no hand-back.
 #

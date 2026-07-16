@@ -223,17 +223,19 @@ contains:
 cmd = "npm run typecheck && npm test"   # the deterministic floor: zero tokens, daemon-run
 
 [verify.agent]                # optional: an inline reviewer — a FRESH agent (never the
-model = "claude-opus-4-8"     # builder) reviews the diff read-only against the task intent;
-maxRounds = 2                 # a FAIL report goes back to the builder to fix, bounded, then
-                              # a fresh reviewer looks again
+tool = "codex"                # builder) reviews the diff read-only against the task intent;
+model = "gpt-5.6-sol"         # a FAIL report goes back to the builder to fix, bounded, then
+maxRounds = 2                 # a fresh reviewer looks again
 ```
 
 Either half alone works; both means floor-then-reviewer; omit `[verify]` entirely and
 there's no verify stage at all — the diff still lands as a review diff, and you are the
-gate. The reviewer is where a **stronger model than the builder's** earns its cost, and it
-holds no Noriq credential: its whole output is its report, so it can judge work but never
-move it. A failure of either gate comes back to the *live* build session with the output in
-context — no re-dispatch, no fresh agent re-deriving what the daemon already knows.
+gate. The reviewer is where a **stronger model than the builder's** earns its cost — or a
+**different vendor's** entirely (`tool` runs the reviewer on the other driver, so claude's
+work can be judged by codex and vice versa). It holds no Noriq credential: its whole output
+is its report, so it can judge work but never move it. A failure of either gate comes back
+to the *live* build session with the output in context — no re-dispatch, no fresh agent
+re-deriving what the daemon already knows.
 
 ## Landing the work
 
