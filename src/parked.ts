@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
+import type { Workspace } from './vcs/types';
 
 /**
  * Runs parked on a human (RUN-30) — the daemon's side of `blocked`.
@@ -42,10 +43,15 @@ export interface ParkedRun {
    * project its human can.
    */
   mcpToken: string;
-  /** The Run's worktree, kept alive across the park: it holds work that exists nowhere else. */
-  worktreePath: string;
-  worktreeBranch: string;
-  repoRoot: string;
+  /**
+   * The Run's leased workspace, kept alive across the park: it holds work that exists nowhere
+   * else. Persisted WHOLE (RUN-50) — including the backend-owned `location`, which is why that
+   * field's contract is JSON-serializable — so a resume hands the backend exactly what its
+   * `lease()` minted, instead of the supervisor rebuilding a git-shaped object from loose
+   * fields (the old shape hand-assembled a WorktreeInfo with `baseSha: ''`, a lie that only
+   * worked because git's hasChanges tolerates it).
+   */
+  workspace: Workspace;
   /**
    * Spend so far. A resumed run inherits the REMAINDER of its budget, never a fresh one —
    * otherwise park/resume is an unbounded-spend loophole: ask a question, get a new ceiling.
@@ -94,7 +100,10 @@ export class ParkedStore {
     }
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as ParkedFile;
-      this.cache = new Map((parsed.parked ?? []).map((p) => [p.run.id, p]));
+      // Drop entries from a pre-RUN-50 daemon (loose worktreePath fields, no workspace):
+      // resuming one would hand the backend a workspace it cannot read. Same trade as the
+      // corrupt-file case below — the park is forgotten, the worktree survives for the human.
+      this.cache = new Map((parsed.parked ?? []).filter((p) => !!p.workspace).map((p) => [p.run.id, p]));
     } catch {
       // Corrupt file → start empty rather than refuse to boot. The cost is a forgotten park
       // (whose worktree still exists for the human); the cost of throwing is a dead daemon.

@@ -32,7 +32,6 @@ import {
   verifyFeedbackPrompt,
 } from './verify';
 import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
-import { type WorktreeInfo, runBranch } from './worktree';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -335,7 +334,7 @@ export class RunSupervisor {
   private async landRun(ctx: {
     run: Run;
     repo: ResolvedRepo;
-    worktree: WorktreeInfo;
+    worktree: Workspace;
     policy: LandPolicy;
     task: AnchorTask | null;
     driver: AgentDriver;
@@ -378,7 +377,7 @@ export class RunSupervisor {
     // First landing into this branch: fork it from the repo's declared main so the
     // integration line starts somewhere sane rather than from this run's base.
     if (!(await vcs.targetExists(repo.root, branch))) {
-      const from = repo.manifest.defaultBranch ?? worktree.baseSha;
+      const from = repo.manifest.defaultBranch ?? worktree.baseId;
       await vcs.createTarget(repo.root, branch, from);
       this.log.info('created the landing branch', { branch, from });
     }
@@ -437,18 +436,18 @@ export class RunSupervisor {
         ? await this.verifyWithFeedback({
             run: ctx.run,
             spec: repo.manifest.verify,
-            cwd: worktree.path,
+            cwd: worktree.localPath,
             session: ctx.session,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
-        : await runVerify(repo.manifest.verify, worktree.path, { exec: this.deps.verifyExec });
+        : await runVerify(repo.manifest.verify, worktree.localPath, { exec: this.deps.verifyExec });
       if (!result.passed) {
         return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
       }
       this.log.info('verify passed on the rebased result', { runId: run.id, branch });
     }
 
-    const ff = await vcs.publish(repo.root, branch, worktree.branch);
+    const ff = await vcs.publish(worktree, branch);
     if (!ff.ok) {
       // Distinguish "the branch moved" (retryable) from "git refused" (needs a human) —
       // collapsing both into 'race' sends everyone hunting a concurrency bug that isn't
@@ -537,7 +536,7 @@ export class RunSupervisor {
     ctx: {
       run: Run;
       repo: ResolvedRepo;
-      worktree: WorktreeInfo;
+      worktree: Workspace;
       policy: LandPolicy;
       task: AnchorTask | null;
       driver: AgentDriver;
@@ -551,7 +550,7 @@ export class RunSupervisor {
     const session = superviseBudget(ctx.driver, {
       runId: `${ctx.run.id}:conflict`,
       kind: 'build', // it is editing its own diff — the build floor, nothing wider
-      cwd: ctx.worktree.path,
+      cwd: ctx.worktree.localPath,
       prompt: assembleConflictPrompt({
         conflicts,
         landBranch: ctx.policy.branch,
@@ -611,7 +610,7 @@ export class RunSupervisor {
   private async parkIfBlocked(ctx: {
     run: Run;
     repo: ResolvedRepo;
-    worktree: WorktreeInfo;
+    worktree: Workspace;
     exit: DriverExit;
     session: DriverSession;
     runAgent: RunAgent;
@@ -654,9 +653,7 @@ export class RunSupervisor {
       agentId: ctx.runAgent.agentId,
       agentLabel: ctx.runAgent.label,
       mcpToken: ctx.runAgent.token,
-      worktreePath: ctx.worktree.path,
-      worktreeBranch: ctx.worktree.branch,
-      repoRoot: ctx.repo.root,
+      workspace: ctx.worktree,
       spent: { tokens: totalTokens(exit.telemetry), usd: exit.telemetry.costUsd },
       activeSeconds: ctx.activeSeconds,
       parkedAt: new Date().toISOString(),
@@ -703,16 +700,11 @@ export class RunSupervisor {
     if (!driver) return fail(`no driver for tool ${run.agentTool}`);
     if (!entry.sessionId) return fail('parked run has no session to resume');
 
-    // The worktree is REUSED, never recreated: it holds the work the agent did before it asked,
-    // and the session it is about to resume expects to find it exactly as it left it.
-    const worktree: WorktreeInfo = {
-      runId: run.id,
-      repoRoot: entry.repoRoot,
-      path: entry.worktreePath,
-      branch: entry.worktreeBranch,
-      readOnly: kind === 'scope',
-      baseSha: '',
-    };
+    // The workspace is REUSED, never re-leased: it holds the work the agent did before it
+    // asked, and the session it is about to resume expects to find it exactly as it left it.
+    // Restored WHOLE from the park (RUN-50) — before that, this code hand-assembled a git-shaped
+    // object with `baseSha: ''`, a lie that only worked because git's hasWork tolerates it.
+    const worktree = entry.workspace;
     const runAgent: RunAgent = {
       agentId: entry.agentId,
       label: entry.agentLabel,
@@ -736,7 +728,7 @@ export class RunSupervisor {
     const budgetRun = superviseBudget(driver, {
       runId: run.id,
       kind,
-      cwd: worktree.path,
+      cwd: worktree.localPath,
       // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
       // all of it, and re-sending it would both waste the context and confuse a conversation
       // that is mid-thought.
@@ -822,7 +814,7 @@ export class RunSupervisor {
       this.log.warn('parked run expired — nobody answered in time; its worktree is kept', {
         runId: p.run.id,
         parkedAt: p.parkedAt,
-        worktree: p.worktreePath,
+        worktree: p.workspace.localPath,
       });
     }
     return stale.length;
@@ -863,31 +855,34 @@ export class RunSupervisor {
     // "fix" the code it is judging.
     const readOnly = kind === 'scope';
 
-    // A VERIFY run branches from the BUILD it judges, not from HEAD — otherwise it gets a
+    // A VERIFY run leases from the BUILD it judges, not from HEAD — otherwise it gets a
     // pristine checkout, the `git diff` its prompt orders is empty, and it renders a
-    // verdict on code nobody changed. `verifiesRunId` is what carries that link.
+    // verdict on code nobody changed. `verifiesRunId` is what carries that link. By run id,
+    // not by ref (RUN-50): how a run's work is NAMED — a branch, a shelved change — is the
+    // backend's own convention, and this file no longer knows it.
     const verifiesRunId = run.kind === 'verify' ? (run.verifiesRunId ?? null) : null;
-    const baseRef = verifiesRunId ? runBranch(verifiesRunId) : undefined;
 
     let worktree: Workspace;
     try {
-      worktree = await this.deps.vcs.lease(repo.root, run.id, { readOnly, baseRef });
+      worktree = await this.deps.vcs.lease(repo.root, run.id, {
+        readOnly,
+        fromRunId: verifiesRunId ?? undefined,
+      });
     } catch (err) {
-      // A verify run whose target branch is gone (reaped, or built on another machine)
-      // must fail loudly: silently falling back to HEAD would hand back a confident PASS
-      // on an empty diff, which is worse than no gate at all.
-      if (baseRef) {
+      // A verify run whose build is gone (reaped, or built on another machine) must fail
+      // loudly: silently falling back to HEAD would hand back a confident PASS on an empty
+      // diff, which is worse than no gate at all.
+      if (verifiesRunId) {
         return fail(
-          `cannot verify ${verifiesRunId}: its branch ${baseRef} is not in this repo — ` +
-            `${(err as Error).message}`,
+          `cannot verify ${verifiesRunId}: its work is not in this repo — ${(err as Error).message}`,
         );
       }
-      return fail(`worktree setup failed: ${(err as Error).message}`);
+      return fail(`workspace setup failed: ${(err as Error).message}`);
     }
     // dispatched → running, and the first phase (RUN-31). The status half is the real
     // transition; the phase half rides the telemetry frame the daemon splits this into.
-    this.deps.report(run.id, { status: 'running', worktreePath: worktree.path, phase: 'agent' });
-    this.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.path });
+    this.deps.report(run.id, { status: 'running', worktreePath: worktree.localPath, phase: 'agent' });
+    this.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.localPath });
 
     // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
     // a lookup failure degrades to the bare id rather than sinking the run.
@@ -929,7 +924,7 @@ export class RunSupervisor {
     // actually under review — everything the build added since it forked. Three dots =
     // "since the merge base", so an unrelated main moving on doesn't pollute the review.
     const diffCmd = verifiesRunId
-      ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseSha}...HEAD`
+      ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
       : undefined;
 
     // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
@@ -952,7 +947,7 @@ export class RunSupervisor {
     const budgetRun = superviseBudget(driver, {
       runId: run.id,
       kind,
-      cwd: worktree.path,
+      cwd: worktree.localPath,
       prompt,
       permission,
       noriqMcp,
@@ -1027,7 +1022,7 @@ export class RunSupervisor {
   private async afterDriver(ctx: {
     run: Run;
     repo: ResolvedRepo;
-    worktree: WorktreeInfo;
+    worktree: Workspace;
     driver: AgentDriver;
     permission: PermissionProfile;
     noriqMcp?: NoriqMcp;
@@ -1073,7 +1068,10 @@ export class RunSupervisor {
         .checkpoint(worktree, `noriq run ${run.id}: ${label}`)
         .then((committed) => {
           if (committed)
-            this.log.info('committed the run diff to its branch', { runId: run.id, branch: worktree.branch });
+            this.log.info('committed the run diff to its branch', {
+              runId: run.id,
+              workRef: worktree.workRef,
+            });
         })
         .catch((err) =>
           this.log.error('could not commit the run diff — it stays uncommitted', {
@@ -1154,7 +1152,7 @@ export class RunSupervisor {
       const result = await this.verifyWithFeedback({
         run,
         spec: repo.manifest.verify,
-        cwd: worktree.path,
+        cwd: worktree.localPath,
         session: budgetRun.session,
         phase: 'verifying',
       });

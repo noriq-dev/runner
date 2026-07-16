@@ -24,9 +24,16 @@ const entry = (over: Partial<ParkedRun> = {}): ParkedRun => ({
   agentId: 'agt_1',
   agentLabel: 'build-abc123',
   mcpToken: 'tok_secret',
-  worktreePath: '/wt/run_1',
-  worktreeBranch: 'noriq/run/run_1',
-  repoRoot: '/repos/repo_a',
+  // The whole Workspace, location included (RUN-50) — a resume must hand the backend exactly
+  // what its lease() minted, and the park file is the one place that round-trips it as JSON.
+  workspace: {
+    runId: 'run_1',
+    localPath: '/wt/run_1',
+    readOnly: false,
+    baseId: 'base0000',
+    workRef: 'noriq/run/run_1',
+    location: { repoRoot: '/repos/repo_a', branch: 'noriq/run/run_1' },
+  },
   spent: { tokens: 1000, usd: 0.5 },
   activeSeconds: 120,
   parkedAt: '2026-07-15T10:00:00.000Z',
@@ -42,7 +49,20 @@ describe('ParkedStore survives the daemon (RUN-30)', () => {
     await new ParkedStore(f).park(entry());
     const reborn = new ParkedStore(f); // a different daemon, cold
     expect((await reborn.get('run_1'))?.sessionId).toBe('sess-abc');
-    expect((await reborn.get('run_1'))?.worktreePath).toBe('/wt/run_1');
+    const ws = (await reborn.get('run_1'))?.workspace;
+    expect(ws?.localPath).toBe('/wt/run_1');
+    // The opaque location must survive the JSON round-trip intact — it is what the backend
+    // reads back on resume, and a park that mangled it would strand the run.
+    expect(ws?.location).toEqual({ repoRoot: '/repos/repo_a', branch: 'noriq/run/run_1' });
+  });
+
+  it('drops a pre-RUN-50 park (no workspace) instead of resuming what it cannot read', async () => {
+    const f = file();
+    // The old loose fields, and no workspace — what a pre-RUN-50 daemon wrote.
+    const { workspace: _dropped, ...stale } = { ...entry(), worktreePath: '/wt/run_1' };
+    await writeFile(f, `${JSON.stringify({ parked: [stale] }, null, 2)}\n`);
+    // Forgotten park, surviving worktree — the same trade the corrupt-file case makes.
+    expect(await new ParkedStore(f).list()).toEqual([]);
   });
 
   it('unpark is exactly-once — the second caller gets nothing', async () => {

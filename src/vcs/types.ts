@@ -1,5 +1,3 @@
-import type { WorktreeInfo } from '../worktree';
-
 /**
  * The VCS seam (RUN-49): the nine outcomes the daemon needs from source control, named as
  * outcomes rather than git verbs. This is VCS-SPIKE.md §2 made real — the operation set was
@@ -23,17 +21,54 @@ import type { WorktreeInfo } from '../worktree';
  */
 
 /**
- * A leased workspace. Today this is exactly git's WorktreeInfo — `branch` and `baseSha` are
- * git concepts leaking through the alias, and RUN-50 owns splitting it into a local filesystem
- * path + an opaque backend-owned location. Do not add fields here; add them there.
+ * A leased workspace (RUN-50): the local filesystem path and the backend's own location are
+ * DIFFERENT TYPES, never interchangeable.
+ *
+ * The trap this shape exists to prevent: Perforce depot paths (`//depot/proj/file.c`) satisfy
+ * both `startsWith('/')` (RUN-42's exact bug) *and* `path.isAbsolute()` — RUN-42's fix — while
+ * being no filesystem path at all. RUN-55 then met the trap in live data: a single `-Mj` resolve
+ * object carries `clientFile` (filesystem) and `fromFile` (`//depot/…`) side by side. Git fuses
+ * the two namespaces, which is exactly why a git-first design never notices. So the fusion is
+ * unrepresentable here: one field is a path, the other is not even a string to this code.
  */
-export type Workspace = WorktreeInfo;
+export interface Workspace {
+  runId: string;
+  /**
+   * Where the agent's process works — cwd for the driver and for verify. A real filesystem
+   * path, and the ONLY field here that is one.
+   */
+  localPath: string;
+  /** Physically read-only lease (scope/verify) — defense-in-depth under the permission floor. */
+  readOnly: boolean;
+  /**
+   * The snapshot this lease started from, in the backend's own id-space (git: a sha; Perforce:
+   * a change number; Diversion: a commit id). An opaque token: hand it back to the SAME backend
+   * as a ref, display it, never parse it.
+   */
+  baseId: string;
+  /**
+   * Where the work lives, in words — for logs, reports, and humans (git/Diversion: the run's
+   * branch; Perforce: client + pending change). Display ONLY: the moment this becomes an
+   * operand, it is `location` smuggled past the type system.
+   */
+  workRef: string;
+  /**
+   * Backend-owned state, opaque to everything outside the backend that minted it — `unknown`
+   * so reaching in is a type error, not a code-review catch. Must stay JSON-serializable:
+   * parked runs (RUN-30) persist the whole Workspace and hand it back on resume.
+   */
+  location: unknown;
+}
 
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
-  /** Base ref to lease from. Defaults to the repo's current state. */
-  baseRef?: string;
+  /**
+   * Lease from another Run's work instead of the repo's current state — how a verify run gets
+   * the build's output (RUN-21). By run id, NOT by ref: how a run's work is named (a branch, a
+   * shelved change) is the backend's own business.
+   */
+  fromRunId?: string;
 }
 
 export type IntegrateResult = { ok: true } | { ok: false; conflicts: string[] };
@@ -69,16 +104,16 @@ export interface VcsBackend {
   /** Give the workspace back. Git destroys it (worktree + never-shared branch); a live backend
    *  would CLEAN it (revert unopened, delete the pending change) and hand it back to the pool —
    *  which is why this is not named `remove`. Safe to call twice. */
-  dispose(ws: Pick<Workspace, 'repoRoot' | 'path' | 'branch'>): Promise<void>;
+  dispose(ws: Workspace): Promise<void>;
 
   /** Did this Run actually produce anything — saved or not? A no-op run must not reach verify:
    *  a PASS over an empty tree would land the Run in review as a success with nothing in it. */
-  hasWork(ws: Pick<Workspace, 'path' | 'baseSha'>): Promise<boolean>;
+  hasWork(ws: Workspace): Promise<boolean>;
 
   /** Make the Run's work durable in the workspace, so it survives a reap and a human can review
    *  it. Returns false when there was nothing to save. Git commits locally; note a live backend
    *  checkpoints to the SERVER (`p4 shelve`) — accepted, documented in THREAT-MODEL.md. */
-  checkpoint(ws: Pick<Workspace, 'path'>, message: string): Promise<boolean>;
+  checkpoint(ws: Workspace, message: string): Promise<boolean>;
 
   /** Does the landing target exist? (Tells "no landing branch yet" from a typo.) */
   targetExists(repoRoot: string, target: string): Promise<boolean>;
@@ -95,20 +130,24 @@ export interface VcsBackend {
    * On conflict the integration is left IN PROGRESS so an agent can resolve the listed paths;
    * callers that don't resolve must `abandonIntegrate`.
    */
-  integrate(ws: Pick<Workspace, 'path'>, target: string): Promise<IntegrateResult>;
+  integrate(ws: Workspace, target: string): Promise<IntegrateResult>;
 
   /** Continue a conflicted integration after the agent edited the paths. */
-  resumeIntegrate(ws: Pick<Workspace, 'path'>): Promise<IntegrateResult>;
+  resumeIntegrate(ws: Workspace): Promise<IntegrateResult>;
 
   /** Put the workspace back the way it was before a failed integration. */
-  abandonIntegrate(ws: Pick<Workspace, 'path'>): Promise<void>;
+  abandonIntegrate(ws: Workspace): Promise<void>;
 
   /**
    * Land the workspace's state on `target` IFF the target hasn't moved — compare-and-swap,
    * never a merge commit. Losing the race is an expected result, not an error: report it and
    * let the caller re-integrate.
+   *
+   * Takes the WORKSPACE, not a ref: how a run's work is named (its branch, its pending change)
+   * is `location`'s business, and the old `fromRef` parameter was the supervisor passing git's
+   * branch name back in — the exact leak RUN-50 closes.
    */
-  publish(repoRoot: string, target: string, fromRef: string): Promise<PublishResult>;
+  publish(ws: Workspace, target: string): Promise<PublishResult>;
 
   /**
    * Git's extra publishing step (RUN-27 `[land].autoPush`): push the landed target to its

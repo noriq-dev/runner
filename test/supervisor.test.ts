@@ -11,7 +11,7 @@ import type {
 import { zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
 import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget, resolveModel } from '../src/supervisor';
-import type { WorktreeInfo } from '../src/worktree';
+import type { Workspace } from '../src/vcs/types';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -79,7 +79,7 @@ class FakeDriver implements AgentDriver {
 }
 
 class FakeWorktrees {
-  created: Array<{ root: string; runId: string; readOnly: boolean; baseRef?: string }> = [];
+  created: Array<{ root: string; runId: string; readOnly: boolean; fromRunId?: string }> = [];
   removed: string[] = [];
   /** Whether the agent left a diff. Defaults true — most tests model real work. */
   changed = true;
@@ -89,17 +89,19 @@ class FakeWorktrees {
   lease = async (
     root: string,
     runId: string,
-    opts: { readOnly?: boolean; baseRef?: string } = {},
-  ): Promise<WorktreeInfo> => {
-    if (this.createFails) throw new Error(`invalid reference: ${opts.baseRef}`);
-    this.created.push({ root, runId, readOnly: !!opts.readOnly, baseRef: opts.baseRef });
+    opts: { readOnly?: boolean; fromRunId?: string } = {},
+  ): Promise<Workspace> => {
+    if (this.createFails) throw new Error(`invalid reference: ${opts.fromRunId}`);
+    this.created.push({ root, runId, readOnly: !!opts.readOnly, fromRunId: opts.fromRunId });
     return {
       runId,
-      repoRoot: root,
-      path: `/wt/${runId}`,
-      branch: `noriq/run/${runId}`,
+      localPath: `/wt/${runId}`,
       readOnly: !!opts.readOnly,
-      baseSha: 'base0000',
+      baseId: 'base0000',
+      workRef: `noriq/run/${runId}`,
+      // This fake is its own backend, so its location is its own business — which is the
+      // point: the supervisor must work without ever looking inside it.
+      location: { repoRoot: root, branch: `noriq/run/${runId}` },
     };
   };
   hasWork = async (): Promise<boolean> => {
@@ -107,12 +109,12 @@ class FakeWorktrees {
     return this.changed;
   };
   commits: Array<{ path: string; message: string }> = [];
-  checkpoint = async (info: { path: string }, message: string): Promise<boolean> => {
-    this.commits.push({ path: info.path, message });
+  checkpoint = async (ws: Workspace, message: string): Promise<boolean> => {
+    this.commits.push({ path: ws.localPath, message });
     return this.changed;
   };
-  dispose = async (info: { path: string }): Promise<void> => {
-    this.removed.push(info.path);
+  dispose = async (ws: Workspace): Promise<void> => {
+    this.removed.push(ws.localPath);
   };
 
   // ── landing ────────────────────────────────────────────────────────────────
@@ -135,7 +137,7 @@ class FakeWorktrees {
     this.createdBranches.push({ branch, from });
   };
   integrate = async (
-    _info: { path: string },
+    _ws: Workspace,
     onto: string,
   ): Promise<{ ok: true } | { ok: false; conflicts: string[] }> => {
     this.rebases.push(onto);
@@ -147,13 +149,14 @@ class FakeWorktrees {
     this.aborted += 1;
   };
   publish = async (
-    _root: string,
+    ws: Workspace,
     branch: string,
-    fromRef: string,
   ): Promise<{ ok: true; sha: string } | { ok: false; reason: 'race' | 'error'; detail: string }> => {
     if (this.landRaces) return { ok: false, reason: 'race', detail: `${branch} has moved on` };
     if (this.landRefuses) return { ok: false, reason: 'error', detail: this.landRefuses };
-    this.landings.push({ branch, fromRef });
+    // fromRef preserved in the recording via workRef, so the assertions still name the run
+    // branch that reached publish — the fake reads its own display field, never location.
+    this.landings.push({ branch, fromRef: ws.workRef });
     return { ok: true, sha: 'landedsha' };
   };
   /** Non-empty → git refuses the landing with this message (e.g. a checked-out branch). */
@@ -798,7 +801,7 @@ describe('a verify run can actually SEE the diff it judges', () => {
     const h = harness();
     const done = h.supervisor.supervise(verifyRun());
     await flush();
-    expect(h.worktrees.created[0]?.baseRef).toBe('noriq/run/run_build7');
+    expect(h.worktrees.created[0]?.fromRunId).toBe('run_build7'); // the RUN, not its branch (RUN-50)
     h.claude.emitText('VERDICT: PASS');
     h.claude.complete('done');
     await done;
@@ -833,14 +836,16 @@ describe('a verify run can actually SEE the diff it judges', () => {
     const exit = await h.supervisor.supervise(verifyRun());
     expect(exit.outcome).toBe('failed');
     expect(exit.reason).toContain('run_build7');
-    expect(exit.reason).toContain('noriq/run/run_build7');
+    // Names the RUN whose work is missing, not its branch: since RUN-50 the supervisor does
+    // not know the branch convention exists — the old assertion here was pinning the leak.
+    expect(exit.reason).toContain('its work is not in this repo');
   });
 
   it('leaves scope/build runs branching from HEAD', async () => {
     const h = harness();
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
     await flush();
-    expect(h.worktrees.created[0]?.baseRef).toBeUndefined();
+    expect(h.worktrees.created[0]?.fromRunId).toBeUndefined();
     h.claude.complete('done');
     await done;
   });
@@ -849,7 +854,7 @@ describe('a verify run can actually SEE the diff it judges', () => {
     const h = harness();
     const done = h.supervisor.supervise(makeRun({ kind: 'build', verifiesRunId: 'run_build7' }));
     await flush();
-    expect(h.worktrees.created[0]?.baseRef).toBeUndefined();
+    expect(h.worktrees.created[0]?.fromRunId).toBeUndefined();
     h.claude.complete('done');
     await done;
   });
@@ -858,7 +863,7 @@ describe('a verify run can actually SEE the diff it judges', () => {
     const h = harness();
     const done = h.supervisor.supervise(makeRun({ kind: 'verify', verifiesRunId: null }));
     await flush();
-    expect(h.worktrees.created[0]?.baseRef).toBeUndefined();
+    expect(h.worktrees.created[0]?.fromRunId).toBeUndefined();
     h.claude.emitText('VERDICT: PASS');
     h.claude.complete('done');
     await done;
@@ -1368,8 +1373,9 @@ describe('parking a run on a human (RUN-30)', () => {
     await done;
     expect(await h.parked.get('run_1')).toMatchObject({
       sessionId: 'sess-fake',
-      worktreePath: '/wt/run_1',
-      worktreeBranch: 'noriq/run/run_1',
+      // The WHOLE workspace, location included (RUN-50): resume hands it back to the backend
+      // verbatim, so anything missing here is work the resumed run cannot find.
+      workspace: { localPath: '/wt/run_1', workRef: 'noriq/run/run_1' },
       agentId: 'agt_run1',
       // Persisted, not re-minted: RUN-43 made the run→agent credential deliberately
       // non-reissuable, and a park is the same process later, not a second one.

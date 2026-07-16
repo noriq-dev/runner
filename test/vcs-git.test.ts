@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { GitBackend, type GitOps } from '../src/vcs/git';
+import type { Workspace } from '../src/vcs/types';
 import type { WorktreeInfo } from '../src/worktree';
 
 // GitBackend is a naming boundary, so its whole contract is the MAPPING: each outcome reaches
 // the right git verb, with the arguments passed through untouched and the result returned
 // verbatim. Nothing here exercises git itself — worktree.test.ts owns that behaviour, against
 // real repos, and this seam must not duplicate (or drift from) it.
+//
+// Since RUN-50 the boundary also carries the TYPE split: WorktreeInfo (git's own shape, path +
+// branch fused) stays behind the backend, and what comes out is a Workspace whose localPath is
+// the only filesystem path and whose location is opaque. These tests pin the wrap/unwrap.
 
-const ws: WorktreeInfo = {
+const info: WorktreeInfo = {
   runId: 'run_1',
   repoRoot: '/repo',
   path: '/wt/run_1',
@@ -25,7 +30,7 @@ function recorder() {
       return result;
     };
   const ops: GitOps = {
-    create: record('create', ws),
+    create: record('create', info),
     remove: record('remove', undefined),
     hasChanges: record('hasChanges', true),
     commitWork: record('commitWork', true),
@@ -47,11 +52,35 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(new GitBackend(ops).kind).toBe('git');
   });
 
-  it('maps every outcome to its verb, args untouched, results verbatim', async () => {
+  it('lease wraps WorktreeInfo into a Workspace: localPath is the path, location hides the rest', async () => {
+    const { ops, calls } = recorder();
+    const ws = await new GitBackend(ops).lease('/repo', 'run_1', { readOnly: true });
+    expect(ws).toEqual({
+      runId: 'run_1',
+      localPath: '/wt/run_1',
+      readOnly: false, // verbatim from what git reported, not from what was asked
+      baseId: 'base0000',
+      workRef: 'noriq/run/run_1',
+      location: { repoRoot: '/repo', branch: 'noriq/run/run_1' },
+    });
+    expect(calls[0]).toEqual({
+      method: 'create',
+      args: ['/repo', 'run_1', { readOnly: true, baseRef: undefined }],
+    });
+  });
+
+  it('lease({fromRunId}) becomes the OTHER run’s branch — the naming convention stays in here', async () => {
+    const { ops, calls } = recorder();
+    await new GitBackend(ops).lease('/repo', 'run_2', { fromRunId: 'run_1' });
+    expect(calls[0]?.args[2]).toEqual({ readOnly: undefined, baseRef: 'noriq/run/run_1' });
+  });
+
+  it('maps every workspace outcome to its verb, unwrapping location — results verbatim', async () => {
     const { ops, calls } = recorder();
     const vcs = new GitBackend(ops);
+    const ws: Workspace = await vcs.lease('/repo', 'run_1');
+    calls.length = 0;
 
-    expect(await vcs.lease('/repo', 'run_1', { readOnly: true, baseRef: 'main' })).toBe(ws);
     await vcs.dispose(ws);
     expect(await vcs.hasWork(ws)).toBe(true);
     expect(await vcs.checkpoint(ws, 'msg')).toBe(true);
@@ -61,40 +90,49 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(await vcs.integrate(ws, 'noriq/integration')).toEqual({ ok: false, conflicts: ['a.ts'] });
     expect(await vcs.resumeIntegrate(ws)).toEqual({ ok: true });
     await vcs.abandonIntegrate(ws);
-    expect(await vcs.publish('/repo', 'noriq/integration', ws.branch)).toEqual({ ok: true, sha: 'sha1' });
+    expect(await vcs.publish(ws, 'noriq/integration')).toEqual({ ok: true, sha: 'sha1' });
     expect(await vcs.share('/repo', 'noriq/integration')).toEqual({ ok: false, detail: 'offline' });
     expect(await vcs.reapOrphans('/repo')).toBe(2);
 
     expect(calls).toEqual([
-      { method: 'create', args: ['/repo', 'run_1', { readOnly: true, baseRef: 'main' }] },
-      { method: 'remove', args: [ws] },
-      { method: 'hasChanges', args: [ws] },
-      { method: 'commitWork', args: [ws, 'msg'] },
+      { method: 'remove', args: [{ repoRoot: '/repo', path: '/wt/run_1', branch: 'noriq/run/run_1' }] },
+      { method: 'hasChanges', args: [{ path: '/wt/run_1', baseSha: 'base0000' }] },
+      { method: 'commitWork', args: [{ path: '/wt/run_1' }, 'msg'] },
       { method: 'refExists', args: ['/repo', 'noriq/integration'] },
       { method: 'createBranch', args: ['/repo', 'noriq/integration', 'main'] },
-      { method: 'rebaseOnto', args: [ws, 'noriq/integration'] },
-      { method: 'continueRebase', args: [ws] },
-      { method: 'abortRebase', args: [ws] },
-      { method: 'landFastForward', args: ['/repo', 'noriq/integration', ws.branch] },
+      { method: 'rebaseOnto', args: [{ path: '/wt/run_1' }, 'noriq/integration'] },
+      { method: 'continueRebase', args: [{ path: '/wt/run_1' }] },
+      { method: 'abortRebase', args: [{ path: '/wt/run_1' }] },
+      // publish takes the WORKSPACE; the branch it publishes from comes out of location,
+      // never from a caller-supplied ref (RUN-50).
+      { method: 'landFastForward', args: ['/repo', 'noriq/integration', 'noriq/run/run_1'] },
       { method: 'pushBranch', args: ['/repo', 'noriq/integration'] },
       { method: 'reapOrphans', args: ['/repo', undefined] },
     ]);
   });
 
   it('share forwards an explicit remote, and withholds the arg entirely when the caller did', async () => {
-    // pushBranch defaults remote='origin' via a DEFAULT PARAMETER — pass `undefined` through and
-    // the default still applies, but the distinction matters if that ever becomes an options
-    // object. Pin the passthrough both ways so a refactor can't silently drop the remote.
     const { ops, calls } = recorder();
     await new GitBackend(ops).share('/repo', 'b', 'upstream');
     expect(calls[0]).toEqual({ method: 'pushBranch', args: ['/repo', 'b', 'upstream'] });
   });
 
-  it('a WorktreeManager-shaped object satisfies GitOps structurally — the seam already existed', () => {
-    // Type-level: if WorktreeManager stops satisfying GitOps (a rename, a signature drift),
-    // this file fails to COMPILE, which is the earliest possible alarm.
+  it('refuses a workspace whose location it did not mint — by name, not with a git error', async () => {
+    // The guard exists for the park file: a Workspace round-trips through JSON on disk
+    // (RUN-30), where another backend's location or an old daemon's schema can produce
+    // anything. It must fail HERE, legibly — not as git complaining about a branch called
+    // "[object Object]".
     const { ops } = recorder();
-    const backend: GitBackend = new GitBackend(ops);
-    expect(backend).toBeInstanceOf(GitBackend);
+    const vcs = new GitBackend(ops);
+    const alien: Workspace = {
+      runId: 'run_9',
+      localPath: '/wt/run_9',
+      readOnly: false,
+      baseId: 'x',
+      workRef: 'client-9',
+      location: { client: 'ws9', change: 42 }, // a Perforce-shaped location
+    };
+    await expect(vcs.publish(alien, 'main')).rejects.toThrow(/does not carry a git location/);
+    await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
   });
 });
