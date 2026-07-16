@@ -206,6 +206,13 @@ export const ProjectManifest = z.object({
   // (see the resolution contract below) — NOT a server-local id, so the checkout
   // is portable across instances/forks without editing this file.
   key: ProjectKey,
+  // Lock this repo's work to one BOARD within the project (RUN-71) — `key` one level down: a
+  // project can host several repos, and without this every task a repo's agents create piles
+  // onto the default board. A NAME, not an id, for the same reason key is not a prj_… id:
+  // ids are server-local and this file is committed. Resolved per server at registration
+  // (case-insensitive); an unknown name resolves to null — visible in the dashboard, never
+  // silently rebound. Null = the project's default board, exactly as before.
+  board: z.string().min(1).max(80).nullable().default(null),
   verify: VerifySpec.nullable().default(null),
   tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
   defaultBranch: z.string().nullable().default(null),

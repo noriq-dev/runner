@@ -23,7 +23,16 @@ export interface RunnerRegistration {
   tools: AgentTool[];
   kinds: RunKind[];
   maxConcurrency: number;
-  repos: Array<{ id: string; projectKey: string; name: string; defaultBranch: string | null }>;
+  repos: Array<{
+    id: string;
+    projectKey: string;
+    /** The board lock (RUN-71): the marker's committed board NAME, riding the key's rails —
+     *  the server resolves it to a boardId within the resolved project, and that board is
+     *  where this repo's agents land the tasks they create. Null = the project default. */
+    board: string | null;
+    name: string;
+    defaultBranch: string | null;
+  }>;
 }
 
 const DEFAULT_KINDS: RunKind[] = ['scope', 'build', 'verify'];
@@ -47,6 +56,7 @@ export function buildRegistration(
     repos: discovered.map((r) => ({
       id: r.id,
       projectKey: r.projectKey,
+      board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
     })),

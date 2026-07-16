@@ -9,7 +9,9 @@ const repos: DiscoveredRepo[] = [
     projectKey: 'AAA',
     name: 'a',
     defaultBranch: 'main',
-    manifest: { key: 'AAA' } as never,
+    // The board lock (RUN-71) travels from the marker to the wire — the server resolves
+    // the NAME, the daemon never sees a board id.
+    manifest: { key: 'AAA', board: 'Runner' } as never,
   },
   {
     id: 'repo_b',
@@ -17,7 +19,7 @@ const repos: DiscoveredRepo[] = [
     projectKey: 'BBB',
     name: 'b',
     defaultBranch: null,
-    manifest: { key: 'BBB' } as never,
+    manifest: { key: 'BBB', board: null } as never,
   },
 ];
 
@@ -29,8 +31,8 @@ describe('buildRegistration', () => {
     expect(reg.tools).toEqual(['claude']);
     expect(reg.kinds).toEqual(['scope', 'build', 'verify']);
     expect(reg.repos).toEqual([
-      { id: 'repo_a', projectKey: 'AAA', name: 'a', defaultBranch: 'main' },
-      { id: 'repo_b', projectKey: 'BBB', name: 'b', defaultBranch: null },
+      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main' },
+      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null },
     ]);
     expect('runnerId' in reg).toBe(false); // omitted on first registration
   });

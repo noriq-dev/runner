@@ -172,6 +172,11 @@ export const RunnerRepo = z.object({
   id: z.string(), // stable per (runner, repo), e.g. hash of the root path
   projectKey: z.string().min(1), // committed KEY from .noriq/project.toml
   projectId: z.string().nullable().default(null), // resolved against this server; null if unknown here
+  // The board lock (RUN-71), riding the key's rails: `board` is the committed NAME from the
+  // marker, `boardId` its per-server resolution. Null when the marker names none, the project
+  // didn't resolve, or no board matches — unresolved is visible, never silently rebound.
+  board: z.string().nullable().default(null),
+  boardId: z.string().nullable().default(null),
   name: z.string().default(''), // display name (repo dir basename)
   defaultBranch: z.string().nullable().default(null),
 });

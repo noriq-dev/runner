@@ -32,6 +32,10 @@ export interface RegisteredRunnerRepo {
   id: string;
   projectKey: string;
   projectId: string | null;
+  /** The board lock (RUN-71): the committed name we sent, and the server's resolution of it.
+   *  boardId null while board is set = the name didn't resolve on this server. */
+  board: string | null;
+  boardId: string | null;
   name: string;
   defaultBranch: string | null;
 }

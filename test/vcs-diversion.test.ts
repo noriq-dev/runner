@@ -322,6 +322,7 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
         root: '/repo',
         manifest: {
           key: 'DV',
+          board: null,
           verify: null, // no deterministic floor in this test — the landing flow is the subject
           tool: null,
           defaultBranch: 'main',

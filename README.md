@@ -166,6 +166,12 @@ noriq-runner discover    # list the repos found under your scan roots
 The KEY in `.noriq/project.toml` is resolved to a `prj_…` id per configured server
 at registration, so a checkout stays portable across instances and forks.
 
+An optional `board = "…"` in the same marker locks the repo's work to one **board** within
+that project — the same idea as the key, one level down. Tasks this repo's agents create
+land on that board instead of the project default, and the dispatch form filters its anchor
+list to it. Like the key it's a committed *name* (matched case-insensitively), resolved per
+server; a name that doesn't resolve simply doesn't bind, and the repo stays dispatchable.
+
 ## Commands
 
 | Command            | What it does                                             |

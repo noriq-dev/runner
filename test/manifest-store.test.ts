@@ -127,6 +127,7 @@ describe('the committed marker is re-read per run (no restart)', () => {
 describe('changedSections', () => {
   const m = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
     key: 'PROJ',
+    board: null,
     verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
     tool: null,
     defaultBranch: null,

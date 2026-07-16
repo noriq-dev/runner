@@ -13,8 +13,8 @@ async function marker(dir: string, body: string) {
 
 beforeAll(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'noriq-discovery-'));
-  // repoA — valid, with a git HEAD → defaultBranch
-  await marker(path.join(root, 'repoA'), 'key = "AAA"\n');
+  // repoA — valid, with a git HEAD → defaultBranch, and a board lock (RUN-71)
+  await marker(path.join(root, 'repoA'), 'key = "AAA"\nboard = "Runner"\n');
   await mkdir(path.join(root, 'repoA', '.git'), { recursive: true });
   await writeFile(path.join(root, 'repoA', '.git', 'HEAD'), 'ref: refs/heads/main\n');
   // repoB — valid, nested one level deeper (monorepo-style discovery)
@@ -40,6 +40,10 @@ describe('discoverRepos', () => {
     expect(aaa?.defaultBranch).toBe('main');
     expect(bbb?.defaultBranch).toBeNull(); // no .git
     expect(aaa?.root).toBe(path.join(root, 'repoA'));
+    // The board lock rides the manifest verbatim (RUN-71): a committed NAME the server
+    // resolves at registration; absent = null = the project's default board.
+    expect(aaa?.manifest.board).toBe('Runner');
+    expect(bbb?.manifest.board).toBeNull();
   });
 
   it('gives a stable id per root path', () => {

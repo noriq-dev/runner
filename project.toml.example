@@ -14,6 +14,16 @@
 # reach on the server (the key you see in the dashboard, e.g. ACME).
 key = "ACME"
 
+# Optional: lock this repo's work to one BOARD within the project (RUN-71) — the same
+# idea as `key`, one level down. A project can host several repos; without this, every
+# task this repo's agents create lands on the project's default board. A board NAME
+# (matched case-insensitively), not an id, for the same reason `key` is not a prj_… id:
+# ids are server-local and this file is committed. A name the server can't resolve is
+# shown as unresolved in the dashboard and simply doesn't bind — the repo stays fully
+# dispatchable. A landing default, not a fence: the dispatch form filters its anchor
+# list to this board, and an agent explicitly told another board is not blocked.
+# board = "Runner"
+
 # Default agent driver for this repo. Omit (or null) to use the runner's default.
 # One of: "claude" | "codex".
 tool = "claude"
