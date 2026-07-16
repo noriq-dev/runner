@@ -1726,3 +1726,29 @@ describe('per-repo backend routing (RUN-60)', () => {
     expect(h.worktrees.removed).toEqual([]);
   });
 });
+
+describe('disposePreservesWork (RUN-52) — the pool-of-1 wedge guard', () => {
+  it('a kept build STILL disposes when the backend preserves work itself', async () => {
+    // On git, "keep the unlanded diff" means skip dispose — dispose destroys. On a pool-of-1
+    // backend (Diversion, Perforce) that skip holds the lease forever and wedges every later
+    // run on the repo; their dispose shelves/keeps the work server-side, so disposing IS
+    // keeping. The flag is how the backend says which shape it is.
+    const repoVcs = new FakeWorktrees();
+    (repoVcs as { disposePreservesWork?: boolean }).disposePreservesWork = true;
+    const h = harness({ repoVcs });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(repoVcs.removed).toEqual(['/wt/run_1']); // disposed despite being a kept build
+  });
+
+  it('git keeps its shape: an unlanded successful build skips dispose', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.removed).toEqual([]); // kept for the human — dispose would destroy it
+  });
+});

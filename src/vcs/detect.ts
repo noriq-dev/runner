@@ -33,7 +33,7 @@ const execFileP = promisify(execFile);
  */
 
 export interface VcsDetection {
-  kind: 'git' | 'diversion';
+  kind: 'git' | 'diversion' | 'perforce';
   /** Diversion's repo id (dv.repo.…) — DiversionBackend is constructed per repo with it. */
   repoId?: string;
   /** Why this repo got this backend — for the discover log, so routing is never silent. */
@@ -105,6 +105,15 @@ export async function detectVcs(roots: string[], deps: DetectDeps = {}): Promise
     if (exists(path.join(root, '.git'))) {
       // Explicit .git wins even inside a Diversion workspace — see the precedence note above.
       out.set(root, { kind: 'git', reason: '.git present at the root' });
+      continue;
+    }
+    // Perforce (RUN-52): a client workspace root conventionally carries a `.p4config` file
+    // (the P4CONFIG mechanism — it is how the p4 CLI itself finds the client from a cwd, and
+    // it is what PerforceBackend requires anyway). No .p4config → this daemon does not treat
+    // the directory as Perforce, even if a client maps it: probing a p4d per repo would put a
+    // network round-trip in discovery and hang on a dead server.
+    if (exists(path.join(root, '.p4config'))) {
+      out.set(root, { kind: 'perforce', reason: '.p4config present at the root' });
       continue;
     }
     const registry = await dvRegistry();

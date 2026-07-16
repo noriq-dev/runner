@@ -107,6 +107,21 @@ backend actually does:
 | **Isolation** | one worktree per run, minted freely | **pool-of-1 lease on the repo's workspace, in-process**: runs take turns. Two daemons on one workspace are not defended against — one daemon per machine is the operating assumption (one `dv` sync agent per machine enforces the same). |
 | **Load-bearing infrastructure** | the `git` binary | the **`dv` sync agent** (a background process the daemon does not own) plus the operator's stored OAuth token, which is one credential for *everything* — workspace, commit, merge, review, delete. There is nothing to withhold. |
 
+### The Perforce backend, specifically (RUN-52 — mappings measured in RUN-55)
+
+The inverse of Diversion on the mechanics, the same on the model:
+
+| | |
+|---|---|
+| **The CAS is the server's own** | `p4 submit` refuses a moved line atomically ("Out of date files must be resolved or reverted", per file) — no backend-carried guard, no window. Equal to git's `--ff-only`, better than Diversion. |
+| **What leaves the machine, when** | `checkpoint` **shelves — a depot write, before any gate** (RUN-48's accepted trade). Between dispose-shelve and a later submit the work is server-visible to anyone who can unshelve. There is no dry-run. |
+| **`[land].branch` selects nothing** | there are no branches: landing is `p4 submit` to the line the client workspace VIEWS, chosen when the operator configured the client. Point the client's view at something production-adjacent and you have handed agents production — the same sharp edge as `[land].branch`, moved into the client spec. `createTarget` refuses loudly; streams vs branch specs stays open until a real depot decides it. |
+| **Conflicts** | fully agent-resolvable, headless (measured): `merge3` markers are written into the files, the agent edits, `resolve -ay` accepts, submit retries. Same shape as git. |
+| **Read-only scope runs** | the floor is the driver permission profile, same as everywhere. The first writable lease migrates the client to `allwrite`, once (agents write files; they do not `p4 edit`) — and measured live, that flip is NOT retroactive, so it comes with a one-time `sync -f`. After it, `noallwrite`'s free OS enforcement is gone for good; per-lease flipping would force-resync a deliberately large repo on every scope/build alternation. |
+| **Authorship** | the daemon's own `P4USER` — changes read `noriq@<client>`, distinguishable from the human's. Better than Diversion. |
+| **Crash recovery / kept work** | §5's shelve-then-clean, literally: dispose and the reaper shelve any opened noriq changelist (recoverable from another machine, byte-for-byte — measured) before reverting. `disposePreservesWork` — the supervisor always disposes here, because on a pool-of-1 backend "skip dispose to keep the work" holds the lease forever. |
+| **Isolation** | pool-of-1 lease on the repo's client workspace, in process, one daemon per machine — same as Diversion, same RUN-48 reasoning. |
+
 ## Auto-landing (`[land]`) — an explicit trade
 
 Earlier this document said the daemon "never merges". It now merges — *locally*, into

@@ -108,6 +108,17 @@ export interface VcsBackend {
    *  of the supervisor's machinery. */
   readonly kind: string;
 
+  /**
+   * True when `dispose` makes unlanded work durable itself (Diversion: the branch is already
+   * server-side; Perforce: dispose shelves before cleaning) — so the caller may ALWAYS dispose.
+   *
+   * Exists because git's keep-the-work shape is the opposite: its dispose DESTROYS, so the
+   * supervisor keeps an unlanded build by *skipping* dispose — and on a pool-of-1 backend that
+   * skip holds the lease forever and wedges every later run on the repo. The flag lets each
+   * backend say which shape it is; absent means git's (skip to keep).
+   */
+  readonly disposePreservesWork?: boolean;
+
   /** Lease an isolated workspace, exclusively, for this Run. Git mints one; a live backend
    *  would wait its turn for one. */
   lease(repoRoot: string, runId: string, opts?: LeaseOptions): Promise<Workspace>;

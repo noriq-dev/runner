@@ -162,6 +162,7 @@ export type {
 } from './vcs/types';
 export { GitBackend, type GitOps } from './vcs/git';
 export { detectVcs, parseDvRepoList, type DetectDeps, type VcsDetection } from './vcs/detect';
+export { PerforceBackend, realP4Cli, type P4Cli, type PerforceBackendOpts } from './vcs/perforce';
 export {
   DiversionBackend,
   DV_API_BASE,

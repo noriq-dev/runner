@@ -146,6 +146,10 @@ interface MergeConflict {
 
 export class DiversionBackend implements VcsBackend {
   readonly kind = 'diversion';
+  /** Unlanded work survives dispose without help: checkpointed commits live on the run's
+   *  server-side branch, and even uncommitted edits synced continuously (§9). Skipping dispose
+   *  to "keep" work here would only wedge the pool-of-1 lease (RUN-52's find). */
+  readonly disposePreservesWork = true;
   private readonly repoId: string;
   private readonly http: DvHttp;
   private readonly cli: DvCli;

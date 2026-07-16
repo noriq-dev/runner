@@ -18,6 +18,7 @@ import { checkForUpdate, updateAdvice } from './update';
 import { detectVcs } from './vcs/detect';
 import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
+import { PerforceBackend } from './vcs/perforce';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient } from './ws-client';
 
@@ -87,7 +88,7 @@ export class Daemon {
     // machine default; a repo the detector cannot place falls back to it, loudly.
     const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
     const detections = await detectVcs(repos.map((r) => r.root));
-    const backendFor = new Map<string, GitBackend | DiversionBackend>();
+    const backendFor = new Map<string, GitBackend | DiversionBackend | PerforceBackend>();
     for (const r of repos) {
       const d = detections.get(r.root);
       if (d?.kind === 'diversion' && d.repoId) {
@@ -95,6 +96,9 @@ export class Daemon {
         // lease queue — a per-run instance would silently disable the lease. One daemon per
         // machine is the operating assumption on this backend (the lease is in-process).
         backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId }));
+      } else if (d?.kind === 'perforce') {
+        // Same per-repo, once-only rule: the pool-of-1 lease lives in the instance (RUN-52).
+        backendFor.set(r.root, new PerforceBackend());
       } else {
         backendFor.set(r.root, vcs);
       }

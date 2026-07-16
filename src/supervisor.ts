@@ -60,6 +60,7 @@ export type SupervisorVcs = Pick<
   | 'abandonIntegrate'
   | 'publish'
   | 'share'
+  | 'disposePreservesWork'
 >;
 
 export interface ResolvedRepo {
@@ -1235,8 +1236,14 @@ export class RunSupervisor {
     // it is on the integration branch the worktree and its throwaway branch are dead
     // weight — reaping them here is what keeps ~/.noriq/worktrees from growing one
     // directory per run forever. Scope/verify and driver failures are cleaned up as before.
-    if (!(kind === 'build' && driverSucceeded && !landed)) {
-      await this.vcsFor(repo)
+    //
+    // EXCEPT on a backend whose dispose preserves the work itself (RUN-52): there, skipping
+    // dispose is not "keep the work", it is "hold the pool-of-1 lease forever" — the next run
+    // on this repo would wait on a workspace nobody will ever hand back. Such a backend
+    // shelves/keeps the work server-side inside dispose, so disposing IS keeping.
+    const vcsOut = this.vcsFor(repo);
+    if (!(kind === 'build' && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
+      await vcsOut
         .dispose(worktree)
         .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
     }
