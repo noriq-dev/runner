@@ -8,3 +8,6 @@ coverage/
 # The daemon's local machine config + any local secrets never get committed.
 runner.toml
 .noriq-runner/
+# The repo's own Noriq marker — normally COMMITTED, ignored here for now while we
+# dogfood the runner on itself (Montana's call, 2026-07-16). Drop this line to share it.
+.noriq/
