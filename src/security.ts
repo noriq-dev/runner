@@ -120,7 +120,23 @@ const STAY_ALIVE = ['heartbeat'];
  * the reviewer mutates nothing.
  */
 const NORIQ_TOOLS: Record<RunKind, string[]> = {
-  scope: ['set_agent_identity', 'get_briefing', 'get_task', 'get_plans', 'create_plan'],
+  // Scope can TEND the plan it mints, not just mint it (RUN-69): update_plan is what the
+  // server's own playbook instructs, and the dependency pair prunes the artifact edges that
+  // enforced phase ordering creates — a live scope run had to raise_alert and hand a human
+  // five edges to cut because this floor said no. Safe because the RUN-23 gate still holds:
+  // plans arrive PROPOSED and a human approves them after the tidying. Still excluded, on
+  // purpose: create_task/decompose_task (mint claimable work outside the proposed-plan gate)
+  // and claim/release (scope plans, never executes).
+  scope: [
+    'set_agent_identity',
+    'get_briefing',
+    'get_task',
+    'get_plans',
+    'create_plan',
+    'update_plan',
+    'add_dependency',
+    'remove_dependency',
+  ],
   build: [
     'set_agent_identity',
     'get_briefing',

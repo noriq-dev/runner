@@ -70,6 +70,19 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
     expect(noriqToolNamesFor('scope')).not.toContain('claim_task');
     expect(noriqToolNamesFor('build')).not.toContain('create_plan');
   });
+
+  it('scope can TEND the plan it mints, but not mint claimable work outside the gate (RUN-69)', () => {
+    const scope = noriqToolNamesFor('scope');
+    // A live scope run promised to cut its plan's artifact phase-edges, found the floor said
+    // no, and could only raise_alert — the human then hand-cut five edges at approval.
+    expect(scope).toContain('update_plan');
+    expect(scope).toContain('add_dependency');
+    expect(scope).toContain('remove_dependency');
+    // The RUN-23 gate is why the above is safe — and why these two stay out: both create
+    // claimable work that no human ever approved.
+    expect(scope).not.toContain('create_task');
+    expect(scope).not.toContain('decompose_task');
+  });
 });
 
 describe('permission profiles never grant a dangerous mode UNINVITED (RUN-68)', () => {
