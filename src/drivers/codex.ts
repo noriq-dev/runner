@@ -73,8 +73,15 @@ export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 /** Permission profile → Codex sandbox. Codex's sandbox is coarser than the
  *  Claude driver's tool allowlist: scope/verify → read-only, build → workspace-
  *  write (writes confined to the worktree). The manifest bash allowlist doesn't
- *  map 1:1 (Codex gates by sandbox level + approval policy, not per-command). */
+ *  map 1:1 (Codex gates by sandbox level + approval policy, not per-command).
+ *
+ *  AUTO (RUN-68) grants `danger-full-access` — but ONLY when the profile also grants write.
+ *  The sandbox is the ONLY enforcement codex has, so dropping it for a read-only kind would
+ *  silently turn `auto` into `write`, and those are different promises: auto loosens command
+ *  gating, never the write axis. For a read-only kind auto is therefore a no-op here — headless
+ *  codex never prompted anyway, so there is nothing softer than read-only to give it. */
 export function mapSandbox(profile: PermissionProfile): CodexSandbox {
+  if (profile.auto && profile.write) return 'danger-full-access';
   return profile.write ? 'workspace-write' : 'read-only';
 }
 

@@ -271,8 +271,11 @@ permission profiles (including which Noriq MCP tools each kind may call); daemon
 budgets (SIGTERM on breach); **no push credentials for any agent, ever, and the daemon
 publishes only where the repo opted it in — never merging into the protected branch**;
 secrets stay local (only the OAuth token crosses the wire, injected into the agent's MCP
-transport rather than its shell). Full threat model — and the explicit trade auto-landing
-makes — in [`THREAT-MODEL.md`](THREAT-MODEL.md).
+transport rather than its shell). A repo that trusts its agents can opt a kind out of the
+command allowlist into the driver's own auto mode (`[permissions.<kind>] auto = true`) —
+read-only stays read-only and the Noriq tool floor holds regardless, but the bash
+allowlist is the price. Full threat model — and the explicit trades auto-landing and
+`auto` make — in [`THREAT-MODEL.md`](THREAT-MODEL.md).
 
 ## Try it end-to-end
 

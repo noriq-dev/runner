@@ -132,9 +132,9 @@ describe('changedSections', () => {
     defaultBranch: null,
     land: null,
     permissions: {
-      scope: { write: false, network: 'restricted', allow: [], deny: [] },
-      build: { write: true, network: 'restricted', allow: [], deny: [] },
-      verify: { write: false, network: 'restricted', allow: [], deny: [] },
+      scope: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
+      build: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
+      verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
     },
     // No per-kind model/effort: this repo takes whatever the tool defaults to (RUN-33).
     defaults: {

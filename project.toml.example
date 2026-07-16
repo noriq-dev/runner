@@ -169,8 +169,28 @@ cmd = "npm run typecheck && npm test"
 #   network : "restricted" (default) | "none" | "full" — egress policy the driver
 #             maps onto the CLI sandbox.
 #   allow   : extra allowlist rules handed to the driver, e.g. "Bash(npm test:*)".
-#             Build needs its bash allowlist here — bare `Bash` is NEVER granted.
-#   deny    : explicit deny rules.
+#             Build needs its bash allowlist here — bare `Bash` is never granted
+#             unless you opt the kind into `auto` (below).
+#   deny    : explicit deny rules. Deny outranks everything, INCLUDING auto.
+#   auto    : opt this kind into the driver's own AUTO mode (RUN-68) — Claude's
+#             bypass-permissions / codex's unsandboxed full access — instead of the
+#             curated allowlist. Default false, and the default is the floor; this
+#             is the per-kind trust escape hatch for repos the allowlist fits badly.
+#
+#             What auto does NOT loosen, by design:
+#               - `write` survives it: a read-only kind stays read-only (edit-tool
+#                 denials on Claude; codex keeps the read-only sandbox — its sandbox
+#                 is its only enforcement, so codex auto only changes write kinds).
+#               - `deny` still binds.
+#               - Push credentials (absent from the env) and the per-kind Noriq tool
+#                 floor (enforced by the server's own tool registration) hold regardless.
+#             What it DOES give up: the bash allowlist, and — for a write kind — the
+#             sandbox confining writes to the worktree. On Claude, bash can also mutate
+#             files, so verify-with-auto weakens "the reviewer never edits" to the
+#             edit-tools layer. Committed file, deliberate choice. See THREAT-MODEL.md.
+#
+# [permissions.build]
+# auto = true
 [permissions.scope]
 write = false
 network = "restricted"

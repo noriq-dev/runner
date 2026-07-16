@@ -9,6 +9,7 @@ const perm = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   network: 'restricted',
   allow: [],
   deny: [],
+  auto: false,
   ...over,
 });
 
@@ -71,21 +72,45 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
   });
 });
 
-describe('permission profiles never grant a dangerous mode', () => {
-  it('Claude: always dontAsk; build never gets bare Bash', () => {
+describe('permission profiles never grant a dangerous mode UNINVITED (RUN-68)', () => {
+  it('Claude: dontAsk by default; build never gets bare Bash', () => {
     for (const write of [false, true]) {
       const p = mapPermission(perm({ write }), write ? 'build' : 'scope');
-      expect(p.permissionMode).toBe('dontAsk'); // never bypassPermissions
+      expect(p.permissionMode).toBe('dontAsk'); // never bypassPermissions without auto
       expect(p.allowedTools).not.toContain('Bash'); // bare bash never granted
     }
   });
 
-  it('Codex: only read-only or workspace-write — never danger-full-access', () => {
+  it('Codex: only read-only or workspace-write by default — never danger-full-access', () => {
     expect(mapSandbox(perm({ write: false }))).toBe('read-only');
     expect(mapSandbox(perm({ write: true }))).toBe('workspace-write');
-    // exhaustive over the write flag — no input yields danger-full-access
+    // exhaustive over the write flag — no auto-less input yields danger-full-access
     for (const write of [false, true]) {
       expect(mapSandbox(perm({ write }))).not.toBe('danger-full-access');
     }
+  });
+
+  it('auto is the committed opt-in: Claude goes bypass, codex build goes full access', () => {
+    expect(mapPermission(perm({ write: true, auto: true }), 'build').permissionMode).toBe(
+      'bypassPermissions',
+    );
+    expect(mapSandbox(perm({ write: true, auto: true }))).toBe('danger-full-access');
+  });
+
+  it('the write axis SURVIVES auto — trust loosens command gating, never read-only', () => {
+    // Claude: deny outranks bypass, so a read-only kind keeps its edit-tool denials.
+    const p = mapPermission(perm({ write: false, auto: true }), 'verify');
+    expect(p.permissionMode).toBe('bypassPermissions');
+    expect(p.disallowedTools).toContain('Edit');
+    expect(p.disallowedTools).toContain('Write');
+    // ...but bare Bash is no longer denied — unrestricted EXECUTION is what auto means.
+    expect(p.disallowedTools).not.toContain('Bash');
+    // Codex: the sandbox is its only enforcement; auto must not turn read-only into write.
+    expect(mapSandbox(perm({ write: false, auto: true }))).toBe('read-only');
+  });
+
+  it('manifest deny rules still bind under auto', () => {
+    const p = mapPermission(perm({ write: true, auto: true, deny: ['WebFetch'] }), 'build');
+    expect(p.disallowedTools).toContain('WebFetch');
   });
 });

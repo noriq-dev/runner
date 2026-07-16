@@ -175,7 +175,13 @@ class FakeWorktrees {
   };
 }
 
-const perm = (write: boolean): PermissionProfile => ({ write, network: 'restricted', allow: [], deny: [] });
+const perm = (write: boolean): PermissionProfile => ({
+  write,
+  network: 'restricted',
+  allow: [],
+  deny: [],
+  auto: false,
+});
 const noModel = (): ModelDefault => ({ model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',

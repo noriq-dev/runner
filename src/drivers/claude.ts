@@ -149,6 +149,23 @@ export function mapPermission(
   // No edit tools without write — that is what read-only means, and it is the property
   // that stops a VERIFY agent from "fixing" the code it is supposed to be judging.
   if (!profile.write) disallowed.push(...EDIT_TOOLS);
+
+  // AUTO (RUN-68): the repo opted this kind into Claude's own bypass mode — everything is
+  // approved except what `disallowedTools` names, and deny outranks bypass, so the write axis
+  // above SURVIVES auto. Bare `Bash` is deliberately not denied here: unrestricted execution is
+  // what auto means. The honest cost: bash can mutate files, so for a read-only kind auto
+  // weakens "cannot edit" from tool-enforced to edit-tools-only (scope keeps its physical
+  // chmod; verify does not). Push credentials and the Noriq tool floor hold regardless — the
+  // first is absent from the env, the second is enforced by the server's own tool registration
+  // (RUN-47), which bypass mode cannot talk its way past.
+  if (profile.auto) {
+    return {
+      permissionMode: 'bypassPermissions',
+      allowedTools: dedupe(allowed),
+      disallowedTools: dedupe(disallowed),
+    };
+  }
+
   // Bare `Bash` is denied outright ONLY when the profile grants no bash rules of its
   // own. Deny outranks allow, so a blanket 'Bash' here would silently neuter an
   // explicit `Bash(npm test:*)` — the rule would sit in the manifest doing nothing.

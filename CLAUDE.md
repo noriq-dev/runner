@@ -89,8 +89,13 @@ and should be updated alongside any change here.
   merge*, deliberately: freeing humans from per-run clicks is the point of the product, and a
   boundary nobody can move is just a boundary nobody uses.
   ~~The daemon never pushes~~ was the v1 wording and is simply false now. Do not restore it.
-- **Bare `Bash` and `danger-full-access` are never granted.** Permission mapping only ever emits
-  `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex) — see `mapPermission`, `mapSandbox`.
+- **Bare `Bash` and `danger-full-access` are never granted *uninvited*.** By default the mapping only
+  emits `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex). Since RUN-68 a repo's committed
+  manifest may opt a kind into the driver's auto mode (`[permissions.<kind>] auto = true` → Claude
+  bypass-permissions; codex `danger-full-access` for write kinds only) — the same deliberate
+  boundary-move as autoPush above. What survives auto by construction: `write` (read-only stays
+  read-only), `deny`, env credential stripping, and the server-enforced Noriq tool floor (RUN-47).
+  ~~never granted~~ was the pre-RUN-68 wording; do not restore it — see `mapPermission`, `mapSandbox`.
 - **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
 - **The verify agent executes but never edits** — authorship separation is the point of the gate.
 - **One worktree per Run**; never two runs in one checkout; never force-delete work that exists nowhere

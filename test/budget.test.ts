@@ -64,7 +64,7 @@ const startOpts = (b: RunBudget): DriverStartOptions => ({
   kind: 'build',
   cwd: '/wt',
   prompt: 'x',
-  permission: { write: true, network: 'restricted', allow: [], deny: [] },
+  permission: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
   budget: b,
 });
 

@@ -48,6 +48,7 @@ const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   network: 'restricted',
   allow: [],
   deny: [],
+  auto: false,
   ...over,
 });
 

@@ -334,9 +334,9 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
             autoPush: false,
           },
           permissions: {
-            scope: { write: false, network: 'restricted', allow: [], deny: [] },
-            build: { write: true, network: 'restricted', allow: [], deny: [] },
-            verify: { write: false, network: 'restricted', allow: [], deny: [] },
+            scope: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
+            build: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
+            verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
           },
           defaults: {
             scope: { model: null, effort: null },

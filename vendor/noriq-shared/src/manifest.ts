@@ -28,6 +28,17 @@ export const PermissionProfile = z.object({
   network: NetworkPolicy.default('restricted'),
   allow: z.array(z.string()).default([]), // extra allow rules handed to the driver
   deny: z.array(z.string()).default([]),
+  /**
+   * Opt this kind into the driver's own AUTO mode (RUN-68): Claude's bypass-permissions,
+   * codex's unsandboxed full access — instead of the curated allowlist. Default FALSE, and the
+   * default is the floor; this is the committed, per-kind trust escape hatch for repos whose
+   * work the allowlist fits badly. Two axes it deliberately does NOT loosen: `write` survives
+   * auto (a read-only kind stays read-only — edit-tool denials on Claude, read-only sandbox on
+   * codex), and `deny` still binds. Push credentials and the per-kind Noriq tool floor are
+   * enforced elsewhere (env stripping; server-side registration, RUN-47) and are untouched by
+   * this. See THREAT-MODEL.md — this moves a boundary that used to be absolute.
+   */
+  auto: z.boolean().default(false),
 });
 export type PermissionProfile = z.infer<typeof PermissionProfile>;
 
@@ -66,9 +77,9 @@ export type KindDefaults = z.infer<typeof KindDefaults>;
 // No agent ever gets push credentials (enforced by the daemon, not expressible here).
 // A factory (not a shared literal) so each parse gets fresh, non-aliased arrays.
 const defaultPermissions = (): KindPermissions => ({
-  scope: { write: false, network: 'restricted', allow: [], deny: [] },
-  build: { write: true, network: 'restricted', allow: [], deny: [] },
-  verify: { write: false, network: 'restricted', allow: [], deny: [] },
+  scope: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
+  build: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
+  verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
 });
 
 /**

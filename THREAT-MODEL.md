@@ -27,7 +27,7 @@ that contain it. Security here is load-bearing, not polish.
 | Agent edits/deletes files outside its task | **One git worktree per Run** on a throwaway branch `noriq/run/<id>`; never two runs in one checkout | `worktree.ts` |
 | A scope (read-only) agent writes anything | **Per-kind permission profile**: scope gets read-only tools (Claude `dontAsk` + read-only allowlist) / `read-only` sandbox (Codex); **plus** the scope worktree is physically `chmod`'d read-only (defense in depth) | `drivers/claude.ts` `mapPermission`, `drivers/codex.ts` `mapSandbox`, `worktree.ts` `setReadOnly` |
 | The verify agent "fixes" the code it is judging | **Execute, never edit.** Verify's profile is `write = false`, so Edit/Write/MultiEdit are denied and its bash rules are enumerated (install + run + `git diff`) — it can exercise the behavior but cannot alter a line of it, nor weaken a test to make its own verdict easy. Its worktree is deliberately **not** `chmod`'d read-only (unlike scope): a verifier that cannot run the suite can only review by eye, which is the weakest form of this gate. The separation that matters is authorship, and that is enforced by the profile | `drivers/claude.ts` `mapPermission`, `.noriq/project.toml` `[permissions.verify]` |
-| A build agent runs arbitrary shell | Build gets edit tools + a **bash allowlist** only (the manifest's `allow` rules, e.g. `Bash(npm test:*)`) — **bare `Bash` is never granted**; Codex confines writes to `workspace-write` | `drivers/claude.ts`, `drivers/codex.ts` |
+| A build agent runs arbitrary shell | Build gets edit tools + a **bash allowlist** only (the manifest's `allow` rules, e.g. `Bash(npm test:*)`) — **bare `Bash` is never granted by default**; Codex confines writes to `workspace-write`. A repo's committed manifest may opt a kind out of the allowlist entirely with `[permissions.<kind>] auto = true` (RUN-68): Claude bypass-permissions / codex `danger-full-access` (write kinds only). `write`, `deny`, credential stripping, and the server-side Noriq floor survive auto — the allowlist and (for a write kind) worktree confinement of writes do not. See "What the daemon never does" | `drivers/claude.ts` `mapPermission`, `drivers/codex.ts` `mapSandbox` |
 | Agent pushes to the remote / merges | **No agent ever gets push credentials**, and this half is absolute: the spawned process runs under `sanitizedAgentEnv` — `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, credential helper disabled via `GIT_CONFIG_*` — so even `git push` inside the allowlist has no credentials and no way to prompt for them. The **daemon** is a separate question: with `[land].autoPush` (opt-in, default off) it pushes the working branch `[land].branch` names, and never anything else | `security.ts`, `supervisor.ts` |
 | The daemon merges its own work into main | **It doesn't — it asks.** A completed plan's working branch becomes a **merge request** (RUN-28, `gh pr create`); a human merges it. The daemon only ever fast-forwards `[land].branch` itself, and only with a diff that passed the gate *rebased onto it*. A dispatch may steer the target only within `[land].allowedBranches` (RUN-41), which is empty by default — so a repo saying `branch = "agents"` can never be written anywhere else. **What backs this is the daemon's own code plus the forge's branch protection, NOT the absence of a credential**: once autoPush is on, the same token that pushes a working branch could push `main`, and what stops it is that the daemon does not try | `land.ts`, `merge-request.ts`, `worktree.ts` `pushBranch` |
 | Agent exfiltrates secrets from the environment | `sanitizedAgentEnv` **strips** `NORIQ_TOKEN` and common cloud/git tokens from the child's shell env. The agent reaches Noriq via its **MCP** connection (credential injected at the transport), so `bash` never sees the token | `security.ts` |
@@ -50,9 +50,16 @@ that contain it. Security here is load-bearing, not polish.
   that Run's diff passed the gate *rebased onto it* (see below).
 - Never grants an agent's shell the Noriq token or cloud/git credentials.
 - Never runs an agent outside its per-Run worktree.
-- Never runs a build agent with unrestricted `Bash` or a `danger-full-access`
-  sandbox — the permission mapping only ever emits `dontAsk` (Claude) and
-  `read-only` / `workspace-write` (Codex).
+- Never runs an agent with unrestricted `Bash` or a `danger-full-access` sandbox
+  **unless the repo's committed manifest opted that kind in** (`[permissions.<kind>]
+  auto = true`, RUN-68). Without auto the mapping only ever emits `dontAsk` (Claude)
+  and `read-only` / `workspace-write` (Codex) — that is still every repo's default.
+  With auto, Claude runs bypass-permissions and codex build runs unsandboxed; what
+  survives auto by construction: `write` (read-only kinds keep edit denials / the
+  read-only sandbox), `deny` rules, the env-level credential stripping, and the
+  server-enforced Noriq tool floor (RUN-47). Same shape as autoPush: a boundary
+  that used to be absolute is now a committed, per-repo choice — because "never,
+  for everyone" was pricing one trust level for all repos.
 - Never force-deletes a worktree holding work that exists nowhere else.
 
 ### What the boundary actually is, and where it moved
