@@ -45,9 +45,32 @@ import { assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify
 // attribution depended on the model complying and the daemon never learned who its own child
 // was — run.status.agentId was null on every run ever reported.
 
+/** The slice of a VcsBackend the supervisor drives — everything except reapOrphans, which is
+ *  the daemon's (crash recovery is not a per-Run concern). */
+export type SupervisorVcs = Pick<
+  VcsBackend,
+  | 'lease'
+  | 'dispose'
+  | 'hasWork'
+  | 'checkpoint'
+  | 'targetExists'
+  | 'createTarget'
+  | 'integrate'
+  | 'resumeIntegrate'
+  | 'abandonIntegrate'
+  | 'publish'
+  | 'share'
+>;
+
 export interface ResolvedRepo {
   root: string;
   manifest: ProjectManifest;
+  /**
+   * This repo's backend (RUN-60), when it is not the machine default — the daemon detects per
+   * repo (git by `.git`, Diversion by the dv registry) and routes here. Omitted → `deps.vcs`,
+   * which keeps every existing caller and test meaning exactly what it meant.
+   */
+  vcs?: SupervisorVcs;
 }
 
 export interface RunReport {
@@ -76,22 +99,9 @@ export interface RunSupervisorDeps {
   drivers: Partial<Record<AgentTool, AgentDriver>>;
   /** The VCS seam (RUN-49). This Pick is the interface's origin story: its git-verb
    *  predecessor was how the nine outcomes were DISCOVERED — the supervisor already declared
-   *  exactly what it needs, so the seam was renamed, not designed. Everything except
-   *  reapOrphans, which is the daemon's (crash recovery is not a per-Run concern). */
-  vcs: Pick<
-    VcsBackend,
-    | 'lease'
-    | 'dispose'
-    | 'hasWork'
-    | 'checkpoint'
-    | 'targetExists'
-    | 'createTarget'
-    | 'integrate'
-    | 'resumeIntegrate'
-    | 'abandonIntegrate'
-    | 'publish'
-    | 'share'
-  >;
+   *  exactly what it needs, so the seam was renamed, not designed. This is the MACHINE DEFAULT;
+   *  a repo may carry its own backend via ResolvedRepo.vcs (RUN-60). */
+  vcs: SupervisorVcs;
   /** repoRef → local repo root + the manifest to run under. May be async: the daemon
    *  re-reads the committed marker per Run so a config edit needs no restart. */
   resolveRepo: (repoRef: string) => ResolvedRepo | null | Promise<ResolvedRepo | null>;
@@ -307,6 +317,11 @@ export class RunSupervisor {
     this.log = deps.logger ?? defaultLogger;
   }
 
+  /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
+  private vcsFor(repo: ResolvedRepo): SupervisorVcs {
+    return repo.vcs ?? this.deps.vcs;
+  }
+
   /**
    * Serialize work per repo. rebase → verify → fast-forward is a read-modify-write of
    * one branch: two concurrent runs would each rebase onto the same tip, each verify a
@@ -372,7 +387,7 @@ export class RunSupervisor {
       }
       branch = run.targetBranch;
     }
-    const vcs = this.deps.vcs;
+    const vcs = this.vcsFor(repo);
 
     // First landing into this branch: fork it from the repo's declared main so the
     // integration line starts somewhere sane rather than from this run's base.
@@ -868,7 +883,7 @@ export class RunSupervisor {
 
     let worktree: Workspace;
     try {
-      worktree = await this.deps.vcs.lease(repo.root, run.id, {
+      worktree = await this.vcsFor(repo).lease(repo.root, run.id, {
         readOnly,
         fromRunId: verifiesRunId ?? undefined,
       });
@@ -918,7 +933,9 @@ export class RunSupervisor {
           label: runAgent.label,
         });
       } catch (err) {
-        await this.deps.vcs.dispose(worktree).catch(() => {});
+        await this.vcsFor(repo)
+          .dispose(worktree)
+          .catch(() => {});
         return fail(`could not create the Noriq agent for this run: ${(err as Error).message}`);
       }
     }
@@ -934,7 +951,9 @@ export class RunSupervisor {
     // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
     // which it can only do if the daemon actually made someone.
     if (!runAgent) {
-      await this.deps.vcs.dispose(worktree).catch(() => {});
+      await this.vcsFor(repo)
+        .dispose(worktree)
+        .catch(() => {});
       return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
     }
     const prompt = assemblePrompt(run, repo.manifest, {
@@ -1054,7 +1073,9 @@ export class RunSupervisor {
     // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
     // review as "done" with an empty diff — a silent no-op reported as success.
     if (kind === 'build' && driverSucceeded) {
-      const changed = await this.deps.vcs.hasWork(worktree).catch(() => true); // can't tell → assume it worked and let verify decide
+      const changed = await this.vcsFor(repo)
+        .hasWork(worktree)
+        .catch(() => true); // can't tell → assume it worked and let verify decide
       if (!changed) {
         this.log.warn('build produced no changes — skipping verify, not a success', { runId: run.id });
         exit = { ...exit, outcome: 'failed', isError: true, reason: 'no_changes' };
@@ -1068,7 +1089,7 @@ export class RunSupervisor {
     // start. Committing here is what makes "a review diff on the branch" true.
     if (kind === 'build' && driverSucceeded) {
       const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
-      await this.deps.vcs
+      await this.vcsFor(repo)
         .checkpoint(worktree, `noriq run ${run.id}: ${label}`)
         .then((committed) => {
           if (committed)
@@ -1215,7 +1236,7 @@ export class RunSupervisor {
     // weight — reaping them here is what keeps ~/.noriq/worktrees from growing one
     // directory per run forever. Scope/verify and driver failures are cleaned up as before.
     if (!(kind === 'build' && driverSucceeded && !landed)) {
-      await this.deps.vcs
+      await this.vcsFor(repo)
         .dispose(worktree)
         .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
     }

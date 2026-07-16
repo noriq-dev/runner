@@ -15,6 +15,8 @@ import { SteeringBridge } from './steering';
 import { type RunReport, RunSupervisor } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
+import { detectVcs } from './vcs/detect';
+import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient } from './ws-client';
@@ -79,15 +81,34 @@ export class Daemon {
       repos: repos.map((r) => `${r.name}:${r.projectKey}`),
     });
 
+    // The daemon speaks to source control only through the VCS seam (RUN-49), and routes each
+    // repo to its backend by DETECTION (RUN-60) — git by `.git` at the root, Diversion by the
+    // dv registry, never a manifest field (a committed lie would travel). Git remains the
+    // machine default; a repo the detector cannot place falls back to it, loudly.
+    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
+    const detections = await detectVcs(repos.map((r) => r.root));
+    const backendFor = new Map<string, GitBackend | DiversionBackend>();
+    for (const r of repos) {
+      const d = detections.get(r.root);
+      if (d?.kind === 'diversion' && d.repoId) {
+        // One instance PER REPO, constructed once: it carries the repo id and the pool-of-1
+        // lease queue — a per-run instance would silently disable the lease. One daemon per
+        // machine is the operating assumption on this backend (the lease is in-process).
+        backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId }));
+      } else {
+        backendFor.set(r.root, vcs);
+      }
+      this.log.info(`repo ${r.name} → ${d?.kind ?? 'git'}`, { root: r.root, why: d?.reason });
+    }
+
     // Crash-safe cleanup: a fresh start means every prior local process is gone,
     // so any leftover noriq/run/* worktree is orphaned — reap it before we begin.
-    // The daemon speaks to source control only through the VCS seam (RUN-49); git is the one
-    // backend today, and WorktreeManager is its implementation detail rather than the surface.
-    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
     let reaped = 0;
     const kept: string[] = [];
     for (const r of repos) {
-      reaped += await vcs.reapOrphans(r.root, { onSkip: (p) => kept.push(p) });
+      reaped += await (backendFor.get(r.root) ?? vcs).reapOrphans(r.root, {
+        onSkip: (p) => kept.push(p),
+      });
     }
     if (reaped) this.log.info(`reaped ${reaped} orphaned worktree(s) from a prior run`);
     // Never silently discard an agent's output: a worktree with unsaved work outlives
@@ -143,7 +164,8 @@ export class Daemon {
         const r = reposById.get(repoRef);
         if (!r) return null;
         const manifest = await manifests.current(r.root);
-        return manifest ? { root: r.root, manifest } : null;
+        // The repo's detected backend rides along (RUN-60); omitted = the git default.
+        return manifest ? { root: r.root, manifest, vcs: backendFor.get(r.root) } : null;
       },
       report: (runId, rep) => {
         // Spend, log tail, and phase stream on their own frame (RUN-22/31) — no transition
@@ -357,7 +379,7 @@ export class Daemon {
         const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
         // Push again before opening: landing pushed each run as it went, but this is the moment
         // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
-        const push = await vcs.share(repo.root, branch);
+        const push = await (backendFor.get(repo.root) ?? vcs).share(repo.root, branch);
         if (!push.ok) {
           await client
             .reportMerge(runner.id, { planId: plan.planId, failed: `push failed: ${push.detail}` })

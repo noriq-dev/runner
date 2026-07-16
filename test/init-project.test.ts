@@ -34,6 +34,7 @@ const run = (answers: string[], over: Parameters<typeof runInitProject>[0] = {})
     out: () => {},
     detect: async () => NPM,
     scanRoots: async () => [dir],
+    detectVcsFor: async () => undefined, // no dv spawns from tests
     ...over,
   });
 
@@ -212,5 +213,15 @@ describe('runInitProject', () => {
     const res = await run(['ACME', 'claude', 'npm run check', '']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.permissions.build.allow).toEqual(['Bash(npm test:*)']);
+  });
+
+  it('warns a Diversion operator BEFORE the marker is committed: there is no dry-run (RUN-60)', async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', ''], {
+      out: (l) => lines.push(l),
+      detectVcsFor: async () => ({ kind: 'diversion', repoId: 'dv.repo.x', reason: 'registry' }),
+    });
+    expect(lines.join('\n')).toMatch(/no dry-run/);
+    expect(lines.join('\n')).toMatch(/syncs to the cloud/);
   });
 });

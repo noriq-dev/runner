@@ -246,6 +246,8 @@ function harness(
     stillConflicted?: string[];
     /** true → the landing branch moved under the run. */
     landRaces?: boolean;
+    /** A per-repo backend riding ResolvedRepo (RUN-60) — must win over deps.vcs. */
+    repoVcs?: FakeWorktrees;
     /** What the server says when asked whether the run parked (RUN-30). */
     parkState?: Partial<ParkState>;
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
@@ -274,7 +276,13 @@ function harness(
     drivers: over.drivers ?? { claude, codex },
     vcs: worktrees,
     resolveRepo: (repoRef) =>
-      over.hasRepo === false ? null : { root: `/repos/${repoRef}`, manifest: over.manifest ?? manifest() },
+      over.hasRepo === false
+        ? null
+        : {
+            root: `/repos/${repoRef}`,
+            manifest: over.manifest ?? manifest(),
+            ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
+          },
     report: (runId, r) => reports.push({ runId, ...r }),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
     verifyExec: async () => {
@@ -1699,5 +1707,22 @@ describe('choosing a model + effort (RUN-33)', () => {
     await resumed;
     expect(h.claude.starts.at(-1)?.model).toBe('claude-sonnet-5');
     expect(h.claude.starts.at(-1)?.effort).toBe('medium');
+  });
+});
+
+describe('per-repo backend routing (RUN-60)', () => {
+  it('a repo-routed backend wins over the machine default, for EVERY workspace operation', async () => {
+    const repoVcs = new FakeWorktrees();
+    const h = harness({ repoVcs });
+    const done = h.supervisor.supervise(makeRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    // The whole run went to the repo's backend; the default saw nothing. Routing that split
+    // one run across two backends would silently corrupt a live backend's lease.
+    expect(repoVcs.created).toHaveLength(1);
+    expect(repoVcs.removed).toEqual(['/wt/run_1']);
+    expect(h.worktrees.created).toEqual([]);
+    expect(h.worktrees.removed).toEqual([]);
   });
 });

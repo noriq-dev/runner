@@ -6,6 +6,7 @@ import { loadRunnerConfig } from './config';
 import { manifestPath } from './discovery';
 import { tomlString } from './init';
 import { detectTools } from './tools';
+import { type VcsDetection, detectVcs } from './vcs/detect';
 
 /**
  * `noriq-runner init-project` — the guided repo marker (RUN-56).
@@ -32,6 +33,8 @@ export interface InitProjectDeps {
   detect?: (cwd: string) => Promise<Ecosystem>;
   /** Injectable so tests never read the real ~/.noriq/runner.toml. */
   scanRoots?: () => Promise<string[] | null>;
+  /** Injectable VCS detection (RUN-60) — tests don't need a real dv registry. */
+  detectVcsFor?: (root: string) => Promise<VcsDetection | undefined>;
   configPath?: string;
 }
 
@@ -296,6 +299,17 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
 
     const eco = await (deps.detect ?? detectEcosystem)(cwd);
     if (eco.name !== 'unknown') out(`  Detected a ${eco.name} project.`);
+
+    // Which backend will work this repo (RUN-60) — and the one thing an operator of a live
+    // backend must hear BEFORE committing the marker, not at the first dispatch: there is no
+    // dry-run there (RUN-48, THREAT-MODEL.md).
+    const vcsDet = await (deps.detectVcsFor ?? (async (r: string) => (await detectVcs([r])).get(r)))(cwd);
+    if (vcsDet?.kind === 'diversion') {
+      out('  This is a Diversion workspace. Know before you commit this marker:');
+      out('  every write an agent makes here syncs to the cloud within seconds — before any');
+      out('  verify gate, on every run, including failed ones. There is no dry-run mode.');
+      out('  See THREAT-MODEL.md ("The Diversion backend, specifically").');
+    }
     const verifyCmd = (await ask('  Verify command (blank for none)', eco.verifyCmd ?? undefined)) || null;
 
     // No default, on purpose. `[land].branch` is never inferred and blank must stay the easy

@@ -161,6 +161,7 @@ export type {
   Workspace,
 } from './vcs/types';
 export { GitBackend, type GitOps } from './vcs/git';
+export { detectVcs, parseDvRepoList, type DetectDeps, type VcsDetection } from './vcs/detect';
 export {
   DiversionBackend,
   DV_API_BASE,
