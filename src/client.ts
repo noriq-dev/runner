@@ -1,4 +1,5 @@
 import type { RunnerRegistration } from './registration';
+import { VERSION } from './version';
 
 /** The slice of a task the daemon inlines into an agent's prompt. */
 export interface TaskBrief {
@@ -214,24 +215,83 @@ export class NoriqClient {
     });
   }
 
-  /** Call an MCP tool as the daemon's actor, returning the tool's text payload parsed
-   *  as JSON (Noriq tools answer with a single JSON text block). */
-  private async mcpCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+  /** The daemon's live MCP session id (RUN-73). Null until the first call initializes. */
+  private mcpSessionId: string | null = null;
+
+  private async mcpHeaders(): Promise<Record<string, string>> {
+    return {
+      Authorization: `Bearer ${await this.getToken()}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    };
+  }
+
+  /**
+   * Open an MCP session (RUN-73). The server rejects sessionless tool calls outright —
+   * "sessionless calls are not attributable" — and it is right to: without this handshake the
+   * daemon's get_task/add_comment were refused, so anchor prompts degraded to bare ids and
+   * every gate comment (verify failure, reviewer rejection, land failure) silently never
+   * posted. The session id rides the `mcp-session-id` response header.
+   */
+  private async mcpInitialize(): Promise<string> {
+    const headers = await this.mcpHeaders();
     const res = await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${await this.getToken()}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-      },
+      headers,
       body: JSON.stringify({
         jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name, arguments: args },
+        id: 0,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'noriq-runner', version: VERSION },
+        },
       }),
     });
+    const sid = res.headers.get('mcp-session-id');
     const raw = await res.text();
+    if (!res.ok || !sid) {
+      throw new Error(
+        `mcp initialize → ${res.status}${sid ? '' : ' (no mcp-session-id header)'}: ${raw.slice(0, 200)}`,
+      );
+    }
+    // The spec's follow-up; some transports won't serve requests until it arrives.
+    await this.fetchImpl(`${this.base}/mcp`, {
+      method: 'POST',
+      headers: { ...headers, 'mcp-session-id': sid },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+    }).catch(() => {
+      /* best-effort — the tool call below is the real probe */
+    });
+    this.mcpSessionId = sid;
+    return sid;
+  }
+
+  /** Call an MCP tool as the daemon's actor, returning the tool's text payload parsed
+   *  as JSON (Noriq tools answer with a single JSON text block). Initializes a session
+   *  lazily and re-initializes ONCE on a session the server no longer knows — worker
+   *  isolates recycle sessions at will, so the retry is load-bearing, not polish. */
+  private async mcpCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const attempt = async (sid: string): Promise<{ res: Response; raw: string }> => {
+      const res = await this.fetchImpl(`${this.base}/mcp`, {
+        method: 'POST',
+        headers: { ...(await this.mcpHeaders()), 'mcp-session-id': sid },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      });
+      return { res, raw: await res.text() };
+    };
+    let { res, raw } = await attempt(this.mcpSessionId ?? (await this.mcpInitialize()));
+    if (res.status === 400 || res.status === 404) {
+      // The session died with its isolate (or expired). One fresh handshake, one retry.
+      this.mcpSessionId = null;
+      ({ res, raw } = await attempt(await this.mcpInitialize()));
+    }
     if (!res.ok) throw new Error(`${name} → ${res.status}: ${raw.slice(0, 300)}`);
     return parseMcpText(raw);
   }

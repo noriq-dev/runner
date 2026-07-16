@@ -79,3 +79,106 @@ describe('NoriqClient', () => {
     await expect(client.heartbeat('rnr_x', { freeSlots: 0 })).rejects.toThrow(/404.*runner not found/);
   });
 });
+
+describe('MCP session lifecycle (RUN-73)', () => {
+  // The live failure: the server refuses sessionless tool calls ("not attributable"), so
+  // the daemon's get_task 400'd — anchor prompts degraded to bare ids — and every gate
+  // comment silently never posted. These drive a stateful fake server: sessions are minted
+  // by initialize, required for tools/call, and can be forgotten at any time (isolates
+  // recycle), which is why the retry-once matters.
+  type Frame = { method?: string; sid: string | null; toolName?: string };
+
+  function fakeMcpServer(opts: { forgetAfterMint?: number } = {}) {
+    const frames: Frame[] = [];
+    const sessions = new Set<string>();
+    let minted = 0;
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        method?: string;
+        params?: { name?: string };
+      };
+      const sid = new Headers(init?.headers).get('mcp-session-id');
+      frames.push({ method: body.method, sid, toolName: body.params?.name });
+      if (body.method === 'initialize') {
+        minted += 1;
+        const id = `sess_${minted}`;
+        sessions.add(id);
+        // Simulate an isolate recycling right after the handshake: the first N minted
+        // sessions are forgotten before the first tool call arrives.
+        if (opts.forgetAfterMint && minted <= opts.forgetAfterMint) sessions.delete(id);
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
+          status: 200,
+          headers: { 'mcp-session-id': id },
+        });
+      }
+      if (body.method === 'notifications/initialized') return new Response(null, { status: 202 });
+      if (!sid || !sessions.has(sid)) {
+        return new Response(JSON.stringify({ error: 'no MCP session — call initialize first' }), {
+          status: 400,
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            content: [
+              { type: 'text', text: JSON.stringify({ task: { key: 'K-1', title: 'T', body: null } }) },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    return { fetchImpl, frames, mintedCount: () => minted };
+  }
+
+  it('initializes once, sends the session header on every tool call, and reuses the session', async () => {
+    const srv = fakeMcpServer();
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
+    expect(await client.getTask('task_1')).toEqual({ key: 'K-1', title: 'T', body: null });
+    await client.getTask('task_2');
+    expect(srv.mintedCount()).toBe(1); // ONE handshake, N calls
+    const calls = srv.frames.filter((f) => f.method === 'tools/call');
+    expect(calls).toHaveLength(2);
+    for (const c of calls) expect(c.sid).toBe('sess_1');
+    // The spec's follow-up rode the new session too.
+    expect(srv.frames.some((f) => f.method === 'notifications/initialized' && f.sid === 'sess_1')).toBe(true);
+  });
+
+  it('identifies itself in the handshake — attributability is the point', async () => {
+    const srv = fakeMcpServer();
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
+    await client.getTask('task_1');
+    // Re-parse the captured initialize frame from the raw body we recorded via frames? The
+    // fake keeps only method/sid, so capture again with a probe: one more client, one frame.
+    let init: { params?: { clientInfo?: { name?: string; version?: string } } } | null = null;
+    const probe = (async (_u: string | URL, i?: RequestInit) => {
+      const b = JSON.parse(String(i?.body));
+      if (b.method === 'initialize') init = b;
+      return srv.fetchImpl(_u, i);
+    }) as typeof fetch;
+    const client2 = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: probe });
+    await client2.getTask('task_1');
+    expect(init!.params?.clientInfo?.name).toBe('noriq-runner');
+    expect(init!.params?.clientInfo?.version).toBeTruthy();
+  });
+
+  it('a session the server forgot → ONE fresh handshake and a retry, not an error', async () => {
+    // Worker isolates recycle sessions at will; the daemon may hold a session id the server
+    // no longer knows. That must cost one retry, not an anchor prompt or a lost comment.
+    const srv = fakeMcpServer({ forgetAfterMint: 1 });
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
+    expect(await client.getTask('task_1')).toEqual({ key: 'K-1', title: 'T', body: null });
+    expect(srv.mintedCount()).toBe(2); // the forgotten one + the retry's
+  });
+
+  it('postComment rides the same session machinery (the gate-comment surface)', async () => {
+    const srv = fakeMcpServer();
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
+    await client.postComment('prj_1', 'task_1', 'verify failed: …');
+    const call = srv.frames.find((f) => f.method === 'tools/call');
+    expect(call?.toolName).toBe('add_comment');
+    expect(call?.sid).toBe('sess_1');
+  });
+});
