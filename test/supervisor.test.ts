@@ -1612,6 +1612,46 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer
   });
 
+  // A "continue a failed run" dispatch (PLNR-180/RUN-91) carries budget.maxRounds — a fresh
+  // reviewer-round budget for the kept worktree — clamped by the repo's committed ceiling.
+  const continueRun = (maxRounds: number) =>
+    makeRun({
+      kind: 'build',
+      anchor: { type: 'task', taskId: 'task_9' },
+      budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds },
+    });
+
+  it('budget.maxRounds narrows the reviewer rounds: 0 is a pure gate over a manifest that allows 2 (RUN-91)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 2 }) });
+    const done = h.supervisor.supervise(continueRun(0));
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toEqual([]); // dispatch said 0 → never handed back, despite manifest 2
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(1);
+  });
+
+  it('budget.maxRounds cannot WIDEN past the manifest ceiling — the repo owner clamps it (RUN-91)', async () => {
+    // The manifest allows one fix round; a continue asking for five gets one, not five.
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(continueRun(5));
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review'); // gated after the manifest's single fix round, not five
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(2); // initial + 1
+  });
+
   it('a reviewer with no verdict still GATES the run — but as no-judgment, never as a refusal (RUN-72)', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());

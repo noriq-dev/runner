@@ -101,12 +101,54 @@ export class WorktreeManager {
     return path.join(this.baseDir, `${path.basename(repoRoot)}-${runId}`);
   }
 
+  /** Does the run's throwaway branch already exist locally? True only for a kept, gate-failed
+   *  prior attempt at this exact run id (RUN-91) — a fresh run's id has never been minted. */
+  private async branchExists(repoRoot: string, branch: string): Promise<boolean> {
+    try {
+      await this.git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repoRoot);
+      return true;
+    } catch {
+      return false; // rev-parse --quiet exits non-zero (no output) when the ref is absent
+    }
+  }
+
+  /** Is `dir` still a registered worktree of this repo? (A reap can spare a branch but prune its
+   *  worktree; then a continue must re-attach one rather than assume the checkout is there.) */
+  private async worktreeRegistered(repoRoot: string, dir: string): Promise<boolean> {
+    const { stdout } = await this.git(['worktree', 'list', '--porcelain'], repoRoot);
+    return stdout.split('\n').some((line) => line === `worktree ${dir}`);
+  }
+
   /** Create the Run's isolated worktree + throwaway branch. */
   async create(repoRoot: string, runId: string, opts: CreateWorktreeOptions = {}): Promise<WorktreeInfo> {
     await mkdir(this.baseDir, { recursive: true });
     const branch = runBranch(runId);
     const dir = this.worktreePath(repoRoot, runId);
     const baseRef = opts.baseRef ?? 'HEAD';
+
+    // Continue a failed run (RUN-91). A gate-failed build is KEPT, not disposed, so its branch and
+    // worktree survive on disk; the server re-dispatches the SAME run id (PLNR-180) and "resume"
+    // is inferred from exactly this — the branch already existing. Adopt it: `worktree add -b`
+    // would fail on the branch, and re-forking would discard the work the prior attempt committed.
+    // The fork point is recovered as the branch's merge-base with the target, so the diff still
+    // spans the WHOLE accumulated change rather than only what this sitting adds.
+    if (await this.branchExists(repoRoot, branch)) {
+      if (!(await this.worktreeRegistered(repoRoot, dir))) {
+        await this.git(['worktree', 'add', dir, branch], repoRoot); // branch kept, worktree pruned
+      }
+      const { stdout: forkSha } = await this.git(['merge-base', branch, baseRef], repoRoot);
+      // No setReadOnly on adopt: a continue is a build (writable), and re-chmod'ing a tree full of
+      // the prior attempt's work is both pointless and a fight with the agent about to edit it.
+      return {
+        runId,
+        repoRoot,
+        path: dir,
+        branch,
+        readOnly: opts.readOnly ?? false,
+        baseSha: forkSha.trim(),
+      };
+    }
+
     // Pin the fork point BEFORE the agent can move HEAD — this is what "did it change
     // anything?" is measured against later.
     const { stdout: baseSha } = await this.git(['rev-parse', baseRef], repoRoot);

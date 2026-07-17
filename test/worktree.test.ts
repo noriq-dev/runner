@@ -467,3 +467,45 @@ describe('rebaseInProgress survives a Windows git path (RUN-42)', () => {
     expect(await wm.rebaseInProgress({ path: '/wt/run_1' })).toBe(true);
   });
 });
+
+describe('continue a failed run adopts the kept worktree (RUN-91)', () => {
+  it('re-creating a run id whose branch exists reuses the worktree and its committed work', async () => {
+    // First attempt: an agent commits work, then the run "fails" — the daemon keeps the worktree.
+    const first = await wm.create(repo, 'continueRun');
+    await writeFile(path.join(first.path, 'attempt.ts'), 'export const tries = 1;\n');
+    await wm.commitWork(first, 'noriq run continueRun: first attempt');
+    const { stdout: firstHead } = await git(['rev-parse', 'HEAD'], first.path);
+
+    // The continue dispatch (PLNR-180) re-sends the SAME run id. create() must ADOPT, never throw
+    // on the existing branch, and never re-fork away the committed work.
+    const again = await wm.create(repo, 'continueRun');
+    expect(again.branch).toBe(first.branch);
+    expect(samePath(again.path, first.path)).toBe(true);
+    expect(existsSync(path.join(again.path, 'attempt.ts'))).toBe(true);
+    const { stdout: againHead } = await git(['rev-parse', 'HEAD'], again.path);
+    expect(againHead.trim()).toBe(firstHead.trim()); // same tip — resumed, not restarted
+
+    // baseSha is the fork point (merge-base with the target), so the accumulated diff still counts.
+    const { stdout: fork } = await git(['merge-base', again.branch, 'main'], repo);
+    expect(again.baseSha).toBe(fork.trim());
+    expect(await wm.hasChanges(again)).toBe(true);
+
+    await wm.remove(again);
+  });
+
+  it('re-attaches a worktree when the branch was kept but its checkout was pruned', async () => {
+    const first = await wm.create(repo, 'continuePruned');
+    await writeFile(path.join(first.path, 'work.ts'), 'export const y = 2;\n');
+    await wm.commitWork(first, 'noriq run continuePruned: work');
+    // A reap that spared committed work can leave the branch while pruning the checkout dir.
+    await git(['worktree', 'remove', '--force', first.path], repo);
+    expect(existsSync(first.path)).toBe(false);
+    expect((await git(['branch', '--list', first.branch], repo)).stdout.trim()).not.toBe('');
+
+    const again = await wm.create(repo, 'continuePruned');
+    expect(samePath(again.path, first.path)).toBe(true);
+    expect(existsSync(path.join(again.path, 'work.ts'))).toBe(true); // re-attached to the branch tip
+
+    await wm.remove(again);
+  });
+});

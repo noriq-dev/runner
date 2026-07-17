@@ -814,7 +814,14 @@ export class RunSupervisor {
     budget?: RunBudget;
   }): Promise<VerifyVerdict & { rounds: number }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
-    const maxRounds = reviewer?.maxRounds ?? 0;
+    // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
+    const manifestRounds = reviewer?.maxRounds ?? 0;
+    // A "continue a failed run" dispatch (PLNR-180) carries budget.maxRounds — a fresh reviewer-
+    // round budget for the kept worktree. The manifest clamps it: the server never reads the repo
+    // owner's [verify.agent].maxRounds, so it can't be widened past what the owner committed
+    // (RUN-91). Null (a normal dispatch) → the manifest's own value, unchanged.
+    const maxRounds =
+      ctx.budget?.maxRounds != null ? Math.min(ctx.budget.maxRounds, manifestRounds) : manifestRounds;
     // The same intent a dispatched verify run would get: the anchor task's text, else the brief.
     const intent = ctx.task
       ? `${ctx.task.key} — ${ctx.task.title}${ctx.task.body ? `\n\n${ctx.task.body}` : ''}`
