@@ -81,6 +81,13 @@ export interface Ecosystem {
 const UNKNOWN: Ecosystem = { name: 'unknown', verifyCmd: null, allow: [] };
 
 /**
+ * The largest timeout the daemon can actually honor. `runVerify` hands `timeoutSeconds * 1000`
+ * to a Node timer, and Node clamps delays above 2³¹−1 ms to ~1 ms — so a bigger value here would
+ * validate, then time the gate out the instant it starts. Refuse what cannot be delivered.
+ */
+const MAX_VERIFY_TIMEOUT_SECONDS = Math.floor((2 ** 31 - 1) / 1000);
+
+/**
  * Guess the ecosystem from what is on disk.
  *
  * The `allow` list is the part that matters, and it is the reason this returns rules rather than
@@ -520,11 +527,11 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
         const answer = raw.trim();
         if (!answer) break;
         const n = Number(answer);
-        if (Number.isInteger(n) && n > 0) {
+        if (Number.isInteger(n) && n > 0 && n <= MAX_VERIFY_TIMEOUT_SECONDS) {
           verifyTimeoutSeconds = n;
           break;
         }
-        out('  ✗ a positive whole number of seconds, or blank for the default.');
+        out(`  ✗ a whole number of seconds, 1–${MAX_VERIFY_TIMEOUT_SECONDS}, or blank for the default.`);
       }
     }
 

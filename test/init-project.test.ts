@@ -389,6 +389,7 @@ describe('runInitProject', () => {
       '', // no shell pin
       'nope', // timeout: not a number → re-ask
       '-5', // timeout: not positive → re-ask
+      '2147484', // timeout: * 1000 overflows Node's 2³¹−1 ms timer (fires at ~1 ms) → re-ask
       '120',
       'y', // reviewer
       '', // model: driver default
