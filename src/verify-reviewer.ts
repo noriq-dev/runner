@@ -26,7 +26,15 @@ export interface ReviewerPromptContext {
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
  *  no MCP. The verifyCmd sentence exists so the reviewer spends its turns on what the
- *  deterministic floor CANNOT check instead of re-running a suite that already passed. */
+ *  deterministic floor CANNOT check instead of re-running a suite that already passed.
+ *
+ *  The template scopes the review to the CHANGE, not the file, and treats the intent as a
+ *  floor the diff must meet rather than a ceiling it may not exceed (RUN-76). Each fresh
+ *  reviewer is stateless, so without that discipline it re-reads whole changed files against
+ *  a possibly-superseded brief and re-reports pre-existing code — the loop this gate saw fail
+ *  three ways: pre-existing code flagged as the author's, later-approved evolution read as a
+ *  violation, and every round re-raising the same out-of-scope finding. Cross-round memory
+ *  (the builder's rebuttal to a settled finding) is a separate, heavier fix and NOT here. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,

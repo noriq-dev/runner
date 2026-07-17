@@ -31,7 +31,12 @@ export interface VerifyPromptContext {
  *  request_input) is repeated in the template — it does not inherit assemblePrompt's identity
  *  block. A verifier that finds something alarming but out of scope for its verdict has
  *  nowhere else to put it: its output is parsed for PASS/FAIL, so prose around the verdict is
- *  read by nobody. */
+ *  read by nobody.
+ *
+ *  Like the inline reviewer (RUN-76), the template scopes the verdict to what the diff CHANGED
+ *  and treats the specs as a floor, not a ceiling — the strict "when ambiguous, FAIL" posture
+ *  stays, but only for code the diff touched, so pre-existing code and behavior beyond the
+ *  specs cannot manufacture a false FAIL. */
 export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): string {
   return renderPrompt('verify-agent', {
     label: ctx.agent.label,

@@ -34,6 +34,20 @@ describe('assembleVerifyPrompt', () => {
     expect(p).not.toMatch(/git diff/);
     expect(p).toMatch(/modified files in this workspace/i);
   });
+
+  it('scopes the verdict to the change and keeps ambiguous-FAIL for in-scope code only (RUN-76)', () => {
+    const p = assembleVerifyPrompt('the endpoint must reject bad tokens', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+      diffCmd: 'git diff main...HEAD',
+    });
+    expect(p).toMatch(/Only what THIS change introduces is under review/);
+    expect(p).toMatch(/not this diff's to answer for/);
+    expect(p).toMatch(/not a ceiling/);
+    // The strict posture survives, but bounded to what the diff changed.
+    expect(p).toMatch(/when the evidence about such code is ambiguous, FAIL/);
+    expect(p).toMatch(/not for pre-existing code/);
+  });
 });
 
 describe('parseVerdict', () => {

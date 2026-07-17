@@ -72,6 +72,24 @@ describe('assembleReviewerPrompt', () => {
     expect(p).not.toContain('git diff');
   });
 
+  it('scopes the review to the CHANGE, not the whole file (RUN-76)', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    // Pre-existing code is context, not a target — this is what stops a fresh reviewer
+    // flagging code the change never touched (the VCS-detection / clobber re-raises).
+    expect(p).toMatch(/Only what THIS change introduces is under review/);
+    expect(p).toMatch(/not this author's to answer for/);
+    expect(p).toMatch(/CONTEXT/);
+  });
+
+  it('treats the intent as a floor, not a ceiling — extra behavior is not a defect (RUN-76)', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).toMatch(/not a ceiling/);
+    expect(p).toMatch(/Behavior BEYOND the intent is not a defect/);
+    expect(p).toMatch(/superseded/);
+    // And the anti-manufacturing line so an empty report can honestly PASS.
+    expect(p).toMatch(/manufacture a finding/i);
+  });
+
   it('its verdict line round-trips through the shared parser', () => {
     // The reviewer and the dispatched verify kind share one protocol — a drift here would
     // make every reviewer verdict read as 'unknown', i.e. a permanent FAIL.
