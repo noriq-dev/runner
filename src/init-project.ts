@@ -1,12 +1,14 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { AgentTool, RunEffort, RunKind } from '@noriq-dev/shared';
 import { loadRunnerConfig } from './config';
-import { manifestPath } from './discovery';
+import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
 import { detectTools } from './tools';
 import { type VcsDetection, detectVcs } from './vcs/detect';
+import { DEFAULT_VERIFY_TIMEOUT_SECONDS } from './verify';
 
 /**
  * `noriq-runner init-project` — the guided repo marker (RUN-56).
@@ -34,6 +36,13 @@ export interface InitProjectDeps {
   /** Injectable so tests never read the real ~/.noriq/runner.toml. */
   scanRoots?: () => Promise<string[] | null>;
   /**
+   * Injectable discovery, defaulting to the daemon's REAL walk. The post-write verdict has to be
+   * the daemon's own answer to "will this repo be seen", not a lexical guess: the walk stops a few
+   * levels deep and skips ignored dirs (node_modules, vendor, target), so a repo lexically "under"
+   * a scanRoot can still be invisible. Tests inject to avoid a fixture tree.
+   */
+  discover?: (roots: string[]) => Promise<Array<{ root: string }>>;
+  /**
    * Injectable so tests never depend on which CLIs the HOST has (defaults to the real
    * detectTools). Without this, the "Agent driver" question silently disappears on any box
    * without `claude`/`codex` on PATH — CI — and every positional test answer shifts one slot:
@@ -42,6 +51,12 @@ export interface InitProjectDeps {
   installedTools?: () => string[];
   /** Injectable VCS detection (RUN-60) — tests don't need a real dv registry. */
   detectVcsFor?: (root: string) => Promise<VcsDetection | undefined>;
+  /**
+   * `--advanced` (RUN-62): pre-answers the trailing "Curate advanced options?" question with
+   * yes. The flag and the question are the same fork — the question exists so the tier is
+   * discoverable without reading --help, the flag so the discovery is skippable next time.
+   */
+  advanced?: boolean;
   configPath?: string;
 }
 
@@ -66,6 +81,13 @@ export interface Ecosystem {
 const UNKNOWN: Ecosystem = { name: 'unknown', verifyCmd: null, allow: [] };
 
 /**
+ * The largest timeout the daemon can actually honor. `runVerify` hands `timeoutSeconds * 1000`
+ * to a Node timer, and Node clamps delays above 2³¹−1 ms to ~1 ms — so a bigger value here would
+ * validate, then time the gate out the instant it starts. Refuse what cannot be delivered.
+ */
+const MAX_VERIFY_TIMEOUT_SECONDS = Math.floor((2 ** 31 - 1) / 1000);
+
+/**
  * Guess the ecosystem from what is on disk.
  *
  * The `allow` list is the part that matters, and it is the reason this returns rules rather than
@@ -81,7 +103,20 @@ export async function detectEcosystem(cwd: string): Promise<Ecosystem> {
   const has = (f: string) => existsSync(path.join(cwd, f));
 
   if (has('package.json')) {
-    const npm: string[] = ['Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npx tsc:*)'];
+    // A fresh worktree has no node_modules, so without a pinned install rule the derived gate can
+    // never go green — `npm test` exits 127 (`tsc: command not found`). Grant the LOCKFILE-PINNED
+    // install (`npm ci`: installs exactly the lockfile, never rewrites it) only when a lockfile
+    // actually pins it: `npm ci` errors without one, and an install rule that always fails is worse
+    // than none. Never `npm install` — it can add packages and rewrite the lockfile.
+    // Either lockfile pins `npm ci`: package-lock.json is the common one, npm-shrinkwrap.json is
+    // the published-package form — npm ci honours both, so a shrinkwrap-only repo must get the rule.
+    const pinned = has('package-lock.json') || has('npm-shrinkwrap.json');
+    const npm: string[] = [
+      ...(pinned ? ['Bash(npm ci:*)'] : []),
+      'Bash(npm test:*)',
+      'Bash(npm run:*)',
+      'Bash(npx tsc:*)',
+    ];
     try {
       const pkg = JSON.parse(await readFile(path.join(cwd, 'package.json'), 'utf8')) as {
         scripts?: Record<string, string>;
@@ -151,15 +186,61 @@ export function scanRootWarning(repo: string, roots: string[] | null): string | 
   return covered ? null : 'this repo is not under any scanRoot — the runner will not find it';
 }
 
-export function renderProjectManifest(m: {
+/** One kind's [defaults] choice (RUN-33). Null = inherit — the manifest simply omits the key. */
+export interface KindDefaultChoice {
+  model: string | null;
+  effort: RunEffort | null;
+}
+
+/** Per-kind [defaults], curated in the advanced tier. */
+export type DefaultsChoice = Record<RunKind, KindDefaultChoice>;
+
+/**
+ * The [land] envelope beyond `branch` (RUN-64), curated only when quick mode named a branch.
+ * Null = never curated: every knob keeps its schema default and the rendered [land] block is
+ * byte-for-byte what quick mode writes. A curated envelope writes only what differs from those
+ * defaults — widening the envelope is typed, never defaulted, and the committed file shows
+ * exactly what was chosen.
+ */
+export interface LandChoices {
+  /** Default true. False = an unverified diff may reach the branch — permitted, never assumed. */
+  onlyWhenVerifyPasses: boolean;
+  /** Default true: the build agent may resolve MECHANICAL rebase conflicts in its own worktree. */
+  resolveConflicts: boolean;
+  /** Branch globs a DISPATCH may override `branch` with (RUN-41). EMPTY MEANS NO OVERRIDE. */
+  allowedBranches: string[];
+  /** Default false — flipping it crosses the one boundary the daemon otherwise has (RUN-27). */
+  autoPush: boolean;
+  /** Only offered once autoPush is on — the pair is validated before writing (RUN-28). */
+  mergeTarget: string | null;
+}
+
+/**
+ * Everything the wizard chose, accumulated across the quick flow and any advanced sections,
+ * rendered exactly ONCE at the end. RUN-40's rule 1 (validate before writing) applies to the
+ * whole session, not per question — no section writes; sections only fill this in.
+ */
+export interface ManifestChoices {
   key: string;
   tool: string | null;
   verifyCmd: string | null;
-  /** The inline reviewer (RUN-61), when chosen. `model` null = the driver's own default. */
-  reviewer?: { model: string | null } | null;
+  /** Advanced [verify] knobs (RUN-63) — meaningful only alongside `verifyCmd`. Null/absent =
+   *  unchosen: the rendered file keeps the commented hint instead of a value. */
+  verifyShell?: string | null;
+  verifyTimeoutSeconds?: number | null;
+  /** The inline reviewer (RUN-61), when chosen. `model`/`effort` null = the driver's own
+   *  default; `maxRounds` null = the schema default (2) — 0 is a real choice (a pure gate),
+   *  which is why the renderer tests `!= null` and never truthiness. */
+  reviewer?: { model: string | null; effort?: string | null; maxRounds?: number | null } | null;
   landBranch: string | null;
   allow: string[];
-}): string {
+  /** Per-kind [defaults] (RUN-62). Null/absent = never curated → the commented guidance block. */
+  defaults?: DefaultsChoice | null;
+  /** The [land] envelope (RUN-64). Null/absent = never curated → quick mode's exact block. */
+  land?: LandChoices | null;
+}
+
+export function renderProjectManifest(m: ManifestChoices): string {
   const lines: string[] = [
     '# Noriq project marker — COMMITTED, so it travels with the repo and your team shares it.',
     '# Written by `noriq-runner init-project`. Carries no secrets.',
@@ -175,6 +256,37 @@ export function renderProjectManifest(m: {
     lines.push('', '# Default agent driver for this repo.', `tool = ${tomlString(m.tool)}`);
   }
 
+  // Per-kind [defaults] (RUN-33). Chosen values become real sections; nothing chosen keeps the
+  // guidance as comments, so the manifest stays its own documentation either way.
+  const defs = m.defaults ?? null;
+  const chosenKinds = defs ? RunKind.options.filter((k) => defs[k].model || defs[k].effort) : [];
+  if (defs && chosenKinds.length) {
+    lines.push(
+      '',
+      '# Per-kind model + reasoning effort (RUN-33). Precedence: the dispatch → these → the',
+      "# tool's own default. `model` passes through unvalidated (a wrong name fails fast);",
+      '# `effort` is tool-agnostic intent — codex clamps above its own high, never errors.',
+    );
+    chosenKinds.forEach((kind, i) => {
+      const d = defs[kind];
+      if (i > 0) lines.push('');
+      lines.push(`[defaults.${kind}]`);
+      if (d.model) lines.push(`model = ${tomlString(d.model)}`);
+      if (d.effort) lines.push(`effort = ${tomlString(d.effort)}`);
+    });
+  } else {
+    lines.push(
+      '',
+      '# Per-kind model + reasoning effort (RUN-33): say "scope with something strong, build',
+      '# with something cheap" once, in the commit, instead of per dispatch. `model` is the',
+      "# vendor's own name, deliberately unvalidated (a wrong one fails fast); `effort` is",
+      `# ${RunEffort.options.join(' | ')} (codex clamps above its own high). Omitted = inherit:`,
+      '# [defaults.scope]',
+      '# model = "claude-opus-4-8"',
+      '# effort = "high"',
+    );
+  }
+
   if (m.verifyCmd) {
     lines.push(
       '',
@@ -182,7 +294,12 @@ export function renderProjectManifest(m: {
       "# clean, in the run's worktree. Non-zero exit GATES the run — it cannot reach `done`.",
       '[verify]',
       `cmd = ${tomlString(m.verifyCmd)}`,
-      '# shell = "bash"   # pin one if this command is not portable to cmd.exe (mixed-OS teams)',
+      m.verifyShell
+        ? `shell = ${tomlString(m.verifyShell)}`
+        : '# shell = "bash"   # pin one if this command is not portable to cmd.exe (mixed-OS teams)',
+      m.verifyTimeoutSeconds != null
+        ? `timeoutSeconds = ${m.verifyTimeoutSeconds}`
+        : `# timeoutSeconds = ${DEFAULT_VERIFY_TIMEOUT_SECONDS}   # blank = this built-in default; a timeout GATES the run`,
     );
   } else if (!m.reviewer) {
     lines.push(
@@ -203,20 +320,64 @@ export function renderProjectManifest(m: {
       m.reviewer.model
         ? `model = ${tomlString(m.reviewer.model)}`
         : '# model = "claude-opus-4-8"   # blank = the driver\'s default (or [defaults.verify])',
-      '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',
+      m.reviewer.effort
+        ? `effort = ${tomlString(m.reviewer.effort)}`
+        : '# effort = "high"   # low | medium | high | xhigh | max — blank falls through like model',
+      m.reviewer.maxRounds != null
+        ? `maxRounds = ${m.reviewer.maxRounds}`
+        : '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',
     );
   }
 
   if (m.landBranch) {
+    const land = m.land ?? null;
     lines.push(
       '',
       '# Auto-landing: a build that passes the gate is rebased onto this branch, RE-VERIFIED',
       '# there, then fast-forwarded in. Work accumulates here for you to merge onward.',
       '[land]',
       `branch = ${tomlString(m.landBranch)}`,
-      '# autoPush = false      # push this branch to its remote. Off = nothing an agent writes',
-      '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
-      '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
+    );
+    // Every knob below is written ONLY when it was typed to a non-default value: an untouched
+    // envelope renders byte-for-byte what quick mode writes, and the committed file shows what
+    // was CHOSEN — never a default restated as if someone had chosen it (RUN-64).
+    if (land && !land.onlyWhenVerifyPasses) {
+      lines.push(
+        '# CHOSEN: landing does not wait on the verify gate — an unverified diff reaches this',
+        '# branch. Permitted, never assumed.',
+        'onlyWhenVerifyPasses = false',
+      );
+    }
+    if (land && !land.resolveConflicts) {
+      lines.push(
+        '# CHOSEN: rebase conflicts always fail out to a human — the build agent never resolves.',
+        'resolveConflicts = false',
+      );
+    }
+    if (land?.allowedBranches.length) {
+      lines.push(
+        '# Branch globs a DISPATCH may override `branch` with (RUN-41). Absent = no override.',
+        `allowedBranches = [${land.allowedBranches.map(tomlString).join(', ')}]`,
+      );
+    }
+    lines.push(
+      ...(land?.autoPush
+        ? [
+            '# CHOSEN: this branch leaves the machine after every landing — `git log',
+            '# origin/main..main` no longer shows what the agents did. See THREAT-MODEL.md.',
+            'autoPush = true',
+          ]
+        : [
+            '# autoPush = false      # push this branch to its remote. Off = nothing an agent writes',
+            '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
+          ]),
+      // The wizard only offers mergeTarget once autoPush is on; the renderer holds the same
+      // line for direct callers — a merge request cannot exist without the branch reaching the
+      // remote, so an invalid pair is dropped HERE rather than half-honoured at the next
+      // dispatch (RUN-28).
+      land?.autoPush && land.mergeTarget
+        ? `mergeTarget = ${tomlString(land.mergeTarget)}`
+        : '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
     );
   } else {
     lines.push(
@@ -253,6 +414,143 @@ export function renderProjectManifest(m: {
 
   return lines.join('\n');
 }
+
+/** The prompting surface a section sees — the same injected `ask`/`out` as the quick flow. */
+interface AdvancedIo {
+  ask: (question: string, fallback?: string) => Promise<string>;
+  out: (line: string) => void;
+}
+
+/**
+ * One advanced tier section: a titled group of questions that fills in `choices` and writes
+ * NOTHING — the single write at the end of the session covers the quick and advanced answers
+ * alike, so rule 1 holds for the whole session. This shape is the point of RUN-62 as much as
+ * the first section is: the follow-ups (B–D) each append an entry to ADVANCED_SECTIONS; the
+ * fork, the loop, and the ask-everything-then-write-once ordering are already here.
+ */
+interface AdvancedSection {
+  title: string;
+  /** Absent = always applies. A section with nothing to configure is skipped whole, title and
+   *  all — [land] without a branch: nothing auto-lands, so there is nothing to walk (RUN-64). */
+  applies?: (choices: ManifestChoices) => boolean;
+  run: (io: AdvancedIo, choices: ManifestChoices) => Promise<void>;
+}
+
+/** Section A: per-kind [defaults] model + effort (RUN-33). */
+const defaultsSection: AdvancedSection = {
+  title: 'Per-kind model & effort — [defaults]',
+  async run({ ask, out }, choices) {
+    out('  Pin a model and/or reasoning effort per run kind, in the commit: the dispatch');
+    out("  overrides these, these override the tool's own default. Model names pass through");
+    out('  unvalidated — they change constantly, and a stale allowlist here would reject one');
+    out('  your CLI supports fine; a wrong name fails fast. Effort is one of');
+    out(`  ${RunEffort.options.join(' | ')} — codex clamps anything above its own high rather`);
+    out('  than erroring. Blank = inherit, on every question.');
+    const blank = (): KindDefaultChoice => ({ model: null, effort: null });
+    const defaults: DefaultsChoice = { scope: blank(), build: blank(), verify: blank() };
+    for (const kind of RunKind.options) {
+      const model = (await ask(`  ${kind}: model (blank = inherit)`)).trim() || null;
+      // Effort is the one advanced field with a shape, so it re-asks here (rule 1) rather
+      // than writing a manifest the schema will refuse at the next dispatch.
+      let effort: RunEffort | null = null;
+      for (;;) {
+        const answer = (await ask(`  ${kind}: effort (blank = inherit)`)).trim().toLowerCase();
+        if (!answer) break;
+        const parsed = RunEffort.safeParse(answer);
+        if (parsed.success) {
+          effort = parsed.data;
+          break;
+        }
+        out(`  ✗ one of ${RunEffort.options.join(' | ')}, or blank to inherit.`);
+      }
+      defaults[kind] = { model, effort };
+    }
+    choices.defaults = defaults;
+  },
+};
+
+/**
+ * Section B: the rest of the [land] envelope (RUN-64) — only reachable when quick mode named a
+ * branch, because with no branch nothing auto-lands and there is nothing to configure. Every
+ * question defaults to what quick mode writes, so Enter all the way through changes nothing in
+ * the file; each widening must be TYPED, and each prints what it means when it happens.
+ */
+const landSection: AdvancedSection = {
+  title: 'Landing envelope — [land]',
+  applies: (choices) => choices.landBranch !== null,
+  async run({ ask, out }, choices) {
+    const branch = choices.landBranch;
+    if (!branch) return; // applies() gates this; belt-and-braces for direct callers
+    const declined = (answer: string) => answer === 'n' || answer === 'no';
+
+    out('  Every knob here defaults to exactly what quick mode writes — Enter all the way');
+    out('  through changes nothing. Widening the envelope is typed, never defaulted.');
+    out('');
+
+    // Default true, and only a typed "n" turns the gate off — the same posture as the schema:
+    // permitted, never assumed. The consequence is printed at the moment of choosing, not
+    // buried in a doc the chooser has not read.
+    const gate = (
+      await ask('  Land only when verify passes on the rebased result? (Y/n)', 'Y')
+    ).toLowerCase();
+    const onlyWhenVerifyPasses = !declined(gate);
+    if (!onlyWhenVerifyPasses) {
+      out('  ⚠ Off means an UNVERIFIED diff reaches the branch: a build that failed the gate —');
+      out('    or never ran it — still lands there.');
+    }
+
+    const resolve = (
+      await ask('  Let the build agent resolve mechanical rebase conflicts? (Y/n)', 'Y')
+    ).toLowerCase();
+    const resolveConflicts = !declined(resolve);
+
+    // EMPTY MEANS NO OVERRIDE, and that default is load-bearing (RUN-41): defaulting to
+    // "anywhere" would make every repo writable at `main` by anyone who can dispatch, and the
+    // repo owner and the dispatcher are not always the same person. The repo opts in, typed.
+    out('');
+    out(`  A dispatch can never choose the landing branch: this repo lands only at ${branch}.`);
+    out('  Globs here (e.g. feature/** wip/*) let a dispatch override that — blank keeps the');
+    out('  envelope closed.');
+    const allowedBranches = (await ask('  Branch globs a dispatch may land on (blank = no override)'))
+      .split(/[,\s]+/)
+      .filter(Boolean);
+
+    // Default false, and the default is the point (RUN-27): every other defence rests on
+    // "nothing an agent writes leaves this machine".
+    const push = (await ask(`  Push ${branch} to its remote after each landing? (y/N)`, 'N')).toLowerCase();
+    const autoPush = push === 'y' || push === 'yes';
+    if (autoPush) {
+      out('  ⚠ This crosses the one boundary the daemon otherwise has — agent work now leaves');
+      out('    this machine on its own, and `git log origin/main..main` stops being your "what');
+      out('    did the agents do?" check. See THREAT-MODEL.md before committing this.');
+    }
+
+    // Offered only once autoPush is on: a merge request cannot exist without the branch
+    // reaching the remote. Validating the pair HERE (rule 1) beats writing a manifest whose
+    // merge request can never open at the next dispatch.
+    let mergeTarget: string | null = null;
+    if (autoPush) {
+      out('');
+      out("  The daemon can open a merge request when a plan's work completes. A per-plan");
+      out('  branch template — branch = "noriq/plan-<planKey>" — is what makes that MR mean');
+      out("  something: one plan's worth of work per review (RUN-28).");
+      for (;;) {
+        const answer = (await ask('  Merge-request target branch (blank = no merge requests)')).trim();
+        if (!answer) break;
+        if (answer === branch) {
+          out('  ✗ that is the landing branch itself — a merge request needs a different base.');
+          continue;
+        }
+        mergeTarget = answer;
+        break;
+      }
+    }
+
+    choices.land = { onlyWhenVerifyPasses, resolveConflicts, allowedBranches, autoPush, mergeTarget };
+  },
+};
+
+const ADVANCED_SECTIONS: AdvancedSection[] = [defaultsSection, landSection];
 
 export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitProjectResult> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -314,10 +612,34 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       if (/^[A-Z0-9]{1,8}$/.test(candidate)) key = candidate;
       else out('  ✗ 1–8 letters or digits, e.g. ACME. It must match a project on your server.');
     }
+    // Shape is all we can check: there is no project-listing endpoint on the client, so a KEY that
+    // is well-formed but names no project resolves to nothing on the server. Say so plainly.
+    out(`  KEY ${key} must match a project key on your Noriq server (there's no way to check that`);
+    out('  from here) — confirm it in the dashboard.');
 
-    const installed = (deps.installedTools ?? detectTools)();
-    const tool = installed.length ? await ask(`  Agent driver (${installed.join(' | ')})`, installed[0]) : '';
-    if (!installed.length) out('  No drivers found on PATH — install `claude` or `codex` later.');
+    // Offer only the drivers actually on PATH, and HOLD the answer to them. `tool` is
+    // z.enum(['claude','codex']) and discovery silently DROPS a manifest that fails the schema
+    // (readManifest → null), so a free-text typo — or a schema-valid driver this machine lacks —
+    // would write a marker that passes this wizard yet no run here could ever execute, with no error
+    // anywhere: the exact cliff this command exists to remove. Blank always means "the runner's
+    // default" (tool = null), so it carries NO fallback that would silently rewrite it.
+    const installed: string[] = (deps.installedTools ?? detectTools)();
+    let tool: string | null = null;
+    if (installed.length) {
+      for (;;) {
+        const answer = (await ask(`  Agent driver (${installed.join(' | ')}; blank = runner default)`))
+          .trim()
+          .toLowerCase();
+        if (!answer) break; // stays null — the runner's default
+        if (AgentTool.safeParse(answer).success && installed.includes(answer)) {
+          tool = answer;
+          break;
+        }
+        out(`  ✗ pick one of: ${installed.join(', ')} — or leave blank for the runner default.`);
+      }
+    } else {
+      out('  No drivers found on PATH — leaving the driver unset (install `claude`/`codex` later).');
+    }
 
     const eco = await (deps.detect ?? detectEcosystem)(cwd);
     if (eco.name !== 'unknown') out(`  Detected a ${eco.name} project.`);
@@ -334,6 +656,30 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     }
     const verifyCmd = (await ask('  Verify command (blank for none)', eco.verifyCmd ?? undefined)) || null;
 
+    // The advanced [verify] knobs (RUN-63), asked only when there is a cmd for them to govern —
+    // a shell pin or a timeout with nothing to run is dead config.
+    let verifyShell: string | null = null;
+    let verifyTimeoutSeconds: number | null = null;
+    if (verifyCmd) {
+      out('');
+      out('  This file is COMMITTED, so that command travels to teammates on other OSes: `&&` is');
+      out('  portable to cmd.exe by luck; env prefixes, redirection, globs and $VAR are not —');
+      out('  mixed-OS teams pin `bash` (Git for Windows ships one). An absent pin fails the gate');
+      out("  outright, so blank (= the platform's own shell) stays the default.");
+      verifyShell = (await ask('  Pin a shell for it? (blank = platform default)')) || null;
+      for (;;) {
+        const raw = await ask(`  Verify timeout in seconds (blank = ${DEFAULT_VERIFY_TIMEOUT_SECONDS})`);
+        const answer = raw.trim();
+        if (!answer) break;
+        const n = Number(answer);
+        if (Number.isInteger(n) && n > 0 && n <= MAX_VERIFY_TIMEOUT_SECONDS) {
+          verifyTimeoutSeconds = n;
+          break;
+        }
+        out(`  ✗ a whole number of seconds, 1–${MAX_VERIFY_TIMEOUT_SECONDS}, or blank for the default.`);
+      }
+    }
+
     // The other half of the verify choice (RUN-61). Both halves may be blank — no verify stage
     // is a legitimate configuration, not a misconfiguration, so neither question presumes.
     out('');
@@ -341,10 +687,41 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     out('  a fresh read-only session (optionally a stronger model) whose report is handed back');
     out('  to the builder to fix.');
     const wantReviewer = (await ask('  Add the inline reviewer? (y/N)', 'N')).toLowerCase();
-    const reviewer =
-      wantReviewer === 'y' || wantReviewer === 'yes'
-        ? { model: (await ask("  Reviewer model (blank = the driver's default)")) || null }
-        : null;
+    let reviewer: { model: string | null; effort: string | null; maxRounds: number | null } | null = null;
+    if (wantReviewer === 'y' || wantReviewer === 'yes') {
+      const model = (await ask("  Reviewer model (blank = the driver's default)")) || null;
+      // Effort is tool-agnostic INTENT (RUN-33) — validated here because a typo'd effort would
+      // otherwise surface as a schema refusal at the NEXT dispatch, not at setup.
+      let effort: string | null = null;
+      for (;;) {
+        const raw = await ask(`  Reviewer effort (${RunEffort.options.join(' | ')}; blank = default)`);
+        const answer = raw.trim().toLowerCase();
+        if (!answer) break;
+        if (RunEffort.safeParse(answer).success) {
+          effort = answer;
+          break;
+        }
+        out(`  ✗ one of ${RunEffort.options.join(' | ')}, or blank for the default.`);
+      }
+      // Bounded by default for RUN-21's reason: an agent that cannot satisfy the reviewer in
+      // two rounds is not going to on the third — it is going to keep spending. 0 is a real
+      // choice (one review, no hand-back — a pure gate), not an absence.
+      let maxRounds: number | null = null;
+      for (;;) {
+        const raw = await ask(
+          '  FAIL → fix → re-review rounds, 0–5 (blank = 2; 0 = review only, no hand-back)',
+        );
+        const answer = raw.trim();
+        if (!answer) break;
+        const n = Number(answer);
+        if (Number.isInteger(n) && n >= 0 && n <= 5) {
+          maxRounds = n;
+          break;
+        }
+        out('  ✗ a whole number from 0 to 5, or blank for the default (2).');
+      }
+      reviewer = { model, effort, maxRounds };
+    }
 
     // No default, on purpose. `[land].branch` is never inferred and blank must stay the easy
     // answer — offering "noriq/integration" at a keystroke is the silent envelope-widening
@@ -354,36 +731,101 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     out('  Leave blank for none (every diff waits on its own branch).');
     const landBranch = (await ask('  Auto-land to which branch? (blank = none)')) || null;
 
+    const choices: ManifestChoices = {
+      key,
+      tool: tool || null,
+      verifyCmd,
+      verifyShell,
+      verifyTimeoutSeconds,
+      reviewer,
+      landBranch,
+      allow: eco.allow,
+      defaults: null,
+      land: null,
+    };
+
+    // The fork (RUN-62). One trailing question, default N, so the tier is discoverable
+    // without reading --help; the --advanced flag just pre-answers it. Every advanced
+    // question runs BEFORE the write below — rule 1 covers the session, not each question.
+    let advanced = deps.advanced ?? false;
+    if (!advanced) {
+      out('');
+      out('  The quick questions are done. Advanced options (per-kind model/effort defaults,');
+      out('  the [land] envelope when auto-landing is on) can be curated now, or added to the');
+      out('  file by hand later — it documents them all.');
+      const curate = (await ask('  Curate advanced options? (y/N)', 'N')).toLowerCase();
+      advanced = curate === 'y' || curate === 'yes';
+    }
+    if (advanced) {
+      for (const section of ADVANCED_SECTIONS) {
+        if (section.applies && !section.applies(choices)) continue;
+        out('');
+        out(`  ${section.title}`);
+        out('');
+        await section.run({ ask, out }, choices);
+      }
+    }
+
     await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(
-      target,
-      renderProjectManifest({ key, tool: tool || null, verifyCmd, reviewer, landBranch, allow: eco.allow }),
-      'utf8',
-    );
+    await writeFile(target, renderProjectManifest(choices), 'utf8');
     out('');
     out(`  ✓ wrote ${target}`);
 
-    // Rule 3, and the only thing here the user could not have worked out themselves.
+    // Rule 3, and the only thing here the user could not have worked out themselves: does the
+    // daemon's OWN discovery walk actually reach this marker? A lexical containment check lies —
+    // the walk stops a few levels deep and skips ignored dirs — so we run the real walk and look
+    // for this repo in its result. This is worth more than every other line the command prints.
     const roots = await (
       deps.scanRoots ??
       (async () => {
         try {
           return (await loadRunnerConfig(deps.configPath)).config.scanRoots;
         } catch {
-          return null; // no machine config yet — `init` reports that, not us
+          return null; // machine config missing/unreadable — reported below, not swallowed
         }
       })
     )();
-    const warning = scanRootWarning(cwd, roots);
     out('');
-    if (warning) {
-      out(`  ⚠️  ${warning}.`);
-      out('     Discovery only walks the scanRoots in your runner.toml, so this marker would');
-      out('     never be found and nothing here would be dispatchable — with no error anywhere.');
-      out('     Add this path to scanRoots, or move the repo under one:');
-      for (const r of roots ?? []) out(`       ${r}`);
-    } else if (roots) {
-      out('  ✓ this repo is under a scanRoot — the runner will find it.');
+    if (roots === null) {
+      // Without a readable runner.toml we cannot answer the one question only this command can, and
+      // falling through to "commit it" would imply the runner is guaranteed to see the repo.
+      out('  ⚠️  Could not read your machine config, so I cannot confirm the runner will see this');
+      out('     repo. Run `noriq-runner init` to set it up, then `noriq-runner discover`.');
+    } else if (roots.length === 0) {
+      out('  ⚠️  Your runner.toml lists no scanRoots, so the runner walks nothing and will not find');
+      out('     this repo. Add its path to scanRoots (`noriq-runner init` can do this):');
+      out(`       ${path.resolve(cwd)}`);
+    } else {
+      const discover = deps.discover ?? ((r: string[]) => discoverRepos(r));
+      const canon = (p: string) => {
+        try {
+          return realpathSync(p);
+        } catch {
+          return path.resolve(p);
+        }
+      };
+      const me = canon(cwd);
+      // Canonicalize both sides: a scanRoot reaching the repo through a symlink (Fedora Atomic's
+      // /home → /var/home, macOS /var → /private/var) prints a different path string than cwd.
+      const seen = (await discover(roots)).some((repo) => canon(repo.root) === me);
+      const outside = scanRootWarning(cwd, roots);
+      if (seen) {
+        out('  ✓ this repo is under a scanRoot and discovery found it — the runner will see it.');
+      } else if (outside) {
+        // Lexically outside every root: the plain "not under any scanRoot" case.
+        out(`  ⚠️  ${outside}.`);
+        out('     Discovery only walks the scanRoots in your runner.toml, so this marker would');
+        out('     never be found and nothing here would be dispatchable — with no error anywhere.');
+        out('     Add this path to a scanRoot, or move the repo under one:');
+        for (const r of roots) out(`       ${r}`);
+      } else {
+        // Under a scanRoot lexically, but the walk did not reach it — depth cap, or an ignored dir
+        // (node_modules, vendor, target, a dot-dir) sits between the root and here.
+        out('  ⚠️  This repo sits under a scanRoot but discovery did not reach it — the walk stops a');
+        out('     few levels deep and skips dot- and build dirs (node_modules, vendor, target).');
+        out("     Add the repo's own path to scanRoots so it is found directly:");
+        out(`       ${path.resolve(cwd)}`);
+      }
     }
 
     out('');

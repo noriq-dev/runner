@@ -35,6 +35,34 @@ export type AgentTool = z.infer<typeof AgentTool>;
 export const RunEffort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
 export type RunEffort = z.infer<typeof RunEffort>;
 
+/**
+ * What ONE model actually spent on a run (RUN-59) — the SDK's own per-model aggregate, keys
+ * un-renamed on purpose so the stored facts match what the tool billed from.
+ *
+ * `runs.model`/`runs.effort` (RUN-33) record what the DISPATCH asked for; this records what
+ * HAPPENED, which is a different fact: a run dispatched as Opus already spends real tokens on a
+ * haiku sub-agent the primary path never mentions. Both are worth keeping — "I asked for Opus and
+ * got 30% haiku" is only visible if you keep the request AND the reality.
+ *
+ * All four token classes, not just input/output: the run's totals are computed from all four, so a
+ * breakdown that dropped cache tokens would not sum to the number displayed next to it. The tooltip
+ * shows input/output/cost; the totals need the rest. Store what the SDK gives; show what the UI needs.
+ */
+export const RunModelUsage = z.object({
+  inputTokens: z.number().nonnegative(),
+  outputTokens: z.number().nonnegative(),
+  cacheReadInputTokens: z.number().nonnegative(),
+  cacheCreationInputTokens: z.number().nonnegative(),
+  costUSD: z.number().nonnegative(),
+});
+export type RunModelUsage = z.infer<typeof RunModelUsage>;
+
+/** The model mix of a run, keyed by the tool's own model id (e.g. 'claude-opus-4-8[1m]'). Null =
+ *  the driver could not attribute spend by model (codex today, or an older SDK) — the UI renders
+ *  "not reported", never 100% of the requested model, which is exactly the lie RUN-59 removes. */
+export const RunModelMix = z.record(z.string(), RunModelUsage);
+export type RunModelMix = z.infer<typeof RunModelMix>;
+
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
 // terminal ∈ {done, failed, cancelled}. `blocked` = agent parked on request_input.
 export const RunStatus = z.enum([
@@ -134,6 +162,12 @@ export const Run = z.object({
   // a CHECK constraint) would mean a migration every time a model ships.
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
+  // NB (RUN-59): what the run ACTUALLY spent per model — distinct from `model` above (the request)
+  // — is persisted server-side as the `runs.model_usage` JSON column and rides the live
+  // `run.telemetry.modelUsage` frame (see ws.ts). It is deliberately NOT a field on this Run entity
+  // in the runner's vendored contract: the daemon only ever WRITES the mix (via telemetry) and
+  // never reads it back, and adding a defaulted field here would force `modelUsage: null` onto every
+  // Run literal the daemon builds for no runtime gain. The server adds the read-path column itself.
   budget: RunBudget,
   status: RunStatus,
   // Sub-state of `running` (RUN-31) — see RunPhase. Cosmetic by construction: nothing

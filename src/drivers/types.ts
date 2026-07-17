@@ -4,6 +4,20 @@ import type { AgentTool, PermissionProfile, RunBudget, RunEffort, RunKind } from
 // (RUN-12) and the Codex protocol-mode driver (RUN-13). A driver turns a Run into
 // a live, steerable agent process and streams telemetry/status back.
 
+/**
+ * What ONE model spent (RUN-59) — the SDK's own per-model aggregate, keys un-renamed. Mirrors the
+ * wire contract's `RunModelUsage`; kept as a local interface for the same anti-corruption reason
+ * the driver mirrors the rest of the SDK's shape (see claude.ts). All four token classes, so a
+ * breakdown sums to the run total shown beside it.
+ */
+export interface ModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
+}
+
 export interface DriverTelemetry {
   inputTokens: number;
   outputTokens: number;
@@ -11,6 +25,14 @@ export interface DriverTelemetry {
   cacheCreationTokens: number;
   costUsd: number;
   numTurns: number;
+  /**
+   * The spend broken down by the model that actually incurred it (RUN-59), keyed by the tool's own
+   * model id. ABSENT when the driver cannot attribute spend by model — codex has no per-model
+   * aggregate, and the claude `usage`-fallback path sees only one path. Absent means "not reported",
+   * never "100% of the requested model": inventing a single-model mix is the lie this exists to
+   * remove. When present, the per-model token classes sum to the fields above.
+   */
+  modelUsage?: Record<string, ModelUsage>;
 }
 
 export const zeroTelemetry = (): DriverTelemetry => ({

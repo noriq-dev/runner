@@ -12,7 +12,14 @@ import type {
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import type { ParkState, RunAgent } from './client';
 import { superviseBudget, totalTokens } from './drivers/budget';
-import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry, NoriqMcp } from './drivers/types';
+import type {
+  AgentDriver,
+  DriverExit,
+  DriverSession,
+  DriverTelemetry,
+  ModelUsage,
+  NoriqMcp,
+} from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
 import {
   type LandOutcome,
@@ -249,15 +256,97 @@ export function remainingBudget(budget: RunBudget | null, spent: ParkedRun): Run
   };
 }
 
-/** Fold a park's prior spend into a live tick, so the dashboard shows the RUN's total. */
-export const addSpent = (t: DriverTelemetry, spent: ParkedRun['spent']): DriverTelemetry => ({
-  ...t,
-  // Prior tokens land in inputTokens: the split across the four buckets is not recoverable from
-  // the park (it stores one total), and the figure that matters — and that the budget reads — is
-  // the sum. Better one honest total than four invented components.
-  inputTokens: t.inputTokens + spent.tokens,
-  costUsd: t.costUsd + spent.usd,
+/** Sum two model mixes model-by-model, field-by-field (RUN-59). Absent on both sides → absent. */
+export const mergeModelUsage = (
+  a?: Record<string, ModelUsage>,
+  b?: Record<string, ModelUsage>,
+): Record<string, ModelUsage> | undefined => {
+  if (!a && !b) return undefined;
+  const out: Record<string, ModelUsage> = {};
+  for (const src of [a, b]) {
+    if (!src) continue;
+    for (const [id, u] of Object.entries(src)) {
+      const cur = out[id];
+      out[id] = cur
+        ? {
+            inputTokens: cur.inputTokens + u.inputTokens,
+            outputTokens: cur.outputTokens + u.outputTokens,
+            cacheReadInputTokens: cur.cacheReadInputTokens + u.cacheReadInputTokens,
+            cacheCreationInputTokens: cur.cacheCreationInputTokens + u.cacheCreationInputTokens,
+            costUSD: cur.costUSD + u.costUSD,
+          }
+        : { ...u };
+    }
+  }
+  return out;
+};
+
+/** A park's prior spend, rehydrated as a telemetry snapshot to SEED a resumed run's tally (RUN-59).
+ *  Prior tokens land in inputTokens — the split across the four buckets is not recoverable from the
+ *  park (it stores one total), and the figure that matters (and that the budget reads) is the sum.
+ *  The prior MIX carries over whole, so a resumed run's breakdown keeps summing to its total. */
+export const telemetryFromSpent = (spent: ParkedRun['spent']): DriverTelemetry => ({
+  inputTokens: spent.tokens,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  costUsd: spent.usd,
+  numTurns: 0,
+  ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
 });
+
+/**
+ * The run's spend, tallied across every SESSION that bills to it (RUN-59).
+ *
+ * A run is not one session: the primary agent (and its fix turns), each inline-reviewer round, the
+ * conflict resolver, and a park's prior spend all cost real tokens on real — sometimes DIFFERENT —
+ * models. Reporting only the primary's mix is the same half-truth as reporting only the dispatched
+ * model. Each session records its latest snapshot under its own slot; the run's figure is the sum.
+ *
+ * Authority, not size: `record` is last-writer-wins per slot, NOT a max. Within one session each
+ * result is that session's running cumulative aggregate and arrives AFTER its own live ticks, so the
+ * latest snapshot is the authoritative one — picking "the largest" would let a live over-count (or a
+ * mix-less interim tick) beat the result that supersedes it.
+ *
+ * The aggregate mix is all-or-nothing: it exists only if EVERY slot that spent anything attributed
+ * that spend by model. One un-attributed session (codex, the claude usage-fallback, a pre-RUN-59
+ * park) → the run reports NO mix, not a partial one — a breakdown that omits a spending model would
+ * not sum to the total beside it, which is the one thing the tooltip must never do.
+ */
+export class RunTally {
+  private readonly slots = new Map<string, DriverTelemetry>();
+
+  /** Record a session's latest snapshot. Last-writer-wins per slot (see class doc). */
+  record(slot: string, t: DriverTelemetry): void {
+    this.slots.set(slot, t);
+  }
+
+  /** Seed a slot only if empty — used for a park's prior spend, which must not clobber a live
+   *  session that already recorded under the same slot. */
+  seed(slot: string, t: DriverTelemetry): void {
+    if (!this.slots.has(slot)) this.slots.set(slot, t);
+  }
+
+  total(): DriverTelemetry {
+    const acc = zeroTelemetry();
+    let mix: Record<string, ModelUsage> | undefined;
+    let complete = true;
+    for (const t of this.slots.values()) {
+      acc.inputTokens += t.inputTokens;
+      acc.outputTokens += t.outputTokens;
+      acc.cacheReadTokens += t.cacheReadTokens;
+      acc.cacheCreationTokens += t.cacheCreationTokens;
+      acc.costUsd += t.costUsd;
+      acc.numTurns += t.numTurns;
+      const spent =
+        t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens > 0 || t.costUsd > 0;
+      if (t.modelUsage) mix = mergeModelUsage(mix, t.modelUsage);
+      else if (spent) complete = false; // a spending session with no mix breaks the sum
+    }
+    if (complete && mix) acc.modelUsage = mix;
+    return acc;
+  }
+}
 
 /** The anchor task's human-readable content, inlined into the prompt. */
 export interface AnchorTask {
@@ -429,6 +518,9 @@ export class RunSupervisor {
     permission: PermissionProfile;
     noriqMcp?: NoriqMcp;
     budget?: RunBudget;
+    /** The run's cross-session tally (RUN-59): a conflict-resolution turn spends real tokens, and
+     *  resolveConflict records them into it. */
+    tally: RunTally;
     /** The still-live build session, when the run was started multiTurn — so a gate failure on
      *  the rebased result can be handed back rather than ending the run (RUN-29). */
     session?: DriverSession;
@@ -680,6 +772,9 @@ export class RunSupervisor {
     /** The live build session — the feedback target, NOT the reviewer's. */
     session: DriverSession;
     task: AnchorTask | null;
+    /** The run's cross-session tally (RUN-59): each reviewer round records its spend here so the
+     *  run's mix includes the reviewer's model, which may be a different vendor entirely. */
+    tally: RunTally;
     /** Live accessor for the builder session's output, so the fix turn's structured RESPONSE
      *  block can be captured and fed into the next reviewer's ledger (RUN-79). */
     getSessionText?: () => string;
@@ -800,6 +895,9 @@ export class RunSupervisor {
     budget?: RunBudget;
     /** Which look this is (1 = the first review) — transcript attribution (RUN-74). */
     round: number;
+    /** The run's cross-session tally (RUN-59): this reviewer's spend is recorded into it under a
+     *  per-round slot, so the run's total + mix count the reviewer's model. */
+    tally: RunTally;
     /** Findings adjudicated in earlier rounds (RUN-79) — empty on the first look. */
     ledger?: LedgerEntry[];
   }): Promise<VerifyVerdict> {
@@ -853,9 +951,10 @@ export class RunSupervisor {
           text += t;
           this.transcript(ctx.run.id).text('reviewer', t, ctx.round);
         },
-        // Same surface the conflict resolver uses: the run's spend keeps moving on the dashboard
-        // while a second session burns. (Cross-session totals are RUN-59's problem, not this one.)
-        onTelemetry: (t) => this.deps.report(ctx.run.id, { status: 'running', telemetry: t }),
+        // The reviewer's LIVE ticks are deliberately NOT folded into the run frame (RUN-59). Its
+        // mix is only known at its result, so folding a live tick (tokens, no mix) would strand a
+        // climbing total next to a stale primary-only mix under the server's COALESCE. Its spend
+        // joins the run at its result instead — see the tally.record below, reported as one jump.
       },
     });
     // Killable while it reviews, same as the conflict resolver — and unregistered after, for the
@@ -863,6 +962,12 @@ export class RunSupervisor {
     this.deps.steering?.register(ctx.run.id, session.session, session.stop);
     try {
       const exit = await session.done;
+      // Record the reviewer's whole spend regardless of verdict (RUN-59): the tokens burned whether
+      // it PASSed, FAILed, or crashed, and this may be a different vendor's model than the build.
+      // A fresh session per round → its exit is that round's own cumulative, so a per-round slot
+      // sums rather than overwrites. Then publish the run total, mix and all, as one step.
+      ctx.tally.record(`review:${ctx.round}`, exit.telemetry);
+      this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
         return {
@@ -889,6 +994,8 @@ export class RunSupervisor {
       permission: PermissionProfile;
       noriqMcp?: NoriqMcp;
       budget?: RunBudget;
+      /** The run's cross-session tally (RUN-59): the conflict turn's spend records into it. */
+      tally: RunTally;
     },
     conflicts: string[],
   ): Promise<{ resolved: boolean; text: string }> {
@@ -910,7 +1017,9 @@ export class RunSupervisor {
         onText: (t) => {
           text += t;
         },
-        onTelemetry: (t) => this.deps.report(ctx.run.id, { status: 'running', telemetry: t }),
+        // Like the reviewer (RUN-59): live ticks are not folded (mix unknown until the result), so
+        // the run frame never shows a total climbing past a stale mix. The conflict turn's whole
+        // spend joins the run at its result — recorded below and reported as one step.
       },
     });
     // Still killable while it works — and unregistered when it stops. supervise()'s own
@@ -921,6 +1030,10 @@ export class RunSupervisor {
     this.deps.steering?.register(ctx.run.id, session.session, session.stop);
     try {
       const exit = await session.done;
+      // The conflict turn's spend joins the run whether or not it resolved anything (RUN-59) — the
+      // tokens burned either way, on the build's own model (kind:'build', ctx.driver).
+      ctx.tally.record('conflict', exit.telemetry);
+      this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         return { resolved: false, text: text || `agent exited ${exit.reason ?? 'badly'}` };
       }
@@ -961,6 +1074,9 @@ export class RunSupervisor {
     session: DriverSession;
     runAgent: RunAgent;
     activeSeconds: number;
+    /** The run's spend tallied across every session so far (RUN-59) — what the park persists so a
+     *  resume can keep summing, and what the blocked report carries. */
+    tally: RunTally;
     /** The run's trailing output, so the park report carries the last thing it said — usually
      *  the question itself, which is what a human opening the dashboard wants to read. */
     tail: string;
@@ -993,6 +1109,9 @@ export class RunSupervisor {
       return null;
     }
 
+    // The RUN's spend, not just this sitting's (RUN-59): the tally already folds any prior park and
+    // every session that billed. Persisting the mix keeps a resume's breakdown summing to its total.
+    const runSpend = ctx.tally.total();
     await this.deps.parked.park({
       run,
       sessionId,
@@ -1000,21 +1119,27 @@ export class RunSupervisor {
       agentLabel: ctx.runAgent.label,
       mcpToken: ctx.runAgent.token,
       workspace: ctx.worktree,
-      spent: { tokens: totalTokens(exit.telemetry), usd: exit.telemetry.costUsd },
+      spent: {
+        tokens: totalTokens(runSpend),
+        usd: runSpend.costUsd,
+        ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
+      },
       activeSeconds: ctx.activeSeconds,
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
     // The server already moved the row to blocked when the agent asked; reporting it back is what
     // makes the daemon's view and the dashboard's agree, and it carries the final spend.
-    this.deps.report(run.id, { status: 'blocked', telemetry: exit.telemetry, logTail: ctx.tail });
+    this.deps.report(run.id, { status: 'blocked', telemetry: runSpend, logTail: ctx.tail });
     this.log.info('run parked on a human — session ended, worktree kept', {
       runId: run.id,
       question: state.question?.slice(0, 80) ?? null,
     });
     // NOT terminal, and the worktree is deliberately left alone: it holds the work, and the
-    // resumed session expects to find it exactly where it was.
-    return { ...exit, outcome: 'done', isError: false, reason: 'parked', sessionId };
+    // resumed session expects to find it exactly where it was. Carry the RUN's spend (tally total),
+    // not this sitting's first-result snapshot, so a caller reading the returned exit agrees with
+    // what was reported and parked (RUN-59).
+    return { ...exit, outcome: 'done', isError: false, reason: 'parked', sessionId, telemetry: runSpend };
   }
 
   /**
@@ -1070,6 +1195,10 @@ export class RunSupervisor {
 
     let verifyText = '';
     let tail = '';
+    // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
+    // figures accumulate onto — and keep summing with — everything spent before the park.
+    const tally = new RunTally();
+    tally.seed('__prior__', telemetryFromSpent(entry.spent));
     const startedAt = Date.now();
     const budgetRun = superviseBudget(driver, {
       runId: run.id,
@@ -1091,8 +1220,10 @@ export class RunSupervisor {
       // budget, and a run could park its way past any limit.
       budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
       handlers: {
-        onTelemetry: (t) =>
-          this.deps.report(run.id, { status: 'running', telemetry: addSpent(t, entry.spent), logTail: tail }),
+        onTelemetry: (t) => {
+          tally.record('primary', t);
+          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
+        },
         onText: (t) => {
           verifyText += t;
           tail = (tail + t).slice(-LOG_TAIL_CAP);
@@ -1107,8 +1238,10 @@ export class RunSupervisor {
     } finally {
       this.deps.steering?.unregister(run.id);
     }
-    // Spend is cumulative across the park — the run's totals are the run's, not this sitting's.
-    exit = { ...exit, telemetry: addSpent(exit.telemetry, entry.spent) };
+    // Record this sitting's terminal result (captures a driver/fake that emits no separate tick),
+    // then the run's spend is cumulative across the park — the tally already folds the seeded prior.
+    tally.record('primary', exit.telemetry);
+    exit = { ...exit, telemetry: tally.total() };
 
     // It can park AGAIN. An agent given an answer may well have a second question, and there is
     // no reason the second one is worth less than the first.
@@ -1120,6 +1253,7 @@ export class RunSupervisor {
       session: budgetRun.session,
       runAgent,
       activeSeconds: entry.activeSeconds + (Date.now() - startedAt) / 1000,
+      tally,
       tail,
     });
     if (reparked) return reparked;
@@ -1136,6 +1270,7 @@ export class RunSupervisor {
       session: budgetRun.session,
       stopSession: budgetRun.stop,
       exit,
+      tally,
       verifyText,
       getSessionText: () => verifyText,
       tail,
@@ -1341,6 +1476,9 @@ export class RunSupervisor {
     });
     let verifyText = ''; // accumulated agent output — the verify verdict is parsed from it
     let tail = ''; // rolling tail of the same output, capped, for the live dashboard (RUN-22)
+    // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
+    // its model mix are the sum across sessions, always consistent with each other.
+    const tally = new RunTally();
     // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
     // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
     const startedAt = Date.now();
@@ -1360,9 +1498,15 @@ export class RunSupervisor {
       ...resolveModel(run, repo.manifest),
       budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       handlers: {
-        // Each telemetry tick carries the current spend AND the latest log tail, so
-        // the dashboard sees burn + output without a status transition per tick.
-        onTelemetry: (t) => this.deps.report(run.id, { status: 'running', telemetry: t, logTail: tail }),
+        // Each telemetry tick carries the current spend AND the latest log tail, so the dashboard
+        // sees burn + output without a status transition per tick. The primary session — including
+        // its fix turns, which stream through these same handlers — records into the tally, and the
+        // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
+        // knows the split), so the mix appears when the result lands, not before.
+        onTelemetry: (t) => {
+          tally.record('primary', t);
+          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
+        },
         onText: (t) => {
           verifyText += t;
           tail = (tail + t).slice(-LOG_TAIL_CAP);
@@ -1379,6 +1523,10 @@ export class RunSupervisor {
     } finally {
       this.deps.steering?.unregister(run.id);
     }
+    // The terminal result, recorded authoritatively (RUN-59): a driver whose result carries a mix
+    // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
+    // run later stream through the handler above and overwrite this with their fuller cumulative.
+    tally.record('primary', exit.telemetry);
 
     // The session ending is ambiguous (RUN-30): an agent that asked a human a question ends its
     // turn exactly like one that finished. Only the server knows which, so ask it before treating
@@ -1391,6 +1539,7 @@ export class RunSupervisor {
       session: budgetRun.session,
       runAgent,
       activeSeconds: (Date.now() - startedAt) / 1000,
+      tally,
       tail,
     });
     if (parked) return parked;
@@ -1407,6 +1556,7 @@ export class RunSupervisor {
       session: budgetRun.session,
       stopSession: budgetRun.stop,
       exit,
+      tally,
       verifyText,
       getSessionText: () => verifyText,
       tail,
@@ -1433,6 +1583,9 @@ export class RunSupervisor {
     session: DriverSession;
     stopSession: () => Promise<void>;
     exit: DriverExit;
+    /** The run's cross-session spend tally (RUN-59) — the reviewer and conflict-resolver sessions
+     *  this method spawns record into it, and the terminal report is its total. */
+    tally: RunTally;
     verifyText: string;
     /** Live accessor for the session's accumulated output — NOT the `verifyText` snapshot, which
      *  froze when the driver's first turn ended. reviewWithFeedback reads it around each fix turn
@@ -1440,7 +1593,8 @@ export class RunSupervisor {
     getSessionText?: () => string;
     tail: string;
   }): Promise<DriverExit> {
-    const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, verifyText, tail } = ctx;
+    const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, tally, verifyText, tail } =
+      ctx;
     const kind = run.kind as RunKind;
     const budgetRun = { session: ctx.session, stop: ctx.stopSession };
     let exit = ctx.exit;
@@ -1543,6 +1697,7 @@ export class RunSupervisor {
         driver,
         session: budgetRun.session,
         task,
+        tally,
         getSessionText: ctx.getSessionText,
         budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       });
@@ -1600,6 +1755,7 @@ export class RunSupervisor {
           driver,
           permission,
           noriqMcp,
+          tally,
           budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
         }),
       ).catch(
@@ -1659,6 +1815,11 @@ export class RunSupervisor {
       }
     }
 
+    // The run's true spend + mix, summed across every session that billed (RUN-59): the primary
+    // (with its fix turns), every reviewer round, the conflict resolver, and any prior park — all
+    // recorded into the tally by now. This supersedes the primary session's own first-result
+    // snapshot (`exit.telemetry`), which missed both the sub-sessions and the fix turns.
+    exit = { ...exit, telemetry: tally.total() };
     this.deps.report(run.id, {
       status: exit.outcome,
       agentId: runAgent.agentId,

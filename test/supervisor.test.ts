@@ -7,11 +7,21 @@ import type {
   DriverSession,
   DriverStartOptions,
   DriverTelemetry,
+  ModelUsage,
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
 import { noriqToolNamesFor } from '../src/security';
-import { type RunReport, RunSupervisor, assemblePrompt, mergeBudget, resolveModel } from '../src/supervisor';
+import {
+  type RunReport,
+  RunSupervisor,
+  RunTally,
+  assemblePrompt,
+  mergeBudget,
+  mergeModelUsage,
+  resolveModel,
+  telemetryFromSpent,
+} from '../src/supervisor';
 import type { Workspace } from '../src/vcs/types';
 
 // A driver whose run the test completes by calling complete() — which drives the
@@ -78,12 +88,14 @@ class FakeDriver implements AgentDriver {
   emitTelemetry(t: Partial<DriverTelemetry> = {}): void {
     this.opts?.handlers?.onTelemetry?.({ ...zeroTelemetry(), ...t });
   }
-  complete(outcome: 'done' | 'failed'): void {
+  /** Default spend is 42 output tokens; a test that cares about the model mix (RUN-59) passes its
+   *  own telemetry (e.g. a modelUsage breakdown). */
+  complete(outcome: 'done' | 'failed', telemetry: Partial<DriverTelemetry> = { outputTokens: 42 }): void {
     this.opts?.handlers?.onExit?.({
       outcome,
       isError: outcome === 'failed',
       reason: outcome === 'failed' ? 'boom' : null,
-      telemetry: { ...zeroTelemetry(), outputTokens: 42 },
+      telemetry: { ...zeroTelemetry(), ...telemetry },
     });
   }
 }
@@ -2320,5 +2332,231 @@ describe('disposePreservesWork (RUN-52) — the pool-of-1 wedge guard', () => {
     h.claude.complete('done');
     await done;
     expect(h.worktrees.removed).toEqual([]); // kept for the human — dispose would destroy it
+  });
+});
+
+describe('the run model mix (RUN-59)', () => {
+  const mix = (over: Partial<ModelUsage> = {}): ModelUsage => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    costUSD: 0,
+    ...over,
+  });
+  const tel = (over: Partial<DriverTelemetry> = {}): DriverTelemetry => ({ ...zeroTelemetry(), ...over });
+
+  describe('mergeModelUsage', () => {
+    it('sums a shared model field-by-field and unions distinct models', () => {
+      const merged = mergeModelUsage(
+        { opus: mix({ inputTokens: 4, costUSD: 0.5 }) },
+        { opus: mix({ inputTokens: 10, outputTokens: 2, costUSD: 0.1 }), haiku: mix({ inputTokens: 3 }) },
+      );
+      expect(merged?.opus).toEqual(mix({ inputTokens: 14, outputTokens: 2, costUSD: 0.6 }));
+      expect(merged?.haiku).toEqual(mix({ inputTokens: 3 }));
+    });
+    it('is absent only when BOTH sides are absent', () => {
+      expect(mergeModelUsage(undefined, undefined)).toBeUndefined();
+      expect(mergeModelUsage({ opus: mix({ inputTokens: 1 }) }, undefined)).toEqual({
+        opus: mix({ inputTokens: 1 }),
+      });
+    });
+  });
+
+  describe('RunTally', () => {
+    it('sums spend across slots, and its mix sums to those totals', () => {
+      const t = new RunTally();
+      t.record(
+        'primary',
+        tel({
+          inputTokens: 100,
+          costUsd: 0.5,
+          modelUsage: { opus: mix({ inputTokens: 100, costUSD: 0.5 }) },
+        }),
+      );
+      t.record(
+        'review:1',
+        tel({
+          inputTokens: 20,
+          costUsd: 0.1,
+          modelUsage: { sonnet: mix({ inputTokens: 20, costUSD: 0.1 }) },
+        }),
+      );
+      const total = t.total();
+      expect(total.inputTokens).toBe(120);
+      expect(total.costUsd).toBeCloseTo(0.6);
+      // The tooltip invariant: sum of per-model tokens === the run total shown beside it.
+      const summed = Object.values(total.modelUsage ?? {}).reduce((a, u) => a + u.inputTokens, 0);
+      expect(summed).toBe(total.inputTokens);
+      expect(Object.keys(total.modelUsage ?? {})).toEqual(['opus', 'sonnet']);
+    });
+
+    it('is last-writer-wins per slot, not max — a result supersedes its own live ticks', () => {
+      const t = new RunTally();
+      // A live tick can transiently over-count; the authoritative result replaces it.
+      t.record('primary', tel({ inputTokens: 999 })); // interim, no mix
+      t.record('primary', tel({ inputTokens: 540, modelUsage: { opus: mix({ inputTokens: 540 }) } })); // the result
+      expect(t.total().inputTokens).toBe(540);
+      expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 540 }) });
+    });
+
+    it('drops the whole mix when any spending slot could not attribute it (codex build)', () => {
+      const t = new RunTally();
+      t.record('primary', tel({ inputTokens: 200 })); // codex — spend, no mix
+      t.record('review:1', tel({ inputTokens: 20, modelUsage: { sonnet: mix({ inputTokens: 20 }) } }));
+      const total = t.total();
+      expect(total.inputTokens).toBe(220); // totals still count both sessions
+      expect(total.modelUsage).toBeUndefined(); // but a partial mix would not sum — so: not reported
+    });
+
+    it('a zero-spend slot with no mix does not block the aggregate', () => {
+      const t = new RunTally();
+      t.record('primary', tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100 }) } }));
+      t.record('conflict', tel()); // spent nothing, reported no mix — must not veto
+      expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 100 }) });
+    });
+
+    it('seed folds a park’s prior spend, keeping the mix summing across sittings', () => {
+      const t = new RunTally();
+      t.seed(
+        '__prior__',
+        telemetryFromSpent({
+          tokens: 42,
+          usd: 0.2,
+          modelUsage: { opus: mix({ inputTokens: 42, costUSD: 0.2 }) },
+        }),
+      );
+      t.record(
+        'primary',
+        tel({ outputTokens: 8, costUsd: 0.1, modelUsage: { opus: mix({ outputTokens: 8, costUSD: 0.1 }) } }),
+      );
+      const total = t.total();
+      // prior 42 (in inputTokens) + this sitting's 8 output = 50 total tokens.
+      expect(total.inputTokens + total.outputTokens).toBe(50);
+      const opus = total.modelUsage?.opus;
+      expect(opus).toMatchObject({ inputTokens: 42, outputTokens: 8 });
+      expect(opus?.costUSD).toBeCloseTo(0.3);
+    });
+
+    it('a pre-RUN-59 park (spend, no mix) yields NO breakdown rather than one that does not add up', () => {
+      const t = new RunTally();
+      t.seed('__prior__', telemetryFromSpent({ tokens: 42, usd: 0.2 })); // no modelUsage
+      t.record('primary', tel({ outputTokens: 8, modelUsage: { opus: mix({ outputTokens: 8 }) } }));
+      expect(t.total().inputTokens + t.total().outputTokens).toBe(50);
+      expect(t.total().modelUsage).toBeUndefined();
+    });
+  });
+
+  it('folds an Opus build + a Sonnet reviewer into ONE mix that sums to the run total', async () => {
+    // The exact case the reviewer flagged: a second session on a DIFFERENT model must appear in the
+    // run's "actual" mix, and the breakdown must still sum to the reported total.
+    const reviewed = manifest({
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        agent: { tool: null, model: null, effort: null, maxRounds: 2 },
+      },
+    });
+    const h = harness({ manifest: reviewed });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    // The build turn: Opus.
+    h.claude.complete('done', {
+      inputTokens: 100,
+      costUsd: 0.5,
+      modelUsage: { 'claude-opus-4-8': mix({ inputTokens: 100, costUSD: 0.5 }) },
+    });
+    // Wait for the reviewer session.
+    for (let i = 0; i < 100 && h.claude.opts?.runId !== 'run_1:review'; i++) await flush();
+    expect(h.claude.opts?.runId).toBe('run_1:review');
+    h.claude.emitText('Judged the diff.\nVERDICT: PASS');
+    // The reviewer turn: Sonnet — a real, different model spending real tokens.
+    h.claude.complete('done', {
+      inputTokens: 20,
+      costUsd: 0.1,
+      modelUsage: { 'claude-sonnet-4-5': mix({ inputTokens: 20, costUSD: 0.1 }) },
+    });
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    // The terminal report carries BOTH models, summing to the run total.
+    const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
+    const runMix = terminal?.telemetry?.modelUsage;
+    expect(Object.keys(runMix ?? {}).sort()).toEqual(['claude-opus-4-8', 'claude-sonnet-4-5']);
+    expect(terminal?.telemetry?.inputTokens).toBe(120);
+    const summed = Object.values(runMix ?? {}).reduce((a, u) => a + u.inputTokens, 0);
+    expect(summed).toBe(terminal?.telemetry?.inputTokens);
+    // And the returned exit agrees with what was reported.
+    expect(exit.telemetry.modelUsage).toEqual(runMix);
+  });
+
+  it('a codex build + a claude reviewer reports NO mix — never a partial one', async () => {
+    const reviewed = manifest({
+      tool: 'codex',
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        agent: { tool: 'claude', model: null, effort: null, maxRounds: 2 },
+      },
+    });
+    const h = harness({ manifest: reviewed });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    // Codex build: spend, but no per-model mix (the driver cannot attribute it).
+    h.codex.complete('done', { inputTokens: 200 });
+    for (let i = 0; i < 100 && h.claude.opts?.runId !== 'run_1:review'; i++) await flush();
+    expect(h.claude.opts?.runId).toBe('run_1:review');
+    h.claude.emitText('Judged the diff.\nVERDICT: PASS');
+    h.claude.complete('done', {
+      inputTokens: 20,
+      modelUsage: { 'claude-sonnet-4-5': mix({ inputTokens: 20 }) },
+    });
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
+    expect(terminal?.telemetry?.inputTokens).toBe(220); // totals count both
+    expect(terminal?.telemetry?.modelUsage).toBeUndefined(); // but the mix is not reported
+  });
+
+  it('persists the run mix into the park and re-seeds it on resume, still summing', async () => {
+    const h = harness({ parkState: { blocked: true, question: 'Which API?' } });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done', {
+      inputTokens: 100,
+      costUsd: 0.5,
+      modelUsage: { 'claude-opus-4-8': mix({ inputTokens: 100, costUSD: 0.5 }) },
+    });
+    await done;
+    const parked = await h.parked.get('run_1');
+    // The park carries the per-model breakdown, not just the aggregate.
+    expect(parked!.spent.modelUsage).toEqual({ 'claude-opus-4-8': mix({ inputTokens: 100, costUSD: 0.5 }) });
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use v2.');
+    await flush();
+    h.claude.complete('done', {
+      outputTokens: 10,
+      costUsd: 0.1,
+      modelUsage: { 'claude-opus-4-8': mix({ outputTokens: 10, costUSD: 0.1 }) },
+    });
+    const exit = await resumed;
+    // Opus spend from both sittings, merged; the mix still sums to the run total.
+    expect(exit!.telemetry.modelUsage?.['claude-opus-4-8']).toEqual(
+      mix({ inputTokens: 100, outputTokens: 10, costUSD: 0.6 }),
+    );
+    const total = exit!.telemetry;
+    const summed = Object.values(total.modelUsage ?? {}).reduce(
+      (a, u) => a + u.inputTokens + u.outputTokens,
+      0,
+    );
+    expect(summed).toBe(total.inputTokens + total.outputTokens);
   });
 });

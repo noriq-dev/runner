@@ -1,4 +1,4 @@
-import type { AgentTool, RunKind, RunnerConfig } from '@noriq-dev/shared';
+import type { AgentTool, RunKind, RunModelMix, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
@@ -40,6 +40,41 @@ export function shouldForwardRunStatus(
   rep: Pick<RunReport, 'status' | 'worktreePath' | 'agentId' | 'exit'>,
 ): boolean {
   return previous !== rep.status || rep.worktreePath != null || rep.exit != null || rep.agentId != null;
+}
+
+/**
+ * The telemetry frame's spend fields for a report (RUN-22/59). Extracted and exported for the same
+ * reason shouldForwardRunStatus is: the null-vs-clear semantics of `modelUsage` are exactly the kind
+ * of subtlety that ships wrong and silently.
+ *
+ * `modelUsage` is a TRI-STATE, and deliberately NOT plain null-means-no-news like the others:
+ *   - a mix object   → the authoritative per-model breakdown; it sums to the totals on this frame.
+ *   - `{}`           → telemetry IS present but cannot be attributed by model (a codex session, the
+ *                      claude usage-fallback, or a run whose sessions no longer all report a mix). An
+ *                      EXPLICIT clear the server must STORE — because a stale mix from an earlier,
+ *                      then-complete frame must not outlive the spend it no longer sums to. `null`
+ *                      cannot express this: the server COALESCEs null as "keep", which would pin the
+ *                      stale mix beside a climbing total forever (the exact bug this exists to remove).
+ *   - `null`         → no news — a phase-only tick with no telemetry at all; COALESCE keeps what is
+ *                      stored, so a "verifying" tick never wipes the spend or the mix.
+ *
+ * The key invariant: every frame that carries telemetry carries the mix's CURRENT truth (object or
+ * `{}`), so the stored mix always reflects the last spend-bearing frame — never a retraction that
+ * `null` silently swallowed.
+ */
+export function telemetryFrame(rep: Pick<RunReport, 'telemetry'>): {
+  tokensUsed: number | null;
+  usdSpent: number | null;
+  modelUsage: RunModelMix | null;
+} {
+  if (!rep.telemetry) return { tokensUsed: null, usdSpent: null, modelUsage: null };
+  return {
+    tokensUsed: totalTokens(rep.telemetry),
+    usdSpent: rep.telemetry.costUsd,
+    // `?? {}`, never `?? null`: an unattributable telemetry frame CLEARS a stored mix rather than
+    // leaving it stale under COALESCE. Only the no-telemetry branch above sends null (no news).
+    modelUsage: rep.telemetry.modelUsage ?? {},
+  };
 }
 
 export interface DaemonHandle {
@@ -185,9 +220,10 @@ export class Daemon {
         // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
         // say "verifying" without claiming the spend is zero.
         if (rep.telemetry || rep.phase) {
+          // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
+          // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
           held.ws?.sendTelemetry(runId, {
-            tokensUsed: rep.telemetry ? totalTokens(rep.telemetry) : null,
-            usdSpent: rep.telemetry ? rep.telemetry.costUsd : null,
+            ...telemetryFrame(rep),
             logTail: rep.logTail ?? null,
             phase: rep.phase ?? null,
           });

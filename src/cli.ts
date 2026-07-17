@@ -38,6 +38,10 @@ auth options:
   --browser        Force the browser flow (loopback + PKCE)
   --device         Force the device-code flow — for a box with no browser (SSH, CI)
 
+init-project options:
+  --advanced       Also curate the advanced options (per-kind model/effort defaults);
+                   without it, one trailing question offers the same fork
+
 Environment:
   NORIQ_TOKEN      A token to use as-is; overrides the stored credentials.
   NORIQ_NO_BROWSER Set to force the device flow, as --device does.
@@ -50,6 +54,7 @@ interface ParsedArgs {
   logLevel?: string;
   server?: string;
   authMode: AuthMode;
+  advanced: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -58,6 +63,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let logLevel: string | undefined;
   let server: string | undefined;
   let authMode: AuthMode = 'auto';
+  let advanced = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--config') configPath = argv[++i];
@@ -65,12 +71,13 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === '--server') server = argv[++i];
     else if (arg === '--device') authMode = 'device';
     else if (arg === '--browser') authMode = 'browser';
+    else if (arg === '--advanced') advanced = true;
     else if (arg === '--version' || arg === '-v') positional.push('version');
     else if (arg === '--help' || arg === '-h') positional.push('help');
     else if (arg?.startsWith('-')) throw new Error(`unknown option: ${arg}`);
     else if (arg) positional.push(arg);
   }
-  return { command: positional[0] ?? 'help', configPath, logLevel, server, authMode };
+  return { command: positional[0] ?? 'help', configPath, logLevel, server, authMode, advanced };
 }
 
 /** The server to talk to: --server wins, else the machine config's. */
@@ -209,7 +216,7 @@ export async function run(argv: string[]): Promise<number> {
       case 'init-project':
         // Marks the repo the user is standing in — cwd is the input, so there is no path
         // argument to get wrong (RUN-56).
-        await runInitProject({ configPath: args.configPath });
+        await runInitProject({ configPath: args.configPath, advanced: args.advanced });
         return 0;
       case 'update':
         return await cmdUpdate();

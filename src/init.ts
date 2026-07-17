@@ -245,7 +245,8 @@ export async function runInit(deps: InitDeps = {}): Promise<InitResult> {
       out('  Found no repos under:');
       for (const r of config.scanRoots) out(`    ${r}`);
       out('');
-      out('  A repo opts in by committing .noriq/project.toml — see project.toml.example.');
+      out('  A repo opts in by committing .noriq/project.toml. Run `noriq-runner init-project`');
+      out('  from inside a repo to generate one — no hand-edited TOML.');
       out('  Nothing can be dispatched here until at least one exists.');
     }
 

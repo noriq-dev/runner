@@ -78,9 +78,13 @@ export {
   renderProjectManifest,
   runInitProject,
   scanRootWarning,
+  type DefaultsChoice,
   type Ecosystem,
   type InitProjectDeps,
   type InitProjectResult,
+  type KindDefaultChoice,
+  type LandChoices,
+  type ManifestChoices,
 } from './init-project';
 export { detectTools } from './tools';
 export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
@@ -119,6 +123,7 @@ export {
   type DriverTelemetry,
   type DriverExit,
   type DriverOutcome,
+  type ModelUsage,
   zeroTelemetry,
 } from './drivers/types';
 export {
@@ -142,9 +147,12 @@ export {
 export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from './drivers/budget';
 export {
   RunSupervisor,
+  RunTally,
   assemblePrompt,
   cmdVerify,
   mergeBudget,
+  mergeModelUsage,
+  telemetryFromSpent,
   type RunSupervisorDeps,
   type ResolvedRepo,
   type RunReport,
