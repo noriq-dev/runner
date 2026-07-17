@@ -475,10 +475,13 @@ describe('Noriq MCP wiring', () => {
         'mcp__noriq__set_agent_identity',
         'mcp__noriq__get_task',
         'mcp__noriq__claim_task',
-        'mcp__noriq__release_task',
         'mcp__noriq__post_comment',
       ]),
     );
+    // But NOT release_task (RUN-83): a build agent claims and works, but the RUN's terminal
+    // outcome moves the task onward (gate passed → review, failed → failed), not the agent —
+    // which is what stops a gate-failed task stranding in `review`.
+    expect(p.allowedTools).not.toContain('mcp__noriq__release_task');
   });
 
   it('scopes Noriq access per kind, not blanket', () => {

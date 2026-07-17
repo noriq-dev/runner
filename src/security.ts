@@ -137,12 +137,17 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     'add_dependency',
     'remove_dependency',
   ],
+  // No release_task (RUN-83): a build agent claims its anchor task (→ in_progress) and works,
+  // but it does NOT move the task onward — the RUN's terminal outcome does, server-side. The
+  // agent used to call release_task(review) when it finished, which happened BEFORE the daemon's
+  // verify/reviewer gate ran; a gate FAILURE then left the task stranded in `review`,
+  // indistinguishable from work genuinely awaiting a human. Now the task stays in_progress
+  // through the gate and transitionRun sets it: gate passed → review, gate failed → failed.
   build: [
     'set_agent_identity',
     'get_briefing',
     'get_task',
     'claim_task',
-    'release_task',
     'post_comment',
     'read_open_comments',
     'resolve_comment',
