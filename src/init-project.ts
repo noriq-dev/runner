@@ -229,9 +229,21 @@ export interface LandChoices {
 export interface PermissionChoices {
   /** EXTRA build allow rules, appended to the ecosystem-derived set — never replacing it. */
   buildAllow: string[];
-  /** Per-kind deny rules. Deny outranks everything, including `auto`. */
+  /** Per-kind deny rules. Deny outranks everything on Claude (disallowedTools), `auto`
+   *  included; it binds NOTHING on codex, which gates by sandbox level rather than per
+   *  command (see `mapSandbox`). The wizard says so before asking — a rule that silently
+   *  stops nothing on half the drivers is exactly the false claim this tier must not write. */
   deny: Record<RunKind, string[]>;
-  /** Per-kind egress. Default 'restricted' — the floor quick mode writes. */
+  /**
+   * Per-kind egress. Default 'restricted' — the floor quick mode writes.
+   *
+   * DECLARED, NOT ENFORCED: no driver reads `network` today, so an agent gets whatever egress
+   * the daemon has whatever this says. The key is offered anyway — it is in the committed
+   * schema, `restricted` is already written for every kind by quick mode, and a repo recording
+   * the egress it INTENDS is what makes enforcement adoptable rather than a flag day. But the
+   * wizard states the gap at the moment of choosing rather than letting someone walk away
+   * believing `none` is a firewall. See the alert filed against this task.
+   */
   network: Record<RunKind, NetworkPolicy>;
 }
 
@@ -437,6 +449,17 @@ export function renderProjectManifest(m: ManifestChoices): string {
     '# Per-kind security floor. These are the safe defaults: scope and verify are READ-ONLY,',
     '# build gets write in its own worktree. No agent ever gets push credentials — that is',
     '# enforced by the daemon and is not expressible here.',
+    '#',
+    '# What each key below is actually worth today — because a policy that reads as a control',
+    '# and is only an intention is worse than no key at all:',
+    '#   write   : ENFORCED. Claude withholds the edit tools; codex gets a read-only sandbox.',
+    '#   allow   : ENFORCED on Claude (allowedTools). Codex gates by sandbox level, not per',
+    '#             command, so these rules do not narrow a codex run.',
+    '#   deny    : ENFORCED on Claude (disallowedTools, outranking `auto`). NOT on codex, for',
+    '#             the same reason as `allow` — a denied command still runs there.',
+    '#   network : DECLARED, NOT ENFORCED. No driver reads it: an agent gets whatever egress',
+    '#             the daemon process has, whatever this says. It records intent until the',
+    '#             runner can isolate a run at the network layer. Do not rely on it.',
   );
   const perms = m.permissions ?? null;
   // The write axis is rendered, never chosen: read-only scope/verify and a build that writes its
@@ -448,8 +471,8 @@ export function renderProjectManifest(m: ManifestChoices): string {
     lines.push(`[permissions.${kind}]`, `write = ${kind === 'build'}`);
     if (network === 'full') {
       lines.push(
-        '# CHOSEN: unrestricted egress — anything this agent can read, it can also send',
-        '# anywhere. The allowlist below bounds what it can RUN, not where bytes go.',
+        '# CHOSEN: unrestricted egress. Note this is the value that becomes a no-op the day the',
+        '# key starts being enforced — the other two are the ones that will bite.',
       );
     }
     lines.push(`network = ${tomlString(network)}`);
@@ -467,7 +490,8 @@ export function renderProjectManifest(m: ManifestChoices): string {
     const deny = perms?.deny[kind] ?? [];
     if (deny.length) {
       lines.push(
-        '# Deny outranks everything, including `auto` and the rules above.',
+        '# Deny outranks everything on Claude, including `auto` and the rules above. On codex it',
+        '# binds nothing — see the key legend at the top of this section.',
         `deny = [${deny.map(tomlString).join(', ')}]`,
       );
     }
@@ -649,7 +673,7 @@ const permissionsSection: AdvancedSection = {
   async run({ ask, out }, choices) {
     out('  The floor is not a question here: scope and verify are READ-ONLY, build writes its');
     out('  own worktree, and no agent ever holds push credentials. What you can curate is what');
-    out('  build may RUN, what no kind may run, and where bytes may go.');
+    out('  build may RUN, what no kind may run, and what egress you mean each kind to have.');
     out('');
 
     // Appended, never replacing: the derived set is what makes the suggested verify command
@@ -684,8 +708,20 @@ const permissionsSection: AdvancedSection = {
       verify: 'restricted',
     };
     out('');
-    out('  Now per kind: egress, then anything to deny outright. Deny outranks every allow');
-    out('  rule above. Enter keeps the floor.');
+    out('  Now per kind: egress, then anything to deny outright. Enter keeps the floor.');
+    out('');
+    // Say what each key is worth BEFORE it is chosen. A wizard that walks someone through
+    // picking `network = "none"` while no driver reads the key has not configured anything —
+    // it has talked them into believing something false, in a file their teammates inherit.
+    // That is the failure RUN-65 exists to prevent, pointed at the wizard's own prose.
+    out('  Before you choose: `deny` binds on Claude (it maps to disallowedTools and outranks');
+    out('  everything). It does NOT bind on codex — codex gates by sandbox level, not per');
+    out('  command — so a deny rule there records intent and stops nothing.');
+    out('');
+    out('  And `network` is DECLARED, NOT ENFORCED today: no driver reads it. An agent gets');
+    out('  whatever egress this daemon has, whichever value you pick. It is worth recording');
+    out('  what you INTEND — the key is in the schema and enforcement is a known gap — but do');
+    out('  not leave here believing `none` firewalls anything. It does not, yet.');
     for (const kind of RunKind.options) {
       out('');
       for (;;) {
@@ -695,19 +731,20 @@ const permissionsSection: AdvancedSection = {
         if (!answer) break; // Enter keeps the floor; `restricted` is already the initial value
         const parsed = NetworkPolicy.safeParse(answer);
         if (!parsed.success) {
-          out('  ✗ none (no egress at all) or restricted — or type `full` out to see what it means.');
+          out('  ✗ none or restricted — or type `full` out to see what it means.');
           continue;
         }
-        // `full` parses, and is deliberately absent from the question: it is the one value here
-        // that cannot be walked back by any rule below it. Offering it in the prompt would make
-        // it a menu item; making it typed keeps it a decision, and the decision gets its reason
-        // stated at the moment it is made rather than in a doc nobody opened.
+        // `full` parses, and is deliberately absent from the question: of the three it is the
+        // only one that can never become MORE restrictive later, so it is the only one whose
+        // meaning changes the day enforcement lands. Offering it in the prompt would make it a
+        // menu item; making it typed keeps it a decision.
         if (parsed.data === 'full') {
-          out('  ⚠ `full` is not offered, only accepted: unrestricted egress means anything this');
-          out('    agent can read — your source, your .env, whatever the allowlist lets it run —');
-          out('    it can also send anywhere. `restricted` reaches the model API and the package');
-          out('    registries, which is what a build actually needs. See THREAT-MODEL.md.');
-          const sure = (await ask(`  Really give ${kind} unrestricted egress? (y/N)`, 'N')).toLowerCase();
+          out('  ⚠ `full` is not offered, only accepted. Not because it does something dangerous');
+          out('    today — nothing reads this key, so it does nothing at all. Because it is the');
+          out('    one value that will still be doing nothing once the runner CAN isolate a run:');
+          out('    `none` and `restricted` start biting, `full` opts this kind out forever, and');
+          out('    nobody will re-read this file to notice. See THREAT-MODEL.md.');
+          const sure = (await ask(`  Really declare ${kind} unrestricted egress? (y/N)`, 'N')).toLowerCase();
           if (sure !== 'y' && sure !== 'yes') continue;
         }
         network[kind] = parsed.data;

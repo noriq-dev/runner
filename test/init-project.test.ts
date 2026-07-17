@@ -818,10 +818,50 @@ describe('runInitProject', () => {
     expect(parsed.permissions.scope.network).toBe('full');
     const text = lines.join('\n');
     expect(text).toMatch(/not offered, only accepted/);
-    expect(text).toMatch(/send anywhere/); // what it means, said where it is chosen
     expect(text).toMatch(/THREAT-MODEL/);
     // And the file says it was chosen, so a reader of the commit knows it was not a default.
     expect(await readFile(res.manifestPath, 'utf8')).toMatch(/# CHOSEN: unrestricted egress/);
+  });
+
+  // The wizard's own honesty (RUN-65). `network` is read by NO driver — grep `profile.network`
+  // in src/drivers — and `mapSandbox` consumes only write/auto, so codex ignores `deny`. The
+  // wizard writes both keys anyway (they are in the committed schema, and quick mode has always
+  // written `network = "restricted"`), so what it must never do is claim they bite. A wizard
+  // that talks someone into believing `none` is a firewall has not configured a security
+  // control; it has written a falsehood into a file their teammates inherit.
+
+  it('never claims `none` is a firewall — the unenforced key is named as such (RUN-65)', async () => {
+    const lines: string[] = [];
+    await run([...PERMS_PREFIX, '', 'none', '', '', '', '', '', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    const text = lines.join('\n');
+    expect(text).toMatch(/DECLARED, NOT ENFORCED/);
+    expect(text).toMatch(/no driver reads it/i);
+    // The specific false promise the first draft made, and must never make again.
+    expect(text).not.toMatch(/no egress at all/);
+  });
+
+  it('tells you `deny` does not bind on codex before asking for deny rules (RUN-65)', async () => {
+    const lines: string[] = [];
+    await run([...PERMS_PREFIX, '', '', 'Bash(curl:*)', '', '', '', '', '', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    expect(lines.join('\n')).toMatch(/does NOT bind on codex|not bind on codex/i);
+  });
+
+  it('the committed file carries the enforcement legend, not just the session (RUN-65)', async () => {
+    // The manifest outlives the wizard session by years and travels to people who never ran it.
+    // A caveat that exists only in scrollback is a caveat that does not exist.
+    const res = await run(['ACME', 'claude', '', '']); // quick mode — it writes `network` too
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).toMatch(/network : DECLARED, NOT ENFORCED/);
+    expect(toml).toMatch(/deny.*ENFORCED on Claude[\s\S]*NOT on codex/);
+    expect(toml).toMatch(/write.*: ENFORCED/);
+    // Still a valid manifest — the legend is comments, and the keys mean what the schema says.
+    expect(ProjectManifest.parse(parseToml(toml)).permissions.build.network).toBe('restricted');
   });
 
   it('declining the `full` confirmation re-asks rather than widening egress (RUN-65)', async () => {

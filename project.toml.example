@@ -183,12 +183,20 @@ cmd = "npm run typecheck && npm test"
 # gate passed. A build agent running `git push` in its worktree has no credentials
 # and no way to get them.)
 #   write   : may the agent edit files in its worktree?
-#   network : "restricted" (default) | "none" | "full" — egress policy the driver
-#             maps onto the CLI sandbox.
+#   network : "restricted" (default) | "none" | "full" — the egress you INTEND this
+#             kind to have. DECLARED, NOT ENFORCED: no driver reads this key today,
+#             so an agent gets whatever egress the daemon process has, whatever you
+#             write here. Record the intent — it is what makes enforcement adoptable
+#             when the runner can isolate a run at the network layer — but do not
+#             mistake "none" for a firewall. It is not one yet.
 #   allow   : extra allowlist rules handed to the driver, e.g. "Bash(npm test:*)".
 #             Build needs its bash allowlist here — bare `Bash` is never granted
-#             unless you opt the kind into `auto` (below).
-#   deny    : explicit deny rules. Deny outranks everything, INCLUDING auto.
+#             unless you opt the kind into `auto` (below). ENFORCED on Claude
+#             (allowedTools); codex gates by sandbox LEVEL, not per command, so
+#             these rules do not narrow a codex run.
+#   deny    : explicit deny rules. On Claude they outrank everything, INCLUDING auto.
+#             On codex they bind nothing, for the same reason `allow` does not — a
+#             denied command still runs there. See `mapSandbox` in drivers/codex.ts.
 #   auto    : opt this kind into the driver's own AUTO mode (RUN-68) — Claude's
 #             bypass-permissions / codex's unsandboxed full access — instead of the
 #             curated allowlist. Default false, and the default is the floor; this
