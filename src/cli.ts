@@ -40,8 +40,8 @@ auth options:
 
 init-project options:
   --advanced       Also curate the advanced options (per-kind model/effort defaults, the
-                   [land] envelope, build allow/deny rules and egress, the default
-                   branch); without it, one trailing question offers the same fork
+                   [land] envelope, build allow/deny rules, the default branch);
+                   without it, one trailing question offers the same fork
 
 Environment:
   NORIQ_TOKEN      A token to use as-is; overrides the stored credentials.

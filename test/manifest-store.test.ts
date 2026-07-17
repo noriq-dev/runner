@@ -45,6 +45,39 @@ function spyLogger() {
   };
 }
 
+describe('a manifest written before RUN-88 still loads', () => {
+  // `network` was in the schema — and written into EVERY manifest init-project generated — for a
+  // year before RUN-88 removed it as unenforced. Those files are committed, in repos on disk, and
+  // nobody is going to edit them because a runner upgraded. zod strips unknown keys rather than
+  // rejecting, so the removal is a non-event at parse; this pins that, because the failure mode if
+  // it were wrong is every pre-RUN-88 repo silently losing its marker and going undispatchable.
+  it('ignores the removed `network` key instead of refusing the file (RUN-88)', async () => {
+    await write(`
+key = "PROJ"
+[verify]
+cmd = "npm test"
+[permissions.scope]
+write = false
+network = "none"
+[permissions.build]
+write = true
+network = "restricted"
+allow = ["Bash(npm test:*)"]
+[permissions.verify]
+write = false
+network = "full"
+`);
+    const loaded = await loadManifest(dir);
+    expect(loaded?.key).toBe('PROJ');
+    // The floor still means what it says, and the dead key is simply gone from the parsed value.
+    expect(loaded?.permissions.scope.write).toBe(false);
+    expect(loaded?.permissions.build.write).toBe(true);
+    expect(loaded?.permissions.build.allow).toEqual(['Bash(npm test:*)']);
+    expect(loaded?.permissions.scope).not.toHaveProperty('network');
+    await write(BASE);
+  });
+});
+
 describe('the committed marker is re-read per run (no restart)', () => {
   it('picks up an edit without anything restarting', async () => {
     await write(BASE);
@@ -133,9 +166,9 @@ describe('changedSections', () => {
     defaultBranch: null,
     land: null,
     permissions: {
-      scope: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
-      build: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
-      verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
+      scope: { write: false, allow: [], deny: [], auto: false },
+      build: { write: true, allow: [], deny: [], auto: false },
+      verify: { write: false, allow: [], deny: [], auto: false },
     },
     // No per-kind model/effort: this repo takes whatever the tool defaults to (RUN-33).
     defaults: {

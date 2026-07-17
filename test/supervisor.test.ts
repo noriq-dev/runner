@@ -210,7 +210,6 @@ class FakeWorktrees {
 
 const perm = (write: boolean): PermissionProfile => ({
   write,
-  network: 'restricted',
   allow: [],
   deny: [],
   auto: false,

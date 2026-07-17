@@ -2,7 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { AgentTool, NetworkPolicy, RunEffort, RunKind } from '@noriq-dev/shared';
+import { AgentTool, RunEffort, RunKind } from '@noriq-dev/shared';
 import { loadRunnerConfig } from './config';
 import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
@@ -234,17 +234,10 @@ export interface PermissionChoices {
    *  command (see `mapSandbox`). The wizard says so before asking — a rule that silently
    *  stops nothing on half the drivers is exactly the false claim this tier must not write. */
   deny: Record<RunKind, string[]>;
-  /**
-   * Per-kind egress. Default 'restricted' — the floor quick mode writes.
-   *
-   * DECLARED, NOT ENFORCED: no driver reads `network` today, so an agent gets whatever egress
-   * the daemon has whatever this says. The key is offered anyway — it is in the committed
-   * schema, `restricted` is already written for every kind by quick mode, and a repo recording
-   * the egress it INTENDS is what makes enforcement adoptable rather than a flag day. But the
-   * wizard states the gap at the moment of choosing rather than letting someone walk away
-   * believing `none` is a firewall. See the alert filed against this task.
-   */
-  network: Record<RunKind, NetworkPolicy>;
+  // No `network` here (RUN-88): the key is gone from the schema. This wizard used to ask for it
+  // behind three lines of apology explaining that nothing read it — which is the tell. A question
+  // that has to talk the person answering it out of believing their answer is a question that
+  // should not be asked. It returns with RUN-53's container boundary, enforced.
 }
 
 /**
@@ -457,9 +450,10 @@ export function renderProjectManifest(m: ManifestChoices): string {
     '#             command, so these rules do not narrow a codex run.',
     '#   deny    : ENFORCED on Claude (disallowedTools, outranking `auto`). NOT on codex, for',
     '#             the same reason as `allow` — a denied command still runs there.',
-    '#   network : DECLARED, NOT ENFORCED. No driver reads it: an agent gets whatever egress',
-    '#             the daemon process has, whatever this says. It records intent until the',
-    '#             runner can isolate a run at the network layer. Do not rely on it.',
+    '#',
+    '# There is no egress key. An agent gets whatever network this daemon has, and nothing you',
+    '# can write here changes that — so nothing here pretends to. Isolate a run at the network',
+    '# layer and the key comes back enforced (RUN-53).',
   );
   const perms = m.permissions ?? null;
   // The write axis is rendered, never chosen: read-only scope/verify and a build that writes its
@@ -467,15 +461,7 @@ export function renderProjectManifest(m: ManifestChoices): string {
   // move it (RUN-65). Everything else below is written only where it differs from that floor.
   RunKind.options.forEach((kind, i) => {
     if (i > 0) lines.push('');
-    const network = perms?.network[kind] ?? 'restricted';
     lines.push(`[permissions.${kind}]`, `write = ${kind === 'build'}`);
-    if (network === 'full') {
-      lines.push(
-        '# CHOSEN: unrestricted egress. Note this is the value that becomes a no-op the day the',
-        '# key starts being enforced — the other two are the ones that will bite.',
-      );
-    }
-    lines.push(`network = ${tomlString(network)}`);
     if (kind === 'build') {
       // Bare `Bash` is never granted, so without this a build agent cannot run the verify command
       // above. The empty case is left explicit rather than omitted: an empty allowlist is a real
@@ -663,17 +649,18 @@ export function refuseAllowRule(rule: string): string | null {
 }
 
 /**
- * Section C: the curatable [permissions] slice (RUN-65) — the extra build rules and the egress
- * policy a real repo hand-edits in after its first failed run, and nothing else. The floor
- * itself (`write`) is never asked, and `auto` is never offered: this section curates the
- * allowlist, it does not "configure your sandbox".
+ * Section C: the curatable [permissions] slice (RUN-65) — the extra build rules a real repo
+ * hand-edits in after its first failed run, and nothing else. The floor itself (`write`) is
+ * never asked, and `auto` is never offered: this section curates the allowlist, it does not
+ * "configure your sandbox". It curated egress too until RUN-88 established there was no egress
+ * to curate.
  */
 const permissionsSection: AdvancedSection = {
-  title: 'Build allowlist, deny rules & egress — [permissions]',
+  title: 'Build allowlist & deny rules — [permissions]',
   async run({ ask, out }, choices) {
     out('  The floor is not a question here: scope and verify are READ-ONLY, build writes its');
     out('  own worktree, and no agent ever holds push credentials. What you can curate is what');
-    out('  build may RUN, what no kind may run, and what egress you mean each kind to have.');
+    out('  build may RUN, and what no kind may run.');
     out('');
 
     // Appended, never replacing: the derived set is what makes the suggested verify command
@@ -702,54 +689,19 @@ const permissionsSection: AdvancedSection = {
     }
 
     const deny: Record<RunKind, string[]> = { scope: [], build: [], verify: [] };
-    const network: Record<RunKind, NetworkPolicy> = {
-      scope: 'restricted',
-      build: 'restricted',
-      verify: 'restricted',
-    };
     out('');
-    out('  Now per kind: egress, then anything to deny outright. Enter keeps the floor.');
+    out('  Now per kind: anything to deny outright. Enter keeps the floor.');
     out('');
-    // Say what each key is worth BEFORE it is chosen. A wizard that walks someone through
-    // picking `network = "none"` while no driver reads the key has not configured anything —
-    // it has talked them into believing something false, in a file their teammates inherit.
-    // That is the failure RUN-65 exists to prevent, pointed at the wizard's own prose.
+    // Say what the key is worth BEFORE it is chosen — a wizard that walks someone through
+    // configuring something inert has not configured anything, it has talked them into
+    // believing something false, in a file their teammates inherit. That is the failure RUN-65
+    // exists to prevent, pointed at the wizard's own prose. RUN-88 removed the egress question
+    // that used to lead this section rather than keep apologising for it in three lines.
     out('  Before you choose: `deny` binds on Claude (it maps to disallowedTools and outranks');
     out('  everything). It does NOT bind on codex — codex gates by sandbox level, not per');
     out('  command — so a deny rule there records intent and stops nothing.');
-    out('');
-    out('  And `network` is DECLARED, NOT ENFORCED today: no driver reads it. An agent gets');
-    out('  whatever egress this daemon has, whichever value you pick. It is worth recording');
-    out('  what you INTEND — the key is in the schema and enforcement is a known gap — but do');
-    out('  not leave here believing `none` firewalls anything. It does not, yet.');
     for (const kind of RunKind.options) {
       out('');
-      for (;;) {
-        const answer = (await ask(`  ${kind}: network — none | restricted`, 'restricted'))
-          .trim()
-          .toLowerCase();
-        if (!answer) break; // Enter keeps the floor; `restricted` is already the initial value
-        const parsed = NetworkPolicy.safeParse(answer);
-        if (!parsed.success) {
-          out('  ✗ none or restricted — or type `full` out to see what it means.');
-          continue;
-        }
-        // `full` parses, and is deliberately absent from the question: of the three it is the
-        // only one that can never become MORE restrictive later, so it is the only one whose
-        // meaning changes the day enforcement lands. Offering it in the prompt would make it a
-        // menu item; making it typed keeps it a decision.
-        if (parsed.data === 'full') {
-          out('  ⚠ `full` is not offered, only accepted. Not because it does something dangerous');
-          out('    today — nothing reads this key, so it does nothing at all. Because it is the');
-          out('    one value that will still be doing nothing once the runner CAN isolate a run:');
-          out('    `none` and `restricted` start biting, `full` opts this kind out forever, and');
-          out('    nobody will re-read this file to notice. See THREAT-MODEL.md.');
-          const sure = (await ask(`  Really declare ${kind} unrestricted egress? (y/N)`, 'N')).toLowerCase();
-          if (sure !== 'y' && sure !== 'yes') continue;
-        }
-        network[kind] = parsed.data;
-        break;
-      }
       for (;;) {
         const rule = (await ask(`  ${kind}: deny rule (blank = done)`)).trim();
         if (!rule) break;
@@ -761,7 +713,7 @@ const permissionsSection: AdvancedSection = {
       }
     }
 
-    choices.permissions = { buildAllow, deny, network };
+    choices.permissions = { buildAllow, deny };
   },
 };
 
@@ -988,9 +940,9 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     if (!advanced) {
       out('');
       out('  The quick questions are done. Advanced options (per-kind model/effort defaults,');
-      out('  the [land] envelope when auto-landing is on, extra build allow/deny rules and');
-      out('  egress, the default branch) can be curated now, or added to the file by hand');
-      out('  later — it documents them all.');
+      out('  the [land] envelope when auto-landing is on, extra build allow/deny rules, the');
+      out('  default branch) can be curated now, or added to the file by hand later — it');
+      out('  documents them all.');
       const curate = (await ask('  Curate advanced options? (y/N)', 'N')).toLowerCase();
       advanced = curate === 'y' || curate === 'yes';
     }

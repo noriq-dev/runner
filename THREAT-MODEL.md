@@ -228,8 +228,20 @@ change; a human running `npm i -g` is exposed to the same artifact, but at a mom
 - **Read-only for scope is layered, not absolute.** `chmod` + the driver permission
   profile both enforce it; a sandbox escape in the agent CLI is out of the Runner's
   control (it's the CLI vendor's boundary).
-- **Network egress** is `restricted` by profile intent but ultimately governed by
-  the agent CLI's own sandbox — the Runner sets the policy, the CLI enforces it.
+- **Network egress is NOT controlled. An agent has whatever network this daemon has.**
+  There is no knob, and that is the honest state rather than an oversight: a
+  `permissions.*.network` key (`none | restricted | full`) sat in the manifest schema for a
+  year, defaulted to `restricted`, and was read by nothing (RUN-88 removed it). This entry
+  used to say egress was "`restricted` by profile intent but ultimately governed by the agent
+  CLI's own sandbox — the Runner sets the policy, the CLI enforces it." No policy was ever set
+  and no CLI ever enforced one; the sentence described a mechanism that did not exist, which is
+  worse than the gap it was describing. The Claude Agent SDK exposes no egress control at all
+  (denying WebFetch/WebSearch gates *tools*, not the network — an allowlisted `curl` still
+  egresses); codex's sandbox implies coarse egress but cannot express the three levels.
+  Real control needs the container boundary — see RUN-53, which is where the permission model
+  relocates anyway; the key returns there, enforced, or not at all. Until then: if a run must
+  not reach the network, isolate the box. Do not re-add a declared-only key (see the
+  `apply`-key note above — this is the same mistake, and we made it twice).
 - **The MCP-server credential wiring** (how the agent gets Noriq access without the
   token in its shell env) is finalized at the dogfood; `sanitizedAgentEnv` already
   assumes the token reaches the agent over MCP, not the environment.

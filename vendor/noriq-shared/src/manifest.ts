@@ -15,17 +15,31 @@ import { AgentTool, RunBudget, RunEffort } from './runner';
 //     concurrency, and default budget ceilings.
 // ---------------------------------------------------------------------------
 
-// What network access an agent process gets. Enforced by the daemon/driver, not
-// declared for decoration — part of the load-bearing security model.
-export const NetworkPolicy = z.enum(['none', 'restricted', 'full']);
-export type NetworkPolicy = z.infer<typeof NetworkPolicy>;
-
 // A per-kind permission profile. Tool-agnostic *intent*; the driver translates
 // it to claude/codex specifics. `write` gates filesystem mutation in the Run's
 // worktree — the core scope↔build distinction.
+//
+// There is NO `network` key here, and its absence is the design (RUN-88). One existed from
+// Phase 1 — `none | restricted | full`, defaulting to `restricted` on every kind, parsed,
+// validated, written by init-project — and read by NOTHING. The comment above it claimed it was
+// "enforced by the daemon/driver … part of the load-bearing security model"; both clauses were
+// false for its entire life, and this schema IS the security model's documentation, so the lie
+// was the load-bearing part. A reader had every reason to believe `network = "none"` firewalled
+// an agent. It firewalled nothing.
+//
+// Not removed as a wontfix — removed because neither driver can honour it and a key nobody can
+// honour is a false assurance with a security-shaped name. The Claude Agent SDK exposes no egress
+// control at all (tool-gating WebFetch/WebSearch is not network-gating: bash `curl` still walks
+// out). Codex could approximate ONE bit via `sandbox_workspace_write.network_access`, but binding
+// on codex while silently no-opping on the DEFAULT driver is the same false assurance, narrower
+// and harder to notice. Real egress control needs the container boundary — RUN-53 — which is
+// where the permission model relocates anyway. Re-add it THERE, enforced on arrival.
+//
+// This is the same call as UpdatePolicy's missing `apply` key below, and RUN-38's
+// `oauth_tokens.scope` before it: a stored setting nothing consults reads as working, and is
+// worse than an absent one. Do not restore this key ahead of its enforcement.
 export const PermissionProfile = z.object({
   write: z.boolean(),
-  network: NetworkPolicy.default('restricted'),
   allow: z.array(z.string()).default([]), // extra allow rules handed to the driver
   deny: z.array(z.string()).default([]),
   /**
@@ -77,9 +91,9 @@ export type KindDefaults = z.infer<typeof KindDefaults>;
 // No agent ever gets push credentials (enforced by the daemon, not expressible here).
 // A factory (not a shared literal) so each parse gets fresh, non-aliased arrays.
 const defaultPermissions = (): KindPermissions => ({
-  scope: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
-  build: { write: true, network: 'restricted', allow: [], deny: [], auto: false },
-  verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
+  scope: { write: false, allow: [], deny: [], auto: false },
+  build: { write: true, allow: [], deny: [], auto: false },
+  verify: { write: false, allow: [], deny: [], auto: false },
 });
 
 /**

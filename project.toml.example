@@ -183,12 +183,6 @@ cmd = "npm run typecheck && npm test"
 # gate passed. A build agent running `git push` in its worktree has no credentials
 # and no way to get them.)
 #   write   : may the agent edit files in its worktree?
-#   network : "restricted" (default) | "none" | "full" — the egress you INTEND this
-#             kind to have. DECLARED, NOT ENFORCED: no driver reads this key today,
-#             so an agent gets whatever egress the daemon process has, whatever you
-#             write here. Record the intent — it is what makes enforcement adoptable
-#             when the runner can isolate a run at the network layer — but do not
-#             mistake "none" for a firewall. It is not one yet.
 #   allow   : extra allowlist rules handed to the driver, e.g. "Bash(npm test:*)".
 #             Build needs its bash allowlist here — bare `Bash` is never granted
 #             unless you opt the kind into `auto` (below). ENFORCED on Claude
@@ -214,11 +208,19 @@ cmd = "npm run typecheck && npm test"
 #             files, so verify-with-auto weakens "the reviewer never edits" to the
 #             edit-tools layer. Committed file, deliberate choice. See THREAT-MODEL.md.
 #
+# THERE IS NO EGRESS KEY, and its absence is deliberate (RUN-88). A `network` key existed here
+# for a year — "restricted" | "none" | "full", written into every generated manifest — and no
+# driver ever read it: an agent got whatever network the daemon had, whatever the file said.
+# The Claude SDK has no egress control to hand it to, and codex could only honour a fraction of
+# it, so the key was a firewall-shaped word that stopped nothing. Egress control arrives with
+# container-isolated runs (RUN-53) and the key returns then, enforced. Until then the honest
+# statement is this paragraph: agents on this daemon have the daemon's network. Gate egress at
+# the box (or the container) if you need it gated.
+#
 # [permissions.build]
 # auto = true
 [permissions.scope]
 write = false
-network = "restricted"
 
 # DEP BOOTSTRAP (RUN-56): each Run gets a FRESH worktree, and a fresh worktree has no
 # node_modules — without an install rule, `npm test` is allowed but exits 127 (`tsc:
@@ -230,12 +232,10 @@ network = "restricted"
 #                 only if agents changing dependencies is work you actually dispatch.
 [permissions.build]
 write = true
-network = "restricted"
 allow = ["Bash(npm ci:*)", "Bash(npm test:*)", "Bash(npm run build:*)", "Bash(npx tsc:*)"]
 
 [permissions.verify]
 write = false
-network = "restricted"
 # Verify usually inherits deps from the build worktree it reviews, but a STANDALONE
 # verify run starts fresh too. Exact `Bash(npm ci)` (no `:*`) is the safe grant: it
 # cannot touch tracked files, so "executes but never edits" holds even on a driver

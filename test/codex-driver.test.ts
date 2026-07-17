@@ -45,7 +45,6 @@ class FakeTransport implements CodexTransport {
 
 const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
-  network: 'restricted',
   allow: [],
   deny: [],
   auto: false,
