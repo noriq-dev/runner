@@ -56,6 +56,7 @@ const budget = (over: Partial<RunBudget> = {}): RunBudget => ({
   maxTokens: null,
   maxUsd: null,
   maxDurationSeconds: null,
+  maxRounds: null,
   ...over,
 });
 

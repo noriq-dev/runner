@@ -1,4 +1,4 @@
-import type { AgentTool, RunKind, RunModelMix, RunnerConfig } from '@noriq-dev/shared';
+import type { AgentTool, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
@@ -65,7 +65,7 @@ export function shouldForwardRunStatus(
 export function telemetryFrame(rep: Pick<RunReport, 'telemetry'>): {
   tokensUsed: number | null;
   usdSpent: number | null;
-  modelUsage: RunModelMix | null;
+  modelUsage: RunModelUsage | null;
 } {
   if (!rep.telemetry) return { tokensUsed: null, usdSpent: null, modelUsage: null };
   return {

@@ -9,6 +9,7 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
+import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import type { ParkState, RunAgent } from './client';
 import { superviseBudget, totalTokens } from './drivers/budget';
@@ -20,7 +21,7 @@ import type {
   ModelUsage,
   NoriqMcp,
 } from './drivers/types';
-import { UNATTRIBUTED_MODEL_ID, zeroTelemetry } from './drivers/types';
+import { zeroTelemetry } from './drivers/types';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -209,6 +210,9 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
     maxTokens: runBudget?.maxTokens ?? fallback?.maxTokens ?? null,
     maxUsd: runBudget?.maxUsd ?? fallback?.maxUsd ?? null,
     maxDurationSeconds: runBudget?.maxDurationSeconds ?? fallback?.maxDurationSeconds ?? null,
+    // The reviewer-round override (PLNR-180/RUN-91) is the dispatch's alone — the machine fallback
+    // never sets it — but it merges per-dimension like the rest so it survives to the supervisor.
+    maxRounds: runBudget?.maxRounds ?? fallback?.maxRounds ?? null,
   };
 }
 
@@ -253,6 +257,9 @@ export function remainingBudget(budget: RunBudget | null, spent: ParkedRun): Run
     maxTokens: left(budget.maxTokens, spent.spent.tokens),
     maxUsd: budget.maxUsd == null ? null : Math.max(0.01, budget.maxUsd - spent.spent.usd),
     maxDurationSeconds: left(budget.maxDurationSeconds, spent.activeSeconds),
+    // A round count, not a spend remainder — carried over verbatim, never decremented by prior
+    // tokens/time (PLNR-180/RUN-91).
+    maxRounds: budget.maxRounds,
   };
 }
 

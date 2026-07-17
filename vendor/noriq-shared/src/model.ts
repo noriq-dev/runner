@@ -13,6 +13,10 @@ export const TaskStatus = z.enum([
   'review',
   'done',
   'cancelled',
+  // A gate-failed task (0049). A WIRE-only status DERIVED from tasks.failed_at — the DB column
+  // stays within its CHECK (D1 cannot rebuild tasks to widen it; see 0049) — exactly as
+  // RunnerStatus carries 'offboarded', derived from offboarded_at.
+  'failed',
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
 

@@ -28,7 +28,15 @@ export interface BudgetRun {
  * stops the process; the terminal exit's reason is overridden to the breach.
  */
 export function superviseBudget(driver: AgentDriver, startOpts: DriverStartOptions): BudgetRun {
-  const budget: RunBudget = startOpts.budget ?? { maxTokens: null, maxUsd: null, maxDurationSeconds: null };
+  // maxRounds is irrelevant to SIGTERM enforcement here (it caps reviewer rounds, not spend) —
+  // null completes the RunBudget shape without changing any ceiling this function checks.
+  const budget: RunBudget = {
+    maxTokens: null,
+    maxUsd: null,
+    maxDurationSeconds: null,
+    maxRounds: null,
+    ...startOpts.budget,
+  };
   let breach: BudgetBreach | null = null;
   let resolved = false;
   let settle!: (exit: DriverExit) => void;

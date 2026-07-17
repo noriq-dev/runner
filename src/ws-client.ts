@@ -1,5 +1,5 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
-import type { AgentTool, Run, RunKind, RunModelMix, RunPhase, RunStatus } from '@noriq-dev/shared';
+import type { AgentTool, Run, RunKind, RunModelUsage, RunPhase, RunStatus } from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
 
@@ -175,7 +175,7 @@ export class WsClient {
     t: {
       tokensUsed?: number | null;
       usdSpent?: number | null;
-      modelUsage?: RunModelMix | null;
+      modelUsage?: RunModelUsage | null;
       logTail?: string | null;
       phase?: RunPhase | null;
     },

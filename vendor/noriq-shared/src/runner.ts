@@ -33,35 +33,49 @@ export type AgentTool = z.infer<typeof AgentTool>;
  * is wrong for someone no matter which one you pick.
  */
 export const RunEffort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
-export type RunEffort = z.infer<typeof RunEffort>;
 
 /**
- * What ONE model actually spent on a run (RUN-59) — the SDK's own per-model aggregate, keys
- * un-renamed on purpose so the stored facts match what the tool billed from.
+ * What a run ACTUALLY spent, per model (RUN-59). `runs.model` records what the dispatch
+ * ASKED for; this records the reality — an "opus" run already spends real tokens on a haiku
+ * sub-agent (RUN-34 measured it), and only keeping both makes "I asked for opus and got 30%
+ * haiku" visible.
  *
- * `runs.model`/`runs.effort` (RUN-33) record what the DISPATCH asked for; this records what
- * HAPPENED, which is a different fact: a run dispatched as Opus already spends real tokens on a
- * haiku sub-agent the primary path never mentions. Both are worth keeping — "I asked for Opus and
- * got 30% haiku" is only visible if you keep the request AND the reality.
- *
- * All four token classes, not just input/output: the run's totals are computed from all four, so a
- * breakdown that dropped cache tokens would not sum to the number displayed next to it. The tooltip
- * shows input/output/cost; the totals need the rest. Store what the SDK gives; show what the UI needs.
+ * The SDK's own field names, un-renamed and authoritative (it bills from these). ALL FOUR
+ * token classes are kept, not just input/output: the run's displayed totals are computed
+ * from all four, so a per-model breakdown that omitted cache tokens would not sum to the
+ * number shown next to it — a user hovering each model and adding them up must land on the
+ * run total.
  */
-export const RunModelUsage = z.object({
-  inputTokens: z.number().nonnegative(),
-  outputTokens: z.number().nonnegative(),
-  cacheReadInputTokens: z.number().nonnegative(),
-  cacheCreationInputTokens: z.number().nonnegative(),
+export const RunModelMix = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadInputTokens: z.number().int().nonnegative(),
+  cacheCreationInputTokens: z.number().int().nonnegative(),
   costUSD: z.number().nonnegative(),
 });
-export type RunModelUsage = z.infer<typeof RunModelUsage>;
-
-/** The model mix of a run, keyed by the tool's own model id (e.g. 'claude-opus-4-8[1m]'). Null =
- *  the driver could not attribute spend by model (codex today, or an older SDK) — the UI renders
- *  "not reported", never 100% of the requested model, which is exactly the lie RUN-59 removes. */
-export const RunModelMix = z.record(z.string(), RunModelUsage);
 export type RunModelMix = z.infer<typeof RunModelMix>;
+
+/**
+ * The reserved key for spend that could NOT be attributed to a model (RUN-86). A codex session
+ * reports tokens but no per-model split and no cost; the runner used to drop the WHOLE run's mix
+ * over one such session (the all-or-nothing rule that made a Claude build show "not reported"
+ * because its reviewer was codex). Instead it now folds that spend into this one bucket, so the
+ * per-model parts still SUM to the run total — codex's tokens land here at $0 cost, matching that
+ * the run total already books codex at $0. A model can never be named this (the parens make it a
+ * non-id), so a consumer keys on it to render "unattributed" rather than a model.
+ */
+export const UNATTRIBUTED_MODEL_ID = '(unattributed)';
+
+/**
+ * The full mix, keyed by model id (e.g. "claude-opus-4-8"), plus possibly the reserved
+ * `UNATTRIBUTED_MODEL_ID` bucket (RUN-86). Empty/absent = the run reported no spend at all (or a
+ * telemetry-less tick) — THAT is the only "models not reported" case now; a run that spent
+ * anything carries at least the unattributed bucket. Every value's four token classes + cost sum,
+ * across all keys, to the run's displayed totals.
+ */
+export const RunModelUsage = z.record(z.string(), RunModelMix);
+export type RunModelUsage = z.infer<typeof RunModelUsage>;
+export type RunEffort = z.infer<typeof RunEffort>;
 
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
 // terminal ∈ {done, failed, cancelled}. `blocked` = agent parked on request_input.
@@ -115,6 +129,12 @@ export const RunBudget = z.object({
   maxTokens: z.number().int().positive().nullable().default(null),
   maxUsd: z.number().positive().nullable().default(null),
   maxDurationSeconds: z.number().int().positive().nullable().default(null),
+  // A per-dispatch override of the reviewer ROUND budget (PLNR-180/RUN-91) — not a SIGTERM
+  // ceiling like the three above, but the same idea: a cap the run carries instead of leaving to
+  // the daemon's default. Null = the daemon uses its committed manifest `[verify.agent].maxRounds`
+  // (the server never reads that manifest — it stays the repo owner's authority, and clamps this).
+  // Set on a "continue a failed run" dispatch to hand the kept worktree N more reviewer rounds.
+  maxRounds: z.number().int().positive().nullable().default(null),
 });
 export type RunBudget = z.infer<typeof RunBudget>;
 
@@ -162,12 +182,6 @@ export const Run = z.object({
   // a CHECK constraint) would mean a migration every time a model ships.
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
-  // NB (RUN-59): what the run ACTUALLY spent per model — distinct from `model` above (the request)
-  // — is persisted server-side as the `runs.model_usage` JSON column and rides the live
-  // `run.telemetry.modelUsage` frame (see ws.ts). It is deliberately NOT a field on this Run entity
-  // in the runner's vendored contract: the daemon only ever WRITES the mix (via telemetry) and
-  // never reads it back, and adding a defaulted field here would force `modelUsage: null` onto every
-  // Run literal the daemon builds for no runtime gain. The server adds the read-path column itself.
   budget: RunBudget,
   status: RunStatus,
   // Sub-state of `running` (RUN-31) — see RunPhase. Cosmetic by construction: nothing
@@ -179,6 +193,10 @@ export const Run = z.object({
   // work is happening (and the verify agent can reference the checkout). Machine-
   // local path; null until the daemon reports it.
   worktreePath: z.string().nullable().default(null),
+  // What the run actually spent per model (RUN-59) — the persisted runs.model_usage read
+  // path. Null = "not reported" (codex, an old runner, or a driver that can't break spend
+  // down by model). Never confuse with `model` above, which is only what was requested.
+  modelUsage: RunModelUsage.nullable().default(null),
   // Provenance + lifecycle timestamps.
   createdBy: z.string(), // actor id that dispatched the brief
   createdAt: z.string().datetime(),

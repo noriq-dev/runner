@@ -1,4 +1,5 @@
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
+import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
 import type {
@@ -9,7 +10,7 @@ import type {
   DriverTelemetry,
   ModelUsage,
 } from '../src/drivers/types';
-import { UNATTRIBUTED_MODEL_ID, zeroTelemetry } from '../src/drivers/types';
+import { zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
 import { noriqToolNamesFor } from '../src/security';
 import {
@@ -253,13 +254,15 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,
-  budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null },
+  budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null },
   status: 'dispatched',
   // Not yet started, so nothing to report (RUN-31). The daemon sets the phase; the server
   // only ever reads it back to us.
   phase: null,
   exit: null,
   worktreePath: null,
+  // The server's read-path field (RUN-59); the daemon only ever WRITES the mix via telemetry.
+  modelUsage: null,
   createdBy: 'usr_1',
   createdAt: '2026-07-14T00:00:00.000Z',
   updatedAt: '2026-07-14T00:00:00.000Z',
@@ -744,8 +747,8 @@ describe('assemblePrompt inlines the anchor task', () => {
 });
 
 describe('mergeBudget', () => {
-  const machine: RunBudget = { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 };
-  const empty: RunBudget = { maxTokens: null, maxUsd: null, maxDurationSeconds: null };
+  const machine: RunBudget = { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null };
+  const empty: RunBudget = { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null };
 
   it('falls back to the machine ceilings when the Run carries none', () => {
     // The dashboard dispatch form leaves these blank by default — without the
@@ -756,15 +759,21 @@ describe('mergeBudget', () => {
 
   it('lets the Run win per-dimension, not whole-object', () => {
     // Setting only maxUsd must NOT silently drop the machine's token/time ceilings.
-    expect(mergeBudget({ maxTokens: null, maxUsd: 1, maxDurationSeconds: null }, machine)).toEqual({
+    expect(
+      mergeBudget({ maxTokens: null, maxUsd: 1, maxDurationSeconds: null, maxRounds: null }, machine),
+    ).toEqual({
       maxTokens: 500_000,
       maxUsd: 1,
       maxDurationSeconds: 1800,
+      maxRounds: null,
     });
   });
 
   it('honours an explicit Run budget above the machine default (default, not clamp)', () => {
-    expect(mergeBudget({ maxTokens: null, maxUsd: 50, maxDurationSeconds: null }, machine)?.maxUsd).toBe(50);
+    expect(
+      mergeBudget({ maxTokens: null, maxUsd: 50, maxDurationSeconds: null, maxRounds: null }, machine)
+        ?.maxUsd,
+    ).toBe(50);
   });
 
   it('stays unbounded only when nothing is configured anywhere', () => {
@@ -776,7 +785,7 @@ describe('mergeBudget', () => {
 describe('RunSupervisor budget defaults', () => {
   it('runs a budget-less dispatch under the machine ceilings from runner.toml', async () => {
     const { supervisor, claude } = harness({
-      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 },
+      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null },
     });
     const run = supervisor.supervise(makeRun({ kind: 'scope' }));
     await flush();
@@ -784,15 +793,23 @@ describe('RunSupervisor budget defaults', () => {
     await run;
 
     // The whole point: an unbudgeted dispatch must not reach the driver unbounded.
-    expect(claude.opts?.budget).toEqual({ maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 });
+    expect(claude.opts?.budget).toEqual({
+      maxTokens: 500_000,
+      maxUsd: 5,
+      maxDurationSeconds: 1800,
+      maxRounds: null,
+    });
   });
 
   it('still lets an explicit Run budget take precedence', async () => {
     const { supervisor, claude } = harness({
-      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 },
+      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null },
     });
     const run = supervisor.supervise(
-      makeRun({ kind: 'scope', budget: { maxTokens: null, maxUsd: 1, maxDurationSeconds: null } }),
+      makeRun({
+        kind: 'scope',
+        budget: { maxTokens: null, maxUsd: 1, maxDurationSeconds: null, maxRounds: null },
+      }),
     );
     await flush();
     claude.complete('done');
@@ -2082,7 +2099,9 @@ describe('resuming a parked run (RUN-30)', () => {
   it('inherits the REMAINING budget, never a fresh one', async () => {
     // Otherwise "ask a question" is a way to buy more budget, and a run could park its way past
     // any ceiling.
-    const h = await parkFirst({ defaultBudget: { maxTokens: 1000, maxUsd: 5, maxDurationSeconds: 600 } });
+    const h = await parkFirst({
+      defaultBudget: { maxTokens: 1000, maxUsd: 5, maxDurationSeconds: 600, maxRounds: null },
+    });
     h.answerIt();
     const parked = await h.parked.get('run_1');
     expect(parked!.spent.tokens).toBe(42); // what the fake driver burned
@@ -2097,7 +2116,9 @@ describe('resuming a parked run (RUN-30)', () => {
   it('does not charge the run for the time a human took to answer', async () => {
     // Wall-clock counts ACTIVE time only. Charging the wait would mean every question answered
     // after lunch returns to a run that is already dead — a slower way to lose the work.
-    const h = await parkFirst({ defaultBudget: { maxTokens: null, maxUsd: null, maxDurationSeconds: 600 } });
+    const h = await parkFirst({
+      defaultBudget: { maxTokens: null, maxUsd: null, maxDurationSeconds: 600, maxRounds: null },
+    });
     h.answerIt();
     const parked = await h.parked.get('run_1');
     expect(parked!.activeSeconds).toBeLessThan(5); // the test's own runtime, not a wall-clock age
@@ -2471,8 +2492,8 @@ describe('the run model mix (RUN-59)', () => {
     });
 
     it('the reserved bucket key is exactly the wire literal the dashboard renders (RUN-86/87)', () => {
-      // A runner-local mirror of @noriq-dev/shared's UNATTRIBUTED_MODEL_ID until the vendored slice
-      // is refreshed (RUN-87); this pins the byte-identical value that crosses the wire.
+      // Imported straight from the vendored @noriq-dev/shared now (RUN-87 refreshed it); this pins
+      // the byte-identical value the runner emits and the dashboard keys on.
       expect(UNATTRIBUTED_MODEL_ID).toBe('(unattributed)');
     });
   });
