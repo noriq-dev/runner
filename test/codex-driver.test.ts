@@ -163,7 +163,13 @@ describe('CodexDriver', () => {
     // claude driver used to drop. Deltas split mid-word AND at the newline itself.
     const h = harness();
     const fake = h.getFake();
-    for (const text of ['I’ll review the diff.', '\n', 'The changed wizard now.', '\n- High — VCS detec', 'tion.']) {
+    for (const text of [
+      'I’ll review the diff.',
+      '\n',
+      'The changed wizard now.',
+      '\n- High — VCS detec',
+      'tion.',
+    ]) {
       fake.push({ type: 'text', text });
     }
     fake.push({ type: 'turn_complete' });
