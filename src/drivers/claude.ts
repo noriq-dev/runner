@@ -41,6 +41,15 @@ export interface SdkAssistantMessage {
   /** Every SDK message carries it; it is what `resume` takes (RUN-30). */
   session_id?: string;
 }
+/** A raw streaming delta (`includePartialMessages`). Its text_deltas are the model's
+ *  exact token stream — newlines and all — which the assembled `assistant` message loses
+ *  at content-block/turn boundaries (RUN-77). We read text from here and keep the
+ *  assistant message for usage only. Minimal shape; we touch only text_delta. */
+export interface SdkPartialAssistantMessage {
+  type: 'stream_event';
+  event: { type: string; delta?: { type: string; text?: string } };
+  session_id?: string;
+}
 /** The SDK's per-model aggregate (sdk.d.ts `ModelUsage`). The only complete record of what a run
  *  spent — `usage` describes one model's path and silently omits sub-agents. See
  *  telemetryFromResult for the measurements. */
@@ -65,6 +74,7 @@ export interface SdkResultMessage {
 }
 export type SdkMessage =
   | SdkAssistantMessage
+  | SdkPartialAssistantMessage
   | SdkResultMessage
   | { type: 'system'; subtype?: string; session_id?: string }
   | { type: string; session_id?: string };
@@ -105,6 +115,9 @@ export interface SdkQueryOptions {
    * id resumes any number of times.
    */
   resume?: string;
+  /** Emit SDKPartialAssistantMessage stream events — the raw text-delta stream we read
+   *  for a byte-faithful transcript (RUN-77). */
+  includePartialMessages?: boolean;
 }
 export type QueryFn = (args: {
   prompt: AsyncIterable<SdkUserMessage>;
@@ -282,6 +295,11 @@ export class ClaudeDriver implements AgentDriver {
         allowedTools: perm.allowedTools,
         disallowedTools: perm.disallowedTools,
         abortController: abort,
+        // Stream raw text deltas so the transcript is byte-faithful (RUN-77). The assembled
+        // `assistant` message joins content blocks with '' and drops the newlines the model
+        // put between them — invisible in prose but it clumps a whole bulleted review into
+        // one paragraph. The deltas are the exact token stream; we read text from them.
+        includePartialMessages: true,
         // Noriq over the MCP transport: the token rides an Authorization header, so
         // the agent can report its work without the secret ever entering its shell.
         ...(opts.noriqMcp
@@ -341,6 +359,10 @@ export class ClaudeDriver implements AgentDriver {
     let awaitingTurn: ((exit: DriverExit) => void) | null = null;
 
     const live = zeroTelemetry();
+    // Text is streamed byte-faithfully from stream_event deltas (RUN-77); this tracks
+    // whether the current turn produced any, so the assembled assistant message only
+    // supplies text as a fallback (a transport without partial messages, or the tests).
+    let sawDeltaText = false;
     const consume = async () => {
       try {
         for await (const msg of query) {
@@ -349,10 +371,25 @@ export class ClaudeDriver implements AgentDriver {
           // the id shows up on system messages too, i.e. before the first assistant turn.
           const sid = (msg as { session_id?: string }).session_id;
           if (sid) session.sessionId = sid;
+          if (msg.type === 'stream_event') {
+            // The model's exact bytes, delta by delta — the only faithful source for the
+            // transcript. Only text_delta; thinking/tool-input deltas are not agent prose.
+            const ev = (msg as SdkPartialAssistantMessage).event;
+            if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+              sawDeltaText = true;
+              opts.handlers?.onText?.(ev.delta.text);
+            }
+            continue;
+          }
           if (msg.type === 'assistant') {
             const am = msg as SdkAssistantMessage;
-            const text = extractText(am.message.content ?? []);
-            if (text) opts.handlers?.onText?.(text);
+            // Only if the turn streamed no deltas — extractText joins blocks with '' and
+            // drops inter-block newlines, so the deltas are always preferred when present.
+            if (!sawDeltaText) {
+              const text = extractText(am.message.content ?? []);
+              if (text) opts.handlers?.onText?.(text);
+            }
+            sawDeltaText = false;
             const u = am.message.usage;
             if (u) {
               // RUN-34, measured rather than assumed. The old comment here claimed this sum
