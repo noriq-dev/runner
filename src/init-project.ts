@@ -196,6 +196,26 @@ export interface KindDefaultChoice {
 export type DefaultsChoice = Record<RunKind, KindDefaultChoice>;
 
 /**
+ * The [land] envelope beyond `branch` (RUN-64), curated only when quick mode named a branch.
+ * Null = never curated: every knob keeps its schema default and the rendered [land] block is
+ * byte-for-byte what quick mode writes. A curated envelope writes only what differs from those
+ * defaults — widening the envelope is typed, never defaulted, and the committed file shows
+ * exactly what was chosen.
+ */
+export interface LandChoices {
+  /** Default true. False = an unverified diff may reach the branch — permitted, never assumed. */
+  onlyWhenVerifyPasses: boolean;
+  /** Default true: the build agent may resolve MECHANICAL rebase conflicts in its own worktree. */
+  resolveConflicts: boolean;
+  /** Branch globs a DISPATCH may override `branch` with (RUN-41). EMPTY MEANS NO OVERRIDE. */
+  allowedBranches: string[];
+  /** Default false — flipping it crosses the one boundary the daemon otherwise has (RUN-27). */
+  autoPush: boolean;
+  /** Only offered once autoPush is on — the pair is validated before writing (RUN-28). */
+  mergeTarget: string | null;
+}
+
+/**
  * Everything the wizard chose, accumulated across the quick flow and any advanced sections,
  * rendered exactly ONCE at the end. RUN-40's rule 1 (validate before writing) applies to the
  * whole session, not per question — no section writes; sections only fill this in.
@@ -216,6 +236,8 @@ export interface ManifestChoices {
   allow: string[];
   /** Per-kind [defaults] (RUN-62). Null/absent = never curated → the commented guidance block. */
   defaults?: DefaultsChoice | null;
+  /** The [land] envelope (RUN-64). Null/absent = never curated → quick mode's exact block. */
+  land?: LandChoices | null;
 }
 
 export function renderProjectManifest(m: ManifestChoices): string {
@@ -308,15 +330,54 @@ export function renderProjectManifest(m: ManifestChoices): string {
   }
 
   if (m.landBranch) {
+    const land = m.land ?? null;
     lines.push(
       '',
       '# Auto-landing: a build that passes the gate is rebased onto this branch, RE-VERIFIED',
       '# there, then fast-forwarded in. Work accumulates here for you to merge onward.',
       '[land]',
       `branch = ${tomlString(m.landBranch)}`,
-      '# autoPush = false      # push this branch to its remote. Off = nothing an agent writes',
-      '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
-      '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
+    );
+    // Every knob below is written ONLY when it was typed to a non-default value: an untouched
+    // envelope renders byte-for-byte what quick mode writes, and the committed file shows what
+    // was CHOSEN — never a default restated as if someone had chosen it (RUN-64).
+    if (land && !land.onlyWhenVerifyPasses) {
+      lines.push(
+        '# CHOSEN: landing does not wait on the verify gate — an unverified diff reaches this',
+        '# branch. Permitted, never assumed.',
+        'onlyWhenVerifyPasses = false',
+      );
+    }
+    if (land && !land.resolveConflicts) {
+      lines.push(
+        '# CHOSEN: rebase conflicts always fail out to a human — the build agent never resolves.',
+        'resolveConflicts = false',
+      );
+    }
+    if (land?.allowedBranches.length) {
+      lines.push(
+        '# Branch globs a DISPATCH may override `branch` with (RUN-41). Absent = no override.',
+        `allowedBranches = [${land.allowedBranches.map(tomlString).join(', ')}]`,
+      );
+    }
+    lines.push(
+      ...(land?.autoPush
+        ? [
+            '# CHOSEN: this branch leaves the machine after every landing — `git log',
+            '# origin/main..main` no longer shows what the agents did. See THREAT-MODEL.md.',
+            'autoPush = true',
+          ]
+        : [
+            '# autoPush = false      # push this branch to its remote. Off = nothing an agent writes',
+            '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
+          ]),
+      // The wizard only offers mergeTarget once autoPush is on; the renderer holds the same
+      // line for direct callers — a merge request cannot exist without the branch reaching the
+      // remote, so an invalid pair is dropped HERE rather than half-honoured at the next
+      // dispatch (RUN-28).
+      land?.autoPush && land.mergeTarget
+        ? `mergeTarget = ${tomlString(land.mergeTarget)}`
+        : '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
     );
   } else {
     lines.push(
@@ -369,6 +430,9 @@ interface AdvancedIo {
  */
 interface AdvancedSection {
   title: string;
+  /** Absent = always applies. A section with nothing to configure is skipped whole, title and
+   *  all — [land] without a branch: nothing auto-lands, so there is nothing to walk (RUN-64). */
+  applies?: (choices: ManifestChoices) => boolean;
   run: (io: AdvancedIo, choices: ManifestChoices) => Promise<void>;
 }
 
@@ -405,7 +469,88 @@ const defaultsSection: AdvancedSection = {
   },
 };
 
-const ADVANCED_SECTIONS: AdvancedSection[] = [defaultsSection];
+/**
+ * Section B: the rest of the [land] envelope (RUN-64) — only reachable when quick mode named a
+ * branch, because with no branch nothing auto-lands and there is nothing to configure. Every
+ * question defaults to what quick mode writes, so Enter all the way through changes nothing in
+ * the file; each widening must be TYPED, and each prints what it means when it happens.
+ */
+const landSection: AdvancedSection = {
+  title: 'Landing envelope — [land]',
+  applies: (choices) => choices.landBranch !== null,
+  async run({ ask, out }, choices) {
+    const branch = choices.landBranch;
+    if (!branch) return; // applies() gates this; belt-and-braces for direct callers
+    const declined = (answer: string) => answer === 'n' || answer === 'no';
+
+    out('  Every knob here defaults to exactly what quick mode writes — Enter all the way');
+    out('  through changes nothing. Widening the envelope is typed, never defaulted.');
+    out('');
+
+    // Default true, and only a typed "n" turns the gate off — the same posture as the schema:
+    // permitted, never assumed. The consequence is printed at the moment of choosing, not
+    // buried in a doc the chooser has not read.
+    const gate = (
+      await ask('  Land only when verify passes on the rebased result? (Y/n)', 'Y')
+    ).toLowerCase();
+    const onlyWhenVerifyPasses = !declined(gate);
+    if (!onlyWhenVerifyPasses) {
+      out('  ⚠ Off means an UNVERIFIED diff reaches the branch: a build that failed the gate —');
+      out('    or never ran it — still lands there.');
+    }
+
+    const resolve = (
+      await ask('  Let the build agent resolve mechanical rebase conflicts? (Y/n)', 'Y')
+    ).toLowerCase();
+    const resolveConflicts = !declined(resolve);
+
+    // EMPTY MEANS NO OVERRIDE, and that default is load-bearing (RUN-41): defaulting to
+    // "anywhere" would make every repo writable at `main` by anyone who can dispatch, and the
+    // repo owner and the dispatcher are not always the same person. The repo opts in, typed.
+    out('');
+    out(`  A dispatch can never choose the landing branch: this repo lands only at ${branch}.`);
+    out('  Globs here (e.g. feature/** wip/*) let a dispatch override that — blank keeps the');
+    out('  envelope closed.');
+    const allowedBranches = (await ask('  Branch globs a dispatch may land on (blank = no override)'))
+      .split(/[,\s]+/)
+      .filter(Boolean);
+
+    // Default false, and the default is the point (RUN-27): every other defence rests on
+    // "nothing an agent writes leaves this machine".
+    const push = (await ask(`  Push ${branch} to its remote after each landing? (y/N)`, 'N')).toLowerCase();
+    const autoPush = push === 'y' || push === 'yes';
+    if (autoPush) {
+      out('  ⚠ This crosses the one boundary the daemon otherwise has — agent work now leaves');
+      out('    this machine on its own, and `git log origin/main..main` stops being your "what');
+      out('    did the agents do?" check. See THREAT-MODEL.md before committing this.');
+    }
+
+    // Offered only once autoPush is on: a merge request cannot exist without the branch
+    // reaching the remote. Validating the pair HERE (rule 1) beats writing a manifest whose
+    // merge request can never open at the next dispatch.
+    let mergeTarget: string | null = null;
+    if (autoPush) {
+      out('');
+      out("  The daemon can open a merge request when a plan's work completes. A per-plan");
+      out('  branch template — branch = "noriq/plan-<planKey>" — is what makes that MR mean');
+      out("  something: one plan's worth of work per review (RUN-28).");
+      for (;;) {
+        const answer = (await ask('  Merge-request target branch (blank = no merge requests)')).trim();
+        if (!answer) break;
+        if (answer === branch) {
+          out('  ✗ that is the landing branch itself — a merge request needs a different base.');
+          continue;
+        }
+        mergeTarget = answer;
+        break;
+      }
+    }
+
+    choices.land = { onlyWhenVerifyPasses, resolveConflicts, allowedBranches, autoPush, mergeTarget };
+  },
+};
+
+const ADVANCED_SECTIONS: AdvancedSection[] = [defaultsSection, landSection];
 
 export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitProjectResult> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -596,6 +741,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       landBranch,
       allow: eco.allow,
       defaults: null,
+      land: null,
     };
 
     // The fork (RUN-62). One trailing question, default N, so the tier is discoverable
@@ -604,13 +750,15 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     let advanced = deps.advanced ?? false;
     if (!advanced) {
       out('');
-      out('  The quick questions are done. Advanced options (per-kind model/effort defaults)');
-      out('  can be curated now, or added to the file by hand later — it documents them all.');
+      out('  The quick questions are done. Advanced options (per-kind model/effort defaults,');
+      out('  the [land] envelope when auto-landing is on) can be curated now, or added to the');
+      out('  file by hand later — it documents them all.');
       const curate = (await ask('  Curate advanced options? (y/N)', 'N')).toLowerCase();
       advanced = curate === 'y' || curate === 'yes';
     }
     if (advanced) {
       for (const section of ADVANCED_SECTIONS) {
+        if (section.applies && !section.applies(choices)) continue;
         out('');
         out(`  ${section.title}`);
         out('');

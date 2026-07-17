@@ -83,6 +83,7 @@ export {
   type InitProjectDeps,
   type InitProjectResult,
   type KindDefaultChoice,
+  type LandChoices,
   type ManifestChoices,
 } from './init-project';
 export { detectTools } from './tools';

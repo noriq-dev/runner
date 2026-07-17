@@ -172,6 +172,68 @@ describe('renderProjectManifest → a manifest the daemon actually accepts', () 
     expect(parsed.verify?.agent?.maxRounds).toBe(2); // schema default
   });
 
+  it('an untouched [land] envelope renders byte-for-byte what quick mode writes (RUN-64)', () => {
+    // The rule for the whole section: Enter all the way through changes NOTHING in the file.
+    // A default restated as a value would read as if someone had chosen it.
+    const base = { key: 'X', tool: null, verifyCmd: null, landBranch: 'agents', allow: [] };
+    const quick = renderProjectManifest(base);
+    const walked = renderProjectManifest({
+      ...base,
+      land: {
+        onlyWhenVerifyPasses: true,
+        resolveConflicts: true,
+        allowedBranches: [],
+        autoPush: false,
+        mergeTarget: null,
+      },
+    });
+    expect(walked).toBe(quick);
+  });
+
+  it('typed [land] answers replace the comment hints and parse (RUN-64)', () => {
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: null,
+      landBranch: 'noriq/plan-<planKey>',
+      allow: [],
+      land: {
+        onlyWhenVerifyPasses: false,
+        resolveConflicts: false,
+        allowedBranches: ['feature/**', 'wip/*'],
+        autoPush: true,
+        mergeTarget: 'main',
+      },
+    });
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.land?.onlyWhenVerifyPasses).toBe(false);
+    expect(parsed.land?.resolveConflicts).toBe(false);
+    expect(parsed.land?.allowedBranches).toEqual(['feature/**', 'wip/*']);
+    expect(parsed.land?.autoPush).toBe(true);
+    expect(parsed.land?.mergeTarget).toBe('main');
+  });
+
+  it('drops a mergeTarget arriving without autoPush — the pair is validated before writing (RUN-64)', () => {
+    // The wizard never produces this pair (the question is only offered once autoPush is on);
+    // the renderer holds the same line for direct callers rather than writing a manifest whose
+    // merge request can never exist.
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: null,
+      landBranch: 'agents',
+      allow: [],
+      land: {
+        onlyWhenVerifyPasses: true,
+        resolveConflicts: true,
+        allowedBranches: [],
+        autoPush: false,
+        mergeTarget: 'main',
+      },
+    });
+    expect(ProjectManifest.parse(parseToml(toml)).land?.mergeTarget).toBeNull();
+  });
+
   it('escapes a Windows-shaped verify command rather than emitting broken TOML', () => {
     // RUN-42's lesson: backslash introduces an escape in a TOML basic string, so C:\… is not a
     // string literal you can just interpolate.
@@ -507,6 +569,100 @@ describe('runInitProject', () => {
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.defaults.scope.model).toBeNull();
     expect(parsed.defaults.verify.effort).toBeNull();
+  });
+
+  // The [land] envelope (RUN-64). Question order inside its section: verify gate (Y/n),
+  // conflict resolution (Y/n), branch globs, autoPush (y/N), then — only under autoPush —
+  // the merge-request target.
+
+  it('Enter all the way through the landing section writes byte-for-byte what quick mode writes (RUN-64)', async () => {
+    const quickAnswers = ['ACME', 'claude', '', '', 'noriq/integration'];
+    await run(quickAnswers); // the trailing fork question falls back to N
+    const quick = await readFile(path.join(dir, '.noriq', 'project.toml'), 'utf8');
+
+    // Same five answers, advanced tier on, every advanced question left at its default.
+    await run(['y', ...quickAnswers], { advanced: true }); // 'y' overwrites the first file
+    const walked = await readFile(path.join(dir, '.noriq', 'project.toml'), 'utf8');
+    expect(walked).toBe(quick);
+  });
+
+  it('walks the [land] envelope: every widening is typed, and the pair rides together (RUN-64)', async () => {
+    const res = await run(
+      [
+        'ACME',
+        'claude',
+        '', // verify cmd: none
+        '', // reviewer: no
+        'noriq/plan-<planKey>',
+        ...['', '', '', '', '', ''], // the six [defaults] questions: all inherit
+        'n', // onlyWhenVerifyPasses → false, consequence printed
+        'n', // resolveConflicts → false
+        'feature/** wip/*', // allowedBranches
+        'y', // autoPush → true, THREAT-MODEL line printed
+        'main', // mergeTarget — only offered because autoPush is on
+      ],
+      { advanced: true },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.land?.branch).toBe('noriq/plan-<planKey>');
+    expect(parsed.land?.onlyWhenVerifyPasses).toBe(false);
+    expect(parsed.land?.resolveConflicts).toBe(false);
+    expect(parsed.land?.allowedBranches).toEqual(['feature/**', 'wip/*']);
+    expect(parsed.land?.autoPush).toBe(true);
+    expect(parsed.land?.mergeTarget).toBe('main');
+  });
+
+  it('no land branch → the landing section never runs, title and all (RUN-64)', async () => {
+    const asked: string[] = [];
+    const lines: string[] = [];
+    const answers = asker(['ACME', 'claude', '', '', '']); // land: blank
+    await run([], {
+      advanced: true,
+      out: (l) => lines.push(l),
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return answers(q, fallback);
+      },
+    });
+    expect(asked.some((q) => /verify passes|globs|push|merge-request/i.test(q))).toBe(false);
+    expect(lines.join('\n')).not.toMatch(/Landing envelope/);
+  });
+
+  it('no autoPush → no mergeTarget question: the pair cannot be mistyped into existence (RUN-64)', async () => {
+    const asked: string[] = [];
+    // key, tool, cmd, reviewer, land, six defaults, gate, resolve, globs, autoPush(blank = N)
+    const answers = asker(['ACME', 'claude', '', '', 'agents', '', '', '', '', '', '', '', '', '', '']);
+    await run([], {
+      advanced: true,
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return answers(q, fallback);
+      },
+    });
+    expect(asked.some((q) => /push/i.test(q))).toBe(true); // the autoPush question was offered
+    expect(asked.some((q) => /merge-request/i.test(q))).toBe(false); // its dependent was not
+  });
+
+  it('refuses a merge target equal to the landing branch — an MR needs a different base (RUN-64)', async () => {
+    const res = await run(
+      ['ACME', 'claude', '', '', 'agents', '', '', '', '', '', '', '', '', '', 'y', 'agents', 'main'],
+      { advanced: true },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    // 'agents' (the branch itself) was refused and re-asked; 'main' is accepted.
+    expect(parsed.land?.mergeTarget).toBe('main');
+  });
+
+  it('prints what each widening means: the unverified-diff and THREAT-MODEL lines (RUN-64)', async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', '', 'agents', '', '', '', '', '', '', 'n', '', '', 'y', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    const text = lines.join('\n');
+    expect(text).toMatch(/UNVERIFIED diff/); // answering the gate off says what it means
+    expect(text).toMatch(/THREAT-MODEL/); // flipping autoPush names the boundary it crosses
+    expect(text).toMatch(/<planKey>/); // the MR ask teaches the per-plan branch template
   });
 
   it('warns a Diversion operator BEFORE the marker is committed: there is no dry-run (RUN-60)', async () => {
