@@ -136,6 +136,53 @@ describe('ClaudeDriver', () => {
     expect(fake.closed).toBe(true); // session closed on finish
   });
 
+  it('streams raw text deltas byte-faithfully, keeping newlines the assembled message drops (RUN-77)', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    // The model's real bytes: a sentence, a newline, another sentence, then a bulleted list —
+    // arriving as deltas, some split mid-word (as the SDK does). The newline between sentences
+    // is its OWN emission, exactly where the assembled message used to lose it.
+    const deltas = ['I’ll review the diff.', '\n', 'The changed wizard now.', '\n- High — VCS detec', 'tion contradicts it.'];
+    for (const text of deltas) {
+      fake.push({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+    }
+    // A thinking delta must NOT reach the transcript as agent prose.
+    fake.push({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', text: 'hmm, let me think' } } });
+    // The assembled message follows (its content joins blocks with '' — the lossy path).
+    // Because deltas streamed this turn, it contributes usage only, never re-emitted text.
+    fake.push({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: 'I’ll review the diff.The changed wizard now.- High — VCS detection contradicts it.' }],
+        usage: { input_tokens: 10, output_tokens: 30 },
+      },
+    });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0.001, usage: { input_tokens: 10, output_tokens: 30 } });
+
+    await h.session.done();
+    const joined = h.texts.join('');
+    // Byte-faithful: every newline survives, so the bullet starts its own line.
+    expect(joined).toBe('I’ll review the diff.\nThe changed wizard now.\n- High — VCS detection contradicts it.');
+    expect(joined).not.toContain('diff.The'); // the clump the old assembled path produced
+    expect(joined).not.toContain('let me think'); // thinking stays out of the transcript
+  });
+
+  it('falls back to the assembled message text when a turn streamed no deltas', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({ type: 'assistant', message: { content: [{ type: 'text', text: 'no-partials transport' }], usage: { input_tokens: 1, output_tokens: 1 } } });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } });
+    await h.session.done();
+    expect(h.texts.join('')).toBe('no-partials transport');
+  });
+
+  it('requests partial messages so the raw delta stream is available', async () => {
+    const h = harness();
+    h.getFake().push({ type: 'result', subtype: 'success', is_error: false, num_turns: 0, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 } });
+    await h.session.done();
+    expect((h.getFake().options as { includePartialMessages?: boolean }).includePartialMessages).toBe(true);
+  });
+
   it('maps an error result to a failed outcome with the subtype as reason', async () => {
     const h = harness();
     h.getFake().push({
