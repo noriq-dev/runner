@@ -35,7 +35,10 @@ import {
  *  reports "not reported" rather than implying 100% of the requested model — the lie RUN-59
  *  removes. Do NOT synthesize a single-model mix from the thread total to fill the gap. */
 export type CodexEvent =
-  | { type: 'text'; text: string }
+  // itemId: which agentMessage item a text delta belongs to (0.144.x names one; 0.142.x
+  // doesn't) — the driver inserts a paragraph break when it changes, because distinct
+  // items are distinct model messages with no newline between them (RUN-80).
+  | { type: 'text'; text: string; itemId?: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; cacheReadTokens: number }
   | { type: 'turn_complete' }
   | { type: 'error'; message: string };
@@ -161,11 +164,19 @@ export class CodexDriver implements AgentDriver {
     };
 
     const live = zeroTelemetry();
+    // Distinct agentMessage items are distinct model messages with no newline between
+    // them — insert a paragraph break when the item id changes (RUN-80; claude does the
+    // same at assistant-turn boundaries). Id-less deltas (0.142.x) never trigger it.
+    let lastItemId: string | undefined;
     const consume = async () => {
       try {
         for await (const ev of transport.events) {
           if (ev.type === 'text') {
-            if (ev.text) opts.handlers?.onText?.(ev.text);
+            if (ev.text) {
+              if (ev.itemId && lastItemId && ev.itemId !== lastItemId) opts.handlers?.onText?.('\n\n');
+              if (ev.itemId) lastItemId = ev.itemId;
+              opts.handlers?.onText?.(ev.text);
+            }
           } else if (ev.type === 'usage') {
             // Codex reports cumulative thread usage — set (don't accumulate).
             live.inputTokens = ev.inputTokens;
@@ -248,7 +259,15 @@ interface TokenBreakdown {
 /** Map a raw app-server JSON-RPC notification to a normalized CodexEvent. */
 export function normalizeNotification(method: string, params: Record<string, unknown>): CodexEvent | null {
   if ((NOTIF.agentMessageDelta as readonly string[]).includes(method)) {
-    return { type: 'text', text: String((params as { delta?: unknown }).delta ?? '') };
+    // 0.144.x carries the owning item's id (itemId, or item.id); 0.142.x has neither —
+    // the field is simply absent then, and the driver's break-on-change never fires.
+    const p = params as { delta?: unknown; itemId?: unknown; item?: { id?: unknown } };
+    const itemId = p.itemId ?? p.item?.id;
+    return {
+      type: 'text',
+      text: String(p.delta ?? ''),
+      ...(itemId != null ? { itemId: String(itemId) } : {}),
+    };
   }
   if ((NOTIF.tokenUsage as readonly string[]).includes(method)) {
     const total = ((params as { tokenUsage?: { total?: TokenBreakdown } }).tokenUsage?.total ??

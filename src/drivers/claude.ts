@@ -383,6 +383,22 @@ export class ClaudeDriver implements AgentDriver {
     // whether the current turn produced any, so the assembled assistant message only
     // supplies text as a fallback (a transport without partial messages, or the tests).
     let sawDeltaText = false;
+    // Distinct assistant turns carry NO newline between them — the model ends one response
+    // and the next begins after tool calls; every chat UI renders that as a paragraph
+    // break, but raw concatenation reads "…the SDK behavior.Now I have…" (RUN-80). The
+    // driver is the only layer that sees turn boundaries, so it inserts the break into the
+    // onText stream: armed when a turn ends, spent by the next text emitted, never before
+    // the first text, and tool_use-only turns can't stack extras.
+    let emittedText = false;
+    let pendingTurnBreak = false;
+    const emitText = (text: string) => {
+      if (pendingTurnBreak) {
+        pendingTurnBreak = false;
+        opts.handlers?.onText?.('\n\n');
+      }
+      emittedText = true;
+      opts.handlers?.onText?.(text);
+    };
     const consume = async () => {
       try {
         for await (const msg of query) {
@@ -397,7 +413,7 @@ export class ClaudeDriver implements AgentDriver {
             const ev = (msg as SdkPartialAssistantMessage).event;
             if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
               sawDeltaText = true;
-              opts.handlers?.onText?.(ev.delta.text);
+              emitText(ev.delta.text);
             }
             continue;
           }
@@ -407,9 +423,11 @@ export class ClaudeDriver implements AgentDriver {
             // drops inter-block newlines, so the deltas are always preferred when present.
             if (!sawDeltaText) {
               const text = extractText(am.message.content ?? []);
-              if (text) opts.handlers?.onText?.(text);
+              if (text) emitText(text);
             }
             sawDeltaText = false;
+            // The turn is over; whatever text comes next is a new paragraph (RUN-80).
+            if (emittedText) pendingTurnBreak = true;
             const u = am.message.usage;
             if (u) {
               // RUN-34, measured rather than assumed. The old comment here claimed this sum

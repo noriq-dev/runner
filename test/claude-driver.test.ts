@@ -193,6 +193,70 @@ describe('ClaudeDriver', () => {
     expect(joined).not.toContain('let me think'); // thinking stays out of the transcript
   });
 
+  it('separates distinct assistant turns with a paragraph break (RUN-80)', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    const delta = (text: string) =>
+      fake.push({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      });
+    const turnEnd = (text: string) =>
+      fake.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text }], usage: { input_tokens: 1, output_tokens: 1 } },
+      });
+
+    // Turn 1 streams, ends; tool work happens; turn 2 streams, ends. The model emits no
+    // newline between turns — the driver inserts the paragraph break chat UIs render.
+    delta('Let me read the SDK behavior.');
+    turnEnd('Let me read the SDK behavior.');
+    delta('Now I have a complete picture.');
+    turnEnd('Now I have a complete picture.');
+    // A tool_use-only turn (no text) must not stack a second break.
+    fake.push({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use' }], usage: { input_tokens: 1, output_tokens: 1 } },
+    });
+    delta('Now the wire frame:');
+    turnEnd('Now the wire frame:');
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 3,
+      total_cost_usd: 0,
+      usage: { input_tokens: 3, output_tokens: 3 },
+    });
+
+    await h.session.done();
+    expect(h.texts.join('')).toBe(
+      'Let me read the SDK behavior.\n\nNow I have a complete picture.\n\nNow the wire frame:',
+    );
+  });
+
+  it('separates turns on the no-deltas fallback path too (RUN-80)', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    const turn = (text: string) =>
+      fake.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text }], usage: { input_tokens: 1, output_tokens: 1 } },
+      });
+    turn('First turn.');
+    turn('Second turn.');
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 2,
+      total_cost_usd: 0,
+      usage: { input_tokens: 2, output_tokens: 2 },
+    });
+    await h.session.done();
+    expect(h.texts.join('')).toBe('First turn.\n\nSecond turn.');
+  });
+
   it('falls back to the assembled message text when a turn streamed no deltas', async () => {
     const h = harness();
     const fake = h.getFake();
