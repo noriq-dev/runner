@@ -157,6 +157,22 @@ describe('CodexDriver', () => {
     expect(fake.closed).toBe(true);
   });
 
+  it('streams agentMessageDelta text byte-faithfully, newlines intact (RUN-77 parity)', async () => {
+    // Codex's only text source is the raw agentMessageDelta stream (no assembled-message
+    // path), so concatenated deltas reproduce the model's bytes exactly — the newlines the
+    // claude driver used to drop. Deltas split mid-word AND at the newline itself.
+    const h = harness();
+    const fake = h.getFake();
+    for (const text of ['I’ll review the diff.', '\n', 'The changed wizard now.', '\n- High — VCS detec', 'tion.']) {
+      fake.push({ type: 'text', text });
+    }
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+    const joined = h.texts.join('');
+    expect(joined).toBe('I’ll review the diff.\nThe changed wizard now.\n- High — VCS detection.');
+    expect(joined).not.toContain('diff.The');
+  });
+
   it('maps an error event to a failed outcome', async () => {
     const h = harness();
     h.getFake().push({ type: 'error', message: 'sandbox denied write' });
