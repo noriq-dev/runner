@@ -8,6 +8,7 @@ import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
 import { detectTools } from './tools';
 import { type VcsDetection, detectVcs } from './vcs/detect';
+import { DEFAULT_VERIFY_TIMEOUT_SECONDS } from './verify';
 
 /**
  * `noriq-runner init-project` — the guided repo marker (RUN-56).
@@ -196,8 +197,14 @@ export interface ManifestChoices {
   key: string;
   tool: string | null;
   verifyCmd: string | null;
-  /** The inline reviewer (RUN-61), when chosen. `model` null = the driver's own default. */
-  reviewer?: { model: string | null } | null;
+  /** Advanced [verify] knobs (RUN-63) — meaningful only alongside `verifyCmd`. Null/absent =
+   *  unchosen: the rendered file keeps the commented hint instead of a value. */
+  verifyShell?: string | null;
+  verifyTimeoutSeconds?: number | null;
+  /** The inline reviewer (RUN-61), when chosen. `model`/`effort` null = the driver's own
+   *  default; `maxRounds` null = the schema default (2) — 0 is a real choice (a pure gate),
+   *  which is why the renderer tests `!= null` and never truthiness. */
+  reviewer?: { model: string | null; effort?: string | null; maxRounds?: number | null } | null;
   landBranch: string | null;
   allow: string[];
   /** Per-kind [defaults] (RUN-62). Null/absent = never curated → the commented guidance block. */
@@ -258,7 +265,12 @@ export function renderProjectManifest(m: ManifestChoices): string {
       "# clean, in the run's worktree. Non-zero exit GATES the run — it cannot reach `done`.",
       '[verify]',
       `cmd = ${tomlString(m.verifyCmd)}`,
-      '# shell = "bash"   # pin one if this command is not portable to cmd.exe (mixed-OS teams)',
+      m.verifyShell
+        ? `shell = ${tomlString(m.verifyShell)}`
+        : '# shell = "bash"   # pin one if this command is not portable to cmd.exe (mixed-OS teams)',
+      m.verifyTimeoutSeconds != null
+        ? `timeoutSeconds = ${m.verifyTimeoutSeconds}`
+        : `# timeoutSeconds = ${DEFAULT_VERIFY_TIMEOUT_SECONDS}   # blank = this built-in default; a timeout GATES the run`,
     );
   } else if (!m.reviewer) {
     lines.push(
@@ -279,7 +291,12 @@ export function renderProjectManifest(m: ManifestChoices): string {
       m.reviewer.model
         ? `model = ${tomlString(m.reviewer.model)}`
         : '# model = "claude-opus-4-8"   # blank = the driver\'s default (or [defaults.verify])',
-      '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',
+      m.reviewer.effort
+        ? `effort = ${tomlString(m.reviewer.effort)}`
+        : '# effort = "high"   # low | medium | high | xhigh | max — blank falls through like model',
+      m.reviewer.maxRounds != null
+        ? `maxRounds = ${m.reviewer.maxRounds}`
+        : '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',
     );
   }
 
@@ -487,6 +504,30 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     }
     const verifyCmd = (await ask('  Verify command (blank for none)', eco.verifyCmd ?? undefined)) || null;
 
+    // The advanced [verify] knobs (RUN-63), asked only when there is a cmd for them to govern —
+    // a shell pin or a timeout with nothing to run is dead config.
+    let verifyShell: string | null = null;
+    let verifyTimeoutSeconds: number | null = null;
+    if (verifyCmd) {
+      out('');
+      out('  This file is COMMITTED, so that command travels to teammates on other OSes: `&&` is');
+      out('  portable to cmd.exe by luck; env prefixes, redirection, globs and $VAR are not —');
+      out('  mixed-OS teams pin `bash` (Git for Windows ships one). An absent pin fails the gate');
+      out("  outright, so blank (= the platform's own shell) stays the default.");
+      verifyShell = (await ask('  Pin a shell for it? (blank = platform default)')) || null;
+      for (;;) {
+        const raw = await ask(`  Verify timeout in seconds (blank = ${DEFAULT_VERIFY_TIMEOUT_SECONDS})`);
+        const answer = raw.trim();
+        if (!answer) break;
+        const n = Number(answer);
+        if (Number.isInteger(n) && n > 0) {
+          verifyTimeoutSeconds = n;
+          break;
+        }
+        out('  ✗ a positive whole number of seconds, or blank for the default.');
+      }
+    }
+
     // The other half of the verify choice (RUN-61). Both halves may be blank — no verify stage
     // is a legitimate configuration, not a misconfiguration, so neither question presumes.
     out('');
@@ -494,10 +535,41 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     out('  a fresh read-only session (optionally a stronger model) whose report is handed back');
     out('  to the builder to fix.');
     const wantReviewer = (await ask('  Add the inline reviewer? (y/N)', 'N')).toLowerCase();
-    const reviewer =
-      wantReviewer === 'y' || wantReviewer === 'yes'
-        ? { model: (await ask("  Reviewer model (blank = the driver's default)")) || null }
-        : null;
+    let reviewer: { model: string | null; effort: string | null; maxRounds: number | null } | null = null;
+    if (wantReviewer === 'y' || wantReviewer === 'yes') {
+      const model = (await ask("  Reviewer model (blank = the driver's default)")) || null;
+      // Effort is tool-agnostic INTENT (RUN-33) — validated here because a typo'd effort would
+      // otherwise surface as a schema refusal at the NEXT dispatch, not at setup.
+      let effort: string | null = null;
+      for (;;) {
+        const raw = await ask(`  Reviewer effort (${RunEffort.options.join(' | ')}; blank = default)`);
+        const answer = raw.trim().toLowerCase();
+        if (!answer) break;
+        if (RunEffort.safeParse(answer).success) {
+          effort = answer;
+          break;
+        }
+        out(`  ✗ one of ${RunEffort.options.join(' | ')}, or blank for the default.`);
+      }
+      // Bounded by default for RUN-21's reason: an agent that cannot satisfy the reviewer in
+      // two rounds is not going to on the third — it is going to keep spending. 0 is a real
+      // choice (one review, no hand-back — a pure gate), not an absence.
+      let maxRounds: number | null = null;
+      for (;;) {
+        const raw = await ask(
+          '  FAIL → fix → re-review rounds, 0–5 (blank = 2; 0 = review only, no hand-back)',
+        );
+        const answer = raw.trim();
+        if (!answer) break;
+        const n = Number(answer);
+        if (Number.isInteger(n) && n >= 0 && n <= 5) {
+          maxRounds = n;
+          break;
+        }
+        out('  ✗ a whole number from 0 to 5, or blank for the default (2).');
+      }
+      reviewer = { model, effort, maxRounds };
+    }
 
     // No default, on purpose. `[land].branch` is never inferred and blank must stay the easy
     // answer — offering "noriq/integration" at a keystroke is the silent envelope-widening
@@ -511,6 +583,8 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       key,
       tool: tool || null,
       verifyCmd,
+      verifyShell,
+      verifyTimeoutSeconds,
       reviewer,
       landBranch,
       allow: eco.allow,

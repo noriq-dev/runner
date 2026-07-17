@@ -136,6 +136,42 @@ describe('renderProjectManifest → a manifest the daemon actually accepts', () 
     expect(toml).not.toMatch(/^\[defaults\./m);
   });
 
+  it('chosen advanced values replace the comment hints (RUN-63)', () => {
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: 'npm test',
+      verifyShell: 'bash',
+      verifyTimeoutSeconds: 900,
+      // maxRounds: 0 on purpose — a real choice (pure gate, no hand-back), and the falsy value
+      // a truthiness test in the renderer would silently swallow back into the comment hint.
+      reviewer: { model: null, effort: 'high', maxRounds: 0 },
+      landBranch: null,
+      allow: [],
+    });
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.verify?.shell).toBe('bash');
+    expect(parsed.verify?.timeoutSeconds).toBe(900);
+    expect(parsed.verify?.agent?.effort).toBe('high');
+    expect(parsed.verify?.agent?.maxRounds).toBe(0);
+  });
+
+  it('unchosen advanced knobs stay commented, so the schema defaults ride through (RUN-63)', () => {
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: 'npm test',
+      reviewer: { model: null },
+      landBranch: null,
+      allow: [],
+    });
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.verify?.shell).toBeNull(); // the platform's own shell stays the default
+    expect(parsed.verify?.timeoutSeconds).toBeNull(); // the built-in default
+    expect(parsed.verify?.agent?.effort).toBeNull();
+    expect(parsed.verify?.agent?.maxRounds).toBe(2); // schema default
+  });
+
   it('escapes a Windows-shaped verify command rather than emitting broken TOML', () => {
     // RUN-42's lesson: backslash introduces an escape in a TOML basic string, so C:\… is not a
     // string literal you can just interpolate.
@@ -284,14 +320,16 @@ describe('runInitProject', () => {
   });
 
   it('takes the land branch only when one is typed', async () => {
-    const res = await run(['ACME', 'claude', 'npm test', '', 'noriq/integration']);
+    // key, tool, cmd, shell, timeout, reviewer?, land — the advanced knobs left blank
+    const res = await run(['ACME', 'claude', 'npm test', '', '', '', 'noriq/integration']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.land?.branch).toBe('noriq/integration');
     expect(parsed.land?.autoPush).toBe(false); // the daemon must not publish because a wizard ran
   });
 
   it('writes the inline reviewer when chosen, with its model (RUN-61)', async () => {
-    const res = await run(['ACME', 'claude', 'npm test', 'y', 'claude-opus-4-8', '']);
+    // key, tool, cmd, shell, timeout, reviewer?, model, effort, rounds, land
+    const res = await run(['ACME', 'claude', 'npm test', '', '', 'y', 'claude-opus-4-8', '', '', '']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.verify?.cmd).toBe('npm test');
     expect(parsed.verify?.agent?.model).toBe('claude-opus-4-8');
@@ -304,6 +342,66 @@ describe('runInitProject', () => {
     expect(parsed.verify?.cmd).toBeNull();
     expect(parsed.verify?.agent).not.toBeNull();
     expect(parsed.verify?.agent?.model).toBeNull(); // blank = the driver's default
+  });
+
+  it('writes the advanced verify knobs when answered (RUN-63)', async () => {
+    // key, tool, cmd, shell, timeout, reviewer?, model, effort, rounds, land
+    const res = await run(['ACME', 'claude', 'npm test', 'bash', '900', 'y', '', 'xhigh', '0', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.verify?.shell).toBe('bash');
+    expect(parsed.verify?.timeoutSeconds).toBe(900);
+    expect(parsed.verify?.agent?.effort).toBe('xhigh');
+    expect(parsed.verify?.agent?.maxRounds).toBe(0); // 0 = a pure gate, not "unset"
+  });
+
+  it('no cmd → no shell or timeout question (RUN-63)', async () => {
+    const asked: string[] = [];
+    const answers = asker(['ACME', 'claude', '', '', '']); // key, tool, cmd(blank), reviewer, land
+    await run([], {
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return answers(q, fallback);
+      },
+    });
+    expect(asked.some((q) => /shell/i.test(q))).toBe(false);
+    expect(asked.some((q) => /timeout/i.test(q))).toBe(false);
+  });
+
+  it('no reviewer → no effort or rounds question (RUN-63)', async () => {
+    const asked: string[] = [];
+    const answers = asker(['ACME', 'claude', 'npm test', '', '', '', '']); // reviewer declined
+    await run([], {
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return answers(q, fallback);
+      },
+    });
+    expect(asked.some((q) => /shell/i.test(q))).toBe(true); // the cmd DID unlock its knobs
+    expect(asked.some((q) => /effort/i.test(q))).toBe(false);
+    expect(asked.some((q) => /rounds/i.test(q))).toBe(false);
+  });
+
+  it('re-asks on a bad timeout, effort, or rounds instead of writing an invalid manifest (RUN-63)', async () => {
+    const res = await run([
+      'ACME',
+      'claude',
+      'npm test',
+      '', // no shell pin
+      'nope', // timeout: not a number → re-ask
+      '-5', // timeout: not positive → re-ask
+      '120',
+      'y', // reviewer
+      '', // model: driver default
+      'ultra', // effort: not in the enum → re-ask
+      'HIGH', // case-insensitive on purpose — intent, not a magic string
+      '7', // rounds: out of the 0–5 bound → re-ask
+      '3',
+      '', // land: none
+    ]);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.verify?.timeoutSeconds).toBe(120);
+    expect(parsed.verify?.agent?.effort).toBe('high');
+    expect(parsed.verify?.agent?.maxRounds).toBe(3);
   });
 
   it('carries the ecosystem allowlist through, so a build agent can run the verify it suggested', async () => {
@@ -367,8 +465,8 @@ describe('runInitProject', () => {
 
   it('--advanced skips the fork question and asks the six [defaults] questions', async () => {
     const res = await run(
-      // key   tool      verify      rev  land  s.model            s.eff   b.model/eff  v.model  v.eff
-      ['ACME', 'claude', 'npm test', '', '', 'claude-opus-4-8', 'high', '', '', '', 'xhigh'],
+      // key   tool      verify      shell/timeout  rev  land  s.model            s.eff   b.model/eff  v.model  v.eff
+      ['ACME', 'claude', 'npm test', '', '', '', '', 'claude-opus-4-8', 'high', '', '', '', 'xhigh'],
       { advanced: true },
     );
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
