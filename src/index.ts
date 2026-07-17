@@ -78,9 +78,12 @@ export {
   renderProjectManifest,
   runInitProject,
   scanRootWarning,
+  type DefaultsChoice,
   type Ecosystem,
   type InitProjectDeps,
   type InitProjectResult,
+  type KindDefaultChoice,
+  type ManifestChoices,
 } from './init-project';
 export { detectTools } from './tools';
 export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';

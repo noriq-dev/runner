@@ -2,7 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { AgentTool } from '@noriq-dev/shared';
+import { AgentTool, RunEffort, RunKind } from '@noriq-dev/shared';
 import { loadRunnerConfig } from './config';
 import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
@@ -50,6 +50,12 @@ export interface InitProjectDeps {
   installedTools?: () => string[];
   /** Injectable VCS detection (RUN-60) — tests don't need a real dv registry. */
   detectVcsFor?: (root: string) => Promise<VcsDetection | undefined>;
+  /**
+   * `--advanced` (RUN-62): pre-answers the trailing "Curate advanced options?" question with
+   * yes. The flag and the question are the same fork — the question exists so the tier is
+   * discoverable without reading --help, the flag so the discovery is skippable next time.
+   */
+  advanced?: boolean;
   configPath?: string;
 }
 
@@ -172,7 +178,21 @@ export function scanRootWarning(repo: string, roots: string[] | null): string | 
   return covered ? null : 'this repo is not under any scanRoot — the runner will not find it';
 }
 
-export function renderProjectManifest(m: {
+/** One kind's [defaults] choice (RUN-33). Null = inherit — the manifest simply omits the key. */
+export interface KindDefaultChoice {
+  model: string | null;
+  effort: RunEffort | null;
+}
+
+/** Per-kind [defaults], curated in the advanced tier. */
+export type DefaultsChoice = Record<RunKind, KindDefaultChoice>;
+
+/**
+ * Everything the wizard chose, accumulated across the quick flow and any advanced sections,
+ * rendered exactly ONCE at the end. RUN-40's rule 1 (validate before writing) applies to the
+ * whole session, not per question — no section writes; sections only fill this in.
+ */
+export interface ManifestChoices {
   key: string;
   tool: string | null;
   verifyCmd: string | null;
@@ -180,7 +200,11 @@ export function renderProjectManifest(m: {
   reviewer?: { model: string | null } | null;
   landBranch: string | null;
   allow: string[];
-}): string {
+  /** Per-kind [defaults] (RUN-62). Null/absent = never curated → the commented guidance block. */
+  defaults?: DefaultsChoice | null;
+}
+
+export function renderProjectManifest(m: ManifestChoices): string {
   const lines: string[] = [
     '# Noriq project marker — COMMITTED, so it travels with the repo and your team shares it.',
     '# Written by `noriq-runner init-project`. Carries no secrets.',
@@ -194,6 +218,37 @@ export function renderProjectManifest(m: {
 
   if (m.tool) {
     lines.push('', '# Default agent driver for this repo.', `tool = ${tomlString(m.tool)}`);
+  }
+
+  // Per-kind [defaults] (RUN-33). Chosen values become real sections; nothing chosen keeps the
+  // guidance as comments, so the manifest stays its own documentation either way.
+  const defs = m.defaults ?? null;
+  const chosenKinds = defs ? RunKind.options.filter((k) => defs[k].model || defs[k].effort) : [];
+  if (defs && chosenKinds.length) {
+    lines.push(
+      '',
+      '# Per-kind model + reasoning effort (RUN-33). Precedence: the dispatch → these → the',
+      "# tool's own default. `model` passes through unvalidated (a wrong name fails fast);",
+      '# `effort` is tool-agnostic intent — codex clamps above its own high, never errors.',
+    );
+    chosenKinds.forEach((kind, i) => {
+      const d = defs[kind];
+      if (i > 0) lines.push('');
+      lines.push(`[defaults.${kind}]`);
+      if (d.model) lines.push(`model = ${tomlString(d.model)}`);
+      if (d.effort) lines.push(`effort = ${tomlString(d.effort)}`);
+    });
+  } else {
+    lines.push(
+      '',
+      '# Per-kind model + reasoning effort (RUN-33): say "scope with something strong, build',
+      '# with something cheap" once, in the commit, instead of per dispatch. `model` is the',
+      "# vendor's own name, deliberately unvalidated (a wrong one fails fast); `effort` is",
+      `# ${RunEffort.options.join(' | ')} (codex clamps above its own high). Omitted = inherit:`,
+      '# [defaults.scope]',
+      '# model = "claude-opus-4-8"',
+      '# effort = "high"',
+    );
   }
 
   if (m.verifyCmd) {
@@ -274,6 +329,59 @@ export function renderProjectManifest(m: {
 
   return lines.join('\n');
 }
+
+/** The prompting surface a section sees — the same injected `ask`/`out` as the quick flow. */
+interface AdvancedIo {
+  ask: (question: string, fallback?: string) => Promise<string>;
+  out: (line: string) => void;
+}
+
+/**
+ * One advanced tier section: a titled group of questions that fills in `choices` and writes
+ * NOTHING — the single write at the end of the session covers the quick and advanced answers
+ * alike, so rule 1 holds for the whole session. This shape is the point of RUN-62 as much as
+ * the first section is: the follow-ups (B–D) each append an entry to ADVANCED_SECTIONS; the
+ * fork, the loop, and the ask-everything-then-write-once ordering are already here.
+ */
+interface AdvancedSection {
+  title: string;
+  run: (io: AdvancedIo, choices: ManifestChoices) => Promise<void>;
+}
+
+/** Section A: per-kind [defaults] model + effort (RUN-33). */
+const defaultsSection: AdvancedSection = {
+  title: 'Per-kind model & effort — [defaults]',
+  async run({ ask, out }, choices) {
+    out('  Pin a model and/or reasoning effort per run kind, in the commit: the dispatch');
+    out("  overrides these, these override the tool's own default. Model names pass through");
+    out('  unvalidated — they change constantly, and a stale allowlist here would reject one');
+    out('  your CLI supports fine; a wrong name fails fast. Effort is one of');
+    out(`  ${RunEffort.options.join(' | ')} — codex clamps anything above its own high rather`);
+    out('  than erroring. Blank = inherit, on every question.');
+    const blank = (): KindDefaultChoice => ({ model: null, effort: null });
+    const defaults: DefaultsChoice = { scope: blank(), build: blank(), verify: blank() };
+    for (const kind of RunKind.options) {
+      const model = (await ask(`  ${kind}: model (blank = inherit)`)).trim() || null;
+      // Effort is the one advanced field with a shape, so it re-asks here (rule 1) rather
+      // than writing a manifest the schema will refuse at the next dispatch.
+      let effort: RunEffort | null = null;
+      for (;;) {
+        const answer = (await ask(`  ${kind}: effort (blank = inherit)`)).trim().toLowerCase();
+        if (!answer) break;
+        const parsed = RunEffort.safeParse(answer);
+        if (parsed.success) {
+          effort = parsed.data;
+          break;
+        }
+        out(`  ✗ one of ${RunEffort.options.join(' | ')}, or blank to inherit.`);
+      }
+      defaults[kind] = { model, effort };
+    }
+    choices.defaults = defaults;
+  },
+};
+
+const ADVANCED_SECTIONS: AdvancedSection[] = [defaultsSection];
 
 export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitProjectResult> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -399,12 +507,38 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     out('  Leave blank for none (every diff waits on its own branch).');
     const landBranch = (await ask('  Auto-land to which branch? (blank = none)')) || null;
 
+    const choices: ManifestChoices = {
+      key,
+      tool: tool || null,
+      verifyCmd,
+      reviewer,
+      landBranch,
+      allow: eco.allow,
+      defaults: null,
+    };
+
+    // The fork (RUN-62). One trailing question, default N, so the tier is discoverable
+    // without reading --help; the --advanced flag just pre-answers it. Every advanced
+    // question runs BEFORE the write below — rule 1 covers the session, not each question.
+    let advanced = deps.advanced ?? false;
+    if (!advanced) {
+      out('');
+      out('  The quick questions are done. Advanced options (per-kind model/effort defaults)');
+      out('  can be curated now, or added to the file by hand later — it documents them all.');
+      const curate = (await ask('  Curate advanced options? (y/N)', 'N')).toLowerCase();
+      advanced = curate === 'y' || curate === 'yes';
+    }
+    if (advanced) {
+      for (const section of ADVANCED_SECTIONS) {
+        out('');
+        out(`  ${section.title}`);
+        out('');
+        await section.run({ ask, out }, choices);
+      }
+    }
+
     await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(
-      target,
-      renderProjectManifest({ key, tool, verifyCmd, reviewer, landBranch, allow: eco.allow }),
-      'utf8',
-    );
+    await writeFile(target, renderProjectManifest(choices), 'utf8');
     out('');
     out(`  ✓ wrote ${target}`);
 

@@ -84,6 +84,58 @@ describe('renderProjectManifest → a manifest the daemon actually accepts', () 
     expect(parsed.permissions.build.write).toBe(true);
   });
 
+  it('emits real [defaults.*] sections for chosen kinds only (RUN-62)', () => {
+    const toml = renderProjectManifest({
+      key: 'ACME',
+      tool: 'claude',
+      verifyCmd: 'npm test',
+      landBranch: null,
+      allow: [],
+      defaults: {
+        scope: { model: 'claude-opus-4-8', effort: 'high' },
+        build: { model: null, effort: null },
+        verify: { model: null, effort: 'xhigh' },
+      },
+    });
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.defaults.scope.model).toBe('claude-opus-4-8');
+    expect(parsed.defaults.scope.effort).toBe('high');
+    expect(parsed.defaults.verify.effort).toBe('xhigh');
+    expect(parsed.defaults.verify.model).toBeNull(); // effort without model — independent halves
+    expect(parsed.defaults.build.model).toBeNull(); // nothing chosen = inherit
+    expect(toml).not.toMatch(/\[defaults\.build\]/); // an all-blank kind gets no empty section
+  });
+
+  it('keeps the [defaults] guidance as comments when nothing was chosen', () => {
+    // The manifest stays its own documentation: someone opening it later must still see the
+    // knob exists, spelled correctly, without reading project.toml.example.
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: null,
+      landBranch: null,
+      allow: [],
+    });
+    expect(toml).toMatch(/# \[defaults\.scope\]/);
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.defaults.scope.model).toBeNull();
+    expect(parsed.defaults.scope.effort).toBeNull();
+  });
+
+  it('an all-blank curated [defaults] renders the same as never curating', () => {
+    const blank = { model: null, effort: null };
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: null,
+      landBranch: null,
+      allow: [],
+      defaults: { scope: { ...blank }, build: { ...blank }, verify: { ...blank } },
+    });
+    expect(toml).toMatch(/# \[defaults\.scope\]/);
+    expect(toml).not.toMatch(/^\[defaults\./m);
+  });
+
   it('escapes a Windows-shaped verify command rather than emitting broken TOML', () => {
     // RUN-42's lesson: backslash introduces an escape in a TOML basic string, so C:\… is not a
     // string literal you can just interpolate.
@@ -307,6 +359,55 @@ describe('runInitProject', () => {
     const lines: string[] = [];
     await run(['ACME', 'claude', '', ''], { out: (l) => lines.push(l), scanRoots: async () => null });
     expect(lines.join('\n')).toMatch(/Could not read your machine config/);
+  });
+
+  // The advanced tier (RUN-62). Question order after the quick flow's five (key, tool,
+  // verify cmd, reviewer y/N, land): the curate fork (skipped under --advanced), then per
+  // kind — scope model, scope effort, build model, build effort, verify model, verify effort.
+
+  it('--advanced skips the fork question and asks the six [defaults] questions', async () => {
+    const res = await run(
+      // key   tool      verify      rev  land  s.model            s.eff   b.model/eff  v.model  v.eff
+      ['ACME', 'claude', 'npm test', '', '', 'claude-opus-4-8', 'high', '', '', '', 'xhigh'],
+      { advanced: true },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.defaults.scope.model).toBe('claude-opus-4-8');
+    expect(parsed.defaults.scope.effort).toBe('high');
+    expect(parsed.defaults.build.model).toBeNull(); // blank = inherit
+    expect(parsed.defaults.build.effort).toBeNull();
+    expect(parsed.defaults.verify.model).toBeNull();
+    expect(parsed.defaults.verify.effort).toBe('xhigh');
+  });
+
+  it('the trailing fork question reaches the same tier without the flag', async () => {
+    const res = await run(['ACME', 'claude', '', '', '', 'y', '', 'medium', '', '', '', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.defaults.scope.effort).toBe('medium');
+  });
+
+  it('the fork defaults to N — the quick flow never gains six surprise questions', async () => {
+    // No answer for the curate question at all: the asker falls back to the 'N' default,
+    // exactly what a user mashing Enter gets. The manifest keeps the commented guidance.
+    const res = await run(['ACME', 'claude', '', '']);
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).toMatch(/# \[defaults\.scope\]/);
+    expect(toml).not.toMatch(/^\[defaults\./m);
+  });
+
+  it('re-asks on a bad effort instead of writing one the schema refuses (rule 1)', async () => {
+    const res = await run(['ACME', 'claude', '', '', '', '', 'ultra', 'XHigh'], { advanced: true });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    // 'ultra' was refused and re-asked; the retry is accepted case-insensitively.
+    expect(parsed.defaults.scope.effort).toBe('xhigh');
+  });
+
+  it('answering everything blank in the advanced tier still writes a valid manifest', async () => {
+    const res = await run(['ACME', 'claude', '', ''], { advanced: true });
+    expect(res.wrote).toBe(true);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.defaults.scope.model).toBeNull();
+    expect(parsed.defaults.verify.effort).toBeNull();
   });
 
   it('warns a Diversion operator BEFORE the marker is committed: there is no dry-run (RUN-60)', async () => {
