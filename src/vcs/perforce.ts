@@ -186,6 +186,12 @@ export class PerforceBackend implements VcsBackend {
         await this.p4(['unshelve', '-s', buildChange], repoRoot);
       }
 
+      // Continue a failed run (RUN-93): a prior attempt at THIS run id shelved its work at dispose
+      // (disposePreservesWork), and reapOrphans above spared it — a shelved changelist has no
+      // opened files, so it is not re-cleaned. Find it now, BEFORE minting this sitting's
+      // changelist, so `findRunChange` cannot match the one we are about to create.
+      const priorChange = opts?.fromRunId ? null : await this.findRunChange(repoRoot, runId);
+
       // The run's pending changelist. Its description IS the crash-recovery record (the reaper
       // greps for it), mirroring git's run-id-in-the-branch-name. `--field` does the spec
       // surgery so no regex of ours can corrupt it — the exact pattern RUN-55 measured.
@@ -196,6 +202,17 @@ export class PerforceBackend implements VcsBackend {
       const created = await this.p4(['change', '-i'], repoRoot, changeSpec);
       const change = created.stdout.match(/Change (\d+) created/)?.[1];
       if (!change) throw new Error(`could not create a changelist: ${created.stdout}`);
+
+      if (priorChange && priorChange !== change) {
+        // Unshelve the prior attempt's work straight INTO this sitting's changelist — into the
+        // named one, not the default, because `reconcile -c` at checkpoint SKIPS files already
+        // opened elsewhere (the exact trap the lease self-heal above exists for), so work left in
+        // the default would never make it into the submit. Then drop the stale shelf + changelist
+        // so it stops matching `findRunChange` and cannot accumulate as an orphan.
+        await this.p4(['unshelve', '-s', priorChange, '-c', change], repoRoot);
+        await this.p4(['shelve', '-d', '-c', priorChange], repoRoot).catch(() => {});
+        await this.p4(['change', '-d', priorChange], repoRoot).catch(() => {});
+      }
 
       return {
         runId,

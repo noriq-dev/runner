@@ -112,6 +112,21 @@ describe('PerforceBackend — lease/dispose', () => {
     expect(calls.find((c) => c.what === 'p4 client -i')?.stdin).toContain('allwrite');
   });
 
+  it('continue a failed run: unshelves the prior attempt’s changelist into this sitting (RUN-93)', async () => {
+    // A kept prior attempt at run_1 was shelved at dispose; its changelist still names the run.
+    const { backend, calls } = fakes({
+      changesLong: 'Change 30 on 2026/07/16 by noriq@ws1 *pending*\n\n\tnoriq run run_1\n\n',
+    });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(ws.location).toEqual({ client: 'ws1', change: '42' }); // this sitting's fresh changelist
+    // The prior work is unshelved straight INTO changelist 42 (not the default, where reconcile -c
+    // would skip it), then the stale shelf + changelist are dropped so they can't re-match.
+    expect(calls.some((c) => c.what === 'p4 unshelve -s 30 -c 42')).toBe(true);
+    expect(calls.some((c) => c.what === 'p4 shelve -d -c 30')).toBe(true);
+    expect(calls.some((c) => c.what === 'p4 change -d 30')).toBe(true);
+    await backend.dispose(ws);
+  });
+
   it('a read-only lease keeps noallwrite — the OS enforces the scope floor for free', async () => {
     const { backend, calls } = fakes({});
     await backend.lease('/ws1', 'run_1', { readOnly: true });

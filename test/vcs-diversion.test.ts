@@ -143,6 +143,24 @@ describe('DiversionBackend — lease/dispose (the pool-of-1)', () => {
     // No DELETE /branches call: the branch is server-side, durable, team-visible history, and
     // may hold the only committed copy of unlanded work.
   });
+
+  it('continue a failed run: adopts the run’s existing branch, never re-POSTs it (RUN-93)', async () => {
+    // A kept prior attempt: the run's own branch already exists server-side with its work on it.
+    const { backend, calls } = fakes({
+      branches: { main: 'dv.commit.10', 'noriq/run/run_1': 'dv.commit.work' },
+    });
+    const ws = await backend.lease('/repo', 'run_1');
+    expect(ws.workRef).toBe('noriq/run/run_1');
+    // Base is the current line head, so hasWork sees the branch's own commit as work.
+    expect(ws.baseId).toBe('dv.commit.10');
+    expect(await backend.hasWork(ws)).toBe(true);
+    // It checked the existing branch out and did NOT POST a fresh one (which would 409).
+    expect(calls.some((c) => c.what === 'dv checkout noriq/run/run_1 --discard-changes --ignore-shelf')).toBe(
+      true,
+    );
+    expect(calls.some((c) => c.what.startsWith('POST') && c.what.includes('/branches?'))).toBe(false);
+    await backend.dispose(ws);
+  });
 });
 
 describe('DiversionBackend — integrate (merge the target IN; no rebase exists)', () => {

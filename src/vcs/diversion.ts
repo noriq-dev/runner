@@ -202,6 +202,26 @@ export class DiversionBackend implements VcsBackend {
       const branch = `noriq/run/${runId}`;
       const { stdout: baseBranchRaw } = await this.cli(['branch-name'], repoRoot);
       const baseBranch = baseBranchRaw.trim();
+
+      // Continue a failed run (RUN-93): the run's OWN branch already exists server-side from a kept
+      // prior attempt — dispose preserves it (§9), so a re-dispatch of the same run id finds it
+      // here. Adopt it: `POST /branches` would 409 on the existing name, and re-forking would
+      // abandon the work the prior attempt committed. `hasWork` compares the branch head to
+      // `baseId`, so the current line head as base makes the branch's own commits read as work.
+      const priorHead = opts?.fromRunId ? null : await this.branchHead(branch);
+      if (priorHead !== null) {
+        const baseId = (await this.branchHead(baseBranch)) ?? priorHead;
+        await this.cli(['checkout', branch, '--discard-changes', '--ignore-shelf'], repoRoot);
+        return {
+          runId,
+          localPath: repoRoot,
+          readOnly: opts?.readOnly ?? false,
+          baseId,
+          workRef: branch,
+          location: { repoId: this.repoId, branch, baseBranch } satisfies DvLocation,
+        };
+      }
+
       const from = opts?.fromRunId ? `noriq/run/${opts.fromRunId}` : baseBranch;
 
       const baseId = await this.branchHead(from);
