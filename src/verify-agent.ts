@@ -36,7 +36,9 @@ export interface VerifyPromptContext {
  *  Like the inline reviewer (RUN-76), the template scopes the verdict to what the diff CHANGED
  *  and treats the specs as a floor, not a ceiling — the strict "when ambiguous, FAIL" posture
  *  stays, but only for code the diff touched, so pre-existing code and behavior beyond the
- *  specs cannot manufacture a false FAIL. */
+ *  specs cannot manufacture a false FAIL. RUN-78 adds the same workspace-boundary rule the
+ *  inline reviewer carries: a spec whose implementation lives in another repo/service is
+ *  follow-up, not a finding, while a contract this diff participates in stays in scope. */
 export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): string {
   return renderPrompt('verify-agent', {
     label: ctx.agent.label,

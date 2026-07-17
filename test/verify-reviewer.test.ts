@@ -90,6 +90,17 @@ describe('assembleReviewerPrompt', () => {
     expect(p).toMatch(/manufacture a finding/i);
   });
 
+  it('excuses requirements that live in another repo/service, but not broken contracts (RUN-78)', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    // A cross-repo/service requirement is follow-up, not a verdict-driving finding — this is
+    // what stops a standalone-repo run failing over server-side surfaces it can never carry.
+    expect(p).toMatch(/another repository/);
+    expect(p).toMatch(/not a finding and must not drive the verdict/i);
+    // But integration the change PARTICIPATES in stays in scope — the rule is not a loophole.
+    expect(p).toMatch(/PARTICIPATES in is still yours/);
+    expect(p).toMatch(/never a bug that reaches elsewhere/);
+  });
+
   it('its verdict line round-trips through the shared parser', () => {
     // The reviewer and the dispatched verify kind share one protocol — a drift here would
     // make every reviewer verdict read as 'unknown', i.e. a permanent FAIL.
