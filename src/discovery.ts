@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { ProjectManifest } from '@noriq-dev/shared';
 import { parse as parseToml } from 'smol-toml';
+import { logger as defaultLogger } from './logger';
 
 /** A repo the daemon discovered under a scan root (has a .noriq/project.toml). */
 export interface DiscoveredRepo {
@@ -37,20 +38,61 @@ export function repoId(root: string): string {
 /** The committed marker's path for a repo root. */
 export const manifestPath = (root: string): string => path.join(root, '.noriq', 'project.toml');
 
-async function readManifest(markerPath: string): Promise<ProjectManifest | null> {
+/**
+ * Kinds whose committed profile still declares the REMOVED `network` key (RUN-88).
+ *
+ * Reads the RAW parsed TOML, because by the time zod is done the evidence is gone: the key was
+ * deleted from `PermissionProfile`, and zod strips unknowns rather than rejecting. That strip is
+ * what keeps every pre-RUN-88 repo dispatchable — but on its own it makes the file WORSE than
+ * before. `network = "none"` sits committed in the manifest, reading to anyone who opens it like
+ * a firewall, while the daemon hands the agent its own full egress and says nothing. The key
+ * being unenforced was RUN-88's bug; the key being unenforced AND unmentioned is that same bug
+ * with the evidence removed. Silence is not compatibility.
+ *
+ * Exported (and pure) so the detection is testable without a daemon or an fs.
+ */
+export function legacyNetworkKinds(raw: unknown): string[] {
+  const perms = (raw as { permissions?: unknown } | null | undefined)?.permissions;
+  if (!perms || typeof perms !== 'object') return [];
+  return Object.entries(perms as Record<string, unknown>)
+    .filter(([, profile]) => profile !== null && typeof profile === 'object' && 'network' in profile)
+    .map(([kind]) => kind);
+}
+
+async function readManifest(
+  markerPath: string,
+  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
+): Promise<ProjectManifest | null> {
   try {
     const raw = parseToml(await readFile(markerPath, 'utf8'));
     const parsed = ProjectManifest.safeParse(raw);
-    return parsed.success ? parsed.data : null; // invalid marker → skip
+    if (!parsed.success) return null; // invalid marker → skip
+    // Say the quiet part, every read. A manifest is re-read per Run (see ManifestStore), so this
+    // fires at the moment it matters: right before an agent is spawned with egress the committed
+    // file claims it does not have. Noisy by design and self-limiting — delete the key and it
+    // stops. A one-shot warning at daemon start would be missed by whoever reads the run log.
+    const stale = legacyNetworkKinds(raw);
+    if (stale.length) {
+      log.warn(
+        'project.toml still declares `network` — that key was REMOVED (RUN-88) and is ignored: ' +
+          "these agents get this daemon's full network egress regardless of what it says. If a run " +
+          'must not reach the network, isolate the box — the file cannot do it. Delete the key.',
+        { marker: markerPath, kinds: stale },
+      );
+    }
+    return parsed.data;
   } catch {
     return null;
   }
 }
 
 /** Read + validate a repo's committed manifest off disk. null = absent or invalid.
- *  Exported so callers can re-read it without re-walking every scan root. */
-export const loadManifest = (root: string): Promise<ProjectManifest | null> =>
-  readManifest(manifestPath(root));
+ *  Exported so callers can re-read it without re-walking every scan root. The logger is
+ *  injectable for tests; everything else on this path takes the module's own. */
+export const loadManifest = (
+  root: string,
+  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
+): Promise<ProjectManifest | null> => readManifest(manifestPath(root), log);
 
 /** Best-effort default branch from .git/HEAD (no git subprocess). */
 async function gitDefaultBranch(root: string): Promise<string | null> {

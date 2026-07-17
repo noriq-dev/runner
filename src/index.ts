@@ -8,7 +8,14 @@ export {
   loadRunnerConfig,
   parseRunnerConfig,
 } from './config';
-export { type DiscoveredRepo, discoverRepos, loadManifest, manifestPath, repoId } from './discovery';
+export {
+  type DiscoveredRepo,
+  discoverRepos,
+  legacyNetworkKinds,
+  loadManifest,
+  manifestPath,
+  repoId,
+} from './discovery';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,
