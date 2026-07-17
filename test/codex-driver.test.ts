@@ -179,6 +179,35 @@ describe('CodexDriver', () => {
     expect(joined).not.toContain('diff.The');
   });
 
+  it('separates distinct agentMessage items with a paragraph break; id-less deltas never do (RUN-80)', async () => {
+    const h = harness();
+    const fake = h.getFake();
+    fake.push({ type: 'text', text: 'First message.', itemId: 'item_a' });
+    fake.push({ type: 'text', text: ' Continued.', itemId: 'item_a' });
+    fake.push({ type: 'text', text: 'Second message.', itemId: 'item_b' });
+    // 0.142.x sends no item id — the break-on-change must never fire on absence.
+    fake.push({ type: 'text', text: ' trailing id-less delta' });
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+    expect(h.texts.join('')).toBe('First message. Continued.\n\nSecond message. trailing id-less delta');
+
+    // normalizeNotification surfaces the id from either 0.144.x shape.
+    expect(normalizeNotification('item/agentMessage/delta', { delta: 'x', itemId: 'i1' })).toEqual({
+      type: 'text',
+      text: 'x',
+      itemId: 'i1',
+    });
+    expect(normalizeNotification('item/agentMessage/delta', { delta: 'x', item: { id: 'i2' } })).toEqual({
+      type: 'text',
+      text: 'x',
+      itemId: 'i2',
+    });
+    expect(normalizeNotification('thread/agentMessageDelta', { delta: 'x' })).toEqual({
+      type: 'text',
+      text: 'x',
+    });
+  });
+
   it('maps an error event to a failed outcome', async () => {
     const h = harness();
     h.getFake().push({ type: 'error', message: 'sandbox denied write' });
