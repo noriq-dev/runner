@@ -94,8 +94,11 @@ export async function detectEcosystem(cwd: string): Promise<Ecosystem> {
     // install (`npm ci`: installs exactly the lockfile, never rewrites it) only when a lockfile
     // actually pins it: `npm ci` errors without one, and an install rule that always fails is worse
     // than none. Never `npm install` — it can add packages and rewrite the lockfile.
+    // Either lockfile pins `npm ci`: package-lock.json is the common one, npm-shrinkwrap.json is
+    // the published-package form — npm ci honours both, so a shrinkwrap-only repo must get the rule.
+    const pinned = has('package-lock.json') || has('npm-shrinkwrap.json');
     const npm: string[] = [
-      ...(has('package-lock.json') ? ['Bash(npm ci:*)'] : []),
+      ...(pinned ? ['Bash(npm ci:*)'] : []),
       'Bash(npm test:*)',
       'Bash(npm run:*)',
       'Bash(npx tsc:*)',

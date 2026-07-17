@@ -155,6 +155,14 @@ describe('detectEcosystem', () => {
     expect(eco.allow).not.toContain('Bash(npm install:*)'); // never the lockfile-rewriting form
   });
 
+  it('accepts npm-shrinkwrap.json as the pinning lockfile too, not only package-lock.json', async () => {
+    // `npm ci` honours a shrinkwrap (the published-package form); a shrinkwrap-only repo still needs
+    // the install rule or its fresh worktree can never bootstrap.
+    await writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'x' } }));
+    await writeFile(path.join(dir, 'npm-shrinkwrap.json'), '{}');
+    expect((await detectEcosystem(dir)).allow).toContain('Bash(npm ci:*)');
+  });
+
   it('omits the install rule when no lockfile pins it — one that always fails is worse than none', async () => {
     await writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'x' } }));
     const eco = await detectEcosystem(dir);
