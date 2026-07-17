@@ -33,8 +33,16 @@ export interface ReviewerPromptContext {
  *  reviewer is stateless, so without that discipline it re-reads whole changed files against
  *  a possibly-superseded brief and re-reports pre-existing code — the loop this gate saw fail
  *  three ways: pre-existing code flagged as the author's, later-approved evolution read as a
- *  violation, and every round re-raising the same out-of-scope finding. Cross-round memory
- *  (the builder's rebuttal to a settled finding) is a separate, heavier fix and NOT here. */
+ *  violation, and every round re-raising the same out-of-scope finding.
+ *
+ *  RUN-78 adds the workspace-boundary rule: a requirement whose implementation lives in another
+ *  repo/service/deployment cannot be satisfied from this tree, so it is follow-up for the human,
+ *  not a verdict-driving finding — but a contract this change PARTICIPATES in (a wire frame it
+ *  emits, an interface it calls) stays in scope. This repo is standalone by design (see
+ *  CLAUDE.md), so cross-repo intent is common; without the rule fresh reviewers split on it
+ *  (RUN-59 dogfood: rounds 1/3 failed a run over server-repo surfaces the diff could never carry,
+ *  round 2 reasoned the boundary out unprompted). Cross-round memory of the builder's rebuttal to
+ *  a settled finding is the separate, heavier fix (RUN-79), NOT here. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,

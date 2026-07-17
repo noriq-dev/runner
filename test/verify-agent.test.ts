@@ -48,6 +48,18 @@ describe('assembleVerifyPrompt', () => {
     expect(p).toMatch(/when the evidence about such code is ambiguous, FAIL/);
     expect(p).toMatch(/not for pre-existing code/);
   });
+
+  it('excuses specs that live in another repo/service, but not broken contracts (RUN-78)', () => {
+    const p = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+      diffCmd: 'git diff main...HEAD',
+    });
+    expect(p).toMatch(/another repository/);
+    expect(p).toMatch(/not a finding and must not drive the verdict/i);
+    expect(p).toMatch(/PARTICIPATES in is still yours/);
+    expect(p).toMatch(/never a bug that reaches elsewhere/);
+  });
 });
 
 describe('parseVerdict', () => {

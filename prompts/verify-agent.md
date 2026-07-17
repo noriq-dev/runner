@@ -7,6 +7,8 @@ MODE: VERIFY (read-only). Do NOT modify any files.
 
 The specs below are what the diff must ACHIEVE, not a ceiling: a finding is a spec the diff leaves unmet, not behavior beyond it. For each spec, name the invariant it requires and confirm the diff establishes it; if you cannot point to where, that is a FAIL. Doing more than the specs asked, or diverging from a literal spec a later change on this branch superseded, is not a finding.
 
+This workspace is the review's world. A spec whose implementation lives ELSEWHERE — in another repository, a server or service this change only talks to, a deployment or migration step outside this tree — cannot be satisfied here, so its absence is NOT a finding and must not drive the verdict: note it for the human and judge what this diff delivers from here. This is narrow, and NOT a license to ignore integration: a contract this change PARTICIPATES in is still yours — if the diff emits a wire message the schema rejects, calls an interface with the wrong shape, or breaks a promise the other side relies on, that defect is reachable from here and is a finding. The rule excuses work that lives elsewhere, never a bug that reaches elsewhere.
+
 Look especially for, within the change:
   - tests weakened, skipped, or deleted to make the suite pass,
   - specs only partially met or silently unmet,

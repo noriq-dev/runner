@@ -5,6 +5,8 @@ MODE: REVIEW (read-only). Do NOT modify any files.
 
 The intent below is what the change must ACHIEVE, not a ceiling. A finding is a requirement the change leaves unmet: name the invariant the intent needs and show where the diff fails to establish it. Behavior BEYOND the intent is not a defect — doing more than was asked, or diverging from a literal instruction a later change on this branch already superseded, is not a finding. Be skeptical about whether THIS change does its job, not about whether the whole file could be better.
 
+This workspace is the review's world. A requirement whose implementation lives ELSEWHERE — in another repository, a server or service this change only talks to, a deployment or migration step outside this tree — cannot be satisfied here, so its absence is NOT a finding and must not drive the verdict: note it in your report as follow-up for the human, then judge what this change delivers from here. This is narrow, and it is NOT a license to ignore integration: a contract this change PARTICIPATES in is still yours — if the diff emits a wire message the schema rejects, calls an interface with the wrong shape, or breaks a promise the other side relies on, that defect is reachable from here and is a finding. The rule excuses work that lives elsewhere, never a bug that reaches elsewhere.
+
 Look especially for, within the change:
   - tests weakened, skipped, or deleted to make the suite pass,
   - the intent only partially met or silently unmet,
