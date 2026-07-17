@@ -69,6 +69,20 @@ export interface LeaseOptions {
    * shelved change) is the backend's own business.
    */
   fromRunId?: string;
+  /**
+   * Fork from a named landing TARGET (the plan's / integration working branch) when it exists,
+   * instead of the repo's current state (RUN-82). This is how a later task in a plan sees its
+   * predecessors' landed work: they land on `[land].branch`, so a run based there starts from
+   * that accumulation and its landing rebase is a trivial fast-forward — without it a later task
+   * forks from a stale main, cannot see the work it builds on, and its review diff double-counts
+   * it. A landing target, named the same way `targetExists`/`createTarget`/`integrate` name one
+   * (a string the backend interprets); a live backend leases from that target's own state.
+   *
+   * Ignored together with `fromRunId`: a verify run leases from the build it judges, never a
+   * branch. The caller passes this ONLY when the target already exists — the backend may assume
+   * it does.
+   */
+  fromTarget?: string;
 }
 
 export type IntegrateResult =

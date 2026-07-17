@@ -75,6 +75,18 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(calls[0]?.args[2]).toEqual({ readOnly: undefined, baseRef: 'noriq/run/run_1' });
   });
 
+  it('lease({fromTarget}) forks from the landing branch directly (RUN-82)', async () => {
+    const { ops, calls } = recorder();
+    await new GitBackend(ops).lease('/repo', 'run_2', { fromTarget: 'noriq/plan-x' });
+    expect(calls[0]?.args[2]).toEqual({ readOnly: undefined, baseRef: 'noriq/plan-x' });
+  });
+
+  it('fromRunId WINS over fromTarget — a verify run judges the build, not the plan branch (RUN-82)', async () => {
+    const { ops, calls } = recorder();
+    await new GitBackend(ops).lease('/repo', 'run_2', { fromRunId: 'run_1', fromTarget: 'noriq/plan-x' });
+    expect(calls[0]?.args[2]).toEqual({ readOnly: undefined, baseRef: 'noriq/run/run_1' });
+  });
+
   it('maps every workspace outcome to its verb, unwrapping location — results verbatim', async () => {
     const { ops, calls } = recorder();
     const vcs = new GitBackend(ops);

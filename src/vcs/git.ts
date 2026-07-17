@@ -78,7 +78,9 @@ export class GitBackend implements VcsBackend {
       // "Lease from run X's work" in git terms: X's throwaway branch. The run-id → branch-name
       // convention is this backend's own (worktree.ts owns it), which is why the option is a
       // run id and not a ref — the supervisor no longer knows the convention exists.
-      baseRef: opts?.fromRunId ? runBranch(opts.fromRunId) : undefined,
+      // A landing target (RUN-82) is already a branch here, so it IS the base ref directly.
+      // fromRunId wins: a verify run leases from the build it judges, not from a target.
+      baseRef: opts?.fromRunId ? runBranch(opts.fromRunId) : opts?.fromTarget,
     });
     return {
       runId: info.runId,

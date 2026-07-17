@@ -376,6 +376,26 @@ export class RunSupervisor {
   }
 
   /**
+   * The branch a run forks from — and is measured against — instead of HEAD (RUN-82): the
+   * resolved `[land]` target, when it is configured AND already exists (a predecessor landed on
+   * it). This is what lets a later task in a plan see its predecessors' work: they land on the
+   * plan's working branch, so a run based there starts from that accumulation and its landing
+   * rebase is a trivial fast-forward. Null when no `[land]`, or the target does not exist yet
+   * (the first task in a plan) — the run forks from HEAD, exactly as before. The dispatch's
+   * targetBranch override is deliberately NOT applied here: it is validated at land time, and
+   * forking from the computed plan branch keeps lease-time free of that decision.
+   */
+  private async planBase(repo: ResolvedRepo, run: Run): Promise<string | null> {
+    const land = repo.manifest.land;
+    if (!land) return null;
+    const target = resolveLandBranch(land.branch, run.planKey);
+    const exists = await this.vcsFor(repo)
+      .targetExists(repo.root, target)
+      .catch(() => false);
+    return exists ? target : null;
+  }
+
+  /**
    * Serialize work per repo. rebase → verify → fast-forward is a read-modify-write of
    * one branch: two concurrent runs would each rebase onto the same tip, each verify a
    * combination the other never saw, and the loser's fast-forward would fail (or worse,
@@ -1219,11 +1239,18 @@ export class RunSupervisor {
     // backend's own convention, and this file no longer knows it.
     const verifiesRunId = run.kind === 'verify' ? (run.verifiesRunId ?? null) : null;
 
+    // The plan's working branch, when this run belongs to one and it exists (RUN-82). A build
+    // FORKS from it (so it sees predecessors' landed work and lands as a fast-forward); a verify
+    // run is MEASURED against it (below). A verify run still leases from the build it judges
+    // (fromRunId), so `fromTarget` is only meaningful — and only passed — for a build.
+    const planBase = kind === 'build' || kind === 'verify' ? await this.planBase(repo, run) : null;
+
     let worktree: Workspace;
     try {
       worktree = await this.vcsFor(repo).lease(repo.root, run.id, {
         readOnly,
         fromRunId: verifiesRunId ?? undefined,
+        ...(kind === 'build' && planBase ? { fromTarget: planBase } : {}),
       });
     } catch (err) {
       // A verify run whose build is gone (reaped, or built on another machine) must fail
@@ -1288,12 +1315,14 @@ export class RunSupervisor {
     // so a bare `git diff` still shows nothing. Point the verifier at the range that is
     // actually under review — everything the build added since it forked. Three dots =
     // "since the merge base", so an unrelated main moving on doesn't pollute the review.
-    // Only a git-shaped backend gets a diff command; a live backend (Perforce/Diversion) has
-    // no `git diff` to run, so the prompt falls back to inspecting the workspace's files
-    // (same gate the inline reviewer uses).
+    // The base is the plan's working branch when the build forked from one (RUN-82) — else the
+    // build measured against main would re-include every predecessor task's landed work — falling
+    // back to the default branch. Only a git-shaped backend gets a diff command; a live backend
+    // (Perforce/Diversion) has no `git diff` to run, so the prompt falls back to inspecting the
+    // workspace's files (same gate the inline reviewer uses).
     const diffCmd =
       verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
-        ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
+        ? `git diff ${planBase ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
         : undefined;
 
     // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,

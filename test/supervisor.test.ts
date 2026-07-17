@@ -89,7 +89,13 @@ class FakeDriver implements AgentDriver {
 }
 
 class FakeWorktrees {
-  created: Array<{ root: string; runId: string; readOnly: boolean; fromRunId?: string }> = [];
+  created: Array<{
+    root: string;
+    runId: string;
+    readOnly: boolean;
+    fromRunId?: string;
+    fromTarget?: string;
+  }> = [];
   removed: string[] = [];
   /** Whether the agent left a diff. Defaults true — most tests model real work. */
   changed = true;
@@ -99,10 +105,16 @@ class FakeWorktrees {
   lease = async (
     root: string,
     runId: string,
-    opts: { readOnly?: boolean; fromRunId?: string } = {},
+    opts: { readOnly?: boolean; fromRunId?: string; fromTarget?: string } = {},
   ): Promise<Workspace> => {
     if (this.createFails) throw new Error(`invalid reference: ${opts.fromRunId}`);
-    this.created.push({ root, runId, readOnly: !!opts.readOnly, fromRunId: opts.fromRunId });
+    this.created.push({
+      root,
+      runId,
+      readOnly: !!opts.readOnly,
+      fromRunId: opts.fromRunId,
+      fromTarget: opts.fromTarget,
+    });
     return {
       runId,
       localPath: `/wt/${runId}`,
@@ -1327,6 +1339,63 @@ describe('landing a passing build (no human per run)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.worktrees.landings).toHaveLength(1); // landed unverified, as configured
+  });
+});
+
+describe('plan-branch fork base (RUN-82)', () => {
+  // A [land] with a per-plan working branch, and a run that belongs to that plan.
+  const PLAN_LAND = LANDING({ branch: 'noriq/plan-<planKey>' });
+  const planRun = (kind: 'build' | 'verify' = 'build') =>
+    makeRun({
+      kind,
+      anchor: { type: 'task', taskId: 'task_9' },
+      planKey: 'the-curated-init',
+      ...(kind === 'verify' ? { verifiesRunId: 'run_build7' } : {}),
+    });
+
+  it('a build forks from the plan branch when it already exists (a predecessor landed)', async () => {
+    const h = harness({ manifest: PLAN_LAND });
+    h.worktrees.branches.add('noriq/plan-the-curated-init'); // RUN-62/63 landed here
+    const done = h.supervisor.supervise(planRun());
+    await flush();
+    // The worktree forked from the plan branch — so it sees predecessors' work, no mirroring.
+    expect(h.worktrees.created[0]?.fromTarget).toBe('noriq/plan-the-curated-init');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('the FIRST task (plan branch does not exist yet) forks from HEAD, exactly as before', async () => {
+    const h = harness({ manifest: PLAN_LAND }); // branches = {main} only
+    const done = h.supervisor.supervise(planRun());
+    await flush();
+    expect(h.worktrees.created[0]?.fromTarget).toBeUndefined(); // HEAD, no target
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('no [land] configured → no plan base, forks from HEAD', async () => {
+    const h = harness(); // manifest() has land: null
+    h.worktrees.branches.add('noriq/plan-the-curated-init');
+    const done = h.supervisor.supervise(planRun());
+    await flush();
+    expect(h.worktrees.created[0]?.fromTarget).toBeUndefined();
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a verify run does NOT fork from the plan branch — it leases from the build it judges', async () => {
+    const h = harness({ manifest: PLAN_LAND });
+    h.worktrees.branches.add('noriq/plan-the-curated-init');
+    const done = h.supervisor.supervise(planRun('verify'));
+    await flush();
+    expect(h.worktrees.created[0]?.fromRunId).toBe('run_build7'); // the build's work
+    expect(h.worktrees.created[0]?.fromTarget).toBeUndefined(); // NOT the plan branch
+    // …but it is MEASURED against the plan branch, so its diff is the true task delta, not
+    // every predecessor's landed work re-counted.
+    expect(h.claude.opts?.prompt).toContain('git diff noriq/plan-the-curated-init...HEAD');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
   });
 });
 
