@@ -5,7 +5,10 @@ MODE: REVIEW (read-only). Do NOT modify any files.
 
 The intent below is what the change must ACHIEVE, not a ceiling. A finding is a requirement the change leaves unmet: name the invariant the intent needs and show where the diff fails to establish it. Behavior BEYOND the intent is not a defect — doing more than was asked, or diverging from a literal instruction a later change on this branch already superseded, is not a finding. Be skeptical about whether THIS change does its job, not about whether the whole file could be better.
 
-This workspace is the review's world. A requirement whose implementation lives ELSEWHERE — in another repository, a server or service this change only talks to, a deployment or migration step outside this tree — cannot be satisfied here, so its absence is NOT a finding and must not drive the verdict: note it in your report as follow-up for the human, then judge what this change delivers from here. This is narrow, and it is NOT a license to ignore integration: a contract this change PARTICIPATES in is still yours — if the diff emits a wire message the schema rejects, calls an interface with the wrong shape, or breaks a promise the other side relies on, that defect is reachable from here and is a finding. The rule excuses work that lives elsewhere, never a bug that reaches elsewhere.
+This workspace is the review's world. A requirement whose implementation lives ELSEWHERE — in another repository, a server or service this change only talks to, a deployment or migration step outside this tree — cannot be satisfied here, so its absence is NOT a finding and must not drive the verdict: note it in your report as follow-up for the human, then judge what this change delivers from here. This is narrow, and it is NOT a license to ignore integration: a contract this change PARTICIPATES in is still yours — if the diff emits a wire message the schema rejects, calls an interface with the wrong shape, or breaks a promise the other side relies on, that defect is reachable from here and is a finding. The rule excuses work that lives elsewhere, never a bug that reaches elsewhere.{{#priorAdjudications}}
+
+PRIOR ADJUDICATIONS — these findings were raised in earlier rounds and the builder responded. Each status below is the builder's CLAIM with an evidence pointer, NOT established fact: verify the pointer against the diff yourself. Re-raise a CONTESTED finding only if you can show, from this diff and citing the line, that its pointer is wrong — never merely because you would have flagged it. For a FIXED finding, confirm the change actually landed. Do not relitigate a finding whose pointer holds up.
+{{priorAdjudications}}{{/priorAdjudications}}
 
 Look especially for, within the change:
   - tests weakened, skipped, or deleted to make the suite pass,
@@ -13,6 +16,10 @@ Look especially for, within the change:
   - missing edge cases and error handling a green test run would miss.
 Every finding names a concrete failure — the inputs or state that trigger it and the wrong result — at a file/line the diff touched, not a vague worry. For code this change touches, dismiss a concern only when the code proves it cannot happen; a realistic but uncertain runtime state is not grounds to drop it. Do NOT manufacture a finding to avoid an empty report: if the change does its job, PASS is the honest verdict.{{#verifyCmd}}
 The deterministic check (`{{verifyCmd}}`) already passed — do not re-run it to grade the work. Spend your turns on what a green suite cannot prove.{{/verifyCmd}}
+
+When the verdict is FAIL, list each finding on its own line, numbered, so the builder can answer each one by number:
+  FINDING <n> [<severity>] <file:line>: <one-sentence claim>
+Put your reasoning above the list if you like, but every finding that drives the verdict must appear as one of these lines.
 
 End your response with EXACTLY one line, on its own:
   VERDICT: PASS   — the change fully and honestly satisfies the intent

@@ -55,6 +55,16 @@ export {
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
 export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from './prompts';
 export {
+  parseFindings,
+  parseFindingResponses,
+  buildLedger,
+  renderLedger,
+  type Finding,
+  type FindingResponse,
+  type FindingStatus,
+  type LedgerEntry,
+} from './adjudication';
+export {
   DEFAULT_PARKED_PATH,
   DEFAULT_PARK_TTL_HOURS,
   ParkedStore,

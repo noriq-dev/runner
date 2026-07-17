@@ -26,6 +26,9 @@ class FakeDriver implements AgentDriver {
   continuations: string[] = [];
   /** Outcome of each continueWith, in order. Defaults to 'done' — the agent fixed it. */
   continueOutcomes: Array<'done' | 'failed'> = [];
+  /** Text the agent "emits" during each continueWith, in order — models the real driver
+   *  streaming a fix turn's output via onText (RUN-79's ledger reads it). Empty = silent. */
+  continueTexts: string[] = [];
   /** True once stop() was called — a multiTurn session that nobody closes hangs the daemon. */
   stopped = false;
   constructor(readonly tool: 'claude' | 'codex') {}
@@ -52,6 +55,12 @@ class FakeDriver implements AgentDriver {
       continueWith: opts.multiTurn
         ? async (text: string): Promise<DriverExit> => {
             this.continuations.push(text);
+            // Stream this fix turn's output the way the real driver does, so anything reading
+            // the session text (the ledger's RESPONSE-block capture) sees it. Emit to THIS
+            // session's handlers (the closed-over opts), not this.opts — the latter has since
+            // moved to the reviewer session, but the fix turn belongs to the build session.
+            const emitted = this.continueTexts.shift();
+            if (emitted) opts.handlers?.onText?.(emitted);
             const outcome = this.continueOutcomes.shift() ?? 'done';
             return {
               outcome,
@@ -1314,6 +1323,35 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.verifyCalls()).toBe(2); // the fix must re-pass the deterministic floor too
+  });
+
+  it('carries round 1 findings + the builder’s rebuttal into round 2’s reviewer prompt (RUN-79)', async () => {
+    // The RUN-59 failure mode: a fresh reviewer re-raised a finding the builder had answered
+    // with evidence, because the rebuttal never reached it. The ledger carries round 1's
+    // numbered finding AND the builder's structured CONTESTED pointer into round 2's prompt.
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true, true] });
+    // The builder's fix turn emits a structured RESPONSE block — the ledger parses it.
+    h.claude.continueTexts = [
+      'Looked at it.\nFINDING 1: CONTESTED src/telemetry.ts:5, commit abc123 — mix is primary-session by design',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn
+    await onReviewTurn(h, 2);
+    // Reviewer round 1 files a NUMBERED finding, then FAIL.
+    h.claude.emitText('FINDING 1 [High] src/telemetry.ts:5: reviewer mix stripped\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // fix turn ran (RESPONSE block emitted), reviewer #2 starts
+
+    const round2Prompt = h.claude.starts[2]!.prompt;
+    expect(round2Prompt).toMatch(/PRIOR ADJUDICATIONS/); // the ledger reached round 2
+    expect(round2Prompt).toContain('reviewer mix stripped'); // round 1's finding claim
+    expect(round2Prompt).toContain('CONTESTED (src/telemetry.ts:5, commit abc123)'); // the rebuttal pointer
+    expect(round2Prompt).toMatch(/verify the pointer against the diff yourself/i); // the frame
+
+    h.claude.emitText('Verified the pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
   });
 
   it('commits the fix before re-review, so the fresh reviewer diff includes it (not the stale HEAD)', async () => {
