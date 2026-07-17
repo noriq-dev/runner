@@ -2,7 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { AgentTool, RunEffort, RunKind } from '@noriq-dev/shared';
+import { AgentTool, NetworkPolicy, RunEffort, RunKind } from '@noriq-dev/shared';
 import { loadRunnerConfig } from './config';
 import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
@@ -222,6 +222,38 @@ export interface LandChoices {
 }
 
 /**
+ * The curatable slice of [permissions] (RUN-65). Null = never curated: every kind keeps the
+ * floor quick mode writes.
+ *
+ * What is NOT here is the design. `write` is absent because scope/verify read-only and
+ * build-writes-its-own-worktree is the floor, not a preference — a wizard that asks is a wizard
+ * that suggests the answer could be no. `auto` is absent for the same reason one step out: a
+ * repo that wants the driver's bypass mode is a repo whose owner has read THREAT-MODEL.md and
+ * can type six words into the file it documents. This tier curates what a real repo hand-edits
+ * in after its first failed run, and stops there.
+ */
+export interface PermissionChoices {
+  /** EXTRA build allow rules, appended to the ecosystem-derived set — never replacing it. */
+  buildAllow: string[];
+  /** Per-kind deny rules. Deny outranks everything on Claude (disallowedTools), `auto`
+   *  included; it binds NOTHING on codex, which gates by sandbox level rather than per
+   *  command (see `mapSandbox`). The wizard says so before asking — a rule that silently
+   *  stops nothing on half the drivers is exactly the false claim this tier must not write. */
+  deny: Record<RunKind, string[]>;
+  /**
+   * Per-kind egress. Default 'restricted' — the floor quick mode writes.
+   *
+   * DECLARED, NOT ENFORCED: no driver reads `network` today, so an agent gets whatever egress
+   * the daemon has whatever this says. The key is offered anyway — it is in the committed
+   * schema, `restricted` is already written for every kind by quick mode, and a repo recording
+   * the egress it INTENDS is what makes enforcement adoptable rather than a flag day. But the
+   * wizard states the gap at the moment of choosing rather than letting someone walk away
+   * believing `none` is a firewall. See the alert filed against this task.
+   */
+  network: Record<RunKind, NetworkPolicy>;
+}
+
+/**
  * Everything the wizard chose, accumulated across the quick flow and any advanced sections,
  * rendered exactly ONCE at the end. RUN-40's rule 1 (validate before writing) applies to the
  * whole session, not per question — no section writes; sections only fill this in.
@@ -250,6 +282,11 @@ export interface ManifestChoices {
    * The manifest stays backend-neutral; this only picks the words the rendered COMMENTS use.
    */
   vocab?: VcsVocab | null;
+  /** The curatable [permissions] slice (RUN-65). Null/absent = the floor, unchanged. */
+  permissions?: PermissionChoices | null;
+  /** The repo's main line (RUN-65) — the one plain-identity field the quick flow never asks.
+   *  Null/absent = the commented hint; the daemon falls back to the run's own base. */
+  defaultBranch?: string | null;
 }
 
 export function renderProjectManifest(m: ManifestChoices): string {
@@ -270,6 +307,25 @@ export function renderProjectManifest(m: ManifestChoices): string {
   if (m.tool) {
     lines.push('', '# Default agent driver for this repo.', `tool = ${tomlString(m.tool)}`);
   }
+
+  // The repo's main line: what a NEW landing target forks from, and what a run's diff is taken
+  // against. Absent, both fall back to the run's own base — right until two runs disagree about
+  // what "the base" was. The key is `defaultBranch` everywhere (the schema's name); only the
+  // comment reads in the backend's own words (RUN-84).
+  lines.push(
+    '',
+    ...(m.defaultBranch
+      ? [
+          `# This repo's main line: a new landing ${vocab.targetNoun} forks from here, and a run's`,
+          '# diff is taken against it. Never written to by the daemon.',
+          `defaultBranch = ${tomlString(m.defaultBranch)}`,
+        ]
+      : [
+          `# defaultBranch = "main"   # the repo's main line: what a new landing ${vocab.targetNoun}`,
+          "#                          # forks from, and what a run's diff is taken against. Blank =",
+          "#                          # the run's own base commit.",
+        ]),
+  );
 
   // Per-kind [defaults] (RUN-33). Chosen values become real sections; nothing chosen keeps the
   // guidance as comments, so the manifest stays its own documentation either way.
@@ -422,23 +478,54 @@ export function renderProjectManifest(m: ManifestChoices): string {
     '# Per-kind security floor. These are the safe defaults: scope and verify are READ-ONLY,',
     '# build gets write in its own worktree. No agent ever gets push credentials — that is',
     '# enforced by the daemon and is not expressible here.',
-    '[permissions.scope]',
-    'write = false',
-    'network = "restricted"',
-    '',
-    '[permissions.build]',
-    'write = true',
-    'network = "restricted"',
+    '#',
+    '# What each key below is actually worth today — because a policy that reads as a control',
+    '# and is only an intention is worse than no key at all:',
+    '#   write   : ENFORCED. Claude withholds the edit tools; codex gets a read-only sandbox.',
+    '#   allow   : ENFORCED on Claude (allowedTools). Codex gates by sandbox level, not per',
+    '#             command, so these rules do not narrow a codex run.',
+    '#   deny    : ENFORCED on Claude (disallowedTools, outranking `auto`). NOT on codex, for',
+    '#             the same reason as `allow` — a denied command still runs there.',
+    '#   network : DECLARED, NOT ENFORCED. No driver reads it: an agent gets whatever egress',
+    '#             the daemon process has, whatever this says. It records intent until the',
+    '#             runner can isolate a run at the network layer. Do not rely on it.',
   );
-  // Bare `Bash` is never granted, so without this a build agent cannot run the verify command
-  // above. The empty case is left explicit rather than omitted: an empty allowlist is a real
-  // state with real consequences, and a reader should see that it was a choice.
-  lines.push(
-    m.allow.length
-      ? `allow = [${m.allow.map(tomlString).join(', ')}]`
-      : '# allow = ["Bash(npm test:*)"]   # a build agent cannot run ANY command without rules here',
-  );
-  lines.push('', '[permissions.verify]', 'write = false', 'network = "restricted"', '');
+  const perms = m.permissions ?? null;
+  // The write axis is rendered, never chosen: read-only scope/verify and a build that writes its
+  // own worktree is the floor the whole model rests on, so the wizard has no question that could
+  // move it (RUN-65). Everything else below is written only where it differs from that floor.
+  RunKind.options.forEach((kind, i) => {
+    if (i > 0) lines.push('');
+    const network = perms?.network[kind] ?? 'restricted';
+    lines.push(`[permissions.${kind}]`, `write = ${kind === 'build'}`);
+    if (network === 'full') {
+      lines.push(
+        '# CHOSEN: unrestricted egress. Note this is the value that becomes a no-op the day the',
+        '# key starts being enforced — the other two are the ones that will bite.',
+      );
+    }
+    lines.push(`network = ${tomlString(network)}`);
+    if (kind === 'build') {
+      // Bare `Bash` is never granted, so without this a build agent cannot run the verify command
+      // above. The empty case is left explicit rather than omitted: an empty allowlist is a real
+      // state with real consequences, and a reader should see that it was a choice.
+      const allow = [...new Set([...m.allow, ...(perms?.buildAllow ?? [])])];
+      lines.push(
+        allow.length
+          ? `allow = [${allow.map(tomlString).join(', ')}]`
+          : '# allow = ["Bash(npm test:*)"]   # a build agent cannot run ANY command without rules here',
+      );
+    }
+    const deny = perms?.deny[kind] ?? [];
+    if (deny.length) {
+      lines.push(
+        '# Deny outranks everything on Claude, including `auto` and the rules above. On codex it',
+        '# binds nothing — see the key legend at the top of this section.',
+        `deny = [${deny.map(tomlString).join(', ')}]`,
+      );
+    }
+  });
+  lines.push('');
 
   return lines.join('\n');
 }
@@ -602,7 +689,160 @@ const landSection: AdvancedSection = {
   },
 };
 
-const ADVANCED_SECTIONS: AdvancedSection[] = [defaultsSection, landSection];
+/**
+ * Why an allow rule is refused, or null when it is fine (RUN-65).
+ *
+ * `mapPermission`/`mapSandbox` would never EMIT either of these from a curated allowlist — so
+ * this is not the enforcement, and it is not pretending to be. It is the committed file staying
+ * honest: a marker travels to teammates' runners, and a rule that reads as "the allowlist grants
+ * everything" is a claim about this repo that no reader should have to test against the driver's
+ * source to disbelieve. The daemon being defensive is not the same as the manifest being true.
+ *
+ * Bare `Bash` — and its wildcard spellings — is unrestricted execution wearing an allowlist's
+ * clothes. `danger-full-access` is codex's sandbox mode, not an allow rule at all: typed here it
+ * does nothing, which is the worst outcome available (it reads as granted and is not).
+ */
+export function refuseAllowRule(rule: string): string | null {
+  const trimmed = rule.trim();
+  const bare = trimmed.replace(/\s+/g, '');
+  // `Bash`, `Bash()`, `Bash(*)`, `Bash(:*)`, `Bash(*:*)` — every spelling of "any command".
+  if (/^Bash(\((\*?(:\*)?|\*:\*)\))?$/i.test(bare)) {
+    return 'bare `Bash` is unrestricted execution — the allowlist exists to be narrower than that. Name the commands (e.g. "Bash(npm test:*)"). See THREAT-MODEL.md; a repo that truly needs this opts the kind into `auto` by hand, having read what it costs.';
+  }
+  if (/danger-full-access/i.test(trimmed)) {
+    return "`danger-full-access` is codex's sandbox mode, not an allow rule — written here it grants nothing while reading as if it grants everything. See THREAT-MODEL.md; `[permissions.build] auto = true` is the real knob, by hand.";
+  }
+  return null;
+}
+
+/**
+ * Section C: the curatable [permissions] slice (RUN-65) — the extra build rules and the egress
+ * policy a real repo hand-edits in after its first failed run, and nothing else. The floor
+ * itself (`write`) is never asked, and `auto` is never offered: this section curates the
+ * allowlist, it does not "configure your sandbox".
+ */
+const permissionsSection: AdvancedSection = {
+  title: 'Build allowlist, deny rules & egress — [permissions]',
+  async run({ ask, out }, choices) {
+    out('  The floor is not a question here: scope and verify are READ-ONLY, build writes its');
+    out('  own worktree, and no agent ever holds push credentials. What you can curate is what');
+    out('  build may RUN, what no kind may run, and what egress you mean each kind to have.');
+    out('');
+
+    // Appended, never replacing: the derived set is what makes the suggested verify command
+    // runnable at all (see detectEcosystem), and a wizard that let it be typed away would hand
+    // back the "the agent is broken" failure this file exists to prevent.
+    if (choices.allow.length) {
+      out('  Detected build rules, already in the file:');
+      for (const rule of choices.allow) out(`    ${rule}`);
+    }
+    out('  Add the rules this repo actually needs on top — the codegen or migration step your');
+    out('  build agent will reach for and be denied. One per line, blank when done.');
+    const buildAllow: string[] = [];
+    for (;;) {
+      const rule = (await ask('  Extra build allow rule (blank = done)')).trim();
+      if (!rule) break;
+      const refusal = refuseAllowRule(rule);
+      if (refusal) {
+        out(`  ✗ ${refusal}`);
+        continue;
+      }
+      if (choices.allow.includes(rule) || buildAllow.includes(rule)) {
+        out('  · already granted — skipping the duplicate.');
+        continue;
+      }
+      buildAllow.push(rule);
+    }
+
+    const deny: Record<RunKind, string[]> = { scope: [], build: [], verify: [] };
+    const network: Record<RunKind, NetworkPolicy> = {
+      scope: 'restricted',
+      build: 'restricted',
+      verify: 'restricted',
+    };
+    out('');
+    out('  Now per kind: egress, then anything to deny outright. Enter keeps the floor.');
+    out('');
+    // Say what each key is worth BEFORE it is chosen. A wizard that walks someone through
+    // picking `network = "none"` while no driver reads the key has not configured anything —
+    // it has talked them into believing something false, in a file their teammates inherit.
+    // That is the failure RUN-65 exists to prevent, pointed at the wizard's own prose.
+    out('  Before you choose: `deny` binds on Claude (it maps to disallowedTools and outranks');
+    out('  everything). It does NOT bind on codex — codex gates by sandbox level, not per');
+    out('  command — so a deny rule there records intent and stops nothing.');
+    out('');
+    out('  And `network` is DECLARED, NOT ENFORCED today: no driver reads it. An agent gets');
+    out('  whatever egress this daemon has, whichever value you pick. It is worth recording');
+    out('  what you INTEND — the key is in the schema and enforcement is a known gap — but do');
+    out('  not leave here believing `none` firewalls anything. It does not, yet.');
+    for (const kind of RunKind.options) {
+      out('');
+      for (;;) {
+        const answer = (await ask(`  ${kind}: network — none | restricted`, 'restricted'))
+          .trim()
+          .toLowerCase();
+        if (!answer) break; // Enter keeps the floor; `restricted` is already the initial value
+        const parsed = NetworkPolicy.safeParse(answer);
+        if (!parsed.success) {
+          out('  ✗ none or restricted — or type `full` out to see what it means.');
+          continue;
+        }
+        // `full` parses, and is deliberately absent from the question: of the three it is the
+        // only one that can never become MORE restrictive later, so it is the only one whose
+        // meaning changes the day enforcement lands. Offering it in the prompt would make it a
+        // menu item; making it typed keeps it a decision.
+        if (parsed.data === 'full') {
+          out('  ⚠ `full` is not offered, only accepted. Not because it does something dangerous');
+          out('    today — nothing reads this key, so it does nothing at all. Because it is the');
+          out('    one value that will still be doing nothing once the runner CAN isolate a run:');
+          out('    `none` and `restricted` start biting, `full` opts this kind out forever, and');
+          out('    nobody will re-read this file to notice. See THREAT-MODEL.md.');
+          const sure = (await ask(`  Really declare ${kind} unrestricted egress? (y/N)`, 'N')).toLowerCase();
+          if (sure !== 'y' && sure !== 'yes') continue;
+        }
+        network[kind] = parsed.data;
+        break;
+      }
+      for (;;) {
+        const rule = (await ask(`  ${kind}: deny rule (blank = done)`)).trim();
+        if (!rule) break;
+        if (deny[kind].includes(rule)) {
+          out('  · already denied — skipping the duplicate.');
+          continue;
+        }
+        deny[kind].push(rule);
+      }
+    }
+
+    choices.permissions = { buildAllow, deny, network };
+  },
+};
+
+/**
+ * Section D: `defaultBranch` (RUN-65) — the one plain-identity field the quick flow never asks,
+ * because it is the only one with an honest fallback (the run's own base). It earns a question
+ * here: the fallback stops being honest the moment two runs disagree about what the base was.
+ */
+const identitySection: AdvancedSection = {
+  title: 'Repo identity — defaultBranch',
+  // The KEY stays `defaultBranch` (the schema's name, and the title above says so), but the prose
+  // reads in the detected backend's words — same split RUN-84 made in landSection, where the TOML
+  // key is `branch` while a Perforce operator is asked about a stream.
+  async run({ ask, out, vocab }, choices) {
+    out(`  This repo's main line: what a NEW landing ${vocab.targetNoun} forks from, and what a`);
+    out("  run's diff is taken against. The daemon never writes to it. Blank = the run's own base");
+    out('  commit, which is fine until two runs disagree about what that was.');
+    choices.defaultBranch =
+      (await ask(`  Default ${vocab.targetNoun} (blank = the run's own base)`)).trim() || null;
+  },
+};
+
+const ADVANCED_SECTIONS: AdvancedSection[] = [
+  defaultsSection,
+  landSection,
+  permissionsSection,
+  identitySection,
+];
 
 export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitProjectResult> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -798,6 +1038,8 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       defaults: null,
       land: null,
       vocab,
+      permissions: null,
+      defaultBranch: null,
     };
 
     // The fork (RUN-62). One trailing question, default N, so the tier is discoverable
@@ -807,8 +1049,9 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     if (!advanced) {
       out('');
       out('  The quick questions are done. Advanced options (per-kind model/effort defaults,');
-      out('  the [land] envelope when auto-landing is on) can be curated now, or added to the');
-      out('  file by hand later — it documents them all.');
+      out('  the [land] envelope when auto-landing is on, extra build allow/deny rules and');
+      out('  egress, the default branch) can be curated now, or added to the file by hand');
+      out('  later — it documents them all.');
       const curate = (await ask('  Curate advanced options? (y/N)', 'N')).toLowerCase();
       advanced = curate === 'y' || curate === 'yes';
     }

@@ -8,6 +8,7 @@ import {
   type Ecosystem,
   defaultKey,
   detectEcosystem,
+  refuseAllowRule,
   renderProjectManifest,
   runInitProject,
   scanRootWarning,
@@ -190,6 +191,50 @@ describe('renderProjectManifest → a manifest the daemon actually accepts', () 
     expect(walked).toBe(quick);
   });
 
+  it('an untouched [permissions] slice renders byte-for-byte what quick mode writes (RUN-65)', () => {
+    const base = { key: 'X', tool: null, verifyCmd: null, landBranch: null, allow: ['Bash(npm ci:*)'] };
+    const walked = renderProjectManifest({
+      ...base,
+      defaultBranch: null,
+      permissions: {
+        buildAllow: [],
+        deny: { scope: [], build: [], verify: [] },
+        network: { scope: 'restricted', build: 'restricted', verify: 'restricted' },
+      },
+    });
+    expect(walked).toBe(renderProjectManifest(base));
+  });
+
+  it('renders the curated [permissions] slice, and only where it differs from the floor (RUN-65)', () => {
+    const toml = renderProjectManifest({
+      key: 'X',
+      tool: null,
+      verifyCmd: 'npm run check',
+      landBranch: null,
+      allow: ['Bash(npm test:*)'],
+      defaultBranch: 'main',
+      permissions: {
+        buildAllow: ['Bash(npx prisma migrate:*)'],
+        deny: { scope: [], build: ['Bash(rm:*)'], verify: [] },
+        network: { scope: 'none', build: 'restricted', verify: 'full' },
+      },
+    });
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.defaultBranch).toBe('main');
+    expect(parsed.permissions.scope.network).toBe('none');
+    expect(parsed.permissions.build.allow).toEqual(['Bash(npm test:*)', 'Bash(npx prisma migrate:*)']);
+    expect(parsed.permissions.build.deny).toEqual(['Bash(rm:*)']);
+    expect(parsed.permissions.verify.network).toBe('full');
+    // The write axis is rendered, never chosen — it stays the floor no matter what was curated.
+    expect(parsed.permissions.scope.write).toBe(false);
+    expect(parsed.permissions.build.write).toBe(true);
+    expect(parsed.permissions.verify.write).toBe(false);
+    // `full` carries its reason into the commit; the kinds at the floor say nothing extra.
+    expect(toml.match(/# CHOSEN: unrestricted egress/g)).toHaveLength(1);
+    expect(parsed.permissions.scope.deny).toEqual([]); // no empty deny = [] noise at the floor
+    expect(toml).not.toMatch(/deny = \[\]/);
+  });
+
   it('typed [land] answers replace the comment hints and parse (RUN-64)', () => {
     const toml = renderProjectManifest({
       key: 'X',
@@ -335,6 +380,31 @@ describe('detectEcosystem', () => {
 
   it('returns unknown, with no rules, for a bare directory', async () => {
     expect(await detectEcosystem(dir)).toMatchObject({ name: 'unknown', verifyCmd: null, allow: [] });
+  });
+});
+
+describe('refuseAllowRule (RUN-65)', () => {
+  // mapPermission/mapSandbox would never EMIT these from a curated allowlist — the refusal is
+  // about the COMMITTED file being honest, not about the driver being defensive.
+  it.each(['Bash', 'bash', ' Bash ', 'Bash()', 'Bash(*)', 'Bash(:*)', 'Bash(*:*)', 'Bash( * )'])(
+    'refuses %j — every spelling of "any command"',
+    (rule) => {
+      expect(refuseAllowRule(rule)).toMatch(/THREAT-MODEL/);
+    },
+  );
+
+  it.each(['danger-full-access', 'Bash(codex --danger-full-access)'])('refuses %j', (rule) => {
+    expect(refuseAllowRule(rule)).toMatch(/THREAT-MODEL/);
+  });
+
+  it.each([
+    'Bash(npm test:*)',
+    'Bash(npm ci:*)',
+    'Bash(bash scripts/gen.sh:*)', // "bash" as an argument is not bare Bash
+    'Read(//tmp/**)',
+    'mcp__noriq__get_task',
+  ])('allows the narrow rule %j', (rule) => {
+    expect(refuseAllowRule(rule)).toBeNull();
   });
 });
 
@@ -665,6 +735,186 @@ describe('runInitProject', () => {
     expect(text).toMatch(/<planKey>/); // the MR ask teaches the per-plan branch template
   });
 
+  // The [permissions] slice and defaultBranch (RUN-65). Question order inside the permissions
+  // section: the extra-build-allow loop (blank ends it), then per kind — network, then that
+  // kind's deny loop (blank ends it). Then the identity section's one question.
+
+  const PERMS_PREFIX = ['ACME', 'claude', '', '', '', ...['', '', '', '', '', '']];
+  // key, tool, cmd(blank), reviewer(N), land(blank = no landing section), six [defaults].
+
+  it('appends extra build allow rules to the derived set — never replacing it (RUN-65)', async () => {
+    const res = await run(
+      [
+        ...PERMS_PREFIX,
+        'Bash(npx prisma migrate:*)', // the rule people hand-edit in after the first failed run
+        'Bash(npm test:*)', // already derived — deduped, not duplicated
+        '', // done adding
+        ...['', '', '', '', '', ''], // scope/build/verify: network + deny, all at the floor
+        '', // defaultBranch
+      ],
+      { advanced: true },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    // The derived rule survives (without it the suggested verify command is unrunnable), and
+    // the typed one rides alongside it exactly once.
+    expect(parsed.permissions.build.allow).toEqual(['Bash(npm test:*)', 'Bash(npx prisma migrate:*)']);
+  });
+
+  it('refuses bare `Bash` at INPUT, with the THREAT-MODEL pointer, and re-asks (RUN-65)', async () => {
+    const lines: string[] = [];
+    const res = await run(
+      [...PERMS_PREFIX, 'Bash', 'Bash(*)', 'Bash(npm ci:*)', '', ...['', '', '', '', '', ''], ''],
+      { advanced: true, out: (l) => lines.push(l) },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    // Neither spelling of "any command" reached the committed file; the narrower retry did.
+    expect(parsed.permissions.build.allow).toEqual(['Bash(npm test:*)', 'Bash(npm ci:*)']);
+    expect(lines.join('\n')).toMatch(/THREAT-MODEL/);
+  });
+
+  it('refuses `danger-full-access` — it grants nothing while reading as everything (RUN-65)', async () => {
+    const lines: string[] = [];
+    const res = await run([...PERMS_PREFIX, 'danger-full-access', '', ...['', '', '', '', '', ''], ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).not.toMatch(/danger-full-access/);
+    expect(lines.join('\n')).toMatch(/THREAT-MODEL/);
+    expect(ProjectManifest.parse(parseToml(toml)).permissions.build.allow).toEqual(['Bash(npm test:*)']);
+  });
+
+  it('takes per-kind network and deny rules (RUN-65)', async () => {
+    const res = await run(
+      [
+        ...PERMS_PREFIX,
+        '', // no extra build rules
+        'none', // scope: no egress at all
+        'Bash(curl:*)', // scope: deny
+        '', // scope: done denying
+        'restricted', // build: the floor, typed
+        '', // build: no denies
+        'none', // verify: no egress
+        '', // verify: no denies
+        '', // defaultBranch
+      ],
+      { advanced: true },
+    );
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.permissions.scope.network).toBe('none');
+    expect(parsed.permissions.scope.deny).toEqual(['Bash(curl:*)']);
+    expect(parsed.permissions.build.network).toBe('restricted');
+    expect(parsed.permissions.verify.network).toBe('none');
+    expect(parsed.permissions.build.deny).toEqual([]);
+  });
+
+  it('`full` is not offered — typing it out prints why, and still needs a yes (RUN-65)', async () => {
+    const lines: string[] = [];
+    const res = await run([...PERMS_PREFIX, '', 'full', 'y', '', '', '', '', '', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.permissions.scope.network).toBe('full');
+    const text = lines.join('\n');
+    expect(text).toMatch(/not offered, only accepted/);
+    expect(text).toMatch(/THREAT-MODEL/);
+    // And the file says it was chosen, so a reader of the commit knows it was not a default.
+    expect(await readFile(res.manifestPath, 'utf8')).toMatch(/# CHOSEN: unrestricted egress/);
+  });
+
+  // The wizard's own honesty (RUN-65). `network` is read by NO driver — grep `profile.network`
+  // in src/drivers — and `mapSandbox` consumes only write/auto, so codex ignores `deny`. The
+  // wizard writes both keys anyway (they are in the committed schema, and quick mode has always
+  // written `network = "restricted"`), so what it must never do is claim they bite. A wizard
+  // that talks someone into believing `none` is a firewall has not configured a security
+  // control; it has written a falsehood into a file their teammates inherit.
+
+  it('never claims `none` is a firewall — the unenforced key is named as such (RUN-65)', async () => {
+    const lines: string[] = [];
+    await run([...PERMS_PREFIX, '', 'none', '', '', '', '', '', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    const text = lines.join('\n');
+    expect(text).toMatch(/DECLARED, NOT ENFORCED/);
+    expect(text).toMatch(/no driver reads it/i);
+    // The specific false promise the first draft made, and must never make again.
+    expect(text).not.toMatch(/no egress at all/);
+  });
+
+  it('tells you `deny` does not bind on codex before asking for deny rules (RUN-65)', async () => {
+    const lines: string[] = [];
+    await run([...PERMS_PREFIX, '', '', 'Bash(curl:*)', '', '', '', '', '', ''], {
+      advanced: true,
+      out: (l) => lines.push(l),
+    });
+    expect(lines.join('\n')).toMatch(/does NOT bind on codex|not bind on codex/i);
+  });
+
+  it('the committed file carries the enforcement legend, not just the session (RUN-65)', async () => {
+    // The manifest outlives the wizard session by years and travels to people who never ran it.
+    // A caveat that exists only in scrollback is a caveat that does not exist.
+    const res = await run(['ACME', 'claude', '', '']); // quick mode — it writes `network` too
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).toMatch(/network : DECLARED, NOT ENFORCED/);
+    expect(toml).toMatch(/deny.*ENFORCED on Claude[\s\S]*NOT on codex/);
+    expect(toml).toMatch(/write.*: ENFORCED/);
+    // Still a valid manifest — the legend is comments, and the keys mean what the schema says.
+    expect(ProjectManifest.parse(parseToml(toml)).permissions.build.network).toBe('restricted');
+  });
+
+  it('declining the `full` confirmation re-asks rather than widening egress (RUN-65)', async () => {
+    const res = await run([...PERMS_PREFIX, '', 'full', 'n', 'restricted', '', '', '', '', '', ''], {
+      advanced: true,
+    });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.permissions.scope.network).toBe('restricted');
+  });
+
+  it('re-asks a network policy that is not a policy at all (rule 1) (RUN-65)', async () => {
+    const res = await run([...PERMS_PREFIX, '', 'yes-please', 'none', '', '', '', '', '', ''], {
+      advanced: true,
+    });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.permissions.scope.network).toBe('none');
+  });
+
+  it('never asks the write flags — the floor is not a preference (RUN-65)', async () => {
+    const asked: string[] = [];
+    const answers = asker([...PERMS_PREFIX, '', '', '', '', '', '', '', '']);
+    await run([], {
+      advanced: true,
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return answers(q, fallback);
+      },
+    });
+    // No question moves the write axis, and none offers the driver's auto/bypass mode: those
+    // are hand-edits into a file that documents what they cost, not wizard keystrokes.
+    expect(asked.some((q) => /\bwrite\b|bypass|sandbox|danger-full-access|auto mode/i.test(q))).toBe(false);
+    const parsed = ProjectManifest.parse(
+      parseToml(await readFile(path.join(dir, '.noriq', 'project.toml'), 'utf8')),
+    );
+    // Walked end to end at the floor: the security defaults are exactly what quick mode writes.
+    expect(parsed.permissions.scope.write).toBe(false);
+    expect(parsed.permissions.build.write).toBe(true);
+    expect(parsed.permissions.verify.write).toBe(false);
+    expect(parsed.permissions.build.auto).toBe(false);
+  });
+
+  it('takes defaultBranch — the one identity field the quick flow never asks (RUN-65)', async () => {
+    const res = await run([...PERMS_PREFIX, '', '', '', '', '', '', '', 'main'], { advanced: true });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.defaultBranch).toBe('main');
+  });
+
+  it('quick mode never asks for a default branch, and never invents one (RUN-65)', async () => {
+    const res = await run(['ACME', 'claude', '', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.defaultBranch).toBeNull();
+  });
+
   it('warns a Diversion operator BEFORE the marker is committed: there is no dry-run (RUN-60)', async () => {
     const lines: string[] = [];
     await run(['ACME', 'claude', '', ''], {
@@ -747,5 +997,9 @@ describe('runInitProject', () => {
     // Perforce submits to the depot — no separate remote to push.
     expect(asked.some((q) => /push/i.test(q))).toBe(false);
     expect(lines.join('\n')).toMatch(/p4 add .* && p4 submit -d "Add Noriq marker"/);
+    // RUN-65's identity section speaks the backend too (the merge reconciliation): the TOML key
+    // stays `defaultBranch`, but a Perforce operator is asked about a stream, never a branch.
+    expect(asked.some((q) => /Default stream \(blank = the run's own base\)/i.test(q))).toBe(true);
+    expect(asked.some((q) => /Default branch/i.test(q))).toBe(false);
   });
 });
