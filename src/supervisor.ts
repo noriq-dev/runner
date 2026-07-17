@@ -152,6 +152,16 @@ export interface RunSupervisorDeps {
   /** Resolve an anchor task's title/body so the prompt can inline it (→ NoriqClient.getTask). */
   resolveTask?: (taskId: string) => Promise<AnchorTask | null>;
   /**
+   * Read-only phase/plan-gate probe (RUN-81, → NoriqClient.checkClaimable): is a task-anchored
+   * run's task claimable RIGHT NOW? Consulted BEFORE spawning, as defense in depth — the server's
+   * dispatch/claim gate is the primary authority, but a bug there (a phase-2 task offered while
+   * phase 1 is only in review) must not spawn an agent on work that isn't unlocked yet.
+   *
+   * Omitted, or a null answer (probe unavailable / transient error), leaves the gate UNCONSULTED
+   * — the daemon spawns exactly as before. Only an explicit `{ claimable: false }` declines.
+   */
+  checkClaimable?: (taskId: string) => Promise<{ claimable: boolean; reason: string | null } | null>;
+  /**
    * Is this Run parked on a human, and have they answered? (→ NoriqClient.getParkState, RUN-30)
    *
    * The server is the authority: only it saw the `request_input`, because the agent reaches
@@ -1161,6 +1171,35 @@ export class RunSupervisor {
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
     const driver = this.deps.drivers[run.agentTool as AgentTool];
     if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+
+    // Defense in depth (RUN-81): the server decides what to dispatch, but a bug in its phase/plan
+    // gate — the removal of plan-task dependency edges left claim_task to enforce phase order
+    // itself — must not let the daemon spawn an agent on a task that isn't unlocked yet (a phase-2
+    // task offered while phase 1 is only in review). The gate lives server-side (phase_tasks), so
+    // ask before spawning. This runs BEFORE the worktree lease so a declined run costs nothing.
+    // Fail OPEN: only a definite `{ claimable: false }` stops the spawn; an absent probe or a
+    // transient error leaves a legitimately-dispatched run untouched.
+    if (run.anchor?.type === 'task' && this.deps.checkClaimable) {
+      const gate = await this.deps.checkClaimable(run.anchor.taskId).catch((err) => {
+        this.log.warn('claimability probe failed — spawning anyway (fail open)', {
+          runId: run.id,
+          err: String(err),
+        });
+        return null;
+      });
+      if (gate && !gate.claimable) {
+        this.log.warn('anchor task is not claimable yet — declining to spawn (phase gate)', {
+          runId: run.id,
+          taskId: run.anchor.taskId,
+          reason: gate.reason,
+        });
+        return fail(
+          `anchor task ${run.anchor.taskId} is not claimable yet — its plan phase is not unlocked${
+            gate.reason ? ` (${gate.reason})` : ''
+          }; not spawning`,
+        );
+      }
+    }
 
     const kind = run.kind as RunKind;
     const permission = repo.manifest.permissions[kind];

@@ -310,4 +310,32 @@ export class NoriqClient {
     if (!t?.key || !t?.title) return null;
     return { key: t.key, title: t.title, body: t.body ?? null };
   }
+
+  /**
+   * Read-only phase/plan-gate probe (RUN-81): is this task claimable RIGHT NOW, respecting the
+   * plan's phase gates? The daemon consults it BEFORE spawning an agent for a task-anchored run —
+   * a backstop for a server-side dispatch/claim bug (a phase-2 task offered while phase 1 is only
+   * in review). The gate lives in phase_tasks server-side, so the daemon cannot compute it locally
+   * and must ask. This must NOT carry the anchored-agent claim bypass — the whole point is to see
+   * the gate the running agent's own claim would skip.
+   *
+   * Contract with the server: MCP tool `can_claim({ taskId }) → { claimable: boolean, reason? }`.
+   *
+   * Returns null when the probe is UNAVAILABLE — an older server without the tool, a malformed
+   * answer, or any error. The gate then fails OPEN: the daemon behaves exactly as it did before
+   * this existed, so a transient hiccup never strands a legitimately-dispatched run. Only a
+   * definite `{ claimable: false }` stops a spawn.
+   */
+  async checkClaimable(taskId: string): Promise<{ claimable: boolean; reason: string | null } | null> {
+    try {
+      const out = (await this.mcpCall('can_claim', { taskId })) as {
+        claimable?: unknown;
+        reason?: unknown;
+      } | null;
+      if (out == null || typeof out.claimable !== 'boolean') return null;
+      return { claimable: out.claimable, reason: typeof out.reason === 'string' ? out.reason : null };
+    } catch {
+      return null; // probe unavailable or errored → fail open, never strand a run
+    }
+  }
 }

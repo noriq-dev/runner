@@ -270,6 +270,10 @@ function harness(
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
     parkStateFails?: boolean;
     parkTtlHours?: number;
+    /** RUN-81 phase-gate probe. Presence of this key wires checkClaimable; the value is what it
+     *  returns ({claimable:false} declines the spawn, null = probe unavailable → fail open).
+     *  Absent = the dep is not wired at all (the pre-RUN-81 daemon). */
+    claimGate?: { claimable: boolean; reason: string | null } | null;
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -287,6 +291,7 @@ function harness(
   let verifyCalls = 0;
   const parked = new FakeParked();
   const parkChecks: string[] = [];
+  const claimChecks: string[] = [];
   const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
   // Mutable, because the real thing is: once a human answers, the server marks the signal
   // answered and moves the run back to running, so the NEXT check says "not blocked".
@@ -340,6 +345,14 @@ function harness(
         ...park.state,
       };
     },
+    ...('claimGate' in over
+      ? {
+          checkClaimable: async (taskId: string) => {
+            claimChecks.push(taskId);
+            return over.claimGate ?? null;
+          },
+        }
+      : {}),
   });
   return {
     supervisor,
@@ -351,6 +364,7 @@ function harness(
     codex,
     parked,
     parkChecks,
+    claimChecks,
     agentCreates,
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
@@ -428,6 +442,63 @@ describe('assemblePrompt', () => {
     });
     expect(p).toMatch(/do NOT need to commit/i);
     expect(p).toMatch(/daemon captures/i);
+  });
+});
+
+describe('the phase-gate spawn backstop (RUN-81)', () => {
+  const anchored = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('declines BEFORE leasing or spawning when the task is not claimable (phase locked)', async () => {
+    const h = harness({ claimGate: { claimable: false, reason: 'phase 1 not complete' } });
+    const exit = await h.supervisor.supervise(anchored());
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/not claimable yet/);
+    expect(exit.reason).toMatch(/phase 1 not complete/); // the server's reason is surfaced
+    expect(h.claimChecks).toEqual(['task_9']); // the probe was consulted
+    expect(h.worktrees.created).toEqual([]); // nothing leased
+    expect(h.agentCreates).toEqual([]); // no identity created
+    expect(h.claude.starts).toEqual([]); // no agent spawned — the whole point
+    expect(h.reports.some((r) => r.status === 'failed')).toBe(true);
+  });
+
+  it('spawns normally when the task IS claimable', async () => {
+    const h = harness({ claimGate: { claimable: true, reason: null } });
+    const done = h.supervisor.supervise(anchored());
+    await flush();
+    expect(h.claimChecks).toEqual(['task_9']);
+    expect(h.worktrees.created.length).toBe(1); // leased → it ran
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('fails OPEN — a null probe answer (unavailable / transient) never strands a run', async () => {
+    const h = harness({ claimGate: null });
+    const done = h.supervisor.supervise(anchored());
+    await flush();
+    expect(h.claimChecks).toEqual(['task_9']); // asked
+    expect(h.worktrees.created.length).toBe(1); // but spawned anyway
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('is not consulted for a run with no task anchor (a plan or bare-brief dispatch)', async () => {
+    const h = harness({ claimGate: { claimable: false, reason: 'ignored' } });
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope' })); // anchor: null
+    await flush();
+    expect(h.claimChecks).toEqual([]); // nothing to gate on
+    expect(h.worktrees.created.length).toBe(1);
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('the pre-RUN-81 daemon (no probe wired) spawns exactly as before', async () => {
+    const h = harness(); // no claimGate key → checkClaimable dep omitted
+    const done = h.supervisor.supervise(anchored());
+    await flush();
+    expect(h.claimChecks).toEqual([]);
+    expect(h.worktrees.created.length).toBe(1);
+    h.claude.complete('done');
+    await done;
   });
 });
 

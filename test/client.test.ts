@@ -182,3 +182,80 @@ describe('MCP session lifecycle (RUN-73)', () => {
     expect(call?.sid).toBe('sess_1');
   });
 });
+
+describe('checkClaimable phase-gate probe (RUN-81)', () => {
+  // A minimal MCP server: handshake, then one can_claim tool result (or an error status).
+  const mcp = (toolResult: unknown, toolStatus = 200) =>
+    (async (_url: string | URL, init?: RequestInit) => {
+      const method = (JSON.parse(String(init?.body)) as { method?: string }).method;
+      if (method === 'initialize')
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
+          status: 200,
+          headers: { 'mcp-session-id': 'sess_1' },
+        });
+      if (method === 'notifications/initialized') return new Response(null, { status: 202 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: JSON.stringify(toolResult) }] },
+        }),
+        { status: toolStatus },
+      );
+    }) as typeof fetch;
+
+  it('returns the gate verdict, reason and all, when the server answers', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ claimable: false, reason: 'phase 1 not complete' }),
+    });
+    expect(await client.checkClaimable('task_1')).toEqual({
+      claimable: false,
+      reason: 'phase 1 not complete',
+    });
+  });
+
+  it('calls the can_claim tool with the task id', async () => {
+    const frames: string[] = [];
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method?: string; params?: { name?: string } };
+      if (body.method === 'tools/call') frames.push(body.params?.name ?? '');
+      if (body.method === 'initialize')
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
+          status: 200,
+          headers: { 'mcp-session-id': 'sess_1' },
+        });
+      if (body.method === 'notifications/initialized') return new Response(null, { status: 202 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: '{"claimable":true}' }] },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl });
+    await client.checkClaimable('task_9');
+    expect(frames).toEqual(['can_claim']);
+  });
+
+  it('fails OPEN (null) when the probe errors — e.g. an older server without the tool', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ error: 'unknown tool can_claim' }, 500),
+    });
+    expect(await client.checkClaimable('task_1')).toBeNull();
+  });
+
+  it('fails OPEN (null) when the answer is malformed (no boolean `claimable`)', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ gated: 'yes' }),
+    });
+    expect(await client.checkClaimable('task_1')).toBeNull();
+  });
+});

@@ -221,6 +221,9 @@ export class Daemon {
       // the one that can register runners and reach every project this human can.
       createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
       resolveTask: (taskId) => client.getTask(taskId),
+      // Phase-gate backstop (RUN-81): don't spawn an agent on a task the server offered but whose
+      // plan phase isn't unlocked. Read-only probe; a null answer fails open (see checkClaimable).
+      checkClaimable: (taskId) => client.checkClaimable(taskId),
       // Parking (RUN-30). The server is the authority on whether a run asked a human something —
       // the agent calls request_input over its own MCP transport, straight past the daemon — so
       // the daemon asks the row rather than trying to observe the call.
