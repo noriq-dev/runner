@@ -52,7 +52,36 @@ export interface ReviewerPromptContext {
  *  PRIOR ADJUDICATIONS section (adjudication.ts). The reviewer stays fresh on the DIFF but is no
  *  longer amnesiac about what was already settled — it verifies each pointer rather than trusting
  *  it, so a real finding still lands and a rebutted one is not relitigated. Empty ledger → the
- *  section renders nothing, so the first look is unchanged. */
+ *  section renders nothing, so the first look is unchanged.
+ *
+ *  Two rules earned by the RUN-66/RUN-88 dogfood, where both runs died in the TERMINAL review —
+ *  the one with no fix budget behind it — on findings raised for the first time there:
+ *
+ *  The revert test makes the scope rule mechanical rather than a matter of taste. RUN-76 already
+ *  said "not this author's to answer for"; RUN-88 shows that stating it is not enough. Asked to
+ *  delete a security-shaped field that never did anything, the reviewer failed the run because
+ *  manifests still carrying the dead key get no migration warning — true, and equally true before
+ *  the diff, which neither created the false assurance nor worsened it. A reviewer whose subject
+ *  IS a false assurance will find one and charge it to whoever touched the file last. "Would a
+ *  revert fix it?" is checkable in a way "is this pre-existing?" is not. It settles SCOPE only, and
+ *  says so in both directions: it never licenses dismissing a defect the diff does own, which is
+ *  the failure mode of every rule that makes flagging harder.
+ *
+ *  Collapsing a CLASS into one numbered finding is what makes a bounded round budget survivable.
+ *  RUN-66 spent all three rounds on one root cause — a wizard that re-derived committed values
+ *  through lossy transforms — and the reviewer reported a fresh sample of it each round (values
+ *  withheld from the fallback, then transforms run over the answer, then a sibling's truthiness
+ *  gating the read). Every finding was correct and none was a repeat, so the ledger above had
+ *  nothing to catch: the builder patched the cited lines, the class survived, and the run failed on
+ *  instance nine of it. The NUMBER is the mechanism, not the prose: the builder answers this report
+ *  number by number and fixes what each number cites, so a class named in a preamble above four
+ *  instance lines still buys four patched lines. It has to occupy a number to be answered as one.
+ *  Instance-reporting is also what the "concrete failure at a file/line" bar quietly incentivises,
+ *  so the rule has to be stated against it — measured on this template, a reviewer handed the four
+ *  RUN-66 round-1 defects as raw notes now returns one finding naming the cause and citing the
+ *  other three as evidence, where the pre-rule wording returned four. That converges the fix in one
+ *  round, or proves the work is bigger than the rounds left — either beats learning it last round,
+ *  which is the RUN-66 outcome this exists to stop. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
