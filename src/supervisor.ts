@@ -23,6 +23,7 @@ import {
 } from './land';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
+import { renderPrompt } from './prompts';
 import { noriqToolNamesFor } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { VcsBackend, Workspace } from './vcs/types';
@@ -295,18 +296,16 @@ export function assemblePrompt(
   // that hits an ambiguity with no invitation to ask does not stop — it picks, and hopes.
   // request_input is not a way to give up: the daemon ends the session, keeps the worktree,
   // and resumes THIS session with the answer (RUN-30), so asking costs the agent nothing.
-  const identity = `You are ${ctx.agent.label} (${ctx.agent.agentId}), a Noriq Runner ${run.kind.toUpperCase()} agent for project ${manifest.key}.
-Your Noriq identity is already set up: the MCP server at ${ctx.server} authenticates you as this agent — do NOT call set_agent_identity. You report your own work through Noriq; the daemon supervises only your process.
-If you need a human decision to go on, call request_input and stop — do not guess. Your session is paused, not discarded: you are resumed with your context intact once someone answers. If you find something alarming that does not block you, call raise_alert and keep working.`;
+  const identity = renderPrompt('identity', {
+    label: ctx.agent.label,
+    agentId: ctx.agent.agentId,
+    kind: run.kind.toUpperCase(),
+    projectKey: manifest.key,
+    server: ctx.server,
+  });
 
   if (run.kind === 'scope') {
-    return `${identity}
-
-MODE: SCOPE (read-only orchestrator). Do NOT modify any files.
-Explore the repo to understand the work, then emit a PROPOSED plan via create_plan with proposed:true (goals + ordered phases over tasks). proposed:true is REQUIRED — it gates the plan's tasks as un-claimable until a human approves it in the dashboard (the mandatory v1 gate). Success = a proposed plan is emitted; there is no diff.
-After create_plan, TEND the plan before you finish: phase ordering auto-depends every phase-N task on ALL of phase N-1, so prune any edge you did not actually intend with remove_dependency, and keep the document honest with update_plan. If a cleanup tool turns out to be unavailable, say so in the plan body where the approver will read it — never promise cleanup you have not done.
-
-Brief: ${run.brief}${anchor}`;
+    return renderPrompt('scope', { identity, brief: run.brief, anchor });
   }
   if (run.kind === 'build') {
     // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
@@ -314,23 +313,19 @@ Brief: ${run.brief}${anchor}`;
     // to answer a question that got asked again, properly, right afterwards. Its run was advisory;
     // the daemon's is authoritative and free. Measured on run_mrlig93q5b574b502963: ~3m24s of agent
     // time including its own verify, then 62s of daemon verify.
-    //
     // Its allowlist still permits running tests — iterating on one file while working is cheap and
     // targeted. What it must not do is burn the full suite to grade itself.
-    const verify = manifest.verify?.cmd
-      ? `\nThe full check (\`${manifest.verify.cmd}\`) is run for you after you finish, and its output comes back to you if it fails — so don't spend a turn on it. Run individual tests while you work if they help.`
-      : '';
-    // Fairness, not just information (RUN-61): a builder that learns of the reviewer only from
-    // a rejection reads it as scope creep and argues; one told up front writes for the review.
-    const review = manifest.verify?.agent
-      ? '\nAn independent reviewer agent then examines your diff against the task intent; its report comes back to you if it finds problems.'
-      : '';
-    return `${identity}
-
-MODE: BUILD (worker, read-write worktree). Implement the work and leave a review diff on this branch (a human merges it — never push).
-You do NOT need to commit: the daemon commits whatever you leave in the worktree onto this Run's branch when you finish, so \`git commit\` being unavailable is expected, not a failure — don't report it as one. Just leave the work in place.${verify}${review}
-
-Brief: ${run.brief}${anchor}`;
+    //
+    // The reviewer sentence is fairness, not just information (RUN-61): a builder that learns of
+    // the reviewer only from a rejection reads it as scope creep and argues; one told up front
+    // writes for the review.
+    return renderPrompt('build', {
+      identity,
+      verifyCmd: manifest.verify?.cmd ?? null,
+      reviewer: Boolean(manifest.verify?.agent),
+      brief: run.brief,
+      anchor,
+    });
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer.
   return assembleVerifyPrompt(`${run.brief}${anchor}`, {

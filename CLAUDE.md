@@ -61,6 +61,12 @@ The dispatch path:
    **`token.ts`**, **`oauth.ts`**, **`auth*.ts`** handle the OAuth 2.1 + PKCE / device-flow token
    lifecycle in `~/.noriq/`.
 
+Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
+(tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and
+maps templates to call sites). Edit the words there — code only decides which template fires and
+with which facts. The build inlines them via esbuild `define` (`__RUNNER_PROMPTS__`, same rail as
+`__RUNNER_VERSION__`), so `dist/cli.js` stays self-contained; tsx/vitest read the files directly.
+
 ### Run kinds
 
 `scope` (read-only, produces a plan), `build` (writes, then gated by verify/land), `verify` (executes

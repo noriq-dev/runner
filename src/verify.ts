@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { killProcessTree, treeSpawnOptions } from './proc';
+import { renderPrompt } from './prompts';
 import { sanitizedAgentEnv } from './security';
 
 // The deterministic verify floor (RUN-19): after a build run's agent exits, the
@@ -134,22 +135,14 @@ export const MAX_VERIFY_FIXES = 2;
  * more tokens than the fix.
  */
 export function verifyFeedbackPrompt(spec: VerifySpec, result: VerifyResult, attempt: number): string {
-  const why = result.timedOut
-    ? `timed out after ${spec.timeoutSeconds ?? DEFAULT_VERIFY_TIMEOUT_SECONDS}s`
-    : `exited ${result.exitCode}`;
-  return [
-    'The check did not pass, so your work is not finished yet.',
-    '',
-    `I ran \`${spec.cmd}\` on your worktree and it ${why}. This is the real gate — the same command`,
-    'decides whether this run lands, so it has to be green.',
-    '',
-    'Output (tail):',
-    '```',
-    result.output.slice(-4000),
-    '```',
-    '',
-    attempt >= MAX_VERIFY_FIXES
-      ? 'This is the last attempt: if it still fails after this, the run stops and a human picks it up.'
-      : 'Fix it and stop when you are done — I will run the check again.',
-  ].join('\n');
+  return renderPrompt('verify-feedback', {
+    cmd: spec.cmd,
+    timedOut: result.timedOut,
+    timeoutSeconds: spec.timeoutSeconds ?? DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    // Stringified so a null exit code renders as "exited null" (killed, no code) rather
+    // than vanishing — the agent should see the truth, odd as it reads.
+    exitCode: String(result.exitCode),
+    output: result.output.slice(-4000),
+    last: attempt >= MAX_VERIFY_FIXES,
+  });
 }

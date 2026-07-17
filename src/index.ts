@@ -53,6 +53,7 @@ export {
   type DeviceCodeResponse,
 } from './auth-device';
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
+export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from './prompts';
 export {
   DEFAULT_PARKED_PATH,
   DEFAULT_PARK_TTL_HOURS,

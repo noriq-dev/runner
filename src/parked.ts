@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
+import { renderPrompt } from './prompts';
 import type { Workspace } from './vcs/types';
 
 /**
@@ -166,9 +167,4 @@ export const expiredParks = (
 
 /** The turn handed to a resumed agent. It has its own context; this is the answer, not a briefing. */
 export const resumePrompt = (question: string | null, answer: string): string =>
-  [
-    'The human answered the question you were waiting on.',
-    ...(question ? [`\nYour question:\n${question}`] : []),
-    `\nTheir answer:\n${answer}`,
-    '\nCarry on from where you stopped.',
-  ].join('\n');
+  renderPrompt('resume', { question, answer });

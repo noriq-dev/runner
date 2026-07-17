@@ -11,6 +11,8 @@
 // findings itself. This also makes authorship separation absolute: the reviewer cannot claim,
 // move, or comment as anyone, only judge.
 
+import { renderPrompt } from './prompts';
+
 export interface ReviewerPromptContext {
   /** What the diff is supposed to achieve — the anchor task's text, or the run brief. */
   intent: string;
@@ -22,28 +24,15 @@ export interface ReviewerPromptContext {
   verifyCmd?: string | null;
 }
 
-/** The prompt for one fresh reviewer session. Read-only, no identity, no MCP. */
+/** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
+ *  no MCP. The verifyCmd sentence exists so the reviewer spends its turns on what the
+ *  deterministic floor CANNOT check instead of re-running a suite that already passed. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
-  const inspect = ctx.diffCmd
-    ? `Inspect the accumulated diff with \`${ctx.diffCmd}\` and read the changed files.`
-    : 'Inspect the modified files in this working tree and read them in full.';
-  const floor = ctx.verifyCmd
-    ? `\nThe deterministic check (\`${ctx.verifyCmd}\`) already passed — do not re-run it to grade the work. Spend your turns on what a green suite cannot prove.`
-    : '';
-  return `You are an INDEPENDENT, adversarial code reviewer. You did NOT write this code; assume nothing about the author's intent beyond the intent below. You have no project-management access — your entire output is your report, and it is read by the daemon and by the agent that wrote the code.
-
-MODE: REVIEW (read-only). Do NOT modify any files.
-${inspect} Your job is to find why this work does NOT satisfy the intent — be skeptical. Look especially for:
-  - tests weakened, skipped, or deleted to make the suite pass,
-  - intent that is only partially met or silently unmet,
-  - missing edge cases and error handling a green test run would miss.${floor}
-
-End your response with EXACTLY one line, on its own:
-  VERDICT: PASS   — the work fully and honestly satisfies the intent
-  VERDICT: FAIL   — it does not (then your report above must list the specific, actionable findings)
-
-Intent to review against:
-${ctx.intent}`;
+  return renderPrompt('reviewer', {
+    diffCmd: ctx.diffCmd ?? null,
+    verifyCmd: ctx.verifyCmd ?? null,
+    intent: ctx.intent,
+  });
 }
 
 /**
@@ -52,19 +41,10 @@ ${ctx.intent}`;
  * cap mirrors the comment surface (a report longer than this has stopped being actionable).
  */
 export function reviewerFeedbackPrompt(findings: string, round: number, maxRounds: number): string {
-  return [
-    'An independent reviewer examined your work and does not consider it finished.',
-    '',
-    'Its report:',
-    '```',
-    findings.slice(-6000),
-    '```',
-    '',
-    'Address the specific findings — do not argue with the report in prose, fix the work.',
-    round >= maxRounds
-      ? 'This is the last attempt: a fresh reviewer looks once more after this, and if it still fails the run stops and a human picks it up.'
-      : 'When you stop, a fresh reviewer will look again.',
-  ].join('\n');
+  return renderPrompt('reviewer-feedback', {
+    findings: findings.slice(-6000),
+    last: round >= maxRounds,
+  });
 }
 
 /** Format a final reviewer rejection for a task comment (the gate surface). */
