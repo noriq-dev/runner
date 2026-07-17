@@ -189,6 +189,7 @@ export type {
 } from './vcs/types';
 export { GitBackend, type GitOps } from './vcs/git';
 export { detectVcs, parseDvRepoList, type DetectDeps, type VcsDetection } from './vcs/detect';
+export { VCS_VOCAB, vocabFor, type VcsKind, type VcsVocab } from './vcs/vocab';
 export { PerforceBackend, realP4Cli, type P4Cli, type PerforceBackendOpts } from './vcs/perforce';
 export {
   DiversionBackend,

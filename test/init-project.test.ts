@@ -674,4 +674,78 @@ describe('runInitProject', () => {
     expect(lines.join('\n')).toMatch(/no dry-run/);
     expect(lines.join('\n')).toMatch(/syncs to the cloud/);
   });
+
+  // The setup copy speaks the detected backend, not git-by-assumption (RUN-84). These drive the
+  // prompts by MATCHING the question text, not by position, because a server-backed VCS skips
+  // whole questions (agent conflict-resolution, the push/merge-request tail) — a positional list
+  // would silently answer the wrong prompt the moment the order changes.
+  const askBy = (rules: Array<[RegExp, string]>) => async (q: string, fallback?: string) =>
+    rules.find(([re]) => re.test(q))?.[1] ?? fallback ?? '';
+
+  it('a Diversion repo lands in Diversion words: merged, no push, dv commit (RUN-84)', async () => {
+    const asked: string[] = [];
+    const lines: string[] = [];
+    const res = await run([], {
+      advanced: true,
+      detectVcsFor: async () => ({ kind: 'diversion', repoId: 'dv.repo.x', reason: 'registry' }),
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return askBy([
+          [/Project KEY/, 'ACME'],
+          [/Agent driver/, 'claude'],
+          [/Auto-land to which branch/, 'noriq/integration'],
+        ])(q, fallback);
+      },
+      out: (l) => lines.push(l),
+    });
+
+    // The [land] gate reads "merged", never "rebased".
+    expect(asked.some((q) => /verify passes on the merged result/i.test(q))).toBe(true);
+    expect(asked.some((q) => /rebased/i.test(q))).toBe(false);
+    // Agent conflict-resolution is not even offered — conflicts are server-side.
+    expect(asked.some((q) => /resolve mechanical/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/resolved server-side/);
+    // The push / merge-request tail is git-only: neither question appears.
+    expect(asked.some((q) => /push/i.test(q))).toBe(false);
+    expect(asked.some((q) => /merge-request/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/already reaches the server/);
+    // The commit hint is `dv`, not `git add`.
+    expect(lines.join('\n')).toMatch(/dv commit -a -m "Add Noriq marker"/);
+    expect(lines.join('\n')).not.toMatch(/git add/);
+
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.land?.branch).toBe('noriq/integration');
+    expect(parsed.land?.autoPush).toBe(false); // server-backed: nothing to push, MR flow is git-only
+    // The rendered [land] block explains the server-side landing instead of git push knobs.
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).toMatch(/reaches the server directly/);
+    expect(toml).not.toMatch(/git log/);
+  });
+
+  it('a Perforce repo lands to a stream, resolves headless, and submits — never pushes (RUN-84)', async () => {
+    const asked: string[] = [];
+    const lines: string[] = [];
+    await run([], {
+      advanced: true,
+      detectVcsFor: async () => ({ kind: 'perforce', reason: '.p4config' }),
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return askBy([
+          [/Project KEY/, 'ACME'],
+          [/Agent driver/, 'claude'],
+          [/Auto-land to which branch/, 'main-stream'],
+        ])(q, fallback);
+      },
+      out: (l) => lines.push(l),
+    });
+
+    expect(asked.some((q) => /verify passes on the merged result/i.test(q))).toBe(true);
+    // p4 resolve runs headless, so the agent-resolution question IS offered — in merge words.
+    expect(asked.some((q) => /resolve mechanical merge conflicts/i.test(q))).toBe(true);
+    // The landing target is a stream, and the override question says so.
+    expect(asked.some((q) => /Stream globs a dispatch may land on/i.test(q))).toBe(true);
+    // Perforce submits to the depot — no separate remote to push.
+    expect(asked.some((q) => /push/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/p4 add .* && p4 submit -d "Add Noriq marker"/);
+  });
 });

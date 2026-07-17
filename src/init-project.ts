@@ -8,6 +8,7 @@ import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
 import { detectTools } from './tools';
 import { type VcsDetection, detectVcs } from './vcs/detect';
+import { type VcsVocab, vocabFor } from './vcs/vocab';
 import { DEFAULT_VERIFY_TIMEOUT_SECONDS } from './verify';
 
 /**
@@ -21,8 +22,10 @@ import { DEFAULT_VERIFY_TIMEOUT_SECONDS } from './verify';
  * clobber, and show what it found. The third one is doing the most work here, but it means
  * something different than it did in `init`: see `scanRootWarning`.
  *
- * Deliberately NOT VCS-aware yet (Montana's call). RUN-49 owns that — this command becomes
- * VCS-aware when there is a backend interface to be aware OF, and RUN-54/55 have not reported.
+ * VCS-aware since RUN-84: detection (`detectVcs`) picks the backend, and its lexicon (`vocabFor`,
+ * vcs/vocab.ts) picks the WORDS every source-control question and comment reads in — a Diversion
+ * operator is never asked about a "rebase", a "push", or a "git commit" they do not have. The
+ * manifest it writes stays backend-neutral; only the copy the operator reads changes.
  */
 
 export interface InitProjectDeps {
@@ -79,6 +82,9 @@ export interface Ecosystem {
 }
 
 const UNKNOWN: Ecosystem = { name: 'unknown', verifyCmd: null, allow: [] };
+
+/** Title-case a single word for a prompt label ("branch" → "Branch", "stream" → "Stream"). */
+const capitalize = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
 
 /**
  * The largest timeout the daemon can actually honor. `runVerify` hands `timeoutSeconds * 1000`
@@ -238,9 +244,18 @@ export interface ManifestChoices {
   defaults?: DefaultsChoice | null;
   /** The [land] envelope (RUN-64). Null/absent = never curated → quick mode's exact block. */
   land?: LandChoices | null;
+  /**
+   * The detected backend's setup lexicon (RUN-84). Absent = git's, the same fallback detection
+   * itself makes — so a direct caller (and every pre-RUN-84 test) renders byte-for-byte as before.
+   * The manifest stays backend-neutral; this only picks the words the rendered COMMENTS use.
+   */
+  vocab?: VcsVocab | null;
 }
 
 export function renderProjectManifest(m: ManifestChoices): string {
+  // Git's lexicon is the default (see `vocab` on ManifestChoices): a caller that never detected a
+  // backend renders exactly as it did before RUN-84.
+  const vocab = m.vocab ?? vocabFor(undefined);
   const lines: string[] = [
     '# Noriq project marker — COMMITTED, so it travels with the repo and your team shares it.',
     '# Written by `noriq-runner init-project`. Carries no secrets.',
@@ -333,8 +348,8 @@ export function renderProjectManifest(m: ManifestChoices): string {
     const land = m.land ?? null;
     lines.push(
       '',
-      '# Auto-landing: a build that passes the gate is rebased onto this branch, RE-VERIFIED',
-      '# there, then fast-forwarded in. Work accumulates here for you to merge onward.',
+      `# Auto-landing: a build that passes the gate is ${vocab.integratedAdj} onto this ${vocab.targetNoun},`,
+      '# RE-VERIFIED there, then landed on it. Work accumulates here for you to merge onward.',
       '[land]',
       `branch = ${tomlString(m.landBranch)}`,
     );
@@ -350,7 +365,7 @@ export function renderProjectManifest(m: ManifestChoices): string {
     }
     if (land && !land.resolveConflicts) {
       lines.push(
-        '# CHOSEN: rebase conflicts always fail out to a human — the build agent never resolves.',
+        `# CHOSEN: ${vocab.conflictAdj} conflicts always fail out to a human — the build agent never resolves.`,
         'resolveConflicts = false',
       );
     }
@@ -360,25 +375,38 @@ export function renderProjectManifest(m: ManifestChoices): string {
         `allowedBranches = [${land.allowedBranches.map(tomlString).join(', ')}]`,
       );
     }
-    lines.push(
-      ...(land?.autoPush
-        ? [
-            '# CHOSEN: this branch leaves the machine after every landing — `git log',
-            '# origin/main..main` no longer shows what the agents did. See THREAT-MODEL.md.',
-            'autoPush = true',
-          ]
-        : [
-            '# autoPush = false      # push this branch to its remote. Off = nothing an agent writes',
-            '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
-          ]),
-      // The wizard only offers mergeTarget once autoPush is on; the renderer holds the same
-      // line for direct callers — a merge request cannot exist without the branch reaching the
-      // remote, so an invalid pair is dropped HERE rather than half-honoured at the next
-      // dispatch (RUN-28).
-      land?.autoPush && land.mergeTarget
-        ? `mergeTarget = ${tomlString(land.mergeTarget)}`
-        : '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
-    );
+    if (vocab.landingReachesRemote) {
+      lines.push(
+        ...(land?.autoPush
+          ? [
+              `# CHOSEN: this ${vocab.targetNoun} leaves the machine after every landing — \`${vocab.auditHint}\``,
+              '# no longer shows what the agents did. See THREAT-MODEL.md.',
+              'autoPush = true',
+            ]
+          : [
+              `# autoPush = false      # push this ${vocab.targetNoun} to its remote. Off = nothing an agent writes`,
+              '#                       # leaves this machine. See THREAT-MODEL.md before flipping it.',
+            ]),
+        // The wizard only offers mergeTarget once autoPush is on; the renderer holds the same
+        // line for direct callers — a merge request cannot exist without the branch reaching the
+        // remote, so an invalid pair is dropped HERE rather than half-honoured at the next
+        // dispatch (RUN-28).
+        land?.autoPush && land.mergeTarget
+          ? `mergeTarget = ${tomlString(land.mergeTarget)}`
+          : '# mergeTarget = "main"  # open a merge request when the run\'s PLAN completes (needs autoPush)',
+      );
+    } else {
+      // Server-backed VCS (RUN-84): `publish` already reached the server, so `share`/autoPush is a
+      // no-op (diversion.ts / perforce.ts) — every write synced before the gate even ran, the fact
+      // the top-of-flow warning states. There is no local-only landing to push, and the daemon's
+      // merge-request flow is git+`gh` (merge-request.ts, daemon.ts). So the git-only push/MR knobs
+      // are omitted rather than written as switches that would do nothing here.
+      lines.push(
+        `# On ${vocab.label}, a landing reaches the server directly — publishing is server-side, with`,
+        '# no separate push, so the git-only autoPush / mergeTarget knobs are left off. Onward review',
+        `# happens through ${vocab.label}, not a pushed ${vocab.targetNoun}.`,
+      );
+    }
   } else {
     lines.push(
       '',
@@ -415,10 +443,12 @@ export function renderProjectManifest(m: ManifestChoices): string {
   return lines.join('\n');
 }
 
-/** The prompting surface a section sees — the same injected `ask`/`out` as the quick flow. */
+/** The prompting surface a section sees — the same injected `ask`/`out` as the quick flow, plus
+ *  the detected backend's lexicon (RUN-84) so a section speaks the operator's actual VCS. */
 interface AdvancedIo {
   ask: (question: string, fallback?: string) => Promise<string>;
   out: (line: string) => void;
+  vocab: VcsVocab;
 }
 
 /**
@@ -478,7 +508,7 @@ const defaultsSection: AdvancedSection = {
 const landSection: AdvancedSection = {
   title: 'Landing envelope — [land]',
   applies: (choices) => choices.landBranch !== null,
-  async run({ ask, out }, choices) {
+  async run({ ask, out, vocab }, choices) {
     const branch = choices.landBranch;
     if (!branch) return; // applies() gates this; belt-and-braces for direct callers
     const declined = (answer: string) => answer === 'n' || answer === 'no';
@@ -489,61 +519,83 @@ const landSection: AdvancedSection = {
 
     // Default true, and only a typed "n" turns the gate off — the same posture as the schema:
     // permitted, never assumed. The consequence is printed at the moment of choosing, not
-    // buried in a doc the chooser has not read.
+    // buried in a doc the chooser has not read. "rebased"/"merged" per the backend (RUN-84).
     const gate = (
-      await ask('  Land only when verify passes on the rebased result? (Y/n)', 'Y')
+      await ask(`  Land only when verify passes on the ${vocab.integratedAdj} result? (Y/n)`, 'Y')
     ).toLowerCase();
     const onlyWhenVerifyPasses = !declined(gate);
     if (!onlyWhenVerifyPasses) {
-      out('  ⚠ Off means an UNVERIFIED diff reaches the branch: a build that failed the gate —');
-      out('    or never ran it — still lands there.');
+      out(`  ⚠ Off means an UNVERIFIED diff reaches the ${vocab.targetNoun}: a build that failed the`);
+      out('    gate — or never ran it — still lands there.');
     }
 
-    const resolve = (
-      await ask('  Let the build agent resolve mechanical rebase conflicts? (Y/n)', 'Y')
-    ).toLowerCase();
-    const resolveConflicts = !declined(resolve);
+    // Agent conflict-resolution only exists where conflicts are editable files (git worktree,
+    // p4 resolve). On Diversion they are server-side (a resolveUrl, not paths), so the agent
+    // cannot take them — offering the choice would promise a job the backend cannot run (RUN-84).
+    let resolveConflicts = true;
+    if (vocab.agentResolvesConflicts) {
+      const resolve = (
+        await ask(`  Let the build agent resolve mechanical ${vocab.conflictAdj} conflicts? (Y/n)`, 'Y')
+      ).toLowerCase();
+      resolveConflicts = !declined(resolve);
+    } else {
+      out('');
+      out(`  On ${vocab.label} a landing conflict is resolved server-side, not in the workspace, so`);
+      out('  the build agent cannot take it — a conflict always waits on a human.');
+    }
 
     // EMPTY MEANS NO OVERRIDE, and that default is load-bearing (RUN-41): defaulting to
     // "anywhere" would make every repo writable at `main` by anyone who can dispatch, and the
     // repo owner and the dispatcher are not always the same person. The repo opts in, typed.
     out('');
-    out(`  A dispatch can never choose the landing branch: this repo lands only at ${branch}.`);
+    out(`  A dispatch can never choose the landing ${vocab.targetNoun}: this repo lands only at ${branch}.`);
     out('  Globs here (e.g. feature/** wip/*) let a dispatch override that — blank keeps the');
     out('  envelope closed.');
-    const allowedBranches = (await ask('  Branch globs a dispatch may land on (blank = no override)'))
+    const allowedBranches = (
+      await ask(`  ${capitalize(vocab.targetNoun)} globs a dispatch may land on (blank = no override)`)
+    )
       .split(/[,\s]+/)
       .filter(Boolean);
 
-    // Default false, and the default is the point (RUN-27): every other defence rests on
-    // "nothing an agent writes leaves this machine".
-    const push = (await ask(`  Push ${branch} to its remote after each landing? (y/N)`, 'N')).toLowerCase();
-    const autoPush = push === 'y' || push === 'yes';
-    if (autoPush) {
-      out('  ⚠ This crosses the one boundary the daemon otherwise has — agent work now leaves');
-      out('    this machine on its own, and `git log origin/main..main` stops being your "what');
-      out('    did the agents do?" check. See THREAT-MODEL.md before committing this.');
-    }
-
-    // Offered only once autoPush is on: a merge request cannot exist without the branch
-    // reaching the remote. Validating the pair HERE (rule 1) beats writing a manifest whose
-    // merge request can never open at the next dispatch.
+    // The push/merge-request tail is git-only (RUN-84): on a server-backed VCS `publish` already
+    // reached the server (`share` no-ops) and the merge-request flow is git+`gh`, so there is no
+    // autoPush to opt into and nothing here to ask. Both knobs stay at their closed default.
+    let autoPush = false;
     let mergeTarget: string | null = null;
-    if (autoPush) {
-      out('');
-      out("  The daemon can open a merge request when a plan's work completes. A per-plan");
-      out('  branch template — branch = "noriq/plan-<planKey>" — is what makes that MR mean');
-      out("  something: one plan's worth of work per review (RUN-28).");
-      for (;;) {
-        const answer = (await ask('  Merge-request target branch (blank = no merge requests)')).trim();
-        if (!answer) break;
-        if (answer === branch) {
-          out('  ✗ that is the landing branch itself — a merge request needs a different base.');
-          continue;
-        }
-        mergeTarget = answer;
-        break;
+    if (vocab.landingReachesRemote) {
+      // Default false, and the default is the point (RUN-27): every other defence rests on
+      // "nothing an agent writes leaves this machine".
+      const push = (await ask(`  Push ${branch} to its remote after each landing? (y/N)`, 'N')).toLowerCase();
+      autoPush = push === 'y' || push === 'yes';
+      if (autoPush) {
+        out('  ⚠ This crosses the one boundary the daemon otherwise has — agent work now leaves');
+        out(`    this machine on its own, and \`${vocab.auditHint}\` stops being your "what did`);
+        out('    the agents do?" check. See THREAT-MODEL.md before committing this.');
       }
+
+      // Offered only once autoPush is on: a merge request cannot exist without the branch
+      // reaching the remote. Validating the pair HERE (rule 1) beats writing a manifest whose
+      // merge request can never open at the next dispatch.
+      if (autoPush) {
+        out('');
+        out("  The daemon can open a merge request when a plan's work completes. A per-plan");
+        out('  branch template — branch = "noriq/plan-<planKey>" — is what makes that MR mean');
+        out("  something: one plan's worth of work per review (RUN-28).");
+        for (;;) {
+          const answer = (await ask('  Merge-request target branch (blank = no merge requests)')).trim();
+          if (!answer) break;
+          if (answer === branch) {
+            out('  ✗ that is the landing branch itself — a merge request needs a different base.');
+            continue;
+          }
+          mergeTarget = answer;
+          break;
+        }
+      }
+    } else {
+      out('');
+      out(`  On ${vocab.label}, this ${vocab.targetNoun} already reaches the server as work lands — there`);
+      out('  is no separate push, and onward review runs there, not through a git remote.');
     }
 
     choices.land = { onlyWhenVerifyPasses, resolveConflicts, allowedBranches, autoPush, mergeTarget };
@@ -648,6 +700,9 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     // backend must hear BEFORE committing the marker, not at the first dispatch: there is no
     // dry-run there (RUN-48, THREAT-MODEL.md).
     const vcsDet = await (deps.detectVcsFor ?? (async (r: string) => (await detectVcs([r])).get(r)))(cwd);
+    // The detected backend's setup lexicon (RUN-84): every VCS-shaped question and comment below
+    // reads in the operator's actual source control, not git-by-assumption. Undetected → git.
+    const vocab = vocabFor(vcsDet?.kind);
     if (vcsDet?.kind === 'diversion') {
       out('  This is a Diversion workspace. Know before you commit this marker:');
       out('  every write an agent makes here syncs to the cloud within seconds — before any');
@@ -742,6 +797,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       allow: eco.allow,
       defaults: null,
       land: null,
+      vocab,
     };
 
     // The fork (RUN-62). One trailing question, default N, so the tier is discoverable
@@ -762,7 +818,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
         out('');
         out(`  ${section.title}`);
         out('');
-        await section.run({ ask, out }, choices);
+        await section.run({ ask, out, vocab }, choices);
       }
     }
 
@@ -830,7 +886,9 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
 
     out('');
     out('  Next:');
-    out(`    git add ${path.join('.noriq', 'project.toml')} && git commit -m "Add Noriq marker"`);
+    // The marker is committed the detected backend's way (RUN-84) — a Diversion or Perforce
+    // operator was never going to `git add` a repo git does not own.
+    out(`    ${vocab.commitMarker(path.join('.noriq', 'project.toml'))}`);
     out('    noriq-runner discover     # confirm this runner sees it');
     out('');
     return { manifestPath: target, wrote: true, key };
