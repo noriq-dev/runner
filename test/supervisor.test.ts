@@ -9,7 +9,7 @@ import type {
   DriverTelemetry,
   ModelUsage,
 } from '../src/drivers/types';
-import { zeroTelemetry } from '../src/drivers/types';
+import { UNATTRIBUTED_MODEL_ID, zeroTelemetry } from '../src/drivers/types';
 import type { ParkedRun } from '../src/parked';
 import { noriqToolNamesFor } from '../src/security';
 import {
@@ -2400,19 +2400,38 @@ describe('the run model mix (RUN-59)', () => {
       expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 540 }) });
     });
 
-    it('drops the whole mix when any spending slot could not attribute it (codex build)', () => {
+    it('folds un-attributable spend into the (unattributed) bucket, keeping the sum (RUN-86)', () => {
       const t = new RunTally();
-      t.record('primary', tel({ inputTokens: 200 })); // codex — spend, no mix
+      t.record('primary', tel({ inputTokens: 200 })); // codex build — spend, no per-model mix
       t.record('review:1', tel({ inputTokens: 20, modelUsage: { sonnet: mix({ inputTokens: 20 }) } }));
       const total = t.total();
-      expect(total.inputTokens).toBe(220); // totals still count both sessions
-      expect(total.modelUsage).toBeUndefined(); // but a partial mix would not sum — so: not reported
+      expect(total.inputTokens).toBe(220);
+      // sonnet is attributed; codex's 200 lands in the reserved bucket — together they still sum,
+      // instead of the old behaviour that discarded sonnet's real breakdown too.
+      expect(total.modelUsage).toEqual({
+        sonnet: mix({ inputTokens: 20 }),
+        [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }),
+      });
+      const summed = Object.values(total.modelUsage ?? {}).reduce((a, u) => a + u.inputTokens, 0);
+      expect(summed).toBe(total.inputTokens);
     });
 
-    it('a zero-spend slot with no mix does not block the aggregate', () => {
+    it('an all-codex run reports only the (unattributed) bucket, still summing (RUN-86)', () => {
+      const t = new RunTally();
+      t.record('primary', tel({ inputTokens: 150 })); // codex: tokens, no mix, no cost
+      expect(t.total().modelUsage).toEqual({ [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 150 }) });
+    });
+
+    it('a spend-less run reports no mix — the only "not reported" case left (RUN-86)', () => {
+      const t = new RunTally();
+      t.record('primary', tel()); // phase-only tick: no spend, no mix
+      expect(t.total().modelUsage).toBeUndefined();
+    });
+
+    it('a zero-spend slot with no mix does not manufacture an empty bucket', () => {
       const t = new RunTally();
       t.record('primary', tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100 }) } }));
-      t.record('conflict', tel()); // spent nothing, reported no mix — must not veto
+      t.record('conflict', tel()); // spent nothing, reported no mix — must not add an unattributed key
       expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 100 }) });
     });
 
@@ -2438,12 +2457,23 @@ describe('the run model mix (RUN-59)', () => {
       expect(opus?.costUSD).toBeCloseTo(0.3);
     });
 
-    it('a pre-RUN-59 park (spend, no mix) yields NO breakdown rather than one that does not add up', () => {
+    it('a pre-RUN-59 park (spend, no mix) lands in the (unattributed) bucket, still summing (RUN-86)', () => {
       const t = new RunTally();
-      t.seed('__prior__', telemetryFromSpent({ tokens: 42, usd: 0.2 })); // no modelUsage
+      t.seed('__prior__', telemetryFromSpent({ tokens: 42, usd: 0.2 })); // no modelUsage → unattributed
       t.record('primary', tel({ outputTokens: 8, modelUsage: { opus: mix({ outputTokens: 8 }) } }));
-      expect(t.total().inputTokens + t.total().outputTokens).toBe(50);
-      expect(t.total().modelUsage).toBeUndefined();
+      const total = t.total();
+      expect(total.inputTokens + total.outputTokens).toBe(50);
+      expect(total.modelUsage).toEqual({
+        opus: mix({ outputTokens: 8 }),
+        // telemetryFromSpent puts prior tokens in inputTokens and usd in costUSD.
+        [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 42, costUSD: 0.2 }),
+      });
+    });
+
+    it('the reserved bucket key is exactly the wire literal the dashboard renders (RUN-86/87)', () => {
+      // A runner-local mirror of @noriq-dev/shared's UNATTRIBUTED_MODEL_ID until the vendored slice
+      // is refreshed (RUN-87); this pins the byte-identical value that crosses the wire.
+      expect(UNATTRIBUTED_MODEL_ID).toBe('(unattributed)');
     });
   });
 
@@ -2492,7 +2522,7 @@ describe('the run model mix (RUN-59)', () => {
     expect(exit.telemetry.modelUsage).toEqual(runMix);
   });
 
-  it('a codex build + a claude reviewer reports NO mix — never a partial one', async () => {
+  it('a codex build + a claude reviewer reports the claude mix + an (unattributed) bucket (RUN-86)', async () => {
     const reviewed = manifest({
       tool: 'codex',
       verify: {
@@ -2520,7 +2550,12 @@ describe('the run model mix (RUN-59)', () => {
     expect(exit.outcome).toBe('done');
     const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
     expect(terminal?.telemetry?.inputTokens).toBe(220); // totals count both
-    expect(terminal?.telemetry?.modelUsage).toBeUndefined(); // but the mix is not reported
+    // The claude reviewer's real breakdown survives; codex's un-attributable 200 lands in the
+    // reserved bucket, so the mix still sums to the total (RUN-86) instead of being dropped whole.
+    expect(terminal?.telemetry?.modelUsage).toEqual({
+      'claude-sonnet-4-5': mix({ inputTokens: 20 }),
+      [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }),
+    });
   });
 
   it('persists the run mix into the park and re-seeds it on resume, still summing', async () => {

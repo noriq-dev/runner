@@ -20,7 +20,7 @@ import type {
   ModelUsage,
   NoriqMcp,
 } from './drivers/types';
-import { zeroTelemetry } from './drivers/types';
+import { UNATTRIBUTED_MODEL_ID, zeroTelemetry } from './drivers/types';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -281,6 +281,20 @@ export const mergeModelUsage = (
   return out;
 };
 
+/**
+ * Fold ONE session's aggregate telemetry into the unattributed bucket (RUN-86). Reads the four
+ * token classes + cost off a `DriverTelemetry` (whose field names differ from `ModelUsage`'s:
+ * `cacheReadTokens`→`cacheReadInputTokens`, `costUsd`→`costUSD`) and adds them in — so the bucket
+ * carries exactly what this session contributed to the run totals, and the mix keeps summing.
+ */
+const addUnattributed = (acc: ModelUsage | undefined, t: DriverTelemetry): ModelUsage => ({
+  inputTokens: (acc?.inputTokens ?? 0) + t.inputTokens,
+  outputTokens: (acc?.outputTokens ?? 0) + t.outputTokens,
+  cacheReadInputTokens: (acc?.cacheReadInputTokens ?? 0) + t.cacheReadTokens,
+  cacheCreationInputTokens: (acc?.cacheCreationInputTokens ?? 0) + t.cacheCreationTokens,
+  costUSD: (acc?.costUSD ?? 0) + t.costUsd,
+});
+
 /** A park's prior spend, rehydrated as a telemetry snapshot to SEED a resumed run's tally (RUN-59).
  *  Prior tokens land in inputTokens — the split across the four buckets is not recoverable from the
  *  park (it stores one total), and the figure that matters (and that the budget reads) is the sum.
@@ -308,10 +322,14 @@ export const telemetryFromSpent = (spent: ParkedRun['spent']): DriverTelemetry =
  * latest snapshot is the authoritative one — picking "the largest" would let a live over-count (or a
  * mix-less interim tick) beat the result that supersedes it.
  *
- * The aggregate mix is all-or-nothing: it exists only if EVERY slot that spent anything attributed
- * that spend by model. One un-attributed session (codex, the claude usage-fallback, a pre-RUN-59
- * park) → the run reports NO mix, not a partial one — a breakdown that omits a spending model would
- * not sum to the total beside it, which is the one thing the tooltip must never do.
+ * The mix must SUM to the run total beside it — that is the one thing the tooltip must never break.
+ * RUN-59 kept that by making the mix all-or-nothing: one un-attributed spending session (codex, the
+ * claude usage-fallback, a pre-RUN-59 park) dropped the WHOLE mix. But that discarded a Claude
+ * builder's perfectly good breakdown just because its reviewer was codex — the run showed "not
+ * reported" beside real, attributable spend. RUN-86 keeps the sum without the loss: un-attributable
+ * spend is folded into ONE reserved `(unattributed)` bucket carrying exactly what those sessions
+ * contributed to `acc`, so attributed models + the bucket still land on the total. The bucket is a
+ * real key the dashboard renders as "unattributed"; only a genuinely spend-less run has no mix.
  */
 export class RunTally {
   private readonly slots = new Map<string, DriverTelemetry>();
@@ -330,7 +348,11 @@ export class RunTally {
   total(): DriverTelemetry {
     const acc = zeroTelemetry();
     let mix: Record<string, ModelUsage> | undefined;
-    let complete = true;
+    // Spend from mix-less sessions, collected into the one reserved bucket (RUN-86) instead of
+    // nuking the whole mix. Each such session adds its OWN aggregate — the same numbers it puts in
+    // `acc` — so the bucket + the attributed models sum back to the total (codex lands here at $0,
+    // matching that `acc.costUsd` already books it at $0).
+    let unattributed: ModelUsage | undefined;
     for (const t of this.slots.values()) {
       acc.inputTokens += t.inputTokens;
       acc.outputTokens += t.outputTokens;
@@ -341,9 +363,13 @@ export class RunTally {
       const spent =
         t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens > 0 || t.costUsd > 0;
       if (t.modelUsage) mix = mergeModelUsage(mix, t.modelUsage);
-      else if (spent) complete = false; // a spending session with no mix breaks the sum
+      else if (spent) unattributed = addUnattributed(unattributed, t);
     }
-    if (complete && mix) acc.modelUsage = mix;
+    // A mix exists if ANYTHING was attributed or anything was unattributed; only a spend-less run
+    // leaves both undefined (→ no mix, the daemon sends `{}` → the honest "not reported").
+    if (mix || unattributed) {
+      acc.modelUsage = { ...mix, ...(unattributed ? { [UNATTRIBUTED_MODEL_ID]: unattributed } : {}) };
+    }
     return acc;
   }
 }

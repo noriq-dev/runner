@@ -18,6 +18,16 @@ export interface ModelUsage {
   costUSD: number;
 }
 
+/**
+ * The reserved mix key for spend no driver could attribute per-model (RUN-86). Mirrors the wire
+ * contract's `UNATTRIBUTED_MODEL_ID` (@noriq-dev/shared) — kept as a runner-local literal because
+ * the vendored shared slice has not been refreshed to carry it yet (RUN-87); the value must stay
+ * byte-identical to the shared one (a test pins it), since this string is what crosses the wire and
+ * the dashboard keys on it to render "unattributed". A real model can never be named this: the
+ * parens make it a non-id.
+ */
+export const UNATTRIBUTED_MODEL_ID = '(unattributed)';
+
 export interface DriverTelemetry {
   inputTokens: number;
   outputTokens: number;
