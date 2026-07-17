@@ -9,6 +9,7 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
+import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import type { ParkState, RunAgent } from './client';
 import { superviseBudget, totalTokens } from './drivers/budget';
 import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry, NoriqMcp } from './drivers/types';
@@ -649,6 +650,9 @@ export class RunSupervisor {
     /** The live build session — the feedback target, NOT the reviewer's. */
     session: DriverSession;
     task: AnchorTask | null;
+    /** Live accessor for the builder session's output, so the fix turn's structured RESPONSE
+     *  block can be captured and fed into the next reviewer's ledger (RUN-79). */
+    getSessionText?: () => string;
     budget?: RunBudget;
   }): Promise<VerifyVerdict & { rounds: number }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
@@ -680,8 +684,13 @@ export class RunSupervisor {
           return false;
         });
 
+    // The cross-round adjudication ledger (RUN-79): findings raised in earlier rounds plus the
+    // builder's structured rebuttal to each, carried to every fresh reviewer so a settled finding
+    // is verified rather than relitigated. Empty on the first look.
+    let ledger: LedgerEntry[] = [];
+
     await foldFixIntoBranch('pre-review checkpoint');
-    let verdict = await this.runReviewer({ ...ctx, intent, round: 1 });
+    let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
 
@@ -699,14 +708,24 @@ export class RunSupervisor {
       transcript.milestone(
         `handing the reviewer's report to the live agent (fix round ${round}/${maxRounds})`,
       );
+      // This round's findings, for the ledger — parsed from the reviewer's OWN output (its
+      // numbered FINDING lines), so the builder's response can be paired to them by number.
+      const findings = parseFindings(verdict.findings);
       // Tokens burn on a fix turn — the phase must say so (RUN-31).
       this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+      // Snapshot the builder's output length BEFORE the fix turn; the delta after is exactly the
+      // fix turn's text, from which we parse the structured RESPONSE block (RUN-79). Captured here,
+      // before the floor re-verify below can append its own turns.
+      const textBefore = ctx.getSessionText?.().length ?? 0;
       const exit = await ctx.session
         .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
           return null;
         });
+      const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
+      // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
+      ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
       if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round };
@@ -733,7 +752,7 @@ export class RunSupervisor {
       // Commit the builder's fix (and any floor-fix turn above) so the fresh reviewer's
       // `baseId...HEAD` actually advances to include it — without this the re-review is a no-op.
       await foldFixIntoBranch(`reviewer fix round ${round}`);
-      verdict = await this.runReviewer({ ...ctx, intent, round: round + 1 });
+      verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       if (verdict.passed) return { ...verdict, rounds: round };
     }
@@ -751,6 +770,8 @@ export class RunSupervisor {
     budget?: RunBudget;
     /** Which look this is (1 = the first review) — transcript attribution (RUN-74). */
     round: number;
+    /** Findings adjudicated in earlier rounds (RUN-79) — empty on the first look. */
+    ledger?: LedgerEntry[];
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -787,6 +808,7 @@ export class RunSupervisor {
         intent: ctx.intent,
         diffCmd,
         verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
+        ledger: ctx.ledger,
       }),
       permission: manifest.permissions.verify,
       // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
@@ -1085,6 +1107,7 @@ export class RunSupervisor {
       stopSession: budgetRun.stop,
       exit,
       verifyText,
+      getSessionText: () => verifyText,
       tail,
     });
   }
@@ -1317,6 +1340,7 @@ export class RunSupervisor {
       stopSession: budgetRun.stop,
       exit,
       verifyText,
+      getSessionText: () => verifyText,
       tail,
     });
   }
@@ -1342,6 +1366,10 @@ export class RunSupervisor {
     stopSession: () => Promise<void>;
     exit: DriverExit;
     verifyText: string;
+    /** Live accessor for the session's accumulated output — NOT the `verifyText` snapshot, which
+     *  froze when the driver's first turn ended. reviewWithFeedback reads it around each fix turn
+     *  to capture the builder's structured response block (RUN-79). */
+    getSessionText?: () => string;
     tail: string;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, verifyText, tail } = ctx;
@@ -1447,6 +1475,7 @@ export class RunSupervisor {
         driver,
         session: budgetRun.session,
         task,
+        getSessionText: ctx.getSessionText,
         budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       });
       if (review.passed) {

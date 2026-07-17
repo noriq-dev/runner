@@ -11,6 +11,7 @@
 // findings itself. This also makes authorship separation absolute: the reviewer cannot claim,
 // move, or comment as anyone, only judge.
 
+import { type LedgerEntry, renderLedger } from './adjudication';
 import { renderPrompt } from './prompts';
 
 export interface ReviewerPromptContext {
@@ -22,6 +23,10 @@ export interface ReviewerPromptContext {
   /** The deterministic floor's command, when one is configured — the reviewer is told it
    *  already passed so it spends its turns on what the command CANNOT check. */
   verifyCmd?: string | null;
+  /** Findings already raised and answered in earlier rounds (RUN-79). Empty/absent on the
+   *  first look — a fresh reviewer with no history yet. Rendered into the PRIOR ADJUDICATIONS
+   *  section so a settled finding is verified, not relitigated. */
+  ledger?: LedgerEntry[];
 }
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
@@ -41,13 +46,19 @@ export interface ReviewerPromptContext {
  *  emits, an interface it calls) stays in scope. This repo is standalone by design (see
  *  CLAUDE.md), so cross-repo intent is common; without the rule fresh reviewers split on it
  *  (RUN-59 dogfood: rounds 1/3 failed a run over server-repo surfaces the diff could never carry,
- *  round 2 reasoned the boundary out unprompted). Cross-round memory of the builder's rebuttal to
- *  a settled finding is the separate, heavier fix (RUN-79), NOT here. */
+ *  round 2 reasoned the boundary out unprompted).
+ *
+ *  RUN-79 adds cross-round memory: prior findings + the builder's structured rebuttal ride in the
+ *  PRIOR ADJUDICATIONS section (adjudication.ts). The reviewer stays fresh on the DIFF but is no
+ *  longer amnesiac about what was already settled — it verifies each pointer rather than trusting
+ *  it, so a real finding still lands and a rebutted one is not relitigated. Empty ledger → the
+ *  section renders nothing, so the first look is unchanged. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
     verifyCmd: ctx.verifyCmd ?? null,
     intent: ctx.intent,
+    priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,
   });
 }
 

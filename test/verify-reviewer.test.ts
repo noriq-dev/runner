@@ -101,6 +101,42 @@ describe('assembleReviewerPrompt', () => {
     expect(p).toMatch(/never a bug that reaches elsewhere/);
   });
 
+  it('asks for numbered findings so the builder can answer each by number (RUN-79)', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).toMatch(/FINDING <n> \[<severity>\] <file:line>: <one-sentence claim>/);
+  });
+
+  it('no PRIOR ADJUDICATIONS section on the first look (empty/absent ledger) (RUN-79)', () => {
+    expect(assembleReviewerPrompt({ intent: 'x' })).not.toMatch(/PRIOR ADJUDICATIONS/);
+    expect(assembleReviewerPrompt({ intent: 'x', ledger: [] })).not.toMatch(/PRIOR ADJUDICATIONS/);
+  });
+
+  it('renders the ledger with the verify-don’t-trust frame when findings were adjudicated (RUN-79)', () => {
+    const p = assembleReviewerPrompt({
+      intent: 'x',
+      ledger: [
+        {
+          id: 1,
+          round: 1,
+          severity: 'High',
+          location: 'src/init.ts:357',
+          claim: 'detectVcs runs on every init',
+          status: 'contested',
+          pointer: 'commit 11f19c8',
+          reason: 'pre-existing, added by RUN-60',
+        },
+      ],
+    });
+    expect(p).toMatch(/PRIOR ADJUDICATIONS/);
+    // The framing: claim not fact, verify the pointer, don't relitigate what holds up.
+    expect(p).toMatch(/builder's CLAIM/);
+    expect(p).toMatch(/verify the pointer against the diff yourself/i);
+    expect(p).toMatch(/Re-raise a CONTESTED finding only if you can show/);
+    // The entry itself, with the checkable pointer.
+    expect(p).toContain('detectVcs runs on every init');
+    expect(p).toContain('CONTESTED (commit 11f19c8)');
+  });
+
   it('its verdict line round-trips through the shared parser', () => {
     // The reviewer and the dispatched verify kind share one protocol — a drift here would
     // make every reviewer verdict read as 'unknown', i.e. a permanent FAIL.
@@ -125,5 +161,14 @@ describe('reviewer feedback + rejection surfaces', () => {
   it('the rejection comment names the rounds spent', () => {
     expect(reviewerRejectionComment('findings', 2)).toMatch(/after 2 fix rounds/);
     expect(reviewerRejectionComment('findings', 0)).not.toMatch(/after/);
+  });
+
+  it('requires a structured RESPONSE block so the next reviewer can adjudicate (RUN-79)', () => {
+    const p = reviewerFeedbackPrompt('FINDING 1 [High] a.ts:1: x', 1, 2);
+    expect(p).toMatch(/RESPONSE block/);
+    expect(p).toMatch(/FINDING <n>: FIXED <file:line>/);
+    expect(p).toMatch(/FINDING <n>: CONTESTED/);
+    // The pointer must be checkable or the finding is re-raised — that is the whole contract.
+    expect(p).toMatch(/re-raised/);
   });
 });
