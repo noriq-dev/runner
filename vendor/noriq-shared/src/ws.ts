@@ -166,10 +166,18 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     tokensUsed: z.number().int().nonnegative().nullable().default(null),
     usdSpent: z.number().nonnegative().nullable().default(null),
     // The per-model breakdown of that spend (RUN-59). Rides THIS frame for the same reason spend
-    // does — it is a fact about the run, not a lifecycle transition — and is null-means-no-news
-    // like every field here: a live tick that does not yet know the mix (the split is only known
-    // at a result) sends null, and the server COALESCEs, so it never wipes a mix already stored.
-    // When present it sums to tokensUsed/usdSpent above, because both are computed from it.
+    // does — a fact about the run, not a lifecycle transition. Unlike the other fields here it is a
+    // TRI-STATE, NOT plain null-means-no-news, because a mix once stored must be retractable:
+    //   - a mix object → the authoritative breakdown; it sums to tokensUsed/usdSpent above.
+    //   - `{}`         → this frame HAS spend but it cannot be attributed by model (a codex session,
+    //                    the claude usage-fallback, or a run whose sessions no longer all report a
+    //                    mix). An EXPLICIT clear: the server MUST store it (set model_usage empty/
+    //                    null), NOT COALESCE-skip it — else an earlier, then-complete mix would sit
+    //                    stale beside a climbing total forever. Render as "not reported", like null.
+    //   - `null`       → no news: a phase-only tick with no telemetry. COALESCE keeps what is stored.
+    // So the server persists model_usage from every frame whose modelUsage is non-null ({} → clear),
+    // and only a null modelUsage is skipped. The stored mix then always reflects the last
+    // spend-bearing frame, and always sums to the total shown beside it.
     modelUsage: RunModelMix.nullable().default(null),
     // Tail of the agent's combined output, tail-capped by the daemon (last wins).
     logTail: z.string().nullable().default(null),
