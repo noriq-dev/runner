@@ -1,5 +1,6 @@
 import type { AgentTool, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
+import { ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
@@ -188,6 +189,10 @@ export class Daemon {
     // tomorrow, and a daemon that forgot across a restart would strand both the run and the
     // worktree holding its work.
     const parked = new ParkedStore();
+    // Continuation state for a "continue a failed run" (RUN-91/92): a failed build's spend and
+    // adjudication ledger, kept on disk beside the worktree it belongs to so a re-dispatch of the
+    // same run id re-seeds instead of resetting. Same rationale as `parked` — survive a restart.
+    const continuable = new ContinuableStore();
     const held: { ws?: WsClient } = {};
     // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
     // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
@@ -265,6 +270,7 @@ export class Daemon {
       // the daemon asks the row rather than trying to observe the call.
       getParkState: (runId) => client.getParkState(runId),
       parked,
+      continuable,
       steering,
       logger: this.log,
     });

@@ -2,6 +2,7 @@ import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget }
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
+import type { ContinuableRun } from '../src/continuable';
 import type {
   AgentDriver,
   DriverExit,
@@ -292,6 +293,8 @@ function harness(
     landRaces?: boolean;
     /** A per-repo backend riding ResolvedRepo (RUN-60) — must win over deps.vcs. */
     repoVcs?: FakeWorktrees;
+    /** Pre-seed the continuable store (RUN-92) to model a re-dispatched "continue a failed run". */
+    continuableSeed?: ContinuableRun;
     /** What the server says when asked whether the run parked (RUN-30). */
     parkState?: Partial<ParkState>;
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
@@ -317,6 +320,8 @@ function harness(
   let verifyRan = false;
   let verifyCalls = 0;
   const parked = new FakeParked();
+  const continuable = new FakeContinuable();
+  if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
   const claimChecks: string[] = [];
   const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
@@ -359,6 +364,7 @@ function harness(
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
     parked,
+    continuable,
     parkTtlHours: over.parkTtlHours,
     getParkState: async (runId) => {
       parkChecks.push(runId);
@@ -390,6 +396,7 @@ function harness(
     claude,
     codex,
     parked,
+    continuable,
     parkChecks,
     claimChecks,
     agentCreates,
@@ -415,6 +422,21 @@ class FakeParked {
     const e = this.entries.get(id) ?? null;
     this.entries.delete(id);
     return e;
+  };
+}
+
+/** The continuable store (RUN-92), in memory — what supervise() reads to re-seed a continuation
+ *  and writes at a gate-fail. On-disk behaviour is pinned in continuable.test.ts. */
+class FakeContinuable {
+  entries = new Map<string, ContinuableRun>();
+  puts: ContinuableRun[] = [];
+  put = async (e: ContinuableRun): Promise<void> => {
+    this.puts.push(e);
+    this.entries.set(e.runId, e);
+  };
+  get = async (id: string): Promise<ContinuableRun | null> => this.entries.get(id) ?? null;
+  remove = async (id: string): Promise<void> => {
+    this.entries.delete(id);
   };
 }
 
@@ -1650,6 +1672,96 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.reason).toBe('review'); // gated after the manifest's single fix round, not five
     expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(2); // initial + 1
+  });
+
+  // Continuation continuity (RUN-92): a re-dispatched failed run re-seeds from the record the prior
+  // sitting left, so spend stays cumulative and the ledger is not relitigated.
+  const priorLedgerEntry = {
+    id: 1,
+    round: 2,
+    severity: 'high',
+    location: 'src/auth.ts:42',
+    claim: 'THE-PRIOR-FINDING-ABOUT-AUTH',
+    status: 'fixed' as const,
+    pointer: 'src/auth.ts:50',
+    reason: 'guarded now',
+  };
+
+  it('re-seeds the prior sitting spend so a continuation reports CUMULATIVE totals (RUN-92)', async () => {
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 1000, usd: 0.5 },
+      ledger: [],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed, verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { inputTokens: 40, costUsd: 0.1 }); // the build turn's spend
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done', { inputTokens: 20, costUsd: 0.05 }); // the reviewer's spend
+    await done;
+    const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
+    // prior 1000 (seeded into inputTokens) + build 40 + reviewer 20 = 1060 — never a reset to 60.
+    expect(terminal?.telemetry?.inputTokens).toBe(1060);
+    expect(terminal?.telemetry?.costUsd).toBeCloseTo(0.65);
+  });
+
+  it('hands the prior adjudication ledger to the FIRST reviewer of a continuation (RUN-92)', async () => {
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 10, usd: 0 },
+      ledger: [priorLedgerEntry],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // The very first review of the continuation already carries the settled finding — it verifies
+    // the pointer instead of raising it fresh (the whole point of not relitigating).
+    expect(h.claude.starts[1]?.prompt).toContain('THE-PRIOR-FINDING-ABOUT-AUTH');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('records a continuable entry when a build gate-fails, and clears it when one passes (RUN-92)', async () => {
+    // Fail: the reviewer refuses through its one fix round → gated, worktree kept, record written.
+    const failed = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const runF = failed.supervisor.supervise(buildRun());
+    await flush();
+    failed.claude.complete('done');
+    await onReviewTurn(failed, 2);
+    failed.claude.emitText('FINDING 1 [high] src/auth.ts:9: the 401 path is untested\nVERDICT: FAIL');
+    failed.claude.complete('done');
+    await onReviewTurn(failed, 3);
+    failed.claude.emitText('FINDING 1 [high] src/auth.ts:9: still untested\nVERDICT: FAIL');
+    failed.claude.complete('done');
+    await runF;
+    const record = failed.continuable.puts.at(-1);
+    expect(record?.runId).toBe('run_1');
+    expect(record?.ledger.length).toBeGreaterThan(0); // the reviewer's finding is carried forward
+    expect(failed.continuable.entries.has('run_1')).toBe(true);
+
+    // Pass: a build that satisfies the gate clears any record a prior failed sitting left.
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 5, usd: 0 },
+      ledger: [priorLedgerEntry],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const ok = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed, verifyResults: [true] });
+    const runP = ok.supervisor.supervise(buildRun());
+    await flush();
+    ok.claude.complete('done');
+    await onReviewTurn(ok, 2);
+    ok.claude.emitText('VERDICT: PASS');
+    ok.claude.complete('done');
+    await runP;
+    expect(ok.continuable.entries.has('run_1')).toBe(false); // resolved → nothing left to continue
   });
 
   it('a reviewer with no verdict still GATES the run — but as no-judgment, never as a refusal (RUN-72)', async () => {

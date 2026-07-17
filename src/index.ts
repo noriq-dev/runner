@@ -72,6 +72,7 @@ export {
   resumePrompt,
   type ParkedRun,
 } from './parked';
+export { ContinuableStore, DEFAULT_CONTINUABLE_PATH, type ContinuableRun } from './continuable';
 export {
   defaultKey,
   detectEcosystem,

@@ -12,6 +12,7 @@ import type {
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import type { ParkState, RunAgent } from './client';
+import type { ContinuableRun, ContinuableStore } from './continuable';
 import { superviseBudget, totalTokens } from './drivers/budget';
 import type {
   AgentDriver,
@@ -179,6 +180,10 @@ export interface RunSupervisorDeps {
   getParkState?: (runId: string) => Promise<ParkState>;
   /** Where parked runs are remembered across restarts (RUN-30). Omitted → parking is off. */
   parked?: Pick<ParkedStore, 'park' | 'get' | 'unpark' | 'list'>;
+  /** Where a failed build's continuation state (spend + adjudication ledger) is kept, so a
+   *  "continue a failed run" (RUN-91/92) re-seeds instead of resetting. Omitted → a continue still
+   *  works off the kept worktree, but reports only its own sitting's spend and re-derives findings. */
+  continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
   /** How long a park may sit before the daemon fails it (RUN-30). Default: DEFAULT_PARK_TTL_HOURS. */
   parkTtlHours?: number;
   /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
@@ -812,7 +817,11 @@ export class RunSupervisor {
      *  block can be captured and fed into the next reviewer's ledger (RUN-79). */
     getSessionText?: () => string;
     budget?: RunBudget;
-  }): Promise<VerifyVerdict & { rounds: number }> {
+    /** A prior attempt's adjudication ledger, on a "continue a failed run" (RUN-92): the first
+     *  fresh reviewer starts from the findings the earlier sitting already settled instead of
+     *  relitigating them. Empty/absent on a normal run. */
+    priorLedger?: LedgerEntry[];
+  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
     const manifestRounds = reviewer?.maxRounds ?? 0;
@@ -851,20 +860,21 @@ export class RunSupervisor {
 
     // The cross-round adjudication ledger (RUN-79): findings raised in earlier rounds plus the
     // builder's structured rebuttal to each, carried to every fresh reviewer so a settled finding
-    // is verified rather than relitigated. Empty on the first look.
-    let ledger: LedgerEntry[] = [];
+    // is verified rather than relitigated. Seeded from a prior attempt on a continue (RUN-92);
+    // empty on the first look of a normal run.
+    let ledger: LedgerEntry[] = ctx.priorLedger ?? [];
 
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
-    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
+    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
 
     for (let round = 1; round <= maxRounds; round++) {
       // Only a clear FAIL is a refusal. 'unknown' means NO JUDGMENT — the reviewer was killed,
       // crashed, breached its ceiling, or never wrote a VERDICT line (RUN-72's dogfood: a human
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
-      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1 };
+      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -893,7 +903,7 @@ export class RunSupervisor {
       ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
-      if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round };
+      if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round, ledger };
       this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
       // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
       // deterministic floor re-runs (with its own bounded feedback) before the re-review.
@@ -910,6 +920,7 @@ export class RunSupervisor {
             verdict: 'fail',
             passed: false,
             rounds: round,
+            ledger,
             findings: `the fix for the reviewer's findings broke the deterministic check (\`${floorCmd.cmd}\`):\n${floor.output.slice(-4000)}`,
           };
         }
@@ -919,9 +930,9 @@ export class RunSupervisor {
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
-      if (verdict.passed) return { ...verdict, rounds: round };
+      if (verdict.passed) return { ...verdict, rounds: round, ledger };
     }
-    return { ...verdict, rounds: maxRounds };
+    return { ...verdict, rounds: maxRounds, ledger };
   }
 
   /** One fresh reviewer session over the build's worktree. Read-only profile, no Noriq
@@ -1519,6 +1530,20 @@ export class RunSupervisor {
     // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
     // its model mix are the sum across sessions, always consistent with each other.
     const tally = new RunTally();
+    // Continue a failed run (RUN-92). The lease above already ADOPTED the kept worktree (RUN-91);
+    // this adds the two things git cannot carry across the fail→continue boundary: the prior spend
+    // (re-seeded so this sitting's reported figures stay CUMULATIVE rather than overwriting the
+    // server's totals with only what this sitting spends) and the adjudication ledger (handed to
+    // the reviewer below so it does not relitigate what the earlier sitting settled).
+    const continued = (await this.deps.continuable?.get(run.id)) ?? null;
+    if (continued) {
+      tally.seed('__prior__', telemetryFromSpent(continued.spent));
+      this.log.info('continuing a failed run — re-seeded prior spend and ledger', {
+        runId: run.id,
+        priorTokens: continued.spent.tokens,
+        ledgerEntries: continued.ledger.length,
+      });
+    }
     // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
     // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
     const startedAt = Date.now();
@@ -1600,6 +1625,7 @@ export class RunSupervisor {
       verifyText,
       getSessionText: () => verifyText,
       tail,
+      continued,
     });
   }
 
@@ -1632,10 +1658,17 @@ export class RunSupervisor {
      *  to capture the builder's structured response block (RUN-79). */
     getSessionText?: () => string;
     tail: string;
+    /** The prior sitting's continuation state on a "continue a failed run" (RUN-92): its ledger
+     *  seeds the reviewer, and it decides whether the terminal record is refreshed or dropped. */
+    continued?: ContinuableRun | null;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, tally, verifyText, tail } =
       ctx;
+    const continued = ctx.continued ?? null;
     const kind = run.kind as RunKind;
+    // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
+    // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.
+    let latestLedger: LedgerEntry[] = continued?.ledger ?? [];
     const budgetRun = { session: ctx.session, stop: ctx.stopSession };
     let exit = ctx.exit;
     // Whether the DRIVER succeeded — drives worktree retention (a build with a diff
@@ -1740,7 +1773,9 @@ export class RunSupervisor {
         tally,
         getSessionText: ctx.getSessionText,
         budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+        priorLedger: continued?.ledger,
       });
+      latestLedger = review.ledger; // the freshest adjudication state, for the continuable record
       if (review.passed) {
         this.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });
       } else if (review.verdict === 'fail') {
@@ -1867,6 +1902,34 @@ export class RunSupervisor {
       logTail: tail,
       exit: { outcome: exit.outcome, reason: exit.reason },
     });
+
+    // Continue a failed run (RUN-92): a gate-failed build keeps its work (the same condition the
+    // dispose below skips on), so record what a continue must inherit that git cannot carry —
+    // the CUMULATIVE spend (tally.total already folds any prior sitting, so re-seeding the next
+    // continue from it never double-counts: `put` replaces, never adds) and the reviewer's final
+    // ledger. Any OTHER terminal — done, landed, a driver failure, a non-build — leaves nothing to
+    // continue, so drop a record a prior failed sitting may have left (this continuation resolved it).
+    if (this.deps.continuable) {
+      if (kind === 'build' && exit.outcome === 'failed' && driverSucceeded && !landed) {
+        const spent = exit.telemetry;
+        await this.deps.continuable
+          .put({
+            runId: run.id,
+            spent: {
+              tokens: totalTokens(spent),
+              usd: spent.costUsd,
+              ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
+            },
+            ledger: latestLedger,
+            failedAt: new Date().toISOString(),
+          })
+          .catch((err) =>
+            this.log.warn('could not persist continuation state', { runId: run.id, err: String(err) }),
+          );
+      } else {
+        await this.deps.continuable.remove(run.id).catch(() => {});
+      }
+    }
 
     // Keep only what a human still has to act on: a build whose diff did NOT land. Once
     // it is on the integration branch the worktree and its throwaway branch are dead
