@@ -1,9 +1,10 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { AgentTool } from '@noriq-dev/shared';
 import { loadRunnerConfig } from './config';
-import { manifestPath } from './discovery';
+import { discoverRepos, manifestPath } from './discovery';
 import { tomlString } from './init';
 import { detectTools } from './tools';
 import { type VcsDetection, detectVcs } from './vcs/detect';
@@ -33,6 +34,13 @@ export interface InitProjectDeps {
   detect?: (cwd: string) => Promise<Ecosystem>;
   /** Injectable so tests never read the real ~/.noriq/runner.toml. */
   scanRoots?: () => Promise<string[] | null>;
+  /**
+   * Injectable discovery, defaulting to the daemon's REAL walk. The post-write verdict has to be
+   * the daemon's own answer to "will this repo be seen", not a lexical guess: the walk stops a few
+   * levels deep and skips ignored dirs (node_modules, vendor, target), so a repo lexically "under"
+   * a scanRoot can still be invisible. Tests inject to avoid a fixture tree.
+   */
+  discover?: (roots: string[]) => Promise<Array<{ root: string }>>;
   /**
    * Injectable so tests never depend on which CLIs the HOST has (defaults to the real
    * detectTools). Without this, the "Agent driver" question silently disappears on any box
@@ -81,7 +89,17 @@ export async function detectEcosystem(cwd: string): Promise<Ecosystem> {
   const has = (f: string) => existsSync(path.join(cwd, f));
 
   if (has('package.json')) {
-    const npm: string[] = ['Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npx tsc:*)'];
+    // A fresh worktree has no node_modules, so without a pinned install rule the derived gate can
+    // never go green — `npm test` exits 127 (`tsc: command not found`). Grant the LOCKFILE-PINNED
+    // install (`npm ci`: installs exactly the lockfile, never rewrites it) only when a lockfile
+    // actually pins it: `npm ci` errors without one, and an install rule that always fails is worse
+    // than none. Never `npm install` — it can add packages and rewrite the lockfile.
+    const npm: string[] = [
+      ...(has('package-lock.json') ? ['Bash(npm ci:*)'] : []),
+      'Bash(npm test:*)',
+      'Bash(npm run:*)',
+      'Bash(npx tsc:*)',
+    ];
     try {
       const pkg = JSON.parse(await readFile(path.join(cwd, 'package.json'), 'utf8')) as {
         scripts?: Record<string, string>;
@@ -314,10 +332,34 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       if (/^[A-Z0-9]{1,8}$/.test(candidate)) key = candidate;
       else out('  ✗ 1–8 letters or digits, e.g. ACME. It must match a project on your server.');
     }
+    // Shape is all we can check: there is no project-listing endpoint on the client, so a KEY that
+    // is well-formed but names no project resolves to nothing on the server. Say so plainly.
+    out(`  KEY ${key} must match a project key on your Noriq server (there's no way to check that`);
+    out('  from here) — confirm it in the dashboard.');
 
-    const installed = (deps.installedTools ?? detectTools)();
-    const tool = installed.length ? await ask(`  Agent driver (${installed.join(' | ')})`, installed[0]) : '';
-    if (!installed.length) out('  No drivers found on PATH — install `claude` or `codex` later.');
+    // Offer only the drivers actually on PATH, and HOLD the answer to them. `tool` is
+    // z.enum(['claude','codex']) and discovery silently DROPS a manifest that fails the schema
+    // (readManifest → null), so a free-text typo — or a schema-valid driver this machine lacks —
+    // would write a marker that passes this wizard yet no run here could ever execute, with no error
+    // anywhere: the exact cliff this command exists to remove. Blank always means "the runner's
+    // default" (tool = null), so it carries NO fallback that would silently rewrite it.
+    const installed: string[] = (deps.installedTools ?? detectTools)();
+    let tool: string | null = null;
+    if (installed.length) {
+      for (;;) {
+        const answer = (await ask(`  Agent driver (${installed.join(' | ')}; blank = runner default)`))
+          .trim()
+          .toLowerCase();
+        if (!answer) break; // stays null — the runner's default
+        if (AgentTool.safeParse(answer).success && installed.includes(answer)) {
+          tool = answer;
+          break;
+        }
+        out(`  ✗ pick one of: ${installed.join(', ')} — or leave blank for the runner default.`);
+      }
+    } else {
+      out('  No drivers found on PATH — leaving the driver unset (install `claude`/`codex` later).');
+    }
 
     const eco = await (deps.detect ?? detectEcosystem)(cwd);
     if (eco.name !== 'unknown') out(`  Detected a ${eco.name} project.`);
@@ -357,33 +399,67 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(
       target,
-      renderProjectManifest({ key, tool: tool || null, verifyCmd, reviewer, landBranch, allow: eco.allow }),
+      renderProjectManifest({ key, tool, verifyCmd, reviewer, landBranch, allow: eco.allow }),
       'utf8',
     );
     out('');
     out(`  ✓ wrote ${target}`);
 
-    // Rule 3, and the only thing here the user could not have worked out themselves.
+    // Rule 3, and the only thing here the user could not have worked out themselves: does the
+    // daemon's OWN discovery walk actually reach this marker? A lexical containment check lies —
+    // the walk stops a few levels deep and skips ignored dirs — so we run the real walk and look
+    // for this repo in its result. This is worth more than every other line the command prints.
     const roots = await (
       deps.scanRoots ??
       (async () => {
         try {
           return (await loadRunnerConfig(deps.configPath)).config.scanRoots;
         } catch {
-          return null; // no machine config yet — `init` reports that, not us
+          return null; // machine config missing/unreadable — reported below, not swallowed
         }
       })
     )();
-    const warning = scanRootWarning(cwd, roots);
     out('');
-    if (warning) {
-      out(`  ⚠️  ${warning}.`);
-      out('     Discovery only walks the scanRoots in your runner.toml, so this marker would');
-      out('     never be found and nothing here would be dispatchable — with no error anywhere.');
-      out('     Add this path to scanRoots, or move the repo under one:');
-      for (const r of roots ?? []) out(`       ${r}`);
-    } else if (roots) {
-      out('  ✓ this repo is under a scanRoot — the runner will find it.');
+    if (roots === null) {
+      // Without a readable runner.toml we cannot answer the one question only this command can, and
+      // falling through to "commit it" would imply the runner is guaranteed to see the repo.
+      out('  ⚠️  Could not read your machine config, so I cannot confirm the runner will see this');
+      out('     repo. Run `noriq-runner init` to set it up, then `noriq-runner discover`.');
+    } else if (roots.length === 0) {
+      out('  ⚠️  Your runner.toml lists no scanRoots, so the runner walks nothing and will not find');
+      out('     this repo. Add its path to scanRoots (`noriq-runner init` can do this):');
+      out(`       ${path.resolve(cwd)}`);
+    } else {
+      const discover = deps.discover ?? ((r: string[]) => discoverRepos(r));
+      const canon = (p: string) => {
+        try {
+          return realpathSync(p);
+        } catch {
+          return path.resolve(p);
+        }
+      };
+      const me = canon(cwd);
+      // Canonicalize both sides: a scanRoot reaching the repo through a symlink (Fedora Atomic's
+      // /home → /var/home, macOS /var → /private/var) prints a different path string than cwd.
+      const seen = (await discover(roots)).some((repo) => canon(repo.root) === me);
+      const outside = scanRootWarning(cwd, roots);
+      if (seen) {
+        out('  ✓ this repo is under a scanRoot and discovery found it — the runner will see it.');
+      } else if (outside) {
+        // Lexically outside every root: the plain "not under any scanRoot" case.
+        out(`  ⚠️  ${outside}.`);
+        out('     Discovery only walks the scanRoots in your runner.toml, so this marker would');
+        out('     never be found and nothing here would be dispatchable — with no error anywhere.');
+        out('     Add this path to a scanRoot, or move the repo under one:');
+        for (const r of roots) out(`       ${r}`);
+      } else {
+        // Under a scanRoot lexically, but the walk did not reach it — depth cap, or an ignored dir
+        // (node_modules, vendor, target, a dot-dir) sits between the root and here.
+        out('  ⚠️  This repo sits under a scanRoot but discovery did not reach it — the walk stops a');
+        out('     few levels deep and skips dot- and build dirs (node_modules, vendor, target).');
+        out("     Add the repo's own path to scanRoots so it is found directly:");
+        out(`       ${path.resolve(cwd)}`);
+      }
     }
 
     out('');

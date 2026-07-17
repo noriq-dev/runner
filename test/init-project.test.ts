@@ -146,6 +146,22 @@ describe('detectEcosystem', () => {
     expect(eco.allow.length).toBeGreaterThan(0);
   });
 
+  it('grants the lockfile-pinned install so a fresh worktree can bootstrap its deps', async () => {
+    // A fresh run worktree has no node_modules; without an install rule the derived gate exits 127.
+    await writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'x' } }));
+    await writeFile(path.join(dir, 'package-lock.json'), '{}');
+    const eco = await detectEcosystem(dir);
+    expect(eco.allow).toContain('Bash(npm ci:*)');
+    expect(eco.allow).not.toContain('Bash(npm install:*)'); // never the lockfile-rewriting form
+  });
+
+  it('omits the install rule when no lockfile pins it — one that always fails is worse than none', async () => {
+    await writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'x' } }));
+    const eco = await detectEcosystem(dir);
+    expect(eco.allow).not.toContain('Bash(npm ci:*)');
+    expect(eco.allow.length).toBeGreaterThan(0); // still authorizes the verify command itself
+  });
+
   it('survives an unparseable package.json during setup', async () => {
     await writeFile(path.join(dir, 'package.json'), '{ not json');
     await expect(detectEcosystem(dir)).resolves.toMatchObject({ name: 'npm' });
@@ -234,6 +250,55 @@ describe('runInitProject', () => {
     const res = await run(['ACME', 'claude', 'npm run check', '']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.permissions.build.allow).toEqual(['Bash(npm test:*)']);
+  });
+
+  it('holds the driver to what is installed — re-asks a schema-invalid answer (RUN-56)', async () => {
+    // `tool` is z.enum(['claude','codex']); discovery silently drops a manifest that fails the
+    // schema, so a free-text typo would write a marker that passes the wizard yet never dispatches.
+    const res = await run(['ACME', 'gpt', 'claude', '', '', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.tool).toBe('claude');
+  });
+
+  it('re-asks a schema-valid driver that is not installed on this machine (RUN-56)', async () => {
+    // `codex` parses, but only `claude` is on PATH here — a marker naming codex would pass the
+    // wizard yet no run on this box could execute it, so the loop rejects it.
+    const res = await run(['ACME', 'codex', 'claude', '', '', ''], { installedTools: () => ['claude'] });
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.tool).toBe('claude');
+  });
+
+  it('a blank driver means the runner default (tool = null), not the first installed one', async () => {
+    const res = await run(['ACME', '', '', '', '']);
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.tool).toBeNull();
+  });
+
+  it("confirms the daemon's REAL discovery found the marker it just wrote", async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', ''], { out: (l) => lines.push(l) }); // scanRoots defaults to [dir]
+    expect(lines.join('\n')).toMatch(/discovery found it/);
+  });
+
+  it('warns when the repo is outside every scanRoot — a perfect marker, never discovered', async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', ''], {
+      out: (l) => lines.push(l),
+      scanRoots: async () => ['/no/such/root'],
+    });
+    expect(lines.join('\n')).toMatch(/not under any/);
+  });
+
+  it('warns when runner.toml lists no scanRoots at all', async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', ''], { out: (l) => lines.push(l), scanRoots: async () => [] });
+    expect(lines.join('\n')).toMatch(/no scanRoots|walks nothing/);
+  });
+
+  it('reports a missing/unreadable machine config instead of a bare ✓ (RUN-56)', async () => {
+    const lines: string[] = [];
+    await run(['ACME', 'claude', '', ''], { out: (l) => lines.push(l), scanRoots: async () => null });
+    expect(lines.join('\n')).toMatch(/Could not read your machine config/);
   });
 
   it('warns a Diversion operator BEFORE the marker is committed: there is no dry-run (RUN-60)', async () => {
