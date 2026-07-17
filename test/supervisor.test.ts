@@ -1176,6 +1176,25 @@ describe('landing a passing build (no human per run)', () => {
     expect(h.comments[0]?.body).toContain('individually fine and broken together');
   });
 
+  it('commits a fix the agent makes to pass the rebase gate BEFORE publishing it', async () => {
+    // The landing sibling of the reviewer bug: when the post-rebase gate fails and the live agent
+    // fixes it, that fix lives only in the working tree. publish fast-forwards the branch's
+    // committed HEAD, so without folding it in first the daemon lands (and, under autoPush, pushes)
+    // the very combination the gate just rejected. The fix must be committed before publish.
+    const h = harness({ manifest: LANDING(), verifyResults: [false, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('done');
+    expect(h.claude.continuations).toHaveLength(1); // the gate failed and the agent fixed it
+    expect(h.worktrees.landings).toHaveLength(1); // and it landed
+    // The build's own commit PLUS a landing-fix commit folding the working-tree fix into HEAD,
+    // so publish fast-forwards the fixed tip rather than the broken one.
+    expect(h.worktrees.commits.some((c) => /landing fix/.test(c.message))).toBe(true);
+  });
+
   it('does nothing at all when the manifest declares no [land]', async () => {
     const h = harness(); // land: null
     const done = h.supervisor.supervise(buildRun());
@@ -1293,6 +1312,27 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.verifyCalls()).toBe(2); // the fix must re-pass the deterministic floor too
+  });
+
+  it('commits the fix before re-review, so the fresh reviewer diff includes it (not the stale HEAD)', async () => {
+    // The RUN-56 failure mode: the builder edits the working tree, but the reviewer inspects
+    // `git diff baseId...HEAD` — a committed range. Without a checkpoint between rounds, HEAD
+    // never advances, so every fresh reviewer re-reads the SAME diff and re-reports the SAME
+    // findings, while the deterministic floor (which reads the working tree) passes. The daemon
+    // must fold the fix into the branch before the re-review.
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('The error path is untested.\nVERDICT: FAIL');
+    h.claude.complete('done'); // reviewer #1 files FAIL
+    await onReviewTurn(h, 3); // fix turn ran, floor re-ran, reviewer #2 starts
+    // A commit was made carrying the fix round — HEAD moved, so reviewer #2's range is fresh.
+    expect(h.worktrees.commits.some((c) => /fix round 1/.test(c.message))).toBe(true);
+    h.claude.emitText('Fixed now.\nVERDICT: PASS');
+    h.claude.complete('done');
+    await done;
   });
 
   it('the TRANSCRIPT carries every voice, in order: build → verify → reviewer → fix → re-review (RUN-74)', async () => {

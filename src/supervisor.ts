@@ -512,6 +512,18 @@ export class RunSupervisor {
         return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
       }
       this.log.info('verify passed on the rebased result', { runId: run.id, branch });
+      // A fix the live agent made to pass THIS gate lives only in the working tree, but publish
+      // fast-forwards the branch's committed HEAD — so without folding it in, the landed (and, under
+      // autoPush, pushed) result would silently drop the fix and land the broken combination the
+      // gate just rejected. Same working-tree-vs-committed split as the inline reviewer's. A clean
+      // tree (gate passed first try, or the sessionless runVerify path) is a no-op checkpoint.
+      await vcs.checkpoint(worktree, `noriq run ${run.id}: landing fix`).catch((err) => {
+        this.log.warn('could not commit the landing fix — the branch may fast-forward without it', {
+          runId: run.id,
+          err: String(err),
+        });
+        return false;
+      });
     }
 
     const ff = await vcs.publish(worktree, branch);
@@ -648,6 +660,27 @@ export class RunSupervisor {
     const floorCmd = cmdVerify(ctx.repo.manifest.verify);
 
     const transcript = this.transcript(ctx.run.id);
+
+    // runReviewer inspects `git diff baseId...HEAD` — a COMMITTED range. Anything the builder
+    // left only in the working tree is invisible to it: the pre-review deterministic floor may
+    // already have handed a fix turn back (afterDriver), and every fix round below adds more.
+    // Fold the current tree into the branch before each look, or the fresh reviewer re-reads the
+    // SAME commit and re-reports the SAME findings every round while the floor — which shells out
+    // over the working tree — silently passes. This is the exact split that failed RUN-56: verify
+    // green, review red, forever. Committing here is also what lets a post-review landing rebase
+    // the fixes in rather than fast-forwarding past uncommitted work.
+    const foldFixIntoBranch = (label: string) =>
+      this.vcsFor(ctx.repo)
+        .checkpoint(ctx.worktree, `noriq run ${ctx.run.id}: ${label}`)
+        .catch((err) => {
+          this.log.warn('could not commit before re-review — the reviewer may not see the fix', {
+            runId: ctx.run.id,
+            err: String(err),
+          });
+          return false;
+        });
+
+    await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1 });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
@@ -697,6 +730,9 @@ export class RunSupervisor {
           };
         }
       }
+      // Commit the builder's fix (and any floor-fix turn above) so the fresh reviewer's
+      // `baseId...HEAD` actually advances to include it — without this the re-review is a no-op.
+      await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1 });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       if (verdict.passed) return { ...verdict, rounds: round };
