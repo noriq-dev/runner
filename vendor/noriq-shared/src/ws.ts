@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo } from './runner';
+import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelMix } from './runner';
 
 // ---------------------------------------------------------------------------
 // The runtime channel (RUN plan, Phase 1) — a persistent WebSocket the daemon
@@ -165,6 +165,12 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     runId: z.string(),
     tokensUsed: z.number().int().nonnegative().nullable().default(null),
     usdSpent: z.number().nonnegative().nullable().default(null),
+    // The per-model breakdown of that spend (RUN-59). Rides THIS frame for the same reason spend
+    // does — it is a fact about the run, not a lifecycle transition — and is null-means-no-news
+    // like every field here: a live tick that does not yet know the mix (the split is only known
+    // at a result) sends null, and the server COALESCEs, so it never wipes a mix already stored.
+    // When present it sums to tokensUsed/usdSpent above, because both are computed from it.
+    modelUsage: RunModelMix.nullable().default(null),
     // Tail of the agent's combined output, tail-capped by the daemon (last wins).
     logTail: z.string().nullable().default(null),
     // What the Run is doing right now (RUN-31). It rides THIS frame, not run.status,

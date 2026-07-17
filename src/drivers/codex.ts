@@ -26,7 +26,14 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Normalized, driver-facing events (the transport maps the real app-server
- *  notifications into these). Token usage is cumulative for the thread. */
+ *  notifications into these). Token usage is cumulative for the thread.
+ *
+ *  No per-MODEL breakdown, deliberately (RUN-59): the app-server's usage notification carries one
+ *  cumulative thread total (input/output/cacheRead), no model key and no cost. Per-model figures
+ *  live only in the session JSONL on disk (what ccusage parses), and a per-agent split is an open
+ *  upstream request (openai/codex#14642). So this driver never emits `modelUsage`, and the run
+ *  reports "not reported" rather than implying 100% of the requested model — the lie RUN-59
+ *  removes. Do NOT synthesize a single-model mix from the thread total to fill the gap. */
 export type CodexEvent =
   | { type: 'text'; text: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; cacheReadTokens: number }

@@ -363,6 +363,55 @@ describe('terminal telemetry counts every model (RUN-34)', () => {
     expect(exit.telemetry.costUsd).toBe(0.076198);
   });
 
+  it('reports the per-model mix, keyed by model, keys un-renamed (RUN-59)', async () => {
+    // The KEYS of modelUsage are the model ids — Object.entries keeps them. The daemon stores the
+    // literal per-model facts (all four token classes + cost) so the UI can render either a
+    // by-tokens or by-cost percentage without a migration.
+    const h = harness();
+    h.getFake().push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 2,
+      total_cost_usd: 0.076198,
+      usage: { input_tokens: 4, output_tokens: 79 },
+      modelUsage: {
+        'claude-haiku-4-5-20251001': {
+          inputTokens: 536,
+          outputTokens: 14,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.000581,
+        },
+        'claude-opus-4-8[1m]': {
+          inputTokens: 4,
+          outputTokens: 79,
+          cacheReadInputTokens: 40554,
+          cacheCreationInputTokens: 5332,
+          costUSD: 0.075617,
+        },
+      },
+    });
+    const exit = await h.session.done();
+    const mix = exit.telemetry.modelUsage;
+    expect(Object.keys(mix ?? {})).toEqual(['claude-haiku-4-5-20251001', 'claude-opus-4-8[1m]']);
+    // The haiku sub-agent — a whole model the requested-model row would never mention.
+    expect(mix?.['claude-haiku-4-5-20251001']).toEqual({
+      inputTokens: 536,
+      outputTokens: 14,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      costUSD: 0.000581,
+    });
+    // Every model's token classes sum to the run totals — the "hover the models, land on the run
+    // total" invariant, at the source.
+    const sum = (f: 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens') =>
+      Object.values(mix ?? {}).reduce((a, u) => a + u[f], 0);
+    expect(sum('inputTokens')).toBe(exit.telemetry.inputTokens);
+    expect(sum('outputTokens')).toBe(exit.telemetry.outputTokens);
+    expect(sum('cacheReadInputTokens')).toBe(exit.telemetry.cacheReadTokens);
+  });
+
   it('falls back to `usage` when modelUsage is absent — under-report rather than invent', async () => {
     // An older SDK, or a result shape we have not seen. Reporting zero would be worse than
     // reporting the part we can see.
@@ -378,6 +427,8 @@ describe('terminal telemetry counts every model (RUN-34)', () => {
     const exit = await h.session.done();
     expect(exit.telemetry.inputTokens).toBe(11);
     expect(exit.telemetry.outputTokens).toBe(22);
+    // NO invented mix: absent reads as "not reported", a single-model mix would read as a lie.
+    expect(exit.telemetry.modelUsage).toBeUndefined();
   });
 });
 

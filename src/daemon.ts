@@ -188,6 +188,10 @@ export class Daemon {
           held.ws?.sendTelemetry(runId, {
             tokensUsed: rep.telemetry ? totalTokens(rep.telemetry) : null,
             usdSpent: rep.telemetry ? rep.telemetry.costUsd : null,
+            // The per-model mix (RUN-59) rides alongside the totals it sums to. Absent on a tick
+            // that has no telemetry, or whose telemetry could not attribute spend by model
+            // (codex, the claude usage-fallback) — null, which the server COALESCEs.
+            modelUsage: rep.telemetry?.modelUsage ?? null,
             logTail: rep.logTail ?? null,
             phase: rep.phase ?? null,
           });

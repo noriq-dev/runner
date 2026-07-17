@@ -1,5 +1,5 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
-import type { AgentTool, Run, RunKind, RunPhase, RunStatus } from '@noriq-dev/shared';
+import type { AgentTool, Run, RunKind, RunModelMix, RunPhase, RunStatus } from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
 
@@ -175,6 +175,7 @@ export class WsClient {
     t: {
       tokensUsed?: number | null;
       usdSpent?: number | null;
+      modelUsage?: RunModelMix | null;
       logTail?: string | null;
       phase?: RunPhase | null;
     },
@@ -184,6 +185,9 @@ export class WsClient {
       runId,
       tokensUsed: t.tokensUsed ?? null,
       usdSpent: t.usdSpent ?? null,
+      // The per-model mix (RUN-59), null-means-no-news like every field here: a tick that does not
+      // yet know the split sends null and the server COALESCEs, so it never wipes a stored mix.
+      modelUsage: t.modelUsage ?? null,
       logTail: t.logTail ?? null,
       // Null = no news, not "clear it" — the server COALESCEs every field on this frame.
       phase: t.phase ?? null,

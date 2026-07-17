@@ -9,6 +9,7 @@ import {
   type DriverSession,
   type DriverStartOptions,
   type DriverTelemetry,
+  type ModelUsage,
   zeroTelemetry,
 } from './types';
 
@@ -221,10 +222,14 @@ const extractText = (blocks: SdkContentBlock[]): string =>
  * that number does not bind, and the dashboard's spend is wrong low.
  */
 function telemetryFromResult(m: SdkResultMessage): DriverTelemetry {
-  const models = Object.values(m.modelUsage ?? {});
+  // Object.ENTRIES, not values (RUN-59): the KEYS are the model ids, and they are the whole point
+  // of the breakdown — the run above measured a haiku sub-agent the primary path never named.
+  const models = Object.entries(m.modelUsage ?? {});
   if (!models.length) {
     // No modelUsage (an older SDK, or a result shape we have not seen) — fall back rather than
-    // report zero. Under-reporting beats inventing.
+    // report zero. Under-reporting beats inventing. Deliberately NO modelUsage: a mix built from
+    // the `usage` fallback would claim one model incurred everything, which is the exact lie
+    // RUN-59 removes — absent reads as "not reported", a single invented model reads as truth.
     return {
       inputTokens: m.usage.input_tokens ?? 0,
       outputTokens: m.usage.output_tokens ?? 0,
@@ -234,14 +239,29 @@ function telemetryFromResult(m: SdkResultMessage): DriverTelemetry {
       numTurns: m.num_turns,
     };
   }
+  // The literal per-model facts, SDK keys un-renamed (RUN-59). Not percentages, not derived: the
+  // percentage denominator (tokens vs cost) is a fork with no right answer, so the daemon stores the
+  // raw numbers and the UI decides. All four token classes kept — the totals are computed from all
+  // four, so a breakdown that dropped cache tokens would not sum to the figure shown beside it.
+  const modelUsage: Record<string, ModelUsage> = {};
+  for (const [id, u] of models) {
+    modelUsage[id] = {
+      inputTokens: u.inputTokens ?? 0,
+      outputTokens: u.outputTokens ?? 0,
+      cacheReadInputTokens: u.cacheReadInputTokens ?? 0,
+      cacheCreationInputTokens: u.cacheCreationInputTokens ?? 0,
+      costUSD: u.costUSD ?? 0,
+    };
+  }
   return {
-    inputTokens: models.reduce((a, u) => a + (u.inputTokens ?? 0), 0),
-    outputTokens: models.reduce((a, u) => a + (u.outputTokens ?? 0), 0),
-    cacheReadTokens: models.reduce((a, u) => a + (u.cacheReadInputTokens ?? 0), 0),
-    cacheCreationTokens: models.reduce((a, u) => a + (u.cacheCreationInputTokens ?? 0), 0),
+    inputTokens: models.reduce((a, [, u]) => a + (u.inputTokens ?? 0), 0),
+    outputTokens: models.reduce((a, [, u]) => a + (u.outputTokens ?? 0), 0),
+    cacheReadTokens: models.reduce((a, [, u]) => a + (u.cacheReadInputTokens ?? 0), 0),
+    cacheCreationTokens: models.reduce((a, [, u]) => a + (u.cacheCreationInputTokens ?? 0), 0),
     // total_cost_usd is the SDK's own sum of these — verified equal to the last digit.
     costUsd: m.total_cost_usd,
     numTurns: m.num_turns,
+    modelUsage,
   };
 }
 

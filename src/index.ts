@@ -119,6 +119,7 @@ export {
   type DriverTelemetry,
   type DriverExit,
   type DriverOutcome,
+  type ModelUsage,
   zeroTelemetry,
 } from './drivers/types';
 export {
@@ -142,9 +143,12 @@ export {
 export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from './drivers/budget';
 export {
   RunSupervisor,
+  RunTally,
   assemblePrompt,
   cmdVerify,
   mergeBudget,
+  mergeModelUsage,
+  telemetryFromSpent,
   type RunSupervisorDeps,
   type ResolvedRepo,
   type RunReport,

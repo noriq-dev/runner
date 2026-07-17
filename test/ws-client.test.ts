@@ -194,6 +194,8 @@ describe('WsClient', () => {
     const tel = s0.msgs().find((m) => m.type === 'run.telemetry');
     expect(tel).toMatchObject({ runId: 'run_1', tokensUsed: 4200, usdSpent: 0.19, logTail: 'compiling...' });
     expect(typeof tel!.at).toBe('string');
+    // A tick that doesn't know the mix sends null, not a wiped field (RUN-59): the server COALESCEs.
+    expect(tel!.modelUsage).toBeNull();
 
     // Telemetry is ephemeral: dropping + reconnecting must not re-assert it (only
     // live run.status is re-asserted). Otherwise stale spend would resurrect.
@@ -315,5 +317,34 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
       const parsed = RunnerClientMessage.safeParse(f);
       expect(parsed.success, `frame ${String(f.type)} violates the contract`).toBe(true);
     }
+  });
+
+  it('carries a real per-model mix on the telemetry frame, contract-valid (RUN-59)', () => {
+    const c = makeClient();
+    const frames = framesFrom(c);
+    c.sendTelemetry('run_1', {
+      tokensUsed: 633,
+      usdSpent: 0.0762,
+      modelUsage: {
+        'claude-opus-4-8[1m]': {
+          inputTokens: 4,
+          outputTokens: 79,
+          cacheReadInputTokens: 40554,
+          cacheCreationInputTokens: 5332,
+          costUSD: 0.075617,
+        },
+        'claude-haiku-4-5-20251001': {
+          inputTokens: 536,
+          outputTokens: 14,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.000581,
+        },
+      },
+    });
+    const tel = frames().find((f) => f.type === 'run.telemetry')!;
+    const parsed = RunnerClientMessage.safeParse(tel);
+    expect(parsed.success).toBe(true);
+    expect(Object.keys(tel.modelUsage as Record<string, unknown>)).toContain('claude-opus-4-8[1m]');
   });
 });

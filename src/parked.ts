@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
+import type { ModelUsage } from './drivers/types';
 import { renderPrompt } from './prompts';
 import type { Workspace } from './vcs/types';
 
@@ -56,8 +57,13 @@ export interface ParkedRun {
   /**
    * Spend so far. A resumed run inherits the REMAINDER of its budget, never a fresh one —
    * otherwise park/resume is an unbounded-spend loophole: ask a question, get a new ceiling.
+   *
+   * `modelUsage` (RUN-59) is the per-model breakdown of that spend, carried so a resumed run's mix
+   * keeps summing to its total across sittings. Absent when the pre-park sessions could not attribute
+   * spend by model (codex, the claude usage-fallback) or the park predates RUN-59 — a resume then
+   * reports NO mix rather than one that does not add up.
    */
-  spent: { tokens: number; usd: number };
+  spent: { tokens: number; usd: number; modelUsage?: Record<string, ModelUsage> };
   /**
    * Seconds the run has actually been RUNNING, excluding time parked.
    *
