@@ -113,6 +113,12 @@ export interface LandOutcome {
  * So the prompt makes bailing out the honourable, explicitly-blessed option — an agent
  * that isn't sure is told to say so, and told that saying so is correct behaviour rather
  * than failure. That asymmetry is the safety property.
+ *
+ * The wording speaks in the INTEGRATION outcome, not git verbs (no "rebase", no "git rebase
+ * --continue") — the same outcome-not-verb contract vcs/types.ts is built on, so this prompt
+ * holds on any backend whose conflicts are editable files. A backend whose conflicts live
+ * server-side sets `IntegrateResult.resolveUrl` and never reaches an agent at all. The diff3
+ * conflict markers (<<<<<<< / ======= / >>>>>>>) stay literal: they are universal, not git's.
  */
 export function assembleConflictPrompt(opts: {
   conflicts: string[];

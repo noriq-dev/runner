@@ -16,12 +16,23 @@ describe('assembleVerifyPrompt', () => {
     expect(p).toMatch(/weakened|deleted|skipped/i); // the test-gaming warning
     expect(p).toContain('VERDICT: PASS');
     expect(p).toContain('VERDICT: FAIL');
-    expect(p).toContain('/verify skill');
     expect(p).toContain('reject unauthenticated requests'); // the specs
     // Authorship separation is the point of this gate, so WHICH actor filed the verdict must
     // be a fact the daemon knows — not a name the model was asked to register for itself.
     expect(p).toContain('agt_verifier');
     expect(p).toMatch(/do NOT call set_agent_identity/);
+    // VCS-neutral: no git verb, no Claude-only skill reference leaks into the prompt.
+    expect(p).not.toMatch(/\/verify skill/);
+  });
+
+  it('points at the workspace files when the backend has no diff command (non-git)', () => {
+    const p = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+      // diffCmd absent → a live backend (Perforce/Diversion) with no `git diff`
+    });
+    expect(p).not.toMatch(/git diff/);
+    expect(p).toMatch(/modified files in this workspace/i);
   });
 });
 

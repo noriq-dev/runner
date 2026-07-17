@@ -30,6 +30,22 @@ exactly what the agent reads. Keep section tags inside lines: a conditional sent
 own leading newline (see `build.md`). The file's trailing newline is stripped; everything else is
 verbatim.
 
+## Stay agnostic
+
+These prompts run under any driver (Claude, Codex, …), any model, and any VCS backend, so keep them
+neutral to all three:
+
+- **VCS** — speak in outcomes, not git verbs. `integrate`/`publish`/`checkpoint` (see
+  `src/vcs/types.ts`) hold across git, Perforce, and Diversion; `rebase`, `git commit`, and
+  `worktree` do not. Say "workspace", not "worktree"; "the daemon captures your changes", not "the
+  daemon commits". Anything genuinely git-shaped (a `git diff` range) is passed in by the call site
+  as a variable with a `{{^var}}` fallback for backends that have no such command — never hardcoded.
+  The diff3 conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) are the exception: they are
+  universal, so `conflict.md` keeps them literal.
+- **Driver/model** — no model names, and no driver-specific features (e.g. a Claude Code `/skill`).
+  Noriq MCP tool names (`request_input`, `raise_alert`, `create_plan`, …) are fine: both drivers
+  reach Noriq the same way, over MCP.
+
 ## How they ship
 
 `scripts/build.mjs` inlines every file here into the bundle via esbuild `define`

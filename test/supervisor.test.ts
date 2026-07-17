@@ -404,9 +404,11 @@ describe('assemblePrompt', () => {
     );
     expect(p).toMatch(/BUILD/);
     expect(p).toMatch(/review diff/);
-    expect(p).toMatch(/never push/);
+    expect(p).toMatch(/never publish or push/);
     expect(p).toContain('npm test'); // verify cmd
     expect(p).toContain('task_9');
+    // VCS-neutral: the build prompt names no git verb (a live backend has no worktree/commit).
+    expect(p).not.toMatch(/worktree|git commit/);
   });
   it('tells the build agent the daemon commits, so it stops reporting that as a failure', () => {
     // A real run ended with "⚠️ Not committed — a human needs to commit it" 71s AFTER
@@ -416,7 +418,7 @@ describe('assemblePrompt', () => {
       server: 'https://s',
     });
     expect(p).toMatch(/do NOT need to commit/i);
-    expect(p).toMatch(/daemon commits/i);
+    expect(p).toMatch(/daemon captures/i);
   });
 });
 

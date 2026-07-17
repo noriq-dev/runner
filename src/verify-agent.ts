@@ -20,7 +20,9 @@ export interface VerifyPromptContext {
    *  filed the verdict has to be a fact the daemon knows, not a claim the model makes. */
   agent: { agentId: string; label: string };
   server: string;
-  /** How the agent inspects the accumulated diff (default: the worktree changes). */
+  /** How the agent inspects the accumulated diff, in the backend's own terms (git: a `git diff`
+   *  range). Absent on a backend that has no such command — the prompt then points at the
+   *  workspace's modified files instead, so this stays VCS-neutral. */
   diffCmd?: string;
 }
 
@@ -35,7 +37,7 @@ export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): s
     label: ctx.agent.label,
     agentId: ctx.agent.agentId,
     server: ctx.server,
-    diffCmd: ctx.diffCmd ?? 'git diff',
+    diffCmd: ctx.diffCmd ?? null,
     specs,
   });
 }

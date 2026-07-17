@@ -1226,9 +1226,13 @@ export class RunSupervisor {
     // so a bare `git diff` still shows nothing. Point the verifier at the range that is
     // actually under review — everything the build added since it forked. Three dots =
     // "since the merge base", so an unrelated main moving on doesn't pollute the review.
-    const diffCmd = verifiesRunId
-      ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
-      : undefined;
+    // Only a git-shaped backend gets a diff command; a live backend (Perforce/Diversion) has
+    // no `git diff` to run, so the prompt falls back to inspecting the workspace's files
+    // (same gate the inline reviewer uses).
+    const diffCmd =
+      verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
+        ? `git diff ${repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
+        : undefined;
 
     // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
     // which it can only do if the daemon actually made someone.

@@ -1,10 +1,10 @@
-Your change is being rebased onto {{landBranch}} so it can land, and git could not merge it automatically.
+Your change is being combined with {{landBranch}} so it can land, and the two sets of changes could not be merged automatically.
 
 You implemented: {{#task}}{{task}}{{/task}}{{^task}}the task you just implemented{{/task}}
 Conflicted files:
 {{files}}
 
-The rebase is IN PROGRESS in this worktree. Resolve ONLY if the resolution is mechanical and preserves BOTH sides' intent — e.g. two additions to the same list/import block, or a formatting collision. Edit the files to remove every conflict marker (<<<<<<<, =======, >>>>>>>). Do NOT commit, do not run git rebase --continue — the daemon does that.{{#verifyCmd}}
+The integration is IN PROGRESS in this workspace. Resolve ONLY if the resolution is mechanical and preserves BOTH sides' intent — e.g. two additions to the same list/import block, or a formatting collision. Edit the files to remove every conflict marker (<<<<<<<, =======, >>>>>>>). Do NOT commit, and do NOT run any command that continues or finalizes the integration yourself — the daemon does that once the markers are gone.{{#verifyCmd}}
 When the files are resolved, run: {{verifyCmd}}
 If it does not pass, do NOT force it — say so and stop.{{/verifyCmd}}
 

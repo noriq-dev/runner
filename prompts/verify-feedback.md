@@ -1,6 +1,6 @@
 The check did not pass, so your work is not finished yet.
 
-I ran `{{cmd}}` on your worktree and it {{#timedOut}}timed out after {{timeoutSeconds}}s{{/timedOut}}{{^timedOut}}exited {{exitCode}}{{/timedOut}}. This is the real gate — the same command
+I ran `{{cmd}}` in your workspace and it {{#timedOut}}timed out after {{timeoutSeconds}}s{{/timedOut}}{{^timedOut}}exited {{exitCode}}{{/timedOut}}. This is the real gate — the same command
 decides whether this run lands, so it has to be green.
 
 Output (tail):
