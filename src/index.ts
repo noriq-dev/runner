@@ -151,6 +151,7 @@ export {
   RunTally,
   assemblePrompt,
   cmdVerify,
+  runCommitMessage,
   mergeBudget,
   mergeModelUsage,
   telemetryFromSpent,

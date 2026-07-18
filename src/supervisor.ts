@@ -409,6 +409,16 @@ export function cmdVerify(verify: ProjectManifest['verify']): VerifySpec | null 
     : null;
 }
 
+/**
+ * Commit message for a run checkpoint (RUN-96): WHAT changed on the subject line, the runner's
+ * attribution in the body. The old `noriq run <id>: <label>` order made every agent commit read
+ * identically in one-line history — the id nobody scans pushed the task key/title everybody
+ * scans off the right edge.
+ */
+export function runCommitMessage(runId: string, label: string): string {
+  return `${label}\n\nnoriq run ${runId}`;
+}
+
 /** Render the anchor. A bare task id tells the agent nothing — inline the title/body
  *  the daemon already resolved so it starts knowing the job instead of spending its
  *  first turn (and possibly failing) on a get_task round-trip. */
@@ -685,7 +695,7 @@ export class RunSupervisor {
       // autoPush, pushed) result would silently drop the fix and land the broken combination the
       // gate just rejected. Same working-tree-vs-committed split as the inline reviewer's. A clean
       // tree (gate passed first try, or the sessionless runVerify path) is a no-op checkpoint.
-      await vcs.checkpoint(worktree, `noriq run ${run.id}: landing fix`).catch((err) => {
+      await vcs.checkpoint(worktree, runCommitMessage(run.id, 'landing fix')).catch((err) => {
         this.log.warn('could not commit the landing fix — the branch may fast-forward without it', {
           runId: run.id,
           err: String(err),
@@ -860,7 +870,7 @@ export class RunSupervisor {
     // the fixes in rather than fast-forwarding past uncommitted work.
     const foldFixIntoBranch = (label: string) =>
       this.vcsFor(ctx.repo)
-        .checkpoint(ctx.worktree, `noriq run ${ctx.run.id}: ${label}`)
+        .checkpoint(ctx.worktree, runCommitMessage(ctx.run.id, label))
         .catch((err) => {
           this.log.warn('could not commit before re-review — the reviewer may not see the fix', {
             runId: ctx.run.id,
@@ -1711,7 +1721,7 @@ export class RunSupervisor {
     if (kind === 'build' && driverSucceeded) {
       const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
       await this.vcsFor(repo)
-        .checkpoint(worktree, `noriq run ${run.id}: ${label}`)
+        .checkpoint(worktree, runCommitMessage(run.id, label))
         .then((committed) => {
           if (committed)
             this.log.info('committed the run diff to its branch', {

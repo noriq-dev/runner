@@ -916,6 +916,12 @@ describe("the run's diff is made durable", () => {
     expect(h.worktrees.commits).toEqual([
       { path: '/wt/run_1', message: expect.stringContaining('noriq run run_1') },
     ]);
+    // Subject line first, attribution in the body (RUN-96): one-line history must show WHAT
+    // changed (task key + title), never a wall of identical run ids.
+    const [subject, blank, attribution] = h.worktrees.commits[0]!.message.split('\n');
+    expect(subject).toBe('ship the thing'); // the run's brief — what a human scans for
+    expect(blank).toBe('');
+    expect(attribution).toBe('noriq run run_1');
   });
 
   it('commits BEFORE verify, so a gated build still leaves a reviewable diff', async () => {
