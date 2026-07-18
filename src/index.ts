@@ -162,6 +162,8 @@ export { RunTranscript, nullTranscript, type RunLogRole, type RunLogSegment } fr
 export {
   runVerify,
   verifyFailureComment,
+  verifyFixRounds,
+  MAX_VERIFY_FIXES,
   DEFAULT_VERIFY_TIMEOUT_SECONDS,
   type VerifySpec,
   type VerifyResult,

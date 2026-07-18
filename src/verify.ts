@@ -15,6 +15,9 @@ export interface VerifySpec {
   /** Pin the shell `cmd` runs under. Undefined = the platform's own (sh on POSIX, cmd.exe on
    *  Windows) — see the manifest schema for why a committed manifest may want to pin one. */
   shell?: string | null;
+  /** Committed bound for the fail→fix→re-verify loop (RUN-94). Undefined/null = the daemon's
+   *  default (MAX_VERIFY_FIXES); 0 is a real choice — a pure gate, no hand-back. */
+  maxRounds?: number | null;
 }
 
 export interface VerifyResult {
@@ -119,8 +122,15 @@ export function verifyFailureComment(spec: VerifySpec, result: VerifyResult): st
 
 /** How many times a failing gate is handed back to the live agent before a human is needed
  *  (RUN-29; RUN-21's K=2). Bounded because an agent that cannot fix it in two tries is not
- *  going to on the third — it is going to keep spending. */
+ *  going to on the third — it is going to keep spending. Since RUN-94 this is the DEFAULT,
+ *  not the law: a repo commits its own bound via `[verify] maxRounds` (see verifyFixRounds). */
 export const MAX_VERIFY_FIXES = 2;
+
+/** The effective fix-loop bound for a spec: the repo's committed `[verify] maxRounds`, else
+ *  the daemon's default (RUN-94). */
+export function verifyFixRounds(spec: VerifySpec): number {
+  return spec.maxRounds ?? MAX_VERIFY_FIXES;
+}
 
 /**
  * What the agent is told when the gate refuses its work (RUN-29).
@@ -143,6 +153,6 @@ export function verifyFeedbackPrompt(spec: VerifySpec, result: VerifyResult, att
     // than vanishing — the agent should see the truth, odd as it reads.
     exitCode: String(result.exitCode),
     output: result.output.slice(-4000),
-    last: attempt >= MAX_VERIFY_FIXES,
+    last: attempt >= verifyFixRounds(spec),
   });
 }

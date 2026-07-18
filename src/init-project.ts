@@ -266,6 +266,8 @@ export interface ManifestChoices {
    *  unchosen: the rendered file keeps the commented hint instead of a value. */
   verifyShell?: string | null;
   verifyTimeoutSeconds?: number | null;
+  /** Floor fix rounds (RUN-94) — same `!= null` rule as reviewer.maxRounds: 0 = a pure gate. */
+  verifyMaxRounds?: number | null;
   /** The inline reviewer (RUN-61), when chosen. `model`/`effort` null = the driver's own
    *  default; `maxRounds` null = the schema default (2) — 0 is a real choice (a pure gate),
    *  which is why the renderer tests `!= null` and never truthiness. */
@@ -371,6 +373,9 @@ export function renderProjectManifest(m: ManifestChoices): string {
       m.verifyTimeoutSeconds != null
         ? `timeoutSeconds = ${m.verifyTimeoutSeconds}`
         : `# timeoutSeconds = ${DEFAULT_VERIFY_TIMEOUT_SECONDS}   # blank = this built-in default; a timeout GATES the run`,
+      m.verifyMaxRounds != null
+        ? `maxRounds = ${m.verifyMaxRounds}`
+        : '# maxRounds = 2   # failing-cmd → fix → re-verify rounds before a human picks it up (0 = pure gate)',
     );
   } else if (!m.reviewer) {
     lines.push(
@@ -955,6 +960,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
     // a shell pin or a timeout with nothing to run is dead config.
     let verifyShell: string | null = null;
     let verifyTimeoutSeconds: number | null = null;
+    let verifyMaxRounds: number | null = null;
     if (verifyCmd) {
       out('');
       out('  This file is COMMITTED, so that command travels to teammates on other OSes: `&&` is');
@@ -972,6 +978,21 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
           break;
         }
         out(`  ✗ a whole number of seconds, 1–${MAX_VERIFY_TIMEOUT_SECONDS}, or blank for the default.`);
+      }
+      // The floor's fix loop (RUN-94) — same bounded-by-default shape as the reviewer's rounds
+      // below, and 0 is likewise a real choice: a pure gate that never hands the failure back.
+      for (;;) {
+        const raw = await ask(
+          '  Failing-cmd → fix → re-verify rounds, 0–5 (blank = 2; 0 = gate only, no hand-back)',
+        );
+        const answer = raw.trim();
+        if (!answer) break;
+        const n = Number(answer);
+        if (Number.isInteger(n) && n >= 0 && n <= 5) {
+          verifyMaxRounds = n;
+          break;
+        }
+        out('  ✗ a whole number from 0 to 5, or blank for the default (2).');
       }
     }
 
@@ -1032,6 +1053,7 @@ export async function runInitProject(deps: InitProjectDeps = {}): Promise<InitPr
       verifyCmd,
       verifyShell,
       verifyTimeoutSeconds,
+      verifyMaxRounds,
       reviewer,
       landBranch,
       allow: eco.allow,

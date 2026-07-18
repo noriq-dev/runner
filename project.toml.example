@@ -86,6 +86,9 @@ defaultBranch = "main"
 # Put tsc in `cmd`: vitest/esbuild do NOT catch type errors.
 [verify]
 cmd = "npm run typecheck && npm test"
+# maxRounds = 2                  # failing-cmd → fix → re-verify rounds handed back to the LIVE
+#                                # agent before the run stops and a human picks it up (RUN-94).
+#                                # 0 = a pure gate, no hand-back. Blank = 2.
 #
 # [verify.agent]                 # the inline reviewer (all fields optional)
 # tool = "codex"                 # review on a DIFFERENT driver than the builder (RUN-70) —

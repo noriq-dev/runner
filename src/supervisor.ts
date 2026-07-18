@@ -38,12 +38,12 @@ import { noriqToolNamesFor } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { VcsBackend, Workspace } from './vcs/types';
 import {
-  MAX_VERIFY_FIXES,
   type VerifyExec,
   type VerifySpec,
   runVerify,
   verifyFailureComment,
   verifyFeedbackPrompt,
+  verifyFixRounds,
 } from './verify';
 import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
 import {
@@ -399,7 +399,14 @@ export interface AnchorTask {
  * narrows through here instead of trusting the field.
  */
 export function cmdVerify(verify: ProjectManifest['verify']): VerifySpec | null {
-  return verify?.cmd ? { cmd: verify.cmd, timeoutSeconds: verify.timeoutSeconds, shell: verify.shell } : null;
+  return verify?.cmd
+    ? {
+        cmd: verify.cmd,
+        timeoutSeconds: verify.timeoutSeconds,
+        shell: verify.shell,
+        maxRounds: verify.maxRounds,
+      }
+    : null;
 }
 
 /** Render the anchor. A bare task id tells the agent nothing — inline the title/body
@@ -726,8 +733,9 @@ export class RunSupervisor {
    * re-derived a failure whose exact output the daemon already had. Now the same session gets the
    * command, the code and the output, fixes it, and the gate re-runs.
    *
-   * Bounded (RUN-21's K=2): an agent that cannot fix it in two tries will not on the third — it
-   * will keep spending. The budget still applies underneath, so a loop cannot outrun its ceiling.
+   * Bounded (RUN-21's K=2, since RUN-94 the repo may commit its own `[verify] maxRounds`): an
+   * agent that cannot fix it in a couple of tries will usually keep spending, so the default
+   * stays tight. The budget still applies underneath, so a loop cannot outrun its ceiling.
    */
   /** The verify command's outcome, in the transcript (RUN-74): a pass is one system line, a
    *  failure also carries the output tail in the 'verify' voice — the part a human reads. */
@@ -763,7 +771,10 @@ export class RunSupervisor {
     // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
     if (result.passed || !ctx.session.continueWith) return result;
 
-    for (let attempt = 1; attempt <= MAX_VERIFY_FIXES; attempt++) {
+    // The repo's committed bound, else the daemon's K=2 (RUN-94). 0 = a pure gate: the verdict
+    // stands and no fix turn is spent — the repo said so, in the commit.
+    const rounds = verifyFixRounds(ctx.spec);
+    for (let attempt = 1; attempt <= rounds; attempt++) {
       this.log.info('verify failed — handing it back to the live agent', {
         runId: ctx.run.id,
         attempt,

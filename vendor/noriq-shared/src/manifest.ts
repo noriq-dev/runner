@@ -133,6 +133,15 @@ export const VerifySpec = z
      * cmd.exe handling the common case correctly.
      */
     shell: z.string().min(1).nullable().default(null),
+    /**
+     * How many FAIL→fix→re-verify rounds the daemon hands a failing `cmd` back to the LIVE
+     * builder before the run stops and a human picks it up (RUN-94). The floor half of the
+     * knob `[verify.agent]` already commits: RUN-29 wired the feedback loop but hardcoded
+     * RUN-21's K=2, so a repo whose suite needs a wider bound (or a pure gate) had no say.
+     * 0 = one verify, no hand-back. The budget still applies underneath — a loop cannot
+     * outrun its ceiling. Only meaningful with `cmd`; the reviewer's loop is `agent.maxRounds`.
+     */
+    maxRounds: z.number().int().min(0).max(5).default(2),
     agent: VerifyReviewer.nullable().default(null),
   })
   .refine((v) => v.cmd !== null || v.agent !== null, {

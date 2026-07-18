@@ -128,7 +128,7 @@ describe('changedSections', () => {
   const m = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
     key: 'PROJ',
     board: null,
-    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
+    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
     tool: null,
     defaultBranch: null,
     land: null,
@@ -152,7 +152,10 @@ describe('changedSections', () => {
 
   it('names each section that actually differs', () => {
     expect(
-      changedSections(m(), m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null, agent: null } })),
+      changedSections(
+        m(),
+        m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null } }),
+      ),
     ).toEqual(['verify']);
     expect(
       changedSections(

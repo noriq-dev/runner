@@ -221,7 +221,7 @@ const noModel = (): ModelDefault => ({ model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   board: null,
-  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
+  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
   tool: null,
   defaultBranch: null,
   land: null,
@@ -1126,6 +1126,37 @@ describe('verify feedback loop (RUN-29)', () => {
     expect(h.comments.some((c) => c.body.includes('npm test'))).toBe(true); // and said why
   });
 
+  it("honors a repo's committed [verify] maxRounds over the K=2 default (RUN-94)", async () => {
+    // The bound is the repo's to commit, not the daemon's to hardcode: a long-tail suite may
+    // earn 4 rounds. The default stays 2 — this widens only where a manifest says so.
+    const wider = manifest();
+    if (wider.verify) wider.verify.maxRounds = 4;
+    const h = harness({ verifyPasses: false, manifest: wider });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('verify'); // still gated in the end…
+    expect(h.claude.continuations).toHaveLength(4); // …but after the committed 4 rounds
+    // The last hand-back says it IS the last — the prompt's warning tracks the real bound.
+    expect(h.claude.continuations[3]).toContain('last attempt');
+    expect(h.claude.continuations[2]).not.toContain('last attempt');
+  });
+
+  it('maxRounds = 0 is a pure gate — the verdict stands, no fix turn is spent', async () => {
+    const gateOnly = manifest();
+    if (gateOnly.verify) gateOnly.verify.maxRounds = 0;
+    const h = harness({ verifyPasses: false, manifest: gateOnly });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('verify');
+    expect(h.claude.continuations).toEqual([]); // the repo said so, in the commit
+  });
+
   it('stops pushing turns at a session that died trying', async () => {
     // The agent errored or breached its budget mid-fix. Its last verdict stands: pushing more
     // turns at a dead session is how a loop becomes a spend.
@@ -1460,6 +1491,7 @@ describe('the inline reviewer (RUN-61)', () => {
         cmd,
         timeoutSeconds: null,
         shell: null,
+        maxRounds: 2,
         agent: { tool: null, model: null, effort: null, maxRounds: 2, ...agent },
       },
     });
@@ -1842,6 +1874,7 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
+          maxRounds: 2,
           agent: { tool: null, model: null, effort: null, maxRounds: 2 },
         },
       },
@@ -1866,6 +1899,7 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
+          maxRounds: 2,
           agent: { tool: null, model: null, effort: null, maxRounds: 0 },
         },
       },
@@ -2658,6 +2692,7 @@ describe('the run model mix (RUN-59)', () => {
         cmd: 'npm test',
         timeoutSeconds: null,
         shell: null,
+        maxRounds: 2,
         agent: { tool: null, model: null, effort: null, maxRounds: 2 },
       },
     });
@@ -2702,6 +2737,7 @@ describe('the run model mix (RUN-59)', () => {
         cmd: 'npm test',
         timeoutSeconds: null,
         shell: null,
+        maxRounds: 2,
         agent: { tool: 'claude', model: null, effort: null, maxRounds: 2 },
       },
     });
