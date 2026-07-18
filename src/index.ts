@@ -210,6 +210,7 @@ export {
   runBranch,
   setReadOnly,
   setWritable,
+  comparableWorktreePath,
   DEFAULT_WORKTREES_DIR,
   WORKTREE_BRANCH_PREFIX,
   type WorktreeInfo,

@@ -493,6 +493,36 @@ describe('continue a failed run adopts the kept worktree (RUN-91)', () => {
     await wm.remove(again);
   });
 
+  it("adopt recognizes a registered worktree despite git's other-slash spelling (RUN-95)", async () => {
+    // The Windows CI failure: the daemon builds `C:\Users\RUNNER~1\…` while porcelain prints
+    // `C:/Users/…`, so a verbatim compare said "unregistered" and `worktree add` collided with
+    // the checkout it should have adopted. Driven through an injected git that reports the
+    // OPPOSITE slash spelling of the computed path, so the split reproduces on every OS; the
+    // real-git adopt path is covered by the tests around this one.
+    const dir = path.join(base, `${path.basename(repo)}-continueWin`);
+    const flipped = dir.includes('\\') ? dir.replace(/\\/g, '/') : dir.replace(/\//g, '\\');
+    const calls: string[][] = [];
+    const fake = new WorktreeManager({
+      baseDir: base,
+      git: async (args: string[]) => {
+        calls.push(args);
+        if (args[0] === 'worktree' && args[1] === 'list')
+          return {
+            stdout: `worktree ${flipped}\nHEAD abc\nbranch refs/heads/${runBranch('continueWin')}\n`,
+            stderr: '',
+          };
+        if (args[0] === 'merge-base') return { stdout: 'base\n', stderr: '' };
+        if (args[0] === 'worktree' && args[1] === 'add')
+          throw new Error('adopt must not re-add a registered worktree');
+        return { stdout: '', stderr: '' }; // rev-parse --verify: branch "exists"
+      },
+    });
+    const adopted = await fake.create(repo, 'continueWin');
+    expect(adopted.branch).toBe(runBranch('continueWin'));
+    expect(adopted.baseSha).toBe('base');
+    expect(calls.some((a) => a[0] === 'worktree' && a[1] === 'add')).toBe(false);
+  });
+
   it('re-attaches a worktree when the branch was kept but its checkout was pruned', async () => {
     const first = await wm.create(repo, 'continuePruned');
     await writeFile(path.join(first.path, 'work.ts'), 'export const y = 2;\n');

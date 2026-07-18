@@ -1,10 +1,35 @@
 import { execFile } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
+
+/**
+ * Normalize a path for comparing what the DAEMON built against what GIT reports (RUN-95).
+ *
+ * On Windows one directory has several spellings: path.join says `C:\Users\RUNNER~1\…`
+ * (backslashes, possibly the 8.3 short form) while git porcelain prints `C:/Users/…`. Comparing
+ * them verbatim concluded a registered worktree wasn't — so a continue's adopt path ran
+ * `worktree add` into the existing checkout and every Windows continue failed. realpath collapses
+ * the short/long split where the path exists (falling back for one that doesn't), slashes are
+ * unified, and win32 compares case-insensitively because its filesystems do.
+ */
+export function comparableWorktreePath(p: string): string {
+  // Slashes FIRST: a backslashed spelling is not even absolute to POSIX path.resolve, which
+  // would silently prefix the cwd and defeat the comparison this exists for.
+  const unified = p.replace(/\\/g, '/');
+  let resolved = unified;
+  try {
+    resolved = realpathSync.native(unified);
+  } catch {
+    // Not on disk (e.g. a pruned checkout still listed as prunable) — compare as spelled.
+  }
+  const posix = path.resolve(resolved).replace(/\\/g, '/');
+  return process.platform === 'win32' ? posix.toLowerCase() : posix;
+}
 
 /** Where per-Run worktrees are created (outside any repo). */
 export const DEFAULT_WORKTREES_DIR = path.join(os.homedir(), '.noriq', 'worktrees');
@@ -116,7 +141,17 @@ export class WorktreeManager {
    *  worktree; then a continue must re-attach one rather than assume the checkout is there.) */
   private async worktreeRegistered(repoRoot: string, dir: string): Promise<boolean> {
     const { stdout } = await this.git(['worktree', 'list', '--porcelain'], repoRoot);
-    return stdout.split('\n').some((line) => line === `worktree ${dir}`);
+    // Never compare the spellings verbatim (RUN-95): git prints forward slashes where this
+    // daemon built platform ones, which on Windows read as "not registered" for a worktree
+    // that very much was — and the adopt path then collided with its own checkout.
+    const want = comparableWorktreePath(dir);
+    return stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .some(
+        (line) =>
+          line.startsWith('worktree ') && comparableWorktreePath(line.slice('worktree '.length)) === want,
+      );
   }
 
   /** Create the Run's isolated worktree + throwaway branch. */
