@@ -6,6 +6,7 @@ import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
 import { resolveLandBranch } from './land';
+import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { openMergeRequest } from './merge-request';
@@ -122,7 +123,11 @@ export class Daemon {
     // repo to its backend by DETECTION (RUN-60) — git by `.git` at the root, Diversion by the
     // dv registry, never a manifest field (a committed lie would travel). Git remains the
     // machine default; a repo the detector cannot place falls back to it, loudly.
-    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
+    // The Noriq lock view (RUN-98), shared across every backend: git delegates to it outright,
+    // Perforce/Diversion mirror their native locks into it. One instance — it holds a per-token
+    // MCP session cache — authenticating each call as the RUN's agent, not the daemon (RUN-97 §2).
+    const locks = new LockClient({ server: this.config.server });
+    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }), locks);
     const detections = await detectVcs(repos.map((r) => r.root));
     const backendFor = new Map<string, GitBackend | DiversionBackend | PerforceBackend>();
     for (const r of repos) {
@@ -131,10 +136,10 @@ export class Daemon {
         // One instance PER REPO, constructed once: it carries the repo id and the pool-of-1
         // lease queue — a per-run instance would silently disable the lease. One daemon per
         // machine is the operating assumption on this backend (the lease is in-process).
-        backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId }));
+        backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId, locks }));
       } else if (d?.kind === 'perforce') {
         // Same per-repo, once-only rule: the pool-of-1 lease lives in the instance (RUN-52).
-        backendFor.set(r.root, new PerforceBackend());
+        backendFor.set(r.root, new PerforceBackend({ locks }));
       } else {
         backendFor.set(r.root, vcs);
       }

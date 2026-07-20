@@ -148,3 +148,85 @@ describe('GitBackend — the outcome→verb mapping', () => {
     await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
   });
 });
+
+// Git has no native lock (RUN-98): the backend's lock ops are pure delegation to the injected
+// Noriq lock client, held as the RUN's token. Absent client → graceful no-op.
+describe('GitBackend — lock delegation (RUN-98)', () => {
+  const ws: Workspace = {
+    runId: 'run_1',
+    localPath: '/wt/run_1',
+    readOnly: false,
+    baseId: 'b',
+    workRef: 'noriq/run/run_1',
+    location: { repoRoot: '/repo', branch: 'noriq/run/run_1' },
+  };
+  const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
+
+  function lockRecorder(acquireResult: unknown) {
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+    const locks = {
+      acquire: async (...args: unknown[]) => {
+        calls.push({ method: 'acquire', args });
+        return acquireResult as never;
+      },
+      release: async (...args: unknown[]) => {
+        calls.push({ method: 'release', args });
+        return { released: [] };
+      },
+      check: async (...args: unknown[]) => {
+        calls.push({ method: 'check', args });
+        return { enabled: true, conflicts: [], mine: [] };
+      },
+    };
+    return { locks, calls };
+  }
+
+  it('lock delegates to acquire with the run token + scope branch + task, and passes a grant through', async () => {
+    const { ops } = recorder();
+    const { locks, calls } = lockRecorder({ ok: true, enabled: true, locks: [{ id: 'lk_1', path: 'a.ts' }] });
+    const out = await new GitBackend(ops, locks).lock(ws, ['a.ts'], ctx);
+    expect(out).toEqual({ ok: true, enabled: true, locks: [{ id: 'lk_1', path: 'a.ts' }] });
+    expect(calls[0]).toEqual({
+      method: 'acquire',
+      args: ['run-token', { projectId: 'prj_x', paths: ['a.ts'], branch: 'main', taskId: 'task_9' }],
+    });
+  });
+
+  it('lock surfaces a conflict verbatim (all-or-nothing)', async () => {
+    const { ops } = recorder();
+    const conflict = { ok: false, conflicts: [{ path: 'a.ts', holder: 'agt_other', holderName: 'peer' }] };
+    const { locks } = lockRecorder(conflict);
+    expect(await new GitBackend(ops, locks).lock(ws, ['a.ts'], ctx)).toEqual(conflict);
+  });
+
+  it('lock/queryLocks are no-ops with no client wired — a daemon without a lock layer is unchanged', async () => {
+    const { ops } = recorder();
+    const vcs = new GitBackend(ops); // no lock delegate
+    expect(await vcs.lock(ws, ['a.ts'], ctx)).toEqual({ ok: true, enabled: false, locks: [] });
+    expect(await vcs.queryLocks('/repo', ['a.ts'], ctx)).toEqual({ enabled: false, conflicts: [], mine: [] });
+  });
+
+  it('empty path list never calls the server (nothing to lock)', async () => {
+    const { ops } = recorder();
+    const { locks, calls } = lockRecorder({ ok: true, enabled: true, locks: [] });
+    await new GitBackend(ops, locks).lock(ws, [], ctx);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('unlock delegates release by ids; queryLocks delegates check with the scope branch', async () => {
+    const { ops } = recorder();
+    const { locks, calls } = lockRecorder({ ok: true, enabled: true, locks: [] });
+    const vcs = new GitBackend(ops, locks);
+    await vcs.unlock(ws, { lockIds: ['lk_1'] }, ctx);
+    await vcs.queryLocks('/repo', ['a.ts'], ctx);
+    expect(calls.find((c) => c.method === 'release')?.args).toEqual([
+      'run-token',
+      'prj_x',
+      { lockIds: ['lk_1'] },
+    ]);
+    expect(calls.find((c) => c.method === 'check')?.args).toEqual([
+      'run-token',
+      { projectId: 'prj_x', paths: ['a.ts'], branch: 'main' },
+    ]);
+  });
+});

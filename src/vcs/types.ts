@@ -1,3 +1,5 @@
+import type { LockConflict, LockGrant } from '../lock-client';
+
 /**
  * The VCS seam (RUN-49): the nine outcomes the daemon needs from source control, named as
  * outcomes rather than git verbs. This is VCS-SPIKE.md §2 made real — the operation set was
@@ -105,6 +107,33 @@ export type PublishResult =
 export type ShareResult = { ok: true } | { ok: false; detail: string };
 
 /**
+ * What a lock op needs beyond the workspace (RUN-98): which project, whose identity holds the
+ * lock, the scope branch, and the task to auto-release against.
+ *
+ * `token` is the RUN's bound agent token (RUN-43), NOT the daemon's — so the daemon's
+ * predictive acquire and the in-agent hook's reactive acquire share ONE holder and never fight
+ * each other, and the server's auto-release-on-task-settle covers cleanup (RUN-97 §2).
+ */
+export interface LockContext {
+  projectId: string;
+  token: string;
+  /** Scope branch = the run's LANDING TARGET, not its throwaway worktree branch (RUN-97 §5).
+   *  null/absent → lock across all branches. */
+  branch?: string | null;
+  /** Link locks to the anchor task so they auto-release when it settles. */
+  taskId?: string | null;
+}
+
+/**
+ * The outcome of an acquire. `enabled:false` on an `ok:true` result means the project has file
+ * locking turned OFF — a no-op grant the caller proceeds past, distinct from a real grant. A
+ * conflict is all-or-nothing: nothing was taken, and `conflicts` names who to coordinate with.
+ */
+export type LockOutcome =
+  | { ok: true; enabled: boolean; locks: LockGrant[] }
+  | { ok: false; conflicts: LockConflict[] };
+
+/**
  * One VCS backend. Git today; Diversion (RUN-51) and Perforce (RUN-52) are the candidates the
  * shape was proven against on paper (VCS-SPIKE.md §3/§4) — pending the hands-on discoveries
  * (RUN-54/55) before either is built.
@@ -203,4 +232,32 @@ export interface VcsBackend {
    * actually removed.
    */
   reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number>;
+
+  /**
+   * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and
+   * callers treat absence as "no enforcement here" — exactly how the supervisor treats its other
+   * optional deps (checkClaimable, getParkState). The three shipped backends implement it:
+   *  - git has no native lock → delegates to Noriq's lock primitive (the common case);
+   *  - Perforce/Diversion use their native locks and mirror into the Noriq view for a unified
+   *    dashboard.
+   * Uniform to the supervisor either way (RUN-97 §1).
+   */
+
+  /** Acquire exclusive locks over `paths` for this Run, all-or-nothing. A conflict returns
+   *  `{ ok:false, conflicts }` and takes nothing; a locking-disabled project returns
+   *  `{ ok:true, enabled:false }`. Re-acquiring one's own paths renews them. */
+  lock?(ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome>;
+
+  /** Release locks this Run holds — by grant id or by the exact paths taken. Safe with nothing
+   *  held (already auto-released on task settle, or expired). */
+  unlock?(ws: Workspace, sel: { lockIds?: string[]; paths?: string[] }, ctx: LockContext): Promise<void>;
+
+  /** Look without taking (read-only): who holds locks colliding with `paths` on the scope
+   *  branch, and which are already ours. The dispatch-time precheck (RUN-103) runs BEFORE any
+   *  lease, so this takes `repoRoot`, not a Workspace. */
+  queryLocks?(
+    repoRoot: string,
+    paths: string[],
+    ctx: LockContext,
+  ): Promise<{ enabled: boolean; conflicts: LockConflict[]; mine: LockGrant[] }>;
 }

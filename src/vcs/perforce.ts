@@ -2,7 +2,16 @@ import { spawn } from 'node:child_process';
 import { rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { IntegrateResult, LeaseOptions, PublishResult, VcsBackend, Workspace } from './types';
+import type { LockDelegate } from './git';
+import type {
+  IntegrateResult,
+  LeaseOptions,
+  LockContext,
+  LockOutcome,
+  PublishResult,
+  VcsBackend,
+  Workspace,
+} from './types';
 
 /**
  * Perforce, as a VcsBackend (RUN-52).
@@ -101,6 +110,11 @@ export interface PerforceBackendOpts {
   p4?: P4Cli;
   /** Injectable for tests — writes the merge3 marker file into the workspace. */
   writeFileFn?: (p: string, content: string) => Promise<void>;
+  /** The Noriq lock view (RUN-99). Perforce has real exclusive locks, but the runner's cross-run
+   *  coordination + the unified dashboard live in the Noriq lock primitive — so acquire/release
+   *  mirror there (authoritative for conflicts), and `p4 lock` is layered on as the native
+   *  enforcement floor. Absent → the native layer only, and queryLocks/lock report `enabled:false`. */
+  locks?: LockDelegate;
 }
 
 export class PerforceBackend implements VcsBackend {
@@ -108,12 +122,14 @@ export class PerforceBackend implements VcsBackend {
   readonly disposePreservesWork = true;
   private readonly p4: P4Cli;
   private readonly write: (p: string, content: string) => Promise<void>;
+  private readonly locks?: LockDelegate;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly held = new Map<string, () => void>();
 
   constructor(opts: PerforceBackendOpts = {}) {
     this.p4 = opts.p4 ?? realP4Cli;
     this.write = opts.writeFileFn ?? ((p, c) => writeFile(p, c, 'utf8'));
+    this.locks = opts.locks;
   }
 
   private async clientName(cwd: string): Promise<string> {
@@ -443,5 +459,60 @@ export class PerforceBackend implements VcsBackend {
       opts?.onSkip?.(`change ${change} (noriq run ${m[2]}) — shelved server-side`);
     }
     return cleaned;
+  }
+
+  /**
+   * Locking on Perforce (RUN-99): TWO layers, both real.
+   *
+   *  1. The Noriq lock view is the AUTHORITATIVE cross-run coordination layer — the same
+   *     primitive git uses, so two runner runs on one depot contend the same way everywhere and
+   *     the dashboard shows one unified picture. Conflicts are decided here.
+   *  2. `p4 lock` is the NATIVE enforcement floor, layered on after a grant: it locks whichever
+   *     of the paths are already opened in the run's changelist against another client's submit.
+   *     Best-effort — a path the agent has not opened yet is simply not p4-locked (predictive
+   *     scope is a Noriq concept; p4's is opened-file granular), and a failure never fails the
+   *     grant the Noriq view already made.
+   *
+   * A foreign client's raw `p4 lock` (a human at a workstation) is NOT yet reflected as a Noriq
+   * conflict — surfacing that needs live-server fstat parsing and is a follow-up; the runner's
+   * own runs coordinate fully today.
+   */
+  async lock(ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> {
+    if (!this.locks || paths.length === 0) return { ok: true, enabled: false, locks: [] };
+    const r = await this.locks.acquire(ctx.token, {
+      projectId: ctx.projectId,
+      paths,
+      branch: ctx.branch,
+      taskId: ctx.taskId,
+    });
+    if (!r.ok) return { ok: false, conflicts: r.conflicts };
+    if (r.enabled) await this.nativeLock(ws, paths, 'lock');
+    return { ok: true, enabled: r.enabled, locks: r.locks };
+  }
+
+  async unlock(
+    ws: Workspace,
+    sel: { lockIds?: string[]; paths?: string[] },
+    ctx: LockContext,
+  ): Promise<void> {
+    if (!this.locks) return;
+    if (sel.paths?.length) await this.nativeLock(ws, sel.paths, 'unlock');
+    await this.locks.release(ctx.token, ctx.projectId, sel);
+  }
+
+  async queryLocks(_repoRoot: string, paths: string[], ctx: LockContext) {
+    if (!this.locks || paths.length === 0) return { enabled: false, conflicts: [], mine: [] };
+    return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
+  }
+
+  /** Best-effort native `p4 lock`/`p4 unlock` over the opened subset of `paths`. Guarded whole:
+   *  the Noriq view already decided the outcome, so nothing here may throw into that decision. */
+  private async nativeLock(ws: Workspace, paths: string[], verb: 'lock' | 'unlock'): Promise<void> {
+    try {
+      const loc = p4Location(ws);
+      await this.p4([verb, '-c', loc.change, ...paths], ws.localPath);
+    } catch {
+      /* a path not opened in this change, or no p4 lock permission — the Noriq view stands */
+    }
   }
 }

@@ -1,5 +1,27 @@
 import { describe, expect, it } from 'vitest';
+import type { LockDelegate } from '../src/vcs/git';
 import { type P4Cli, PerforceBackend } from '../src/vcs/perforce';
+
+/** A fake Noriq lock view (the authoritative coordination layer) that records calls and returns
+ *  a configurable acquire result. */
+function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
+  const calls: Array<{ method: string; token: string; args: unknown }> = [];
+  const locks: LockDelegate = {
+    acquire: async (token, input) => {
+      calls.push({ method: 'acquire', token, args: input });
+      return acquireResult as never;
+    },
+    release: async (token, projectId, sel) => {
+      calls.push({ method: 'release', token, args: { projectId, sel } });
+      return { released: [] };
+    },
+    check: async (token, input) => {
+      calls.push({ method: 'check', token, args: input });
+      return { enabled: true, conflicts: [], mine: [] };
+    },
+  };
+  return { locks, calls };
+}
 
 // Orchestration tests over an injected p4 — the fake answers with the MEASURED outputs from
 // RUN-55's real p4d session (VCS-SPIKE.md §10): the submit out-of-date refusal text, the
@@ -22,6 +44,8 @@ function fakes(over: {
   submitRefuses?: string;
   /** changes -l output (for the reaper / fromRunId lookup). */
   changesLong?: string;
+  /** The Noriq lock view to inject (RUN-99). */
+  locks?: LockDelegate;
 }) {
   const calls: Call[] = [];
   const writes: Array<{ path: string; content: string }> = [];
@@ -70,6 +94,7 @@ function fakes(over: {
         stderr: '',
       };
     }
+    if (args[0] === 'lock' || args[0] === 'unlock') return { stdout: '', stderr: '' };
     if (args[0] === 'print') return { stdout: 'printed depot rev\n', stderr: '' };
     if (args[0] === 'merge3')
       return {
@@ -91,6 +116,7 @@ function fakes(over: {
     writeFileFn: async (path, content) => {
       writes.push({ path, content });
     },
+    locks: over.locks,
   });
   return { backend, calls, writes };
 }
@@ -291,5 +317,64 @@ describe('PerforceBackend — location guard', () => {
       location: { repoId: 'dv.repo.x', branch: 'b', baseBranch: 'main' }, // Diversion-shaped
     };
     await expect(backend.publish(alien, 'x')).rejects.toThrow(/Perforce location/);
+  });
+});
+
+describe('PerforceBackend — locking (RUN-99): Noriq view authoritative, p4 lock as the native floor', () => {
+  const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
+
+  it('acquires the Noriq view AND lays a native p4 lock on the run’s changelist', async () => {
+    const { locks, calls: lockCalls } = fakeLocks({
+      ok: true,
+      enabled: true,
+      locks: [{ id: 'lk', path: 'a.txt' }],
+    });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    const out = await backend.lock(ws, ['a.txt'], ctx);
+
+    expect(out).toEqual({ ok: true, enabled: true, locks: [{ id: 'lk', path: 'a.txt' }] });
+    // Noriq is the coordination truth, held as the RUN token…
+    expect(lockCalls[0]).toMatchObject({ method: 'acquire', token: 'run-token' });
+    // …and the native p4 lock names the run's changelist (42) as the enforcement floor.
+    expect(calls.some((c) => c.what === 'p4 lock -c 42 a.txt')).toBe(true);
+  });
+
+  it('a Noriq conflict is all-or-nothing — no native p4 lock is attempted', async () => {
+    const { locks } = fakeLocks({ ok: false, conflicts: [{ path: 'a.txt', holder: 'agt_other' }] });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    const out = await backend.lock(ws, ['a.txt'], ctx);
+    expect(out).toEqual({ ok: false, conflicts: [{ path: 'a.txt', holder: 'agt_other' }] });
+    expect(calls.some((c) => c.what.startsWith('p4 lock'))).toBe(false);
+  });
+
+  it('a failing native p4 lock never fails the grant (best-effort floor)', async () => {
+    const { locks } = fakeLocks({ ok: true, enabled: true, locks: [] });
+    // p4 that throws on `lock` — the grant must still stand.
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o') return { stdout: 'Options: allwrite\n', stderr: '' };
+      if (args[0] === 'sync') return { stdout: '', stderr: '' };
+      if (args.includes('changes') && args.includes('-m1')) return { stdout: '7\n', stderr: '' };
+      if (args.includes('changes')) return { stdout: '', stderr: '' };
+      if (args.includes('change') && args.includes('-o'))
+        return { stdout: 'Change: new\nDescription:\n\tnoriq run run_1\n', stderr: '' };
+      if (args[0] === 'change' && args[1] === '-i') return { stdout: 'Change 42 created.\n', stderr: '' };
+      if (args[0] === 'opened') return { stdout: '', stderr: '' };
+      if (args[0] === 'lock') throw new Error('file(s) not opened on this client');
+      return { stdout: '', stderr: '' };
+    };
+    const backend = new PerforceBackend({ p4, locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(await backend.lock(ws, ['a.txt'], ctx)).toEqual({ ok: true, enabled: true, locks: [] });
+  });
+
+  it('with no lock view wired, locking reports disabled and touches no p4', async () => {
+    const { backend, calls } = fakes({});
+    const ws = await backend.lease('/ws1', 'run_1');
+    const before = calls.length;
+    expect(await backend.lock(ws, ['a.txt'], ctx)).toEqual({ ok: true, enabled: false, locks: [] });
+    expect(calls.slice(before).some((c) => c.what.startsWith('p4 lock'))).toBe(false);
   });
 });

@@ -3,6 +3,27 @@ import type { AgentDriver, DriverExit, DriverStartOptions } from '../src/drivers
 import { zeroTelemetry } from '../src/drivers/types';
 import { RunSupervisor } from '../src/supervisor';
 import { DiversionBackend, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
+import type { LockDelegate } from '../src/vcs/git';
+
+/** A fake Noriq lock view (the authoritative coordination layer), recording calls. */
+function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
+  const calls: Array<{ method: string; token: string }> = [];
+  const locks: LockDelegate = {
+    acquire: async (token) => {
+      calls.push({ method: 'acquire', token });
+      return acquireResult as never;
+    },
+    release: async (token) => {
+      calls.push({ method: 'release', token });
+      return { released: [] };
+    },
+    check: async (token) => {
+      calls.push({ method: 'check', token });
+      return { enabled: true, conflicts: [], mine: [] };
+    },
+  };
+  return { locks, calls };
+}
 
 // The backend is orchestration over two injected transports — the API (merges, branches) and
 // the CLI (anything that must materialize files, which is the sync agent's job). These tests
@@ -27,6 +48,10 @@ function fakes(over: {
   /** What `dv commit` prints (or an Error to throw). */
   commit?: string | Error;
   currentBranch?: string;
+  /** The Noriq lock view to inject (RUN-100). */
+  locks?: LockDelegate;
+  /** Model a non-Pro workspace: the soft-lock endpoint answers 402 (native degrades). */
+  softLockUnavailable?: boolean;
 }) {
   const branches: Record<string, string> = over.branches ?? { main: 'dv.commit.10' };
   const mergeQueue = [...(over.mergeResponses ?? [])];
@@ -66,6 +91,13 @@ function fakes(over: {
     if (method === 'GET' && apiPath.includes('/merges/')) {
       return { status: 200, body: over.mergeDetails ?? { conflicts: [] } };
     }
+    if (apiPath.endsWith('/locks')) {
+      // The native soft-lock endpoint (Pro-gated). realDvHttp resolves any non-2xx into a body,
+      // never a throw — but the backend's nativeSoftLock ignores the outcome either way.
+      return over.softLockUnavailable
+        ? { status: 402, body: { error: 'Pro required' } }
+        : { status: 200, body: {} };
+    }
     throw new Error(`fake has no answer for ${method} ${apiPath}`);
   };
 
@@ -81,7 +113,7 @@ function fakes(over: {
     return { stdout: '', stderr: '' };
   };
 
-  const backend = new DiversionBackend({ repoId: 'dv.repo.test', http, cli });
+  const backend = new DiversionBackend({ repoId: 'dv.repo.test', http, cli, locks: over.locks });
   return { backend, calls, branches };
 }
 
@@ -415,5 +447,50 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
       'POST /repos/dv.repo.test/merges?base_id=noriq%2Fintegration&other_id=noriq%2Frun%2Frun_dv1',
     );
     expect(branches['noriq/integration']).toBe('dv.commit.31'); // the landed head
+  });
+});
+
+describe('DiversionBackend — locking (RUN-100): Noriq view authoritative, soft lock degrades', () => {
+  const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
+
+  it('acquires the Noriq view AND posts a native soft lock on a Pro workspace', async () => {
+    const { locks, calls: lockCalls } = fakeLocks({
+      ok: true,
+      enabled: true,
+      locks: [{ id: 'lk', path: 'a.ts' }],
+    });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/repo', 'run_1');
+    const out = await backend.lock(ws, ['a.ts'], ctx);
+    expect(out).toEqual({ ok: true, enabled: true, locks: [{ id: 'lk', path: 'a.ts' }] });
+    expect(lockCalls[0]).toMatchObject({ method: 'acquire', token: 'run-token' });
+    expect(calls.some((c) => c.what === 'POST /repos/dv.repo.test/locks')).toBe(true);
+  });
+
+  it('degrades to the Noriq layer alone when soft locks are unavailable (non-Pro) — grant still stands', async () => {
+    const { locks } = fakeLocks({ ok: true, enabled: true, locks: [] });
+    const { backend } = fakes({ locks, softLockUnavailable: true });
+    const ws = await backend.lease('/repo', 'run_1');
+    // The native 402 must not fail the grant the Noriq view made.
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({ ok: true, enabled: true, locks: [] });
+  });
+
+  it('a Noriq conflict is all-or-nothing — no native soft lock attempted', async () => {
+    const { locks } = fakeLocks({ ok: false, conflicts: [{ path: 'a.ts', holder: 'agt_other' }] });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/repo', 'run_1');
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({
+      ok: false,
+      conflicts: [{ path: 'a.ts', holder: 'agt_other' }],
+    });
+    expect(calls.some((c) => c.what.endsWith('/locks'))).toBe(false);
+  });
+
+  it('no lock view wired → disabled, no HTTP', async () => {
+    const { backend, calls } = fakes({});
+    const ws = await backend.lease('/repo', 'run_1');
+    const before = calls.length;
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({ ok: true, enabled: false, locks: [] });
+    expect(calls.slice(before).some((c) => c.what.endsWith('/locks'))).toBe(false);
   });
 });

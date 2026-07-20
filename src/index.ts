@@ -186,12 +186,24 @@ export {
 export type {
   IntegrateResult,
   LeaseOptions,
+  LockContext,
+  LockOutcome,
   PublishResult,
   ShareResult,
   VcsBackend,
   Workspace,
 } from './vcs/types';
-export { GitBackend, type GitOps } from './vcs/git';
+export {
+  LockClient,
+  parseToolReply,
+  type AcquireInput,
+  type AcquireResult,
+  type CheckResult,
+  type LockClientOptions,
+  type LockConflict,
+  type LockGrant,
+} from './lock-client';
+export { GitBackend, type GitOps, type LockDelegate } from './vcs/git';
 export { detectVcs, parseDvRepoList, type DetectDeps, type VcsDetection } from './vcs/detect';
 export { VCS_VOCAB, vocabFor, type VcsKind, type VcsVocab } from './vcs/vocab';
 export { PerforceBackend, realP4Cli, type P4Cli, type PerforceBackendOpts } from './vcs/perforce';

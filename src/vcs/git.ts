@@ -1,5 +1,11 @@
+import type { LockClient } from '../lock-client';
 import { type WorktreeManager, runBranch } from '../worktree';
-import type { LeaseOptions, VcsBackend, Workspace } from './types';
+import type { LeaseOptions, LockContext, LockOutcome, VcsBackend, Workspace } from './types';
+
+/** The slice of LockClient the git backend delegates its lock ops to — injectable, and OPTIONAL:
+ *  a daemon with no Noriq lock layer wired (or a test) constructs GitBackend without it, and the
+ *  lock ops become graceful no-ops (`enabled:false`). */
+export type LockDelegate = Pick<LockClient, 'acquire' | 'release' | 'check'>;
 
 /** The slice of WorktreeManager this backend delegates to — injectable for tests. */
 export type GitOps = Pick<
@@ -67,9 +73,11 @@ function gitLocation(ws: Workspace): GitLocation {
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
   private readonly git: GitOps;
+  private readonly locks?: LockDelegate;
 
-  constructor(git: GitOps) {
+  constructor(git: GitOps, locks?: LockDelegate) {
     this.git = git;
+    this.locks = locks;
   }
 
   async lease(repoRoot: string, runId: string, opts?: LeaseOptions): Promise<Workspace> {
@@ -140,5 +148,36 @@ export class GitBackend implements VcsBackend {
 
   reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number> {
     return this.git.reapOrphans(repoRoot, opts);
+  }
+
+  /**
+   * Git has NO native file lock (RUN-98) — the whole reason this plan exists — so all three lock
+   * ops delegate to Noriq's lock primitive over the injected client, held as the run's agent
+   * (`ctx.token`). With no client wired they are no-ops that report `enabled:false`, so a daemon
+   * or test without a lock layer behaves exactly as before.
+   */
+  async lock(_ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> {
+    if (!this.locks || paths.length === 0) return { ok: true, enabled: false, locks: [] };
+    const r = await this.locks.acquire(ctx.token, {
+      projectId: ctx.projectId,
+      paths,
+      branch: ctx.branch,
+      taskId: ctx.taskId,
+    });
+    return r.ok ? { ok: true, enabled: r.enabled, locks: r.locks } : { ok: false, conflicts: r.conflicts };
+  }
+
+  async unlock(
+    _ws: Workspace,
+    sel: { lockIds?: string[]; paths?: string[] },
+    ctx: LockContext,
+  ): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.release(ctx.token, ctx.projectId, sel);
+  }
+
+  async queryLocks(_repoRoot: string, paths: string[], ctx: LockContext) {
+    if (!this.locks || paths.length === 0) return { enabled: false, conflicts: [], mine: [] };
+    return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
   }
 }
