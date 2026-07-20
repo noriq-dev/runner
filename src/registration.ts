@@ -64,13 +64,14 @@ export interface RunnerRegistration {
     name: string;
     defaultBranch: string | null;
     /**
-     * This repo's custom workflows (RUN-125): each name WITH its `base` kind. The base is what the
-     * dashboard must set `Run.kind` to when it dispatches that workflow — the workflow overrides only
-     * the prompt, while every permission/gate is enforced off `kind`. Names alone (the RUN-121 shape)
-     * let a UI pick a read-only workflow but leave `kind = build`, silently granting write; carrying
-     * the base closes that footgun. The three built-ins are implicit and not listed.
+     * This repo's custom workflow NAMES (RUN-121; matches shared `RunnerRepo.workflows`). The wire
+     * carries just the choice — the base + prompt stay the runner's authority in the committed
+     * manifest, and the DAEMON resolves a selected name to its base posture (`effectiveKind`,
+     * RUN-126), so a mismatched dispatched `kind` can never escalate write. The three built-ins are
+     * implicit and not listed. (RUN-125 briefly advertised the base here; reverted — the daemon,
+     * which holds the manifest, is the right authority, not the dashboard.)
      */
-    workflows: Array<{ name: string; base: RunKind }>;
+    workflows: string[];
   }>;
 }
 
@@ -100,13 +101,10 @@ export function buildRegistration(
       board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
-      // The repo's custom workflows (RUN-125): name + base kind, so the dashboard can set
-      // Run.kind = base on dispatch (the base carries the posture; the workflow only overrides the
-      // prompt). The three built-ins are always available and are not listed.
-      workflows: Object.entries(r.manifest.workflows ?? {}).map(([name, def]) => ({
-        name,
-        base: def.base,
-      })),
+      // The repo's custom workflow names (RUN-121) — the three built-ins are always available and
+      // are not listed. The daemon resolves each to its base posture at dispatch (RUN-126), so the
+      // wire carries just the name (matches shared RunnerRepo.workflows: string[]).
+      workflows: Object.keys(r.manifest.workflows ?? {}),
     })),
   };
 }

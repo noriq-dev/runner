@@ -1,17 +1,6 @@
 import { z } from 'zod';
 import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
-// ===========================================================================
-// PENDING PLANAR PORT (RUN-122): several fields in this file and in runner.ts were
-// authored HERE first so the runner could compile and test against them. They must
-// be ported verbatim into planar `packages/shared/src` and re-vendored — do NOT run
-// `npm run vendor:shared` before that port, or these deltas are overwritten from
-// planar. The full delta list + the dispatch/dashboard companions are in
-// PLANAR-PORT.md; reconciliation is RUN-122 (Phase 5).
-//   manifest.ts:  ModelDefault.agent, VerifyReviewer.agent, WorkflowDef,
-//                 ProjectManifest.workflows
-//   runner.ts:    Run.agent, Run.workflow, (registration) agents[] + repos[].workflows
-// ===========================================================================
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
 // schemas validate the *parsed* object (shared stays runtime-neutral — no TOML
@@ -234,8 +223,6 @@ export type LandPolicy = z.infer<typeof LandPolicy>;
  * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
  * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
  * (scope/build/verify) are always present and need no declaration.
- *
- * PENDING PLANAR PORT (RUN-119/RUN-122): authored in the vendored copy first — see the top marker.
  */
 export const WorkflowDef = z.object({
   // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.

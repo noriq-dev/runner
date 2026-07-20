@@ -47,7 +47,7 @@ describe('buildRegistration', () => {
     expect(reg.repos).toEqual([]);
   });
 
-  it('advertises each custom workflow WITH its base kind (RUN-125)', () => {
+  it('advertises custom workflow NAMES (RUN-121; base stays the runner’s authority, RUN-126)', () => {
     const withWorkflows: DiscoveredRepo[] = [
       {
         id: 'repo_w',
@@ -66,10 +66,9 @@ describe('buildRegistration', () => {
       },
     ];
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, withWorkflows);
-    expect(reg.repos[0]?.workflows).toEqual([
-      { name: 'docs', base: 'scope' }, // read-only base → the dashboard sets kind=scope
-      { name: 'hotfix', base: 'build' },
-    ]);
+    // Names only — the daemon resolves each to its base posture (effectiveKind), so the wire needn't
+    // carry it, and this matches shared RunnerRepo.workflows: string[].
+    expect(reg.repos[0]?.workflows).toEqual(['docs', 'hotfix']);
   });
 
   it('advertises the coordinate catalog per installed tool (RUN-115)', () => {

@@ -757,6 +757,22 @@ describe('RunSupervisor', () => {
     await done;
   });
 
+  it('a workflow BASE overrides a mismatched dispatched kind — no write escalation (RUN-126)', async () => {
+    // The footgun closed daemon-side: dispatch says kind=build (writable) but names a scope-based
+    // workflow. The daemon holds the manifest, so the base wins — the run is READ-ONLY regardless.
+    const m = manifest({
+      workflows: { docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}' } },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'docs' }));
+    await flush();
+    expect(h.claude.opts?.permission.write).toBe(false); // base=scope posture, not dispatched build
+    expect(h.claude.opts?.kind).toBe('scope'); // the driver runs under the effective kind
+    expect(h.claude.opts?.prompt).toContain('DOCS: survey'); // custom prompt still applies
+    h.claude.complete('done');
+    await done;
+  });
+
   it('an unknown workflow name falls back to the built-in for the kind (RUN-121)', async () => {
     const h = harness();
     const done = h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));

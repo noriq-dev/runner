@@ -270,6 +270,26 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
   return runCoordinate(run).tool;
 }
 
+/**
+ * The kind whose POSTURE a run actually runs under (RUN-126) — the daemon's authoritative answer,
+ * not the dispatcher's. When a run selects a custom `workflow`, its posture IS that workflow's base
+ * (a `docs` workflow based on `scope` is read-only), so the base wins over whatever `kind` the
+ * dispatch carried. This closes the footgun where a UI (or any client) selects a read-only workflow
+ * but leaves `kind = build`: the daemon holds the manifest and decides, so a mismatched dispatched
+ * kind can never escalate write. No workflow (or an unknown name) → the dispatched `kind` stands.
+ *
+ * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
+ * inherited from its base — so it doubles as the posture kind.
+ */
+export function effectiveKind(
+  run: Pick<Run, 'kind' | 'workflow'>,
+  manifest: Pick<ProjectManifest, 'workflows'>,
+): RunKind {
+  if (!run.workflow) return run.kind as RunKind;
+  const wf = resolveWorkflow(run.workflow, manifest);
+  return (wf?.promptShape ?? run.kind) as RunKind;
+}
+
 export function resolveModel(
   run: Pick<Run, 'kind' | 'agent' | 'agentTool' | 'model' | 'effort'>,
   manifest: ProjectManifest,
@@ -1399,8 +1419,6 @@ export class RunSupervisor {
     const entry = await this.deps.parked?.unpark(runId);
     if (!entry) return null;
     const { run } = entry;
-    const kind = run.kind as RunKind;
-    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
 
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
@@ -1410,6 +1428,8 @@ export class RunSupervisor {
 
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
+    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
+    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
     const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
@@ -1601,7 +1621,7 @@ export class RunSupervisor {
       }
     }
 
-    const kind = run.kind as RunKind;
+    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
     const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
     const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
     // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
@@ -1673,7 +1693,7 @@ export class RunSupervisor {
         // cannot call. Same list the driver enforces — one policy, two views.
         runAgent = await this.deps.createRunAgent(run.id, {
           label: `${run.kind}-${run.id.slice(-6)}`,
-          allowedTools: noriqToolNamesFor(run.kind),
+          allowedTools: noriqToolNamesFor(kind), // the EFFECTIVE kind (RUN-126), not the dispatched one
         });
         noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: runAgent.token };
         // Say who is working this Run as soon as we know — which is now BEFORE the process
@@ -1915,7 +1935,7 @@ export class RunSupervisor {
     const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, tally, verifyText, tail } =
       ctx;
     const continued = ctx.continued ?? null;
-    const kind = run.kind as RunKind;
+    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
     const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
     // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
     // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.

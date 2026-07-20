@@ -179,6 +179,7 @@ export {
   runCoordinate,
   resolveAgentTool,
   resolveModel,
+  effectiveKind,
   mergeBudget,
   mergeModelUsage,
   telemetryFromSpent,

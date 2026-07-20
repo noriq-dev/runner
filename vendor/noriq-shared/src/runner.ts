@@ -180,14 +180,11 @@ export const Run = z.object({
   // naming tool+model+effort in one string. When set it WINS over agentTool/model/effort below (the
   // legacy triple, kept for one deprecation window); when null the runner synthesizes a coordinate
   // FROM that triple, so a dispatcher that never learned the coordinate keeps working unchanged.
-  // PENDING PLANAR PORT (RUN-122): authored in the vendored copy first — see the marker in
-  // manifest.ts and PLANAR-PORT.md; do not re-vendor from planar before RUN-122 ports it.
   agent: z.string().nullable().default(null),
   // The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
   // workflow is a NAMED variant of `kind` (its base): `kind` still carries the posture (so every
   // permission/gate stays kind-driven and floor-safe), and `workflow` only swaps in the workflow's
   // own prompt. Null / an unknown name → the built-in for `kind`, unchanged.
-  // PENDING PLANAR PORT (RUN-121/RUN-122): authored in the vendored copy first — see manifest.ts.
   workflow: z.string().nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
@@ -244,13 +241,36 @@ export const RunnerRepo = z.object({
   boardId: z.string().nullable().default(null),
   name: z.string().default(''), // display name (repo dir basename)
   defaultBranch: z.string().nullable().default(null),
+  // This repo's custom workflow NAMES (RUN-121), advertised so the dashboard can offer them on
+  // dispatch. The three built-ins (scope/build/verify) are always available and are NOT listed.
+  // Names only: the base + prompt live in the committed manifest and stay the runner's authority —
+  // the daemon resolves a selected name to its base+prompt locally (resolveWorkflow), so the wire
+  // carries just the choice.
+  workflows: z.array(z.string()).default([]),
 });
 export type RunnerRepo = z.infer<typeof RunnerRepo>;
+
+/**
+ * One installed driver's coordinate MENU (RUN-115): the model ids + efforts the dashboard renders
+ * as an `<tool>.<model>.<effort>` picker. `models` is a SUGGESTION list, not a whitelist — model
+ * names belong to the vendor and change weekly, so the dispatch model field stays free-text and a
+ * name off this list still dispatches. `efforts` is the closed set this driver distinguishes (codex
+ * collapses xhigh/max into its own 'high', so it advertises fewer).
+ */
+export const AdvertisedAgent = z.object({
+  tool: AgentTool,
+  models: z.array(z.string()).default([]),
+  efforts: z.array(RunEffort).default([]),
+});
+export type AdvertisedAgent = z.infer<typeof AdvertisedAgent>;
 
 export const RunnerCapabilities = z.object({
   tools: z.array(AgentTool).default([]), // installed drivers
   kinds: z.array(RunKind).default([]), // run kinds this runner will accept
   maxConcurrency: z.number().int().nonnegative().default(1),
+  // The coordinate catalog per installed tool (RUN-115) — what the dashboard's agent picker reads.
+  // Additive to `tools`; a runner too old to send it advertises an empty menu (free-text only).
+  agents: z.array(AdvertisedAgent).default([]),
 });
 export type RunnerCapabilities = z.infer<typeof RunnerCapabilities>;
 
