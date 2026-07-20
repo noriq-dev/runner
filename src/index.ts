@@ -88,8 +88,22 @@ export {
   type ManifestChoices,
 } from './init-project';
 export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
+export {
+  type AgentCoordinate,
+  coordinateFromParts,
+  formatCoordinate,
+  mergeCoordinate,
+  parseCoordinate,
+  tryParseCoordinate,
+} from './agent-coordinate';
 export { detectTools } from './tools';
-export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
+export {
+  agentCatalog,
+  buildRegistration,
+  type AdvertisedAgent,
+  type RegistrationParams,
+  type RunnerRegistration,
+} from './registration';
 export {
   NoriqClient,
   type NoriqClientOptions,
@@ -120,6 +134,7 @@ export { AsyncQueue } from './async-queue';
 export {
   type AgentDriver,
   type DriverCapabilities,
+  type DriverCatalog,
   type DriverSession,
   type DriverStartOptions,
   type DriverHandlers,
@@ -154,6 +169,9 @@ export {
   assemblePrompt,
   cmdVerify,
   runCommitMessage,
+  runCoordinate,
+  resolveAgentTool,
+  resolveModel,
   mergeBudget,
   mergeModelUsage,
   telemetryFromSpent,

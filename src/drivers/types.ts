@@ -210,9 +210,25 @@ export interface DriverCapabilities {
   perModelTelemetry: boolean;
 }
 
+/**
+ * A driver's advertised menu (RUN-115): the model ids and efforts it can build coordinates from,
+ * so the dashboard can offer a real picker (`claude.<model>.<effort>`) instead of a free-text box.
+ * Deliberately a SUGGESTION, not a whitelist — `model` stays free-form on the wire (vendors ship
+ * models weekly), so a coordinate naming a model not in this list is still accepted; the catalog
+ * only seeds the common choices.
+ */
+export interface DriverCatalog {
+  /** Known/suggested model ids for this driver, newest-first. May be stale; not enforced. */
+  models: string[];
+  /** The efforts this driver meaningfully distinguishes (codex collapses xhigh/max into high). */
+  efforts: RunEffort[];
+}
+
 export interface AgentDriver {
   readonly tool: AgentTool;
   /** What this driver's runtime supports — read by the supervisor instead of branching on `tool`. */
   readonly capabilities: DriverCapabilities;
+  /** The models + efforts this driver advertises for the coordinate picker (RUN-115). */
+  readonly catalog: DriverCatalog;
   start(opts: DriverStartOptions): DriverSession;
 }

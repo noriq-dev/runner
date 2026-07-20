@@ -44,6 +44,7 @@ describe('NoriqClient', () => {
       label: 'l',
       version: '1.2.3',
       tools: ['claude'],
+      agents: [],
       kinds: ['build'],
       maxConcurrency: 1,
       repos: [{ id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main' }],

@@ -62,6 +62,16 @@ defaultBranch = "main"
 #
 # [defaults.verify]
 # effort = "xhigh"             # adversarial reasoning; inherit the tool's model
+#
+# Or spell any of these as one agent COORDINATE (RUN-113) — <tool>.<model>.<effort>,
+# a dotted model version written with underscores (opus-4_8 = opus-4.8). When set,
+# `agent` wins over the model/effort pair above:
+#
+# [defaults.build]
+# agent = "claude.opus-4_8.high"
+#
+# [defaults.scope]
+# agent = "codex.gpt-5_6-sol.high"   # a different vendor, in one line
 
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this

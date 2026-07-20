@@ -10,6 +10,7 @@ import { NORIQ_MCP_NAME } from './claude';
 import {
   type AgentDriver,
   type DriverCapabilities,
+  type DriverCatalog,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
@@ -127,8 +128,19 @@ export interface CodexDriverDeps {
  * Drives Codex via app-server protocol mode with spawn/stream/steer/interrupt
  * parity with the Claude driver. Completes on the first turn/completed.
  */
+/**
+ * Codex's advertised coordinate menu (RUN-115). A suggestion, not a whitelist — `model` is free
+ * on the wire. Efforts stop at `high`: codex's `model_reasoning_effort` tops out there, and its
+ * driver clamps xhigh/max down, so advertising them would promise a distinction it cannot make.
+ */
+export const CODEX_CATALOG: DriverCatalog = {
+  models: ['gpt-5.6-sol', 'gpt-5.3-codex'],
+  efforts: ['low', 'medium', 'high'],
+};
+
 export class CodexDriver implements AgentDriver {
   readonly tool = 'codex' as const;
+  readonly catalog: DriverCatalog = CODEX_CATALOG;
   // Codex steers and interrupts over JSON-RPC, but has NO in-process tool hooks (locks fall to the
   // hard floor, RUN-102), no per-model telemetry (spend → the (unattributed) bucket, RUN-86), and
   // no session resume — a parked codex run restarts rather than reloading context (RUN-110).

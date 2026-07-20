@@ -19,7 +19,7 @@ describe('the [verify] choice (RUN-61) — schema', () => {
   it('agent-only parses — a reviewer with no deterministic floor is a real choice', () => {
     const m = ProjectManifest.parse({ ...base, verify: { agent: {} } });
     expect(m.verify?.cmd).toBeNull();
-    expect(m.verify?.agent).toEqual({ tool: null, model: null, effort: null, maxRounds: 2 });
+    expect(m.verify?.agent).toEqual({ agent: null, tool: null, model: null, effort: null, maxRounds: 2 });
   });
 
   it('both parse, with the reviewer keeping its own model/effort', () => {
@@ -28,7 +28,13 @@ describe('the [verify] choice (RUN-61) — schema', () => {
       verify: { cmd: 'npm test', agent: { model: 'claude-opus-4-8', effort: 'high', maxRounds: 1 } },
     });
     expect(m.verify?.cmd).toBe('npm test');
-    expect(m.verify?.agent).toEqual({ tool: null, model: 'claude-opus-4-8', effort: 'high', maxRounds: 1 });
+    expect(m.verify?.agent).toEqual({
+      agent: null,
+      tool: null,
+      model: 'claude-opus-4-8',
+      effort: 'high',
+      maxRounds: 1,
+    });
   });
 
   it('a [verify] section with NEITHER is refused — silence must not read as a gate', () => {

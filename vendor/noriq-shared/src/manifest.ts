@@ -1,6 +1,14 @@
 import { z } from 'zod';
 import { AgentTool, RunBudget, RunEffort } from './runner';
 
+// ===========================================================================
+// PENDING PLANAR PORT (RUN-113/RUN-119): the `agent` coordinate fields added to
+// ModelDefault and VerifyReviewer below were authored HERE first so the runner
+// could compile and test against them. They must be ported verbatim into planar
+// `packages/shared/src/manifest.ts` and re-vendored — do NOT run `npm run
+// vendor:shared` before that port, or these deltas are overwritten from planar.
+// Reconciliation is RUN-119 (Phase 5).
+// ===========================================================================
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
 // schemas validate the *parsed* object (shared stays runtime-neutral — no TOML
@@ -61,6 +69,11 @@ export type KindPermissions = z.infer<typeof KindPermissions>;
  * an ordinary thing to want, and so is the reverse.
  */
 export const ModelDefault = z.object({
+  // The agent coordinate (RUN-113): `claude.opus-4_8.high` — the canonical per-kind selector.
+  // When set it WINS; `model`/`effort` below are the legacy triple, kept as the fallback for one
+  // deprecation window. A free string (the runner's coordinate parser validates it), not an enum —
+  // model ids are the vendor's and change weekly, exactly the reason `model` is a free string.
+  agent: z.string().nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
 });
@@ -98,6 +111,10 @@ export const VerifyReviewer = z.object({
    * vendor's) — name `model` here or take the tool's own default. A tool with no driver on the
    * machine fails the gate loudly rather than silently reviewing with the builder's vendor.
    */
+  // The reviewer's agent coordinate (RUN-113): `codex.gpt-5_6-sol.high` names tool+model+effort in
+  // one string. When set it WINS over `tool`/`model`/`effort` below (the legacy triple), and its
+  // tool segment IS honored — a reviewer on a different vendor is the whole point of RUN-70.
+  agent: z.string().nullable().default(null),
   tool: AgentTool.nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),

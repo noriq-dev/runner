@@ -7,6 +7,7 @@ import { noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import {
   type AgentDriver,
   type DriverCapabilities,
+  type DriverCatalog,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
@@ -355,6 +356,16 @@ export interface ClaudeDriverDeps {
  * interrupt(). Applies the per-kind permission profile and parses the stream-json
  * telemetry (tokens / USD) back to the Run. Completes on the first `result`.
  */
+/**
+ * Claude's advertised coordinate menu (RUN-115). A suggestion for the picker, not a whitelist —
+ * `model` is free-form on the wire, so a newer id the daemon has never heard of still dispatches.
+ * Newest-first; the SDK takes every RunEffort verbatim.
+ */
+export const CLAUDE_CATALOG: DriverCatalog = {
+  models: ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5', 'claude-fable-5'],
+  efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+};
+
 export class ClaudeDriver implements AgentDriver {
   readonly tool = 'claude' as const;
   // The Agent SDK gives us all four (RUN-110): in-process hooks (lockHooks below), soft steer +
@@ -366,6 +377,7 @@ export class ClaudeDriver implements AgentDriver {
     resumableSession: true,
     perModelTelemetry: true,
   };
+  readonly catalog: DriverCatalog = CLAUDE_CATALOG;
   private readonly queryFn: QueryFn;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
 

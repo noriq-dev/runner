@@ -11,6 +11,7 @@ import type {
 } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
+import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, superviseBudget, totalTokens } from './drivers/budget';
@@ -249,13 +250,37 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
  * model must still inherit the repo's effort for that kind, or the one field it set would
  * silently erase the other.
  */
+/**
+ * The dispatch's effective coordinate (RUN-114): the `agent` string when present, else one
+ * synthesized from the legacy `{agentTool, model, effort}` triple. A malformed wire coordinate
+ * falls back to the triple rather than sinking the run — the triple is always well-formed (its
+ * fields are wire-validated), so there is a safe answer. This is the ONE place the runner reconciles
+ * new-form and legacy-form dispatches; everything downstream reads a coordinate.
+ */
+export function runCoordinate(run: Pick<Run, 'agent' | 'agentTool' | 'model' | 'effort'>): AgentCoordinate {
+  const fromTriple = coordinateFromParts(run.agentTool, run.model, run.effort);
+  if (!run.agent) return fromTriple;
+  return tryParseCoordinate(run.agent) ?? fromTriple;
+}
+
+/** The driver a run selects — its coordinate's tool (RUN-114). Identical to `agentTool` for a
+ *  legacy dispatch that carries no coordinate. */
+export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' | 'effort'>): string {
+  return runCoordinate(run).tool;
+}
+
 export function resolveModel(
-  run: Pick<Run, 'kind' | 'model' | 'effort'>,
+  run: Pick<Run, 'kind' | 'agent' | 'agentTool' | 'model' | 'effort'>,
   manifest: ProjectManifest,
 ): { model?: string; effort?: RunEffort } {
   const repo = manifest.defaults?.[run.kind as RunKind];
-  const model = run.model ?? repo?.model ?? null;
-  const effort = run.effort ?? repo?.effort ?? null;
+  // Precedence, most specific first: the dispatch coordinate (RUN-114, which already folds the
+  // agent string OR the legacy triple) → the repo `[defaults.<kind>].agent` coordinate (RUN-113) →
+  // the repo's legacy model/effort pair → the tool's own default (absence).
+  const dispatch = runCoordinate(run);
+  const repoCoord = repo?.agent ? tryParseCoordinate(repo.agent) : null;
+  const model = dispatch.model ?? repoCoord?.model ?? repo?.model ?? null;
+  const effort = dispatch.effort ?? repoCoord?.effort ?? repo?.effort ?? null;
   // Undefined rather than null: these become DriverStartOptions fields, and the drivers treat
   // "absent" as "don't pass it", which is what lets the tool apply its own default.
   return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
@@ -1090,16 +1115,20 @@ export class RunSupervisor {
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
+    // The reviewer as a coordinate (RUN-113): `[verify.agent].agent = "codex.gpt-5_6-sol.high"`
+    // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields.
+    const reviewerCoord = reviewer?.agent ? tryParseCoordinate(reviewer.agent) : null;
+    const reviewerTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
     // The reviewer's driver (RUN-70): the repo may put a different VENDOR's model in judgment —
     // the strongest form of the reviewer's independence. Fail-closed when the named tool has no
     // driver here: silently reviewing with the builder's own vendor would defeat the choice, the
     // same reasoning that makes an absent `shell` pin fail the cmd gate outright (RUN-42).
-    const driver = reviewer?.tool ? this.deps.drivers[reviewer.tool] : ctx.driver;
+    const driver = reviewerTool ? this.deps.drivers[reviewerTool as AgentTool] : ctx.driver;
     if (!driver) {
       return {
         verdict: 'unknown',
         passed: false,
-        findings: `the manifest asks for a '${reviewer?.tool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent].tool`,
+        findings: `the manifest asks for a '${reviewerTool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent]`,
       };
     }
     // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
@@ -1107,8 +1136,11 @@ export class RunSupervisor {
     // the reviewer names its own tool: model names are vendor-specific and [defaults.verify]
     // may name the other vendor's, so the fallback is severed and the tool's own default holds.
     // Effort still falls through — it is tool-agnostic intent, mapped per driver.
-    const model = reviewer?.model ?? (reviewer?.tool ? null : (manifest.defaults?.verify?.model ?? null));
-    const effort = reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
+    const model =
+      reviewerCoord?.model ??
+      reviewer?.model ??
+      (reviewerTool ? null : (manifest.defaults?.verify?.model ?? null));
+    const effort = reviewerCoord?.effort ?? reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
     // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
     // work, so a bare `git diff` shows nothing — the range is the review. A live backend
     // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
@@ -1354,8 +1386,9 @@ export class RunSupervisor {
 
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const driver = this.deps.drivers[run.agentTool as AgentTool];
-    if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
+    const driver = this.deps.drivers[tool as AgentTool];
+    if (!driver) return fail(`no driver for tool ${tool}`);
     if (!entry.sessionId) return fail('parked run has no session to resume');
 
     // The workspace is REUSED, never re-leased: it holds the work the agent did before it
@@ -1511,8 +1544,9 @@ export class RunSupervisor {
 
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const driver = this.deps.drivers[run.agentTool as AgentTool];
-    if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
+    const driver = this.deps.drivers[tool as AgentTool];
+    if (!driver) return fail(`no driver for tool ${tool}`);
 
     // Defense in depth (RUN-81): the server decides what to dispatch, but a bug in its phase/plan
     // gate — the removal of plan-task dependency edges left claim_task to enforce phase order

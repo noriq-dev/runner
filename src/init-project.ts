@@ -357,6 +357,11 @@ export function renderProjectManifest(m: ManifestChoices): string {
       '# [defaults.scope]',
       '# model = "claude-opus-4-8"',
       '# effort = "high"',
+      '#',
+      '# Or as one agent COORDINATE (RUN-113), <tool>.<model>.<effort> with a dotted model',
+      '# version spelled with underscores (opus-4_8 = opus-4.8). When set it wins over the pair:',
+      '# [defaults.build]',
+      '# agent = "claude.opus-4_8.high"',
     );
   }
 
@@ -399,6 +404,8 @@ export function renderProjectManifest(m: ManifestChoices): string {
       m.reviewer.effort
         ? `effort = ${tomlString(m.reviewer.effort)}`
         : '# effort = "high"   # low | medium | high | xhigh | max — blank falls through like model',
+      // The reviewer as one coordinate (RUN-113) — names a different vendor to judge the work:
+      '# agent = "codex.gpt-5_6-sol.high"   # <tool>.<model>.<effort>; wins over tool/model/effort',
       m.reviewer.maxRounds != null
         ? `maxRounds = ${m.reviewer.maxRounds}`
         : '# maxRounds = 2   # FAIL → fix → re-review rounds before a human picks it up',

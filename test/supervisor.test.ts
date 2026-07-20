@@ -6,6 +6,7 @@ import type { ContinuableRun } from '../src/continuable';
 import type {
   AgentDriver,
   DriverCapabilities,
+  DriverCatalog,
   DriverExit,
   DriverSession,
   DriverStartOptions,
@@ -53,6 +54,7 @@ class FakeDriver implements AgentDriver {
     resumableSession: true,
     perModelTelemetry: true,
   };
+  catalog: DriverCatalog = { models: [], efforts: [] };
   constructor(readonly tool: 'claude' | 'codex') {
     if (tool === 'codex') {
       this.capabilities = {
@@ -267,7 +269,7 @@ const perm = (write: boolean): PermissionProfile => ({
   deny: [],
   auto: false,
 });
-const noModel = (): ModelDefault => ({ model: null, effort: null });
+const noModel = (): ModelDefault => ({ agent: null, model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   board: null,
@@ -302,6 +304,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   brief: 'ship the thing',
   repoRef: 'repo_a',
   agentTool: 'claude',
+  // No coordinate by default (RUN-114): a legacy-shaped dispatch — the runner synthesizes one
+  // from agentTool/model/effort below, so behaviour is identical to before the coordinate existed.
+  agent: null,
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,
@@ -669,6 +674,34 @@ describe('RunSupervisor', () => {
     await flush();
     expect(h.codex.opts?.cwd).toBe('/wt/run_1'); // codex driver started
     expect(h.claude.opts).toBeUndefined();
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('a dispatch AGENT coordinate overrides agentTool + carries model/effort (RUN-114)', async () => {
+    // Legacy agentTool says claude, but the coordinate names codex — the coordinate wins.
+    const h = harness();
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'claude', agent: 'codex.gpt-5_6-sol.high' }),
+    );
+    await flush();
+    expect(h.codex.opts?.cwd).toBe('/wt/run_1'); // the coordinate's driver started
+    expect(h.claude.opts).toBeUndefined();
+    expect(h.codex.opts?.model).toBe('gpt-5.6-sol'); // unescaped from the coordinate
+    expect(h.codex.opts?.effort).toBe('high');
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('a legacy dispatch with no coordinate still resolves identically (RUN-114 back-compat)', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', agent: null, model: 'gpt-5.3-codex', effort: 'low' }),
+    );
+    await flush();
+    expect(h.codex.opts?.cwd).toBe('/wt/run_1');
+    expect(h.codex.opts?.model).toBe('gpt-5.3-codex');
+    expect(h.codex.opts?.effort).toBe('low');
     h.codex.complete('done');
     await done;
   });
@@ -1747,7 +1780,7 @@ describe('the inline reviewer (RUN-61)', () => {
         timeoutSeconds: null,
         shell: null,
         maxRounds: 2,
-        agent: { tool: null, model: null, effort: null, maxRounds: 2, ...agent },
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2, ...agent },
       },
     });
 
@@ -1784,6 +1817,25 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.verifyRan()).toBe(true); // the cmd floor still ran first
+  });
+
+  it('a reviewer AGENT coordinate picks the vendor, model, and effort (RUN-113)', async () => {
+    // [verify.agent] agent = "codex.gpt-5_6-sol.high" → a codex reviewer judging a claude build.
+    const h = harness({ manifest: REVIEWED('npm test', { agent: 'codex.gpt-5_6-sol.high' }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn runs on claude
+    for (let i = 0; i < 50; i++) {
+      if (h.codex.starts.some((s) => s.runId === 'run_1:review')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    expect(review).toBeDefined();
+    expect(review?.model).toBe('gpt-5.6-sol'); // unescaped from the coordinate
+    expect(review?.effort).toBe('high');
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    await done;
   });
 
   it('hands a FAIL report back to the builder, then a FRESH reviewer passes the fix', async () => {
@@ -2152,7 +2204,7 @@ describe('the inline reviewer (RUN-61)', () => {
           timeoutSeconds: null,
           shell: null,
           maxRounds: 2,
-          agent: { tool: null, model: null, effort: null, maxRounds: 2 },
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
         },
       },
     });
@@ -2177,7 +2229,7 @@ describe('the inline reviewer (RUN-61)', () => {
           timeoutSeconds: null,
           shell: null,
           maxRounds: 2,
-          agent: { tool: null, model: null, effort: null, maxRounds: 0 },
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
         },
       },
     });
@@ -2229,7 +2281,7 @@ describe('the inline reviewer (RUN-61)', () => {
 
   it('naming a tool severs the [defaults.verify].model fallback — model names are vendor-specific', async () => {
     const m = REVIEWED('npm test', { tool: 'codex' });
-    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'high' }; // the OTHER vendor's model
+    m.defaults.verify = { agent: null, model: 'claude-sonnet-5', effort: 'high' }; // the OTHER vendor's model
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -2244,7 +2296,7 @@ describe('the inline reviewer (RUN-61)', () => {
 
   it('the reviewer model falls back to [defaults.verify] when the agent block names none', async () => {
     const m = REVIEWED();
-    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'xhigh' };
+    m.defaults.verify = { agent: null, model: 'claude-sonnet-5', effort: 'xhigh' };
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -2695,15 +2747,20 @@ describe('choosing a model + effort (RUN-33)', () => {
     manifest({
       defaults: {
         // What the task's own argument asks for: kinds differ, so a repo says so once.
-        scope: { model: 'claude-opus-4-8', effort: 'high' },
-        build: { model: 'claude-sonnet-5', effort: 'medium' },
-        verify: { model: null, effort: 'xhigh' },
+        scope: { agent: null, model: 'claude-opus-4-8', effort: 'high' },
+        build: { agent: null, model: 'claude-sonnet-5', effort: 'medium' },
+        verify: { agent: null, model: null, effort: 'xhigh' },
         ...over,
       },
     });
 
   it('the dispatch wins — a human chose, for this run', () => {
-    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: 'max' }, MODELS())).toEqual({
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: 'max' },
+        MODELS(),
+      ),
+    ).toEqual({
       model: 'claude-fable-5',
       effort: 'max',
     });
@@ -2711,11 +2768,15 @@ describe('choosing a model + effort (RUN-33)', () => {
 
   it('falls back to the repo’s default for THAT kind', () => {
     // The point of per-kind: scope is exploration and judgment, build is execution.
-    expect(resolveModel({ kind: 'scope', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'scope', model: null, effort: null }, MODELS()),
+    ).toEqual({
       model: 'claude-opus-4-8',
       effort: 'high',
     });
-    expect(resolveModel({ kind: 'build', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, MODELS()),
+    ).toEqual({
       model: 'claude-sonnet-5',
       effort: 'medium',
     });
@@ -2724,20 +2785,63 @@ describe('choosing a model + effort (RUN-33)', () => {
   it('merges per FIELD — naming only a model keeps the repo’s effort', () => {
     // Whole-object merge would mean the one field a dispatcher set silently erased the other,
     // which is the bug mergeBudget already exists to avoid.
-    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: null },
+        MODELS(),
+      ),
+    ).toEqual({
       model: 'claude-fable-5',
       effort: 'medium', // the repo's
+    });
+  });
+
+  it('a repo [defaults].agent COORDINATE supplies the model+effort (RUN-113)', () => {
+    const m = MODELS({ build: { agent: 'claude.opus-4_8.high', model: null, effort: null } });
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, m),
+    ).toEqual({
+      model: 'opus-4.8', // unescaped from the coordinate
+      effort: 'high',
+    });
+  });
+
+  it('the coordinate wins over the legacy model/effort pair, dispatch still overrides both', () => {
+    // agent set AND model/effort set on the same block → the coordinate is authoritative...
+    const m = MODELS({ build: { agent: 'claude.opus-4_8.high', model: 'claude-sonnet-5', effort: 'low' } });
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, m),
+    ).toEqual({
+      model: 'opus-4.8',
+      effort: 'high',
+    });
+    // ...but a dispatch value still beats the repo default, coordinate or not.
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: null },
+        m,
+      ),
+    ).toEqual({
+      model: 'claude-fable-5',
+      effort: 'high', // from the coordinate, since the dispatch named no effort
     });
   });
 
   it('says NOTHING when nobody chose — the tool keeps its own default', () => {
     // The pre-RUN-33 behaviour, and it must stay reachable: absent, not null, because the
     // drivers only pass through what is present.
-    expect(resolveModel({ kind: 'build', model: null, effort: null }, manifest())).toEqual({});
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null },
+        manifest(),
+      ),
+    ).toEqual({});
   });
 
   it('an effort with no model is a normal thing to want', () => {
-    expect(resolveModel({ kind: 'verify', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'verify', model: null, effort: null }, MODELS()),
+    ).toEqual({
       effort: 'xhigh',
     });
   });
@@ -2970,7 +3074,7 @@ describe('the run model mix (RUN-59)', () => {
         timeoutSeconds: null,
         shell: null,
         maxRounds: 2,
-        agent: { tool: null, model: null, effort: null, maxRounds: 2 },
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
       },
     });
     const h = harness({ manifest: reviewed });
@@ -3015,7 +3119,7 @@ describe('the run model mix (RUN-59)', () => {
         timeoutSeconds: null,
         shell: null,
         maxRounds: 2,
-        agent: { tool: 'claude', model: null, effort: null, maxRounds: 2 },
+        agent: { agent: null, tool: 'claude', model: null, effort: null, maxRounds: 2 },
       },
     });
     const h = harness({ manifest: reviewed });

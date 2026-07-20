@@ -46,6 +46,18 @@ describe('buildRegistration', () => {
     expect(reg.kinds).toEqual(['build']);
     expect(reg.repos).toEqual([]);
   });
+
+  it('advertises the coordinate catalog per installed tool (RUN-115)', () => {
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude', 'codex'] }, []);
+    const claude = reg.agents.find((a) => a.tool === 'claude');
+    const codex = reg.agents.find((a) => a.tool === 'codex');
+    expect(claude?.models).toContain('claude-opus-4-8');
+    expect(claude?.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    // codex advertises no effort above its own high — it cannot distinguish xhigh/max
+    expect(codex?.efforts).toEqual(['low', 'medium', 'high']);
+    // a runner with no tools advertises no agents
+    expect(buildRegistration({ label: 'l', concurrency: 1, tools: [] }, []).agents).toEqual([]);
+  });
 });
 
 describe('version reporting (RUN-36)', () => {

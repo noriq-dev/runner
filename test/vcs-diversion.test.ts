@@ -344,6 +344,7 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
       resumableSession: true,
       perModelTelemetry: true,
     };
+    readonly catalog = { models: [], efforts: [] };
     opts?: DriverStartOptions;
     start(opts: DriverStartOptions) {
       this.opts = opts;
@@ -401,9 +402,9 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
             verify: { write: false, network: 'restricted', allow: [], deny: [], auto: false },
           },
           defaults: {
-            scope: { model: null, effort: null },
-            build: { model: null, effort: null },
-            verify: { model: null, effort: null },
+            scope: { agent: null, model: null, effort: null },
+            build: { agent: null, model: null, effort: null },
+            verify: { agent: null, model: null, effort: null },
           },
         },
       }),

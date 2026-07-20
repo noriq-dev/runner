@@ -176,6 +176,13 @@ export const Run = z.object({
   brief: z.string().default(''), // the dispatch intent; may be empty for anchored runs
   repoRef: z.string(), // id of a RunnerRepo advertised by the owning runner
   agentTool: AgentTool,
+  // The dispatch's agent COORDINATE (RUN-114): `claude.opus-4_8.high` — the canonical selector,
+  // naming tool+model+effort in one string. When set it WINS over agentTool/model/effort below (the
+  // legacy triple, kept for one deprecation window); when null the runner synthesizes a coordinate
+  // FROM that triple, so a dispatcher that never learned the coordinate keeps working unchanged.
+  // PENDING PLANAR PORT (RUN-114/RUN-119): authored in the vendored copy first — see the marker in
+  // manifest.ts; do not re-vendor from planar before RUN-119 ports it.
+  agent: z.string().nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
   // model names are the vendor's and they change weekly, so pinning them in a wire contract (or

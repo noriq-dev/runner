@@ -4,6 +4,7 @@ import { superviseBudget, totalTokens } from '../src/drivers/budget';
 import type {
   AgentDriver,
   DriverCapabilities,
+  DriverCatalog,
   DriverExit,
   DriverStartOptions,
   DriverTelemetry,
@@ -21,6 +22,7 @@ class FakeDriver implements AgentDriver {
     resumableSession: true,
     perModelTelemetry: true,
   };
+  readonly catalog: DriverCatalog = { models: [], efforts: [] };
   handlers!: DriverStartOptions['handlers'];
   stops = 0;
   private settle!: (e: DriverExit) => void;
