@@ -180,8 +180,8 @@ export const Run = z.object({
   // naming tool+model+effort in one string. When set it WINS over agentTool/model/effort below (the
   // legacy triple, kept for one deprecation window); when null the runner synthesizes a coordinate
   // FROM that triple, so a dispatcher that never learned the coordinate keeps working unchanged.
-  // PENDING PLANAR PORT (RUN-114/RUN-119): authored in the vendored copy first — see the marker in
-  // manifest.ts; do not re-vendor from planar before RUN-119 ports it.
+  // PENDING PLANAR PORT (RUN-122): authored in the vendored copy first — see the marker in
+  // manifest.ts and PLANAR-PORT.md; do not re-vendor from planar before RUN-122 ports it.
   agent: z.string().nullable().default(null),
   // The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
   // workflow is a NAMED variant of `kind` (its base): `kind` still carries the posture (so every

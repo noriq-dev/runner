@@ -54,6 +54,12 @@ The dispatch path:
 5. **`drivers/`** — `AgentDriver` (`drivers/types.ts`) is one interface over `claude.ts` (Claude Agent
    SDK streaming `query()`, not one-shot `claude -p`, so the session stays steerable) and `codex.ts`.
    `drivers/budget.ts` wraps a session to enforce token/USD/wall-clock ceilings (breach → SIGTERM).
+   **This interface is the ONLY place a vendor's specifics live** (RUN-109…111): each driver declares
+   its `capabilities` (in-process hooks, steer, resume, per-model telemetry) and `catalog`, so the
+   supervisor reads a capability rather than comparing a driver's name; env sanitization is hoisted
+   *above* the seam (`DriverStartOptions.env`, computed once in the supervisor's `startAgent`), so the
+   trust boundary holds no matter who spawns. We deliberately keep executing **inside our own trust
+   boundary** — no third-party runtime adapter — but the seam is clean enough to add one later.
 6. **`verify.ts`** (deterministic, zero-token manifest command) then **`verify-agent.ts`** (independent
    adversarial agent) gate a build; **`land.ts`** rebases + re-verifies + fast-forwards when `[land]`
    is configured.
@@ -67,11 +73,25 @@ maps templates to call sites). Edit the words there — code only decides which 
 with which facts. The build inlines them via esbuild `define` (`__RUNNER_PROMPTS__`, same rail as
 `__RUNNER_VERSION__`), so `dist/cli.js` stays self-contained; tsx/vitest read the files directly.
 
-### Run kinds
+### Workflows (formerly "run kinds")
 
 `scope` (read-only, produces a plan), `build` (writes, then gated by verify/land), `verify` (executes
-but never edits). The kind drives the permission profile, worktree writability, prompt assembly, and
-steer mode — most branching in `supervisor.ts` keys off it.
+but never edits) are the three **built-in workflows** (`src/workflow.ts` `BUILTIN_WORKFLOWS`). Since
+RUN-116/117 they are *data*, not a `switch`: a `Workflow` descriptor carries `promptShape`,
+`worktreeWritable`, `produces`, `verifyActor`, `usesPlanBase`, and `supervisor.ts` reads those flags
+— it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119): a named
+variant of a built-in `base` that inherits the base's posture verbatim and only swaps in a prompt.
+
+The **write floor is workflow-independent** (RUN-118): `clampPermissionToWorkflow` forces `write =
+false` for any non-producing workflow at every permission site, so "verify executes but never edits"
+is enforced in code, not by trusting the manifest — a custom workflow can never widen its posture.
+
+### Agent coordinate (formerly tool + model + effort)
+
+A dispatch/manifest names the agent as one dotted **coordinate** — `claude.opus-4_8.high` (`.` in a
+model version is written `_`) — parsed by `src/agent-coordinate.ts`. It is canonical; the legacy
+`{tool, model, effort}` triple is derived from it for one deprecation window (`runCoordinate` /
+`resolveAgentTool` normalize either form, so a legacy dispatch resolves byte-identically).
 
 ### Two-file config
 
@@ -104,6 +124,9 @@ and should be updated alongside any change here.
   ~~never granted~~ was the pre-RUN-68 wording; do not restore it — see `mapPermission`, `mapSandbox`.
 - **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
 - **The verify agent executes but never edits** — authorship separation is the point of the gate.
+  Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
+  `write = false` for any non-producing workflow at every permission site, so no manifest — built-in
+  kind or custom `[workflow.<name>]` — can hand a verify/scope posture the ability to edit.
 - **One worktree per Run**; never two runs in one checkout; never force-delete work that exists nowhere
   else.
 - Merging happens only into the branch `[land].branch` names, only after the gate passed *rebased onto

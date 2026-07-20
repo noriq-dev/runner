@@ -106,6 +106,29 @@ describe('coordinateFromParts (legacy triple → coordinate)', () => {
   });
 });
 
+describe('legacy triple ⟷ coordinate equivalence (RUN-124 deprecation window)', () => {
+  // The back-compat contract: for one deprecation window the runner accepts BOTH a coordinate and
+  // the legacy {tool, model, effort} triple, and they must resolve to the SAME parts. This pins it.
+  const triples: Array<[string, string | null, string | null]> = [
+    ['claude', 'claude-opus-4-8', 'high'],
+    ['codex', 'gpt-5.6-sol', null],
+    ['claude', null, 'max'],
+    ['codex', null, null],
+  ];
+  for (const [tool, model, effort] of triples) {
+    it(`triple (${tool}, ${model}, ${effort}) → coordinate → identical triple`, () => {
+      const coord = coordinateFromParts(tool, model, effort as never);
+      // format then re-parse: the coordinate is a lossless carrier of the triple
+      const round = parseCoordinate(formatCoordinate(coord));
+      expect({ tool: round.tool, model: round.model, effort: round.effort }).toEqual({
+        tool,
+        model,
+        effort,
+      });
+    });
+  }
+});
+
 describe('mergeCoordinate (dispatch → repo defaults → driver default)', () => {
   it('fills only the fields the primary leaves null, first fallback wins', () => {
     const primary: AgentCoordinate = { tool: 'claude', model: null, effort: 'high' };

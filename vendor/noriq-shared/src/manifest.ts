@@ -2,12 +2,15 @@ import { z } from 'zod';
 import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
 // ===========================================================================
-// PENDING PLANAR PORT (RUN-113/RUN-119): the `agent` coordinate fields added to
-// ModelDefault and VerifyReviewer below were authored HERE first so the runner
-// could compile and test against them. They must be ported verbatim into planar
-// `packages/shared/src/manifest.ts` and re-vendored — do NOT run `npm run
-// vendor:shared` before that port, or these deltas are overwritten from planar.
-// Reconciliation is RUN-119 (Phase 5).
+// PENDING PLANAR PORT (RUN-122): several fields in this file and in runner.ts were
+// authored HERE first so the runner could compile and test against them. They must
+// be ported verbatim into planar `packages/shared/src` and re-vendored — do NOT run
+// `npm run vendor:shared` before that port, or these deltas are overwritten from
+// planar. The full delta list + the dispatch/dashboard companions are in
+// PLANAR-PORT.md; reconciliation is RUN-122 (Phase 5).
+//   manifest.ts:  ModelDefault.agent, VerifyReviewer.agent, WorkflowDef,
+//                 ProjectManifest.workflows
+//   runner.ts:    Run.agent, Run.workflow, (registration) agents[] + repos[].workflows
 // ===========================================================================
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
