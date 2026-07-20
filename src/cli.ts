@@ -2,6 +2,7 @@
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { type AuthMode, authorize, resolveMode } from './auth';
+import { completionCandidates, completionScript } from './completion';
 import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
 import { DEFAULT_CREDENTIALS_PATH } from './credentials';
 import { Daemon } from './daemon';
@@ -26,12 +27,20 @@ Commands:
   start            Discover repos, register with Noriq, and supervise dispatched runs
   discover         Scan roots for .noriq/project.toml markers and list found repos
   config           Load, validate, and print the resolved machine config
+  completion       Print a shell completion script (bash | zsh) — see below
   version          Print the version
   help             Print this help
 
 Options:
   --config <path>  Path to runner.toml (default: ${DEFAULT_CONFIG_PATH})
   --log-level <l>  debug | info | warn | error (default: info)
+
+Shell completion:
+  Add tab-completion for commands, flags, and flag values. Source the script from
+  your shell's rc file so it loads every session:
+    bash:  echo 'eval "$(noriq-runner completion bash)"' >> ~/.bashrc
+    zsh:   echo 'eval "$(noriq-runner completion zsh)"'  >> ~/.zshrc
+         (zsh needs \`autoload -U compinit && compinit\` earlier in the rc file)
 
 auth options:
   --server <url>   Noriq server to authorize against (default: the config's server)
@@ -51,6 +60,8 @@ Environment:
 
 interface ParsedArgs {
   command: string;
+  /** Positional arguments after the command, e.g. `completion bash` → ['bash']. */
+  rest: string[];
   configPath?: string;
   logLevel?: string;
   server?: string;
@@ -78,7 +89,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg?.startsWith('-')) throw new Error(`unknown option: ${arg}`);
     else if (arg) positional.push(arg);
   }
-  return { command: positional[0] ?? 'help', configPath, logLevel, server, authMode, advanced };
+  return {
+    command: positional[0] ?? 'help',
+    rest: positional.slice(1),
+    configPath,
+    logLevel,
+    server,
+    authMode,
+    advanced,
+  };
 }
 
 /** The server to talk to: --server wins, else the machine config's. */
@@ -191,6 +210,14 @@ async function cmdStart(configPath?: string): Promise<void> {
 }
 
 export async function run(argv: string[]): Promise<number> {
+  // The completion hook, handled before parseArgs: its argv is raw shell words (flags, empty
+  // trailing word, partial tokens) that the normal parser would consume or reject. Hidden from
+  // help — it exists only for the generated completion scripts to call.
+  if (argv[0] === '__complete') {
+    for (const candidate of completionCandidates(argv.slice(1))) console.log(candidate);
+    return 0;
+  }
+
   let args: ParsedArgs;
   try {
     args = parseArgs(argv);
@@ -227,6 +254,15 @@ export async function run(argv: string[]): Promise<number> {
       case 'config':
         await cmdConfig(args.configPath);
         return 0;
+      case 'completion': {
+        const shell = args.rest[0];
+        if (shell !== 'bash' && shell !== 'zsh') {
+          logger.error('usage: noriq-runner completion <bash|zsh>');
+          return 2;
+        }
+        console.log(completionScript(shell));
+        return 0;
+      }
       case 'discover':
         await cmdDiscover(args.configPath);
         return 0;

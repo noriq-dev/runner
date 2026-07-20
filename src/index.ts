@@ -87,6 +87,7 @@ export {
   type LandChoices,
   type ManifestChoices,
 } from './init-project';
+export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
 export { detectTools } from './tools';
 export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
 export {

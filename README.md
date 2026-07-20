@@ -182,6 +182,7 @@ server; a name that doesn't resolve simply doesn't bind, and the repo stays disp
 | `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
 | `noriq-runner discover`| List repos discovered under the config's scan roots       |
 | `noriq-runner config`  | Load, validate, and print the resolved machine config     |
+| `noriq-runner completion <bash\|zsh>` | Print a shell tab-completion script (source it — see below) |
 | `noriq-runner update`  | Check whether this runner is behind (it will not replace itself) |
 | `noriq-runner version` | Print the version                                         |
 | `noriq-runner help`    | Print help                                                |
@@ -193,6 +194,21 @@ authorize before that file exists, or to point at another instance.
 **`update` only tells you** — it never replaces itself, and there is no auto-update setting. A
 daemon that silently upgrades itself and then spawns agents with file access is a supply-chain
 path into every repo on the machine, so deciding when to take a new version stays yours.
+
+### Tab completion
+
+`noriq-runner <TAB>` completes commands, per-command flags, and flag values (e.g. `--log-level`).
+Source the generated script from your shell's rc file so it loads every session:
+
+```bash
+# bash
+echo 'eval "$(noriq-runner completion bash)"' >> ~/.bashrc
+# zsh (needs `autoload -U compinit && compinit` earlier in the file)
+echo 'eval "$(noriq-runner completion zsh)"' >> ~/.zshrc
+```
+
+The script is generated from the same command table the CLI parses, so it never drifts out of
+sync — it delegates back to the binary for candidates rather than hard-coding a copy of the list.
 
 ## Develop
 
