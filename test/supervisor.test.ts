@@ -739,6 +739,20 @@ describe('RunSupervisor', () => {
     await done;
   });
 
+  it('a verify run stays read-only even if the manifest grants write (RUN-118 floor)', async () => {
+    // The workflow-independent floor: a non-producing workflow can never be handed write, no matter
+    // what [permissions.verify] says — "verify executes but never edits" is not a manifest's to undo.
+    const m = manifest({
+      permissions: { scope: perm(false), build: perm(true), verify: perm(true) },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(makeRun({ kind: 'verify' }));
+    await flush();
+    expect(h.claude.opts?.permission.write).toBe(false); // clamped, despite verify: perm(true)
+    h.claude.complete('done');
+    await done;
+  });
+
   it('build done + verify passes → done (floor gate cleared)', async () => {
     const h = harness({ verifyPasses: true });
     const done = h.supervisor.supervise(

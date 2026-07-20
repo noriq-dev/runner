@@ -56,6 +56,7 @@ import {
   reviewerNoVerdictComment,
   reviewerRejectionComment,
 } from './verify-reviewer';
+import { clampPermissionToWorkflow, workflowFor } from './workflow';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -501,10 +502,11 @@ export function assemblePrompt(
     server: ctx.server,
   });
 
-  if (run.kind === 'scope') {
+  const wf = workflowFor(run.kind as RunKind); // the prompt family is a workflow trait (RUN-117)
+  if (wf.promptShape === 'scope') {
     return renderPrompt('scope', { identity, brief: run.brief, anchor });
   }
-  if (run.kind === 'build') {
+  if (wf.promptShape === 'build') {
     // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
     // ran the SAME command itself as the actual gate — so the agent paid tokens and about a minute
     // to answer a question that got asked again, properly, right afterwards. Its run was advisory;
@@ -596,7 +598,7 @@ export class RunSupervisor {
     token: string,
   ): LockEnforcer | undefined {
     const vcs = this.vcsFor(repo);
-    if (kind !== 'build' || !vcs.lock || !vcs.unlock) return undefined;
+    if (!workflowFor(kind).produces || !vcs.lock || !vcs.unlock) return undefined;
     const ctx: LockContext = {
       projectId: run.projectId,
       token,
@@ -1377,6 +1379,7 @@ export class RunSupervisor {
     if (!entry) return null;
     const { run } = entry;
     const kind = run.kind as RunKind;
+    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
 
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
@@ -1429,9 +1432,9 @@ export class RunSupervisor {
       // that is mid-thought.
       prompt: resumePrompt(entry.question, answer),
       resumeSessionId: entry.sessionId,
-      permission: repo.manifest.permissions[kind],
+      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
-      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      multiTurn: wf.produces && Boolean(repo.manifest.verify),
       // The same model it was running before it parked (RUN-33): the session being resumed is
       // that model's conversation, and quietly finishing the job on a different one would make
       // "resumed with its context intact" only half true.
@@ -1483,7 +1486,7 @@ export class RunSupervisor {
       repo,
       worktree,
       driver,
-      permission: repo.manifest.permissions[kind],
+      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
       task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
       runAgent,
@@ -1578,7 +1581,8 @@ export class RunSupervisor {
     }
 
     const kind = run.kind as RunKind;
-    const permission = repo.manifest.permissions[kind];
+    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
+    const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
     // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
     // suite and exercise the behavior, which needs a writable tree (node_modules, test
     // temp files, .wrangler state) — chmod'ing it read-only makes that instruction
@@ -1586,27 +1590,27 @@ export class RunSupervisor {
     // barred from EDITING by its profile (no Edit/Write tools + an enumerated bash
     // allowlist), which is the property that actually matters: it must not be able to
     // "fix" the code it is judging.
-    const readOnly = kind === 'scope';
+    const readOnly = !wf.worktreeWritable;
 
     // A VERIFY run leases from the BUILD it judges, not from HEAD — otherwise it gets a
     // pristine checkout, the `git diff` its prompt orders is empty, and it renders a
     // verdict on code nobody changed. `verifiesRunId` is what carries that link. By run id,
     // not by ref (RUN-50): how a run's work is NAMED — a branch, a shelved change — is the
     // backend's own convention, and this file no longer knows it.
-    const verifiesRunId = run.kind === 'verify' ? (run.verifiesRunId ?? null) : null;
+    const verifiesRunId = wf.verifyActor ? (run.verifiesRunId ?? null) : null;
 
     // The plan's working branch, when this run belongs to one and it exists (RUN-82). A build
     // FORKS from it (so it sees predecessors' landed work and lands as a fast-forward); a verify
     // run is MEASURED against it (below). A verify run still leases from the build it judges
     // (fromRunId), so `fromTarget` is only meaningful — and only passed — for a build.
-    const planBase = kind === 'build' || kind === 'verify' ? await this.planBase(repo, run) : null;
+    const planBase = wf.usesPlanBase ? await this.planBase(repo, run) : null;
 
     let worktree: Workspace;
     try {
       worktree = await this.vcsFor(repo).lease(repo.root, run.id, {
         readOnly,
         fromRunId: verifiesRunId ?? undefined,
-        ...(kind === 'build' && planBase ? { fromTarget: planBase } : {}),
+        ...(wf.produces && planBase ? { fromTarget: planBase } : {}),
       });
     } catch (err) {
       // A verify run whose build is gone (reaped, or built on another machine) must fail
@@ -1696,7 +1700,7 @@ export class RunSupervisor {
     // lock needs the run's agent token, which is only minted above; a refusal disposes the
     // just-leased worktree. No-op without a resolver / declared scope (the common case today), so
     // the reactive hook + hard floor stay the guarantee.
-    if (kind === 'build' && this.deps.resolveLockScope && this.vcsFor(repo).lock) {
+    if (wf.produces && this.deps.resolveLockScope && this.vcsFor(repo).lock) {
       const scope = (await this.deps.resolveLockScope(run)) ?? [];
       if (scope.length) {
         const ctx: LockContext = {
@@ -1779,7 +1783,7 @@ export class RunSupervisor {
       // Keep the session alive past its first result ONLY when a feedback loop is possible: a
       // build, with a verify command to fail. Scope and verify runs want today's behaviour —
       // finish and close — and a session nobody closes hangs the daemon (see the finally below).
-      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      multiTurn: wf.produces && Boolean(repo.manifest.verify),
       // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
       // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
       ...resolveModel(run, repo.manifest),
@@ -1888,6 +1892,7 @@ export class RunSupervisor {
       ctx;
     const continued = ctx.continued ?? null;
     const kind = run.kind as RunKind;
+    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
     // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
     // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.
     let latestLedger: LedgerEntry[] = continued?.ledger ?? [];
@@ -1904,7 +1909,7 @@ export class RunSupervisor {
     // refused, or ran out of road) exits clean with a pristine worktree; verifying that
     // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
     // review as "done" with an empty diff — a silent no-op reported as success.
-    if (kind === 'build' && driverSucceeded) {
+    if (wf.produces && driverSucceeded) {
       const changed = await this.vcsFor(repo)
         .hasWork(worktree)
         .catch(() => true); // can't tell → assume it worked and let verify decide
@@ -1919,7 +1924,7 @@ export class RunSupervisor {
     // not have (or use) git permissions, and loose files are destroyed by the next
     // `worktree remove --force` — including the crash-safe reap on the daemon's next
     // start. Committing here is what makes "a review diff on the branch" true.
-    if (kind === 'build' && driverSucceeded) {
+    if (wf.produces && driverSucceeded) {
       const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
       await this.vcsFor(repo)
         .checkpoint(worktree, runCommitMessage(run.id, label))
@@ -1970,14 +1975,14 @@ export class RunSupervisor {
     // point and broken together, and a gate that never sees the combination can't catch
     // it. Serialized per repo, because rebase→verify→land is a read-modify-write of one
     // branch and two runs interleaving would land untested combinations.
-    const landPolicy = kind === 'build' && driverSucceeded ? (repo.manifest.land ?? null) : null;
+    const landPolicy = wf.produces && driverSucceeded ? (repo.manifest.land ?? null) : null;
     const floorCmd = cmdVerify(repo.manifest.verify);
 
     // Deterministic verify floor (RUN-19), when NOT landing — the landing pipeline verifies the
     // REBASED result instead, which is strictly the better question. Runs BEFORE the reviewer
     // (RUN-61): the command is cheap and deterministic, so it screens out work not worth an
     // agent's review — the same reason CI runs the linter before the humans arrive.
-    if (kind === 'build' && driverSucceeded && exit.outcome === 'done' && !landPolicy && floorCmd) {
+    if (wf.produces && driverSucceeded && exit.outcome === 'done' && !landPolicy && floorCmd) {
       // Same silence as landing, and the longer of the two in practice: the full suite with
       // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
       // the agent on a failure, which flips the phase to 'agent' again — see below.
@@ -2009,7 +2014,7 @@ export class RunSupervisor {
     // combination still builds (the command's question, asked post-rebase inside the lock), never
     // what the diff means — and an agent review inside the repo lock would serialize every other
     // run on this repo behind a judgment that cannot change.
-    if (kind === 'build' && driverSucceeded && exit.outcome === 'done' && repo.manifest.verify?.agent) {
+    if (wf.produces && driverSucceeded && exit.outcome === 'done' && repo.manifest.verify?.agent) {
       this.deps.report(run.id, { status: 'running', phase: 'verifying' });
       const review = await this.reviewWithFeedback({
         run,
@@ -2125,7 +2130,7 @@ export class RunSupervisor {
     // Independent verify agent (RUN-20): the run's own output IS the verdict. A
     // FAIL (or an ambiguous/absent verdict) gates the phase — the run does not
     // reach done and the findings are surfaced.
-    if (kind === 'verify' && driverSucceeded) {
+    if (wf.verifyActor && driverSucceeded) {
       const v = parseVerdict(verifyText);
       if (v.passed) {
         this.log.info('verify agent PASS', { runId: run.id });
@@ -2158,7 +2163,7 @@ export class RunSupervisor {
     // ledger. Any OTHER terminal — done, landed, a driver failure, a non-build — leaves nothing to
     // continue, so drop a record a prior failed sitting may have left (this continuation resolved it).
     if (this.deps.continuable) {
-      if (kind === 'build' && exit.outcome === 'failed' && driverSucceeded && !landed) {
+      if (wf.produces && exit.outcome === 'failed' && driverSucceeded && !landed) {
         const spent = exit.telemetry;
         await this.deps.continuable
           .put({
@@ -2211,7 +2216,7 @@ export class RunSupervisor {
           this.log.warn('lock release on terminal failed', { runId: run.id, err: String(err) }),
         );
     }
-    if (!(kind === 'build' && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
+    if (!(wf.produces && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
       await vcsOut
         .dispose(worktree)
         .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
