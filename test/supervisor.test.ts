@@ -175,8 +175,12 @@ class FakeWorktrees {
   };
   /** Every terminal release-all (RUN-104), by the run's holder token. */
   releasedAll: string[] = [];
+  /** Ordered log of landing vs lock-release, to prove locks are HELD THROUGH the merge and
+   *  released AFTER it (RUN-105). */
+  timeline: Array<'land' | 'release'> = [];
   releaseRunLocks = async (_ws: Workspace, ctx: LockContext): Promise<void> => {
     this.releasedAll.push(ctx.token);
+    this.timeline.push('release');
   };
 
   // ── landing ────────────────────────────────────────────────────────────────
@@ -219,6 +223,7 @@ class FakeWorktrees {
     // fromRef preserved in the recording via workRef, so the assertions still name the run
     // branch that reached publish — the fake reads its own display field, never location.
     this.landings.push({ branch, fromRef: ws.workRef });
+    this.timeline.push('land');
     return { ok: true, sha: 'landedsha' };
   };
   /** Non-empty → git refuses the landing with this message (e.g. a checked-out branch). */
@@ -1099,6 +1104,37 @@ describe('lock release on terminal (RUN-104)', () => {
     h.claude.complete('done');
     expect((await done).outcome).toBe('done');
     expect(h.worktrees.releasedAll).toEqual(['plnrt_bound_to_agt_run1']);
+  });
+
+  it('HOLDS locks through the merge and releases AFTER landing, never before (RUN-105)', async () => {
+    // Two runs land onto one integration branch serially; the first must keep its locks until its
+    // work is actually on the branch, or the second could grab a file mid-landing and race it.
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.timeline).toEqual(['land', 'release']); // land first, THEN release
+  });
+
+  it('a run in one worktree is gated by a lock a run in ANOTHER worktree holds (RUN-105)', async () => {
+    // Locks live server-side, so two runs on the same repo (each in its own worktree) see each
+    // other's holds — the peer conflict here IS another worktree's run. The hard floor gates the
+    // second rather than letting it clobber the first's file.
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_worktree_b', holderName: 'run in worktree B' }],
+    });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    expect((await done).reason).toBe('lock');
+    expect(h.worktrees.landings).toEqual([]); // the two never land over each other
   });
 });
 

@@ -2124,6 +2124,10 @@ export class RunSupervisor {
     const vcsOut = this.vcsFor(repo);
     // Release the run's locks on terminal (RUN-104), UNCONDITIONALLY — a kept-work build skips
     // dispose (below), but its locks must still free so a peer waiting on those files unblocks.
+    // Placed AFTER landing on purpose (RUN-105): the locks are HELD THROUGH the rebase→verify→
+    // fast-forward, so a second run in another worktree on this repo cannot grab a file mid-merge
+    // and race it — locks live server-side, so runs across worktrees see each other's holds — and
+    // they release only once the work is actually on the integration branch.
     // Best-effort: the server also auto-releases on task settle and via TTL, so a miss here (a
     // crash before this line, a transient error) costs promptness, never correctness — the same
     // reason a daemon RESTART needs no lock reconcile of its own: the existing orphaned-run
