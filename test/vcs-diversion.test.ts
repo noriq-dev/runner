@@ -406,6 +406,7 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
             build: { agent: null, model: null, effort: null },
             verify: { agent: null, model: null, effort: null },
           },
+          workflows: {},
         },
       }),
       report: () => {},

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { AgentTool, RunBudget, RunEffort } from './runner';
+import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
 // ===========================================================================
 // PENDING PLANAR PORT (RUN-113/RUN-119): the `agent` coordinate fields added to
@@ -224,6 +224,25 @@ export const LandPolicy = z.object({
 });
 export type LandPolicy = z.infer<typeof LandPolicy>;
 
+/**
+ * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
+ * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
+ * because scope is, and no field here can change that (the write floor is enforced in the runner,
+ * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
+ * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
+ * (scope/build/verify) are always present and need no declaration.
+ *
+ * PENDING PLANAR PORT (RUN-119/RUN-122): authored in the vendored copy first — see the top marker.
+ */
+export const WorkflowDef = z.object({
+  // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
+  base: RunKind,
+  // A prompt template name or inline text overriding the base's default brief (RUN-121). Null =
+  // use the base's own prompt, exactly as the built-in kind would.
+  prompt: z.string().nullable().default(null),
+});
+export type WorkflowDef = z.infer<typeof WorkflowDef>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -249,6 +268,10 @@ export const ProjectManifest = z.object({
   // still override per run. Not part of the security floor — unlike `permissions`, getting this
   // wrong costs money or quality, never safety.
   defaults: KindDefaults.prefault({}),
+  // Repo-defined workflows (RUN-119), keyed by name: named variants of a built-in kind with their
+  // own prompt. The three built-ins are always available and are NOT listed here; a name that
+  // collides with a built-in is ignored in favour of the built-in (a repo cannot redefine `build`).
+  workflows: z.record(z.string(), WorkflowDef).default({}),
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
 

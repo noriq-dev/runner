@@ -37,7 +37,7 @@ import type { LockConflict } from './lock-client';
 import { LockEnforcer, lockFloorComment } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
-import { renderPrompt } from './prompts';
+import { renderPrompt, renderTemplate } from './prompts';
 import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -56,7 +56,7 @@ import {
   reviewerNoVerdictComment,
   reviewerRejectionComment,
 } from './verify-reviewer';
-import { clampPermissionToWorkflow, workflowFor } from './workflow';
+import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, workflowFor } from './workflow';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -481,7 +481,15 @@ function renderAnchor(run: Run, task?: AnchorTask | null): string {
 export function assemblePrompt(
   run: Run,
   manifest: ProjectManifest,
-  ctx: { agent: RunAgent; server: string; task?: AnchorTask | null; diffCmd?: string },
+  ctx: {
+    agent: RunAgent;
+    server: string;
+    task?: AnchorTask | null;
+    diffCmd?: string;
+    /** The resolved workflow (RUN-121). Default: the built-in for run.kind. A custom workflow with
+     *  a `promptRef` supplies its own brief; its inherited posture still drives everything else. */
+    workflow?: Workflow;
+  },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
   // The daemon created this identity before the process existed and handed it a token that
@@ -502,7 +510,20 @@ export function assemblePrompt(
     server: ctx.server,
   });
 
-  const wf = workflowFor(run.kind as RunKind); // the prompt family is a workflow trait (RUN-117)
+  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
+  if (wf.promptRef) {
+    // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
+    // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
+    // workflow's inherited posture (write floor, gates) still governs everything else.
+    return renderTemplate(wf.promptRef, {
+      identity,
+      server: ctx.server,
+      brief: run.brief,
+      anchor,
+      verifyCmd: manifest.verify?.cmd ?? '',
+      reviewer: manifest.verify?.agent ? 'true' : '',
+    });
+  }
   if (wf.promptShape === 'scope') {
     return renderPrompt('scope', { identity, brief: run.brief, anchor });
   }
@@ -1742,6 +1763,9 @@ export class RunSupervisor {
       server: this.deps.server,
       task,
       diffCmd,
+      // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
+      // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
+      workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,
     });
     let verifyText = ''; // accumulated agent output — the verify verdict is parsed from it
     let tail = ''; // rolling tail of the same output, capped, for the live dashboard (RUN-22)

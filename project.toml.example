@@ -73,6 +73,24 @@ defaultBranch = "main"
 # [defaults.scope]
 # agent = "codex.gpt-5_6-sol.high"   # a different vendor, in one line
 
+# ---------------------------------------------------------------------------
+# Custom workflows (RUN-119) — named variants of a built-in run kind.
+# ---------------------------------------------------------------------------
+# A workflow inherits the security POSTURE of its `base` (one of scope/build/verify)
+# and cannot escape it — a scope-based workflow is read-only because scope is, no
+# matter what. What it varies is the PROMPT the agent is briefed with. The three
+# built-ins are always available and need no declaration; a name that collides with
+# one is ignored (you cannot redefine `build`). {{brief}}, {{anchor}}, {{identity}}
+# are available in the prompt.
+#
+# [workflow.docs]
+# base = "scope"                       # read-only, produces a plan — like scope
+# prompt = "Survey {{brief}} and write a docs-update plan. Do NOT change code."
+#
+# [workflow.hotfix]
+# base = "build"                       # writes + is gated by verify/land — like build
+# prompt = "Ship the smallest safe fix for {{brief}}. {{anchor}}"
+
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this
 # section contains:

@@ -183,6 +183,12 @@ export const Run = z.object({
   // PENDING PLANAR PORT (RUN-114/RUN-119): authored in the vendored copy first — see the marker in
   // manifest.ts; do not re-vendor from planar before RUN-119 ports it.
   agent: z.string().nullable().default(null),
+  // The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
+  // workflow is a NAMED variant of `kind` (its base): `kind` still carries the posture (so every
+  // permission/gate stays kind-driven and floor-safe), and `workflow` only swaps in the workflow's
+  // own prompt. Null / an unknown name → the built-in for `kind`, unchanged.
+  // PENDING PLANAR PORT (RUN-121/RUN-122): authored in the vendored copy first — see manifest.ts.
+  workflow: z.string().nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
   // model names are the vendor's and they change weekly, so pinning them in a wire contract (or

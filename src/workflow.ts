@@ -1,4 +1,4 @@
-import type { PermissionProfile, RunKind } from '@noriq-dev/shared';
+import type { PermissionProfile, ProjectManifest, RunKind } from '@noriq-dev/shared';
 
 /**
  * A workflow (RUN-116) is the SHAPE of a run — what it may touch, what it produces, and which gates
@@ -36,6 +36,9 @@ export interface Workflow {
   /** Fork from the plan's base (build/verify build ON approved work) rather than the repo default
    *  (scope explores from the tip). */
   usesPlanBase: boolean;
+  /** A custom prompt (template name or inline text) overriding the base's default brief (RUN-119).
+   *  Absent/null on a built-in → the promptShape's own template. Consumed by RUN-121. */
+  promptRef?: string | null;
 }
 
 /** The three built-in workflows — the `scope`/`build`/`verify` kinds expressed as data, reproducing
@@ -71,6 +74,26 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
  *  matching built-in; RUN-121 will let a `workflow` id name a custom one, falling back to this. */
 export function workflowFor(kind: RunKind): Workflow {
   return BUILTIN_WORKFLOWS[kind];
+}
+
+const isBuiltinId = (id: string): id is RunKind => id in BUILTIN_WORKFLOWS;
+
+/**
+ * Resolve a workflow by id (RUN-119): a built-in kind name, or a repo-defined `[workflow.<name>]`.
+ * A built-in id ALWAYS wins over a same-named custom one — a repo cannot redefine `build` and
+ * quietly widen it. A custom workflow inherits its `base` built-in's posture verbatim (so the
+ * write floor and every gate come from a known-safe foundation) and only carries its own id +
+ * prompt override. An id that names neither returns `undefined`, so the caller can fall back to the
+ * run's kind rather than guessing a posture.
+ */
+export function resolveWorkflow(
+  id: string,
+  manifest: Pick<ProjectManifest, 'workflows'>,
+): Workflow | undefined {
+  if (isBuiltinId(id)) return BUILTIN_WORKFLOWS[id];
+  const custom = manifest.workflows?.[id];
+  if (!custom) return undefined;
+  return { ...BUILTIN_WORKFLOWS[custom.base], id, promptRef: custom.prompt };
 }
 
 /**

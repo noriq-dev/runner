@@ -63,6 +63,8 @@ export interface RunnerRegistration {
     board: string | null;
     name: string;
     defaultBranch: string | null;
+    /** This repo's custom workflow names (RUN-121); the built-ins are implicit. */
+    workflows: string[];
   }>;
 }
 
@@ -92,6 +94,9 @@ export function buildRegistration(
       board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
+      // The repo's custom workflow names (RUN-121) — the three built-ins are always available and
+      // are not listed. Lets the dashboard offer this repo's own workflows on dispatch.
+      workflows: Object.keys(r.manifest.workflows ?? {}),
     })),
   };
 }

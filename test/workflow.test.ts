@@ -1,6 +1,12 @@
 import type { PermissionProfile } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { BUILTIN_WORKFLOWS, type Workflow, clampPermissionToWorkflow, workflowFor } from '../src/workflow';
+import {
+  BUILTIN_WORKFLOWS,
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  workflowFor,
+} from '../src/workflow';
 
 const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -45,6 +51,42 @@ describe('built-in workflows (RUN-116)', () => {
     expect(all.filter((w) => w.verifyActor)).toHaveLength(1);
     // only scope is worktree-read-only
     expect(all.filter((w) => !w.worktreeWritable).map((w) => w.id)).toEqual(['scope']);
+  });
+});
+
+describe('resolveWorkflow — repo-defined workflows (RUN-119)', () => {
+  const M = (workflows: Record<string, { base: 'scope' | 'build' | 'verify'; prompt: string | null }>) =>
+    ({ workflows }) as Parameters<typeof resolveWorkflow>[1];
+
+  it('resolves a built-in kind id to its built-in workflow', () => {
+    expect(resolveWorkflow('build', M({}))).toEqual(BUILTIN_WORKFLOWS.build);
+  });
+
+  it('a custom workflow inherits its base posture, keeps its own id + prompt', () => {
+    const wf = resolveWorkflow('docs', M({ docs: { base: 'scope', prompt: 'explain-the-area' } }));
+    expect(wf).toMatchObject({
+      id: 'docs',
+      promptShape: 'scope', // inherited from base
+      worktreeWritable: false, // read-only, because scope is
+      produces: false,
+      promptRef: 'explain-the-area',
+    });
+  });
+
+  it('a built-in id wins over a same-named custom workflow (no redefining build)', () => {
+    // A repo cannot widen `build` by declaring [workflow.build] base = "scope".
+    const wf = resolveWorkflow('build', M({ build: { base: 'scope', prompt: null } }));
+    expect(wf).toEqual(BUILTIN_WORKFLOWS.build); // the real build, not the read-only impostor
+  });
+
+  it('returns undefined for an id that names neither a kind nor a defined workflow', () => {
+    expect(resolveWorkflow('nope', M({}))).toBeUndefined();
+  });
+
+  it('a custom build-based workflow keeps the producing posture (write floor unaffected)', () => {
+    const wf = resolveWorkflow('hotfix', M({ hotfix: { base: 'build', prompt: null } }));
+    expect(wf?.produces).toBe(true);
+    expect(clampPermissionToWorkflow({ write: true } as never, wf as Workflow).write).toBe(true);
   });
 });
 

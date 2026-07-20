@@ -281,6 +281,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   // No per-kind model/effort by default: this repo takes whatever the tool defaults to,
   // which is what every run got before RUN-33 existed.
   defaults: { scope: noModel(), build: noModel(), verify: noModel() },
+  workflows: {},
   ...over,
 });
 
@@ -307,6 +308,8 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   // No coordinate by default (RUN-114): a legacy-shaped dispatch — the runner synthesizes one
   // from agentTool/model/effort below, so behaviour is identical to before the coordinate existed.
   agent: null,
+  // No custom workflow by default (RUN-121): the run's kind selects the built-in.
+  workflow: null,
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,
@@ -736,6 +739,31 @@ describe('RunSupervisor', () => {
     await flush();
     expect(claude.opts?.lockEnforcer).toBeUndefined();
     claude.complete('done');
+    await done;
+  });
+
+  it('a custom workflow supplies its own prompt but inherits its base posture (RUN-121)', async () => {
+    const m = manifest({
+      workflows: { docs: { base: 'scope', prompt: 'DOCS-MODE: survey {{brief}} read-only' } },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'scope', workflow: 'docs', brief: 'the auth module' }),
+    );
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('DOCS-MODE: survey the auth module read-only');
+    expect(h.claude.opts?.permission.write).toBe(false); // inherited scope posture: read-only
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('an unknown workflow name falls back to the built-in for the kind (RUN-121)', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    await flush();
+    // no throw, and the scope built-in prompt is used
+    expect(h.claude.opts?.prompt).toContain('MODE: SCOPE');
+    h.claude.complete('done');
     await done;
   });
 

@@ -31,8 +31,8 @@ describe('buildRegistration', () => {
     expect(reg.tools).toEqual(['claude']);
     expect(reg.kinds).toEqual(['scope', 'build', 'verify']);
     expect(reg.repos).toEqual([
-      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main' },
-      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null },
+      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main', workflows: [] },
+      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null, workflows: [] },
     ]);
     expect('runnerId' in reg).toBe(false); // omitted on first registration
   });

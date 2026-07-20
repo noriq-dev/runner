@@ -143,6 +143,7 @@ describe('changedSections', () => {
       build: { agent: null, model: null, effort: null },
       verify: { agent: null, model: null, effort: null },
     },
+    workflows: {},
     ...over,
   });
 

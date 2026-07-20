@@ -88,7 +88,13 @@ export {
   type ManifestChoices,
 } from './init-project';
 export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
-export { BUILTIN_WORKFLOWS, type Workflow, clampPermissionToWorkflow, workflowFor } from './workflow';
+export {
+  BUILTIN_WORKFLOWS,
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  workflowFor,
+} from './workflow';
 export {
   type AgentCoordinate,
   coordinateFromParts,
