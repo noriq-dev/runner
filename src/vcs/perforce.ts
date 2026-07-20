@@ -505,6 +505,13 @@ export class PerforceBackend implements VcsBackend {
     return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
   }
 
+  /** Release the run's Noriq-view locks (RUN-104). Native p4 locks release with the changelist on
+   *  dispose/submit, so only the view needs an explicit drop. */
+  async releaseRunLocks(_ws: Workspace, ctx: LockContext): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.releaseAllMine(ctx.token, ctx.projectId);
+  }
+
   /** Best-effort native `p4 lock`/`p4 unlock` over the opened subset of `paths`. Guarded whole:
    *  the Noriq view already decided the outcome, so nothing here may throw into that decision. */
   private async nativeLock(ws: Workspace, paths: string[], verb: 'lock' | 'unlock'): Promise<void> {

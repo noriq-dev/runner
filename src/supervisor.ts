@@ -88,7 +88,7 @@ export type SupervisorVcs = Pick<
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
   // lock/unlock/queryLocks are optional the same way (RUN-98): a fake or lock-less backend omits
   // them, and the supervisor treats absence as "no lock layer" (RUN-101/103).
-  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths'>>;
+  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths' | 'releaseRunLocks'>>;
 
 export interface ResolvedRepo {
   root: string;
@@ -174,6 +174,18 @@ export interface RunSupervisorDeps {
    * — the daemon spawns exactly as before. Only an explicit `{ claimable: false }` declines.
    */
   checkClaimable?: (taskId: string) => Promise<{ claimable: boolean; reason: string | null } | null>;
+  /**
+   * Dispatch-time predictive locking (RUN-103): the DECLARED file scope of a run, if one is
+   * known, so the daemon can take its locks before the agent starts and refuse a dispatch that
+   * would clash — extending the RUN-81 phase-gate backstop from "is the task claimable" to "are
+   * its files free".
+   *
+   * Honest by construction: no run carries a declared scope on the wire today, so this is a
+   * PLUGGABLE resolver (a future dispatch field / task metadata), and when it is absent or yields
+   * nothing the predictive layer no-ops — the reactive hook (RUN-101) and hard floor (RUN-102)
+   * remain the guarantee. Paths are repo-relative.
+   */
+  resolveLockScope?: (run: Run) => Promise<string[] | null> | string[] | null;
   /**
    * Is this Run parked on a human, and have they answered? (→ NoriqClient.getParkState, RUN-30)
    *
@@ -1624,6 +1636,45 @@ export class RunSupervisor {
         .catch(() => {});
       return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
     }
+
+    // Dispatch-time predictive locking (RUN-103): with a DECLARED scope, take its locks now — as
+    // the run's holder, before the agent starts — and REFUSE a dispatch that clashes rather than
+    // race two agents onto the same files. Runs here (not the RUN-81 pre-lease gate) because a
+    // lock needs the run's agent token, which is only minted above; a refusal disposes the
+    // just-leased worktree. No-op without a resolver / declared scope (the common case today), so
+    // the reactive hook + hard floor stay the guarantee.
+    if (kind === 'build' && this.deps.resolveLockScope && this.vcsFor(repo).lock) {
+      const scope = (await this.deps.resolveLockScope(run)) ?? [];
+      if (scope.length) {
+        const ctx: LockContext = {
+          projectId: run.projectId,
+          token: runAgent.token,
+          branch: this.lockScopeBranch(repo, run),
+          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+        };
+        const outcome = await this.vcsFor(repo).lock!(worktree, scope, ctx).catch(
+          () => ({ ok: true, enabled: false, locks: [] }) as LockOutcome,
+        );
+        if (!outcome.ok) {
+          this.log.warn('predictive lock refused the dispatch — its declared scope clashes', {
+            runId: run.id,
+            holders: outcome.conflicts.map((c) => c.holderName ?? c.holder),
+          });
+          if (run.anchor?.type === 'task') {
+            this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(outcome.conflicts));
+          }
+          await this.vcsFor(repo)
+            .dispose(worktree)
+            .catch(() => {});
+          return fail(
+            `declared file scope is locked by another run (${outcome.conflicts
+              .map((c) => c.path)
+              .join(', ')}); not spawning`,
+          );
+        }
+      }
+    }
+
     const prompt = assemblePrompt(run, repo.manifest, {
       agent: runAgent,
       server: this.deps.server,
@@ -2071,6 +2122,24 @@ export class RunSupervisor {
     // on this repo would wait on a workspace nobody will ever hand back. Such a backend
     // shelves/keeps the work server-side inside dispose, so disposing IS keeping.
     const vcsOut = this.vcsFor(repo);
+    // Release the run's locks on terminal (RUN-104), UNCONDITIONALLY — a kept-work build skips
+    // dispose (below), but its locks must still free so a peer waiting on those files unblocks.
+    // Best-effort: the server also auto-releases on task settle and via TTL, so a miss here (a
+    // crash before this line, a transient error) costs promptness, never correctness — the same
+    // reason a daemon RESTART needs no lock reconcile of its own: the existing orphaned-run
+    // reconcile fails those runs, which settles their tasks, which releases their locks server-side.
+    if (vcsOut.releaseRunLocks) {
+      await vcsOut
+        .releaseRunLocks(worktree, {
+          projectId: run.projectId,
+          token: ctx.runAgent.token,
+          branch: this.lockScopeBranch(repo, run),
+          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+        })
+        .catch((err) =>
+          this.log.warn('lock release on terminal failed', { runId: run.id, err: String(err) }),
+        );
+    }
     if (!(kind === 'build' && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
       await vcsOut
         .dispose(worktree)

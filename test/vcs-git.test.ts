@@ -178,6 +178,10 @@ describe('GitBackend — lock delegation (RUN-98)', () => {
         calls.push({ method: 'check', args });
         return { enabled: true, conflicts: [], mine: [] };
       },
+      releaseAllMine: async (...args: unknown[]) => {
+        calls.push({ method: 'releaseAllMine', args });
+        return { released: [] };
+      },
     };
     return { locks, calls };
   }

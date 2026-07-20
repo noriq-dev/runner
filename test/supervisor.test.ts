@@ -173,6 +173,11 @@ class FakeWorktrees {
   unlock = async (_ws: Workspace, sel: { lockIds?: string[]; paths?: string[] }): Promise<void> => {
     this.releases.push({ paths: sel.paths });
   };
+  /** Every terminal release-all (RUN-104), by the run's holder token. */
+  releasedAll: string[] = [];
+  releaseRunLocks = async (_ws: Workspace, ctx: LockContext): Promise<void> => {
+    this.releasedAll.push(ctx.token);
+  };
 
   // ── landing ────────────────────────────────────────────────────────────────
   /** Branches that exist. The landing branch is absent until something creates it. */
@@ -329,6 +334,8 @@ function harness(
     changedFiles?: string[];
     /** Conflicts the lock layer returns when the floor acquires; empty = granted. */
     lockConflicts?: LockConflict[];
+    /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
+    lockScope?: string[] | null;
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -413,6 +420,7 @@ function harness(
           },
         }
       : {}),
+    ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
   });
   return {
     supervisor,
@@ -1026,6 +1034,71 @@ describe('the hard lock floor (RUN-102)', () => {
     await done;
     expect(h.worktrees.lockCalls).toEqual([]); // never touched the lock layer
     expect(h.worktrees.landings).toHaveLength(1);
+  });
+});
+
+describe('dispatch-time predictive locking (RUN-103)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('takes the declared scope before the agent starts, then runs', async () => {
+    const h = harness({ manifest: LANDING(), lockScope: ['src/x.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    // The FIRST acquire is the predictive one, on the declared scope, before any driver output.
+    expect(h.worktrees.lockCalls[0]?.paths).toEqual(['src/x.ts']);
+    expect(h.claude.starts).toHaveLength(1); // the agent still ran
+  });
+
+  it('REFUSES a dispatch whose declared scope clashes — no agent spawned, worktree disposed', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+    });
+    const exit = await h.supervisor.supervise(buildRun());
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/locked by another run/);
+    expect(h.claude.starts).toHaveLength(0); // never spawned — refused, not raced
+    expect(h.worktrees.removed).toEqual(['/wt/run_1']); // the just-leased worktree is disposed
+    expect(h.comments.some((c) => c.body.includes('src/hot.ts'))).toBe(true);
+  });
+
+  it('no resolver wired → predictive layer is silent (the common case today)', async () => {
+    const h = harness({ manifest: LANDING() }); // lockScope absent
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.claude.starts).toHaveLength(1);
+  });
+});
+
+describe('lock release on terminal (RUN-104)', () => {
+  it('releases the run’s locks as its holder on EVERY terminal path (kept-work build included)', async () => {
+    // A build that changed something but did not land is KEPT (worktree not disposed) — its locks
+    // must still release so a peer unblocks. The release fires regardless of retention.
+    const h = harness({ verifyPasses: false }); // gated → kept, not landed
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.removed).toEqual([]); // kept for the human…
+    expect(h.worktrees.releasedAll).toEqual(['plnrt_bound_to_agt_run1']); // …but locks released
+  });
+
+  it('releases on a clean landed build too', async () => {
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.worktrees.releasedAll).toEqual(['plnrt_bound_to_agt_run1']);
   });
 });
 

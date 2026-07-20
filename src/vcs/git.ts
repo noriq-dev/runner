@@ -5,7 +5,7 @@ import type { LeaseOptions, LockContext, LockOutcome, VcsBackend, Workspace } fr
 /** The slice of LockClient the git backend delegates its lock ops to — injectable, and OPTIONAL:
  *  a daemon with no Noriq lock layer wired (or a test) constructs GitBackend without it, and the
  *  lock ops become graceful no-ops (`enabled:false`). */
-export type LockDelegate = Pick<LockClient, 'acquire' | 'release' | 'check'>;
+export type LockDelegate = Pick<LockClient, 'acquire' | 'release' | 'check' | 'releaseAllMine'>;
 
 /** The slice of WorktreeManager this backend delegates to — injectable for tests. */
 export type GitOps = Pick<
@@ -184,5 +184,10 @@ export class GitBackend implements VcsBackend {
   async queryLocks(_repoRoot: string, paths: string[], ctx: LockContext) {
     if (!this.locks || paths.length === 0) return { enabled: false, conflicts: [], mine: [] };
     return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
+  }
+
+  async releaseRunLocks(_ws: Workspace, ctx: LockContext): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.releaseAllMine(ctx.token, ctx.projectId);
   }
 }

@@ -19,6 +19,10 @@ function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: []
       calls.push({ method: 'check', token, args: input });
       return { enabled: true, conflicts: [], mine: [] };
     },
+    releaseAllMine: async (token, projectId) => {
+      calls.push({ method: 'releaseAllMine', token, args: { projectId } });
+      return { released: [] };
+    },
   };
   return { locks, calls };
 }

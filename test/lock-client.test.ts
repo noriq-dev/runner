@@ -172,6 +172,32 @@ describe('LockClient', () => {
     expect(res.mine).toEqual([{ id: 'lk_mine', path: 'b' }]);
   });
 
+  it('releaseAllMine lists the holder’s own locks then releases those ids (RUN-104)', async () => {
+    const calls: Call[] = [];
+    const fetchImpl = fakeMcp(
+      (name) => {
+        if (name === 'list_locks')
+          return { body: { enabled: true, locks: [{ id: 'lk_1' }, { id: 'lk_2' }] } };
+        return { body: { ok: true, released: ['lk_1', 'lk_2'] } };
+      },
+      { calls },
+    );
+    const res = await client(fetchImpl).releaseAllMine('run-token', 'prj_x');
+    expect(res.released).toEqual(['lk_1', 'lk_2']);
+    const list = calls.find((c) => c.body.params?.name === 'list_locks')!;
+    expect(list.body.params?.arguments).toEqual({ projectId: 'prj_x', mine: true });
+    const rel = calls.find((c) => c.body.params?.name === 'release_lock')!;
+    expect(rel.body.params?.arguments).toEqual({ projectId: 'prj_x', lockIds: ['lk_1', 'lk_2'] });
+  });
+
+  it('releaseAllMine is a no-op when the holder has nothing (no release call)', async () => {
+    const calls: Call[] = [];
+    const fetchImpl = fakeMcp(() => ({ body: { enabled: true, locks: [] } }), { calls });
+    const res = await client(fetchImpl).releaseAllMine('t', 'prj_x');
+    expect(res.released).toEqual([]);
+    expect(calls.some((c) => c.body.params?.name === 'release_lock')).toBe(false);
+  });
+
   it('re-initializes and retries once when the MCP session was recycled', async () => {
     const calls: Call[] = [];
     const fetchImpl = fakeMcp(() => ({ body: { ok: true, locks: [] } }), { calls, expireOnce: true });

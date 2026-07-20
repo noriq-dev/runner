@@ -507,6 +507,13 @@ export class DiversionBackend implements VcsBackend {
     return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
   }
 
+  /** Release the run's Noriq-view locks (RUN-104); dv soft locks (Pro) release with the
+   *  workspace's branch switch on dispose. */
+  async releaseRunLocks(_ws: Workspace, ctx: LockContext): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.releaseAllMine(ctx.token, ctx.projectId);
+  }
+
   /** Best-effort Diversion soft lock over `paths`. Guarded whole: any failure (Pro-gated, offline,
    *  endpoint drift) degrades silently to the Noriq layer, which already decided the outcome. */
   private async nativeSoftLock(ws: Workspace, paths: string[], verb: 'acquire' | 'release'): Promise<void> {

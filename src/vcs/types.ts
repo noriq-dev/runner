@@ -265,4 +265,9 @@ export interface VcsBackend {
    *  hard-floor lock gate acquires them before the diff is made durable (RUN-102). Optional: a
    *  backend that cannot enumerate them omits it and the floor is skipped for that backend. */
   changedPaths?(ws: Workspace): Promise<string[]>;
+
+  /** Release EVERY lock this Run holds, on its terminal path (RUN-104) — prompt cleanup so peers
+   *  unblock sooner. For a task-anchored run the server also auto-releases on task settle, and
+   *  TTL covers a crash, so this is promptness, not correctness. */
+  releaseRunLocks?(ws: Workspace, ctx: LockContext): Promise<void>;
 }

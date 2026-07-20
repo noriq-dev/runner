@@ -124,6 +124,24 @@ export class LockClient {
     return { released: body?.released ?? [] };
   }
 
+  /**
+   * Release EVERY lock this token holds (RUN-104): list its own, then release those ids. The
+   * prompt terminal cleanup — for a task-anchored run the server also auto-releases on task
+   * settle, and TTL covers a crash, so this is promptness, not correctness. No-op when the
+   * project has locking off or the run held nothing.
+   */
+  async releaseAllMine(token: string, projectId: string): Promise<{ released: string[] }> {
+    const reply = await this.callTool(token, 'list_locks', { projectId, mine: true });
+    if (reply.isError) {
+      if (NOT_ENABLED.test(reply.text)) return { released: [] };
+      throw new Error(`list_locks: ${reply.text.slice(0, 300)}`);
+    }
+    const body = reply.body as { enabled?: boolean; locks?: Array<{ id: string }> };
+    const ids = (body?.locks ?? []).map((l) => l.id).filter(Boolean);
+    if (!ids.length) return { released: [] };
+    return this.release(token, projectId, { lockIds: ids });
+  }
+
   /** Look without taking (read-only): who holds locks colliding with `paths` on the scope
    *  branch, and which are already the caller's. The dispatch-time precheck (RUN-103). */
   async check(token: string, input: AcquireInput): Promise<CheckResult> {
