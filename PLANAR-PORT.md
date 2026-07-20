@@ -32,7 +32,10 @@ except the removal of the `PENDING PLANAR PORT` markers.
 The runner's registration POST body now carries (planar's zod currently strips these):
 - `agents: Array<{ tool, models: string[], efforts: RunEffort[] }>` — the coordinate catalog per
   installed tool, for the dashboard's agent picker.
-- `repos[].workflows: string[]` — each repo's custom workflow names.
+- `repos[].workflows: Array<{ name: string; base: RunKind }>` — each repo's custom workflows with
+  the base kind the dashboard must set `Run.kind` to (RUN-125). Planar's `RunnerRepo.workflows` must
+  carry the `base`, not just the name — else the picker can't derive the posture and a mismatched
+  `kind` silently escalates write.
 
 Persist/expose these so the dashboard can render pickers.
 
@@ -44,6 +47,8 @@ Persist/expose these so the dashboard can render pickers.
 - When a repo advertises custom workflows, offer them on dispatch. Sending a custom workflow means:
   set `Run.workflow = "<name>"` **and** `Run.kind = <that workflow's base>` — the runner keys every
   permission/gate off `kind` (the workflow only overrides the prompt), so the base must be correct.
+  The base now rides the registration (`repos[].workflows[].base`, RUN-125), so the dashboard
+  auto-sets `kind = base` and should PREVENT a mismatched kind rather than only hinting it.
 
 ## 4. Dashboard — the pickers
 

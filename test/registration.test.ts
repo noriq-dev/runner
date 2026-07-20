@@ -47,6 +47,31 @@ describe('buildRegistration', () => {
     expect(reg.repos).toEqual([]);
   });
 
+  it('advertises each custom workflow WITH its base kind (RUN-125)', () => {
+    const withWorkflows: DiscoveredRepo[] = [
+      {
+        id: 'repo_w',
+        root: '/x/w',
+        projectKey: 'WWW',
+        name: 'w',
+        defaultBranch: 'main',
+        manifest: {
+          key: 'WWW',
+          board: null,
+          workflows: {
+            docs: { base: 'scope', prompt: 'survey it' },
+            hotfix: { base: 'build', prompt: null },
+          },
+        } as never,
+      },
+    ];
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, withWorkflows);
+    expect(reg.repos[0]?.workflows).toEqual([
+      { name: 'docs', base: 'scope' }, // read-only base → the dashboard sets kind=scope
+      { name: 'hotfix', base: 'build' },
+    ]);
+  });
+
   it('advertises the coordinate catalog per installed tool (RUN-115)', () => {
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude', 'codex'] }, []);
     const claude = reg.agents.find((a) => a.tool === 'claude');

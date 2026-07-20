@@ -63,8 +63,14 @@ export interface RunnerRegistration {
     board: string | null;
     name: string;
     defaultBranch: string | null;
-    /** This repo's custom workflow names (RUN-121); the built-ins are implicit. */
-    workflows: string[];
+    /**
+     * This repo's custom workflows (RUN-125): each name WITH its `base` kind. The base is what the
+     * dashboard must set `Run.kind` to when it dispatches that workflow — the workflow overrides only
+     * the prompt, while every permission/gate is enforced off `kind`. Names alone (the RUN-121 shape)
+     * let a UI pick a read-only workflow but leave `kind = build`, silently granting write; carrying
+     * the base closes that footgun. The three built-ins are implicit and not listed.
+     */
+    workflows: Array<{ name: string; base: RunKind }>;
   }>;
 }
 
@@ -94,9 +100,13 @@ export function buildRegistration(
       board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
-      // The repo's custom workflow names (RUN-121) — the three built-ins are always available and
-      // are not listed. Lets the dashboard offer this repo's own workflows on dispatch.
-      workflows: Object.keys(r.manifest.workflows ?? {}),
+      // The repo's custom workflows (RUN-125): name + base kind, so the dashboard can set
+      // Run.kind = base on dispatch (the base carries the posture; the workflow only overrides the
+      // prompt). The three built-ins are always available and are not listed.
+      workflows: Object.entries(r.manifest.workflows ?? {}).map(([name, def]) => ({
+        name,
+        base: def.base,
+      })),
     })),
   };
 }
