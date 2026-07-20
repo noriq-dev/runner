@@ -1,6 +1,7 @@
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
+import type { LockEnforcer } from '../lock-hooks';
 import type { logger as Logger } from '../logger';
 import { noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import {
@@ -105,6 +106,8 @@ export interface SdkQueryOptions {
   maxTurns?: number;
   maxBudgetUsd?: number;
   mcpServers?: Record<string, SdkMcpHttpServer>;
+  /** In-process hooks (RUN-101): PreToolUse denies an edit to a locked path, Stop releases. */
+  hooks?: Partial<Record<'PreToolUse' | 'Stop' | 'SubagentStop', SdkHookMatcher[]>>;
   /** Ignore all ambient MCP config (user settings, .mcp.json, plugins). */
   strictMcpConfig?: boolean;
   /**
@@ -120,6 +123,33 @@ export interface SdkQueryOptions {
    *  for a byte-faithful transcript (RUN-77). */
   includePartialMessages?: boolean;
 }
+/**
+ * Narrow mirror of the SDK's in-process hook shape (RUN-101), the same anti-corruption pattern
+ * as the message mirrors above — we emit exactly this (verified against sdk.d.ts `HookCallback` /
+ * `PreToolUseHookSpecificOutput`), and tests inject a fake `queryFn` that invokes it.
+ */
+export interface SdkHookInput {
+  hook_event_name: string;
+  tool_name?: string;
+  tool_input?: unknown;
+}
+export interface SdkHookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'PreToolUse';
+    permissionDecision?: 'allow' | 'deny' | 'ask' | 'defer';
+    permissionDecisionReason?: string;
+  };
+}
+export type SdkHookCallback = (
+  input: SdkHookInput,
+  toolUseId: string | undefined,
+  opts: { signal: AbortSignal },
+) => Promise<SdkHookOutput>;
+export interface SdkHookMatcher {
+  matcher?: string;
+  hooks: SdkHookCallback[];
+}
+
 export type QueryFn = (args: {
   prompt: AsyncIterable<SdkUserMessage>;
   options?: SdkQueryOptions;
@@ -143,6 +173,47 @@ export const NORIQ_MCP_NAME = 'noriq';
  *  per-kind Noriq floor a Claude-only property); this only applies the SDK's prefix. */
 export const noriqToolsFor = (kind: RunKind): string[] =>
   noriqToolNamesFor(kind).map((t) => `mcp__${NORIQ_MCP_NAME}__${t}`);
+
+/**
+ * The PreToolUse + Stop hook option that wires an in-process LockEnforcer into the SDK (RUN-101).
+ * PreToolUse asks the enforcer to lock the tool's write set; a conflict → `permissionDecision:
+ * 'deny'` with the conflict text, which the SDK feeds back to the model. Stop releases.
+ */
+export function lockHooks(enforcer: LockEnforcer): NonNullable<SdkQueryOptions['hooks']> {
+  return {
+    PreToolUse: [
+      {
+        hooks: [
+          async (input): Promise<SdkHookOutput> => {
+            const reason = await enforcer.guard(
+              input.tool_name ?? '',
+              (input.tool_input as Record<string, unknown>) ?? {},
+            );
+            return reason
+              ? {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: reason,
+                  },
+                }
+              : {};
+          },
+        ],
+      },
+    ],
+    Stop: [
+      {
+        hooks: [
+          async (): Promise<SdkHookOutput> => {
+            await enforcer.releaseHeld();
+            return {};
+          },
+        ],
+      },
+    ],
+  };
+}
 
 export function mapPermission(
   profile: PermissionProfile,
@@ -333,6 +404,12 @@ export class ClaudeDriver implements AgentDriver {
               },
             }
           : {}),
+        // Reactive file locking (RUN-101): a PreToolUse hook denies an edit to a path another
+        // agent holds, a Stop hook releases what this session took. Runs IN-PROCESS in the
+        // daemon (the enforcer holds the run's token + lock client), so the credential never
+        // enters the agent's shell — the whole reason sanitizedAgentEnv strips it. Injected by
+        // the runner, so it cannot be skipped: the guaranteed variant of the PLNR client hook.
+        ...(opts.lockEnforcer ? { hooks: lockHooks(opts.lockEnforcer) } : {}),
         // ONLY the server we just injected. Otherwise a supervised agent silently
         // inherits the operator's personal MCP config (~/.claude.json, .mcp.json,
         // plugins) — their connectors, their credentials, none of it in the manifest.

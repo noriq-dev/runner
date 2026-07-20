@@ -12,6 +12,7 @@ import type {
   ModelUsage,
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
 import { noriqToolNamesFor } from '../src/security';
 import {
@@ -24,7 +25,7 @@ import {
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
-import type { Workspace } from '../src/vcs/types';
+import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -151,6 +152,26 @@ class FakeWorktrees {
   };
   dispose = async (ws: Workspace): Promise<void> => {
     this.removed.push(ws.localPath);
+  };
+
+  // ── locking (RUN-98/102) ─────────────────────────────────────────────────────
+  /** Paths this run "changed" — the hard floor acquires these before landing. Empty (default)
+   *  → the floor no-ops, so every existing test is unaffected. */
+  changedFiles: string[] = [];
+  /** Conflicts the lock layer returns; empty = granted. */
+  lockConflicts: LockConflict[] = [];
+  /** Every acquire the supervisor made through the seam (floor + reactive). */
+  lockCalls: Array<{ paths: string[]; ctx: LockContext }> = [];
+  releases: Array<{ paths?: string[] }> = [];
+  changedPaths = async (): Promise<string[]> => this.changedFiles;
+  lock = async (_ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> => {
+    this.lockCalls.push({ paths, ctx });
+    return this.lockConflicts.length
+      ? { ok: false, conflicts: this.lockConflicts }
+      : { ok: true, enabled: true, locks: paths.map((p) => ({ id: p, path: p })) };
+  };
+  unlock = async (_ws: Workspace, sel: { lockIds?: string[]; paths?: string[] }): Promise<void> => {
+    this.releases.push({ paths: sel.paths });
   };
 
   // ── landing ────────────────────────────────────────────────────────────────
@@ -304,6 +325,10 @@ function harness(
      *  returns ({claimable:false} declines the spawn, null = probe unavailable → fail open).
      *  Absent = the dep is not wired at all (the pre-RUN-81 daemon). */
     claimGate?: { claimable: boolean; reason: string | null } | null;
+    /** The paths a build "changed" — the hard lock floor (RUN-102) acquires these. */
+    changedFiles?: string[];
+    /** Conflicts the lock layer returns when the floor acquires; empty = granted. */
+    lockConflicts?: LockConflict[];
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -312,6 +337,8 @@ function harness(
   if (over.conflicts) worktrees.conflicts = over.conflicts;
   if (over.stillConflicted) worktrees.stillConflicted = over.stillConflicted;
   if (over.landRaces) worktrees.landRaces = true;
+  if (over.changedFiles) worktrees.changedFiles = over.changedFiles;
+  if (over.lockConflicts) worktrees.lockConflicts = over.lockConflicts;
   const reports: Array<{ runId: string } & RunReport> = [];
   const transcript: Array<{ seq: number; role: string; round: number | null; text: string }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
@@ -952,6 +979,53 @@ describe("the run's diff is made durable", () => {
     h.claude.complete('failed');
     await done;
     expect(h.worktrees.commits).toEqual([]);
+  });
+});
+
+describe('the hard lock floor (RUN-102)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('acquires locks over the build’s changed paths, as the run holder, before landing', async () => {
+    const h = harness({ manifest: LANDING(), changedFiles: ['src/a.ts', 'src/b.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    // The floor ran on exactly the changed set, scoped to the landing branch, as the run agent.
+    const floor = h.worktrees.lockCalls.find((c) => c.paths.includes('src/a.ts'));
+    expect(floor?.paths).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(floor?.ctx.branch).toBe('noriq/integration'); // the [land] target, not noriq/run/*
+    expect(floor?.ctx.token).toBe('plnrt_bound_to_agt_run1'); // held as the run's agent, not the daemon
+    expect(h.worktrees.landings).toHaveLength(1); // clean acquire → it landed
+  });
+
+  it('GATES a build that changed a path a peer holds — kept for review, never landed', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_peer', holderName: 'peer', taskKey: 'RUN-2' }],
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('lock'); // gated by the floor, not verify
+    expect(h.worktrees.commits).toHaveLength(1); // the diff IS committed first…
+    expect(h.worktrees.landings).toEqual([]); // …but never lands over the peer
+    expect(h.worktrees.removed).toEqual([]); // and the worktree is kept for a human
+    expect(h.comments.some((c) => c.body.includes('src/shared.ts') && c.body.includes('peer'))).toBe(true);
+  });
+
+  it('no changed paths → the floor is a no-op (nothing acquired)', async () => {
+    const h = harness({ manifest: LANDING(), changedFiles: [] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.lockCalls).toEqual([]); // never touched the lock layer
+    expect(h.worktrees.landings).toHaveLength(1);
   });
 });
 

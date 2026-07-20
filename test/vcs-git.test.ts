@@ -33,6 +33,7 @@ function recorder() {
     create: record('create', info),
     remove: record('remove', undefined),
     hasChanges: record('hasChanges', true),
+    changedPaths: record('changedPaths', ['src/a.ts']),
     commitWork: record('commitWork', true),
     refExists: record('refExists', true),
     createBranch: record('createBranch', undefined),

@@ -260,4 +260,9 @@ export interface VcsBackend {
     paths: string[],
     ctx: LockContext,
   ): Promise<{ enabled: boolean; conflicts: LockConflict[]; mine: LockGrant[] }>;
+
+  /** The repo-relative paths this Run touched (uncommitted + committed since its base) — the
+   *  hard-floor lock gate acquires them before the diff is made durable (RUN-102). Optional: a
+   *  backend that cannot enumerate them omits it and the floor is skipped for that backend. */
+  changedPaths?(ws: Workspace): Promise<string[]>;
 }

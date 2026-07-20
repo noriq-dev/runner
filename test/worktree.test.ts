@@ -113,6 +113,25 @@ describe('unsaved work survives (real git)', () => {
     await wm.remove(wt);
   });
 
+  it('changedPaths lists BOTH uncommitted and committed-since-base files (the hard-floor set, RUN-102)', async () => {
+    const wt = await wm.create(repo, 'changedRun');
+    // One committed change…
+    await writeFile(path.join(wt.path, 'committed.ts'), 'export const c = 1;\n');
+    await wm.commitWork(wt, 'noriq run changedRun: committed work');
+    // …and one still in the working tree.
+    await writeFile(path.join(wt.path, 'dirty.ts'), 'export const d = 2;\n');
+
+    const paths = (await wm.changedPaths(wt)).sort();
+    expect(paths).toEqual(['committed.ts', 'dirty.ts']);
+    await wm.remove(wt);
+  });
+
+  it('changedPaths is empty for a run that touched nothing', async () => {
+    const wt = await wm.create(repo, 'untouchedRun');
+    expect(await wm.changedPaths(wt)).toEqual([]);
+    await wm.remove(wt);
+  });
+
   it('NEVER reaps a worktree holding uncommitted work', async () => {
     // The regression: reapOrphans ran `worktree remove --force` on daemon start, which
     // silently destroys an agent's uncommitted diff. This is the guard.

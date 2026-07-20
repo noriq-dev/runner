@@ -31,12 +31,14 @@ import {
   rejectTargetBranch,
   resolveLandBranch,
 } from './land';
+import type { LockConflict } from './lock-client';
+import { LockEnforcer, lockFloorComment } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt } from './prompts';
 import { noriqToolNamesFor } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
-import type { VcsBackend, Workspace } from './vcs/types';
+import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import {
   type VerifyExec,
   type VerifySpec,
@@ -84,7 +86,9 @@ export type SupervisorVcs = Pick<
 > &
   // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
-  Partial<Pick<VcsBackend, 'kind'>>;
+  // lock/unlock/queryLocks are optional the same way (RUN-98): a fake or lock-less backend omits
+  // them, and the supervisor treats absence as "no lock layer" (RUN-101/103).
+  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths'>>;
 
 export interface ResolvedRepo {
   root: string;
@@ -517,6 +521,86 @@ export class RunSupervisor {
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
   private vcsFor(repo: ResolvedRepo): SupervisorVcs {
     return repo.vcs ?? this.deps.vcs;
+  }
+
+  /**
+   * The branch a run's file locks are scoped to (RUN-97 §5): the branch it will LAND on, where
+   * two runs actually contend — not its throwaway `noriq/run/<id>` worktree branch (on which
+   * they'd never collide). The `[land]` target when configured, else the dispatch's target, else
+   * the repo default. null → all-branches, the safe fallback when nothing names a target.
+   */
+  private lockScopeBranch(repo: ResolvedRepo, run: Run): string | null {
+    if (repo.manifest.land) return resolveLandBranch(repo.manifest.land.branch, run.planKey);
+    return run.targetBranch ?? repo.manifest.defaultBranch ?? null;
+  }
+
+  /**
+   * The reactive per-edit lock enforcer for a build (RUN-101), or undefined when there is no
+   * lock layer to enforce through. Bound to the run's workspace + agent token + scope branch, so
+   * the driver's PreToolUse hook locks each path the agent edits, as that run's holder. Only for
+   * `build`: scope and verify never write, so they never take a write lock.
+   */
+  private lockEnforcerFor(
+    repo: ResolvedRepo,
+    run: Run,
+    worktree: Workspace,
+    kind: RunKind,
+    token: string,
+  ): LockEnforcer | undefined {
+    const vcs = this.vcsFor(repo);
+    if (kind !== 'build' || !vcs.lock || !vcs.unlock) return undefined;
+    const ctx: LockContext = {
+      projectId: run.projectId,
+      token,
+      branch: this.lockScopeBranch(repo, run),
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    };
+    return new LockEnforcer({
+      root: worktree.localPath,
+      lock: (paths) => vcs.lock!(worktree, paths, ctx),
+      release: (paths) => vcs.unlock!(worktree, { paths }, ctx).then(() => undefined),
+      onDeny: (paths, conflicts) =>
+        this.log.info('lock hook denied an edit to a peer-held path', {
+          runId: run.id,
+          paths,
+          holders: conflicts.map((c) => c.holderName ?? c.holder),
+        }),
+    });
+  }
+
+  /**
+   * The hard floor (RUN-102): before a build's diff is made durable, acquire locks over EVERY
+   * path it changed, as the run's holder. For a Claude build this is an idempotent renew of what
+   * the reactive hook already took; for a Codex build (no in-process hook) it is the FIRST
+   * acquisition — and a conflict means the run edited a path a peer holds, so the run is gated
+   * rather than allowed to clobber. Daemon-side, so no token ever reaches the agent's shell.
+   *
+   * Returns the blocking conflicts, or [] when the floor passed / doesn't apply (no lock layer,
+   * no changed-path enumeration, an empty diff, or locking disabled).
+   */
+  private async enforceLockFloor(
+    repo: ResolvedRepo,
+    run: Run,
+    worktree: Workspace,
+    token: string,
+  ): Promise<LockConflict[]> {
+    const vcs = this.vcsFor(repo);
+    if (!vcs.lock || !vcs.changedPaths) return [];
+    const paths = await vcs.changedPaths(worktree).catch(() => [] as string[]);
+    if (!paths.length) return [];
+    const ctx: LockContext = {
+      projectId: run.projectId,
+      token,
+      branch: this.lockScopeBranch(repo, run),
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    };
+    // A lock-service error must not gate a finished build: the reactive hook and dispatch-time
+    // check are the primary layers, and failing a done build over a Noriq blip is worse than a
+    // missed floor. Treat an error as "no conflict" (fail open), same posture as the hook.
+    const outcome = await vcs
+      .lock(worktree, paths, ctx)
+      .catch(() => ({ ok: true, enabled: false, locks: [] }) as LockOutcome);
+    return outcome.ok ? [] : outcome.conflicts;
   }
 
   /**
@@ -1575,6 +1659,10 @@ export class RunSupervisor {
       prompt,
       permission,
       noriqMcp,
+      // Reactive file locking (RUN-101): a build agent's edits go through a PreToolUse hook that
+      // locks each path as the run's holder and denies one a peer holds. Absent for scope/verify
+      // (no writes) and for a backend with no lock layer.
+      lockEnforcer: this.lockEnforcerFor(repo, run, worktree, kind, runAgent.token),
       // Keep the session alive past its first result ONLY when a feedback loop is possible: a
       // build, with a verify command to fail. Scope and verify runs want today's behaviour —
       // finish and close — and a session nobody closes hangs the daemon (see the finally below).
@@ -1735,6 +1823,27 @@ export class RunSupervisor {
             err: String(err),
           }),
         );
+
+      // The hard floor (RUN-102), AFTER the checkpoint so the diff is preserved on the branch for
+      // a human even when gated: acquire locks over everything this build changed. A conflict
+      // means it touched a path a peer holds (the reactive hook missed it, or this is Codex) —
+      // gate it, do not land it. Marking exit `failed{lock}` (while keeping driverSucceeded, so
+      // the diff + worktree are kept like a verify failure) makes every gate below skip: they key
+      // off `exit.outcome === 'done'`.
+      const floorConflicts = await this.enforceLockFloor(repo, run, worktree, ctx.runAgent.token);
+      if (floorConflicts.length) {
+        this.log.warn('hard lock floor gated the build — it changed paths a peer holds', {
+          runId: run.id,
+          holders: floorConflicts.map((c) => c.holderName ?? c.holder),
+        });
+        if (run.anchor?.type === 'task') {
+          this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(floorConflicts));
+        }
+        // Failed, but driverSucceeded STAYS true — so the committed diff and its worktree are
+        // kept for a human, exactly like a verify failure. The gates below all key off
+        // `exit.outcome === 'done'`, so none of them run; landing is likewise skipped.
+        exit = { ...exit, outcome: 'failed', isError: true, reason: 'lock' };
+      }
     }
 
     // ── Landing (opt-in via the manifest's [land]) ────────────────────────────────
@@ -1750,7 +1859,7 @@ export class RunSupervisor {
     // REBASED result instead, which is strictly the better question. Runs BEFORE the reviewer
     // (RUN-61): the command is cheap and deterministic, so it screens out work not worth an
     // agent's review — the same reason CI runs the linter before the humans arrive.
-    if (kind === 'build' && driverSucceeded && !landPolicy && floorCmd) {
+    if (kind === 'build' && driverSucceeded && exit.outcome === 'done' && !landPolicy && floorCmd) {
       // Same silence as landing, and the longer of the two in practice: the full suite with
       // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
       // the agent on a failure, which flips the phase to 'agent' again — see below.

@@ -13,6 +13,7 @@ export type GitOps = Pick<
   | 'create'
   | 'remove'
   | 'hasChanges'
+  | 'changedPaths'
   | 'commitWork'
   | 'refExists'
   | 'createBranch'
@@ -109,6 +110,10 @@ export class GitBackend implements VcsBackend {
 
   hasWork(ws: Workspace): Promise<boolean> {
     return this.git.hasChanges({ path: ws.localPath, baseSha: ws.baseId });
+  }
+
+  changedPaths(ws: Workspace): Promise<string[]> {
+    return this.git.changedPaths({ path: ws.localPath, baseSha: ws.baseId });
   }
 
   checkpoint(ws: Workspace, message: string): Promise<boolean> {

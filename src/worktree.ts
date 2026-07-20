@@ -221,6 +221,34 @@ export class WorktreeManager {
     return Number(ahead.trim() || '0') > 0;
   }
 
+  /**
+   * The repo-relative paths this run touched — uncommitted (working tree) PLUS committed since
+   * the base it forked from (RUN-102). The hard-floor lock gate acquires these as the run's
+   * holder before the diff is made durable, so a write the reactive hook never saw (a Codex run,
+   * or a Bash write its parser bailed on) still cannot land over a path a peer holds.
+   */
+  async changedPaths(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<string[]> {
+    const set = new Set<string>();
+    const { stdout: porc } = await this.git(['status', '--porcelain'], info.path).catch(() => ({
+      stdout: '',
+      stderr: '',
+    }));
+    for (const line of porc.split('\n')) {
+      const body = line.slice(3).trim(); // strip the XY status columns
+      if (!body) continue;
+      // `R  old -> new` (rename/copy): the write is the destination.
+      const arrow = body.split(' -> ');
+      const p = (arrow[1] ?? arrow[0] ?? '').trim().replace(/^"|"$/g, '');
+      if (p) set.add(p);
+    }
+    const { stdout: committed } = await this.git(
+      ['diff', '--name-only', `${info.baseSha}..HEAD`],
+      info.path,
+    ).catch(() => ({ stdout: '', stderr: '' }));
+    for (const l of committed.split('\n')) if (l.trim()) set.add(l.trim());
+    return [...set];
+  }
+
   /** Tear down a worktree + delete its (never-pushed) branch. Safe to call twice. */
   async remove(info: Pick<WorktreeInfo, 'repoRoot' | 'path' | 'branch'>): Promise<void> {
     await setWritable(info.path).catch(() => {}); // so git can delete read-only scope files
