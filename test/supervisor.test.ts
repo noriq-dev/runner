@@ -1040,6 +1040,20 @@ describe('the hard lock floor (RUN-102)', () => {
     expect(h.worktrees.lockCalls).toEqual([]); // never touched the lock layer
     expect(h.worktrees.landings).toHaveLength(1);
   });
+
+  it('surfaces a lock gate in the run transcript, for the run view (RUN-106)', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_peer', holderName: 'peer' }],
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    const text = h.transcript.map((s) => s.text).join('\n');
+    expect(text).toMatch(/🔒 hard lock floor gated this build.*src\/shared\.ts.*peer/s);
+  });
 });
 
 describe('dispatch-time predictive locking (RUN-103)', () => {

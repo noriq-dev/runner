@@ -571,12 +571,20 @@ export class RunSupervisor {
       root: worktree.localPath,
       lock: (paths) => vcs.lock!(worktree, paths, ctx),
       release: (paths) => vcs.unlock!(worktree, { paths }, ctx).then(() => undefined),
-      onDeny: (paths, conflicts) =>
+      onDeny: (paths, conflicts) => {
         this.log.info('lock hook denied an edit to a peer-held path', {
           runId: run.id,
           paths,
           holders: conflicts.map((c) => c.holderName ?? c.holder),
-        }),
+        });
+        // Surface it in the run view (RUN-106) via the transcript pipeline (RUN-74): the human
+        // watching sees WHY an edit was blocked, and by whom.
+        this.transcript(run.id).milestone(
+          `🔒 lock hook blocked an edit to ${paths.join(', ')} — held by ${conflicts
+            .map((c) => c.holderName ?? c.holder)
+            .join(', ')}`,
+        );
+      },
     });
   }
 
@@ -1660,6 +1668,11 @@ export class RunSupervisor {
             runId: run.id,
             holders: outcome.conflicts.map((c) => c.holderName ?? c.holder),
           });
+          this.transcript(run.id).milestone(
+            `🔒 predictive lock refused this dispatch — its declared scope ${outcome.conflicts
+              .map((c) => c.path)
+              .join(', ')} is held by another run`,
+          );
           if (run.anchor?.type === 'task') {
             this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(outcome.conflicts));
           }
@@ -1887,6 +1900,11 @@ export class RunSupervisor {
           runId: run.id,
           holders: floorConflicts.map((c) => c.holderName ?? c.holder),
         });
+        this.transcript(run.id).milestone(
+          `🔒 hard lock floor gated this build — it changed ${floorConflicts
+            .map((c) => c.path)
+            .join(', ')}, held by ${floorConflicts.map((c) => c.holderName ?? c.holder).join(', ')}`,
+        );
         if (run.anchor?.type === 'task') {
           this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(floorConflicts));
         }
