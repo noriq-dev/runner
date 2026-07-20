@@ -337,6 +337,13 @@ describe('DiversionBackend — the rest of the surface', () => {
 describe('RunSupervisor over DiversionBackend — the interface survives a live-model backend', () => {
   class InstantDriver implements AgentDriver {
     readonly tool = 'claude' as const;
+    readonly capabilities = {
+      toolHooks: true,
+      steer: true,
+      interrupt: true,
+      resumableSession: true,
+      perModelTelemetry: true,
+    };
     opts?: DriverStartOptions;
     start(opts: DriverStartOptions) {
       this.opts = opts;

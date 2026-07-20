@@ -4,11 +4,12 @@ import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { killProcessTree, treeSpawnOptions } from '../proc';
-import { CODEX_MCP_TOKEN_ENV, agentEnvWithMcpToken, noriqToolNamesFor, sanitizedAgentEnv } from '../security';
+import { CODEX_MCP_TOKEN_ENV, noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import { VERSION } from '../version';
 import { NORIQ_MCP_NAME } from './claude';
 import {
   type AgentDriver,
+  type DriverCapabilities,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
@@ -78,6 +79,8 @@ export interface CodexSpawnOptions {
    *  every codex agent got the server's whole tool surface, and a verify agent could
    *  claim_task the work it was judging. */
   kind: RunKind;
+  /** The supervisor-sanitized process env (RUN-109). Absent only in tests → `sanitizedAgentEnv()`. */
+  env?: NodeJS.ProcessEnv;
 }
 export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 
@@ -126,6 +129,16 @@ export interface CodexDriverDeps {
  */
 export class CodexDriver implements AgentDriver {
   readonly tool = 'codex' as const;
+  // Codex steers and interrupts over JSON-RPC, but has NO in-process tool hooks (locks fall to the
+  // hard floor, RUN-102), no per-model telemetry (spend → the (unattributed) bucket, RUN-86), and
+  // no session resume — a parked codex run restarts rather than reloading context (RUN-110).
+  readonly capabilities: DriverCapabilities = {
+    toolHooks: false,
+    steer: true,
+    interrupt: true,
+    resumableSession: false,
+    perModelTelemetry: false,
+  };
   private readonly spawnCodex: SpawnCodex;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
 
@@ -143,6 +156,7 @@ export class CodexDriver implements AgentDriver {
       approvalPolicy: 'never',
       noriqMcp: opts.noriqMcp,
       kind: opts.kind,
+      env: opts.env,
     });
     transport.sendUserTurn(opts.prompt);
 
@@ -343,13 +357,16 @@ export const defaultSpawnCodex = (
     ...(opts.model ? ['-c', `model=${opts.model}`] : []),
     ...(opts.effort ? ['-c', `model_reasoning_effort=${mapEffort(opts.effort)}`] : []),
   ];
-  // Sanitized env (RUN-24): strip secrets + block git push/credential prompts. Codex can
-  // only read its bearer token from the environment (no header option), so that one token —
-  // and only when MCP is actually wired — is put back deliberately. See agentEnvWithMcpToken.
+  // Sanitized env (RUN-24): strip secrets + block git push/credential prompts. Since RUN-109 the
+  // stripped base is handed down by the supervisor (`opts.env`; the `??` is the test-only
+  // fallback). Codex can only read its bearer token from the environment (no header option), so
+  // that one token — and only when MCP is actually wired — is put back deliberately, on top of the
+  // already-stripped base. See CODEX_MCP_TOKEN_ENV in security.ts for why this token is the exception.
+  const base = opts.env ?? sanitizedAgentEnv();
   const child = spawnFn('codex', ['app-server', ...mcpArgs, ...modelArgs], {
     cwd: opts.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: opts.noriqMcp ? agentEnvWithMcpToken(opts.noriqMcp.token) : sanitizedAgentEnv(),
+    env: opts.noriqMcp ? { ...base, [CODEX_MCP_TOKEN_ENV]: opts.noriqMcp.token } : base,
     // Group it with its descendants so close() can reach them all (RUN-42). POSIX-only; on
     // Windows this is a no-op and taskkill /T walks the tree instead.
     ...treeSpawnOptions(),

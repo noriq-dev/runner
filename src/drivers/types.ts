@@ -131,6 +131,20 @@ export interface DriverStartOptions {
    * the hard floor (RUN-102) + its native sandbox instead.
    */
   lockEnforcer?: LockEnforcer;
+  /**
+   * The sanitized process environment the agent MUST run under (RUN-109).
+   *
+   * Computed ONCE by the supervisor (`sanitizedAgentEnv`) and handed down, so the trust boundary
+   * — no daemon token, no cloud/git creds, no git push/prompt — is a SUPERVISOR guarantee that
+   * holds no matter who spawns, rather than a thing each driver remembers to do. It used to live
+   * inside claude.ts/codex.ts because they spawn the local process; a future driver that runs the
+   * agent elsewhere still receives this and must ship it to wherever the process actually runs.
+   *
+   * Absent only in tests, where a driver falls back to `sanitizedAgentEnv()` so the default is
+   * still safe. A driver that needs one credential IN the env (codex's MCP bearer token, which has
+   * no header option) adds ONLY that, on top of this already-stripped base.
+   */
+  env?: NodeJS.ProcessEnv;
   handlers?: DriverHandlers;
 }
 
@@ -168,7 +182,37 @@ export interface DriverSession {
   continueWith?(text: string): Promise<DriverExit>;
 }
 
+/**
+ * What a driver's runtime can and cannot do (RUN-110).
+ *
+ * The claude/codex asymmetry used to be implicit — the supervisor handed every driver a
+ * `lockEnforcer` and simply trusted claude to wire it and codex to ignore it; per-model telemetry
+ * "just wasn't there" for codex. This makes those differences a declared contract the supervisor
+ * reads, so behaviour keys off a capability, not a driver's NAME — and a future driver (a remote
+ * executor) declares what it supports rather than the supervisor knowing it by hard-coded tool id.
+ */
+export interface DriverCapabilities {
+  /**
+   * In-process tool-use hooks — the reactive per-edit lock layer (RUN-101): PreToolUse deny +
+   * Stop release. false → the driver ignores `lockEnforcer` and the daemon-side hard floor
+   * (RUN-102) is the ONLY lock guard for its runs (this is the Codex posture).
+   */
+  toolHooks: boolean;
+  /** Soft steer: `pushInput` injects a next-turn user message into a live session. */
+  steer: boolean;
+  /** Hard interrupt of the current inference (`interrupt`). */
+  interrupt: boolean;
+  /** A resumable session id for park/resume (RUN-30). false → a parked run of this driver cannot
+   *  bring its context back and must restart (Codex has no resume). */
+  resumableSession: boolean;
+  /** Per-model spend attribution (RUN-59). false → its spend lands in the `(unattributed)` bucket
+   *  (RUN-86) rather than a per-model breakdown (Codex reports tokens but no split, no cost). */
+  perModelTelemetry: boolean;
+}
+
 export interface AgentDriver {
   readonly tool: AgentTool;
+  /** What this driver's runtime supports — read by the supervisor instead of branching on `tool`. */
+  readonly capabilities: DriverCapabilities;
   start(opts: DriverStartOptions): DriverSession;
 }

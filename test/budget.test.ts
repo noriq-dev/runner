@@ -1,13 +1,26 @@
 import type { RunBudget } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { superviseBudget, totalTokens } from '../src/drivers/budget';
-import type { AgentDriver, DriverExit, DriverStartOptions, DriverTelemetry } from '../src/drivers/types';
+import type {
+  AgentDriver,
+  DriverCapabilities,
+  DriverExit,
+  DriverStartOptions,
+  DriverTelemetry,
+} from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
 
 // A driver whose session the test drives directly: emit telemetry, complete
 // naturally, and observe stop().
 class FakeDriver implements AgentDriver {
   readonly tool = 'claude' as const;
+  readonly capabilities: DriverCapabilities = {
+    toolHooks: true,
+    steer: true,
+    interrupt: true,
+    resumableSession: true,
+    perModelTelemetry: true,
+  };
   handlers!: DriverStartOptions['handlers'];
   stops = 0;
   private settle!: (e: DriverExit) => void;

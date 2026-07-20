@@ -83,6 +83,20 @@ describe('mapSandbox', () => {
   });
 });
 
+describe('driver capabilities (RUN-110)', () => {
+  it('codex declares NO in-process hooks, no resume, no per-model telemetry', () => {
+    const driver = new CodexDriver({ spawnCodex: (() => ({})) as never });
+    expect(driver.tool).toBe('codex');
+    expect(driver.capabilities).toEqual({
+      toolHooks: false,
+      steer: true,
+      interrupt: true,
+      resumableSession: false,
+      perModelTelemetry: false,
+    });
+  });
+});
+
 describe('normalizeNotification (real app-server shapes)', () => {
   it('maps agentMessageDelta / tokenUsage / turn.completed / error', () => {
     expect(normalizeNotification('thread/agentMessageDelta', { delta: 'hi' })).toEqual({

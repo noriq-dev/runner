@@ -6,6 +6,7 @@ import type { logger as Logger } from '../logger';
 import { noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import {
   type AgentDriver,
+  type DriverCapabilities,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
@@ -356,6 +357,15 @@ export interface ClaudeDriverDeps {
  */
 export class ClaudeDriver implements AgentDriver {
   readonly tool = 'claude' as const;
+  // The Agent SDK gives us all four (RUN-110): in-process hooks (lockHooks below), soft steer +
+  // interrupt on the streaming session, a resumable session id, and a per-model spend aggregate.
+  readonly capabilities: DriverCapabilities = {
+    toolHooks: true,
+    steer: true,
+    interrupt: true,
+    resumableSession: true,
+    perModelTelemetry: true,
+  };
   private readonly queryFn: QueryFn;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
 
@@ -375,13 +385,11 @@ export class ClaudeDriver implements AgentDriver {
       options: {
         cwd: opts.cwd,
         model: opts.model,
-        // The agent's shell environment, with the daemon's OAuth token and cloud/git
-        // credentials stripped, and git's credential paths neutered. Without this the
-        // spawned `claude` inherits process.env verbatim: an allowlisted `npm test` that
-        // shells out could read NORIQ_TOKEN, and `git push` could still prompt. The codex
-        // driver and the verify runner have always sanitized — this path never did, which
-        // made the security model's central claim false for the DEFAULT tool.
-        env: sanitizedAgentEnv(),
+        // The agent's shell environment: the daemon's OAuth token and cloud/git creds stripped,
+        // git's credential paths neutered. Handed down pre-sanitized by the supervisor (RUN-109),
+        // so this guarantee no longer depends on the driver remembering to do it; the `??` is the
+        // test-only fallback for a start with no supervisor-provided env.
+        env: opts.env ?? sanitizedAgentEnv(),
         permissionMode: perm.permissionMode,
         allowedTools: perm.allowedTools,
         disallowedTools: perm.disallowedTools,

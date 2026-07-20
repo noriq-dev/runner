@@ -13,11 +13,12 @@ import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import type { ParkState, RunAgent } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
-import { superviseBudget, totalTokens } from './drivers/budget';
+import { type BudgetRun, superviseBudget, totalTokens } from './drivers/budget';
 import type {
   AgentDriver,
   DriverExit,
   DriverSession,
+  DriverStartOptions,
   DriverTelemetry,
   ModelUsage,
   NoriqMcp,
@@ -36,7 +37,7 @@ import { LockEnforcer, lockFloorComment } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt } from './prompts';
-import { noriqToolNamesFor } from './security';
+import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import {
@@ -533,6 +534,16 @@ export class RunSupervisor {
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
   private vcsFor(repo: ResolvedRepo): SupervisorVcs {
     return repo.vcs ?? this.deps.vcs;
+  }
+
+  /**
+   * The ONE way this supervisor starts a driver (RUN-109). Every agent spawn — main run, reviewer,
+   * conflict turn, verify-fix — funnels through here so the sanitized child env is a supervisor
+   * guarantee, not a per-driver habit. `env` is set BEFORE the caller's opts so an explicit
+   * override still wins, but no caller sets it: they all inherit the stripped env by construction.
+   */
+  private startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun {
+    return superviseBudget(driver, { env: sanitizedAgentEnv(), ...opts });
   }
 
   /**
@@ -1104,7 +1115,7 @@ export class RunSupervisor {
     const diffCmd =
       (this.vcsFor(ctx.repo).kind ?? 'git') === 'git' ? `git diff ${ctx.worktree.baseId}...HEAD` : undefined;
     let text = '';
-    const session = superviseBudget(driver, {
+    const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
       cwd: ctx.worktree.localPath,
@@ -1176,7 +1187,7 @@ export class RunSupervisor {
     conflicts: string[],
   ): Promise<{ resolved: boolean; text: string }> {
     let text = '';
-    const session = superviseBudget(ctx.driver, {
+    const session = this.startAgent(ctx.driver, {
       runId: `${ctx.run.id}:conflict`,
       kind: 'build', // it is editing its own diff — the build floor, nothing wider
       cwd: ctx.worktree.localPath,
@@ -1376,7 +1387,7 @@ export class RunSupervisor {
     const tally = new RunTally();
     tally.seed('__prior__', telemetryFromSpent(entry.spent));
     const startedAt = Date.now();
-    const budgetRun = superviseBudget(driver, {
+    const budgetRun = this.startAgent(driver, {
       runId: run.id,
       kind,
       cwd: worktree.localPath,
@@ -1716,7 +1727,7 @@ export class RunSupervisor {
     // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
     // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
     const startedAt = Date.now();
-    const budgetRun = superviseBudget(driver, {
+    const budgetRun = this.startAgent(driver, {
       runId: run.id,
       kind,
       cwd: worktree.localPath,
@@ -1725,8 +1736,12 @@ export class RunSupervisor {
       noriqMcp,
       // Reactive file locking (RUN-101): a build agent's edits go through a PreToolUse hook that
       // locks each path as the run's holder and denies one a peer holds. Absent for scope/verify
-      // (no writes) and for a backend with no lock layer.
-      lockEnforcer: this.lockEnforcerFor(repo, run, worktree, kind, runAgent.token),
+      // (no writes) and for a backend with no lock layer — and only handed to a driver that can
+      // actually wire it (RUN-110): a driver without in-process hooks (Codex) relies on the hard
+      // floor instead, so passing it one it would silently drop is just a lie in the start opts.
+      lockEnforcer: driver.capabilities.toolHooks
+        ? this.lockEnforcerFor(repo, run, worktree, kind, runAgent.token)
+        : undefined,
       // Keep the session alive past its first result ONLY when a feedback loop is possible: a
       // build, with a verify command to fail. Scope and verify runs want today's behaviour —
       // finish and close — and a session nobody closes hangs the daemon (see the finally below).

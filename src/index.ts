@@ -119,6 +119,7 @@ export {
 export { AsyncQueue } from './async-queue';
 export {
   type AgentDriver,
+  type DriverCapabilities,
   type DriverSession,
   type DriverStartOptions,
   type DriverHandlers,

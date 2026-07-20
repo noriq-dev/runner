@@ -5,6 +5,7 @@ import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
 import type {
   AgentDriver,
+  DriverCapabilities,
   DriverExit,
   DriverSession,
   DriverStartOptions,
@@ -44,7 +45,25 @@ class FakeDriver implements AgentDriver {
   continueTexts: string[] = [];
   /** True once stop() was called — a multiTurn session that nobody closes hangs the daemon. */
   stopped = false;
-  constructor(readonly tool: 'claude' | 'codex') {}
+  /** Mirrors the real drivers' capabilities (RUN-110): claude wires hooks, codex doesn't. */
+  capabilities: DriverCapabilities = {
+    toolHooks: true,
+    steer: true,
+    interrupt: true,
+    resumableSession: true,
+    perModelTelemetry: true,
+  };
+  constructor(readonly tool: 'claude' | 'codex') {
+    if (tool === 'codex') {
+      this.capabilities = {
+        toolHooks: false,
+        steer: true,
+        interrupt: true,
+        resumableSession: false,
+        perModelTelemetry: false,
+      };
+    }
+  }
   start(opts: DriverStartOptions): DriverSession {
     this.opts = opts;
     this.starts.push(opts);
@@ -651,6 +670,39 @@ describe('RunSupervisor', () => {
     expect(h.codex.opts?.cwd).toBe('/wt/run_1'); // codex driver started
     expect(h.claude.opts).toBeUndefined();
     h.codex.complete('done');
+    await done;
+  });
+
+  it('hands a lock enforcer only to a driver with in-process hooks (RUN-110)', async () => {
+    // claude declares toolHooks → gets the reactive PreToolUse enforcer (RUN-101)
+    const ha = harness();
+    const a = ha.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'claude' }));
+    await flush();
+    expect(ha.claude.opts?.lockEnforcer).toBeDefined();
+    ha.claude.complete('done');
+    await a;
+
+    // codex has no hooks → no enforcer handed to it; the hard floor (RUN-102) is its only guard
+    const hb = harness();
+    const b = hb.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'codex' }));
+    await flush();
+    expect(hb.codex.opts?.lockEnforcer).toBeUndefined();
+    hb.codex.complete('done');
+    await b;
+  });
+
+  it('keys lock enforcement off capabilities, not the driver NAME (RUN-111)', async () => {
+    // A driver that calls itself 'claude' but declares no in-process hooks must NOT get an
+    // enforcer — the supervisor reads the capability, never the vendor name. This is the guard
+    // that keeps the driver map the ONLY place a tool identity matters.
+    const claude = new FakeDriver('claude');
+    claude.capabilities = { ...claude.capabilities, toolHooks: false };
+    const codex = new FakeDriver('codex');
+    const h = harness({ drivers: { claude, codex } });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'claude' }));
+    await flush();
+    expect(claude.opts?.lockEnforcer).toBeUndefined();
+    claude.complete('done');
     await done;
   });
 
@@ -2067,6 +2119,28 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.outcome).toBe('done');
     expect(h.verifyRan()).toBe(false);
     expect(h.claude.starts).toHaveLength(1);
+  });
+
+  it('hands the driver a sanitized env — stripping is a supervisor guarantee (RUN-109)', async () => {
+    const prev = process.env.NORIQ_TOKEN;
+    process.env.NORIQ_TOKEN = 'super-secret-daemon-token';
+    try {
+      const h = harness({ manifest: manifest({ verify: null }) });
+      const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+      await flush();
+      const env = h.claude.starts[0]?.env;
+      expect(env).toBeDefined();
+      // the daemon's OAuth token never reaches the agent's shell — regardless of driver
+      expect(env?.NORIQ_TOKEN).toBeUndefined();
+      // git can neither prompt nor push with a credential helper
+      expect(env?.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env?.GIT_ASKPASS).toBe('/bin/false');
+      h.claude.complete('done');
+      await done;
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, 'NORIQ_TOKEN');
+      else process.env.NORIQ_TOKEN = prev;
+    }
   });
 
   it('with [land]: the reviewer judges intent BEFORE landing, and a PASS lands', async () => {

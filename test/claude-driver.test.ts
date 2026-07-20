@@ -83,6 +83,20 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 
 afterEach(() => vi.restoreAllMocks());
 
+describe('driver capabilities (RUN-110)', () => {
+  it('claude declares in-process hooks, steer, resume, and per-model telemetry', () => {
+    const driver = new ClaudeDriver({ queryFn: (() => undefined) as unknown as QueryFn });
+    expect(driver.tool).toBe('claude');
+    expect(driver.capabilities).toEqual({
+      toolHooks: true,
+      steer: true,
+      interrupt: true,
+      resumableSession: true,
+      perModelTelemetry: true,
+    });
+  });
+});
+
 describe('mapPermission', () => {
   it('scope (read-only) allows read tools, disallows Edit/Bash, dontAsk', () => {
     const p = mapPermission(profile({ write: false }), 'scope');

@@ -50,7 +50,8 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
 }
 
 /**
- * sanitizedAgentEnv + the one Noriq token codex needs, in the env, deliberately.
+ * Why codex re-adds ONE token to the sanitized env, deliberately (the exception the codex driver
+ * makes on top of `sanitizedAgentEnv`).
  *
  * This bends the rule above and it is worth being honest about why. The Claude driver puts
  * the credential on the MCP transport's Authorization header, so it never touches the shell.
@@ -58,7 +59,7 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
  * streamable-HTTP MCP server's token is read from the process environment or codex cannot
  * authenticate at all. There is no third choice short of a local proxy.
  *
- * What makes the trade acceptable is WHICH token this now is (RUN-43). It is minted per Run,
+ * What makes the trade acceptable is WHICH token this is (RUN-43). It is minted per Run,
  * bound to exactly one agent in one project, and revoked by the server the moment the Run
  * goes terminal — so a build agent that reads it out of its own env gains the ability to act
  * as itself, in the project it is already working, until its run ends. Before this, codex got
@@ -66,14 +67,10 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
  * is a worse failure and a silent one. The alternative — passing the DAEMON's token, which
  * can register runners and reach every project its human can — is the thing this replaces.
  *
- * If codex ever grows header support, delete this and use it.
+ * Since RUN-109 the codex driver composes `{ ...opts.env, [CODEX_MCP_TOKEN_ENV]: token }` on the
+ * supervisor-sanitized base rather than re-sanitizing here. If codex ever grows header support,
+ * drop the re-add entirely.
  */
-export function agentEnvWithMcpToken(
-  token: string,
-  base: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  return { ...sanitizedAgentEnv(base), [CODEX_MCP_TOKEN_ENV]: token };
-}
 
 /**
  * Reaching a human — available to EVERY kind (RUN-32).
