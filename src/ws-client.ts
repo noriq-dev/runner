@@ -1,5 +1,13 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
-import type { AgentTool, Run, RunKind, RunModelUsage, RunPhase, RunStatus } from '@noriq-dev/shared';
+import type {
+  AgentTool,
+  ExecutionSpec,
+  Run,
+  RunKind,
+  RunModelUsage,
+  RunPhase,
+  RunStatus,
+} from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
 
@@ -178,6 +186,8 @@ export class WsClient {
       modelUsage?: RunModelUsage | null;
       logTail?: string | null;
       phase?: RunPhase | null;
+      /** The spec this run was briefed with (RUN-166) — once, then null. */
+      executedSpec?: ExecutionSpec | null;
     },
   ): void {
     this.sendRaw({
@@ -191,6 +201,9 @@ export class WsClient {
       logTail: t.logTail ?? null,
       // Null = no news, not "clear it" — the server COALESCEs every field on this frame.
       phase: t.phase ?? null,
+      // Write-once server-side (RUN-166): what a run was briefed with is a fact about a moment
+      // that has passed, so a redelivered frame must not replace it with a later view.
+      executedSpec: t.executedSpec ?? null,
       at: new Date().toISOString(),
     });
   }

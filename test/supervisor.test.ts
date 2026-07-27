@@ -2336,6 +2336,44 @@ describe('plan-branch fork base (RUN-82)', () => {
 // RUN-168. A decomposed spec runs as a chain of sessions, one per step. The point is that each
 // starts FRESH — not carrying the previous step's exploration — and inherits its conclusions
 // instead. A chain of fresh contexts beats one long context only if each link gets the hand-off.
+// RUN-166. A task's spec is a live row anyone may edit at any point, so "what was this builder
+// told?" was inferred from the current row rather than answered — and once verification grades a
+// run against per-acceptance-item evidence (RUN-145), which criteria applied to THIS run stops
+// being a curiosity and becomes the input to a gate.
+describe('a run records the spec it was briefed with (RUN-166)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const withSpec = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: ['it reaps on start'] } }),
+  });
+
+  it('reports it once, and it is the spec the agent was actually briefed with', async () => {
+    const h = harness({ anchorTask: withSpec() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    const reported = h.reports.filter((r) => r.executedSpec);
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.executedSpec!.acceptance.observableTruths).toEqual(['it reaps on start']);
+  });
+
+  // Nothing to record for a task nobody planned and no planner ran on — and a run with no spec
+  // must not report an empty one, which would read as "briefed with nothing" rather than "no
+  // spec". The daemon says nothing instead.
+  it('says nothing for a run with no spec', async () => {
+    const h = harness({ anchorTask: null });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.reports.filter((r) => r.executedSpec)).toHaveLength(0);
+  });
+});
+
 describe('a decomposed run is a chain of sessions (RUN-168)', () => {
   const twoSteps = (): AnchorTask => ({
     key: 'ACME-1',

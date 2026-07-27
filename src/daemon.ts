@@ -345,13 +345,17 @@ export class Daemon {
         //
         // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
         // say "verifying" without claiming the spend is zero.
-        if (rep.telemetry || rep.phase) {
+        if (rep.telemetry || rep.phase || rep.executedSpec) {
           // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
           // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
           held.ws?.sendTelemetry(runId, {
             ...telemetryFrame(rep),
             logTail: rep.logTail ?? null,
             phase: rep.phase ?? null,
+            // Once, when the daemon has resolved it (RUN-166). Rides THIS frame because recording
+            // what a run was briefed with is not a lifecycle transition — run.status has no
+            // running → running edge, so it would be rejected there and silently dropped.
+            executedSpec: rep.executedSpec ?? null,
           });
         }
         if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {

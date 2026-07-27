@@ -155,6 +155,17 @@ export interface RunReport {
   telemetry?: DriverTelemetry;
   /** Rolling tail of the agent's output for the live dashboard (RUN-22), tail-capped. */
   logTail?: string;
+  /**
+   * The execution spec this run was actually briefed with (RUN-166) — sent ONCE, when it is
+   * resolved, and absent on every other frame.
+   *
+   * The daemon is the writer rather than the server at dispatch, and that is the decision. A run
+   * whose task carried no spec gets one from the `plan` stage: a spec the server never sent and
+   * could not have recorded. Those are exactly the runs where "what was this agent told?" matters
+   * most, because nobody wrote the contract beforehand — so a dispatch-time copy would be empty
+   * precisely where it is needed.
+   */
+  executedSpec?: ExecutionSpec;
   exit?: Record<string, unknown> | null;
 }
 
@@ -2246,6 +2257,11 @@ export class RunSupervisor {
     // step; anything else is one session, exactly as before. `checkSteps` has already dropped a
     // decomposition it could not run, so an empty list here means "run this as one" rather than
     // "something was wrong" — which is why there is no branch for the failure.
+    // What this run was actually briefed with, recorded once (RUN-166). Sent here rather than at
+    // dispatch because THIS is where the answer exists: a task that arrived unplanned executes
+    // under whatever the planner wrote, which the server never sent and could not have stored.
+    if (executedSpec) this.deps.report(run.id, { status: 'running', executedSpec: executedSpec.spec });
+
     const chain = checkSteps(executedSpec?.spec);
     const executed = chain.steps.length
       ? await executeChain(this.executeHost(), {
