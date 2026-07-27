@@ -102,8 +102,23 @@ function bareObject(text: string): string | null {
   return start >= 0 && end > start ? text.slice(start, end + 1) : null;
 }
 
-/** What the stage produced. `null` = the run stays unplanned, which is not a failure. */
-export type PlanOutcome = CheckedExecutionSpec | null;
+/**
+ * What the stage produced. `null` = the run stays unplanned, which is not a failure.
+ *
+ * The session stays OPEN when a plan came back, because the checker (RUN-141) revises through it:
+ * a planner asked to fix its own plan in a fresh context would be re-deriving everything it
+ * already worked out. The caller therefore OWNS it and must `close()` — nothing else shuts the
+ * query down, and an open one keeps the daemon's event loop alive forever (RUN-29).
+ */
+export interface PlannedRun {
+  checked: CheckedExecutionSpec;
+  /** Hand the planner a revision request and take its new spec. Null = the turn failed or produced
+   *  nothing usable, which ends the loop with the plan as it stands. */
+  revise(feedback: string): Promise<CheckedExecutionSpec | null>;
+  /** Close the planner's session, and persist whatever the loop settled on. */
+  close(final: CheckedExecutionSpec): Promise<void>;
+}
+export type PlanOutcome = PlannedRun | null;
 
 export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutcome> => {
   const { run, tally } = plan;
@@ -115,6 +130,9 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   const budgetRun = host.startAgent(plan.driver, {
     ...plan.start,
     prompt: plan.prompt,
+    // Kept open so the checker can hand revisions back into the context that wrote the plan
+    // (RUN-141). `close` below is the only thing that shuts it, and every path reaches one.
+    multiTurn: true,
     handlers: {
       onTelemetry: (t) => {
         // Its own slot, so the run's total shows what planning cost rather than folding it into
@@ -135,16 +153,18 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
 
   host.steering?.register(run.id, budgetRun.session, budgetRun.stop);
 
-  let exit: Awaited<BudgetRun['done']>;
-  try {
-    exit = await budgetRun.done;
-  } finally {
+  // The session stays open past its first result (multiTurn) — `close()` is what ends it, and
+  // every path below reaches one. Steering stays registered until then, so a cancel during the
+  // checker loop still has a target.
+  const abandon = async (why: string): Promise<null> => {
     host.steering?.unregister(run.id);
-    // A planner is single-turn, but stopping is what closes the SDK query — an open one keeps the
-    // daemon's event loop alive forever (RUN-29).
     await budgetRun.stop().catch(() => {});
     tally.chargeTime((Date.now() - startedAt) / 1000);
-  }
+    host.transcript(run.id).milestone(`${why} — proceeding unplanned`);
+    return null;
+  };
+
+  const exit = await budgetRun.done;
   tally.record('plan', exit.telemetry);
 
   if (exit.outcome !== 'done') {
@@ -152,17 +172,13 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
       runId: run.id,
       reason: exit.reason,
     });
-    host
-      .transcript(run.id)
-      .milestone(`planning did not finish (${exit.reason ?? 'failed'}) — proceeding unplanned`);
-    return null;
+    return abandon(`planning did not finish (${exit.reason ?? 'failed'})`);
   }
 
   const spec = parsePlannedSpec(text);
   if (!spec) {
     host.log.warn('planner produced no usable spec — the run proceeds unplanned', { runId: run.id });
-    host.transcript(run.id).milestone('planning produced nothing usable — proceeding unplanned');
-    return null;
+    return abandon('planning produced nothing usable');
   }
 
   // Checked exactly as a delivered spec is (RUN-139), and for a sharper reason: the planner wrote
@@ -184,14 +200,15 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
       }`,
     );
 
-  // Write it back so it is VISIBLE and CORRECTABLE — the point of planning in the open rather than
-  // in the builder's head. Best-effort: a save that fails costs reusability on a retry and the
-  // human's chance to correct it, never this run, which already holds the spec in hand.
-  // An EMPTY planned spec is not worth persisting: `hasExecutionSpec` reads it as unplanned
-  // anyway, and storing it would make every future attempt skip planning because the field is no
-  // longer null. A planner that found nothing to say leaves the task exactly as it was.
-  if (host.saveSpec && run.anchor?.type === 'task' && hasExecutionSpec(spec)) {
-    const saved = await host.saveSpec(run.projectId, run.anchor.taskId, spec).catch((err) => {
+  const save = async (final: CheckedExecutionSpec): Promise<void> => {
+    // Written back so the plan is VISIBLE and CORRECTABLE — the point of planning in the open
+    // rather than in the builder's head. Best-effort: a save that fails costs reusability on a
+    // retry and a human's chance to correct it, never this run, which already holds the spec.
+    //
+    // An EMPTY spec is not worth persisting: `hasExecutionSpec` reads it as unplanned anyway, and
+    // storing it would make every future attempt skip planning because the field is no longer null.
+    if (!host.saveSpec || run.anchor?.type !== 'task' || !hasExecutionSpec(final.spec)) return;
+    const saved = await host.saveSpec(run.projectId, run.anchor.taskId, final.spec).catch((err) => {
       host.log.warn('could not save the planned spec back to the task', {
         runId: run.id,
         err: String(err),
@@ -206,7 +223,28 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
         .transcript(run.id)
         .milestone('the task gained a spec while planning — theirs kept, not overwritten');
     }
-  }
+  };
 
-  return checked;
+  return {
+    checked,
+    revise: async (feedback: string) => {
+      const turn = budgetRun.session.continueWith;
+      if (!turn) return null;
+      const revisedExit = await turn.call(budgetRun.session, feedback).catch((err) => {
+        host.log.warn('could not hand the plan findings back', { runId: run.id, err: String(err) });
+        return null;
+      });
+      if (!revisedExit || revisedExit.outcome !== 'done') return null;
+      const revised = parsePlannedSpec(text);
+      // The revision REPLACES the plan, so nothing parseable means the previous one stands rather
+      // than being lost — a checker round that produced no new plan has cost tokens, not a plan.
+      return revised ? host.checkSpec(revised, plan.worktree.localPath) : null;
+    },
+    close: async (final: CheckedExecutionSpec) => {
+      await save(final);
+      host.steering?.unregister(run.id);
+      await budgetRun.stop().catch(() => {});
+      tally.chargeTime((Date.now() - startedAt) / 1000);
+    },
+  };
 };

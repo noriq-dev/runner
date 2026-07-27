@@ -24,6 +24,7 @@
 
 import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
+import type { ExecutionSpec } from '@noriq-dev/shared';
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
@@ -123,6 +124,8 @@ export interface PreparedRun {
   plannedTask: AnchorTask | null;
   /** The planner's brief, assembled from the same facts as the run's own. */
   plannerPrompt: string;
+  /** The plan checker's brief for one round: the spec as it stands, plus the ledger so far. */
+  checkerPrompt: (spec: ExecutionSpec, ledger: string) => string;
   /** Rebuild the RUN's brief around a spec the planner produced. */
   rebuildPrompt: (checked: CheckedExecutionSpec | null) => string;
   repo: ResolvedRepo;
@@ -491,7 +494,12 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // One assembly point, called twice at most: once now with whatever spec the task arrived with,
   // and again by the `plan` stage if it synthesizes one (RUN-140). A closure rather than a second
   // call site so the facts a prompt is built from cannot drift between the two.
-  const buildPrompt = (specBlock: string, forVerify: string, shape?: 'planner') =>
+  const buildPrompt = (
+    specBlock: string,
+    forVerify: string,
+    shape?: 'planner' | 'plan-checker',
+    ledger?: string,
+  ) =>
     assemblePrompt(run, repo.manifest, {
       agent: runAgent,
       server: host.server,
@@ -510,6 +518,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
       // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
       ...(shape ? { promptShapeOverride: shape } : {}),
+      ...(ledger !== undefined ? { ledger } : {}),
       workflow,
     });
 
@@ -526,6 +535,10 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     plannedTask:
       hasExecutionSpec(task?.executionSpec) || task?.executionSpecUnreadable ? null : (task ?? null),
     plannerPrompt: buildPrompt('', '', 'planner'),
+    // The checker reads a SPEC, so its prompt is built per round from whatever the plan is now
+    // (RUN-141) — the same closure, so the facts around the spec cannot drift between rounds.
+    checkerPrompt: (spec, ledger) =>
+      buildPrompt(renderExecutionSpec({ spec, findings: [] }), '', 'plan-checker', ledger),
     rebuildPrompt: (checked) =>
       buildPrompt(renderExecutionSpec(checked), renderExecutionSpec(checked, { only: 'acceptance' })),
     repo,

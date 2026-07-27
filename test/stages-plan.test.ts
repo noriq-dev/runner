@@ -38,6 +38,8 @@ const driverSaying = (text: string, outcome: DriverExit['outcome'] = 'done'): Ag
       interrupt: async () => {},
       stop: async () => {},
       done: async () => exit,
+      // The planner is multiTurn now (RUN-141) — the checker revises through this session.
+      continueWith: async () => exit,
     };
   },
 });
@@ -125,7 +127,9 @@ describe('the plan stage', () => {
   it('plans, checks the result, and writes it back to the task', async () => {
     const h = host();
     const out = await planRun(h, input(driverSaying('```json\n{"requirementIds":["RUN-140"]}\n```')));
-    expect(out?.spec.requirementIds).toEqual(['RUN-140']);
+    expect(out?.checked.spec.requirementIds).toEqual(['RUN-140']);
+    if (out) await out.close(out.checked); // the write-back happens when the session closes
+
     expect(h.saved).toHaveLength(1);
     expect((h.saved[0] as { requirementIds: string[] }).requirementIds).toEqual(['RUN-140']);
   });
@@ -153,13 +157,15 @@ describe('the plan stage', () => {
       },
     });
     const out = await planRun(h, input(driverSaying('```json\n{"discretion":["x"]}\n```')));
-    expect(out?.spec.discretion).toEqual(['x']);
+    if (out) await out.close(out.checked);
+    expect(out?.checked.spec.discretion).toEqual(['x']);
   });
 
   it('runs without a save hook at all — the spec is simply not persisted', async () => {
     const h = host({ saveSpec: undefined });
     const out = await planRun(h, input(driverSaying('```json\n{"discretion":["x"]}\n```')));
-    expect(out?.spec.discretion).toEqual(['x']);
+    if (out) await out.close(out.checked);
+    expect(out?.checked.spec.discretion).toEqual(['x']);
   });
 
   // The planner's spend is its own slot, so the run's total shows what planning cost rather than
@@ -167,7 +173,8 @@ describe('the plan stage', () => {
   it('bills planning to its own slot', async () => {
     const h = host();
     const i = input(driverSaying('```json\n{}\n```')) as { tally: ReturnType<typeof tally> };
-    await planRun(h, i as never);
+    const planned = await planRun(h, i as never);
+    if (planned) await planned.close(planned.checked);
     expect(i.tally.slots.has('plan')).toBe(true);
     expect(i.tally.chargeTime).toHaveBeenCalled();
   });
@@ -182,7 +189,8 @@ describe('the plan stage', () => {
       }),
     });
     const out = await planRun(h, input(driverSaying('```json\n{"requirementIds":["R"]}\n```')));
-    expect(out?.findings).toHaveLength(1);
+    if (out) await out.close(out.checked);
+    expect(out?.checked.findings).toHaveLength(1);
     expect(h.milestones.join(' ')).toMatch(/disagreeing with the checkout/);
   });
 
@@ -196,7 +204,8 @@ describe('the plan stage', () => {
         return { ...s, stop: async () => void stops.push('stopped') };
       },
     };
-    await planRun(host(), input(wrapped));
+    const p2 = await planRun(host(), input(wrapped));
+    if (p2) await p2.close(p2.checked);
     expect(stops).toEqual(['stopped']);
   });
 });
@@ -221,6 +230,7 @@ describe('what the stage refuses to persist', () => {
   it('does not write an empty planned spec back to the task', async () => {
     const h = host();
     const out = await planRun(h, input(driverSaying('```json\n{}\n```')));
+    if (out) await out.close(out.checked);
     expect(out).not.toBeNull(); // this run still gets the (empty) result
     expect(h.saved).toHaveLength(0);
   });
@@ -229,7 +239,8 @@ describe('what the stage refuses to persist', () => {
   it('keeps the run’s own spec but reports a declined save', async () => {
     const h = host({ saveSpec: async () => false });
     const out = await planRun(h, input(driverSaying('```json\n{"discretion":["x"]}\n```')));
-    expect(out?.spec.discretion).toEqual(['x']);
+    if (out) await out.close(out.checked);
+    expect(out?.checked.spec.discretion).toEqual(['x']);
     expect(h.milestones.join(' ')).toMatch(/theirs kept, not overwritten/);
   });
 });

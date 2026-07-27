@@ -94,6 +94,16 @@ quarter of the run's remaining ceiling, after which the builder RE-RESERVES. Pla
 a run: every failure path leaves it exactly as unplanned as it arrived, which is still a first-class
 state.
 
+A repo with `[verify.agent]` also gets the **plan checker** (RUN-141, `src/stages/plan-check.ts`):
+a fresh read-only actor judges the SPEC — missing requirement coverage, impossible ordering,
+oversized scope, vague acceptance criteria, conflicting file ownership — and a FAIL goes back to
+the planner's still-open session, bounded by the same `maxRounds` that bounds the builder's fix
+turns, carrying the same adjudication ledger (`src/adjudication.ts`) so a settled point stays
+settled. Same gate for both because a repo that wants an independent judgement on its WORK is the
+one that wants it on its PLAN. It cannot gate the run either: a plan that never clears goes to the
+builder **with the findings attached**, because refusing to work over a disagreement between two
+advisors about work neither has done is worse than building a plan somebody criticised.
+
 Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
 (tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and
 maps templates to call sites). Edit the words there — code only decides which template fires and

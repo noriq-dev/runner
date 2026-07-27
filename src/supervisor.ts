@@ -26,7 +26,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
-import { type SpecPathProbe, checkExecutionSpec } from './execution-spec';
+import { type CheckedExecutionSpec, type SpecPathProbe, checkExecutionSpec } from './execution-spec';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -45,12 +45,16 @@ import { type StageName, stagesFor } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
+  type PlanCheckHost,
   type PlanHost,
+  type PlannedRun,
   type PrepareHost,
   type PreparedRun,
   type RunPipeline,
   type StageHost,
   type StageImpl,
+  checkPlan,
+  checkerFindings,
   executeRun,
   integrateStage,
   planRun,
@@ -661,7 +665,9 @@ export function assemblePrompt(
      * `Workflow` would have made it declarable in a manifest, and a repo able to declare its own
      * planner posture is exactly the widening `clampPermissionToWorkflow` exists to stop.
      */
-    promptShapeOverride?: 'planner';
+    promptShapeOverride?: 'planner' | 'plan-checker';
+    /** The adjudication ledger, for the plan checker's own prior-rounds section (RUN-141). */
+    ledger?: string;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
@@ -681,7 +687,12 @@ export function assemblePrompt(
     // The PLANNER announces itself as a planner (RUN-140). It ran as "BUILD agent … MODE: PLAN",
     // which is a contradiction in the first two lines of a prompt, and the half of it that was
     // wrong was the half describing what the agent may do.
-    kind: ctx.promptShapeOverride === 'planner' ? 'PLAN' : run.kind.toUpperCase(),
+    kind:
+      ctx.promptShapeOverride === 'planner'
+        ? 'PLAN'
+        : ctx.promptShapeOverride === 'plan-checker'
+          ? 'PLAN CHECK'
+          : run.kind.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
   });
@@ -709,6 +720,16 @@ export function assemblePrompt(
   // build's brief must not silently reshape the planner that writes that build's spec.
   if (ctx.promptShapeOverride === 'planner') {
     return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
+  }
+  if (ctx.promptShapeOverride === 'plan-checker') {
+    return renderPrompt('plan-checker', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: ctx.executionSpec ?? '',
+      ledger: ctx.ledger ?? '',
+    });
   }
   if (wf.promptRef) {
     // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
@@ -2057,7 +2078,7 @@ export class RunSupervisor {
       return prepared.start;
     }
 
-    const checked = await planRun(this.planHost(), {
+    const planned = await planRun(this.planHost(), {
       run,
       repo: prepared.repo,
       worktree: prepared.worktree,
@@ -2085,7 +2106,26 @@ export class RunSupervisor {
       this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
       return null;
     });
-    if (!checked) return prepared.start;
+    if (!planned) return prepared.start;
+
+    // The plan checker (RUN-141), through the planner's still-open session. It cannot gate the
+    // run: a plan that never clears goes to the builder WITH the findings, because refusing to
+    // work over a disagreement between two advisors — about work neither has done — is worse than
+    // building a plan somebody criticised.
+    const outcome = await this.checkPlanIfConfigured(run, prepared, planned).catch((err) => {
+      this.log.warn('the plan checker failed — the plan stands as planned', {
+        runId: run.id,
+        err: String(err),
+      });
+      return { checked: planned.checked, findings: '' };
+    });
+    await planned.close(outcome.checked).catch(() => {});
+    // Findings the loop never resolved travel WITH the plan. A criticised plan handed over looking
+    // like an approved one is the worst of both: the tokens were spent and the warning was not.
+    const extra = checkerFindings(outcome.findings);
+    const checked: CheckedExecutionSpec = extra.length
+      ? { ...outcome.checked, findings: [...outcome.checked.findings, ...extra] }
+      : outcome.checked;
 
     // RE-RESERVE. `prepared.start.budget` was computed before planning, so handing it to the
     // builder unchanged would let a run spend its ceiling twice — exactly the per-session-copy bug
@@ -2102,6 +2142,69 @@ export class RunSupervisor {
       ...prepared.start,
       prompt: prepared.rebuildPrompt(checked),
       ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+    };
+  }
+
+  /**
+   * The plan-checker loop (RUN-141), when the repo asked for one.
+   *
+   * Gated on `[verify.agent]` — the same section that opts a repo into the diff reviewer, and for
+   * the same reason: a repo that wants an independent judgement on its WORK is the one that wants
+   * an independent judgement on its PLAN, and a second knob would be two ways to say one thing.
+   * `maxRounds` bounds the revisions exactly as it bounds the builder's fix turns.
+   */
+  private async checkPlanIfConfigured(
+    run: Run,
+    prepared: PreparedRun,
+    planned: PlannedRun,
+  ): Promise<{ checked: CheckedExecutionSpec; findings: string }> {
+    const reviewer = prepared.repo.manifest.verify?.agent;
+    if (!reviewer) return { checked: planned.checked, findings: '' };
+
+    const result = await checkPlan(this.planCheckHost(planned, prepared.tally), {
+      run,
+      driver: prepared.driver,
+      checked: planned.checked,
+      maxRounds: reviewer.maxRounds,
+      prompt: (spec, ledger) => prepared.checkerPrompt(spec, ledger),
+      start: {
+        ...prepared.start,
+        // Same narrowing as the planner's, and for the same two reasons: `auto` survives the write
+        // clamp, and a filesystem clamp says nothing about the control plane. A checker emits a
+        // report and nothing else.
+        permission: plannerPermission(prepared.permission),
+        noriqMcp: undefined,
+      },
+    });
+    return { checked: result.checked, findings: result.findings };
+  }
+
+  private planCheckHost(planned: PlannedRun, tally: RunTally): PlanCheckHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      ...(this.deps.steering
+        ? {
+            steering: {
+              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
+                this.deps.steering?.register(runId, session, stop),
+              unregister: (runId: string) => this.deps.steering?.unregister(runId),
+            },
+          }
+        : {}),
+      revise: (feedback) => planned.revise(feedback),
+      reserve: () => {
+        const r = tally.reserve();
+        return r.ok
+          ? { ok: true, ...(r.budget ? { budget: plannerBudget(r.budget) } : {}) }
+          : { ok: false, breach: r.breach };
+      },
+      guards: (slot) => ({
+        spendGuard: tally.guard(slot),
+        clockGuard: tally.clockGuard(),
+      }),
     };
   }
 
