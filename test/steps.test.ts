@@ -1,6 +1,6 @@
 import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { MAX_STEPS, checkSteps, renderSteps } from '../src/steps';
+import { MAX_STEPS, checkSteps, planWaves, renderSteps } from '../src/steps';
 
 // RUN-148. A spec may declare an ordered decomposition. The PLANNER owns the judgement (which files
 // are one coherent piece of work); the daemon owns the mechanics (are these ids usable, is this
@@ -81,6 +81,81 @@ describe('what it refuses, and how it refuses', () => {
   it('says nothing at all about a spec that declares no steps', () => {
     expect(checkSteps(spec({ requirementIds: ['R-1'] }))).toEqual({ steps: [], findings: [] });
     expect(checkSteps(null)).toEqual({ steps: [], findings: [] });
+  });
+});
+
+// RUN-149. Which steps may run at the same time. Two different questions: `dependsOn` is the
+// PLAN's statement about order and is authoritative; whether two declared file sets intersect is
+// arithmetic the daemon does.
+describe('grouping steps into waves', () => {
+  const ok = (over: ExecutionSpecInput) => checkSteps(spec(over)).steps;
+  const shape = (waves: Array<Array<{ id: string }>>) => waves.map((w) => w.map((s) => s.id));
+
+  it('runs independent, non-overlapping steps together', () => {
+    const waves = planWaves(
+      ok({
+        steps: [
+          step('a', { anticipatedFiles: [{ path: 'src/a.ts' }] }),
+          step('b', { anticipatedFiles: [{ path: 'src/b.ts' }] }),
+        ],
+      }),
+    );
+    expect(shape(waves)).toEqual([['a', 'b']]);
+  });
+
+  it('holds a dependent step back until its predecessor has finished', () => {
+    const waves = planWaves(ok({ steps: [step('a'), step('b', { dependsOn: ['a'] }), step('c')] }));
+    // c is independent, so it rides with a; b waits for a.
+    expect(shape(waves)).toEqual([['a', 'c'], ['b']]);
+  });
+
+  // The declaration that drives predictive locking is the one that decides this — two steps that
+  // both mean to edit a file are not two things to do at once, whatever their dependencies say.
+  it('separates steps whose declared files overlap, even with no dependency between them', () => {
+    const waves = planWaves(
+      ok({
+        steps: [
+          step('a', { anticipatedFiles: [{ path: 'src/shared.ts' }, { path: 'src/a.ts' }] }),
+          step('b', { anticipatedFiles: [{ path: 'src/shared.ts' }] }),
+        ],
+      }),
+    );
+    expect(shape(waves)).toEqual([['a'], ['b']]);
+  });
+
+  // A decomposition must not outrun the machine. Steps that do not fit fall to the next wave —
+  // a slower schedule, never a smaller plan.
+  it('caps a wave without dropping anything', () => {
+    const waves = planWaves(ok({ steps: [step('a'), step('b'), step('c')] }), 2);
+    expect(shape(waves)).toEqual([['a', 'b'], ['c']]);
+  });
+
+  // A caller asking for no concurrency is answered the way it asked rather than looped over.
+  it('degrades to one step per wave at a limit of one, or of zero', () => {
+    const steps = ok({ steps: [step('a'), step('b')] });
+    expect(shape(planWaves(steps, 1))).toEqual([['a'], ['b']]);
+    expect(shape(planWaves(steps, 0))).toEqual([['a'], ['b']]);
+  });
+
+  it('has no waves for no steps', () => {
+    expect(planWaves([])).toEqual([]);
+  });
+
+  // Every step appears exactly once, whatever the shape — the property that makes a schedule a
+  // schedule rather than a filter.
+  it('schedules every step exactly once', () => {
+    const steps = ok({
+      steps: [
+        step('a', { anticipatedFiles: [{ path: 'x.ts' }] }),
+        step('b', { dependsOn: ['a'] }),
+        step('c', { anticipatedFiles: [{ path: 'x.ts' }] }),
+        step('d', { dependsOn: ['b', 'c'] }),
+      ],
+    });
+    const flat = planWaves(steps, 2)
+      .flat()
+      .map((s) => s.id);
+    expect(flat.sort()).toEqual(['a', 'b', 'c', 'd']);
   });
 });
 

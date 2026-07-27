@@ -276,6 +276,7 @@ export {
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
 export {
   checkSteps,
+  planWaves,
   renderSteps,
   MAX_STEPS,
   type CheckedSteps,

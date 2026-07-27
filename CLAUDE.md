@@ -287,8 +287,17 @@ and should be updated alongside any change here.
   read-only (Codex). It is not "cannot alter a file" — `auto = true` grants unrestricted Bash in a
   writable tree, by the same deliberate opt-in as `autoPush`. THREAT-MODEL.md states the boundary;
   don't restate it more strongly than that.
-- **One worktree per Run**; never two runs in one checkout; never force-delete work that exists nowhere
-  else.
+- **One worktree per unit of concurrent work**; never two RUNS in one checkout; never force-delete
+  work that exists nowhere else.
+  ~~One worktree per Run~~ was the wording until RUN-149, and the amendment is narrow: the rule that
+  carries the isolation is *never two runs in one checkout*, and a run's own concurrent steps do not
+  violate it — they are one run's sessions, under one identity, one budget and one lock scope.
+  A SEQUENTIAL chain still shares the run's single workspace (RUN-168), because steps that cannot
+  race need no isolating. Only steps a wave schedules to overlap take one each, and they take it for
+  a reason the declaration cannot supply: `anticipatedFiles` is briefed as "a starting point, not a
+  fence", so two steps in a wave *can* reach for the same file despite declaring otherwise. The
+  overlap check decides what is worth running together; separate workspaces are what make running
+  together safe.
 - Merging happens only into the branch `[land].branch` names, only after the gate passed *rebased onto
   it*, and only locally.
 

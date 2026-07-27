@@ -137,6 +137,63 @@ function topoOrder(steps: ExecutionStep[]): ExecutionStep[] | null {
 }
 
 /**
+ * The steps grouped into WAVES — sets that may run at the same time (RUN-149).
+ *
+ * A step joins a wave when two things hold, and they are different questions:
+ *
+ *   1. Every step it `dependsOn` is already in an EARLIER wave. This is the plan's own statement
+ *      about order and it is the authority on it.
+ *   2. Its declared files do not overlap any step already in that wave. This is the daemon's
+ *      question, not the planner's — the planner said what each step touches, and whether two of
+ *      those sets intersect is arithmetic.
+ *
+ * The second is why an undeclared overlap is not merely a missed optimisation. `anticipatedFiles`
+ * is briefed to the agent as "a starting point, not a fence", so two steps in one wave CAN reach
+ * for the same file despite declaring otherwise — which is exactly why concurrent steps need
+ * separate workspaces rather than trusting the declaration. The overlap check decides what is
+ * worth running together; it is not what makes running together safe.
+ *
+ * `limit` caps a wave, so a decomposition cannot outrun the machine. Steps that do not fit are not
+ * dropped — they fall to the next wave, which is a slower schedule and never a smaller plan.
+ *
+ * A pure function over the validated list, so the schedule can be reasoned about and tested
+ * without a workspace, a driver, or a clock.
+ */
+export function planWaves(steps: ExecutionStep[], limit = Number.POSITIVE_INFINITY): ExecutionStep[][] {
+  const waves: ExecutionStep[][] = [];
+  const done = new Set<string>();
+  const remaining = [...steps];
+  while (remaining.length) {
+    const wave: ExecutionStep[] = [];
+    const claimed = new Set<string>();
+    for (const step of remaining) {
+      if (wave.length >= limit) break;
+      if (!step.dependsOn.every((d) => done.has(d))) continue;
+      const files = step.anticipatedFiles.map((f) => f.path);
+      if (files.some((f) => claimed.has(f))) continue;
+      wave.push(step);
+      for (const f of files) claimed.add(f);
+    }
+    // Nothing was runnable and steps remain. `checkSteps` has already refused a cycle, so the only
+    // way here is a `limit` of zero or less — a caller asking for no concurrency at all. Answer it
+    // the way it was asked rather than looping: one step per wave is a valid schedule.
+    if (!wave.length) {
+      const next = remaining.shift();
+      if (!next) break;
+      done.add(next.id);
+      waves.push([next]);
+      continue;
+    }
+    for (const s of wave) {
+      done.add(s.id);
+      remaining.splice(remaining.indexOf(s), 1);
+    }
+    waves.push(wave);
+  }
+  return waves;
+}
+
+/**
  * The decomposition as the builder reads it.
  *
  * Until each step is its own session (the remainder of RUN-148), this is what makes a declared
