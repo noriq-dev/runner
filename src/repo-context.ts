@@ -64,15 +64,51 @@ const contains = (root: string, abs: string): boolean => {
  * actually binds is `openConfined` — see RUN-151.
  */
 export const defaultPathProbe: PathProbe = async (abs, root) => {
+  const k = await probePathKind(abs, root);
+  // `unchecked` collapses to `missing` HERE and only here: `[context]` names a path either to be
+  // inlined or to be reported as unresolved, and both readings are "not in the brief". A consumer
+  // that must tell "gone" from "could not look" — the execution-spec checker does (RUN-139) —
+  // calls `probePathKind` and gets the distinction the filesystem actually gave.
+  return k === 'file' || k === 'dir' ? true : k === 'outside-repo' ? 'outside-repo' : 'missing';
+};
+
+/**
+ * What is at a path, once symlinks are followed and containment re-checked.
+ *
+ * The richer answer under `defaultPathProbe`, split out because two consumers want different
+ * things from the same walk:
+ *
+ *   - `missing` vs `unchecked` — ENOENT is the path being gone; EACCES, EIO, or a root whose
+ *     realpath fails are the daemon being unable to look. Reporting the second as the first tells
+ *     a caller a file is definitely absent when nobody managed to check (RUN-139).
+ *   - `file` vs `dir` — `[context]` accepts either (an entry point may be a directory), but a spec
+ *     that says "modify src" when `src` is a directory is telling an agent something impossible,
+ *     and the agent should not be the one to discover it.
+ *
+ * Point-in-time, like any probe: what is here now, not a guarantee about what a later read gets.
+ * The gate that actually binds a read to what was checked is `openConfined` (RUN-151).
+ */
+export type PathKind = 'file' | 'dir' | 'missing' | 'outside-repo' | 'unchecked';
+
+export const probePathKind = async (abs: string, root: string): Promise<PathKind> => {
+  let s: Awaited<ReturnType<typeof stat>>;
   try {
-    const s = await stat(abs);
-    if (!s.isFile() && !s.isDirectory()) return 'missing';
+    s = await stat(abs);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? 'missing' : 'unchecked';
+  }
+  if (!s.isFile() && !s.isDirectory()) return 'missing';
+  try {
     // `stat` already followed the link chain; resolve it explicitly and re-check containment,
     // so an in-repo symlink pointing outside is refused rather than silently followed.
-    return contains(await realpath(root), await realpath(abs)) ? true : 'outside-repo';
+    if (!contains(await realpath(root), await realpath(abs))) return 'outside-repo';
   } catch {
-    return 'missing';
+    // The object is there but its containment could not be established. Refusing outright would
+    // be a fail-CLOSED answer to an unknown, which is the wrong default for orientation — but
+    // calling it present would be the fail-open this exists to avoid.
+    return 'unchecked';
   }
+  return s.isFile() ? 'file' : 'dir';
 };
 
 /**

@@ -9,6 +9,7 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
+import type { ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
@@ -25,6 +26,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
+import type { SpecPathProbe } from './execution-spec';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -199,6 +201,10 @@ export interface RunSupervisorDeps {
   /** How `[context]` paths are checked to exist and stay inside the repo (RUN-128). Injected so
    *  tests never touch a real tree; omitted → the real fs probe. */
   pathProbe?: PathProbe;
+  /** How an execution spec's paths are checked (RUN-139). A separate seam from `pathProbe`
+   *  because it answers a richer question — file vs directory, gone vs could-not-look — that
+   *  `[context]` deliberately collapses. Omitted → the real fs probe. */
+  specPathProbe?: SpecPathProbe;
   /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
    *  omitted → the real fs. */
   readDoc?: DocReader;
@@ -563,6 +569,10 @@ export interface AnchorTask {
   key: string;
   title: string;
   body: string | null;
+  /** What this task was commissioned with (RUN-139). Null = nobody wrote one. */
+  executionSpec?: ExecutionSpec | null;
+  /** The SERVER holds a spec it could not read (RUN-135) — not the same as having none. */
+  executionSpecUnreadable?: boolean;
 }
 
 /**
@@ -623,6 +633,20 @@ export function assemblePrompt(
     repoContext?: string;
     /** The same facts with no inlined documents, for the verify family (RUN-154). */
     repoContextBrief?: string;
+    /**
+     * The anchor task's execution spec, already checked against the checkout and rendered
+     * (RUN-139). A string for the same reason `repoContext` is: checking touches the disk, and
+     * prompt assembly stays synchronous and pure.
+     *
+     * Empty for a task with no spec, which stays the common case — every task filed before the
+     * contract grew one, and plenty since. The verify family does NOT receive it: a reviewer
+     * judging a diff against acceptance criteria is RUN-145's design, not a free extra here.
+     */
+    executionSpec?: string;
+    /** The same spec's ACCEPTANCE CRITERIA alone, for the verify family (RUN-139) — the shape
+     *  RUN-154 gave its context, and for the same reason: an actor that judges needs the standard
+     *  it is judging against, not the author's working notes. */
+    executionSpecForVerify?: string;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
@@ -655,6 +679,12 @@ export function assemblePrompt(
   // of inlined documents. Note it is NOT `produces`: scope produces a plan rather than a diff, but
   // it is an author reading the repo, not a gate deciding on it.
   const repoContext = (wf.verifyActor ? ctx.repoContextBrief : ctx.repoContext) ?? '';
+  // The verify family gets the ACCEPTANCE CRITERIA only — the same trim its context gets
+  // (RUN-154), for the same reason: what it needs is the standard, not the author's working
+  // notes about which files to touch and what was deferred. Withholding the whole spec was the
+  // first cut and it was wrong: a gate that has not been told what "done" means is not
+  // independent, it is under-informed, and it can pass a build that skipped a stated criterion.
+  const executionSpec = wf.verifyActor ? (ctx.executionSpecForVerify ?? '') : (ctx.executionSpec ?? '');
 
   if (wf.promptRef) {
     // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
@@ -666,12 +696,19 @@ export function assemblePrompt(
       brief: run.brief,
       anchor,
       context: repoContext,
+      spec: executionSpec,
       verifyCmd: manifest.verify?.cmd ?? '',
       reviewer: manifest.verify?.agent ? 'true' : '',
     });
   }
   if (wf.promptShape === 'scope') {
-    return renderPrompt('scope', { identity, brief: run.brief, anchor, context: repoContext });
+    return renderPrompt('scope', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: executionSpec,
+    });
   }
   if (wf.promptShape === 'build') {
     // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
@@ -692,13 +729,14 @@ export function assemblePrompt(
       brief: run.brief,
       anchor,
       context: repoContext,
+      spec: executionSpec,
     });
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer. It receives the repo's
   // orientation by NAME only (RUN-154) — it is the actor asked whether a diff looks like this
   // repo's code, so telling it nothing about this repo was backwards, but its context is already
   // carrying the diff and inlining documents on top would crowd out the subject.
-  return assembleVerifyPrompt(`${run.brief}${anchor}`, {
+  return assembleVerifyPrompt(`${run.brief}${anchor}${executionSpec}`, {
     agent: ctx.agent,
     server: ctx.server,
     diffCmd: ctx.diffCmd,
@@ -1965,6 +2003,7 @@ export class RunSupervisor {
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
       context: {
         ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
+        ...(this.deps.specPathProbe ? { specProbe: this.deps.specPathProbe } : {}),
         ...(this.deps.readDoc ? { read: this.deps.readDoc } : {}),
         ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
       },

@@ -26,6 +26,12 @@ import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@nor
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
+import {
+  type SpecPathProbe,
+  checkExecutionSpec,
+  renderExecutionSpec,
+  renderUnreadableSpec,
+} from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
 import { type DocReader, type PathProbe, loadRepoContext, renderRepoContext } from '../repo-context';
@@ -44,7 +50,13 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
-import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, runWorkflow } from '../workflow';
+import {
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  runWorkflow,
+  workflowFor,
+} from '../workflow';
 
 /**
  * What preparation may reach.
@@ -85,7 +97,14 @@ export interface PrepareHost {
   /** The run's effective ceiling: the dispatch's, else the machine default. Null = unbounded. */
   runBudget(run: Run): RunBudget | null;
   /** How `[context]` paths are probed and read (RUN-128/129) — injected so tests touch no disk. */
-  readonly context: { probe?: PathProbe; read?: DocReader; budget?: number };
+  readonly context: {
+    probe?: PathProbe;
+    /** The kind-and-uncertainty probe the execution-spec check needs (RUN-139) — a different
+     *  question from `probe`'s, so a different seam rather than a widened one. */
+    specProbe?: SpecPathProbe;
+    read?: DocReader;
+    budget?: number;
+  };
   readonly continuable?: Pick<ContinuableStore, 'get'>;
 }
 
@@ -410,6 +429,52 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     );
   }
 
+  // The anchor task's spec, checked against THIS checkout before a token is spent (RUN-139). A
+  // stale path is worth telling the agent about — it is the one actor that can act on it — but it
+  // is never fatal: a spec is orientation, and refusing to run because a file moved would make it
+  // a tripwire. The adversarial pre-execution check is RUN-141's own stage.
+  const workflow = run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined;
+  const checkedSpec = task?.executionSpec
+    ? await checkExecutionSpec(task.executionSpec, worktree.localPath, {
+        // NOT `host.context.probe`: that seam answers `[context]`'s question (is this worth
+        // putting in the brief) and collapses "could not look" into "missing". This one needs
+        // the kind and the uncertainty (RUN-139).
+        probe: host.context.specProbe,
+        produces: (workflow ?? workflowFor(kind)).produces,
+      })
+    : null;
+  // Findings go to the RUN'S TRANSCRIPT, not only to daemon stderr — which is what makes the two
+  // levels mean something rather than decorate a log line. A `problem` is the spec contradicting
+  // the checkout, and it belongs where a human watching this run will see it without reading the
+  // daemon's output; a `note` is worth telling the agent and not worth interrupting anyone over.
+  const problems = (checkedSpec?.findings ?? []).filter((f) => f.level === 'problem');
+  for (const f of checkedSpec?.findings ?? []) {
+    host.log.warn(`[spec] ${f.where}: ${f.message}`, { runId: run.id, level: f.level });
+  }
+  if (problems.length) {
+    host
+      .transcript(run.id)
+      .milestone(
+        `the execution spec disagrees with this checkout in ${problems.length} place(s): ${problems
+          .map((f) => f.where)
+          .join(', ')} — the agent was told, and told to trust the repo`,
+      );
+  }
+  if (task?.executionSpecUnreadable) {
+    host
+      .transcript(run.id)
+      .milestone('this task has an execution spec the server could not read — briefed without it');
+  }
+  // A spec the SERVER could not read is not a task without one. Briefing the agent as if it were
+  // unplanned lets whatever the agent then decides become the de-facto plan — the same overwrite
+  // RUN-135's flag exists to prevent, one layer along. So it goes in the PROMPT, not only the log.
+  if (task?.executionSpecUnreadable) {
+    host.log.warn('[spec] the server holds an unreadable execution spec for this task', { runId: run.id });
+  }
+  const renderedSpec = task?.executionSpecUnreadable
+    ? renderUnreadableSpec()
+    : renderExecutionSpec(checkedSpec);
+
   const prompt = assemblePrompt(run, repo.manifest, {
     agent: runAgent,
     server: host.server,
@@ -419,9 +484,15 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
     // documents differ (RUN-154).
     repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
+    executionSpec: renderedSpec,
+    // The definition of done, alone, for the actor that judges (RUN-139). Withholding it made the
+    // gate under-informed rather than independent: a reviewer that has not been told what the work
+    // was commissioned to achieve can pass a build that skipped it, or fail one for leaving out
+    // something the spec explicitly deferred.
+    executionSpecForVerify: renderExecutionSpec(checkedSpec, { only: 'acceptance' }),
     // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
     // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
-    workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,
+    workflow,
   });
 
   return {

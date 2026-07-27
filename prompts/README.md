@@ -40,6 +40,28 @@ carries no `CLAUDE.md` / `AGENTS.md` — those are inlined by default (RUN-129).
 `scope.md` and `build.md` carry it. A custom workflow's prompt is passed the same variable but must
 place the tag itself.
 
+`{{spec}}` is the anchor TASK's execution spec (RUN-134…139), checked against the run's workspace by
+`src/execution-spec.ts` and rendered there. It sits **after** the brief and anchor, for the mirror
+of the reason `{{context}}` sits before them: `{{context}}` is what is true of the repo whatever the
+task, so it is reference read ahead of the ask; the spec is what is true of THIS task, so it reads
+as the ask's own detail. It carries its own leading blank line and renders to nothing when the task
+has no spec — which is most tasks, and not a defect.
+
+The last thing in the block is any finding the deterministic check produced (a `modify` whose file
+is gone, a `create` whose file is already there). Those come last on purpose: they contradict what
+the spec just said, and an agent that reads the contradiction first has nothing to attach it to.
+
+`scope.md` and `build.md` carry it; a custom workflow's prompt is passed it and must place the tag,
+and one written before this existed simply renders without it — extra variables are ignored, so
+nothing throws and nothing is injected into a template the daemon does not control.
+
+The verify family gets a **narrower** rendering of the same spec: the acceptance criteria alone,
+placed with the intent. Withholding it entirely was the first cut and it was wrong — a gate that has
+not been told what the work was commissioned to achieve is not independent, it is under-informed,
+and it can pass a build that skipped a stated criterion or fail one for omitting something the spec
+explicitly deferred. What it does not get is the author's working notes (which files, what was
+decided, what is deferred), for the same reason its `[context]` is trimmed.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

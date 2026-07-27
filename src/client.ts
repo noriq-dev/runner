@@ -1,3 +1,4 @@
+import { ExecutionSpec } from '@noriq-dev/shared';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
@@ -6,6 +7,31 @@ export interface TaskBrief {
   key: string;
   title: string;
   body: string | null;
+  /**
+   * What this task was commissioned with (RUN-134…139). Null = nobody wrote one, which is every
+   * task before the contract grew this and plenty after.
+   */
+  executionSpec: ExecutionSpec | null;
+  /**
+   * The server holds a spec it could not parse (RUN-135). NOT the same as having none: absence
+   * reads as "nobody planned this", and something that plans would then write over it. Carried so
+   * the daemon can say so rather than brief an agent as if the task were unplanned.
+   */
+  executionSpecUnreadable: boolean;
+}
+
+/** Parse a wire spec at the boundary. Absent → no spec; present but unparseable → flagged, never
+ *  silently absent (RUN-135's distinction, enforced on this side of the wire too). */
+function readSpec(
+  raw: unknown,
+  serverSaidUnreadable: boolean,
+): Pick<TaskBrief, 'executionSpec' | 'executionSpecUnreadable'> {
+  if (serverSaidUnreadable) return { executionSpec: null, executionSpecUnreadable: true };
+  if (raw == null) return { executionSpec: null, executionSpecUnreadable: false };
+  const parsed = ExecutionSpec.safeParse(raw);
+  return parsed.success
+    ? { executionSpec: parsed.data, executionSpecUnreadable: false }
+    : { executionSpec: null, executionSpecUnreadable: true };
 }
 
 /**
@@ -305,10 +331,22 @@ export class NoriqClient {
   /** An anchor task's human-readable content, so the prompt can inline it instead of
    *  handing the agent an opaque id it has to go look up. */
   async getTask(taskId: string): Promise<TaskBrief | null> {
-    const out = (await this.mcpCall('get_task', { taskId })) as { task?: Partial<TaskBrief> } | null;
+    const out = (await this.mcpCall('get_task', { taskId })) as {
+      task?: Partial<TaskBrief> & { executionSpec?: unknown; executionSpecUnreadable?: unknown };
+    } | null;
     const t = out?.task;
     if (!t?.key || !t?.title) return null;
-    return { key: t.key, title: t.title, body: t.body ?? null };
+    return {
+      key: t.key,
+      title: t.title,
+      body: t.body ?? null,
+      // Parsed through the contract rather than trusted: this arrives from a server the daemon
+      // does not control, and the whole point of a vendored schema is that the wire is checked at
+      // the boundary. A spec that does not parse is dropped to null and FLAGGED — a server on a
+      // newer contract than this daemon is exactly the case where silently reporting "no spec"
+      // would let a planner overwrite a real one.
+      ...readSpec(t.executionSpec, t.executionSpecUnreadable === true),
+    };
   }
 
   /**

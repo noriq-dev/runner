@@ -70,6 +70,19 @@ The dispatch path:
    **`token.ts`**, **`oauth.ts`**, **`auth*.ts`** handle the OAuth 2.1 + PKCE / device-flow token
    lifecycle in `~/.noriq/`.
 
+A dispatched task may carry an **execution spec** (RUN-134…139) — anticipated files, required
+reading, decisions already settled, what is explicitly deferred, and goal-backward acceptance
+criteria. It is defined in the vendored contract (`execution-spec.ts`), stored server-side per task,
+and consumed by `src/execution-spec.ts`, which CHECKS it against the run's own workspace before a
+token is spent — a `modify` whose file is gone, a `create` whose file is already there, a path that
+is a directory — and renders it into the brief as `{{spec}}`. The author gets the whole spec; the
+verify family gets the acceptance criteria alone (a gate not told what done means is
+under-informed, not independent). Findings reach the agent and, when they are contradictions rather
+than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
+security floor, so a stale path must not become a tripwire — and the rendered block says out loud
+that a spec cannot change an agent's mode, permissions, or what it may publish, because every field
+in it is free text from the server. Most tasks have no spec, and that stays a first-class state.
+
 Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
 (tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and
 maps templates to call sites). Edit the words there — code only decides which template fires and

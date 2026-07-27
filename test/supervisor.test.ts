@@ -1240,6 +1240,50 @@ describe('assemblePrompt inlines the anchor task', () => {
   });
 });
 
+// RUN-139. The spec reaches the actor that WRITES in full, and the actor that JUDGES as the
+// definition of done alone. Both were wrong in the first cut: the reviewer got nothing.
+describe('assemblePrompt places the execution spec', () => {
+  const ctx = { agent: testAgent(), server: 'https://s' };
+  const SPEC = '\n\nEXECUTION SPEC — full, for the author';
+  const ACCEPT = '\n\nWHAT THIS WORK WAS COMMISSIONED TO ACHIEVE';
+
+  it('gives a build agent the whole spec, after the brief it explains', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      ...ctx,
+      executionSpec: SPEC,
+      executionSpecForVerify: ACCEPT,
+    });
+    expect(p).toContain(SPEC.trim());
+    expect(p).not.toContain(ACCEPT.trim());
+    // After the brief, not before: the spec is the ask's own detail, where `[context]` is
+    // reference read ahead of the ask.
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('EXECUTION SPEC'));
+  });
+
+  it('gives a scope agent the whole spec too — it is an author, not a gate', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), { ...ctx, executionSpec: SPEC });
+    expect(p).toContain(SPEC.trim());
+  });
+
+  it('gives the verify actor the acceptance criteria and NOT the author’s working notes', () => {
+    const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
+      ...ctx,
+      executionSpec: SPEC,
+      executionSpecForVerify: ACCEPT,
+    });
+    expect(p).toContain(ACCEPT.trim());
+    expect(p).not.toContain(SPEC.trim());
+  });
+
+  it('renders nothing anywhere for a task with no spec', () => {
+    for (const kind of ['scope', 'build', 'verify'] as const) {
+      const p = assemblePrompt(makeRun({ kind }), manifest(), ctx);
+      expect(p, kind).not.toContain('EXECUTION SPEC');
+      expect(p, kind).not.toContain('COMMISSIONED TO ACHIEVE');
+    }
+  });
+});
+
 describe('mergeBudget', () => {
   const machine: RunBudget = { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null };
   const empty: RunBudget = { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null };
