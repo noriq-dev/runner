@@ -25,6 +25,30 @@ describe('assembleVerifyPrompt', () => {
     expect(p).not.toMatch(/\/verify skill/);
   });
 
+  // RUN-154. The verifier is the actor asked whether a diff satisfies THIS repo's intent, and it
+  // was the only one told nothing about what this repo is. Names only: its context already carries
+  // the diff, so inlining documents on top would crowd out the subject under review.
+  it("carries the repo's own orientation, by name", () => {
+    const p = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+      repoContext: '\n\nThis repo says of itself:\n- Conventions (non-negotiable): ESM only',
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p).toContain('ESM only');
+    // Before the specs, after the verdict instruction — reference first, the ask last.
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Task specs'));
+  });
+
+  it('renders exactly as before when the repo declares nothing', () => {
+    const bare = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+    });
+    expect(bare).not.toContain('This repo says of itself');
+    expect(bare).toMatch(/VERDICT: PASS/);
+  });
+
   it('points at the workspace files when the backend has no diff command (non-git)', () => {
     const p = assembleVerifyPrompt('spec', {
       agent: { agentId: 'agt_v', label: 'verify-x' },

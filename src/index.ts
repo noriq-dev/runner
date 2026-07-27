@@ -57,10 +57,12 @@ export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from '.
 export {
   AGENT_INSTRUCTION_FILES,
   CONTEXT_BUDGET_CHARS,
+  REVIEWER_CONTEXT_MAX_CHARS,
   defaultDocReader,
   defaultPathProbe,
   discoverAgentInstructions,
   loadRepoContext,
+  loadRepoContextBrief,
   loadRepoDocs,
   openConfined,
   renderRepoContext,

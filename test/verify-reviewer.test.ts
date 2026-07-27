@@ -72,6 +72,27 @@ describe('assembleReviewerPrompt', () => {
     expect(p).toMatch(/no project-management access/);
   });
 
+  // RUN-154. This is the actor being asked "does this look like this repo's code?" while being
+  // told nothing about what this repo's code looks like. Names only — the diff already owns its
+  // context, and a reviewer is read-only by definition, so a named file is one it can just read.
+  it("carries the repo's own orientation, by name", () => {
+    const p = assembleReviewerPrompt({
+      intent: 'x',
+      repoContext:
+        "\n\nThis repo says of itself:\n- This repo's rules are written down in: CLAUDE.md — read them before judging the diff against them",
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p).toContain('CLAUDE.md');
+    expect(p).toMatch(/before judging the diff/);
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Intent to review against'));
+  });
+
+  it('renders exactly as before when the repo declares nothing', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).not.toContain('This repo says of itself');
+    expect(p).toMatch(/VERDICT: PASS/);
+  });
+
   it('points at the working tree when there is no diff command (live VCS backends)', () => {
     const p = assembleReviewerPrompt({ intent: 'x' });
     expect(p).toMatch(/modified files in this working tree/);

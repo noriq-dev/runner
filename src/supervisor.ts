@@ -38,7 +38,13 @@ import { LockEnforcer, lockFloorComment } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
-import { type DocReader, type PathProbe, loadRepoContext } from './repo-context';
+import {
+  type DocReader,
+  type PathProbe,
+  loadRepoContext,
+  loadRepoContextBrief,
+  renderRepoContext,
+} from './repo-context';
 import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -522,6 +528,8 @@ export function assemblePrompt(
     /** The repo's own orientation block, already resolved off disk (RUN-128). Optional: a marker
      *  with neither a `[context]` nor a CLAUDE.md/AGENTS.md renders as it did before RUN-128. */
     repoContext?: string;
+    /** The same facts with no inlined documents, for the verify family (RUN-154). */
+    repoContextBrief?: string;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
@@ -546,11 +554,15 @@ export function assemblePrompt(
   // The repo's `[context]` block (RUN-128), rendered ahead of the brief for the scope and build
   // families. A custom workflow's own prompt receives it as `{{context}}` but must PLACE that tag
   // to get it — a template we do not control cannot have text injected into it. The verify family
-  // does not receive it at all: `assembleVerifyPrompt` is a separate assembler, and wiring it is
-  // deliberately still open (RUN-128's release note), not an oversight to be papered over here.
-  const repoContext = ctx.repoContext ?? '';
-
+  // gets the NAMES-ONLY rendering instead (RUN-154), for the reason below.
   const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
+  // Which rendering an actor gets follows what it IS, not which template it uses. `verifyActor` is
+  // the flag that means "this one judges" — so a repo-defined workflow based on `verify` (RUN-119)
+  // gets the bounded, explicitly-untrusted block through its own `{{context}}` too, instead of 16k
+  // of inlined documents. Note it is NOT `produces`: scope produces a plan rather than a diff, but
+  // it is an author reading the repo, not a gate deciding on it.
+  const repoContext = (wf.verifyActor ? ctx.repoContextBrief : ctx.repoContext) ?? '';
+
   if (wf.promptRef) {
     // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
     // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
@@ -589,11 +601,15 @@ export function assemblePrompt(
       context: repoContext,
     });
   }
-  // verify kind (RUN-20): a fresh, independent, adversarial reviewer.
+  // verify kind (RUN-20): a fresh, independent, adversarial reviewer. It receives the repo's
+  // orientation by NAME only (RUN-154) — it is the actor asked whether a diff looks like this
+  // repo's code, so telling it nothing about this repo was backwards, but its context is already
+  // carrying the diff and inlining documents on top would crowd out the subject.
   return assembleVerifyPrompt(`${run.brief}${anchor}`, {
     agent: ctx.agent,
     server: ctx.server,
     diffCmd: ctx.diffCmd,
+    repoContext,
   });
 }
 
@@ -1161,6 +1177,29 @@ export class RunSupervisor {
     return { ...verdict, rounds: maxRounds, ledger };
   }
 
+  /**
+   * The repo's orientation for a judging actor (RUN-154), resolved HERE rather than threaded from
+   * the run's own context. The inline reviewer is reached by two entry paths — a run that finished
+   * in one sitting and one resumed days later in a different process (RUN-30) — and only the first
+   * ever assembled a prompt, so only the first has a resolved context to pass down. Resolving at
+   * the point of use is what makes both paths behave the same, and it is names-only, so it costs
+   * a handful of stats and reads no files.
+   *
+   * Never fatal: a reviewer with no orientation is exactly the reviewer we had before this, so a
+   * broken `[context]` degrades the review rather than failing the gate.
+   */
+  private async reviewerContext(repo: ResolvedRepo, ws: Workspace): Promise<string> {
+    return loadRepoContextBrief(ws.localPath, repo.manifest.context, { probe: this.deps.pathProbe })
+      .then((c) => c.rendered)
+      .catch((err) => {
+        this.log.warn('could not resolve [context] for the reviewer — reviewing without it', {
+          repo: repo.manifest.key,
+          err: String(err),
+        });
+        return '';
+      });
+  }
+
   /** One fresh reviewer session over the build's worktree. Read-only profile, no Noriq
    *  credential, verdict parsed from its output. */
   private async runReviewer(ctx: {
@@ -1221,6 +1260,7 @@ export class RunSupervisor {
         diffCmd,
         verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
         ledger: ctx.ledger,
+        repoContext: await this.reviewerContext(ctx.repo, ctx.worktree),
       }),
       permission: manifest.permissions.verify,
       // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
@@ -1863,6 +1903,9 @@ export class RunSupervisor {
       task,
       diffCmd,
       repoContext: repoCtx.rendered,
+      // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
+      // documents differ (RUN-154).
+      repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
       // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
       // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
       workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,

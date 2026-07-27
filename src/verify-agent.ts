@@ -24,6 +24,10 @@ export interface VerifyPromptContext {
    *  range). Absent on a backend that has no such command — the prompt then points at the
    *  workspace's modified files instead, so this stays VCS-neutral. */
   diffCmd?: string;
+  /** The repo's own orientation, NAMES ONLY (RUN-154). A verifier judges a diff against this
+   *  repo's conventions, so being told nothing about them was backwards; the contents are left
+   *  out because the diff already owns this actor's context. Absent = renders as it did before. */
+  repoContext?: string;
 }
 
 /** Build the adversarial verify prompt (prompts/verify-agent.md) from the phase specs.
@@ -45,6 +49,7 @@ export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): s
     agentId: ctx.agent.agentId,
     server: ctx.server,
     diffCmd: ctx.diffCmd ?? null,
+    context: ctx.repoContext ?? '',
     specs,
   });
 }

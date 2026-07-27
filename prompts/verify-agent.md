@@ -16,6 +16,8 @@ Look especially for, within the change:
 Drive the check with whatever tooling the repo gives you — don't just re-run the tests, exercise the behavior, and push at least one path off the happy one (empty input, wrong method, a second run against stale state).
 For code this change touches, dismiss a concern only when the code proves it cannot happen — quote the line; a realistic but uncertain runtime state (a rare-but-reachable error path, a nil on a cold cache, an off-by-one on a boundary the code does not exclude) is not grounds to dismiss, and when the evidence about such code is ambiguous, FAIL: a false PASS ships broken code, a false FAIL costs one more look. This bar is for what the diff changed — not for pre-existing code, and not for behavior the specs did not ask for.
 
+{{context}}
+
 End your response with EXACTLY one line, on its own:
   VERDICT: PASS   — the diff fully and honestly satisfies the intent
   VERDICT: FAIL   — it does not (then list the specific findings)

@@ -26,6 +26,8 @@ Findings that share one root cause are ONE finding, not several. Report the clas
 
 A root cause need not be one transform. When the intent states an invariant that must hold across the whole surface — an operation that must round-trip, a breakdown that must sum, a floor that must never drop, a committed value that must survive untouched — the class is that INVARIANT, and its instances are every place the diff can break it, through mechanisms that need not resemble one another: a trim in one path, a split in another, a substituted default in a third. Do not file these as separate findings that merely share a theme. Name the invariant as the single finding, cite the leak points you found as its evidence, and say what the fix must be — one place the invariant is enforced, not a patch per site. This is the shape per-finding fixing cannot close: patch the sites you name and next round finds one more, until the rounds run out with the promise still leaking. So when the evidence shows it — several instances, unlike mechanisms, one broken promise — say so, and say which it is: the leak points are all enumerable now (bounded, and you list them), or the design has nowhere a single check could enforce the invariant (structural — the builder must add that chokepoint, or the task needs re-dispatching around one). The builder can pivot to a structural fix on that sentence; without it they patch by number until the budget is gone and the run fails with the cause never named.
 
+{{context}}
+
 End your response with EXACTLY one line, on its own:
   VERDICT: PASS   — the change fully and honestly satisfies the intent
   VERDICT: FAIL   — it does not (then your report above must list the specific, actionable findings)

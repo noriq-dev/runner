@@ -2173,6 +2173,55 @@ describe('the inline reviewer (RUN-61)', () => {
     throw new Error('the reviewer session never started');
   };
 
+  // RUN-154. The reviewer is the actor asked whether a diff looks like this repo's code, and it was
+  // the one told nothing about what this repo's code looks like. Names only — its context already
+  // carries the diff — and resolved at the point of use, so a run RESUMED in a later process gets
+  // it too (only the first sitting ever assembles a prompt with the run's own context in scope).
+  it("carries the repo's own conventions, by name, without inlining the documents", async () => {
+    const reads: string[] = [];
+    const h = harness({
+      manifest: {
+        ...REVIEWED('npm test'),
+        context: {
+          requiredReading: ['CLAUDE.md'],
+          entryPoints: ['src/daemon.ts'],
+          conventions: ['ESM only'],
+        },
+      },
+      pathProbe: async () => true,
+      readDoc: async (abs) => {
+        reads.push(abs);
+        return '# house rules';
+      },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+
+    const review = h.claude.starts[1]!;
+    expect(review.prompt).toContain('QUOTED FROM THE REPOSITORY UNDER REVIEW');
+    expect(review.prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(review.prompt).toContain('CLAUDE.md');
+    expect(review.prompt).toMatch(/before judging the diff/);
+    // The document itself stays out: the diff is what this actor's context is for.
+    expect(review.prompt).not.toContain('# house rules');
+    // Exactly ONE read in the whole run — the builder's. The reviewer's loader added none: it
+    // resolves paths and never opens them, which is what "names only" has to mean to be worth it.
+    expect(reads).toEqual(['/wt/run_1/CLAUDE.md']);
+    // The daemon's verdict rules come AFTER repo-controlled text — last word to the side that is
+    // not written by the repository being judged.
+    expect(review.prompt.indexOf('QUOTED FROM THE REPOSITORY')).toBeLessThan(
+      review.prompt.indexOf('End your response with EXACTLY one line'),
+    );
+    // …and the BUILDER still gets it inlined — the two actors want different things.
+    expect(h.claude.starts[0]?.prompt).toContain('# house rules');
+
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
   it('spawns a fresh read-only session with NO Noriq credential, and a PASS reaches done', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { model: 'claude-opus-4-8', effort: 'high' }) });
     const done = h.supervisor.supervise(buildRun());

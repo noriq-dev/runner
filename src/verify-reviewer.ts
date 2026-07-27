@@ -27,6 +27,10 @@ export interface ReviewerPromptContext {
    *  first look — a fresh reviewer with no history yet. Rendered into the PRIOR ADJUDICATIONS
    *  section so a settled finding is verified, not relitigated. */
   ledger?: LedgerEntry[];
+  /** The repo's own orientation, NAMES ONLY (RUN-154). This is the actor being asked "does this
+   *  look like this repo's code?", and it was the one told nothing about what this repo's code
+   *  looks like. Contents are deliberately not inlined — the diff already owns its context. */
+  repoContext?: string;
 }
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
@@ -87,6 +91,7 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
     diffCmd: ctx.diffCmd ?? null,
     verifyCmd: ctx.verifyCmd ?? null,
     intent: ctx.intent,
+    context: ctx.repoContext ?? '',
     priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,
   });
 }

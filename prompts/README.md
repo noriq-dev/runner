@@ -38,8 +38,17 @@ the ask than after it. It renders to nothing only when the repo declares no `[co
 carries no `CLAUDE.md` / `AGENTS.md` — those are inlined by default (RUN-129).
 
 `scope.md` and `build.md` carry it. A custom workflow's prompt is passed the same variable but must
-place the tag itself. `verify-agent.md` and `reviewer.md` do **not** receive it — they are assembled
-by `verify-agent.ts` / `verify-reviewer.ts`, which take no context argument yet.
+place the tag itself.
+
+`verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
+same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
+reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it
+was the one actor told nothing about them — but its context already carries the diff, and a 16k
+block of inlined documents on top crowds out the subject. The conventions are prose in the manifest,
+so they arrive verbatim either way; what a reviewer loses is file contents it can simply read, being
+read-only by definition and now told which files hold the rules. These two place the tag **after**
+the verdict instructions and before the intent, which is the same "reference first, the ask last"
+rule stated above.
 
 ## Stay agnostic
 
