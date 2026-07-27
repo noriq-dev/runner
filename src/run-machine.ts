@@ -124,7 +124,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     actor: 'none',
     budget: 'none',
     retry: { kind: 'feedback', boundedBy: 'MAX_VERIFY_FIXES' },
-    terminal: ['no_changes', 'lock', 'verify'],
+    terminal: ['no_changes', 'lock', 'lock:unchecked', 'verify'],
     appliesTo: always,
   },
   {

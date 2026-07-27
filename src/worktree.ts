@@ -247,26 +247,55 @@ export class WorktreeManager {
    * the base it forked from (RUN-102). The hard-floor lock gate acquires these as the run's
    * holder before the diff is made durable, so a write the reactive hook never saw (a Codex run,
    * or a Bash write its parser bailed on) still cannot land over a path a peer holds.
+   *
+   * **Throws rather than returning a partial or empty set** (RUN-156). Both probes used to swallow
+   * their errors, so "this run changed nothing" and "git would not tell me what it changed" arrived
+   * as the same `[]` — and the floor treats an empty set as nothing to lock, which is a PASS. That
+   * is a fail-open on the one layer that is the FIRST acquisition for a driver with no in-process
+   * hook: a build could land over a path a peer holds and no line anywhere would say so.
+   *
+   * A partial answer is refused for the same reason. Locking the paths one probe managed to report
+   * looks exactly like a floor that ran, while the paths the other probe would have named go
+   * unlocked — a silent under-lock is worse than a loud failure, because only one of them gets
+   * looked at.
+   *
+   * Both probes are read with `-z`, which is the same requirement wearing different clothes. Git's
+   * human output C-QUOTES anything non-ASCII or unusual under the default `core.quotePath`, so
+   * `src/é.ts` arrives as `"src/\303\251.ts"` — and a floor that locks that string has locked a path
+   * that does not exist while leaving the real one free. `-z` emits raw bytes with NUL separators:
+   * no quoting to undo, and no ambiguity for a filename containing a newline or ` -> `.
    */
   async changedPaths(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<string[]> {
+    // Same guard as `hasChanges`, and for the same reason: git reads `..HEAD` as `HEAD..HEAD` and
+    // reports a confident zero paths. Here that is a floor with nothing to lock, which reads as a
+    // pass.
+    if (!info.baseSha.trim()) throw new Error('worktree has no base commit — cannot tell what it changed');
     const set = new Set<string>();
-    const { stdout: porc } = await this.git(['status', '--porcelain'], info.path).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
-    for (const line of porc.split('\n')) {
-      const body = line.slice(3).trim(); // strip the XY status columns
-      if (!body) continue;
-      // `R  old -> new` (rename/copy): the write is the destination.
-      const arrow = body.split(' -> ');
-      const p = (arrow[1] ?? arrow[0] ?? '').trim().replace(/^"|"$/g, '');
+
+    // `XY <path>\0`, and for a rename/copy `XY <new>\0<old>\0` — two fields, destination FIRST.
+    const { stdout: porc } = await this.git(['status', '--porcelain', '-z'], info.path);
+    const fields = porc.split('\0');
+    for (let i = 0; i < fields.length; i++) {
+      const entry = fields[i];
+      if (!entry) continue;
+      const status = entry.slice(0, 2);
+      const p = entry.slice(3);
+      // The rename's SOURCE is the next field. Consumed rather than parsed: the write this floor
+      // is protecting is the destination, and treating a source as its own entry would mangle the
+      // one after it.
+      if (status.includes('R') || status.includes('C')) i += 1;
       if (p) set.add(p);
     }
+
     const { stdout: committed } = await this.git(
-      ['diff', '--name-only', `${info.baseSha}..HEAD`],
+      ['diff', '--name-only', '-z', `${info.baseSha}..HEAD`],
       info.path,
-    ).catch(() => ({ stdout: '', stderr: '' }));
-    for (const l of committed.split('\n')) if (l.trim()) set.add(l.trim());
+    );
+    for (const p of committed.split('\0')) if (p) set.add(p);
+
+    // About to answer "this run changed nothing" — the answer the floor reads as a pass. Detached
+    // at the base, a run branch full of commits reports no paths, and it is that BRANCH that lands.
+    if (!set.size) await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
     return [...set];
   }
 

@@ -189,9 +189,20 @@ class FakeWorktrees {
   /** Every acquire the supervisor made through the seam (floor + reactive). */
   lockCalls: Array<{ paths: string[]; ctx: LockContext }> = [];
   releases: Array<{ paths?: string[] }> = [];
-  changedPaths = async (): Promise<string[]> => this.changedFiles;
+  /** When set, `changedPaths` REJECTS — git could not say what the run touched (RUN-156). */
+  changedPathsError: string | null = null;
+  changedPaths = async (): Promise<string[]> => {
+    if (this.changedPathsError) throw new Error(this.changedPathsError);
+    return this.changedFiles;
+  };
+  /** When set, `lock` REJECTS — the service did not answer at all (RUN-156). */
+  lockError: string | null = null;
+  /** A project with locking genuinely off: the service ANSWERS `enabled:false`. */
+  lockingDisabled = false;
   lock = async (_ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> => {
     this.lockCalls.push({ paths, ctx });
+    if (this.lockError) throw new Error(this.lockError);
+    if (this.lockingDisabled) return { ok: true, enabled: false, locks: [] };
     return this.lockConflicts.length
       ? { ok: false, conflicts: this.lockConflicts }
       : { ok: true, enabled: true, locks: paths.map((p) => ({ id: p, path: p })) };
@@ -1435,6 +1446,60 @@ describe('the hard lock floor (RUN-102)', () => {
     expect(h.worktrees.landings).toEqual([]); // …but never lands over the peer
     expect(h.worktrees.removed).toEqual([]); // and the worktree is kept for a human
     expect(h.comments.some((c) => c.body.includes('src/shared.ts') && c.body.includes('peer'))).toBe(true);
+  });
+
+  // RUN-156. An empty changed set means "nothing to lock", which the floor reads as a PASS — so a
+  // failure to ENUMERATE arrived as a floor that silently did not run. For a driver with no
+  // in-process hook this is the run's ONLY acquisition, so the build would land over whatever a
+  // peer holds with nothing anywhere saying the check was skipped.
+  it('GATES when it cannot tell what the build changed — a floor that locked nothing is not a pass', async () => {
+    const blind = new FakeWorktrees();
+    blind.changedPathsError = 'fatal: not a git repository';
+    const h = harness({ manifest: LANDING(), repoVcs: blind });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('lock:unchecked'); // distinct from a real conflict — it IS different
+    expect(blind.lockCalls).toEqual([]); // nothing was locked, which is the whole problem
+    expect(blind.landings).toEqual([]); // …so it must not land
+    expect(blind.commits).toHaveLength(1); // the diff is committed first — gating costs a re-dispatch
+    expect(blind.removed).toEqual([]); // …and the worktree is kept for a human
+    expect(h.comments.some((c) => c.body.includes('could not check this run'))).toBe(true);
+  });
+
+  // The other route to the same hole, and the one my first fix left open: a lock service that does
+  // not answer used to become `{ ok: true }`. The justification was that the reactive hook and the
+  // dispatch-time check still stood — false for a Codex build on a first sitting, which has
+  // neither, so that call IS the only acquisition.
+  it('GATES when the lock service does not answer — not just when git does not', async () => {
+    const blind = new FakeWorktrees();
+    blind.changedFiles = ['src/a.ts'];
+    blind.lockError = 'ECONNREFUSED';
+    const h = harness({ manifest: LANDING(), repoVcs: blind });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('lock:unchecked');
+    expect(blind.landings).toEqual([]);
+    expect(blind.removed).toEqual([]); // kept, and continuable — the cost is a re-dispatch
+  });
+
+  // A project with locking genuinely OFF is a service answering, not one failing.
+  it('a locking-disabled project still passes the floor', async () => {
+    const off = new FakeWorktrees();
+    off.changedFiles = ['src/a.ts'];
+    off.lockingDisabled = true;
+    const h = harness({ manifest: LANDING(), repoVcs: off });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(off.landings).toHaveLength(1);
   });
 
   it('no changed paths → the floor is a no-op (nothing acquired)', async () => {

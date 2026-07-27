@@ -76,21 +76,39 @@ export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     // land it. Marking exit `failed{lock}` while KEEPING driverSucceeded makes every later stage
     // skip (they key off `exit.outcome === 'done'`) while the diff and its worktree survive for a
     // human, exactly like a verify failure.
-    const floorConflicts = await host.enforceLockFloor(repo, run, worktree, ctx.runAgent.token);
-    if (floorConflicts.length) {
+    const floor = await host.enforceLockFloor(repo, run, worktree, ctx.runAgent.token);
+    if (floor.conflicts.length) {
       host.log.warn('hard lock floor gated the build — it changed paths a peer holds', {
         runId: run.id,
-        holders: floorConflicts.map((c) => c.holderName ?? c.holder),
+        holders: floor.conflicts.map((c) => c.holderName ?? c.holder),
       });
       host
         .transcript(run.id)
         .milestone(
-          `🔒 hard lock floor gated this build — it changed ${floorConflicts
+          `🔒 hard lock floor gated this build — it changed ${floor.conflicts
             .map((c) => c.path)
-            .join(', ')}, held by ${floorConflicts.map((c) => c.holderName ?? c.holder).join(', ')}`,
+            .join(', ')}, held by ${floor.conflicts.map((c) => c.holderName ?? c.holder).join(', ')}`,
         );
-      comment(lockFloorComment([...floorConflicts]));
+      comment(lockFloorComment(floor.conflicts));
       ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'lock' };
+    } else if (floor.unchecked) {
+      // The floor did not COMPLETE — so it locked nothing, and for a driver with no in-process hook
+      // on a first sitting that was this run's only acquisition (RUN-156). Gate: the alternative is
+      // landing over a path a peer may hold with no line anywhere saying the check was skipped.
+      // Bounded cost — the workspace is kept below and the run is recorded continuable.
+      host.log.warn('hard lock floor did not complete — gating rather than landing unchecked', {
+        runId: run.id,
+        why: floor.unchecked,
+      });
+      host
+        .transcript(run.id)
+        .milestone(
+          '🔒 the hard lock floor could not complete, so nothing was checked against what other runs hold — gated rather than landed unchecked',
+        );
+      comment(
+        `🔒 The lock floor could not check this run's files against what other runs hold, so the run is gated rather than landed unchecked.\n\nNothing is lost: the workspace is kept and this run can be continued. Re-dispatch once the cause below is cleared.\n\n\`\`\`\n${floor.unchecked}\n\`\`\``,
+      );
+      ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'lock:unchecked' };
     }
   }
 

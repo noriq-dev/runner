@@ -103,6 +103,7 @@ describe('what each stage declares', () => {
       expect.arrayContaining([
         'no_changes',
         'lock',
+        'lock:unchecked',
         'verify',
         'verify_agent',
         'review',

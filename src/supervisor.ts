@@ -463,6 +463,18 @@ export class RunTally {
 }
 
 /** The anchor task's human-readable content, inlined into the prompt. */
+/**
+ * What the hard lock floor (RUN-102) concluded. `conflicts` is what it FOUND; `unknownScope` is
+ * the case it could not look at all (RUN-156) — kept apart because an empty `conflicts` used to
+ * mean both, and one of those is a pass while the other is a floor that never ran.
+ */
+export interface LockFloorOutcome {
+  conflicts: LockConflict[];
+  /** Set when the floor could not COMPLETE its check — the scope could not be enumerated, or the
+   *  lock service did not answer. Carries the underlying reason for the log and the comment. */
+  unchecked?: string;
+}
+
 export interface AnchorTask {
   key: string;
   title: string;
@@ -749,32 +761,53 @@ export class RunSupervisor {
    * acquisition — and a conflict means the run edited a path a peer holds, so the run is gated
    * rather than allowed to clobber. Daemon-side, so no token ever reaches the agent's shell.
    *
-   * Returns the blocking conflicts, or [] when the floor passed / doesn't apply (no lock layer,
-   * no changed-path enumeration, an empty diff, or locking disabled).
+   * Three outcomes, and the third is the one RUN-156 added: the floor could not COMPLETE its check.
+   * That used to arrive as a pass, by two different routes — a failed enumeration became an empty
+   * path set (nothing to lock), and a failed lock call became `{ ok: true }`. Both reported success
+   * for a check that never happened.
+   *
+   * Both now fail CLOSED, and the earlier draft of this fix got that wrong. It kept the lock call
+   * failing OPEN on the grounds that "the reactive hook and the dispatch-time check are still
+   * standing" — which is false in exactly the case this floor exists for. A Codex build has no
+   * in-process hook, and a first sitting declares no predictive scope, so for that run this call IS
+   * the only acquisition and its failure means nothing was checked at all.
+   *
+   * What gating costs is bounded and what it prevents is not: the diff is checkpointed just above,
+   * `driverSucceeded` stays true so the workspace is kept, and the run is recorded continuable — so
+   * a Noriq blip costs a re-dispatch, while the alternative is landing over a peer's held file with
+   * no line anywhere saying the check was skipped.
+   *
+   * A project with locking genuinely DISABLED still passes: that is a service saying `enabled:
+   * false`, which is an answer.
    */
   private async enforceLockFloor(
     repo: ResolvedRepo,
     run: Run,
     worktree: Workspace,
     token: string,
-  ): Promise<LockConflict[]> {
+  ): Promise<LockFloorOutcome> {
     const vcs = this.vcsFor(repo);
-    if (!vcs.lock || !vcs.changedPaths) return [];
-    const paths = await vcs.changedPaths(worktree).catch(() => [] as string[]);
-    if (!paths.length) return [];
+    if (!vcs.lock || !vcs.changedPaths) return { conflicts: [] };
+    let paths: string[];
+    try {
+      paths = await vcs.changedPaths(worktree);
+    } catch (err) {
+      return { conflicts: [], unchecked: `could not read what this run changed: ${err}` };
+    }
+    if (!paths.length) return { conflicts: [] };
     const ctx: LockContext = {
       projectId: run.projectId,
       token,
       branch: this.lockScopeBranch(repo, run),
       taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
     };
-    // A lock-service error must not gate a finished build: the reactive hook and dispatch-time
-    // check are the primary layers, and failing a done build over a Noriq blip is worse than a
-    // missed floor. Treat an error as "no conflict" (fail open), same posture as the hook.
-    const outcome = await vcs
-      .lock(worktree, paths, ctx)
-      .catch(() => ({ ok: true, enabled: false, locks: [] }) as LockOutcome);
-    return outcome.ok ? [] : outcome.conflicts;
+    let outcome: LockOutcome;
+    try {
+      outcome = await vcs.lock(worktree, paths, ctx);
+    } catch (err) {
+      return { conflicts: [], unchecked: `the lock service did not answer: ${err}` };
+    }
+    return { conflicts: outcome.ok ? [] : outcome.conflicts };
   }
 
   /**

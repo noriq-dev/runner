@@ -17,9 +17,15 @@ import type { LedgerEntry } from '../adjudication';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverExit, DriverSession, NoriqMcp } from '../drivers/types';
 import type { LandOutcome } from '../land';
-import type { LockConflict } from '../lock-client';
 import type { logger as defaultLogger } from '../logger';
-import type { AnchorTask, ResolvedRepo, RunReport, RunTally, SupervisorVcs } from '../supervisor';
+import type {
+  AnchorTask,
+  LockFloorOutcome,
+  ResolvedRepo,
+  RunReport,
+  RunTally,
+  SupervisorVcs,
+} from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { Workspace } from '../vcs/types';
 import type { VerifyResult, VerifySpec } from '../verify';
@@ -42,12 +48,7 @@ export interface StageHost {
   /** One landing at a time per repo — rebase→verify→fast-forward is a read-modify-write. */
   withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
   /** RUN-102's hard floor: lock everything the build changed, before it can land. */
-  enforceLockFloor(
-    repo: ResolvedRepo,
-    run: Run,
-    ws: Workspace,
-    token: string,
-  ): Promise<readonly LockConflict[]>;
+  enforceLockFloor(repo: ResolvedRepo, run: Run, ws: Workspace, token: string): Promise<LockFloorOutcome>;
   /** The deterministic floor, with RUN-29's hand-back to the live session on a failure. */
   verifyWithFeedback(ctx: {
     run: Run;

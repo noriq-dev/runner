@@ -213,6 +213,104 @@ describe('unsaved work survives (real git)', () => {
     await wm.remove(wt);
   });
 
+  // RUN-156. `[]` from here means "this run changed nothing", and the hard lock floor reads that
+  // as nothing to lock — a PASS. Both probes used to swallow their errors, so a git failure made
+  // the floor a silent no-op that reported success; for a driver with no in-process hook that was
+  // the run's ONLY acquisition, so a build could land over a path a peer holds and no line
+  // anywhere would say the check never ran.
+  describe('changedPaths cannot answer "nothing changed" for "could not tell"', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('rejects when the working-tree probe fails', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') throw new Error('fatal: not a git repository');
+        return { stdout: '', stderr: '' };
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/not a git repository/);
+    });
+
+    // A PARTIAL answer is refused too: locking the paths one probe managed to report looks exactly
+    // like a floor that ran, while everything the other would have named goes unlocked.
+    it('rejects when the committed probe fails, rather than reporting a partial set', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: ' M src/a.ts\0', stderr: '' };
+        throw new Error('fatal: bad object base');
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/bad object/);
+    });
+
+    // `..HEAD` is `HEAD..HEAD` to git — a confident zero paths, with no error to catch. The floor
+    // reads zero paths as nothing to lock, which is a pass.
+    it('rejects when there is no base to measure against', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      await expect(wm.changedPaths({ path: '/wt/run_1', baseSha: '' })).rejects.toThrow(/no base commit/);
+    });
+
+    // Detached at the base, a run branch full of commits reports no changed paths — and it is that
+    // BRANCH that lands, so the floor would check an empty tree and publish the unchecked branch.
+    it('rejects an empty answer from a detached HEAD rather than calling it "changed nothing"', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'symbolic-ref') throw new Error('fatal: ref HEAD is not a symbolic ref');
+        return { stdout: '', stderr: '' };
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/symbolic ref/);
+    });
+
+    it('still answers [] for a run that genuinely changed nothing', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      expect(await wm.changedPaths(wt)).toEqual([]);
+    });
+  });
+
+  // Git's human output C-QUOTES anything non-ASCII under the default core.quotePath, so a floor
+  // reading it locks a path that does not exist and leaves the real one free — a silent under-lock
+  // wearing the appearance of a floor that ran. `-z` emits raw bytes, NUL-separated.
+  describe('changedPaths reads paths git can round-trip, not git’s display form', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('asks both probes for -z output', async () => {
+      const calls: string[][] = [];
+      const wm = withGit(async (args) => {
+        calls.push(args);
+        return { stdout: 'x.ts\0', stderr: '' };
+      });
+      await wm.changedPaths(wt);
+      expect(calls.find((a) => a[0] === 'status')).toContain('-z');
+      expect(calls.find((a) => a[0] === 'diff')).toContain('-z');
+    });
+
+    it('keeps a non-ASCII filename intact instead of its escaped spelling', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status'
+          ? { stdout: ' M src/café.ts\0', stderr: '' }
+          : { stdout: 'src/naïve.ts\0', stderr: '' },
+      );
+      expect((await wm.changedPaths(wt)).sort()).toEqual(['src/café.ts', 'src/naïve.ts']);
+    });
+
+    // In -z a rename is TWO fields, destination first. Reading the source as its own entry would
+    // mangle the entry after it — so it is consumed, not parsed.
+    it('takes a rename’s destination and does not mistake its source for the next entry', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status'
+          ? { stdout: 'R  src/new.ts\0src/old.ts\0 M src/after.ts\0', stderr: '' }
+          : { stdout: '', stderr: '' },
+      );
+      expect((await wm.changedPaths(wt)).sort()).toEqual(['src/after.ts', 'src/new.ts']);
+    });
+
+    it('does not split a filename that happens to contain " -> "', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status' ? { stdout: ' M src/a -> b.ts\0', stderr: '' } : { stdout: '', stderr: '' },
+      );
+      expect(await wm.changedPaths(wt)).toEqual(['src/a -> b.ts']);
+    });
+  });
+
   it('NEVER reaps a worktree holding uncommitted work', async () => {
     // The regression: reapOrphans ran `worktree remove --force` on daemon start, which
     // silently destroys an agent's uncommitted diff. This is the guard.
