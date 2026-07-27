@@ -20,7 +20,11 @@ The deterministic check (`{{verifyCmd}}`) already passed — do not re-run it to
 
 When the verdict is FAIL, list each finding on its own line, numbered, so the builder can answer each one by number:
   FINDING <n> [<severity>] <file:line>: <one-sentence claim>
-Put your reasoning above the list if you like, but every finding that drives the verdict must appear as one of these lines.
+Put your reasoning above the list if you like, but every finding that drives the verdict must appear as one of these lines.{{#requirements}}
+
+This work is traceable to these requirements: {{requirements}}. When a finding puts one of them at risk, name it in a second bracket, after the severity:
+  FINDING <n> [<severity>] [<requirement ids>] <file:line>: <one-sentence claim>
+This is how a settled point stays settled. Each round is judged by a fresh reviewer who never saw the last one's wording, so a finding the builder already answered with evidence gets restated in different words and read as new — the rebuttal is lost and the round is spent relitigating it. A requirement id survives rewording because it is not wording. Omit the bracket when a finding threatens none of them; do not stretch to fit one, since a wrong association is worse than no association.{{/requirements}}
 
 Findings that share one root cause are ONE finding, not several. Report the class as a single numbered line whose claim names the CAUSE, anchored at the line where it is clearest, and cite the other instances inside that same line as evidence of it. Do not give each instance its own number. The builder answers your report number by number and fixes what each number cites, so N instance lines buy N patched lines while the cause lives on to surface again next round — after the budget is spent, failing the run over work your first report could have named. Before reporting a class, go looking for the rest of it and say what you covered: if one field is mishandled by a transform, check every field that transform touches. Naming the cause converges the fix in one round, or proves the work is bigger than the rounds left — and learning that now beats learning it last round.
 

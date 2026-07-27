@@ -18,6 +18,7 @@ const report = (...rows: Array<[number, string, AcceptanceOutcome, string]>): Ac
 const finding = (id: number, location: string, claim = 'something'): Finding => ({
   id,
   severity: 'High',
+  requirements: [],
   location,
   claim,
 });

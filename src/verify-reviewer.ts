@@ -50,6 +50,12 @@ export interface ReviewerPromptContext {
   /** Criteria the spec named that did not fit the checklist — said out loud, because a list that
    *  silently stops reads as a contract that happens to be short. */
   acceptanceOverflow?: number;
+  /**
+   * The requirement ids this work is traceable to (RUN-147), so a finding can name what it
+   * threatens. Empty/absent → the reviewer is never asked to tag, and the ledger keys on prose
+   * exactly as it did before.
+   */
+  requirements?: string[];
 }
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
@@ -115,6 +121,7 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
     acceptance: ctx.acceptance?.length
       ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
       : null,
+    requirements: ctx.requirements?.length ? ctx.requirements.join(', ') : null,
   });
 }
 

@@ -80,6 +80,8 @@ export interface StageHost {
     /** The numbered acceptance criteria this gate must answer (RUN-145). */
     acceptance?: AcceptanceItem[];
     acceptanceOverflow?: number;
+    /** The requirement ids a finding may name (RUN-147). */
+    requirements?: string[];
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {
@@ -137,6 +139,9 @@ export interface RunPipeline {
   /** Criteria the spec named beyond what a checklist carries, so the gate can say its list was
    *  incomplete rather than reporting on a contract that was quietly truncated. */
   readonly acceptanceOverflow: number;
+  /** The requirement ids this work is traceable to (RUN-147) — what a finding may name, and what
+   *  the run reports against when it ends. Empty when the spec names none. */
+  readonly requirements: string[];
 
   // ── the four a stage may move ────────────────────────────────────────────────
   /** The run's fate so far. A gate narrows it; nothing ever widens it back to done. */

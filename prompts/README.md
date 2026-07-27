@@ -92,6 +92,14 @@ builder rewrites correct code to satisfy a gate that merely could not see it. Th
 follow in full: they carry detail a criterion never will, and the builder answers them by number for
 the ledger. A run with no acceptance criteria gets no block at all.
 
+`reviewer.md` also lists the task's `requirementIds` when it has any and asks a finding to name the
+ones it threatens, in a second bracket after the severity (RUN-147). The bracket is optional, so a
+reviewer that ignores it degrades to the previous behaviour rather than to an unparsed line — the
+only acceptable failure mode for a format a model writes. The prompt gives the reason as well as the
+shape: each round is a fresh reviewer that never saw the last one's wording, so a settled finding
+comes back reworded and the ledger's prose key misses it. It also says not to stretch a finding to
+fit a requirement, because a wrong association is worse than none.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

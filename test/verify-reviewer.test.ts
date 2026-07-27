@@ -146,6 +146,7 @@ describe('assembleReviewerPrompt', () => {
           id: 1,
           round: 1,
           severity: 'High',
+          requirements: [],
           location: 'src/init.ts:357',
           claim: 'detectVcs runs on every init',
           status: 'contested',

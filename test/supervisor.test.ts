@@ -2407,6 +2407,71 @@ describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
 // RUN-146. The report is an argument; the fix turn needs a specification. The daemon already holds
 // what is outstanding as data, so it leads with it rather than making the builder reconstruct it
 // from prose every round.
+// RUN-147. A finding tied to the requirement it threatens survives a fresh reviewer's rewording,
+// and the run can say which requirements came through clear.
+describe('findings carry requirement ids (RUN-147)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+
+  const taskRequiring = (...requirementIds: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ requirementIds }),
+  });
+
+  const reviewedWith = async (task: AnchorTask | null, reply: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.claude.starts[1]!;
+    h.claude.emitText(reply);
+    h.claude.complete('done');
+    return { h, review, exit: await done };
+  };
+
+  it('tells the reviewer which requirements exist and how to name one', async () => {
+    const { review } = await reviewedWith(taskRequiring('R-7', 'R-9'), 'VERDICT: PASS');
+    expect(review.prompt).toContain('traceable to these requirements: R-7, R-9');
+    expect(review.prompt).toContain('FINDING <n> [<severity>] [<requirement ids>] <file:line>');
+    // The reason, not just the format — a rule with no rationale is one a model drops under load.
+    expect(review.prompt).toMatch(/survives rewording because it is not wording/);
+    // …and the guard against stretching to fit.
+    expect(review.prompt).toMatch(/a wrong association is worse than no association/);
+  });
+
+  it('reports per requirement when the run ends, including the ones nothing was raised against', async () => {
+    const { h } = await reviewedWith(
+      taskRequiring('R-7', 'R-9'),
+      'FINDING 1 [High] [R-7] src/a.ts:1: it never reaps\nVERDICT: FAIL',
+    );
+    const posted = h.comments.map((c) => c.body).join('\n');
+    expect(posted).toMatch(/❌ \*\*R-7\*\* — 1 finding\(s\) still standing/);
+    expect(posted).toMatch(/➖ \*\*R-9\*\* — no finding was raised against it/);
+  });
+
+  it('says nothing about requirements for a task that names none', async () => {
+    const { review, h } = await reviewedWith(null, 'VERDICT: PASS');
+    expect(review.prompt).not.toContain('traceable to these requirements');
+    expect(h.comments.map((c) => c.body).join('\n')).not.toContain('Requirements');
+  });
+});
+
 describe('a failing gate hands back a specification (RUN-146)', () => {
   const REVIEWED = () =>
     manifest({
@@ -2868,6 +2933,7 @@ describe('the inline reviewer (RUN-61)', () => {
     id: 1,
     round: 2,
     severity: 'high',
+    requirements: [],
     location: 'src/auth.ts:42',
     claim: 'THE-PRIOR-FINDING-ABOUT-AUTH',
     status: 'fixed' as const,

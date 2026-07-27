@@ -1462,6 +1462,8 @@ export class RunSupervisor {
     /** The numbered acceptance criteria every round's reviewer answers (RUN-145). */
     acceptance?: AcceptanceItem[];
     acceptanceOverflow?: number;
+    /** The requirement ids a finding may name (RUN-147). */
+    requirements?: string[];
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
@@ -1505,9 +1507,27 @@ export class RunSupervisor {
     // empty on the first look of a normal run.
     let ledger: LedgerEntry[] = ctx.priorLedger ?? [];
 
+    /**
+     * Fold a round's findings into the ledger AS SOON AS THEY ARE RAISED, rather than only when a
+     * fix turn follows them.
+     *
+     * They used to enter inside the fix loop, which meant the LAST round's findings never entered
+     * at all — including the terminal ones that actually failed the run, which are the ones a human
+     * most wants recorded. A repo with `maxRounds = 0` (a pure gate, no hand-back) had an empty
+     * ledger however much its reviewer found. RUN-147 makes that visible: the per-requirement
+     * report reads the ledger, so an unrecorded finding is a requirement reported as clear.
+     *
+     * Entered with no responses, so they read as 'unanswered' — which is exactly true until the
+     * builder answers. The response folds onto the SAME entry later (same key), so nothing is lost.
+     */
+    const record = (v: VerifyVerdict, round: number) => {
+      ledger = buildLedger(ledger, parseFindings(v.findings), [], round);
+    };
+
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
+    if (verdict.verdict === 'fail') record(verdict, 1);
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
 
     for (let round = 1; round <= maxRounds; round++) {
@@ -1591,6 +1611,7 @@ export class RunSupervisor {
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
+      if (verdict.verdict === 'fail') record(verdict, round + 1);
       if (verdict.passed) return { ...verdict, rounds: round, ledger };
     }
     return { ...verdict, rounds: maxRounds, ledger };
@@ -1639,6 +1660,8 @@ export class RunSupervisor {
      *  asked for a verdict in prose, exactly as before. */
     acceptance?: AcceptanceItem[];
     acceptanceOverflow?: number;
+    /** The requirement ids a finding may name (RUN-147). */
+    requirements?: string[];
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -1722,6 +1745,7 @@ export class RunSupervisor {
         ...(ctx.acceptance?.length
           ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
           : {}),
+        ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
       }),
       // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
       // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
@@ -2690,6 +2714,7 @@ export class RunSupervisor {
       // and silently repoint every answer (RUN-145).
       acceptance: enumerateAcceptance(ctx.executedSpec?.spec),
       acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
+      requirements: ctx.executedSpec?.spec.requirementIds ?? [],
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
       // the human even if verify then fails).

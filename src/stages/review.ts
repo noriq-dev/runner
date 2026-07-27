@@ -9,6 +9,7 @@
  */
 
 import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
+import { renderRequirementOutcomes, requirementOutcomes } from '../adjudication';
 import { reviewerNoVerdictComment, reviewerRejectionComment } from '../verify-reviewer';
 import type { RunPipeline, StageHost } from './types';
 
@@ -33,6 +34,7 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     priorLedger: ctx.continued?.ledger,
     acceptance: ctx.acceptance,
     acceptanceOverflow: ctx.acceptanceOverflow,
+    requirements: ctx.requirements,
   });
   ctx.ledger = review.ledger; // the freshest adjudication state, for the continuable record
 
@@ -50,6 +52,19 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     if (!review.passed || acceptanceNeedsAttention(review.acceptance)) {
       comment(renderAcceptanceReport(review.acceptance));
     }
+  }
+
+  // What the review found PER REQUIREMENT (RUN-147). Posted whatever the verdict, because "which
+  // requirements came through clear" is the run's answer, not a consolation prize for a failure —
+  // and a passing run is where it is least likely to be asked and most useful to have.
+  if (ctx.requirements.length) {
+    const outcomes = requirementOutcomes(ctx.requirements, review.ledger);
+    host
+      .transcript(run.id)
+      .milestone(
+        `requirements: ${outcomes.filter((o) => o.standing.length).length} of ${outcomes.length} still have a finding standing`,
+      );
+    comment(renderRequirementOutcomes(outcomes));
   }
 
   if (review.passed) {

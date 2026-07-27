@@ -93,7 +93,17 @@ A gate that FAILS then hands the live builder a **specification** rather than a 
 the distinction prose cannot — `failed` means change the code, `behaviour-unverified` usually means
 nothing *exercises* it and the repair is a test — so a builder told only "not satisfied" stops
 rewriting correct code to satisfy a gate that could not see it. It never guesses which finding
-threatens which criterion; RUN-147 is where requirement ids make that join real.
+threatens which criterion — RUN-147 makes that join real instead: a finding may name the
+`requirementIds` it threatens in a second bracket, and the adjudication ledger keys on
+**(requirement, location)** when it does rather than on the claim's prose. That is the whole point
+of carrying the ids. Every round is judged by a FRESH reviewer that never saw the last one's
+wording, so it paraphrases by construction — the prose key missed, the builder's evidence-backed
+rebuttal was lost, and the round went on relitigating a settled point. A requirement id survives
+rewording because it is not wording. The bracket is optional and sits after the severity, so every
+finding written before it parses byte-identically. Findings now enter the ledger when they are
+RAISED rather than when a fix turn follows, because otherwise the terminal round's — the ones that
+failed the run — never entered at all. The run then reports per requirement, and says "no finding
+was raised against it" rather than "met": nobody objecting is not the same as anyone checking.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud
