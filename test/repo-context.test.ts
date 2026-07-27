@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ProjectContext } from '@noriq-dev/shared';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   type DocReader,
   type PathProbe,
@@ -127,6 +127,52 @@ describe('defaultPathProbe', () => {
   });
 });
 
+// Against the REAL reader and real files, because the bug these cover is invisible to a fake: a
+// byte-limited read compared against a character count reports a truncated non-ASCII file as
+// complete, and the prompt then tells the agent it holds the whole document.
+describe('defaultDocReader', () => {
+  let root: string;
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'noriq-read-'));
+    await writeFile(path.join(root, 'ascii.md'), 'x'.repeat(500));
+    await writeFile(path.join(root, 'dashes.md'), '—'.repeat(500)); // 3 bytes each in UTF-8
+    await writeFile(path.join(root, 'small.md'), 'tiny');
+  });
+  afterAll(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const read = async (name: string, limit: number) =>
+    loadRepoDocs(root, [name], undefined, limit).then((r) => r.docs[0]);
+
+  it('detects the cut in a pure-ASCII file', async () => {
+    const d = await read('ascii.md', 100);
+    expect(d?.truncated).toBe(true);
+    expect(d?.text).toHaveLength(100);
+  });
+
+  // The regression: 101 characters of em dash is 303 bytes. A byte-sized window decodes to fewer
+  // characters than the limit and the file reads as complete.
+  it('detects the cut in a multi-byte file — bytes are not characters', async () => {
+    const d = await read('dashes.md', 100);
+    expect(d?.truncated).toBe(true);
+    expect(d?.text).toHaveLength(100);
+    expect(d?.text).toBe('—'.repeat(100));
+  });
+
+  it('does not claim a cut on a file that fits', async () => {
+    const d = await read('small.md', 100);
+    expect(d?.truncated).toBeUndefined();
+    expect(d?.text).toBe('tiny');
+  });
+
+  it('does not claim a cut on a file that exactly fills the budget', async () => {
+    const d = await read('small.md', 4);
+    expect(d?.truncated).toBeUndefined();
+    expect(d?.text).toBe('tiny');
+  });
+});
+
 describe('renderRepoContext', () => {
   const resolved = (over = {}) => ({
     requiredReading: [],
@@ -177,14 +223,23 @@ describe('renderRepoContext', () => {
 // RUN-129 — inlining the required reading
 // ---------------------------------------------------------------------------
 
-const reader =
-  (files: Record<string, string>): DocReader =>
-  async (abs) => {
+/** Honours `limit` exactly as the real reader must — a fake that returned whole files would let a
+ *  regression to unbounded reads pass unnoticed, which is the bug this contract exists to stop. */
+const reader = (files: Record<string, string>): DocReader => {
+  const fn: DocReader = async (abs, limit) => {
     const key = path.basename(abs);
     const hit = files[key] ?? files[abs];
     if (hit === undefined) throw new Error(`ENOENT ${abs}`);
-    return hit;
+    reads.push({ path: abs, limit });
+    return hit.slice(0, limit + 1);
   };
+  return fn;
+};
+/** Every read the fake served, so a test can assert the daemon never asked for more than budget. */
+let reads: Array<{ path: string; limit: number }> = [];
+beforeEach(() => {
+  reads = [];
+});
 
 describe('discoverAgentInstructions', () => {
   it('finds the conventional instruction files a repo actually has', async () => {
@@ -216,7 +271,29 @@ describe('loadRepoDocs', () => {
   it('truncates the file that crosses the budget and records the original size', async () => {
     const r = await loadRepoDocs('/repo', ['big.md'], reader({ 'big.md': 'x'.repeat(50) }), 10);
     expect(r.docs[0]?.text).toBe('x'.repeat(10));
-    expect(r.docs[0]?.truncatedFrom).toBe(50);
+    expect(r.docs[0]?.truncated).toBe(true);
+  });
+
+  // The budget must bound the READ, not just the kept slice. Reading whole files and trimming
+  // afterwards lets a committed marker point at a huge in-repo file and stall or OOM the daemon.
+  it('never asks the reader for more than the remaining budget', async () => {
+    await loadRepoDocs('/repo', ['big.md'], reader({ 'big.md': 'x'.repeat(10_000) }), 10);
+    expect(reads).toEqual([{ path: path.resolve('/repo', 'big.md'), limit: 10 }]);
+  });
+
+  it('shrinks the ask as the budget is consumed', async () => {
+    const files = { 'a.md': 'AAA', 'b.md': 'BB' };
+    await loadRepoDocs('/repo', ['a.md', 'b.md'], reader(files), 10);
+    expect(reads.map((r) => r.limit)).toEqual([10, 7]);
+  });
+
+  // loadRepoDocs is exported, so it is a public entry point in its own right — it cannot lean on
+  // resolveRepoContext having checked first.
+  it('confines paths itself rather than trusting the caller', async () => {
+    const r = await loadRepoDocs('/repo', ['../../etc/passwd'], reader({ passwd: 'root:x:0:0' }), 100);
+    expect(r.docs).toEqual([]);
+    expect(r.skipped).toEqual(['../../etc/passwd']);
+    expect(reads).toEqual([]); // refused before any open
   });
 
   it('skips — and names — everything after the budget is spent', async () => {
@@ -268,14 +345,23 @@ describe('renderRepoContext with inlined docs', () => {
     const files = { 'a.md': 'x'.repeat(10), 'b.md': 'B' };
     const loaded = await loadRepoDocs('/repo', ['a.md', 'b.md'], reader(files), 10);
     const out = renderRepoContext(res({ requiredReading: ['a.md', 'b.md'] }), loaded);
-    expect(out).toContain('not included here (context budget): b.md');
+    expect(out).toContain('Declared reading not included below: b.md');
   });
 
-  it('marks a truncated file visibly, with both sizes', async () => {
+  it('marks a truncated file as a fragment, without claiming a size it never measured', async () => {
     const loaded = await loadRepoDocs('/repo', ['big.md'], reader({ 'big.md': 'x'.repeat(50) }), 10);
     const out = renderRepoContext(res({ requiredReading: ['big.md'] }), loaded);
-    expect(out).toContain('----- big.md (truncated — 10 of 50 characters) -----');
-    expect(out).toContain('in full or in part');
+    expect(out).toContain('----- big.md (FIRST 10 characters only — the rest was not read) -----');
+  });
+
+  // Telling an agent not to re-read a file it only half received is how a half-read rule gets
+  // applied with confidence. A fragment must be BOTH named for reading and flagged in the closer.
+  it('sends a truncated file back to be read rather than suppressing it', async () => {
+    const loaded = await loadRepoDocs('/repo', ['big.md'], reader({ 'big.md': 'x'.repeat(50) }), 10);
+    const out = renderRepoContext(res({ requiredReading: ['big.md'] }), loaded);
+    expect(out).toContain('Read before changing anything: big.md');
+    expect(out).toContain('read the rest yourself before relying on it');
+    expect(out).not.toContain('do not spend a turn re-reading them.');
   });
 
   it('still renders nothing when the repo has no context and no docs', () => {
@@ -302,6 +388,19 @@ describe('loadRepoContext', () => {
     });
     expect(r.resolved.requiredReading).toEqual(['docs/ARCH.md']);
     expect(r.rendered).not.toContain('CLAUDE.md');
+  });
+
+  // The fallback keys off what was DECLARED, not what survived. A repo that typo'd its whole list
+  // has still made a choice; substituting CLAUDE.md would show an oriented agent while the
+  // operator never learns their list is broken.
+  it('does not fall back when a declared list resolves to nothing', async () => {
+    const r = await loadRepoContext('/repo', ctx({ requiredReading: ['docs/typo.md'] }), {
+      probe: async (abs) => (abs.endsWith('typo.md') ? 'missing' : true),
+      read: reader({ 'CLAUDE.md': '# repo rules' }),
+    });
+    expect(r.resolved.requiredReading).toEqual([]);
+    expect(r.rendered).not.toContain('# repo rules');
+    expect(r.resolved.unresolved).toEqual([{ declared: 'docs/typo.md', reason: 'missing' }]);
   });
 
   it('a repo with neither a [context] nor instruction files renders nothing', async () => {

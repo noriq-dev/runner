@@ -31,10 +31,14 @@ own leading newline (see `build.md`). The file's trailing newline is stripped; e
 verbatim.
 
 `{{context}}` is the repo's own orientation block (`[context]` in `.noriq/project.toml`, RUN-128),
-resolved by `src/repo-context.ts` and passed to every prompt family — built-ins and custom
-workflows alike. It carries its own leading blank line and renders to nothing when the repo
-declared none, so inline the tag (`…problems.{{context}}`) and place it **before** the brief:
+resolved by `src/repo-context.ts` from the **run's workspace** — not the discovered checkout, which
+may be on a different branch. It carries its own leading blank line and renders to nothing when the
+repo declared none, so inline the tag (`…problems.{{context}}`) and place it **before** the brief:
 ground rules land better read ahead of the ask than after it.
+
+`scope.md` and `build.md` carry it. A custom workflow's prompt is passed the same variable but must
+place the tag itself. `verify-agent.md` and `reviewer.md` do **not** receive it — they are assembled
+by `verify-agent.ts` / `verify-reviewer.ts`, which take no context argument yet.
 
 ## Stay agnostic
 

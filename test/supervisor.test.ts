@@ -600,23 +600,37 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
     expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
   });
 
-  it('a custom workflow gets it without asking (RUN-121 prompts are rendered with the same vars)', () => {
-    const wf = {
-      id: 'docs',
-      promptShape: 'scope' as const,
-      worktreeWritable: false,
-      produces: false,
-      verifyActor: false,
-      usesPlanBase: false,
-      promptRef: 'DOCS-MODE: {{brief}}{{context}}',
-    };
+  const customWf = (promptRef: string) => ({
+    id: 'docs',
+    promptShape: 'scope' as const,
+    worktreeWritable: false,
+    produces: false,
+    verifyActor: false,
+    usesPlanBase: false,
+    promptRef,
+  });
+
+  // A custom prompt is a template we do not control, so the block cannot be injected into it —
+  // the author must place `{{context}}`. Documented in prompts/README.md; asserted here so the
+  // limitation stays visible rather than being discovered by a workflow author.
+  it('a custom workflow that places {{context}} gets the block', () => {
     const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
       agent: testAgent(),
       server: 'https://s',
-      workflow: wf,
+      workflow: customWf('DOCS-MODE: {{brief}}{{context}}'),
       repoContext: block,
     });
     expect(p).toContain('This repo says of itself:');
+  });
+
+  it('a custom workflow that omits the tag silently does without it', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: customWf('DOCS-MODE: {{brief}}'),
+      repoContext: block,
+    });
+    expect(p).not.toContain('This repo says of itself');
   });
 
   // The no-op guarantee: a repo that declares no [context] must get the pre-RUN-128 prompt.
@@ -705,6 +719,31 @@ describe('[context] reaches the spawned agent (RUN-128/129)', () => {
       },
     });
 
+  // The tree the context is read from must be the one the agent stands in. A build forks from the
+  // plan base and a continuation adopts its own branch, so the discovered checkout's CLAUDE.md can
+  // describe a different tree entirely — and the prompt then tells the agent not to re-read it.
+  it('reads the context out of the run’s workspace, not the discovered checkout', async () => {
+    const seen: string[] = [];
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async (abs) => {
+        seen.push(abs);
+        return true;
+      },
+      readDoc: async (abs) => {
+        seen.push(abs);
+        return '# house rules';
+      },
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((p) => p.startsWith('/wt/run_1'))).toBe(true);
+    expect(seen.some((p) => p.startsWith('/repos/'))).toBe(false);
+  });
+
   it('inlines the declared reading and the orientation into the build brief', async () => {
     const h = harness({
       manifest: declaring(),
@@ -750,13 +789,14 @@ describe('[context] reaches the spawned agent (RUN-128/129)', () => {
     const h = harness({
       manifest: declaring(),
       pathProbe: async () => true,
-      readDoc: async () => 'x'.repeat(5_000),
+      // Honours `limit` like the real reader: the budget bounds the READ, not just the kept slice.
+      readDoc: async (_abs, limit) => 'x'.repeat(limit + 1),
       contextBudget: 100,
     });
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
     await flush();
     const prompt = h.claude.opts?.prompt ?? '';
-    expect(prompt).toContain('(truncated — 100 of 5000 characters)');
+    expect(prompt).toContain('(FIRST 100 characters only — the rest was not read)');
     expect(prompt).toContain('Brief:'); // the ask survived
     h.claude.complete('done');
     await done;
@@ -1420,6 +1460,9 @@ describe('dispatch-time predictive locking (RUN-103)', () => {
       manifest: LANDING(),
       lockScope: ['src/hot.ts'],
       lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+      // Disposal is now conditional on the workspace being EMPTY (RUN-130): this scenario is a
+      // fresh lease, so it still disposes. The case where it must NOT is covered two tests down.
+      changed: false,
     });
     const exit = await h.supervisor.supervise(buildRun());
     expect(exit.outcome).toBe('failed');
@@ -1427,6 +1470,33 @@ describe('dispatch-time predictive locking (RUN-103)', () => {
     expect(h.claude.starts).toHaveLength(0); // never spawned — refused, not raced
     expect(h.worktrees.removed).toEqual(['/wt/run_1']); // the just-leased worktree is disposed
     expect(h.comments.some((c) => c.body.includes('src/hot.ts'))).toBe(true);
+  });
+
+  // RUN-130's sharp edge. A CONTINUATION adopts its kept worktree and branch (RUN-91) — and a
+  // continuation is exactly what declares a scope, so this refusal fires precisely where the
+  // workspace holds the prior sitting's committed diff. Disposing it force-removes the worktree
+  // and -D's a never-pushed branch: work that exists nowhere else, destroyed by a lock conflict.
+  it('KEEPS a workspace that holds work when the scope clashes — never force-deletes a continuation', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+    });
+    const exit = await h.supervisor.supervise(buildRun()); // `changed` defaults true → holds work
+    expect(exit.outcome).toBe('failed');
+    expect(h.claude.starts).toHaveLength(0); // still refused, not raced
+    expect(h.worktrees.removed).toEqual([]); // …but the work survives the refusal
+  });
+
+  it('still disposes an EMPTY workspace on a clash — nothing to lose, nothing to leak', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+      changed: false, // a fresh lease with nothing in it
+    });
+    await h.supervisor.supervise(buildRun());
+    expect(h.worktrees.removed).toEqual(['/wt/run_1']);
   });
 
   it('no resolver wired → predictive layer is silent (the common case today)', async () => {

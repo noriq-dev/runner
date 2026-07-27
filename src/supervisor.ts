@@ -543,9 +543,11 @@ export function assemblePrompt(
     server: ctx.server,
   });
 
-  // The repo's `[context]` block (RUN-128). Rendered ahead of the brief for every prompt family,
-  // custom workflows included: what the repo says about itself does not depend on which mode is
-  // reading it, and a workflow author should not have to remember to ask for it.
+  // The repo's `[context]` block (RUN-128), rendered ahead of the brief for the scope and build
+  // families. A custom workflow's own prompt receives it as `{{context}}` but must PLACE that tag
+  // to get it — a template we do not control cannot have text injected into it. The verify family
+  // does not receive it at all: `assembleVerifyPrompt` is a separate assembler, and wiring it is
+  // deliberately still open (RUN-128's release note), not an oversight to be papered over here.
   const repoContext = ctx.repoContext ?? '';
 
   const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
@@ -1759,8 +1761,9 @@ export class RunSupervisor {
     // the run's holder, before the agent starts — and REFUSE a dispatch that clashes rather than
     // race two agents onto the same files. Runs here (not the RUN-81 pre-lease gate) because a
     // lock needs the run's agent token, which is only minted above; a refusal disposes the
-    // just-leased worktree. No-op without a resolver / declared scope (the common case today), so
-    // the reactive hook + hard floor stay the guarantee.
+    // just-leased worktree ONLY when it holds nothing (see below — a continuation's does).
+    // No-op without a resolver / declared scope, so the reactive hook + hard floor stay the
+    // guarantee.
     if (wf.produces && this.deps.resolveLockScope && this.vcsFor(repo).lock) {
       const scope = (await this.deps.resolveLockScope(run)) ?? [];
       if (scope.length) {
@@ -1786,9 +1789,26 @@ export class RunSupervisor {
           if (run.anchor?.type === 'task') {
             this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(outcome.conflicts));
           }
-          await this.vcsFor(repo)
-            .dispose(worktree)
-            .catch(() => {});
+          // NEVER dispose a workspace that already holds work (RUN-130). A CONTINUATION adopts
+          // its kept worktree and branch (RUN-91) — and a continuation is precisely what declares
+          // a scope today, so this refusal fires exactly where the workspace carries the prior
+          // sitting's committed diff. `dispose` force-removes the worktree and `-D`s its
+          // never-pushed branch, which would destroy work that exists nowhere else. The comment
+          // above used to say "a refusal disposes the just-leased worktree"; that was only true
+          // while nothing was ever bound to declare a scope.
+          if (
+            await this.vcsFor(repo)
+              .hasWork(worktree)
+              .catch(() => true)
+          ) {
+            this.log.warn('lock refusal kept a workspace that holds work — not disposing', {
+              runId: run.id,
+            });
+          } else {
+            await this.vcsFor(repo)
+              .dispose(worktree)
+              .catch(() => {});
+          }
           return fail(
             `declared file scope is locked by another run (${outcome.conflicts
               .map((c) => c.path)
@@ -1802,7 +1822,12 @@ export class RunSupervisor {
     // (RUN-129). A path that does not resolve is WARNED about rather than dropped in silence: a
     // required-reading list that quietly shrinks to nothing leaves the repo believing its agents
     // are oriented when they are not.
-    const repoCtx = await loadRepoContext(repo.root, repo.manifest.context, {
+    // Read the context out of the RUN'S WORKSPACE, not the discovered checkout (RUN-128/129).
+    // They are different trees: a build forks from the plan base, a continuation adopts a branch
+    // with its own edits, and a verify run leases the build's branch. Inlining the checkout's
+    // CLAUDE.md and then telling the agent not to re-read it would hand it instructions that do
+    // not describe the tree it is standing in. `localPath` is where the agent actually runs.
+    const repoCtx = await loadRepoContext(worktree.localPath, repo.manifest.context, {
       probe: this.deps.pathProbe,
       read: this.deps.readDoc,
       budget: this.deps.contextBudget,

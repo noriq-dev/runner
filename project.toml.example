@@ -31,8 +31,13 @@ tool = "claude"
 # The repo's main branch, if the daemon should reference it. Optional.
 defaultBranch = "main"
 
-# ── What this repo tells every agent about itself (RUN-128) ──────────────────
-# Optional. Omit the whole section and briefs read exactly as they did before.
+# ── What this repo tells every agent about itself (RUN-128/129) ──────────────
+# Optional — but NOT inert when omitted: if this repo has a CLAUDE.md or AGENTS.md
+# at its root, the daemon inlines it into every scope/build brief by default. Those
+# files are written to steer a coding agent, and ignoring them meant our agents
+# worked from less than the repo had already written down. Declaring
+# `requiredReading` below REPLACES that fallback; there is currently no way to opt
+# out of it entirely (say so if you need one).
 #
 # Before this existed, an agent's brief carried the task and nothing else, so
 # every run spent its most valuable early context re-deriving the same facts —
@@ -48,7 +53,13 @@ defaultBranch = "main"
 # its agents are oriented.
 #
 # [context]
-# # Read before changing anything. Order matters — it is priority.
+# # Read before changing anything. Order matters — it is priority: files are
+# # inlined in this order until the budget runs out, so put what an agent cannot
+# # work without first. The file that crosses the line is included as a marked
+# # fragment and the agent is told to read the rest itself; later ones are named.
+# # Declaring this list replaces the CLAUDE.md/AGENTS.md fallback described above —
+# # including when every path in it fails to resolve (you get warnings, not a
+# # silent substitution).
 # requiredReading = ["docs/ARCHITECTURE.md", "CLAUDE.md"]
 # # Where to start reading the code. Architectural entry points, not an index.
 # entryPoints = ["src/daemon.ts", "src/supervisor.ts"]

@@ -1,4 +1,4 @@
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { ProjectContext } from '@noriq-dev/shared';
 
@@ -134,8 +134,10 @@ export interface InlinedDoc {
   /** Repo-relative, as it will be labelled in the brief. */
   path: string;
   text: string;
-  /** Set when the budget cut this file short — surfaced in the brief, never silent. */
-  truncatedFrom?: number;
+  /** Set when the budget cut this file short — surfaced in the brief, never silent. The original
+   *  size is deliberately NOT recorded: the reader stops at the budget, so it was never measured,
+   *  and a number we did not measure is worse than no number. */
+  truncated?: boolean;
 }
 
 export interface LoadedRepoDocs {
@@ -145,10 +147,39 @@ export interface LoadedRepoDocs {
   skipped: string[];
 }
 
-/** Reads a file's text. Injected so tests never touch a real tree. */
-export type DocReader = (absPath: string) => Promise<string>;
+/**
+ * Reads at most `limit` characters of a file. The limit is part of the CONTRACT, not a courtesy:
+ * a committed marker names these paths, so reading a file whole and truncating afterwards lets any
+ * repo hand the daemon a multi-gigabyte in-repo file and stall or OOM it before a single budget
+ * character is spent. Injected so tests never touch a real tree.
+ */
+export type DocReader = (absPath: string, limit: number) => Promise<string>;
 
-const defaultDocReader: DocReader = (abs) => readFile(abs, 'utf8');
+/**
+ * `limit` is in CHARACTERS, and the byte/character distinction is the whole subtlety here.
+ *
+ * Reading `limit + 1` BYTES and comparing the decoded length is wrong the moment a file is not
+ * pure ASCII: this repo's own docs are full of em dashes, so 6191 bytes decode to 6167 characters,
+ * land under the limit, and a plainly truncated document gets reported as complete — the exact
+ * "you have the whole rule" lie this budget exists to avoid. Caught by dogfooding, not by tests.
+ *
+ * UTF-8 is at most 4 bytes per character, so reading `4 * (limit + 1)` bytes guarantees that a
+ * file with more than `limit` characters decodes to more than `limit` — which is all the caller
+ * needs to detect the cut. Memory stays bounded at four times the budget.
+ */
+const defaultDocReader: DocReader = async (abs, limit) => {
+  const want = (limit + 1) * 4;
+  const fh = await open(abs, 'r');
+  try {
+    const buf = Buffer.alloc(want);
+    const { bytesRead } = await fh.read(buf, 0, want, 0);
+    // A trailing partial character at the buffer edge decodes to U+FFFD; harmless, since anything
+    // near the edge is beyond `limit` and gets sliced away by the caller anyway.
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await fh.close();
+  }
+};
 
 /** The conventional instruction files this repo actually has. Only consulted when the manifest
  *  declared no `requiredReading` — an explicit list is never silently extended. */
@@ -186,9 +217,18 @@ export async function loadRepoDocs(
       skipped.push(rel);
       continue;
     }
+    const abs = path.resolve(root, rel);
+    // Confine HERE too, not only at probe time. `resolveRepoContext` checks a path and this opens
+    // it — two operations, so the check does not bind the open. This is also the public entry
+    // point (it is exported), and an unconfined exported reader is a footgun regardless of who
+    // calls it. It does not close the TOCTOU race on its own; it closes the lexical hole.
+    if (!contains(root, abs)) {
+      skipped.push(rel);
+      continue;
+    }
     let text: string;
     try {
-      text = await read(path.resolve(root, rel));
+      text = await read(abs, left);
     } catch {
       // Resolvable at probe time, unreadable now (permissions, a race with a checkout). Treat it
       // as skipped rather than failing the run — a brief missing one document still works.
@@ -199,7 +239,10 @@ export async function loadRepoDocs(
       docs.push({ path: rel, text });
       left -= text.length;
     } else {
-      docs.push({ path: rel, text: text.slice(0, left), truncatedFrom: text.length });
+      // The reader returns at most `left + 1`, so a longer result means the file was cut. We know
+      // it was cut but NOT how big it actually is — and claiming a size we did not measure would
+      // be worse than not naming one.
+      docs.push({ path: rel, text: text.slice(0, left), truncated: true });
       left = 0;
     }
   }
@@ -219,12 +262,14 @@ export function renderRepoContext(c: ResolvedRepoContext, loaded?: LoadedRepoDoc
   if (c.conventions.length) lines.push(`Conventions (non-negotiable): ${c.conventions.join('; ')}`);
 
   const inlined = loaded?.docs ?? [];
-  // Only NAME the required reading when it is not reproduced below — naming a file whose text
-  // follows it just invites the agent to spend a tool call re-reading what it already has.
-  const named = c.requiredReading.filter((p) => !inlined.some((d) => d.path === p));
+  // Suppress the NAME only of a file reproduced IN FULL — naming that invites a wasted tool call.
+  // A TRUNCATED file is the opposite case: the agent holds a fragment, and unless it is told to go
+  // and read the rest it will apply half a rule believing it read the whole one.
+  const whole = new Set(inlined.filter((d) => !d.truncated).map((d) => d.path));
+  const named = c.requiredReading.filter((p) => !whole.has(p));
   if (named.length) lines.push(`Read before changing anything: ${named.join(', ')}`);
   if (loaded?.skipped.length) {
-    lines.push(`Also worth reading, not included here (context budget): ${loaded.skipped.join(', ')}`);
+    lines.push(`Declared reading not included below: ${loaded.skipped.join(', ')}`);
   }
 
   if (!lines.length && !inlined.length) return '';
@@ -234,13 +279,16 @@ export function renderRepoContext(c: ResolvedRepoContext, loaded?: LoadedRepoDoc
   let out = '\n\nThis repo says of itself:';
   if (lines.length) out += `\n${lines.map((l) => `- ${l}`).join('\n')}`;
   for (const d of inlined) {
-    const mark = d.truncatedFrom ? ` (truncated — ${d.text.length} of ${d.truncatedFrom} characters)` : '';
+    const mark = d.truncated ? ` (FIRST ${d.text.length} characters only — the rest was not read)` : '';
     out += `\n\n----- ${d.path}${mark} -----\n${d.text}`;
   }
   if (inlined.length) {
-    out += '\n----- end of included files -----\nThose files are reproduced above in full';
-    out += inlined.some((d) => d.truncatedFrom) ? ' or in part' : '';
-    out += ' — do not spend a turn re-reading them.';
+    out += '\n----- end of included files -----\n';
+    // Two different instructions, because they are two different situations. Telling an agent not
+    // to re-read a file it only half received is how a half-read rule gets applied with confidence.
+    out += inlined.some((d) => d.truncated)
+      ? 'The files above are complete unless marked otherwise — do not spend a turn re-reading a complete one. Any file marked as cut short is a FRAGMENT: read the rest yourself before relying on it.'
+      : 'Those files are reproduced above in full — do not spend a turn re-reading them.';
   }
   return out;
 }
@@ -248,6 +296,11 @@ export function renderRepoContext(c: ResolvedRepoContext, loaded?: LoadedRepoDoc
 /**
  * The single entry point the supervisor uses: resolve `[context]`, fall back to the repo's
  * conventional instruction files when it declared no reading of its own, and inline what fits.
+ *
+ * The fallback keys off what the manifest DECLARED, not off what survived resolution. A repo that
+ * named three documents and typo'd all three has still made a choice, and quietly substituting
+ * `CLAUDE.md` for it would be the silent-widening move this codebase refuses elsewhere — the
+ * operator would see an oriented agent and never learn their list is broken (the warnings say so).
  */
 export async function loadRepoContext(
   root: string,
@@ -255,7 +308,8 @@ export async function loadRepoContext(
   deps: { probe?: PathProbe; read?: DocReader; budget?: number } = {},
 ): Promise<{ resolved: ResolvedRepoContext; loaded: LoadedRepoDocs; rendered: string }> {
   const resolved = await resolveRepoContext(root, ctx, deps.probe);
-  const reading = resolved.requiredReading.length
+  const declaredReading = (ctx?.requiredReading?.length ?? 0) > 0;
+  const reading = declaredReading
     ? resolved.requiredReading
     : await discoverAgentInstructions(root, deps.probe);
   const loaded = await loadRepoDocs(root, reading, deps.read, deps.budget);
