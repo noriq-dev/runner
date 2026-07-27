@@ -88,6 +88,12 @@ most specs are half-written, and a gate that failed every one would make the fie
 This is also where the *inline* reviewer finally got the criteria at all — the same shape as
 RUN-158, a rule described as holding for "the verify family" holding only for the dispatched member
 while the one that gates every build had never been told what done means.
+A gate that FAILS then hands the live builder a **specification** rather than a critique (RUN-146,
+`src/repair.ts`): the outstanding criteria first, the report as the evidence behind them. It draws
+the distinction prose cannot — `failed` means change the code, `behaviour-unverified` usually means
+nothing *exercises* it and the repair is a test — so a builder told only "not satisfied" stops
+rewriting correct code to satisfy a gate that could not see it. It never guesses which finding
+threatens which criterion; RUN-147 is where requirement ids make that join real.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud

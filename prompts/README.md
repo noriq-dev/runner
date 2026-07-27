@@ -82,6 +82,16 @@ the dispatched verify run is opt-in.
 There is deliberately no prose rendering of the criteria for these actors. Shown the same criteria
 as a list and again as a paragraph, a model answers the paragraph and skips the list.
 
+When a gate FAILS, `reviewer-feedback.md` leads with `{{repair}}` — the outstanding criteria as a
+**specification** rather than a critique (RUN-146, `src/repair.ts`). A report is an argument; the
+builder's question is "what must be true when I stop?", and it was reconstructing that from prose
+every round while the daemon already held it as data. The block draws the distinction prose cannot:
+a `failed` criterion means change the code, a `behaviour-unverified` one usually means nothing
+*exercises* the code and the repair is a test rather than an edit — told only "not satisfied", a
+builder rewrites correct code to satisfy a gate that merely could not see it. The findings still
+follow in full: they carry detail a criterion never will, and the builder answers them by number for
+the ledger. A run with no acceptance criteria gets no block at all.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

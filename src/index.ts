@@ -273,6 +273,7 @@ export {
   type AcceptanceOutcome,
   type AcceptanceReport,
 } from './acceptance';
+export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
 export {
   assembleReviewerPrompt,
   reviewerFeedbackPrompt,

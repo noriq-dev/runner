@@ -14,6 +14,7 @@
 import { type AcceptanceItem, renderAcceptanceChecklist } from './acceptance';
 import { type LedgerEntry, renderLedger } from './adjudication';
 import { renderPrompt } from './prompts';
+import { type RepairSpec, renderRepairSpec } from './repair';
 
 export interface ReviewerPromptContext {
   /** What the diff is supposed to achieve — the anchor task's text, or the run brief. */
@@ -122,9 +123,17 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
  * verify feedback: the report, in context, to the session that can act on it. The findings
  * cap mirrors the comment surface (a report longer than this has stopped being actionable).
  */
-export function reviewerFeedbackPrompt(findings: string, round: number, maxRounds: number): string {
+export function reviewerFeedbackPrompt(
+  findings: string,
+  round: number,
+  maxRounds: number,
+  /** What is still outstanding, as a specification (RUN-146). Absent → the hand-back is the report
+   *  alone, exactly as it was — which is every run whose task carries no acceptance criteria. */
+  repair?: RepairSpec | null,
+): string {
   return renderPrompt('reviewer-feedback', {
     findings: findings.slice(-6000),
+    repair: repair ? renderRepairSpec(repair) : null,
     last: round >= maxRounds,
   });
 }

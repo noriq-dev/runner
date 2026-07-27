@@ -46,6 +46,7 @@ import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
+import { buildRepairSpec } from './repair';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
 import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
 import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
@@ -1535,7 +1536,17 @@ export class RunSupervisor {
       // Same as the deterministic floor's hand-back: the seconds are charged here (RUN-133).
       const fixStartedAt = monotonicMs();
       const exit = await ctx.session
-        .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
+        .continueWith(
+          reviewerFeedbackPrompt(
+            verdict.findings,
+            round,
+            maxRounds,
+            // The gate's own evidence, turned into what is left to do (RUN-146). Built from THIS
+            // round's verdict, so a criterion the builder satisfied last round is not re-issued as
+            // outstanding work.
+            buildRepairSpec(verdict.acceptance, findings),
+          ),
+        )
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
           return null;

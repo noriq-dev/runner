@@ -2404,6 +2404,145 @@ describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
   });
 });
 
+// RUN-146. The report is an argument; the fix turn needs a specification. The daemon already holds
+// what is outstanding as data, so it leads with it rather than making the builder reconstruct it
+// from prose every round.
+describe('a failing gate hands back a specification (RUN-146)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 1,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 1 },
+      },
+    });
+
+  const taskWith = (...truths: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: truths } }),
+  });
+
+  /** Build → reviewer FAILs with `report` → the builder's fix turn. Returns that turn's text. */
+  const fixTurnAfter = async (task: AnchorTask | null, report: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done'); // build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    h.claude.emitText(report);
+    h.claude.complete('done'); // reviewer round 1
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.continuations.length) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const turn = h.claude.continuations[0] ?? '';
+    // Let the run finish so nothing is left pending.
+    for (let i = 0; i < 200 && h.claude.starts.length < 3; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done.catch(() => {});
+    return turn;
+  };
+
+  it('leads with the outstanding criteria, and keeps the report as the evidence behind them', async () => {
+    const turn = await fixTurnAfter(
+      taskWith('it reaps orphans on start'),
+      'FINDING 1 [High] src/worktree.ts:88: reapOrphans is never called\nACCEPTANCE 1: FAILED nothing reaps\nVERDICT: FAIL',
+    );
+    expect(turn).toMatch(/WHAT IS STILL OUTSTANDING/);
+    expect(turn).toMatch(/NOT SATISFIED[\s\S]*it reaps orphans on start/);
+    expect(turn).toContain('Files the report names: src/worktree.ts');
+    // The findings are still there in full — the builder answers them number by number, and the
+    // ledger (RUN-79) depends on that block existing.
+    expect(turn).toContain('reapOrphans is never called');
+    expect(turn).toMatch(/FINDING <n>: FIXED/);
+    // Specification first, evidence second.
+    expect(turn.indexOf('WHAT IS STILL OUTSTANDING')).toBeLessThan(turn.indexOf('Its report'));
+  });
+
+  // The failure this exists to prevent: a builder told only "not satisfied" rewrites code that was
+  // already correct to satisfy a gate that merely could not see it.
+  it('tells the builder an unverified criterion usually needs evidence, not a code change', async () => {
+    const turn = await fixTurnAfter(
+      taskWith('it never pushes'),
+      'FINDING 1 [Med] src/a.ts:1: something else\nACCEPTANCE 1: BEHAVIOUR-UNVERIFIED nothing covers it\nVERDICT: FAIL',
+    );
+    expect(turn).toMatch(/NOT ESTABLISHED[\s\S]*usually NOT a code defect/);
+    expect(turn).toMatch(/prefer making it demonstrable/);
+    // …and the trap closed: a characterization test is not evidence.
+    expect(turn).toMatch(/merely records what the code does today is not evidence/);
+  });
+
+  // A spec built once and reused would tell round 2 to fix what round 1 already fixed — and the
+  // builder, told a criterion is still outstanding when it is not, either re-does the work or
+  // starts distrusting the block. Each round's spec comes from THAT round's verdict.
+  it('reflects the round it is handed to, not the first one', async () => {
+    const h = harness({
+      manifest: manifest({
+        verify: {
+          cmd: null,
+          timeoutSeconds: null,
+          shell: null,
+          maxRounds: 2,
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+        },
+      }),
+      anchorTask: taskWith('it reaps orphans', 'it never pushes'),
+    });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    const awaitReview = async (n: number) => {
+      for (let i = 0; i < 300; i++) {
+        if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= n) return;
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      throw new Error(`reviewer ${n} never started`);
+    };
+    await awaitReview(2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: x\nACCEPTANCE 1: FAILED nothing reaps\nVERDICT: FAIL');
+    h.claude.complete('done'); // round 1
+    await awaitReview(3);
+    // Round 1's criterion is fixed; a DIFFERENT one now fails.
+    h.claude.emitText(
+      'FINDING 2 [High] src/b.ts:1: y\nACCEPTANCE 1: VERIFIED src/a.ts:9\nACCEPTANCE 2: FAILED it pushes\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 2
+    for (let i = 0; i < 300 && h.claude.continuations.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await awaitReview(4);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+
+    const [first, second] = h.claude.continuations;
+    expect(first).toContain('it reaps orphans');
+    expect(second).toContain('it never pushes');
+    // The one round 2's reviewer just marked VERIFIED must not be re-issued as outstanding work.
+    expect(second).not.toMatch(/NOT SATISFIED[\s\S]*it reaps orphans/);
+    expect(second).toMatch(/1 other criterion is already satisfied/);
+  });
+
+  // Every run without a spec, which is most of them, must get exactly the hand-back it got before.
+  it('adds nothing for a run with no criteria', async () => {
+    const turn = await fixTurnAfter(null, 'FINDING 1 [High] src/a.ts:1: broken\nVERDICT: FAIL');
+    expect(turn).not.toContain('WHAT IS STILL OUTSTANDING');
+    expect(turn).toContain('broken');
+  });
+});
+
 describe('the inline reviewer (RUN-61)', () => {
   const REVIEWED = (
     cmd: string | null = 'npm test',
