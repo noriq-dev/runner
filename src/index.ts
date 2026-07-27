@@ -203,6 +203,20 @@ export {
   type StageRetry,
 } from './run-machine';
 export {
+  prepareRun,
+  executeRun,
+  LOG_TAIL_CAP,
+  type PrepareHost,
+  type PrepareOutcome,
+  type PreparedRun,
+  type ExecuteHost,
+  type ExecuteOutcome,
+  type ExecutePlan,
+  type RunPipeline,
+  type StageHost,
+  type StageImpl,
+} from './stages';
+export {
   RunSupervisor,
   RunTally,
   assemblePrompt,

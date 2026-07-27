@@ -33,24 +33,22 @@ import {
   resolveLandBranch,
 } from './land';
 import type { LockConflict } from './lock-client';
-import { LockEnforcer, lockFloorComment } from './lock-hooks';
+import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
-import {
-  type DocReader,
-  type PathProbe,
-  loadRepoContext,
-  loadRepoContextBrief,
-  renderRepoContext,
-} from './repo-context';
+import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
 import { type StageName, stagesFor } from './run-machine';
-import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
+import { sanitizedAgentEnv } from './security';
 import {
+  type ExecuteHost,
+  type PrepareHost,
   type RunPipeline,
   type StageHost,
   type StageImpl,
+  executeRun,
   integrateStage,
+  prepareRun,
   reviewStage,
   settleStage,
   verifyStage,
@@ -125,9 +123,6 @@ export interface RunReport {
   logTail?: string;
   exit?: Record<string, unknown> | null;
 }
-
-/** How much of the agent's trailing output to stream as the live log tail. */
-const LOG_TAIL_CAP = 4000;
 
 export interface RunSupervisorDeps {
   /** One driver per tool (claude/codex). */
@@ -1589,70 +1584,45 @@ export class RunSupervisor {
     this.deps.report(run.id, { status: 'running', phase: 'agent' });
     this.log.info('resuming a parked run', { runId, agentId: entry.agentId, session: entry.sessionId });
 
-    let verifyText = '';
-    let tail = '';
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
     // figures accumulate onto — and keep summing with — everything spent before the park.
     const tally = new RunTally();
     tally.seed('__prior__', telemetryFromSpent(entry.spent));
-    const startedAt = Date.now();
-    const budgetRun = this.startAgent(driver, {
-      runId: run.id,
-      kind,
-      cwd: worktree.localPath,
-      // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
-      // all of it, and re-sending it would both waste the context and confuse a conversation
-      // that is mid-thought.
-      prompt: resumePrompt(entry.question, answer),
-      resumeSessionId: entry.sessionId,
-      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
-      noriqMcp,
-      multiTurn: wf.produces && Boolean(repo.manifest.verify),
-      // The same model it was running before it parked (RUN-33): the session being resumed is
-      // that model's conversation, and quietly finishing the job on a different one would make
-      // "resumed with its context intact" only half true.
-      ...resolveModel(run, repo.manifest),
-      // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
-      // budget, and a run could park its way past any limit.
-      budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
-      handlers: {
-        onTelemetry: (t) => {
-          tally.record('primary', t);
-          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
-        },
-        onText: (t) => {
-          verifyText += t;
-          tail = (tail + t).slice(-LOG_TAIL_CAP);
-          this.transcript(run.id).text('agent', t);
-        },
-      },
-    });
-    this.deps.steering?.register(run.id, budgetRun.session, budgetRun.stop);
-    let exit: DriverExit;
-    try {
-      exit = await budgetRun.done;
-    } finally {
-      this.deps.steering?.unregister(run.id);
-    }
-    // Record this sitting's terminal result (captures a driver/fake that emits no separate tick),
-    // then the run's spend is cumulative across the park — the tally already folds the seeded prior.
-    tally.record('primary', exit.telemetry);
-    exit = { ...exit, telemetry: tally.total() };
 
-    // It can park AGAIN. An agent given an answer may well have a second question, and there is
-    // no reason the second one is worth less than the first.
-    const reparked = await this.parkIfBlocked({
+    // The SAME execute stage `supervise` runs (RUN-131) — including its re-park check, because an
+    // agent given an answer may well have a second question and there is no reason the second one
+    // is worth less than the first. Everything that differs about a resume is resolved here, in
+    // `start`, rather than by a second copy of the spawn-and-await loop.
+    const executed = await executeRun(this.executeHost(), {
       run,
       repo,
       worktree,
-      exit,
-      session: budgetRun.session,
+      driver,
       runAgent,
-      activeSeconds: entry.activeSeconds + (Date.now() - startedAt) / 1000,
       tally,
-      tail,
+      priorActiveSeconds: entry.activeSeconds,
+      start: {
+        runId: run.id,
+        kind,
+        cwd: worktree.localPath,
+        // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
+        // all of it, and re-sending it would both waste the context and confuse a conversation
+        // that is mid-thought.
+        prompt: resumePrompt(entry.question, answer),
+        resumeSessionId: entry.sessionId,
+        permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
+        noriqMcp,
+        multiTurn: wf.produces && Boolean(repo.manifest.verify),
+        // The same model it was running before it parked (RUN-33): the session being resumed is
+        // that model's conversation, and quietly finishing the job on a different one would make
+        // "resumed with its context intact" only half true.
+        ...resolveModel(run, repo.manifest),
+        // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
+        // budget, and a run could park its way past any limit.
+        budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
+      },
     });
-    if (reparked) return reparked;
+    if (executed.parked) return executed.parked;
 
     return this.afterDriver({
       run,
@@ -1663,13 +1633,13 @@ export class RunSupervisor {
       noriqMcp,
       task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
       runAgent,
-      session: budgetRun.session,
-      stopSession: budgetRun.stop,
-      exit,
+      session: executed.session,
+      stopSession: executed.stopSession,
+      exit: executed.exit,
       tally,
-      verifyText,
-      getSessionText: () => verifyText,
-      tail,
+      verifyText: executed.sessionText,
+      getSessionText: executed.getSessionText,
+      tail: executed.tail,
     });
   }
 
@@ -1699,397 +1669,113 @@ export class RunSupervisor {
     return stale.length;
   }
 
-  /** Run one dispatched Run to completion. Never throws — failures are reported. */
+  /**
+   * Run one dispatched Run to completion. Never throws — failures are reported.
+   *
+   * Three lines of pipeline (RUN-131): prepare it, execute it, then walk the post-driver stages.
+   * The ~260 lines of setup that used to sit here are `stages/prepare.ts`, and the ~60 that spawned
+   * and awaited the agent are `stages/execute.ts` — which `resume` now shares rather than repeats.
+   */
   async supervise(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
-      return {
-        outcome: 'failed',
-        isError: true,
-        reason,
-        telemetry: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-          costUsd: 0,
-          numTurns: 0,
-        },
-      };
+      return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     };
 
-    const repo = await this.deps.resolveRepo(run.repoRef);
-    if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
-    const driver = this.deps.drivers[tool as AgentTool];
-    if (!driver) return fail(`no driver for tool ${tool}`);
+    const prepared = await prepareRun(this.prepareHost(), run);
+    if (!prepared.ok) return fail(prepared.reason);
 
-    // Defense in depth (RUN-81): the server decides what to dispatch, but a bug in its phase/plan
-    // gate — the removal of plan-task dependency edges left claim_task to enforce phase order
-    // itself — must not let the daemon spawn an agent on a task that isn't unlocked yet (a phase-2
-    // task offered while phase 1 is only in review). The gate lives server-side (phase_tasks), so
-    // ask before spawning. This runs BEFORE the worktree lease so a declined run costs nothing.
-    // Fail OPEN: only a definite `{ claimable: false }` stops the spawn; an absent probe or a
-    // transient error leaves a legitimately-dispatched run untouched.
-    if (run.anchor?.type === 'task' && this.deps.checkClaimable) {
-      const gate = await this.deps.checkClaimable(run.anchor.taskId).catch((err) => {
-        this.log.warn('claimability probe failed — spawning anyway (fail open)', {
-          runId: run.id,
-          err: String(err),
-        });
-        return null;
-      });
-      if (gate && !gate.claimable) {
-        this.log.warn('anchor task is not claimable yet — declining to spawn (phase gate)', {
-          runId: run.id,
-          taskId: run.anchor.taskId,
-          reason: gate.reason,
-        });
-        return fail(
-          `anchor task ${run.anchor.taskId} is not claimable yet — its plan phase is not unlocked${
-            gate.reason ? ` (${gate.reason})` : ''
-          }; not spawning`,
-        );
-      }
-    }
-
-    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
-    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
-    const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
-    // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
-    // suite and exercise the behavior, which needs a writable tree (node_modules, test
-    // temp files, .wrangler state) — chmod'ing it read-only makes that instruction
-    // impossible and reduces the adversarial gate to reading by eye. Verify is still
-    // barred from EDITING by its profile (no Edit/Write tools + an enumerated bash
-    // allowlist), which is the property that actually matters: it must not be able to
-    // "fix" the code it is judging.
-    const readOnly = !wf.worktreeWritable;
-
-    // A VERIFY run leases from the BUILD it judges, not from HEAD — otherwise it gets a
-    // pristine checkout, the `git diff` its prompt orders is empty, and it renders a
-    // verdict on code nobody changed. `verifiesRunId` is what carries that link. By run id,
-    // not by ref (RUN-50): how a run's work is NAMED — a branch, a shelved change — is the
-    // backend's own convention, and this file no longer knows it.
-    const verifiesRunId = wf.verifyActor ? (run.verifiesRunId ?? null) : null;
-
-    // The plan's working branch, when this run belongs to one and it exists (RUN-82). A build
-    // FORKS from it (so it sees predecessors' landed work and lands as a fast-forward); a verify
-    // run is MEASURED against it (below). A verify run still leases from the build it judges
-    // (fromRunId), so `fromTarget` is only meaningful — and only passed — for a build.
-    const planBase = wf.usesPlanBase ? await this.planBase(repo, run) : null;
-
-    let worktree: Workspace;
-    try {
-      worktree = await this.vcsFor(repo).lease(repo.root, run.id, {
-        readOnly,
-        fromRunId: verifiesRunId ?? undefined,
-        ...(wf.produces && planBase ? { fromTarget: planBase } : {}),
-      });
-    } catch (err) {
-      // A verify run whose build is gone (reaped, or built on another machine) must fail
-      // loudly: silently falling back to HEAD would hand back a confident PASS on an empty
-      // diff, which is worse than no gate at all.
-      if (verifiesRunId) {
-        return fail(
-          `cannot verify ${verifiesRunId}: its work is not in this repo — ${(err as Error).message}`,
-        );
-      }
-      return fail(`workspace setup failed: ${(err as Error).message}`);
-    }
-    // dispatched → running, and the first phase (RUN-31). The status half is the real
-    // transition; the phase half rides the telemetry frame the daemon splits this into.
-    this.deps.report(run.id, { status: 'running', worktreePath: worktree.localPath, phase: 'agent' });
-    this.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.localPath });
-
-    // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
-    // a lookup failure degrades to the bare id rather than sinking the run.
-    const task: AnchorTask | null =
-      run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null;
-
-    // The agent's identity AND its Noriq access, in one step (RUN-43). The daemon creates
-    // the agent up front and receives a token bound to it: the process cannot be anyone
-    // else, and we know who our own child is without scraping its output for an `agt_`.
-    //
-    // This token is per-run and least-privilege. It replaces handing every spawned process
-    // the DAEMON's own token — the credential that can register runners and reach every
-    // project its human can. The server revokes this one when the Run goes terminal.
-    //
-    // Without an identity the agent cannot claim or report, so fail loudly rather than
-    // spawn something that can only no-op.
-    let runAgent: RunAgent | undefined;
-    let noriqMcp: NoriqMcp | undefined;
-    if (this.deps.createRunAgent) {
-      try {
-        // Declare the kind's Noriq tool floor with the identity (RUN-47): the server then
-        // advertises exactly what the driver will permit, so the model never sees a tool it
-        // cannot call. Same list the driver enforces — one policy, two views.
-        runAgent = await this.deps.createRunAgent(run.id, {
-          label: `${run.kind}-${run.id.slice(-6)}`,
-          allowedTools: noriqToolNamesFor(kind), // the EFFECTIVE kind (RUN-126), not the dispatched one
-        });
-        noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: runAgent.token };
-        // Say who is working this Run as soon as we know — which is now BEFORE the process
-        // starts, rather than never.
-        this.deps.report(run.id, { status: 'running', agentId: runAgent.agentId });
-        this.log.info('run agent created', {
-          runId: run.id,
-          agentId: runAgent.agentId,
-          label: runAgent.label,
-        });
-      } catch (err) {
-        await this.vcsFor(repo)
-          .dispose(worktree)
-          .catch(() => {});
-        return fail(`could not create the Noriq agent for this run: ${(err as Error).message}`);
-      }
-    }
-
-    // Branching from the build's branch isn't enough on its own: that checkout is CLEAN,
-    // so a bare `git diff` still shows nothing. Point the verifier at the range that is
-    // actually under review — everything the build added since it forked. Three dots =
-    // "since the merge base", so an unrelated main moving on doesn't pollute the review.
-    // The base is the plan's working branch when the build forked from one (RUN-82) — else the
-    // build measured against main would re-include every predecessor task's landed work — falling
-    // back to the default branch. Only a git-shaped backend gets a diff command; a live backend
-    // (Perforce/Diversion) has no `git diff` to run, so the prompt falls back to inspecting the
-    // workspace's files (same gate the inline reviewer uses).
-    const diffCmd =
-      verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
-        ? `git diff ${planBase ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
-        : undefined;
-
-    // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
-    // which it can only do if the daemon actually made someone.
-    if (!runAgent) {
-      await this.vcsFor(repo)
-        .dispose(worktree)
-        .catch(() => {});
-      return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
-    }
-
-    // Dispatch-time predictive locking (RUN-103): with a DECLARED scope, take its locks now — as
-    // the run's holder, before the agent starts — and REFUSE a dispatch that clashes rather than
-    // race two agents onto the same files. Runs here (not the RUN-81 pre-lease gate) because a
-    // lock needs the run's agent token, which is only minted above; a refusal disposes the
-    // just-leased worktree ONLY when it holds nothing (see below — a continuation's does).
-    // No-op without a resolver / declared scope, so the reactive hook + hard floor stay the
-    // guarantee.
-    if (wf.produces && this.deps.resolveLockScope && this.vcsFor(repo).lock) {
-      const scope = (await this.deps.resolveLockScope(run)) ?? [];
-      if (scope.length) {
-        const ctx: LockContext = {
-          projectId: run.projectId,
-          token: runAgent.token,
-          branch: this.lockScopeBranch(repo, run),
-          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
-        };
-        const outcome = await this.vcsFor(repo).lock!(worktree, scope, ctx).catch(
-          () => ({ ok: true, enabled: false, locks: [] }) as LockOutcome,
-        );
-        if (!outcome.ok) {
-          this.log.warn('predictive lock refused the dispatch — its declared scope clashes', {
-            runId: run.id,
-            holders: outcome.conflicts.map((c) => c.holderName ?? c.holder),
-          });
-          this.transcript(run.id).milestone(
-            `🔒 predictive lock refused this dispatch — its declared scope ${outcome.conflicts
-              .map((c) => c.path)
-              .join(', ')} is held by another run`,
-          );
-          if (run.anchor?.type === 'task') {
-            this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(outcome.conflicts));
-          }
-          // NEVER dispose a workspace that already holds work (RUN-130). A CONTINUATION adopts
-          // its kept worktree and branch (RUN-91) — and a continuation is precisely what declares
-          // a scope today, so this refusal fires exactly where the workspace carries the prior
-          // sitting's committed diff. `dispose` force-removes the worktree and `-D`s its
-          // never-pushed branch, which would destroy work that exists nowhere else. The comment
-          // above used to say "a refusal disposes the just-leased worktree"; that was only true
-          // while nothing was ever bound to declare a scope.
-          //
-          // Only GIT's dispose is destructive. A live backend sets `disposePreservesWork` and its
-          // dispose is how the exclusive lease returns to the pool — skipping it there preserves
-          // nothing and wedges every later run on the repo until the daemon restarts. The terminal
-          // path below already draws exactly this distinction; this one has to as well.
-          const vcsRef = this.vcsFor(repo);
-          // "Could not tell" counts as work (RUN-152). This guard was always written that way; what
-          // was missing is that `hasWork` used to answer `false` on a failed probe, so it never
-          // fired. The backend rejects now, and the choice is made here where it is visible.
-          const wouldDestroy =
-            !vcsRef.disposePreservesWork &&
-            (await vcsRef.hasWork(worktree).catch((err) => {
-              this.log.warn('could not tell whether the workspace holds work — keeping it', {
-                runId: run.id,
-                err: String(err),
-              });
-              return true;
-            }));
-          if (wouldDestroy) {
-            this.log.warn('lock refusal kept a workspace that holds work — not disposing', {
-              runId: run.id,
-            });
-          } else {
-            await vcsRef.dispose(worktree).catch(() => {});
-          }
-          return fail(
-            `declared file scope is locked by another run (${outcome.conflicts
-              .map((c) => c.path)
-              .join(', ')}); not spawning`,
-          );
-        }
-      }
-    }
-
-    // The repo's `[context]` (RUN-128), resolved against its root and inlined under a budget
-    // (RUN-129). A path that does not resolve is WARNED about rather than dropped in silence: a
-    // required-reading list that quietly shrinks to nothing leaves the repo believing its agents
-    // are oriented when they are not.
-    // Read the context out of the RUN'S WORKSPACE, not the discovered checkout (RUN-128/129).
-    // They are different trees: a build forks from the plan base, a continuation adopts a branch
-    // with its own edits, and a verify run leases the build's branch. Inlining the checkout's
-    // CLAUDE.md and then telling the agent not to re-read it would hand it instructions that do
-    // not describe the tree it is standing in. `localPath` is where the agent actually runs.
-    const repoCtx = await loadRepoContext(worktree.localPath, repo.manifest.context, {
-      probe: this.deps.pathProbe,
-      read: this.deps.readDoc,
-      budget: this.deps.contextBudget,
-    });
-    for (const u of repoCtx.resolved.unresolved) {
-      this.log.warn(
-        `[context] ${u.declared} in ${repo.manifest.key} is ${
-          u.reason === 'outside-repo' ? 'outside the repo — refused' : 'missing'
-        }; not included in the brief`,
-      );
-    }
-    if (repoCtx.loaded.skipped.length) {
-      this.log.warn(
-        `[context] budget spent before ${repoCtx.loaded.skipped.join(', ')} — named in the brief, not inlined`,
-      );
-    }
-
-    const prompt = assemblePrompt(run, repo.manifest, {
-      agent: runAgent,
-      server: this.deps.server,
-      task,
-      diffCmd,
-      repoContext: repoCtx.rendered,
-      // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
-      // documents differ (RUN-154).
-      repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
-      // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
-      // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
-      workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,
-    });
-    let verifyText = ''; // accumulated agent output — the verify verdict is parsed from it
-    let tail = ''; // rolling tail of the same output, capped, for the live dashboard (RUN-22)
-    // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
-    // its model mix are the sum across sessions, always consistent with each other.
-    const tally = new RunTally();
-    // Continue a failed run (RUN-92). The lease above already ADOPTED the kept worktree (RUN-91);
-    // this adds the two things git cannot carry across the fail→continue boundary: the prior spend
-    // (re-seeded so this sitting's reported figures stay CUMULATIVE rather than overwriting the
-    // server's totals with only what this sitting spends) and the adjudication ledger (handed to
-    // the reviewer below so it does not relitigate what the earlier sitting settled).
-    const continued = (await this.deps.continuable?.get(run.id)) ?? null;
-    if (continued) {
-      tally.seed('__prior__', telemetryFromSpent(continued.spent));
-      this.log.info('continuing a failed run — re-seeded prior spend and ledger', {
-        runId: run.id,
-        priorTokens: continued.spent.tokens,
-        ledgerEntries: continued.ledger.length,
-      });
-    }
-    // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
-    // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
-    const startedAt = Date.now();
-    const budgetRun = this.startAgent(driver, {
-      runId: run.id,
-      kind,
-      cwd: worktree.localPath,
-      prompt,
-      permission,
-      noriqMcp,
-      // Reactive file locking (RUN-101): a build agent's edits go through a PreToolUse hook that
-      // locks each path as the run's holder and denies one a peer holds. Absent for scope/verify
-      // (no writes) and for a backend with no lock layer — and only handed to a driver that can
-      // actually wire it (RUN-110): a driver without in-process hooks (Codex) relies on the hard
-      // floor instead, so passing it one it would silently drop is just a lie in the start opts.
-      lockEnforcer: driver.capabilities.toolHooks
-        ? this.lockEnforcerFor(repo, run, worktree, kind, runAgent.token)
-        : undefined,
-      // Keep the session alive past its first result ONLY when a feedback loop is possible: a
-      // build, with a verify command to fail. Scope and verify runs want today's behaviour —
-      // finish and close — and a session nobody closes hangs the daemon (see the finally below).
-      multiTurn: wf.produces && Boolean(repo.manifest.verify),
-      // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
-      // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
-      ...resolveModel(run, repo.manifest),
-      budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-      handlers: {
-        // Each telemetry tick carries the current spend AND the latest log tail, so the dashboard
-        // sees burn + output without a status transition per tick. The primary session — including
-        // its fix turns, which stream through these same handlers — records into the tally, and the
-        // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
-        // knows the split), so the mix appears when the result lands, not before.
-        onTelemetry: (t) => {
-          tally.record('primary', t);
-          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
-        },
-        onText: (t) => {
-          verifyText += t;
-          tail = (tail + t).slice(-LOG_TAIL_CAP);
-          this.transcript(run.id).text('agent', t);
-        },
-      },
-    });
-    // Steerable + cancellable while it runs (RUN-16/18).
-    this.deps.steering?.register(run.id, budgetRun.session, budgetRun.stop);
-
-    let exit: DriverExit;
-    try {
-      exit = await budgetRun.done;
-    } finally {
-      this.deps.steering?.unregister(run.id);
-    }
-    // The terminal result, recorded authoritatively (RUN-59): a driver whose result carries a mix
-    // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
-    // run later stream through the handler above and overwrite this with their fuller cumulative.
-    tally.record('primary', exit.telemetry);
-
-    // The session ending is ambiguous (RUN-30): an agent that asked a human a question ends its
-    // turn exactly like one that finished. Only the server knows which, so ask it before treating
-    // this as terminal — everything below destroys context that a parked run still needs.
-    const parked = await this.parkIfBlocked({
+    const executed = await executeRun(this.executeHost(), {
       run,
-      repo,
-      worktree,
-      exit,
-      session: budgetRun.session,
-      runAgent,
-      activeSeconds: (Date.now() - startedAt) / 1000,
-      tally,
-      tail,
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      runAgent: prepared.runAgent,
+      tally: prepared.tally,
+      start: prepared.start,
+      priorActiveSeconds: 0,
     });
-    if (parked) return parked;
+    if (executed.parked) return executed.parked;
 
     return this.afterDriver({
       run,
-      repo,
-      worktree,
-      driver,
-      permission,
-      noriqMcp,
-      task,
-      runAgent,
-      session: budgetRun.session,
-      stopSession: budgetRun.stop,
-      exit,
-      tally,
-      verifyText,
-      getSessionText: () => verifyText,
-      tail,
-      continued,
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      permission: prepared.permission,
+      ...(prepared.noriqMcp ? { noriqMcp: prepared.noriqMcp } : {}),
+      task: prepared.task,
+      runAgent: prepared.runAgent,
+      session: executed.session,
+      stopSession: executed.stopSession,
+      exit: executed.exit,
+      tally: prepared.tally,
+      verifyText: executed.sessionText,
+      getSessionText: executed.getSessionText,
+      tail: executed.tail,
+      continued: prepared.continued,
     });
+  }
+
+  /**
+   * The surface `prepare` reaches — see `stageHost` for why this is closures, not `this`.
+   *
+   * Every optional dep is re-wrapped in an arrow rather than copied by reference, and that is not
+   * ceremony: `this.deps.checkClaimable(id)` calls with `deps` as the receiver, and handing the bare
+   * function over would silently call it with the HOST as the receiver instead. A dep written as a
+   * method (`checkClaimable() { return this.client... }`) satisfies the declared type and would
+   * start throwing — which the claimability probe swallows as a transient failure and fails OPEN,
+   * spawning a run the phase gate meant to decline. The daemon passes arrows today; the contract is
+   * public, so it must not depend on that.
+   */
+  private prepareHost(): PrepareHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      postComment: (projectId, taskId, body) => this.deps.postComment?.(projectId, taskId, body),
+      transcript: (runId) => this.transcript(runId),
+      server: this.deps.server,
+      resolveRepo: (repoRef) => this.deps.resolveRepo(repoRef),
+      driverFor: (tool) => this.deps.drivers[tool as AgentTool],
+      vcsFor: (repo) => this.vcsFor(repo),
+      ...(this.deps.checkClaimable
+        ? { checkClaimable: (taskId: string) => this.deps.checkClaimable!(taskId) }
+        : {}),
+      planBase: (repo, run) => this.planBase(repo, run),
+      ...(this.deps.createRunAgent
+        ? {
+            createRunAgent: (runId: string, opts: { label?: string; allowedTools?: string[] }) =>
+              this.deps.createRunAgent!(runId, opts),
+          }
+        : {}),
+      resolveAnchorTask: (taskId) => this.resolveAnchorTask(taskId),
+      ...(this.deps.resolveLockScope
+        ? { resolveLockScope: (run: Run) => this.deps.resolveLockScope!(run) }
+        : {}),
+      lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
+      lockEnforcerFor: (repo, run, worktree, kind, token) =>
+        this.lockEnforcerFor(repo, run, worktree, kind, token),
+      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+      context: {
+        ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
+        ...(this.deps.readDoc ? { read: this.deps.readDoc } : {}),
+        ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
+      },
+      ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+    };
+  }
+
+  /** The surface `execute` reaches. `startAgent` is here — and nowhere wider — because it is the
+   *  one place the sanitized child env is applied (RUN-109). */
+  private executeHost(): ExecuteHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      ...(this.deps.steering ? { steering: this.deps.steering } : {}),
+      parkIfBlocked: (ctx) => this.parkIfBlocked(ctx),
+    };
   }
 
   /**
@@ -2175,10 +1861,10 @@ export class RunSupervisor {
 }
 
 /**
- * The stages this method runs. `prepare` and `execute` happen in `supervise`/`resume` BEFORE the
- * pipeline object exists — they are what BUILDS it — so they are declared in the sequence and
- * absent here. A stage with no entry is skipped, which is what lets the two halves land separately
- * without the list ever disagreeing with itself.
+ * The stages this method runs. `prepare` and `execute` are absent by construction, not by omission:
+ * they happen BEFORE the pipeline object exists — they are what BUILDS it — so they take a run and
+ * return one rather than narrowing a context they were handed, and `supervise` calls them directly.
+ * A stage with no entry here is simply not part of the post-driver walk.
  */
 const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
   verify: verifyStage,

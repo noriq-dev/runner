@@ -3700,3 +3700,40 @@ describe('the run model mix (RUN-59)', () => {
     expect(summed).toBe(total.inputTokens + total.outputTokens);
   });
 });
+
+// RUN-131. The extraction moved the optional deps onto a stage host, and a bare function copied
+// across changes what `this` is when it runs: `this.deps.checkClaimable(id)` calls with `deps` as
+// the receiver, `host.checkClaimable(id)` calls with the HOST. A dep written as a method — which
+// the declared type allows — would start throwing, and the claimability probe swallows a throw as
+// a transient failure and fails OPEN. That is the phase gate silently ceasing to exist.
+describe('an optional dep keeps its own receiver (RUN-131)', () => {
+  it('a method-style checkClaimable still declines the spawn', async () => {
+    const worktrees = new FakeWorktrees();
+    const claude = new FakeDriver('claude');
+    const reports: Array<{ runId: string } & RunReport> = [];
+    // `drivers` is deliberately the member it reads: the deps object has one and the stage host
+    // does not, so a lost receiver is a TypeError rather than a silent coincidence.
+    const deps = {
+      drivers: { claude },
+      vcs: worktrees,
+      resolveRepo: () => ({ root: '/repos/repo_a', manifest: manifest() }),
+      report: (runId: string, r: RunReport) => reports.push({ runId, ...r }),
+      createRunAgent: async () => testAgent(),
+      server: 'https://noriq.example',
+      pathProbe: async () => 'missing' as const,
+      readDoc: async () => '',
+      async checkClaimable(_taskId: string) {
+        const tools = Object.keys(this.drivers).join(',');
+        return { claimable: false, reason: `no phase for ${tools}` };
+      },
+    };
+    const supervisor = new RunSupervisor(deps);
+    const exit = await supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/not claimable yet.*no phase for claude/s);
+    // And it really did decline BEFORE the lease — a fail-open would have leased and spawned.
+    expect(worktrees.created).toEqual([]);
+  });
+});
