@@ -320,3 +320,4 @@ export {
   type CreateWorktreeOptions,
   type GitRunner,
 } from './worktree';
+export * from './repo-intel';
