@@ -171,6 +171,16 @@ describe('defaultDocReader', () => {
     expect(d?.truncated).toBeUndefined();
     expect(d?.text).toBe('tiny');
   });
+
+  // 4-byte characters are TWO UTF-16 units, so an odd cut lands between a surrogate pair and emits
+  // a lone surrogate — a malformed character in the prompt rather than a shortened one.
+  it('never severs a surrogate pair when cutting', async () => {
+    await writeFile(path.join(root, 'emoji.md'), '🔒'.repeat(50));
+    const d = await read('emoji.md', 5); // odd limit → the cut falls mid-pair
+    expect(d?.truncated).toBe(true);
+    expect(d?.text).toBe('🔒🔒'); // 4 units kept, the split pair dropped whole
+    expect(/[\uD800-\uDBFF]$/.test(d?.text ?? '')).toBe(false);
+  });
 });
 
 describe('renderRepoContext', () => {

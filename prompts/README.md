@@ -32,9 +32,10 @@ verbatim.
 
 `{{context}}` is the repo's own orientation block (`[context]` in `.noriq/project.toml`, RUN-128),
 resolved by `src/repo-context.ts` from the **run's workspace** — not the discovered checkout, which
-may be on a different branch. It carries its own leading blank line and renders to nothing when the
-repo declared none, so inline the tag (`…problems.{{context}}`) and place it **before** the brief:
-ground rules land better read ahead of the ask than after it.
+may be on a different branch. It carries its own leading blank line, so inline the tag
+(`…problems.{{context}}`) and place it **before** the brief: ground rules land better read ahead of
+the ask than after it. It renders to nothing only when the repo declares no `[context]` **and**
+carries no `CLAUDE.md` / `AGENTS.md` — those are inlined by default (RUN-129).
 
 `scope.md` and `build.md` carry it. A custom workflow's prompt is passed the same variable but must
 place the tag itself. `verify-agent.md` and `reviewer.md` do **not** receive it — they are assembled

@@ -172,13 +172,31 @@ const defaultDocReader: DocReader = async (abs, limit) => {
   const fh = await open(abs, 'r');
   try {
     const buf = Buffer.alloc(want);
-    const { bytesRead } = await fh.read(buf, 0, want, 0);
+    // LOOP. `read()` may return fewer bytes than asked for without being at EOF, and treating a
+    // short read as EOF is how a fragment gets reported as a complete document — the same lie the
+    // byte/character bug produced, reached by a different route.
+    let filled = 0;
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, filled, want - filled, filled);
+      if (bytesRead === 0) break; // genuine EOF
+      filled += bytesRead;
+      if (filled >= want) break;
+    }
     // A trailing partial character at the buffer edge decodes to U+FFFD; harmless, since anything
     // near the edge is beyond `limit` and gets sliced away by the caller anyway.
-    return buf.subarray(0, bytesRead).toString('utf8');
+    return buf.subarray(0, filled).toString('utf8');
   } finally {
     await fh.close();
   }
+};
+
+/** Cut to `n` UTF-16 units without severing a surrogate pair — slicing an emoji in half emits a
+ *  lone surrogate, which is a malformed character in the prompt rather than a shortened one. */
+const sliceWhole = (s: string, n: number): string => {
+  if (s.length <= n) return s;
+  const code = s.charCodeAt(n - 1);
+  // A high surrogate in the last kept position means its partner is the first dropped one.
+  return s.slice(0, code >= 0xd800 && code <= 0xdbff ? n - 1 : n);
 };
 
 /** The conventional instruction files this repo actually has. Only consulted when the manifest
@@ -242,7 +260,7 @@ export async function loadRepoDocs(
       // The reader returns at most `left + 1`, so a longer result means the file was cut. We know
       // it was cut but NOT how big it actually is — and claiming a size we did not measure would
       // be worse than not naming one.
-      docs.push({ path: rel, text: text.slice(0, left), truncated: true });
+      docs.push({ path: rel, text: sliceWhole(text, left), truncated: true });
       left = 0;
     }
   }
@@ -251,7 +269,9 @@ export async function loadRepoDocs(
 
 /**
  * Render the resolved context as the brief's orientation block. Empty when the repo declared
- * nothing, so a marker without `[context]` produces byte-identical prompts to before.
+ * nothing AND no instruction file was discovered. Note that a marker without `[context]` is NOT
+ * automatically silent: `loadRepoContext` falls back to the repo's CLAUDE.md / AGENTS.md, which is
+ * the point of RUN-129. Silence requires a repo that declares nothing and carries neither file.
  *
  * Inlined documents come LAST within the block and the brief follows them, which is the shape
  * long-context models attend to best: bulk reference first, the actual ask last.

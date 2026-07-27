@@ -1488,6 +1488,18 @@ describe('dispatch-time predictive locking (RUN-103)', () => {
     expect(h.worktrees.removed).toEqual([]); // …but the work survives the refusal
   });
 
+  // Only GIT's dispose destroys. A live backend's dispose RETURNS THE LEASE, so skipping it there
+  // preserves nothing and wedges every later run on the repo until the daemon restarts.
+  it('still disposes on a clash when the backend preserves work — dispose is the lease release', async () => {
+    const pooled = new FakeWorktrees();
+    // `repoVcs` wins over deps.vcs (RUN-60), so the conflict has to be armed on THIS instance.
+    (pooled as { disposePreservesWork?: boolean }).disposePreservesWork = true;
+    pooled.lockConflicts = [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }];
+    const h = harness({ manifest: LANDING(), lockScope: ['src/hot.ts'], repoVcs: pooled });
+    await h.supervisor.supervise(buildRun()); // holds work, but disposal is non-destructive here
+    expect(pooled.removed).toEqual(['/wt/run_1']);
+  });
+
   it('still disposes an EMPTY workspace on a clash — nothing to lose, nothing to leak', async () => {
     const h = harness({
       manifest: LANDING(),

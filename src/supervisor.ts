@@ -520,7 +520,7 @@ export function assemblePrompt(
      *  a `promptRef` supplies its own brief; its inherited posture still drives everything else. */
     workflow?: Workflow;
     /** The repo's own orientation block, already resolved off disk (RUN-128). Optional: a marker
-     *  without `[context]` renders byte-identical prompts to before. */
+     *  with neither a `[context]` nor a CLAUDE.md/AGENTS.md renders as it did before RUN-128. */
     repoContext?: string;
   },
 ): string {
@@ -1796,18 +1796,20 @@ export class RunSupervisor {
           // never-pushed branch, which would destroy work that exists nowhere else. The comment
           // above used to say "a refusal disposes the just-leased worktree"; that was only true
           // while nothing was ever bound to declare a scope.
-          if (
-            await this.vcsFor(repo)
-              .hasWork(worktree)
-              .catch(() => true)
-          ) {
+          //
+          // Only GIT's dispose is destructive. A live backend sets `disposePreservesWork` and its
+          // dispose is how the exclusive lease returns to the pool — skipping it there preserves
+          // nothing and wedges every later run on the repo until the daemon restarts. The terminal
+          // path below already draws exactly this distinction; this one has to as well.
+          const vcsRef = this.vcsFor(repo);
+          const wouldDestroy =
+            !vcsRef.disposePreservesWork && (await vcsRef.hasWork(worktree).catch(() => true));
+          if (wouldDestroy) {
             this.log.warn('lock refusal kept a workspace that holds work — not disposing', {
               runId: run.id,
             });
           } else {
-            await this.vcsFor(repo)
-              .dispose(worktree)
-              .catch(() => {});
+            await vcsRef.dispose(worktree).catch(() => {});
           }
           return fail(
             `declared file scope is locked by another run (${outcome.conflicts
