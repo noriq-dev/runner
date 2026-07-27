@@ -14,7 +14,7 @@ import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } f
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
-import { type BudgetRun, superviseBudget, totalTokens } from './drivers/budget';
+import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
   AgentDriver,
   DriverExit,
@@ -484,6 +484,26 @@ export class RunTally {
       return exceedsRun(this.ceiling, { telemetry: this.sum(probe.values()), activeSeconds: this.active });
     };
   }
+
+  /**
+   * The wall-clock counterpart of `guard`, for `DriverStartOptions.clockGuard` (RUN-159): seconds
+   * left on the run, right now.
+   *
+   * Reads `active` rather than probing like `guard` does, because time is not telemetry — a
+   * session's stretch is charged once, when it ends, so there is no in-flight figure to swap in.
+   * That also means the answer EXCLUDES the caller's own running stretch, which is correct: the
+   * session's own budget already covers that half, and the arming side takes the tighter of the two.
+   */
+  clockGuard(): () => number | null {
+    return () => {
+      const max = this.ceiling?.maxDurationSeconds;
+      return max == null ? null : Math.max(0, max - this.active);
+    };
+  }
+
+  /* `active` is only as good as the clock its callers time with, which is why every one of them
+   * uses `monotonicMs` — a wall-clock step would otherwise hand this ledger seconds nobody spent
+   * (or credit back seconds that were), and the budget layer would enforce against the drift. */
 
   /** Seed a slot only if empty — used for a park's prior spend, which must not clobber a live
    *  session that already recorded under the same slot. */
@@ -1142,7 +1162,8 @@ export class RunSupervisor {
     cwd: string;
     session: DriverSession;
     /** The run's cross-session tally (RUN-133): a hand-back turn's active seconds are charged to
-     *  it, because the session's own wall-clock deadline died with its first result. */
+     *  it when the turn ends, which is what a later session's reservation — and the live
+     *  `clockGuard` re-arming this session's own deadline (RUN-159) — is short by. */
     tally: RunTally;
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
@@ -1168,19 +1189,26 @@ export class RunSupervisor {
       // to climb during "verifying" — the same lie this task exists to stop telling (RUN-31).
       this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
       // A hand-back is more agent time on the run's clock (RUN-133). Its TOKENS are policed live by
-      // the session's spendGuard; its SECONDS are only knowable here, because the session's own
-      // wall-clock deadline was cleared when its first result landed.
-      const fixStartedAt = Date.now();
+      // the session's spendGuard and its SECONDS by the deadline re-armed around this turn
+      // (RUN-159) — but the deadline is enforcement, not accounting: charging the stretch here is
+      // what makes the next session's reservation, and the next turn's own deadline, short by it.
+      const fixStartedAt = monotonicMs();
       const exit = await ctx.session
         .continueWith(verifyFeedbackPrompt(ctx.spec, result, attempt))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the failure back', { runId: ctx.run.id, err: String(err) });
           return null;
         })
-        .finally(() => ctx.tally.chargeTime((Date.now() - fixStartedAt) / 1000));
+        .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       // The agent died, errored, or breached its budget trying to fix it. Its last verdict stands;
-      // pushing more turns at a session that just failed is how a loop becomes a spend.
-      if (!exit || exit.outcome !== 'done') return result;
+      // pushing more turns at a session that just failed is how a loop becomes a spend. The RUN's
+      // reason stays the gate's, deliberately — the failing verify is what a human must act on —
+      // so the turn's own reason is logged here or it is lost (RUN-159).
+      if (!exit || exit.outcome !== 'done') {
+        if (exit?.reason)
+          this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
+        return result;
+      }
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
       this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
@@ -1293,20 +1321,26 @@ export class RunSupervisor {
       // before the floor re-verify below can append its own turns.
       const textBefore = ctx.getSessionText?.().length ?? 0;
       // Same as the deterministic floor's hand-back: the seconds are charged here (RUN-133).
-      const fixStartedAt = Date.now();
+      const fixStartedAt = monotonicMs();
       const exit = await ctx.session
         .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
           return null;
         })
-        .finally(() => ctx.tally.chargeTime((Date.now() - fixStartedAt) / 1000));
+        .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
       // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
       ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
-      if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round, ledger };
+      // Same as the floor's hand-back: the run keeps the reviewer's reason, so the turn's own
+      // reason is logged here or nobody ever learns the session ran out (RUN-159).
+      if (!exit || exit.outcome !== 'done') {
+        if (exit?.reason)
+          this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
+        return { ...verdict, rounds: round, ledger };
+      }
       this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
       // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
       // deterministic floor re-runs (with its own bounded feedback) before the re-review.
@@ -1447,7 +1481,7 @@ export class RunSupervisor {
     // on work no agent did — and since RUN-133 that number is subtracted from what the next session
     // may spend and persisted into a continuation, so the error would compound rather than pass.
     const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
-    const startedAt = Date.now();
+    const startedAt = monotonicMs();
     const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
@@ -1475,6 +1509,7 @@ export class RunSupervisor {
       budget: reservation.budget,
       // …and the live check, so a reviewer cannot outspend the RUN even inside its own allowance.
       spendGuard: ctx.tally.guard(`review:${ctx.round}`),
+      clockGuard: ctx.tally.clockGuard(),
       handlers: {
         onText: (t) => {
           text += t;
@@ -1498,7 +1533,7 @@ export class RunSupervisor {
       ctx.tally.record(`review:${ctx.round}`, exit.telemetry);
       // …and its wall-clock too (RUN-133), so the next session's reservation is short by what this
       // one took. Sessions are strictly sequential here, so these sum rather than overlap.
-      ctx.tally.chargeTime((Date.now() - startedAt) / 1000);
+      ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
@@ -1544,7 +1579,7 @@ export class RunSupervisor {
     }
 
     let text = '';
-    const startedAt = Date.now();
+    const startedAt = monotonicMs();
     const session = this.startAgent(ctx.driver, {
       runId: `${ctx.run.id}:conflict`,
       kind: 'build', // it is editing its own diff — the build floor, nothing wider
@@ -1559,6 +1594,7 @@ export class RunSupervisor {
       noriqMcp: ctx.noriqMcp,
       budget: reservation.budget,
       spendGuard: ctx.tally.guard('conflict'),
+      clockGuard: ctx.tally.clockGuard(),
       handlers: {
         onText: (t) => {
           text += t;
@@ -1579,7 +1615,7 @@ export class RunSupervisor {
       // The conflict turn's spend joins the run whether or not it resolved anything (RUN-59) — the
       // tokens burned either way, on the build's own model (kind:'build', ctx.driver).
       ctx.tally.record('conflict', exit.telemetry);
-      ctx.tally.chargeTime((Date.now() - startedAt) / 1000);
+      ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         return { resolved: false, text: text || `agent exited ${exit.reason ?? 'badly'}` };
@@ -1790,6 +1826,7 @@ export class RunSupervisor {
         // a run spawns, rather than a resume-only helper beside a reviewer that had none.
         budget: reservation.budget,
         spendGuard: tally.guard('primary'),
+        clockGuard: tally.clockGuard(),
       },
     });
     if (executed.parked) return executed.parked;

@@ -463,6 +463,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       // kept open for hand-back turns, and the reviewer spends from the same ceiling in between, so
       // by the time it is handed work back its own allowance is stale.
       spendGuard: tally.guard('primary'),
+      clockGuard: tally.clockGuard(),
     },
   };
 };

@@ -18,7 +18,7 @@
 
 import type { Run } from '@noriq-dev/shared';
 import type { RunAgent } from '../client';
-import type { BudgetRun } from '../drivers/budget';
+import { type BudgetRun, monotonicMs } from '../drivers/budget';
 import type { AgentDriver, DriverExit, DriverSession, DriverStartOptions } from '../drivers/types';
 import type { logger as defaultLogger } from '../logger';
 import type { ResolvedRepo, RunReport, RunTally } from '../supervisor';
@@ -95,7 +95,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
 
   // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
   // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
-  const startedAt = Date.now();
+  const startedAt = monotonicMs();
   const budgetRun = host.startAgent(plan.driver, {
     ...plan.start,
     handlers: {
@@ -131,7 +131,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
   // This sitting's active stretch joins the run's wall-clock spend (RUN-133), so what the reviewer
   // and the conflict turn may spend is short by what the agent already took. The tally was seeded
   // with any PRIOR sitting's seconds at construction, which is why only this sitting is added here.
-  tally.chargeTime((Date.now() - startedAt) / 1000);
+  tally.chargeTime((monotonicMs() - startedAt) / 1000);
   // Carry the RUN's spend rather than this sitting's first-result snapshot. `settle` recomputes the
   // same total before reporting, and `parkIfBlocked` reads the tally directly, so this changes no
   // outcome — it just stops the exit in flight from disagreeing with everything that reads it.
@@ -147,7 +147,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
     exit,
     session: budgetRun.session,
     runAgent: plan.runAgent,
-    activeSeconds: plan.priorActiveSeconds + (Date.now() - startedAt) / 1000,
+    activeSeconds: plan.priorActiveSeconds + (monotonicMs() - startedAt) / 1000,
     tally,
     tail,
   });

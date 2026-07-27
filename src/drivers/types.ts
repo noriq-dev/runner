@@ -137,6 +137,19 @@ export interface DriverStartOptions {
    * ledger means. Present → it wins for tokens/USD; the wall-clock deadline is still `budget`'s.
    */
   spendGuard?: (t: DriverTelemetry) => string | null;
+  /**
+   * The wall-clock counterpart of `spendGuard` (RUN-159): how many seconds the RUN has left, asked
+   * each time a stretch of agent work is armed. Null (or absent) = unbounded on that axis.
+   *
+   * Same staleness it exists to fix, different axis. `budget.maxDurationSeconds` is this session's
+   * allowance at the moment it was reserved; a multiTurn session outlives that, and the seconds a
+   * reviewer spends between two hand-back turns are the run's, not free. Without this the builder
+   * would be re-armed against its own original allowance and the run's total could exceed its
+   * ceiling by however much every other session took.
+   *
+   * The tighter of the two remainders wins, so a caller with no run ledger loses nothing.
+   */
+  clockGuard?: () => number | null;
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */
   noriqMcp?: NoriqMcp;
   /**
