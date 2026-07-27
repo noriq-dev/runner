@@ -76,6 +76,16 @@ export interface ParkedRun {
   parkedAt: string;
   /** The question the agent asked, for the log and for the resume turn. */
   question: string | null;
+  /**
+   * Which STEP of a decomposed run was speaking when it parked (RUN-168), or null/absent for an
+   * undecomposed run and every park written before this existed.
+   *
+   * Without it a resume restores one session, runs it, and stops — so a chain that parked on step
+   * two of five would come back, finish step two, and report the run DONE having silently skipped
+   * the rest of its plan. That is a correctness bug rather than a missing feature, which is why it
+   * is not deferrable to whenever chains grow their next capability.
+   */
+  stepId?: string | null;
 }
 
 type ParkedFile = { parked: ParkedRun[] };

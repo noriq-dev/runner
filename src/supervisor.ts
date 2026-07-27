@@ -65,17 +65,21 @@ import {
   type StageImpl,
   checkPlan,
   checkerFindings,
+  executeChain,
   executeRun,
   integrateStage,
   mapPatterns,
   planRun,
   prepareRun,
   renderAnalogs,
+  renderPriorSteps,
+  renderStepFocus,
   reviewStage,
   settleStage,
   verifyStage,
   worthMapping,
 } from './stages';
+import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
@@ -1932,6 +1936,8 @@ export class RunSupervisor {
     /** The run's trailing output, so the park report carries the last thing it said — usually
      *  the question itself, which is what a human opening the dashboard wants to read. */
     tail: string;
+    /** Which step of a decomposed run was speaking (RUN-168). */
+    stepId?: string;
   }): Promise<DriverExit | null> {
     const { run, exit } = ctx;
     if (!this.deps.parked || !this.deps.getParkState) return null;
@@ -1977,6 +1983,9 @@ export class RunSupervisor {
         ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
       },
       activeSeconds: ctx.activeSeconds,
+      // Where the chain stopped (RUN-168). Null rather than omitted for an undecomposed run, so a
+      // reader of the record cannot mistake "this run had no steps" for "this park predates steps".
+      stepId: ctx.stepId ?? null,
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
@@ -2084,7 +2093,29 @@ export class RunSupervisor {
     // agent given an answer may well have a second question and there is no reason the second one
     // is worth less than the first. Everything that differs about a resume is resolved here, in
     // `start`, rather than by a second copy of the spawn-and-await loop.
-    const executed = await executeRun(this.executeHost(), {
+    const resumeStart = {
+      runId: run.id,
+      kind,
+      cwd: worktree.localPath,
+      // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
+      // all of it, and re-sending it would both waste the context and confuse a conversation
+      // that is mid-thought.
+      prompt: resumePrompt(entry.question, answer, changed),
+      resumeSessionId: entry.sessionId,
+      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
+      noriqMcp,
+      multiTurn: wf.produces && Boolean(repo.manifest.verify),
+      // The same model it was running before it parked (RUN-33): the session being resumed is
+      // that model's conversation, and quietly finishing the job on a different one would make
+      // "resumed with its context intact" only half true.
+      ...resolveModel(run, repo.manifest),
+      // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
+      // a run spawns, rather than a resume-only helper beside a reviewer that had none.
+      budget: reservation.budget,
+      spendGuard: tally.guard('primary'),
+      clockGuard: tally.clockGuard(),
+    };
+    const resumeBase = {
       run,
       repo,
       worktree,
@@ -2092,29 +2123,24 @@ export class RunSupervisor {
       runAgent,
       tally,
       priorActiveSeconds: entry.activeSeconds,
-      start: {
-        runId: run.id,
-        kind,
-        cwd: worktree.localPath,
-        // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
-        // all of it, and re-sending it would both waste the context and confuse a conversation
-        // that is mid-thought.
-        prompt: resumePrompt(entry.question, answer, changed),
-        resumeSessionId: entry.sessionId,
-        permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
-        noriqMcp,
-        multiTurn: wf.produces && Boolean(repo.manifest.verify),
-        // The same model it was running before it parked (RUN-33): the session being resumed is
-        // that model's conversation, and quietly finishing the job on a different one would make
-        // "resumed with its context intact" only half true.
-        ...resolveModel(run, repo.manifest),
-        // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
-        // a run spawns, rather than a resume-only helper beside a reviewer that had none.
-        budget: reservation.budget,
-        spendGuard: tally.guard('primary'),
-        clockGuard: tally.clockGuard(),
-      },
-    });
+      start: resumeStart,
+    };
+    // A resumed CHAIN picks up where it parked and runs the steps that never got to (RUN-168).
+    // Without this a resume restored one session, ran it, and returned — so a run that parked on
+    // step two of five came back, finished step two, and reported DONE having silently skipped the
+    // rest of its plan. The chain is recomputed from the spec as it stands NOW, which is the same
+    // re-fetch RUN-164 already does, so a spec corrected during the park is the one that governs.
+    const resumedChain = checkSteps(resumedSpec?.spec);
+    const executed = resumedChain.steps.length
+      ? await executeChain(this.executeHost(), {
+          ...resumeBase,
+          steps: resumedChain.steps,
+          ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
+          stepPrompt: (step, i, prior) =>
+            `${resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
+          checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
+        })
+      : await executeRun(this.executeHost(), resumeBase);
     if (executed.parked) return executed.parked;
 
     return this.afterDriver({
@@ -2198,7 +2224,7 @@ export class RunSupervisor {
     const afterPlan = cancelled('execute');
     if (afterPlan) return fail(afterPlan.reason);
 
-    const executed = await executeRun(this.executeHost(), {
+    const base = {
       run,
       repo: prepared.repo,
       worktree: prepared.worktree,
@@ -2207,7 +2233,22 @@ export class RunSupervisor {
       tally: prepared.tally,
       start,
       priorActiveSeconds: 0,
-    });
+    };
+    // A spec that declared a runnable decomposition runs as a CHAIN of sessions (RUN-168), one per
+    // step; anything else is one session, exactly as before. `checkSteps` has already dropped a
+    // decomposition it could not run, so an empty list here means "run this as one" rather than
+    // "something was wrong" — which is why there is no branch for the failure.
+    const chain = checkSteps(executedSpec?.spec);
+    const executed = chain.steps.length
+      ? await executeChain(this.executeHost(), {
+          ...base,
+          steps: chain.steps,
+          stepPrompt: (step, i, prior) =>
+            `${start.prompt}${renderStepFocus(step, i, chain.steps.length)}${renderPriorSteps(prior)}`,
+          checkpoint: (label) =>
+            this.vcsFor(prepared.repo).checkpoint(prepared.worktree, runCommitMessage(run.id, label)),
+        })
+      : await executeRun(this.executeHost(), base);
     if (executed.parked) return executed.parked;
 
     return this.afterDriver({

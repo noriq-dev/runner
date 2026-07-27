@@ -52,6 +52,9 @@ export interface ExecuteHost {
     activeSeconds: number;
     tally: RunTally;
     tail: string;
+    /** Which step was speaking, on a decomposed run (RUN-168) — persisted so a resume knows where
+     *  the chain stopped rather than finishing one session and calling the run done. */
+    stepId?: string;
   }): Promise<DriverExit | null>;
 }
 
@@ -71,6 +74,8 @@ export interface ExecutePlan {
    * human (RUN-30).
    */
   priorActiveSeconds: number;
+  /** Which step this session IS, on a decomposed run (RUN-168). Absent for an undecomposed run. */
+  stepId?: string;
 }
 
 /** Either the run parked on a human — terminal for this sitting — or it finished talking. */
@@ -150,6 +155,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
     activeSeconds: plan.priorActiveSeconds + (monotonicMs() - startedAt) / 1000,
     tally,
     tail,
+    ...(plan.stepId ? { stepId: plan.stepId } : {}),
   });
   if (parked) return { parked };
 

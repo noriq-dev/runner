@@ -431,6 +431,9 @@ function harness(
     anchorTask?: AnchorTask | null;
   } = {},
 ) {
+  // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
+  // (RUN-164) — a test of a resumed chain has to be able to model that.
+  let anchorTask = over.anchorTask ?? null;
   const worktrees = new FakeWorktrees();
   if (over.changed === false) worktrees.changed = false;
   if (over.createFails) worktrees.createFails = true;
@@ -522,7 +525,7 @@ function harness(
         }
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
-    ...(over.anchorTask !== undefined ? { resolveTask: async () => over.anchorTask ?? null } : {}),
+    ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
     ...(over.cancelled
       ? {
           steering: {
@@ -547,6 +550,10 @@ function harness(
     parkChecks,
     claimChecks,
     agentCreates,
+    /** Model a human rewriting the task's spec while the run is parked. */
+    setAnchorTask: (t: AnchorTask | null) => {
+      anchorTask = t;
+    },
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
       park.state = { blocked: false };
@@ -2320,6 +2327,81 @@ describe('plan-branch fork base (RUN-82)', () => {
 // verify run and CLAUDE.md said "the verify family"; the family has two members and this is the one
 // that gates every build with a [verify.agent], while the dispatched run is opt-in. Same shape as
 // RUN-158: a rule described as holding everywhere, holding at the site that runs less often.
+// RUN-168. A decomposed spec runs as a chain of sessions, one per step. The point is that each
+// starts FRESH — not carrying the previous step's exploration — and inherits its conclusions
+// instead. A chain of fresh contexts beats one long context only if each link gets the hand-off.
+describe('a decomposed run is a chain of sessions (RUN-168)', () => {
+  const twoSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'the contract, then its consumer',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'land the contract', anticipatedFiles: [{ path: 'src/a.ts', change: 'create' }] },
+        { id: 's2', title: 'consume it', dependsOn: ['s1'] },
+      ],
+    }),
+  });
+
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('spawns one session per step, each with its own brief, and lands only at the end', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('step one done');
+    h.claude.complete('done'); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('step two done');
+    h.claude.complete('done'); // s2
+    const exit = await done;
+
+    expect(h.claude.starts).toHaveLength(2);
+    expect(h.claude.starts[0]!.prompt).toContain('YOU ARE DOING STEP 1 OF 2: land the contract');
+    expect(h.claude.starts[1]!.prompt).toContain('YOU ARE DOING STEP 2 OF 2: consume it');
+    // A FRESH session, not the previous step's continued — that is the whole reason to decompose.
+    expect(h.claude.starts[1]!.resumeSessionId).toBeUndefined();
+    // …carrying what step one concluded, so it does not rediscover it.
+    expect(h.claude.starts[1]!.prompt).toContain('WHAT THE EARLIER STEPS DID');
+    expect(h.claude.starts[1]!.prompt).toContain('step one done');
+    expect(exit.outcome).toBe('done');
+  });
+
+  // Continuing past a failed step would build later steps on a foundation the run already knows is
+  // broken, and would report a run that did half its plan as one that did all of it.
+  it('stops at the first step that does not finish, and keeps that step’s reason', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    const exit = await done;
+    expect(h.claude.starts).toHaveLength(1); // step two never ran
+    expect(exit.outcome).toBe('failed');
+  });
+
+  it('says in the transcript which step is speaking, and which never ran', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    const said = h.transcript.map((t) => t.text).join('\n');
+    expect(said).toContain('step 1/2 — land the contract [s1]');
+    expect(said).toMatch(/the remaining steps did not run/);
+  });
+
+  // A spec with no steps must behave exactly as it did before — that is most runs.
+  it('runs a spec with no steps as one session, as always', async () => {
+    const h = harness({ anchorTask: null });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.claude.starts).toHaveLength(1);
+    expect(h.claude.starts[0]!.prompt).not.toContain('YOU ARE DOING STEP');
+  });
+});
+
 describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
   const REVIEWED = () =>
     manifest({
@@ -3520,6 +3602,75 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.resumeSessionId).toBe('sess-fake');
     expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
     expect(h.worktrees.created).toHaveLength(1); // only the original
+  });
+
+  // RUN-168, and the bug this ticket exists to prevent. A resume restores ONE session and runs it,
+  // so a chain that parked on step two of five came back, finished step two, and reported the run
+  // DONE having silently skipped the rest of its plan.
+  it('a resumed chain finishes the steps that never ran', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: task });
+    // It parked on step one, and the record says so — without that the resume has no idea a chain
+    // is in flight, let alone where it stopped.
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed step-one session
+    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    // Step TWO started — a fresh session with its own brief, not the resumed one carrying on.
+    const second = h.claude.starts.at(-1)!;
+    expect(second.prompt).toContain('YOU ARE DOING STEP 2 OF 2: second');
+    expect(second.resumeSessionId).toBeUndefined();
+    h.claude.complete('done');
+    expect(await resumed).toMatchObject({ outcome: 'done' });
+  });
+
+  // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step
+  // that parked can be gone from the recomputed chain. Restarting from the top would redo landed
+  // work and skipping to the end would abandon it — neither is a guess worth making.
+  it('stops rather than guessing when the parked step is gone from the new plan', async () => {
+    const parkedWith: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: parkedWith });
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+    // A human rewrote the plan while it waited; the step it parked on no longer exists.
+    h.setAnchorTask({
+      ...parkedWith,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 'x1', title: 'rethought' },
+          { id: 'x2', title: 'also rethought' },
+        ],
+      }),
+    });
+    h.answerIt();
+    const exit = await h.supervisor.resume('run_1', 'Use B.');
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:parked-step-gone' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/its plan no longer declares/);
   });
 
   // RUN-145. A resume reaches afterDriver by its OWN path, so it was passing no spec at all: the

@@ -141,6 +141,24 @@ advisors about work neither has done is worse than building a plan somebody crit
 sees the plan as EVIDENCE, never with the builder's "follow it" framing — it is the one actor whose
 job is to disagree with the spec.
 
+A spec may also declare its own **decomposition** (RUN-148/168): `steps`, an ordered list the
+PLANNER authors — which files are one coherent piece of work is a judgement about the work, and
+grouping `anticipatedFiles` mechanically splits one change across two steps and merges two
+unrelated ones. `src/steps.ts` is the daemon's half, and only the mechanical questions judgement
+cannot answer: usable ids, a runnable order, an affordable count. Validation is all-or-nothing and
+never gates — a decomposition it cannot run is DROPPED and the run proceeds as one, which is what
+every run was before and is always a correct way to do the work. `src/stages/chain.ts` then runs
+one session per step: fresh context each time, inheriting the previous step's *conclusions* rather
+than its exploration, reserving from the same `RunTally` as everything else, checkpointing between
+steps so the next session reads the work from the tree. It stops at the first step that does not
+finish, because continuing would build on a foundation the run already knows is broken. The gate
+stays at the PARENT — a criterion is a statement about the finished work, and a step that satisfies
+its own slice can leave the whole unmet — and the fix turns hand back to the last step's session.
+A park records WHICH step it stopped on: without that a resume restored one session, ran it, and
+reported the run done having silently skipped the rest of its plan. Because a park lasts up to 72
+hours and the spec may be corrected while it waits, a parked step that is gone from the recomputed
+chain stops the run and says so rather than guessing between redoing landed work and abandoning it.
+
 Then the **pattern mapper** (RUN-144, `src/stages/pattern-map.ts`), for each file the plan
 anticipates: the closest existing file in this repo that does the same job, and what to copy from
 it. gsd-core's rule is the only rule — *name the file and the lines, never the idea* — because
