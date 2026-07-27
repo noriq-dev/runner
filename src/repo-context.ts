@@ -167,7 +167,7 @@ export type DocReader = (absPath: string, limit: number) => Promise<string>;
  * file with more than `limit` characters decodes to more than `limit` — which is all the caller
  * needs to detect the cut. Memory stays bounded at four times the budget.
  */
-const defaultDocReader: DocReader = async (abs, limit) => {
+export const defaultDocReader: DocReader = async (abs, limit) => {
   const want = (limit + 1) * 4;
   const fh = await open(abs, 'r');
   try {

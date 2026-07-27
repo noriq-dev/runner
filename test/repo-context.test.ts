@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   type DocReader,
   type PathProbe,
+  defaultDocReader,
   defaultPathProbe,
   discoverAgentInstructions,
   loadRepoContext,
@@ -170,6 +171,17 @@ describe('defaultDocReader', () => {
     const d = await read('small.md', 4);
     expect(d?.truncated).toBeUndefined();
     expect(d?.text).toBe('tiny');
+  });
+
+  // The BOUNDED-I/O contract, pinned on the reader itself. Every other test here slices to the
+  // budget afterwards, so they pass just as happily against a whole-file `readFile` — which is the
+  // OOM this bound exists to prevent. Observing the raw return is the only way to see the window.
+  it('reads a bounded window, not the whole file', async () => {
+    const big = path.join(root, 'huge.md');
+    await writeFile(big, 'x'.repeat(200_000));
+    const raw = await defaultDocReader(big, 10);
+    expect(raw.length).toBeLessThanOrEqual((10 + 1) * 4);
+    expect(raw.length).toBeGreaterThan(10); // still enough to detect the cut
   });
 
   // 4-byte characters are TWO UTF-16 units, so an odd cut lands between a surrogate pair and emits
