@@ -154,10 +154,15 @@ steps so the next session reads the work from the tree. It stops at the first st
 finish, because continuing would build on a foundation the run already knows is broken. The gate
 stays at the PARENT — a criterion is a statement about the finished work, and a step that satisfies
 its own slice can leave the whole unmet — and the fix turns hand back to the last step's session.
-A park records WHICH step it stopped on: without that a resume restored one session, ran it, and
-reported the run done having silently skipped the rest of its plan. Because a park lasts up to 72
-hours and the spec may be corrected while it waits, a parked step that is gone from the recomputed
-chain stops the run and says so rather than guessing between redoing landed work and abandoning it.
+Each step's spend records into its OWN tally slot — the tally is last-writer-wins per slot, so a
+chain sharing `primary` would report only its last step and guard against a figure nobody was
+writing. A park records WHICH step it stopped on: without that a resume restored one session, ran
+it, and reported the run done having silently skipped the rest of its plan. A resume then finishes
+that step and stops, reporting what is left, because a fresh step needs the RUN's brief and a
+resume's prompt is deliberately only the question and the answer — a new session given that has an
+answer to a question it never asked and nothing else. Because a park lasts up to 72 hours and the
+spec may be corrected while it waits, a parked step gone from the recomputed chain fails the run
+rather than guessing between redoing landed work and abandoning it.
 
 Then the **pattern mapper** (RUN-144, `src/stages/pattern-map.ts`), for each file the plan
 anticipates: the closest existing file in this repo that does the same job, and what to copy from

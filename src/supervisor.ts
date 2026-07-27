@@ -1983,9 +1983,11 @@ export class RunSupervisor {
         ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
       },
       activeSeconds: ctx.activeSeconds,
-      // Where the chain stopped (RUN-168). Null rather than omitted for an undecomposed run, so a
-      // reader of the record cannot mistake "this run had no steps" for "this park predates steps".
-      stepId: ctx.stepId ?? null,
+      // Where the chain stopped (RUN-168). Omitted entirely for an undecomposed run, so its park
+      // record is byte-identical to one written before chains existed — a park is a persisted file
+      // other tooling reads, and a field that appears on every record to say "not applicable" is a
+      // shape change for nothing.
+      ...(ctx.stepId ? { stepId: ctx.stepId } : {}),
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
@@ -2135,12 +2137,18 @@ export class RunSupervisor {
       ? await executeChain(this.executeHost(), {
           ...resumeBase,
           steps: resumedChain.steps,
+          // A fresh step cannot be briefed from a resume, whose prompt is only the question and the
+          // answer — so the resumed step finishes and the run reports what is left.
+          stopAfterResumedStep: true,
           ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
           stepPrompt: (step, i, prior) =>
             `${resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
         })
       : await executeRun(this.executeHost(), resumeBase);
+    // The parked step is gone from the recomputed plan (RUN-168). Reported the way every other
+    // unresumable park is: the workspace is KEPT, because it holds work that exists nowhere else.
+    if ('chainFailed' in executed) return fail(executed.chainFailed);
     if (executed.parked) return executed.parked;
 
     return this.afterDriver({
@@ -2249,6 +2257,8 @@ export class RunSupervisor {
             this.vcsFor(prepared.repo).checkpoint(prepared.worktree, runCommitMessage(run.id, label)),
         })
       : await executeRun(this.executeHost(), base);
+    // A chain that could not start at all (RUN-168) — no session, so nothing to settle around.
+    if ('chainFailed' in executed) return fail(executed.chainFailed);
     if (executed.parked) return executed.parked;
 
     return this.afterDriver({

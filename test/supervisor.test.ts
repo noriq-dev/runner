@@ -2343,6 +2343,19 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
     }),
   });
 
+  const threeSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'three steps',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'first' },
+        { id: 's2', title: 'second' },
+        { id: 's3', title: 'third' },
+      ],
+    }),
+  });
+
   const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
 
   it('spawns one session per step, each with its own brief, and lands only at the end', async () => {
@@ -2368,15 +2381,36 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
   });
 
   // Continuing past a failed step would build later steps on a foundation the run already knows is
-  // broken, and would report a run that did half its plan as one that did all of it.
-  it('stops at the first step that does not finish, and keeps that step’s reason', async () => {
+  // broken, and would report a run that did half its plan as one that did all of it. Three steps
+  // and a failure in the MIDDLE, because failing the only session is what a run did before this
+  // existed — it would pass with the feature removed and prove nothing about chains.
+  it('stops at the step that failed, having run the ones before it', async () => {
+    const h = harness({ anchorTask: threeSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('one done');
+    h.claude.complete('done'); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.complete('failed'); // s2
+    const exit = await done;
+    expect(h.claude.starts).toHaveLength(2); // s1 ran, s2 failed, s3 never started
+    expect(exit).toMatchObject({ outcome: 'failed' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/step 2\/3 did not finish/);
+  });
+
+  // The tally is last-writer-wins PER SLOT, so steps sharing `primary` would leave the run's total
+  // showing only the last one — and the live guard, named per step, would be probing a different
+  // figure from the one being written.
+  it('records each step’s spend in its own slot, so the run total is the whole chain', async () => {
     const h = harness({ anchorTask: twoSteps() });
     const done = h.supervisor.supervise(buildRun());
     await flush();
-    h.claude.complete('failed');
+    h.claude.complete('done', { outputTokens: 100 }); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.complete('done', { outputTokens: 30 }); // s2
     const exit = await done;
-    expect(h.claude.starts).toHaveLength(1); // step two never ran
-    expect(exit.outcome).toBe('failed');
+    // 130, not 30. Sharing a slot would have reported only the last step.
+    expect(exit.telemetry?.outputTokens).toBe(130);
   });
 
   it('says in the transcript which step is speaking, and which never ran', async () => {
@@ -3607,7 +3641,13 @@ describe('resuming a parked run (RUN-30)', () => {
   // RUN-168, and the bug this ticket exists to prevent. A resume restores ONE session and runs it,
   // so a chain that parked on step two of five came back, finished step two, and reported the run
   // DONE having silently skipped the rest of its plan.
-  it('a resumed chain finishes the steps that never ran', async () => {
+  //
+  // What it does now is finish the parked step and report the run INCOMPLETE, naming what is left.
+  // The remaining steps are not run, and that is a stated limitation rather than an oversight: a
+  // fresh step needs the RUN's brief, and a resume's prompt is deliberately only the question and
+  // the human's answer, because the session it restores already holds everything else. A new
+  // session given that would have an answer to a question it never asked and nothing else.
+  it('a resumed chain finishes its parked step and reports what is left, not done', async () => {
     const task: AnchorTask = {
       key: 'ACME-1',
       title: 'two steps',
@@ -3629,15 +3669,13 @@ describe('resuming a parked run (RUN-30)', () => {
     await flush();
     const before = h.claude.starts.length;
     h.claude.complete('done'); // the resumed step-one session
-    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
-      await new Promise((r) => setTimeout(r, 0));
-    }
-    // Step TWO started — a fresh session with its own brief, not the resumed one carrying on.
-    const second = h.claude.starts.at(-1)!;
-    expect(second.prompt).toContain('YOU ARE DOING STEP 2 OF 2: second');
-    expect(second.resumeSessionId).toBeUndefined();
-    h.claude.complete('done');
-    expect(await resumed).toMatchObject({ outcome: 'done' });
+    const exit = await resumed;
+
+    // No fresh step was started with a resume prompt for a brief.
+    expect(h.claude.starts).toHaveLength(before);
+    // …and the run does NOT claim to be done, which is the whole bug.
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:resume-incomplete' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/still need a full brief/);
   });
 
   // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step

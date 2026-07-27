@@ -76,6 +76,16 @@ export interface ExecutePlan {
   priorActiveSeconds: number;
   /** Which step this session IS, on a decomposed run (RUN-168). Absent for an undecomposed run. */
   stepId?: string;
+  /**
+   * Which tally slot this session's spend records into. Defaults to `primary`, which is every
+   * undecomposed run.
+   *
+   * A chain must pass a slot PER STEP, and the two halves have to agree: the tally is
+   * last-writer-wins per slot (a session reports its own cumulative), so N steps sharing `primary`
+   * would leave the run's total showing only the last one — and the live guard, which reads the
+   * slot it was named with, would be probing a different figure from the one being written.
+   */
+  slot?: string;
 }
 
 /** Either the run parked on a human — terminal for this sitting — or it finished talking. */
@@ -110,7 +120,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
       // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
       // knows the split), so the mix appears when the result lands, not before.
       onTelemetry: (t) => {
-        tally.record('primary', t);
+        tally.record(plan.slot ?? 'primary', t);
         host.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
       },
       onText: (t) => {
@@ -132,7 +142,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
   // The terminal result, recorded authoritatively (RUN-59): a driver whose result carries a mix
   // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
   // run later stream through the handler above and overwrite this with their fuller cumulative.
-  tally.record('primary', exit.telemetry);
+  tally.record(plan.slot ?? 'primary', exit.telemetry);
   // This sitting's active stretch joins the run's wall-clock spend (RUN-133), so what the reviewer
   // and the conflict turn may spend is short by what the agent already took. The tally was seeded
   // with any PRIOR sitting's seconds at construction, which is why only this sitting is added here.
