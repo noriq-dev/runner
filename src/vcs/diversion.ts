@@ -190,12 +190,23 @@ export class DiversionBackend implements VcsBackend {
     return this.http(method, `/repos/${encodeURIComponent(this.repoId)}${p}`, body);
   }
 
+  /**
+   * The branch's tip, or null when the branch does not exist yet — which is an ANSWER: a run that
+   * has committed nothing has no branch, and that is the ordinary state of a fresh lease.
+   *
+   * A 200 carrying no `commit_id` is not that (RUN-157). It is a branch the server says exists and
+   * then declines to describe, and it used to collapse into the same null — so `hasWork` reported
+   * "no work" for a response it could not read at all, and the caller acts on `false` by disposing.
+   */
   private async branchHead(branch: string): Promise<string | null> {
     const res = await this.api('GET', `/branches/${encodeURIComponent(branch)}`);
     if (res.status === 404) return null;
     if (res.status !== 200) throw new Error(`branch lookup for ${branch} failed: HTTP ${res.status}`);
     const b = res.body as { commit_id?: string; branch_id?: string };
-    return b.commit_id ?? null;
+    if (!b.commit_id) {
+      throw new Error(`branch ${branch} exists but reported no commit — cannot tell what it holds`);
+    }
+    return b.commit_id;
   }
 
   async lease(repoRoot: string, runId: string, opts?: LeaseOptions): Promise<Workspace> {

@@ -372,6 +372,86 @@ describe('PerforceBackend — hasWork tells "nothing here" from "could not ask"'
   });
 });
 
+// RUN-157. Both of these acted on a swallowed probe: dispose DELETED a changelist it could not
+// read, and checkpoint reported "nothing to save" for a p4 it could not reach. The second is the
+// quieter one — the supervisor ignores checkpoint's boolean, so the run continued to its gates with
+// no durable copy and nothing anywhere saying so.
+describe('PerforceBackend — dispose and checkpoint stop acting on a swallowed probe', () => {
+  const ws = {
+    runId: 'run_1',
+    localPath: '/ws1',
+    readOnly: false,
+    baseId: '7',
+    workRef: 'change 42 in client ws1',
+    location: { client: 'ws1', change: '42' },
+  };
+  /** A p4 that answers `info`, fails the named command with `text`, and succeeds at everything else. */
+  const failing = (cmd: string, text: string) => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === cmd) throw new Error(`p4 ${cmd} exited 1: ${text}`);
+      return { stdout: '', stderr: '' };
+    };
+    return { backend: new PerforceBackend({ p4 }), calls };
+  };
+
+  it('dispose PRESERVES a changelist it could not read, rather than deleting it', async () => {
+    // An allwrite workspace's edits are invisible to p4 until a reconcile, so "could not ask"
+    // cannot be read as "there is nothing in here" — that work has never been shelved.
+    const { backend, calls } = failing('opened', 'Connect to server failed; check $P4PORT.');
+    await backend.dispose(ws);
+    expect(calls.some((c) => c.startsWith('change -d'))).toBe(false); // never the destructive branch
+    // RECONCILE first, and this is the whole point rather than a detail: `shelve` captures only
+    // files already OPEN in the changelist, and on allwrite an agent's edits are not open until
+    // something gathers them. A shelve without it preserves an empty changelist and calls it done.
+    const order = calls.map((c) => c.split(' ')[0]);
+    expect(order.indexOf('reconcile')).toBeGreaterThan(-1);
+    expect(order.indexOf('reconcile')).toBeLessThan(order.indexOf('shelve'));
+    expect(order.indexOf('shelve')).toBeLessThan(order.indexOf('revert'));
+  });
+
+  // Reverting after a shelf that did not land destroys the only copy to tidy a workspace.
+  it('does NOT revert when the shelf failed — the local copy is all there is', async () => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'opened') return { stdout: '//depot/a.txt#1 - edit change 42\n', stderr: '' };
+      if (args[0] === 'shelve') throw new Error('p4 shelve exited 1: Connect to server failed.');
+      return { stdout: '', stderr: '' };
+    };
+    await new PerforceBackend({ p4 }).dispose(ws);
+    expect(calls.some((c) => c.startsWith('shelve'))).toBe(true); // it tried…
+    expect(calls.some((c) => c.startsWith('revert'))).toBe(false); // …and stopped when it failed
+  });
+
+  it('dispose still deletes an empty changelist when p4 SAYS it is empty', async () => {
+    const { backend, calls } = failing('opened', 'File(s) not opened on this client.');
+    await backend.dispose(ws);
+    expect(calls.some((c) => c.startsWith('change -d'))).toBe(true);
+    expect(calls.some((c) => c.startsWith('shelve'))).toBe(false);
+  });
+
+  it('checkpoint rejects when p4 could not be reached, instead of reporting nothing to save', async () => {
+    const { backend } = failing('reconcile', 'Connect to server failed; check $P4PORT.');
+    await expect(backend.checkpoint(ws, 'msg')).rejects.toThrow(/Connect to server failed/);
+  });
+
+  // The SECOND probe, which a single-failure fake leaves untested: reconcile can succeed (it
+  // gathered something) while `opened` is the call that cannot reach the server.
+  it('checkpoint rejects when the second probe is the one that fails', async () => {
+    const { backend } = failing('opened', 'Your session has expired, please login again.');
+    await expect(backend.checkpoint(ws, 'msg')).rejects.toThrow(/session has expired/);
+  });
+
+  it('checkpoint still returns false when there was genuinely nothing to gather', async () => {
+    const { backend } = failing('reconcile', '/ws1/... - no file(s) to reconcile.');
+    expect(await backend.checkpoint(ws, 'msg')).toBe(false);
+  });
+});
+
 describe('PerforceBackend — location guard', () => {
   it('refuses a workspace whose location it did not mint', async () => {
     const { backend } = fakes({});

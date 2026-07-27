@@ -307,6 +307,42 @@ describe('DiversionBackend — the rest of the surface', () => {
     expect(await backend.checkpoint(ws, 'msg')).toBe(false);
   });
 
+  // RUN-157. `branchHead` mapped BOTH a 404 and a 200-without-commit_id to null, and `hasWork`
+  // maps null to false — so a response the backend could not read reported "no work", which the
+  // caller acts on by disposing. A 404 is an ANSWER (a run that has committed nothing has no
+  // branch yet); a branch the server says exists and then declines to describe is not.
+  describe('hasWork tells "no commits yet" from "could not read the answer"', () => {
+    const ws = {
+      runId: 'run_1',
+      localPath: '/repo',
+      readOnly: false,
+      baseId: 'dv.commit.1',
+      workRef: 'noriq/run/run_1',
+      location: { repoId: 'dv.repo.x', branch: 'noriq/run/run_1', baseBranch: 'main' },
+    };
+    /** A workspace with no uncommitted edits, so the answer turns entirely on the branch lookup. */
+    const cleanCli: DvCli = async () => ({ stdout: '', stderr: '' });
+    const withBranchGet = (body: unknown, status = 200) =>
+      new DiversionBackend({
+        repoId: 'dv.repo.x',
+        cli: cleanCli,
+        http: async () => ({ status, body }) as never,
+      });
+
+    it('a branch that does not exist yet is no work — the ordinary state of a fresh lease', async () => {
+      expect(await withBranchGet(null, 404).hasWork(ws)).toBe(false);
+    });
+
+    it('rejects a branch the server says exists but will not describe', async () => {
+      const backend = withBranchGet({ branch_id: 'noriq/run/run_1' }); // 200, no commit_id
+      await expect(backend.hasWork(ws)).rejects.toThrow(/reported no commit/);
+    });
+
+    it('still reports work when the branch has moved past the base', async () => {
+      expect(await withBranchGet({ commit_id: 'dv.commit.9' }).hasWork(ws)).toBe(true);
+    });
+  });
+
   it('reapOrphans destroys nothing — a dead run’s work is already durable server-side', async () => {
     const { backend } = fakes({
       branches: { main: 'dv.commit.10', 'noriq/run/run_dead': 'dv.commit.11' },

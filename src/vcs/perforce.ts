@@ -263,19 +263,46 @@ export class PerforceBackend implements VcsBackend {
     return m?.[1] ?? null;
   }
 
+  /**
+   * Give the workspace back. Deleting the changelist is the DESTRUCTIVE branch, and it is only
+   * taken when p4 said there is nothing in it (RUN-157).
+   *
+   * This used to swallow the probe outright, so a p4 that could not be reached read as "nothing
+   * opened" and the changelist was deleted — on an allwrite workspace whose edits were never
+   * reconciled, that work was never shelved and leaks into whoever leases next. A backend that
+   * advertises `disposePreservesWork` has to actually preserve it.
+   *
+   * An unreadable probe therefore takes the PRESERVE branch, and preserving is three steps rather
+   * than two. `shelve` only captures files that are OPEN in the changelist, and on an allwrite
+   * client an agent's edits are not open until something reconciles them — which is exactly the
+   * work at risk here. So: reconcile (gather what is on disk), shelve (make it durable), then
+   * revert. Reverting is conditional on the shelf actually landing: discarding the local copy
+   * because a shelve we could not verify "probably worked" is the same mistake one layer down.
+   */
   async dispose(ws: Workspace): Promise<void> {
     const loc = p4Location(ws);
     try {
-      const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-        stdout: '',
-        stderr: '',
-      }));
+      let opened: string;
+      try {
+        opened = (await this.p4(['opened', '-c', loc.change], ws.localPath)).stdout;
+      } catch (err) {
+        // "File(s) not opened on this client" is p4 ANSWERING empty; anything else means we could
+        // not ask, and an unaskable changelist is not an empty one.
+        opened = P4_NOTHING_HERE.test(String(err)) ? '' : 'unknown — assume this holds work';
+      }
       if (opened.trim()) {
-        // Unlanded work: durable FIRST (§5's shelve-then-clean — another workspace can recover
-        // it byte-for-byte, measured), then clean. This is what makes always-dispose safe on a
+        // Unlanded work: durable FIRST (§5's shelve-then-clean — another workspace can recover it
+        // byte-for-byte, measured), then clean. This is what makes always-dispose safe on a
         // pool-of-1 backend.
-        await this.p4(['shelve', '-f', '-c', loc.change], ws.localPath).catch(() => {});
-        await this.p4(['revert', '-c', loc.change, '//...'], ws.localPath).catch(() => {});
+        await this.p4(['reconcile', '-c', loc.change], ws.localPath).catch(() => {});
+        const shelved = await this.p4(['shelve', '-f', '-c', loc.change], ws.localPath).then(
+          () => true,
+          () => false,
+        );
+        // A failed shelf leaves the ONLY copy on disk. Reverting then would destroy it to tidy a
+        // workspace — the pool pays for that with a dirty checkout the next lease has to sync over,
+        // which is recoverable in a way the work is not. The changelist survives for the reaper.
+        if (shelved) await this.p4(['revert', '-c', loc.change, '//...'], ws.localPath).catch(() => {});
       } else {
         // Nothing opened (landed, or a no-op run): delete the empty changelist. p4 REFUSES if
         // a shelf exists — the shelf is the orphan record, and it outlives the lease on purpose.
@@ -314,14 +341,20 @@ export class PerforceBackend implements VcsBackend {
     }
   }
 
+  /**
+   * `false` means "there was nothing to save", never "the save could not be attempted" (RUN-157).
+   *
+   * Both probes used to be swallowed, so a p4 outage returned `false` — and the supervisor ignores
+   * checkpoint's boolean, so the run continued to its gates with no durable copy and not one line
+   * anywhere saying so. Propagating instead reaches the supervisor's own handler, which logs "could
+   * not commit the run diff — it stays uncommitted". p4's emptiness messages are still absorbed:
+   * a reconcile with nothing to gather is an answer.
+   */
   async checkpoint(ws: Workspace, _message: string): Promise<boolean> {
     const loc = p4Location(ws);
     // Gather what the agent actually changed into the run's changelist…
-    await this.p4(['reconcile', '-c', loc.change], ws.localPath).catch(() => {});
-    const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
+    await this.emptyOrThrow(this.p4(['reconcile', '-c', loc.change], ws.localPath));
+    const opened = await this.emptyOrThrow(this.p4(['opened', '-c', loc.change], ws.localPath));
     if (!opened.trim()) return false;
     // …then shelve: the durable server-side copy. This WRITES THE DEPOT before any gate runs —
     // RUN-48's accepted trade, in THREAT-MODEL.md in the operator's own terms. (The message is
