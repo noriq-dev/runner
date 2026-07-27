@@ -10,6 +10,9 @@ export interface RunLogSegment {
   seq: number;
   role: RunLogRole;
   round: number | null;
+  /** Which step of a decomposed run said it (RUN-150). Null for an undecomposed run, which is
+   *  most of them, and for anything the parent's own gates say after the chain ends. */
+  step: string | null;
   text: string;
   at: string;
 }
@@ -29,11 +32,26 @@ const FLUSH_AFTER_MS = 2500;
 export class RunTranscript {
   private seq = 0;
   private buf: { role: RunLogRole; round: number | null; text: string } | null = null;
+  /**
+   * Which step of a decomposed run is speaking (RUN-150). Set by the chain at each boundary rather
+   * than passed to every call: `text` is invoked from the driver's onText handler, deep inside a
+   * session that has no idea it is part of a chain, and threading it there would put a chain
+   * concern into every voice's call site.
+   */
+  private step: string | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly sink: (segments: RunLogSegment[]) => void) {}
 
   /** Streamed output from a session. Buffered; consecutive same-voice text coalesces. */
+  /** Whose turn it is, until told otherwise. Flushes first: a segment must not span the boundary,
+   *  or the last words of one step would be attributed to the next. */
+  onStep(step: string | null): void {
+    if (step === this.step) return;
+    this.flush();
+    this.step = step;
+  }
+
   text(role: RunLogRole, text: string, round: number | null = null): void {
     if (!text) return;
     if (this.buf && (this.buf.role !== role || this.buf.round !== round)) this.flush();
@@ -78,7 +96,7 @@ export class RunTranscript {
     if (!items.length) return;
     const at = new Date().toISOString();
     try {
-      this.sink(items.map((it) => ({ seq: this.seq++, ...it, at })));
+      this.sink(items.map((it) => ({ seq: this.seq++, step: this.step, ...it, at })));
     } catch {
       /* a transcript must never gate a run */
     }

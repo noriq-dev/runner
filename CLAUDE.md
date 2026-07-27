@@ -162,7 +162,13 @@ that step and stops, reporting what is left, because a fresh step needs the RUN'
 resume's prompt is deliberately only the question and the answer — a new session given that has an
 answer to a question it never asked and nothing else. Because a park lasts up to 72 hours and the
 spec may be corrected while it waits, a parked step gone from the recomputed chain fails the run
-rather than guessing between redoing landed work and abandoning it.
+rather than guessing between redoing landed work and abandoning it. A transcript segment carries
+WHICH step said it (RUN-150), alongside the reviewer round rather than instead of it — a chain's
+step three can still be on its second round — and the label clears when the chain ends, because the
+gates that follow are the parent's. Children are steps of one run, not runs of their own: the run
+keeps one identity, one credential and one budget, and the dashboard breaks a block at a step
+boundary even when the voice is unchanged, since two `agent` blocks from different steps are two
+sessions with different context.
 
 Then the **pattern mapper** (RUN-144, `src/stages/pattern-map.ts`), for each file the plan
 anticipates: the closest existing file in this repo that does the same job, and what to copy from

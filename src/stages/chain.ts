@@ -116,138 +116,153 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
   let allText = '';
   let last: (ExecuteOutcome & { parked?: undefined }) | null = null;
 
-  for (const [i, step] of steps.entries()) {
-    if (i < from) continue;
-    host.transcript(run.id).milestone(`step ${i + 1}/${steps.length} — ${step.title} [${step.id}]`);
+  try {
+    for (const [i, step] of steps.entries()) {
+      if (i < from) continue;
+      // Everything from here until the next boundary is this step's voice (RUN-150). Set BEFORE the
+      // milestone so the milestone itself carries it — the line announcing a step belongs to it.
+      host.transcript(run.id).onStep(step.id);
+      host.transcript(run.id).milestone(`step ${i + 1}/${steps.length} — ${step.title} [${step.id}]`);
 
-    // Every step reserves from the RUN's remaining ceiling (RUN-133). The FIRST step is not gated
-    // on it: a run with nothing left is handled the way every other exhausted run is — the budget
-    // layer declines the turn — and refusing here instead would give a decomposed run a different
-    // failure shape from an undecomposed one for the same condition.
-    const reservation = plan.tally.reserve();
-    if (!reservation.ok && last) {
-      host.log.warn('no budget left for the next step — stopping the chain', {
-        runId: run.id,
-        stepId: step.id,
-        breach: reservation.breach,
-      });
-      host
-        .transcript(run.id)
-        .milestone(
-          `the run's ceiling was reached before step ${i + 1}/${steps.length} (${reservation.breach}) — that step and everything after it did not run`,
-        );
-      // FAILED, not the previous step's success. Returning that outcome unchanged would send a run
-      // that did half its plan through verify and landing and report it done — the same
-      // silently-truncated-plan shape the park record exists to prevent, arriving by the budget.
-      return {
-        ...last,
-        exit: {
-          ...last.exit,
-          outcome: 'failed',
-          isError: true,
-          reason: `steps:${reservation.breach}`,
-        },
-      };
-    }
-
-    // The FIRST step of a resumed chain is the parked session coming back, so it keeps the caller's
-    // `start` verbatim — its resume session id and the human's answer as its prompt. Every other
-    // step is a fresh session with its own brief.
-    const resumingThisOne = i === from && Boolean(plan.resumeFromStepId);
-    const outcome = await executeRun(host, {
-      ...plan,
-      stepId: step.id,
-      // Its own tally slot, or N steps would overwrite one another's spend and the run would report
-      // only the last (RUN-133's accounting is last-writer-wins PER SLOT).
-      slot: `step:${step.id}`,
-      start: resumingThisOne
-        ? plan.start
-        : {
-            ...plan.start,
-            prompt: plan.stepPrompt(step, i, prior),
-            // A fresh session, never the previous step's: inheriting it would make this one long
-            // context wearing a decomposition, which is the thing being avoided.
-            resumeSessionId: undefined,
-            ...(reservation.ok && reservation.budget ? { budget: reservation.budget } : {}),
-            spendGuard: plan.tally.guard(`step:${step.id}`),
-            clockGuard: plan.tally.clockGuard(),
+      // Every step reserves from the RUN's remaining ceiling (RUN-133). The FIRST step is not gated
+      // on it: a run with nothing left is handled the way every other exhausted run is — the budget
+      // layer declines the turn — and refusing here instead would give a decomposed run a different
+      // failure shape from an undecomposed one for the same condition.
+      const reservation = plan.tally.reserve();
+      if (!reservation.ok && last) {
+        host.log.warn('no budget left for the next step — stopping the chain', {
+          runId: run.id,
+          stepId: step.id,
+          breach: reservation.breach,
+        });
+        host
+          .transcript(run.id)
+          .milestone(
+            `the run's ceiling was reached before step ${i + 1}/${steps.length} (${reservation.breach}) — that step and everything after it did not run`,
+          );
+        // FAILED, not the previous step's success. Returning that outcome unchanged would send a run
+        // that did half its plan through verify and landing and report it done — the same
+        // silently-truncated-plan shape the park record exists to prevent, arriving by the budget.
+        return {
+          ...last,
+          exit: {
+            ...last.exit,
+            outcome: 'failed',
+            isError: true,
+            reason: `steps:${reservation.breach}`,
           },
-      // The run's active seconds SO FAR, read from the tally rather than threaded — which is what
-      // makes a park on step three record the whole run's active time rather than that step's.
-      priorActiveSeconds: plan.tally.activeSeconds(),
-    });
-
-    if (outcome.parked) return outcome;
-    allText += outcome.sessionText;
-    last = {
-      ...outcome,
-      sessionText: allText,
-      getSessionText: () => allText + outcome.getSessionText().slice(outcome.sessionText.length),
-    };
-    if (outcome.exit.outcome !== 'done') {
-      host.log.warn('a step did not finish — the chain stops here', {
-        runId: run.id,
-        stepId: step.id,
-        reason: outcome.exit.reason,
-      });
-      host
-        .transcript(run.id)
-        .milestone(
-          `step ${i + 1}/${steps.length} did not finish (${outcome.exit.reason ?? 'no reason given'}) — the remaining steps did not run`,
-        );
-      return last;
-    }
-
-    prior.push({ id: step.id, title: step.title, text: outcome.sessionText.slice(-SUMMARY_CAP) });
-
-    // A resume finishes the step that parked and stops there — see `stopAfterResumedStep` for why
-    // a fresh step cannot be briefed from a resume. Reported as incomplete, naming what is left,
-    // rather than as a run that did its plan.
-    if (plan.stopAfterResumedStep && i < steps.length - 1) {
-      const remaining = steps.slice(i + 1).map((r) => r.id);
-      host.log.warn('a resumed chain finished its parked step; the rest need a fresh dispatch', {
-        runId: run.id,
-        remaining,
-      });
-      host
-        .transcript(run.id)
-        .milestone(
-          `step ${i + 1}/${steps.length} finished after the resume. Steps ${remaining.join(', ')} still need a full brief, which a resume cannot build — the work so far is kept; re-dispatch to continue.`,
-        );
-      return {
-        ...last,
-        exit: { ...last.exit, outcome: 'failed', isError: true, reason: 'steps:resume-incomplete' },
-      };
-    }
-
-    if (i < steps.length - 1) {
-      // Capture before the next step opens, so its fresh session reads this one's work from the
-      // tree rather than from a summary. Best-effort: a checkpoint that fails leaves the work in
-      // the worktree, where the next step still sees it — it costs the per-step commit boundary,
-      // not the work — so it must not stop a chain that is otherwise fine.
-      const ok = await plan.checkpoint(`step ${i + 1}/${steps.length}: ${step.title}`).catch((err) => {
-        host.log.warn('could not capture a step before the next one', {
-          runId: run.id,
-          stepId: step.id,
-          err: String(err),
-        });
-        return false;
-      });
-      if (!ok) {
-        host.log.info('a step captured nothing — it changed no files', { runId: run.id, stepId: step.id });
+        };
       }
-      // Close the finished session before the next opens. A chain that left every step's session
-      // alive would hold N of them open for the run's length, and on a multiTurn driver nothing
-      // else ever closes one (settle closes only the last). A stop that THROWS is logged rather
-      // than swallowed: it means a live process this chain no longer has a handle to.
-      await outcome.stopSession().catch((err) => {
-        host.log.warn('a finished step could not be closed — its process may still be running', {
+
+      // The FIRST step of a resumed chain is the parked session coming back, so it keeps the caller's
+      // `start` verbatim — its resume session id and the human's answer as its prompt. Every other
+      // step is a fresh session with its own brief.
+      const resumingThisOne = i === from && Boolean(plan.resumeFromStepId);
+      const outcome = await executeRun(host, {
+        ...plan,
+        stepId: step.id,
+        // Its own tally slot, or N steps would overwrite one another's spend and the run would report
+        // only the last (RUN-133's accounting is last-writer-wins PER SLOT).
+        slot: `step:${step.id}`,
+        start: resumingThisOne
+          ? plan.start
+          : {
+              ...plan.start,
+              prompt: plan.stepPrompt(step, i, prior),
+              // A fresh session, never the previous step's: inheriting it would make this one long
+              // context wearing a decomposition, which is the thing being avoided.
+              resumeSessionId: undefined,
+              ...(reservation.ok && reservation.budget ? { budget: reservation.budget } : {}),
+              spendGuard: plan.tally.guard(`step:${step.id}`),
+              clockGuard: plan.tally.clockGuard(),
+            },
+        // The run's active seconds SO FAR, read from the tally rather than threaded — which is what
+        // makes a park on step three record the whole run's active time rather than that step's.
+        priorActiveSeconds: plan.tally.activeSeconds(),
+      });
+
+      if (outcome.parked) return outcome;
+      allText += outcome.sessionText;
+      last = {
+        ...outcome,
+        sessionText: allText,
+        getSessionText: () => allText + outcome.getSessionText().slice(outcome.sessionText.length),
+      };
+      if (outcome.exit.outcome !== 'done') {
+        host.log.warn('a step did not finish — the chain stops here', {
           runId: run.id,
           stepId: step.id,
-          err: String(err),
+          reason: outcome.exit.reason,
         });
-      });
+        host
+          .transcript(run.id)
+          .milestone(
+            `step ${i + 1}/${steps.length} did not finish (${outcome.exit.reason ?? 'no reason given'}) — the remaining steps did not run`,
+          );
+        return last;
+      }
+
+      prior.push({ id: step.id, title: step.title, text: outcome.sessionText.slice(-SUMMARY_CAP) });
+
+      // A resume finishes the step that parked and stops there — see `stopAfterResumedStep` for why
+      // a fresh step cannot be briefed from a resume. Reported as incomplete, naming what is left,
+      // rather than as a run that did its plan.
+      if (plan.stopAfterResumedStep && i < steps.length - 1) {
+        const remaining = steps.slice(i + 1).map((r) => r.id);
+        host.log.warn('a resumed chain finished its parked step; the rest need a fresh dispatch', {
+          runId: run.id,
+          remaining,
+        });
+        host
+          .transcript(run.id)
+          .milestone(
+            `step ${i + 1}/${steps.length} finished after the resume. Steps ${remaining.join(', ')} still need a full brief, which a resume cannot build — the work so far is kept; re-dispatch to continue.`,
+          );
+        return {
+          ...last,
+          exit: { ...last.exit, outcome: 'failed', isError: true, reason: 'steps:resume-incomplete' },
+        };
+      }
+
+      if (i < steps.length - 1) {
+        // Capture before the next step opens, so its fresh session reads this one's work from the
+        // tree rather than from a summary. Best-effort: a checkpoint that fails leaves the work in
+        // the worktree, where the next step still sees it — it costs the per-step commit boundary,
+        // not the work — so it must not stop a chain that is otherwise fine.
+        const ok = await plan.checkpoint(`step ${i + 1}/${steps.length}: ${step.title}`).catch((err) => {
+          host.log.warn('could not capture a step before the next one', {
+            runId: run.id,
+            stepId: step.id,
+            err: String(err),
+          });
+          return false;
+        });
+        if (!ok) {
+          host.log.info('a step captured nothing — it changed no files', { runId: run.id, stepId: step.id });
+        }
+        // Close the finished session before the next opens. A chain that left every step's session
+        // alive would hold N of them open for the run's length, and on a multiTurn driver nothing
+        // else ever closes one (settle closes only the last). A stop that THROWS is logged rather
+        // than swallowed: it means a live process this chain no longer has a handle to.
+        await outcome.stopSession().catch((err) => {
+          host.log.warn('a finished step could not be closed — its process may still be running', {
+            runId: run.id,
+            stepId: step.id,
+            err: String(err),
+          });
+        });
+      }
     }
+
+    // The chain is over; the gates that follow are the PARENT's, not the last step's. Leaving the
+    // label set would file every reviewer round and the terminal report under whichever step happened
+    // to be last, which is exactly the wrong answer in the place a human looks first.
+  } finally {
+    // The chain is over however it ended; the gates that follow are the PARENT's. Leaving the label
+    // set would file every reviewer round and the terminal report under whichever step happened to
+    // be last — and on a FAILED chain that is the step that failed, which is exactly the wrong
+    // answer in the place a human looks first.
+    host.transcript(run.id).onStep(null);
   }
 
   // Unreachable while `checkSteps` guarantees two or more, but a null here would be a crash rather

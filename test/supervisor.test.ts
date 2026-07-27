@@ -443,7 +443,13 @@ function harness(
   if (over.changedFiles) worktrees.changedFiles = over.changedFiles;
   if (over.lockConflicts) worktrees.lockConflicts = over.lockConflicts;
   const reports: Array<{ runId: string } & RunReport> = [];
-  const transcript: Array<{ seq: number; role: string; round: number | null; text: string }> = [];
+  const transcript: Array<{
+    seq: number;
+    role: string;
+    round: number | null;
+    step: string | null;
+    text: string;
+  }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
@@ -2422,6 +2428,29 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
     const said = h.transcript.map((t) => t.text).join('\n');
     expect(said).toContain('step 1/2 — land the contract [s1]');
     expect(said).toMatch(/the remaining steps did not run/);
+  });
+
+  // RUN-150. Without this a five-step run reads as one undifferentiated stream and an operator has
+  // no idea what is actually happening — the whole reason a decomposition is worth watching.
+  it('labels each step’s transcript segments, and stops labelling once the chain is over', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('one');
+    h.claude.complete('done');
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('two');
+    h.claude.complete('done');
+    await done;
+
+    const said = h.transcript.filter((t) => t.text === 'one' || t.text === 'two');
+    expect(said.map((t) => [t.text, t.step])).toEqual([
+      ['one', 's1'],
+      ['two', 's2'],
+    ]);
+    // The gates that follow belong to the PARENT. Leaving the label set would file the terminal
+    // report under whichever step happened to be last.
+    expect(h.transcript.at(-1)!.step).toBeNull();
   });
 
   // A spec with no steps must behave exactly as it did before — that is most runs.

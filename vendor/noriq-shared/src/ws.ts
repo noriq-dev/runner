@@ -201,6 +201,17 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
           // its round. verify = the deterministic cmd's output. system = daemon milestones.
           role: z.enum(['agent', 'reviewer', 'verify', 'system']),
           round: z.number().int().positive().nullable().default(null),
+          /**
+           * Which STEP of a decomposed run was speaking (RUN-150), or null for an undecomposed
+           * one — which is most runs, and every segment written before this existed.
+           *
+           * A second attribution dimension beside `round`, not a replacement for it: a chain's
+           * step three can still be on its second reviewer round, and collapsing the two into one
+           * label would make a transcript that cannot say which. Without it a five-step run reads
+           * as one long undifferentiated stream, and an operator watching it has no idea what is
+           * actually happening — which is the whole reason a decomposition is worth watching.
+           */
+          step: z.string().max(64).nullable().default(null),
           text: z.string().max(16384),
           at: z.string().datetime(),
         }),
