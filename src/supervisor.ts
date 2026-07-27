@@ -79,6 +79,7 @@ import {
   verifyStage,
   worthMapping,
 } from './stages';
+import { authorSpecBlock, buildRunBrief } from './stages/brief';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -2079,13 +2080,13 @@ export class RunSupervisor {
     //
     // A DIFF, not a replay: re-sending the whole brief would spend tokens telling a session what
     // it already holds. Silence when nothing moved, which is the common case.
-    const { rendered: changed, checked: resumedSpec } = await this.specChangedWhileParked(
-      run,
-      worktree,
-      wf.produces,
-    ).catch((err) => {
+    const {
+      rendered: changed,
+      checked: resumedSpec,
+      task: resumedTask,
+    } = await this.specChangedWhileParked(run, worktree, wf.produces).catch((err) => {
       this.log.warn('could not re-check the spec on resume', { runId, err: String(err) });
-      return { rendered: '', checked: null };
+      return { rendered: '', checked: null, task: null };
     });
 
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
@@ -2144,16 +2145,43 @@ export class RunSupervisor {
     // rest of its plan. The chain is recomputed from the spec as it stands NOW, which is the same
     // re-fetch RUN-164 already does, so a spec corrected during the park is the one that governs.
     const resumedChain = checkSteps(resumedSpec?.spec);
+    // The RUN's brief, rebuilt on the resume path (RUN-169) — only when there are later steps to
+    // brief, since building one costs a `[context]` walk and the common resume has nothing after
+    // the session it restores. Never fatal: a resume that cannot build one falls back to what it
+    // always sent, which is the pre-RUN-169 behaviour rather than a new failure.
+    const resumedBrief =
+      resumedChain.steps.length > 1
+        ? await buildRunBrief(this.prepareHost(), {
+            run,
+            repo,
+            worktree,
+            task: resumedTask,
+            runAgent,
+            kind,
+            ...(run.workflow ? { workflow: wf } : {}),
+          }).catch((err) => {
+            this.log.warn('could not rebuild the brief on resume — later steps will not run', {
+              runId,
+              err: String(err),
+            });
+            return null;
+          })
+        : null;
     const executed = resumedChain.steps.length
       ? await executeChain(this.executeHost(), {
           ...resumeBase,
           steps: resumedChain.steps,
-          // A fresh step cannot be briefed from a resume, whose prompt is only the question and the
-          // answer — so the resumed step finishes and the run reports what is left.
-          stopAfterResumedStep: true,
           ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
+          // Only when the brief could not be rebuilt: a fresh step with no brief is worse than one
+          // that does not run, and saying so beats running it badly.
+          ...(resumedBrief ? {} : { stopAfterResumedStep: true }),
+          // A fresh step gets the RUN's brief, not the resume's (RUN-169). The resume prompt is
+          // deliberately only the question and the human's answer, because the session it restores
+          // already holds everything else — but a session opened AFTERWARDS holds nothing, and
+          // handing it an answer to a question it never asked was worse than not running it. So
+          // the brief is rebuilt here, from the same assembler `prepare` uses.
           stepPrompt: (step, i, prior) =>
-            `${resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
+            `${resumedBrief?.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null) ?? resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
         })
       : await executeRun(this.executeHost(), resumeBase);
@@ -2321,18 +2349,21 @@ export class RunSupervisor {
     run: Run,
     worktree: Workspace,
     produces: boolean,
-  ): Promise<{ rendered: string; checked: CheckedExecutionSpec | null }> {
-    const none = { rendered: '', checked: null };
+  ): Promise<{ rendered: string; checked: CheckedExecutionSpec | null; task: AnchorTask | null }> {
+    const none = { rendered: '', checked: null, task: null };
     if (run.anchor?.type !== 'task') return none;
     const task = await this.resolveAnchorTask(run.anchor.taskId);
     if (!task) return none;
-    if (task.executionSpecUnreadable) return { rendered: renderUnreadableSpec(), checked: null };
-    if (!task.executionSpec) return none;
+    // The TASK rides back too (RUN-169): a resumed chain needs it to rebuild a brief for the steps
+    // that never ran, and re-fetching it a second line later would be a second answer to a
+    // question that can change between the two.
+    if (task.executionSpecUnreadable) return { rendered: renderUnreadableSpec(), checked: null, task };
+    if (!task.executionSpec) return { ...none, task };
     const checked = await checkExecutionSpec(task.executionSpec, worktree.localPath, {
       ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
       produces,
     });
-    return { rendered: renderExecutionSpec(checked), checked };
+    return { rendered: renderExecutionSpec(checked), checked, task };
   }
 
   /**

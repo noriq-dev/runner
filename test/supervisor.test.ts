@@ -3708,16 +3708,12 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(h.worktrees.created).toHaveLength(1); // only the original
   });
 
-  // RUN-168, and the bug this ticket exists to prevent. A resume restores ONE session and runs it,
-  // so a chain that parked on step two of five came back, finished step two, and reported the run
-  // DONE having silently skipped the rest of its plan.
-  //
-  // What it does now is finish the parked step and report the run INCOMPLETE, naming what is left.
-  // The remaining steps are not run, and that is a stated limitation rather than an oversight: a
-  // fresh step needs the RUN's brief, and a resume's prompt is deliberately only the question and
-  // the human's answer, because the session it restores already holds everything else. A new
-  // session given that would have an answer to a question it never asked and nothing else.
-  it('a resumed chain finishes its parked step and reports what is left, not done', async () => {
+  // RUN-168 recorded WHERE a chain parked; RUN-169 is what lets the rest of it run. Before the
+  // first, a resume restored one session and reported the run DONE having silently skipped its
+  // plan. Between them, it finished the parked step and reported incomplete — honest, but a
+  // decomposed run that asked one question cost a re-dispatch, and decomposed runs are exactly the
+  // long ones most likely to ask.
+  it('a resumed chain runs the steps that never got to', async () => {
     const task: AnchorTask = {
       key: 'ACME-1',
       title: 'two steps',
@@ -3739,13 +3735,18 @@ describe('resuming a parked run (RUN-30)', () => {
     await flush();
     const before = h.claude.starts.length;
     h.claude.complete('done'); // the resumed step-one session
-    const exit = await resumed;
-
-    // No fresh step was started with a resume prompt for a brief.
-    expect(h.claude.starts).toHaveLength(before);
-    // …and the run does NOT claim to be done, which is the whole bug.
-    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:resume-incomplete' });
-    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/still need a full brief/);
+    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const second = h.claude.starts.at(-1)!;
+    // A FRESH session for step two, with the RUN's brief — not the resume prompt, which is only
+    // the question and the answer and would leave it with no idea what repo it is in.
+    expect(second.resumeSessionId).toBeUndefined();
+    expect(second.prompt).toContain('YOU ARE DOING STEP 2 OF 2: second');
+    expect(second.prompt).toContain('ship the thing'); // the run's own brief
+    expect(second.prompt).not.toContain('Use B.'); // not the answer to step one's question
+    h.claude.complete('done');
+    expect(await resumed).toMatchObject({ outcome: 'done' });
   });
 
   // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step

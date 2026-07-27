@@ -157,10 +157,13 @@ its own slice can leave the whole unmet — and the fix turns hand back to the l
 Each step's spend records into its OWN tally slot — the tally is last-writer-wins per slot, so a
 chain sharing `primary` would report only its last step and guard against a figure nobody was
 writing. A park records WHICH step it stopped on: without that a resume restored one session, ran
-it, and reported the run done having silently skipped the rest of its plan. A resume then finishes
-that step and stops, reporting what is left, because a fresh step needs the RUN's brief and a
-resume's prompt is deliberately only the question and the answer — a new session given that has an
-answer to a question it never asked and nothing else. Because a park lasts up to 72 hours and the
+it, and reported the run done having silently skipped the rest of its plan. A resume then rebuilds
+the RUN's brief and runs the steps that never got to (RUN-169): the resume prompt is deliberately
+only the question and the answer, because the session it restores already holds everything else —
+but a session opened AFTERWARDS holds nothing, so it gets a brief from the same assembler `prepare`
+uses (`stages/brief.ts`, the half of preparation that acquires nothing). A resume that cannot
+rebuild one finishes the parked step and reports what is left rather than briefing a fresh session
+with an answer to a question it never asked. Because a park lasts up to 72 hours and the
 spec may be corrected while it waits, a parked step gone from the recomputed chain fails the run
 rather than guessing between redoing landed work and abandoning it. A transcript segment carries
 WHICH step said it (RUN-150), alongside the reviewer round rather than instead of it — a chain's
