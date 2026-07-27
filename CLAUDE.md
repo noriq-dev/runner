@@ -115,7 +115,10 @@ it. gsd-core's rule is the only rule — *name the file and the lines, never the
 `build.md` has always asked for this in one sentence and given the agent no means to comply; this
 is the means. It is also the only writer of `src/repo-intel.ts` (RUN-143), a `(server, repo, baseId)`
 cache of entry points, layout, conventions and test commands — so a repo that has not moved is not
-re-derived. A cache HIT skips the stage: the facts and the analogs come from the same tree. It is a
+re-derived. A cache hit short-circuits the FACTS half and nothing else — analogs are per-task and are never
+cached, so skipping the stage on a hit would make a warm cache produce a worse brief than a cold
+one at the very thing it exists for. It is also skipped for a continued run, whose `baseId` is a
+merge-base rather than the tree it is looking at. It is a
 CACHE, not an authority: a corrupt read is a miss, deleting the file costs latency and nothing
 else, and the rendered block says the code in front of you is the truth.
 

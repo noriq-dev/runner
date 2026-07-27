@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -65,7 +65,12 @@ export interface IntelStore {
 export const fileIntelStore = (intelPath: string = DEFAULT_INTEL_PATH): IntelStore => ({
   read: async () => {
     try {
-      return JSON.parse(await readFile(intelPath, 'utf8')) as IntelFile;
+      const parsed: unknown = JSON.parse(await readFile(intelPath, 'utf8'));
+      // Shape-checked, not merely parsed: `null` and `[]` are valid JSON that would then throw on
+      // the first property read, and this subsystem's whole contract is that a broken cache is a
+      // miss rather than an error.
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+      return parsed as IntelFile;
     } catch {
       // Missing or corrupt is a MISS, never an error. A cache that can fail a run is worse than
       // no cache: the run would have worked without it.
@@ -73,8 +78,19 @@ export const fileIntelStore = (intelPath: string = DEFAULT_INTEL_PATH): IntelSto
     }
   },
   write: async (file) => {
-    await mkdir(path.dirname(intelPath), { recursive: true });
-    await writeFile(intelPath, `${JSON.stringify(file, null, 2)}\n`);
+    // Temp-and-rename, because the naive truncate-then-write has a window in which a concurrent
+    // READ sees an empty file, treats it as a miss, and the next write persists only its own entry
+    // — losing every other repo's facts rather than one racing entry. Rename is atomic on the same
+    // filesystem, so a reader sees either the old file or the new one.
+    //
+    // This does NOT make concurrent writers safe: two daemons (or two runs) can still each read a
+    // snapshot and last-write-wins one of them away. That is acceptable for a cache — the loss
+    // costs a later run its shortcut — and cross-process locking would be machinery this does not
+    // earn. What it must not do is destroy the file, and now it cannot.
+    await mkdir(path.dirname(intelPath), { recursive: true, mode: 0o700 });
+    const tmp = `${intelPath}.${process.pid}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, intelPath);
   },
 });
 
@@ -119,7 +135,7 @@ export class RepoIntel {
    * agent, which is precisely the work this exists to save.
    */
   async get(repoId: string, baseId: string): Promise<RepoFacts | null> {
-    const file = await this.store.read().catch(() => ({}) as IntelFile);
+    const file = await this.read();
     const entry = file[this.server]?.[repoId];
     if (!entry || entry.baseId !== baseId) return null;
     return {
@@ -137,6 +153,14 @@ export class RepoIntel {
    * Best-effort in both directions — a read that fails starts from empty, and a write that fails
    * is logged by the caller and forgotten. Neither may cost a run.
    */
+  /** Read defensively. `IntelStore` is a seam anyone can implement, and the contract this class
+   *  offers — a broken cache is a MISS, never an error — has to hold whatever comes back through
+   *  it. A store returning `null` or an array is valid JSON and a first-property-read throw. */
+  private async read(): Promise<IntelFile> {
+    const raw = await this.store.read().catch(() => null);
+    return typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as IntelFile) : {};
+  }
+
   async put(repoId: string, baseId: string, facts: RepoFacts): Promise<void> {
     const trimmed: RepoFacts = {
       entryPoints: trim(facts.entryPoints),
@@ -145,7 +169,7 @@ export class RepoIntel {
       testCommands: trim(facts.testCommands),
     };
     if (!hasFacts(trimmed)) return; // nothing learned is not worth a write
-    const file = await this.store.read().catch(() => ({}) as IntelFile);
+    const file = await this.read();
     const forServer = file[this.server] ?? {};
     forServer[repoId] = { ...trimmed, baseId, learnedAt: new Date().toISOString() };
     file[this.server] = forServer;
@@ -154,7 +178,7 @@ export class RepoIntel {
 
   /** Forget a repo's facts — for an operator with a cache that has gone wrong, and for tests. */
   async forget(repoId: string): Promise<void> {
-    const file = await this.store.read().catch(() => ({}) as IntelFile);
+    const file = await this.read();
     if (!file[this.server]?.[repoId]) return;
     delete file[this.server]?.[repoId];
     await this.store.write(file);

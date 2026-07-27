@@ -112,6 +112,15 @@ describe('a broken cache costs latency and nothing else', () => {
     },
   };
 
+  // `null` and `[]` are valid JSON that would then throw on the first property read — and this
+  // subsystem's whole contract is that a broken cache is a miss rather than an error.
+  it('reads valid JSON of the wrong shape as a miss, not a throw', async () => {
+    for (const bad of ['null', '[]', '"a string"', '42']) {
+      const store: IntelStore = { read: async () => JSON.parse(bad), write: async () => {} };
+      await expect(new RepoIntel(store, 'https://noriq.test').get('repo_a', 'sha1')).resolves.toBeNull();
+    }
+  });
+
   it('reads a corrupt store as a miss', async () => {
     expect(await new RepoIntel(broken, 'https://noriq.test').get('repo_a', 'sha1')).toBeNull();
   });

@@ -18,7 +18,7 @@
  * derived from the same base, so if the facts are still current the analogs are too.
  */
 
-import type { Run } from '@noriq-dev/shared';
+import { RepoPath, type Run } from '@noriq-dev/shared';
 import type { BudgetRun } from '../drivers/budget';
 import type { AgentDriver, DriverSession, DriverStartOptions } from '../drivers/types';
 import type { CheckedExecutionSpec } from '../execution-spec';
@@ -67,10 +67,27 @@ export interface PatternMapInput {
   start: Omit<DriverStartOptions, 'handlers' | 'env' | 'prompt' | 'multiTurn'>;
 }
 
-const asStrings = (v: unknown): string[] =>
-  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [];
+const asStrings = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => str(x)).filter(Boolean) : []);
 
-const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+/** One line, bounded. The mapper's prose goes into an IMPERATIVE section of the builder's brief
+ *  ("read these before writing"), and a repo file that talked the mapper into emitting newlines
+ *  could write its own bullet points there. Free text stays free text. */
+const str = (v: unknown, cap = 400): string =>
+  typeof v === 'string'
+    ? v
+        .replace(/[\r\n]+/g, ' ')
+        .trim()
+        .slice(0, cap)
+    : '';
+
+/** An analog must point at a path INSIDE this repo. `RepoPath` is the contract's own check — the
+ *  same one an execution spec's paths get — and it refuses absolute paths, drive letters,
+ *  backslashes and `..`. The mapper reads repo-controlled files, so its output is not trusted for
+ *  being ours: an analog is an instruction to the builder to go and read something. */
+const confinedPath = (v: unknown): string => {
+  const raw = str(v, 300);
+  return raw && RepoPath.safeParse(raw).success ? raw : '';
+};
 
 /**
  * Pull the map out of a mapper's answer.
@@ -94,7 +111,12 @@ export function parsePatternMap(text: string): PatternMap | null {
     const o = raw as { analogs?: unknown; facts?: Record<string, unknown> };
     const analogs = (Array.isArray(o.analogs) ? o.analogs : [])
       .filter((a): a is Record<string, unknown> => typeof a === 'object' && a !== null)
-      .map((a) => ({ for: str(a.for), analog: str(a.analog), lines: str(a.lines), copy: str(a.copy) }))
+      .map((a) => ({
+        for: confinedPath(a.for),
+        analog: confinedPath(a.analog),
+        lines: str(a.lines, 40),
+        copy: str(a.copy),
+      }))
       // An analog with no file is the "follow the pattern" answer. Dropped, not softened: the
       // whole value of this stage is that a builder gets somewhere to look.
       .filter((a) => a.analog && a.copy);

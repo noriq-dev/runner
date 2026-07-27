@@ -2183,20 +2183,7 @@ export class RunSupervisor {
       ? { ...outcome.checked, findings: [...outcome.checked.findings, ...unresolved] }
       : outcome.checked;
 
-    // RE-RESERVE. `prepared.start.budget` was computed before planning, so handing it to the
-    // builder unchanged would let a run spend its ceiling twice — exactly the per-session-copy bug
-    // RUN-133 removed. A build with nothing left declines to spawn rather than starting a process
-    // to kill, and the run fails having at least produced a spec somebody can act on.
-    const rest = prepared.tally.reserve();
-    if (!rest.ok) {
-      this.log.warn('planning used what was left of this run', { runId: run.id, breach: rest.breach });
-      this.transcript(run.id).milestone(
-        `planning used the run's remaining budget (${rest.breach}) — nothing left to build with`,
-      );
-    }
-    // The pattern map (RUN-144) and the repo facts it caches (RUN-143). Read before spawning: a
-    // cache HIT at this base means an earlier run already derived both from the same tree, so the
-    // stage is skipped rather than paid for again.
+    // The pattern map (RUN-144) and the repo facts it caches (RUN-143).
     const extra = await this.mapPatternsIfWorthIt(run, prepared, checked).catch((err) => {
       this.log.warn('the pattern mapper failed — the builder gets no analogs', {
         runId: run.id,
@@ -2204,6 +2191,23 @@ export class RunSupervisor {
       });
       return '';
     });
+
+    // RE-RESERVE, and AFTER the pre-execution stages rather than before them:
+    // `prepared.start.budget` was computed before any of this ran, so handing it to the builder
+    // unchanged would let a run spend its ceiling twice — the per-session-copy bug RUN-133 removed.
+    // Reserving before the pattern map was the same mistake one stage smaller: the builder would
+    // have been told it could spend what the mapper then spent, and killed by the run guard
+    // partway into work its own allowance said it could do.
+    const rest = prepared.tally.reserve();
+    if (!rest.ok) {
+      this.log.warn('the pre-execution stages used what was left of this run', {
+        runId: run.id,
+        breach: rest.breach,
+      });
+      this.transcript(run.id).milestone(
+        `planning used the run's remaining budget (${rest.breach}) — nothing left to build with`,
+      );
+    }
 
     return {
       ...prepared.start,
@@ -2229,12 +2233,17 @@ export class RunSupervisor {
     if (!stagesFor(prepared.workflow).some((st) => st.name === 'pattern-map')) return '';
     if (!worthMapping(checked) || !checked) return '';
 
-    const intel = this.deps.repoIntel;
+    // The FACTS are cacheable and the ANALOGS are not: facts describe the repo whatever the task
+    // is, analogs are about THIS task's files. A cache hit therefore short-circuits the facts half
+    // and nothing else — an earlier version skipped the whole stage on a hit, which meant a warm
+    // cache produced a WORSE brief than a cold one at the very thing this stage exists for.
+    //
+    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
+    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
+    // checkout against a fork point, and a later fresh run at that fork point would read them.
+    const intel = prepared.continued ? undefined : this.deps.repoIntel;
     const cached = await intel?.get(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
-    if (cached) {
-      this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
-      return renderRepoFacts(cached);
-    }
+    if (cached) this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
 
     const reservation = prepared.tally.reserve();
     if (!reservation.ok) {
@@ -2258,18 +2267,19 @@ export class RunSupervisor {
         clockGuard: prepared.tally.clockGuard(),
       },
     });
-    if (!map) return '';
+    if (!map) return renderRepoFacts(cached ?? null);
 
-    // The facts outlive this run; the analogs do not. Best-effort: a cache that cannot be written
-    // costs the NEXT run its shortcut and this one nothing.
-    if (intel && hasFacts(map.facts)) {
+    // The facts outlive this run; the analogs do not. Written only on a MISS — a hit means an
+    // earlier run already derived them from this same tree. Best-effort either way: a cache that
+    // cannot be written costs the NEXT run its shortcut and this one nothing.
+    if (intel && !cached && hasFacts(map.facts)) {
       await intel
         .put(prepared.repo.root, prepared.worktree.baseId, map.facts)
         .catch((err: unknown) =>
           this.log.warn('could not cache what this run learned', { err: String(err) }),
         );
     }
-    return `${renderAnalogs(map.analogs)}${renderRepoFacts(map.facts)}`;
+    return `${renderAnalogs(map.analogs)}${renderRepoFacts(cached ?? map.facts)}`;
   }
 
   private patternMapHost(tally: RunTally): PatternMapHost {
