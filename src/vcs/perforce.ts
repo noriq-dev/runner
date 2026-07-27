@@ -462,7 +462,10 @@ export class PerforceBackend implements VcsBackend {
    * unshelve it byte-for-byte), then revert the workspace clean. Shelved orphans are REPORTED
    * via onSkip, never deleted; the server is the registry a human consults.
    */
-  async reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number> {
+  async reapOrphans(
+    repoRoot: string,
+    opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
+  ): Promise<number> {
     const { stdout } = await this.p4(['changes', '-s', 'pending', '-l'], repoRoot).catch(() => ({
       stdout: '',
       stderr: '',
@@ -471,6 +474,9 @@ export class PerforceBackend implements VcsBackend {
     for (const m of stdout.matchAll(/Change (\d+)[^\n]*\n\n\s*noriq run (\S+)/g)) {
       const change = m[1];
       if (!change) continue;
+      // A LIVE run's changelist is what this would otherwise shelve and revert out from under the
+      // agent still writing into it (RUN-153). At startup nothing is owned and this never fires.
+      if (m[2] && opts?.isOwned?.(m[2])) continue;
       const { stdout: opened } = await this.p4(['opened', '-c', change], repoRoot).catch(() => ({
         stdout: '',
         stderr: '',

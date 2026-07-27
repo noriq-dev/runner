@@ -300,6 +300,19 @@ describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)',
     expect(kept[0]).toContain('shelved server-side');
   });
 
+  // RUN-153. Once this runs on a TIMER rather than only at startup, an owned changelist is one an
+  // agent is writing into right now — and this reaper's cleanup is `shelve` then `revert`, which
+  // would undo the working tree out from under it.
+  it('leaves a changelist the daemon still owns alone — the sweep now runs mid-flight', async () => {
+    const { backend, calls } = fakes({
+      changesLong: 'Change 42 on 2026/07/16 by noriq@ws1 *pending*\n\n\tnoriq run run_live\n\n',
+      opened: '//depot/a.txt#1 - edit change 42\n',
+    });
+    expect(await backend.reapOrphans('/ws1', { isOwned: (id) => id === 'run_live' })).toBe(0);
+    expect(calls.some((c) => c.what.startsWith('p4 shelve'))).toBe(false);
+    expect(calls.some((c) => c.what.startsWith('p4 revert'))).toBe(false);
+  });
+
   it('ignores pending changelists that are not noriq runs — a human’s work is not ours to touch', async () => {
     const { backend, calls } = fakes({
       changesLong: 'Change 9 on 2026/07/16 by montana@ws1 *pending*\n\n\thand-written WIP\n\n',

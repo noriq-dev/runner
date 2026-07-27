@@ -151,7 +151,10 @@ export class GitBackend implements VcsBackend {
       : this.git.pushBranch(repoRoot, target, remote);
   }
 
-  reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number> {
+  reapOrphans(
+    repoRoot: string,
+    opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
+  ): Promise<number> {
     return this.git.reapOrphans(repoRoot, opts);
   }
 

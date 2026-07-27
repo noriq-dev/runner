@@ -109,6 +109,13 @@ export class ContinuableStore {
     return (await this.load()).get(runId) ?? null;
   }
 
+  /** The runs a later dispatch may still come back for. A record here means a worktree and branch
+   *  are being HELD for it (RUN-91), which is what the orphan sweep has to be told (RUN-153) —
+   *  between sittings nothing else knows that checkout is spoken for. */
+  async runIds(): Promise<string[]> {
+    return [...(await this.load()).keys()];
+  }
+
   /** Drop the record once the run reaches a terminal that is not "failed with kept work" — the
    *  continuation succeeded (or was abandoned), so there is nothing left to continue. */
   async remove(runId: string): Promise<void> {

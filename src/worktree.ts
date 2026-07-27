@@ -559,9 +559,19 @@ export class WorktreeManager {
    * A worktree with uncommitted changes or commits of its own is an agent's output that
    * nothing else has a copy of; `git worktree remove --force` would destroy it silently.
    * Skip those and let a human decide. Returns the count actually removed.
+   *
+   * `isOwned` is what lets this run PERIODICALLY rather than only at startup (RUN-153). At start
+   * the question does not arise — every prior process is dead, so every managed worktree is by
+   * definition an orphan. Mid-flight it is the whole question: a live run's worktree is
+   * indistinguishable from a leaked one by inspection, and it can be legitimately empty (an agent
+   * that has not written yet), so `hasUnsavedWork` would not save it. The daemon answers from
+   * what it owns; a caller that passes nothing gets the startup meaning unchanged.
    */
-  async reapOrphans(repoRoot: string, opts: { onSkip?: (path: string) => void } = {}): Promise<number> {
-    const managed = await this.listManaged(repoRoot);
+  async reapOrphans(
+    repoRoot: string,
+    opts: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean } = {},
+  ): Promise<number> {
+    const managed = (await this.listManaged(repoRoot)).filter((w) => !opts.isOwned?.(w.runId));
     // An orphan's fork point died with the daemon that made it, so measure against the
     // primary worktree's HEAD: commits the branch holds that the repo doesn't.
     const { stdout: mainHead } = await this.git(['rev-parse', 'HEAD'], repoRoot).catch(() => ({
@@ -575,6 +585,11 @@ export class WorktreeManager {
         opts.onSkip?.(w.path);
         continue;
       }
+      // Asked AGAIN, immediately before the delete. The filter above ran before several async git
+      // calls, and a parked run can be resumed inside that window — it is added to the daemon's
+      // live set before it touches its worktree, so the second question catches it and the first
+      // one could not.
+      if (opts.isOwned?.(w.runId)) continue;
       await this.remove({ repoRoot, path: w.path, branch: w.branch });
       removed += 1;
     }

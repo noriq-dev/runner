@@ -243,8 +243,16 @@ export interface VcsBackend {
    * the local repo (the run id is in the branch name — no external state); a live backend's
    * registry is the server's, which is that backend's documented cost. Returns the count
    * actually removed.
+   *
+   * `isOwned` names the runs THIS daemon still holds, so the sweep can also run periodically
+   * (RUN-153) rather than only at startup. At startup it is never needed — every prior process is
+   * gone — but mid-flight a live run's workspace looks exactly like a leaked one and may be
+   * legitimately empty, so nothing else can tell them apart. Absent = the startup meaning.
    */
-  reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number>;
+  reapOrphans(
+    repoRoot: string,
+    opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
+  ): Promise<number>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

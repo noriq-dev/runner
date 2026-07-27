@@ -82,6 +82,36 @@ describe('WorktreeManager (real git)', () => {
     expect(reaped).toBe(before.length);
     expect(await wm.listManaged(repo)).toHaveLength(0);
   });
+
+  // RUN-153: the same reap has to run PERIODICALLY, and mid-flight a live run's worktree looks
+  // exactly like an orphan — it may be pristine (an agent that has not written yet), so the
+  // work-bearing check cannot spare it either. Only the daemon knows, so it has to be asked.
+  it('reapOrphans spares a worktree the daemon still owns, empty or not', async () => {
+    const mine = await wm.create(repo, 'runLive'); // pristine — reapable on every other rule
+    const leaked = await wm.create(repo, 'runLeaked');
+    const reaped = await wm.reapOrphans(repo, { isOwned: (id) => id === 'runLive' });
+
+    expect(reaped).toBe(1);
+    expect((await wm.listManaged(repo)).map((w) => w.runId)).toEqual(['runLive']);
+    expect(existsSync(leaked.path)).toBe(false);
+    await wm.remove(mine);
+  });
+
+  // Ownership is asked TWICE, because several async git calls run between the two. A parked run
+  // resumed inside that window is added to the daemon's live set before it touches its worktree,
+  // so only the second question can see it — and the first would already have condemned it.
+  it('re-asks ownership immediately before deleting, so a resume mid-sweep is safe', async () => {
+    const wt = await wm.create(repo, 'runResumed');
+    let asked = 0;
+    const reaped = await wm.reapOrphans(repo, {
+      // Unowned on the way in, owned by the time the delete is due — the resume landed mid-sweep.
+      isOwned: () => ++asked > 1,
+    });
+
+    expect(reaped).toBe(0);
+    expect(existsSync(wt.path)).toBe(true);
+    await wm.remove(wt);
+  });
 });
 
 describe('unsaved work survives (real git)', () => {
