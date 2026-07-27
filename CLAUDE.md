@@ -90,7 +90,9 @@ a thought inside one build's context. Three things narrow it beyond the usual cl
 something the clamp does not: `auto` is dropped (it survives `clampPermissionToWorkflow` by design,
 and on Claude it means unrestricted Bash in a worktree that is writable for the build); it gets **no
 `noriqMcp`**, because a filesystem clamp says nothing about `update_task`; and it may take only a
-quarter of the run's remaining ceiling, after which the builder RE-RESERVES. Planning can never cost
+quarter of the run's remaining ceiling — ONE envelope shared by the planner and every plan-check
+round, not a fresh quarter each — after which the builder RE-RESERVES against a tally that now
+includes every one of them. Planning can never cost
 a run: every failure path leaves it exactly as unplanned as it arrived, which is still a first-class
 state.
 
@@ -102,7 +104,9 @@ turns, carrying the same adjudication ledger (`src/adjudication.ts`) so a settle
 settled. Same gate for both because a repo that wants an independent judgement on its WORK is the
 one that wants it on its PLAN. It cannot gate the run either: a plan that never clears goes to the
 builder **with the findings attached**, because refusing to work over a disagreement between two
-advisors about work neither has done is worse than building a plan somebody criticised.
+advisors about work neither has done is worse than building a plan somebody criticised. The checker
+sees the plan as EVIDENCE, never with the builder's "follow it" framing — it is the one actor whose
+job is to disagree with the spec.
 
 Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
 (tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and

@@ -18,7 +18,7 @@
  * is not worth a run.
  */
 
-import type { ExecutionSpec, Run } from '@noriq-dev/shared';
+import type { ExecutionSpec, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec as ExecutionSpecSchema, hasExecutionSpec } from '@noriq-dev/shared';
 import type { RunAgent } from '../client';
 import type { BudgetRun } from '../drivers/budget';
@@ -112,9 +112,18 @@ function bareObject(text: string): string | null {
  */
 export interface PlannedRun {
   checked: CheckedExecutionSpec;
-  /** Hand the planner a revision request and take its new spec. Null = the turn failed or produced
-   *  nothing usable, which ends the loop with the plan as it stands. */
-  revise(feedback: string): Promise<CheckedExecutionSpec | null>;
+  /** The whole PLANNING phase's ceiling — the planner and every checker round share it (RUN-141).
+   *  Recomputing a fraction per session would compound into most of the run. */
+  envelope: RunBudget | null;
+  /**
+   * Hand the planner a revision request and take its new spec. Null = the turn failed or produced
+   * nothing usable, which ends the loop with the plan as it stands.
+   *
+   * `text` is the turn's own output, for the adjudication half of the ledger: a planner that
+   * contested a finding with a pointer has said something the NEXT checker needs, and a ledger
+   * that records only the finding carries the accusation without the answer (RUN-79).
+   */
+  revise(feedback: string): Promise<{ checked: CheckedExecutionSpec; text: string } | null>;
   /** Close the planner's session, and persist whatever the loop settled on. */
   close(final: CheckedExecutionSpec): Promise<void>;
 }
@@ -164,7 +173,17 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
     return null;
   };
 
-  const exit = await budgetRun.done;
+  // Everything from here to the `return` runs with the session ALREADY OPEN and its ownership not
+  // yet handed over. A throw in any of it — `done` rejecting, `checkSpec` failing, a transcript
+  // callback — would leave an SDK query nobody holds a handle to, and an open one keeps the
+  // daemon's event loop alive forever (RUN-29). So the whole stretch is guarded.
+  let exit: Awaited<BudgetRun['done']>;
+  try {
+    exit = await budgetRun.done;
+  } catch (err) {
+    await abandon(`planning errored (${String(err)})`);
+    return null;
+  }
   tally.record('plan', exit.telemetry);
 
   if (exit.outcome !== 'done') {
@@ -184,7 +203,11 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   // Checked exactly as a delivered spec is (RUN-139), and for a sharper reason: the planner wrote
   // these paths from what it read, so a `modify` naming a file that is not there means it guessed.
   // The builder is told, and so is anyone reading the transcript.
-  const checked = await host.checkSpec(spec, plan.worktree.localPath);
+  const checked = await host.checkSpec(spec, plan.worktree.localPath).catch(async (err) => {
+    await abandon(`could not check the planned spec (${String(err)})`);
+    return null;
+  });
+  if (!checked) return null;
   const problems = checked.findings.filter((f) => f.level === 'problem');
   if (problems.length) {
     host.log.warn('the planned spec disagrees with the checkout', {
@@ -227,7 +250,13 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
 
   return {
     checked,
+    envelope: plan.start.budget ?? null,
     revise: async (feedback: string) => {
+      // Parse only THIS turn's output. `text` accumulates every turn, so parsing the whole buffer
+      // would find the ORIGINAL plan's fence and hand it back as the revision — a revision that
+      // emitted prose, or a bare object, or nothing, would silently look like a successful one.
+      // The reviewer loop takes the same snapshot for the same reason (RUN-79).
+      const before = text.length;
       const turn = budgetRun.session.continueWith;
       if (!turn) return null;
       const revisedExit = await turn.call(budgetRun.session, feedback).catch((err) => {
@@ -235,16 +264,23 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
         return null;
       });
       if (!revisedExit || revisedExit.outcome !== 'done') return null;
-      const revised = parsePlannedSpec(text);
+      const revised = parsePlannedSpec(text.slice(before));
       // The revision REPLACES the plan, so nothing parseable means the previous one stands rather
       // than being lost — a checker round that produced no new plan has cost tokens, not a plan.
-      return revised ? host.checkSpec(revised, plan.worktree.localPath) : null;
+      if (!revised) return null;
+      return { checked: await host.checkSpec(revised, plan.worktree.localPath), text: text.slice(before) };
     },
     close: async (final: CheckedExecutionSpec) => {
-      await save(final);
-      host.steering?.unregister(run.id);
-      await budgetRun.stop().catch(() => {});
-      tally.chargeTime((Date.now() - startedAt) / 1000);
+      // STOPPING IS UNCONDITIONAL. Saving first and stopping after meant a save that hung or threw
+      // left the session open — and the caller discards this promise's rejection, so nothing would
+      // ever have noticed. The persistence is the part that is allowed to fail.
+      try {
+        await save(final);
+      } finally {
+        host.steering?.unregister(run.id);
+        await budgetRun.stop().catch(() => {});
+        tally.chargeTime((Date.now() - startedAt) / 1000);
+      }
     },
   };
 };

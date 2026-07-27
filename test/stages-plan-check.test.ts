@@ -65,10 +65,15 @@ const host = (
     },
     revise: async (feedback) => {
       revisions.push(feedback);
-      return checked({ discretion: [`revised ${revisions.length}`] });
+      return {
+        checked: checked({ discretion: [`revised ${revisions.length}`] }),
+        text: 'FINDING 1: CONTESTED src/a.ts:12 — the criterion is checkable there',
+      };
     },
     reserve: () => ({ ok: true }),
     guards: () => ({}),
+    record: vi.fn(),
+    charge: vi.fn(),
     ...over,
   };
 };
@@ -184,5 +189,22 @@ describe('the adjudication ledger across rounds', () => {
     const r = await checkPlan(host(), input(d, 2));
     expect(r.ledger).toHaveLength(1);
     expect(r.ledger[0]?.round).toBe(2); // the round that most recently raised it
+  });
+
+  // The half that makes a point SETTLED rather than merely raised. A ledger carrying the
+  // accusation without the answer is the shape that let a reviewer re-raise a finding the other
+  // side had already answered with evidence (RUN-59).
+  it('records the planner’s answer, not just the checker’s claim', async () => {
+    const d = checkerSaying('FINDING 1 [blocking] acceptance: vague\n\nVERDICT: FAIL', 'VERDICT: PASS');
+    const r = await checkPlan(host(), input(d));
+    expect(r.ledger[0]?.status).toBe('contested');
+    expect(r.ledger[0]?.pointer).toBe('src/a.ts:12');
+  });
+
+  it('records `unanswered` when the planner fixed it silently, rather than inventing agreement', async () => {
+    const d = checkerSaying('FINDING 1 [blocking] acceptance: vague\n\nVERDICT: FAIL', 'VERDICT: PASS');
+    const h = host({ revise: async () => ({ checked: checked({ discretion: ['fixed'] }), text: 'done.' }) });
+    const r = await checkPlan(h, input(d));
+    expect(r.ledger[0]?.status).toBe('unanswered');
   });
 });

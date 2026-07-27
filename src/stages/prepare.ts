@@ -537,8 +537,15 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     plannerPrompt: buildPrompt('', '', 'planner'),
     // The checker reads a SPEC, so its prompt is built per round from whatever the plan is now
     // (RUN-141) — the same closure, so the facts around the spec cannot drift between rounds.
+    // The DETERMINISTIC findings travel with it: a checker that cannot see the repo disagreeing
+    // with the plan would raise the same points itself, at model prices.
     checkerPrompt: (spec, ledger) =>
-      buildPrompt(renderExecutionSpec({ spec, findings: [] }), '', 'plan-checker', ledger),
+      buildPrompt(
+        renderExecutionSpec({ spec, findings: checkedSpec?.findings ?? [] }, { audience: 'checker' }),
+        '',
+        'plan-checker',
+        ledger,
+      ),
     rebuildPrompt: (checked) =>
       buildPrompt(renderExecutionSpec(checked), renderExecutionSpec(checked, { only: 'acceptance' })),
     repo,

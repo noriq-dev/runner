@@ -22,9 +22,15 @@
  */
 
 import type { ExecutionSpec, Run } from '@noriq-dev/shared';
-import { type LedgerEntry, buildLedger, parseFindings, renderLedger } from '../adjudication';
+import {
+  type LedgerEntry,
+  buildLedger,
+  parseFindingResponses,
+  parseFindings,
+  renderLedger,
+} from '../adjudication';
 import type { BudgetRun } from '../drivers/budget';
-import type { AgentDriver, DriverSession, DriverStartOptions } from '../drivers/types';
+import type { AgentDriver, DriverExit, DriverStartOptions } from '../drivers/types';
 import type { CheckedExecutionSpec, SpecFinding } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
 import { renderPrompt } from '../prompts';
@@ -37,17 +43,19 @@ export interface PlanCheckHost {
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
   startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
-  steering?: {
-    register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
-    unregister: (runId: string) => void;
-  };
   /** Ask the PLANNER to revise, in its still-open session. Returns the revised spec, or null when
    *  the turn failed or produced nothing usable — either of which ends the loop. */
-  revise(feedback: string): Promise<CheckedExecutionSpec | null>;
+  revise(feedback: string): Promise<{ checked: CheckedExecutionSpec; text: string } | null>;
   /** Budget for one checker round, or the reason there is none left. */
   reserve(): { ok: true; budget?: DriverStartOptions['budget'] } | { ok: false; breach: string };
   /** Live guards for a checker session, so its spend counts against the run (RUN-133/159). */
   guards(slot: string): Pick<DriverStartOptions, 'spendGuard' | 'clockGuard'>;
+  /** Fold a finished checker round into the run's ledger. Without this a checker's tokens are
+   *  invisible to every later reservation, and the run spends its ceiling once per stage instead
+   *  of once — the bug RUN-133 exists to prevent, and the one this loop reintroduced. */
+  record(slot: string, exit: DriverExit): void;
+  /** Charge a checker round's wall clock to the run, the way every other session's is. */
+  charge(seconds: number): void;
 }
 
 export interface PlanCheckInput {
@@ -98,16 +106,18 @@ async function checkOnce(
       },
     },
   });
-  host.steering?.register(input.run.id, budgetRun.session, budgetRun.stop);
+  const startedAt = Date.now();
+  const slot = `plan-check:${round}`;
   try {
     const exit = await budgetRun.done;
+    host.record(slot, exit);
     if (exit.outcome !== 'done') {
       host.log.warn('the plan checker did not finish', { runId: input.run.id, reason: exit.reason });
       return null;
     }
   } finally {
-    host.steering?.unregister(input.run.id);
     await budgetRun.stop().catch(() => {});
+    host.charge((Date.now() - startedAt) / 1000);
   }
   const v = parseVerdict(text);
   return { verdict: v.verdict, findings: v.findings };
@@ -137,15 +147,16 @@ export const checkPlan = async (host: PlanCheckHost, input: PlanCheckInput): Pro
     const revised = await host.revise(
       renderPrompt('plan-revision', { findings, round, maxRounds: input.maxRounds }),
     );
-    // The planner's own record of what it did with each finding. Parsed from ITS output, and it
-    // may legitimately be empty: a planner that fixed everything silently has answered nothing,
-    // and the ledger records that as `unanswered` rather than inventing agreement.
-    ledger = buildLedger(ledger, parseFindings(findings), [], round);
+    // The planner's own answer to each finding, parsed from ITS output — the half of the ledger
+    // that makes a point SETTLED rather than merely raised. A finding it answered with a pointer
+    // reaches the next checker as an adjudication; one it fixed silently reaches it as
+    // `unanswered`, which is honest rather than inventing agreement.
+    ledger = buildLedger(ledger, parseFindings(findings), parseFindingResponses(revised?.text ?? ''), round);
     if (!revised) {
       host.log.warn('the planner could not revise — the plan stands as it was', { runId: input.run.id });
       break;
     }
-    current = revised;
+    current = revised.checked;
     rounds = round;
     host.transcript(input.run.id).milestone(`plan revised (round ${round}/${input.maxRounds})`);
 
@@ -185,9 +196,20 @@ export const checkPlan = async (host: PlanCheckHost, input: PlanCheckInput): Pro
  * disagreeing with another about work nobody has done yet.
  */
 export function checkerFindings(findings: string): SpecFinding[] {
-  return parseFindings(findings).map((f) => ({
+  const parsed = parseFindings(findings).map((f) => ({
     level: 'note' as const,
     where: f.location || 'the plan',
     message: `the plan checker refused this and it was not resolved: ${f.claim}`,
   }));
+  if (parsed.length || !findings.trim()) return parsed;
+  // A checker that wrote actionable prose and forgot the numbered format has still refused the
+  // plan, and dropping its report because of the formatting would hand the builder a criticised
+  // plan looking like an approved one — the exact outcome every comment here promises against.
+  return [
+    {
+      level: 'note',
+      where: 'the plan',
+      message: `the plan checker refused this plan and the objection was not resolved: ${findings.trim().slice(0, 800)}`,
+    },
+  ];
 }

@@ -695,6 +695,11 @@ export function assemblePrompt(
           : run.kind.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
+    // The planner and the checker are spawned with NO `noriqMcp` (RUN-140/141), so the shared
+    // identity's "report your work through Noriq, call request_input if you are stuck" would be
+    // instructions to use tools that are not there — and a compliant model that tries one instead
+    // of answering produces no verdict, which is how an unchecked plan slips through.
+    noriq: !ctx.promptShapeOverride,
   });
 
   // The repo's `[context]` block (RUN-128), rendered ahead of the brief for the scope and build
@@ -830,6 +835,33 @@ function plannerBudget(remaining: RunBudget): RunBudget {
  */
 export function plannerPermission(base: PermissionProfile): PermissionProfile {
   return { ...clampPermissionToWorkflow(base, BUILTIN_WORKFLOWS.verify), auto: false };
+}
+
+/** The tighter of two remainders, per dimension. Null on either side means "unbounded there", so
+ *  the other one wins; null on both leaves the dimension unbounded. */
+function tighter(a: RunBudget | undefined, b: RunBudget | undefined): RunBudget | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const min = (x: number | null, y: number | null) => (x == null ? y : y == null ? x : Math.min(x, y));
+  return {
+    maxTokens: min(a.maxTokens, b.maxTokens),
+    maxUsd: min(a.maxUsd, b.maxUsd),
+    maxDurationSeconds: min(a.maxDurationSeconds, b.maxDurationSeconds),
+    maxRounds: a.maxRounds ?? b.maxRounds,
+  };
+}
+
+/** Add two telemetry snapshots. Used for the planning phase's own running total, which is a SUM
+ *  across sessions rather than the tally's last-writer-wins per slot. */
+function sumTelemetry(a: DriverTelemetry, b: DriverTelemetry): DriverTelemetry {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+    costUsd: a.costUsd + b.costUsd,
+    numTurns: a.numTurns + b.numTurns,
+  };
 }
 
 export class RunSupervisor {
@@ -2161,7 +2193,7 @@ export class RunSupervisor {
     const reviewer = prepared.repo.manifest.verify?.agent;
     if (!reviewer) return { checked: planned.checked, findings: '' };
 
-    const result = await checkPlan(this.planCheckHost(planned, prepared.tally), {
+    const result = await checkPlan(this.planCheckHost(planned, prepared.tally, planned.envelope), {
       run,
       driver: prepared.driver,
       checked: planned.checked,
@@ -2179,32 +2211,51 @@ export class RunSupervisor {
     return { checked: result.checked, findings: result.findings };
   }
 
-  private planCheckHost(planned: PlannedRun, tally: RunTally): PlanCheckHost {
+  /**
+   * The checker's host. One PLANNING ENVELOPE is shared by the planner and every checker round —
+   * `plannerBudget` applied per round would compound (a quarter of a shrinking remainder, six
+   * times, is most of the run), and the documented policy is that planning takes a quarter, not
+   * that each planning SESSION does.
+   *
+   * No steering: registering a checker under the run id would overwrite the planner's entry, and
+   * the checker's own cleanup would then leave nothing registered — so a cancel arriving during a
+   * revision would find no target at all. The planner stays registered for the whole loop, which
+   * is the session that actually outlives it.
+   */
+  private planCheckHost(planned: PlannedRun, tally: RunTally, envelope: RunBudget | null): PlanCheckHost {
+    // What the whole planning phase may still spend, tracked here because the tally is the RUN's
+    // ledger and knows nothing about phases.
+    let spentInPhase = zeroTelemetry();
+    let secondsInPhase = 0;
     return {
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       transcript: (runId) => this.transcript(runId),
       startAgent: (driver, opts) => this.startAgent(driver, opts),
-      ...(this.deps.steering
-        ? {
-            steering: {
-              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
-                this.deps.steering?.register(runId, session, stop),
-              unregister: (runId: string) => this.deps.steering?.unregister(runId),
-            },
-          }
-        : {}),
       revise: (feedback) => planned.revise(feedback),
       reserve: () => {
-        const r = tally.reserve();
-        return r.ok
-          ? { ok: true, ...(r.budget ? { budget: plannerBudget(r.budget) } : {}) }
-          : { ok: false, breach: r.breach };
+        // Two ceilings, and the tighter wins: what the RUN has left (so the builder is not starved
+        // by an over-eager loop) and what the PLANNING PHASE has left (so the loop cannot take a
+        // fresh quarter each round).
+        const run = tally.reserve();
+        if (!run.ok) return { ok: false, breach: run.breach };
+        const phase = reserveFromRun(envelope, { telemetry: spentInPhase, activeSeconds: secondsInPhase });
+        if (!phase.ok) return { ok: false, breach: phase.breach };
+        const tightest = tighter(run.budget, phase.budget);
+        return { ok: true, ...(tightest ? { budget: tightest } : {}) };
       },
       guards: (slot) => ({
         spendGuard: tally.guard(slot),
         clockGuard: tally.clockGuard(),
       }),
+      record: (slot, exit) => {
+        tally.record(slot, exit.telemetry);
+        spentInPhase = sumTelemetry(spentInPhase, exit.telemetry);
+      },
+      charge: (seconds) => {
+        tally.chargeTime(seconds);
+        secondsInPhase += Math.max(0, seconds);
+      },
     };
   }
 
