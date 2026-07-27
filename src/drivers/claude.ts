@@ -621,6 +621,18 @@ export class ClaudeDriver implements AgentDriver {
         // the SDK session open and the daemon would never exit.
         closeSession();
         finish({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        // Settle a turn that was IN FLIGHT. `finish` is one-shot and was consumed by the session's
+        // first result, so under multiTurn it does nothing here — and `continueWith`'s promise has
+        // its own resolver, which only the result stream ever calls. Stopping mid-hand-back would
+        // otherwise leave the caller awaiting a turn that can never arrive: the process is gone,
+        // the stream is closed, and `reviewWithFeedback`/`verifyWithFeedback` wait forever, which
+        // hangs the run and pins its worktree. Reachable since RUN-133 gave the budget layer a
+        // reason to stop a session DURING a hand-back (the run-level spend guard).
+        const pending = awaitingTurn;
+        if (pending) {
+          awaitingTurn = null;
+          pending({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        }
       },
       done: () => donePromise,
     };

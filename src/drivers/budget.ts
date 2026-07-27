@@ -68,6 +68,12 @@ export function superviseBudget(driver: AgentDriver, startOpts: DriverStartOptio
   };
   const checkSpend = (t: DriverTelemetry) => {
     if (breach) return;
+    // The run-level guard first when there is one (RUN-133). It sees what EVERY session has spent,
+    // not just this one's, which is the only way a session that outlives its own snapshot — a
+    // multiTurn builder handed work back after the reviewer spent — can still be held to the run's
+    // ceiling. `budget` remains the fallback and the wall-clock deadline's source either way.
+    const guarded = startOpts.spendGuard?.(t);
+    if (guarded) return trip(guarded as BudgetBreach);
     if (budget.maxTokens != null && totalTokens(t) > budget.maxTokens) trip('budget:tokens');
     else if (budget.maxUsd != null && t.costUsd > budget.maxUsd) trip('budget:usd');
   };
@@ -93,6 +99,13 @@ export function superviseBudget(driver: AgentDriver, startOpts: DriverStartOptio
       },
       onExit: (exit) => {
         userHandlers?.onExit?.(exit);
+        // The exit's own telemetry counts too. `onTelemetry` is OPTIONAL in the driver contract
+        // while every exit carries a figure, so a driver that reports its spend only at the end
+        // (or a fake that emits no ticks) slipped past both this ceiling and the run's guard, and
+        // the run reported `done` on a breach. Checking here cannot stop anything — the session is
+        // already over — but it names the reason, and it lets `finalize` override the outcome
+        // rather than blessing an overrun as success.
+        checkSpend(exit.telemetry);
         finalize(exit);
       },
     },

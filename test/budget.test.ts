@@ -162,3 +162,54 @@ describe('superviseBudget', () => {
     expect(d.stops).toBe(1);
   });
 });
+
+// RUN-133. `superviseBudget` polices ONE session; the run-level allocator sits above it and needs a
+// way in, because a session can outlive the ceiling it was handed — a multiTurn builder is kept
+// open while the reviewer spends from the same run budget.
+describe('the run-level spend guard (RUN-133)', () => {
+  it('stops the session when the guard answers, even with room in its own budget', async () => {
+    const d = new FakeDriver();
+    const run = superviseBudget(d, {
+      ...startOpts(budget({ maxTokens: 1_000_000 })),
+      // The session is nowhere near ITS ceiling; the RUN is over. Only the guard can know that.
+      spendGuard: () => 'budget:tokens',
+    });
+    d.emit({ outputTokens: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    const exit = await run.done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('budget:tokens');
+    expect(d.stops).toBe(1);
+  });
+
+  it('leaves the session alone while the guard answers null', async () => {
+    const d = new FakeDriver();
+    const run = superviseBudget(d, { ...startOpts(budget()), spendGuard: () => null });
+    d.emit({ outputTokens: 5000 });
+    d.complete({ outputTokens: 5000 });
+    expect((await run.done).outcome).toBe('done');
+    expect(d.stops).toBe(0);
+  });
+
+  it('takes precedence over the per-session budget, which stays the fallback', async () => {
+    const d = new FakeDriver();
+    const run = superviseBudget(d, {
+      ...startOpts(budget({ maxTokens: 10 })),
+      spendGuard: () => null, // the run is fine…
+    });
+    d.emit({ outputTokens: 100 }); // …but this session is over ITS OWN ceiling
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await run.done).reason).toBe('budget:tokens');
+  });
+
+  // `onTelemetry` is OPTIONAL in the driver contract while every exit carries a figure, so a driver
+  // that reports its spend only at the end used to slip past every check and report `done`.
+  it('checks the EXIT telemetry too, so a tickless driver cannot overspend silently', async () => {
+    const d = new FakeDriver();
+    const run = superviseBudget(d, startOpts(budget({ maxTokens: 100 })));
+    d.complete({ inputTokens: 500 }); // no tick at all — the spend arrives with the exit
+    const exit = await run.done;
+    expect(exit.reason).toBe('budget:tokens');
+    expect(exit.outcome).toBe('failed');
+  });
+});

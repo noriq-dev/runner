@@ -121,6 +121,22 @@ export interface DriverStartOptions {
   effort?: RunEffort;
   /** Ceilings for daemon-side budget enforcement (RUN-14). */
   budget?: RunBudget;
+  /**
+   * A LIVE spend check for this session, consulted on every telemetry tick (RUN-133). Returns the
+   * dimension that is gone, or null to continue; a non-null answer stops the session exactly as a
+   * `budget` breach does.
+   *
+   * It exists because `budget` is a SNAPSHOT and a session can outlive it. A build's session is
+   * kept open for hand-back turns (RUN-29/30), and between two of those turns the reviewer spends
+   * from the same run ceiling — so the builder's original allowance is stale by the time it is
+   * handed work back, and comparing its own cumulative against that stale number lets the RUN
+   * exceed its budget while no single session ever breaches. The guard asks the run's allocator
+   * instead, which knows what every session has spent.
+   *
+   * Absent → `budget` alone decides, which is what every test fake and any caller without a run
+   * ledger means. Present → it wins for tokens/USD; the wall-clock deadline is still `budget`'s.
+   */
+  spendGuard?: (t: DriverTelemetry) => string | null;
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */
   noriqMcp?: NoriqMcp;
   /**

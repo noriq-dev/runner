@@ -39,6 +39,16 @@ export interface ContinuableRun {
    */
   spent: { tokens: number; usd: number; modelUsage?: Record<string, ModelUsage> };
   /**
+   * Agent-active seconds the failed sitting burned (RUN-133), so a continuation's wall-clock
+   * ceiling is a remainder like its tokens and its USD. Without it the duration dimension reset on
+   * every continue: a 60s run that failed at 55s got a fresh 60s, and repeated continues multiplied
+   * the ceiling — the same loophole tokens had, on the axis nobody carried.
+   *
+   * Optional so a record written before this field still loads; absent reads as zero, which is the
+   * old behaviour rather than a crash.
+   */
+  activeSeconds?: number;
+  /**
    * The adjudication ledger (RUN-79) as it stood when the run failed: the fresh reviewer on the
    * continuation starts from the findings the prior sitting already raised and the builder's
    * rebuttals, so a settled finding is verified against the kept tree rather than relitigated from

@@ -130,6 +130,7 @@ export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       spec: floorCmd,
       cwd: worktree.localPath,
       session: ctx.session,
+      tally: ctx.tally,
       phase: 'verifying',
     });
     if (result.passed) {

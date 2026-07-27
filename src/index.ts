@@ -194,6 +194,7 @@ export {
   type CodexSandbox,
 } from './drivers/codex';
 export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from './drivers/budget';
+export { reserveFromRun, exceedsRun, type BudgetReservation, type RunSpend } from './run-budget';
 export {
   RUN_STAGES,
   declaredTerminals,

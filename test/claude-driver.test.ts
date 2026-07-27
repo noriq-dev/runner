@@ -657,3 +657,56 @@ describe("the agent shell never sees the daemon's secrets", () => {
     expect(env?.PATH).toBeTruthy();
   });
 });
+
+// RUN-133. Stopping a multiTurn session mid-hand-back became reachable once the budget layer got a
+// reason to do it (the run-level spend guard fires on a fix turn's telemetry tick). Before this,
+// `stop()` closed the query and called the one-shot `finish()` — already consumed by the session's
+// first result — and never touched `continueWith`'s own pending promise. The caller then awaited a
+// turn that could never arrive: the process was gone, the stream was closed, and
+// `verifyWithFeedback` / `reviewWithFeedback` hung the run and pinned its worktree forever.
+describe('stopping a multiTurn session settles the turn in flight (RUN-133)', () => {
+  const firstResult = (fake: ReturnType<ReturnType<typeof harness>['getFake']>) =>
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: { input_tokens: 10, output_tokens: 10 },
+    });
+
+  it('resolves the pending turn as failed{stopped} rather than hanging', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    firstResult(fake);
+    await h.session.done();
+
+    // A hand-back turn is now in flight and nothing will answer it…
+    const turn = h.session.continueWith!('fix the type error');
+    await tick();
+    // …until the budget layer stops the session, which is exactly what a run-level breach does.
+    await h.session.stop();
+
+    const exit = await Promise.race([turn, tick().then(() => 'HUNG' as const)]);
+    expect(exit).not.toBe('HUNG');
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('settles it exactly once — a second stop finds nothing pending', async () => {
+    const h = harness({ multiTurn: true });
+    firstResult(h.getFake());
+    await h.session.done();
+    const turn = h.session.continueWith!('fix it');
+    await tick();
+    await h.session.stop();
+    await h.session.stop();
+    await expect(turn).resolves.toMatchObject({ outcome: 'failed' });
+  });
+
+  it('stopping with NO turn in flight is unchanged — nothing to settle', async () => {
+    const h = harness({ multiTurn: true });
+    firstResult(h.getFake());
+    await h.session.done();
+    await expect(h.session.stop()).resolves.toBeUndefined();
+  });
+});

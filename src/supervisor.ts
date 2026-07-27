@@ -38,6 +38,7 @@ import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
+import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
 import { type StageName, stagesFor } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
@@ -331,30 +332,6 @@ export function resolveModel(
   return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
-/**
- * What a resumed run may still spend (RUN-30).
- *
- * Tokens and USD carry over as plain remainders: a run that parks and resumes has one budget for
- * its whole life, not one per sitting. Wall-clock does NOT — `activeSeconds` counts only time the
- * agent was actually running, because the wait for a human is not the run's fault and charging it
- * would mean any question answered after a lunch break returns to a run that is already dead.
- *
- * Floors at 1 rather than 0: a remainder of exactly zero would read as "no limit" to the budget
- * supervisor, turning an exhausted run into an unlimited one — the precise inversion of intent.
- */
-export function remainingBudget(budget: RunBudget | null, spent: ParkedRun): RunBudget | undefined {
-  if (!budget) return undefined;
-  const left = (max: number | null, used: number) => (max == null ? null : Math.max(1, max - used));
-  return {
-    maxTokens: left(budget.maxTokens, spent.spent.tokens),
-    maxUsd: budget.maxUsd == null ? null : Math.max(0.01, budget.maxUsd - spent.spent.usd),
-    maxDurationSeconds: left(budget.maxDurationSeconds, spent.activeSeconds),
-    // A round count, not a spend remainder — carried over verbatim, never decremented by prior
-    // tokens/time (PLNR-180/RUN-91).
-    maxRounds: budget.maxRounds,
-  };
-}
-
 /** Sum two model mixes model-by-model, field-by-field (RUN-59). Absent on both sides → absent. */
 export const mergeModelUsage = (
   a?: Record<string, ModelUsage>,
@@ -432,10 +409,80 @@ export const telemetryFromSpent = (spent: ParkedRun['spent']): DriverTelemetry =
  */
 export class RunTally {
   private readonly slots = new Map<string, DriverTelemetry>();
+  /** Agent-active seconds charged to this run so far — the wall-clock dimension's spend. Separate
+   *  from the slots because time is not telemetry: it accumulates, it is never last-writer-wins. */
+  private active = 0;
+
+  /**
+   * The run's ONE ceiling (RUN-133). Held here because the tally is already the run's cumulative
+   * spend and is already threaded to every place a session starts — so "what is left" is a
+   * subtraction on numbers this object has, rather than a second object following it everywhere.
+   * The POLICY is still `reserveFromRun`'s; this only carries the inputs.
+   *
+   * Null/absent = unbounded, which is what every existing caller and test means by omitting it.
+   */
+  constructor(
+    private readonly ceiling: RunBudget | null = null,
+    priorActiveSeconds = 0,
+  ) {
+    this.active = priorActiveSeconds;
+  }
 
   /** Record a session's latest snapshot. Last-writer-wins per slot (see class doc). */
   record(slot: string, t: DriverTelemetry): void {
     this.slots.set(slot, t);
+  }
+
+  /** Charge a finished session's active stretch to the run. Sessions are strictly sequential in
+   *  this daemon — builder, then reviewer, then conflict turn — so these sum rather than overlap. */
+  chargeTime(seconds: number): void {
+    this.active += Math.max(0, seconds);
+  }
+
+  /** Agent-active seconds burned so far, including any prior sitting's. */
+  activeSeconds(): number {
+    return this.active;
+  }
+
+  /**
+   * What the NEXT session may spend: the run's ceiling minus everything already spent (RUN-133).
+   *
+   * Every `startAgent` goes through this instead of taking a fresh copy of the ceiling, which is
+   * what makes a run's total spend bounded rather than bounded-per-session. `{ ok: false }` means
+   * the caller must not spawn at all — see `reserveFromRun` for why that is a result and not a
+   * one-token budget.
+   */
+  reserve(): BudgetReservation {
+    return reserveFromRun(this.ceiling, { telemetry: this.total(), activeSeconds: this.active });
+  }
+
+  /**
+   * A LIVE spend check for one session, for `DriverStartOptions.spendGuard` (RUN-133).
+   *
+   * A reservation is a snapshot, and a session can outlive it: the builder's is computed before it
+   * starts, then the reviewer spends from the same ceiling, and the builder is handed work back.
+   * Checking its own cumulative against that stale allowance lets the RUN exceed its budget while
+   * no session ever breaches. This folds the live tick into the run's view under `slot` — the same
+   * last-writer-wins slot the session's result will land in — and asks the allocator.
+   *
+   * Recording rather than probing a copy is deliberate: the write is idempotent (a later tick and
+   * finally the authoritative result overwrite it), and it keeps ONE definition of the run's spend.
+   * It does not report anything; who publishes a frame is still each call site's decision (RUN-59).
+   */
+  guard(slot: string): (t: DriverTelemetry) => string | null {
+    return (t) => {
+      // A PROBE, never a write. Recording the live tick looked equivalent — same slot, and the
+      // authoritative result overwrites it moments later — but `stop()` fires an exit carrying ZERO
+      // telemetry, and last-writer-wins then erased the session's real spend from the run's total.
+      // A read-only check also keeps RUN-59's reporting contract exactly: a reviewer's live ticks
+      // still never enter the tally, so no frame can show a total climbing past a stale mix.
+      const probe = new Map(this.slots);
+      probe.set(slot, t);
+      // `exceedsRun`, NOT `reserve()`: a running session is over only when the run is strictly OVER
+      // its ceiling. `reserve()` answers "may I start another one", where landing exactly on the
+      // number is a no — using it here killed a session that spent precisely what it was allowed.
+      return exceedsRun(this.ceiling, { telemetry: this.sum(probe.values()), activeSeconds: this.active });
+    };
   }
 
   /** Seed a slot only if empty — used for a park's prior spend, which must not clobber a live
@@ -445,6 +492,12 @@ export class RunTally {
   }
 
   total(): DriverTelemetry {
+    return this.sum(this.slots.values());
+  }
+
+  /** Sum an arbitrary set of slot snapshots. Split out so `guard` can total a PROBE — the live
+   *  slots with one session's in-flight tick swapped in — without writing that tick anywhere. */
+  private sum(snapshots: Iterable<DriverTelemetry>): DriverTelemetry {
     const acc = zeroTelemetry();
     let mix: Record<string, ModelUsage> | undefined;
     // Spend from mix-less sessions, collected into the one reserved bucket (RUN-86) instead of
@@ -452,7 +505,7 @@ export class RunTally {
     // `acc` — so the bucket + the attributed models sum back to the total (codex lands here at $0,
     // matching that `acc.costUsd` already books it at $0).
     let unattributed: ModelUsage | undefined;
-    for (const t of this.slots.values()) {
+    for (const t of snapshots) {
       acc.inputTokens += t.inputTokens;
       acc.outputTokens += t.outputTokens;
       acc.cacheReadTokens += t.cacheReadTokens;
@@ -687,7 +740,9 @@ export class RunSupervisor {
       verifyWithFeedback: (ctx) => this.verifyWithFeedback(ctx),
       reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
       landRun: (ctx) => this.landRun(ctx),
-      // The run's effective ceiling: the dispatch's, else the machine default (RUN-14).
+      // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
+      // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
+      // that the run's sessions divide one ceiling rather than each receiving a copy of it.
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
       ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
     };
@@ -998,6 +1053,7 @@ export class RunSupervisor {
             spec: rebaseGate,
             cwd: worktree.localPath,
             session: ctx.session,
+            tally: ctx.tally,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
         : await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec });
@@ -1085,6 +1141,9 @@ export class RunSupervisor {
     spec: VerifySpec;
     cwd: string;
     session: DriverSession;
+    /** The run's cross-session tally (RUN-133): a hand-back turn's active seconds are charged to
+     *  it, because the session's own wall-clock deadline died with its first result. */
+    tally: RunTally;
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
@@ -1108,12 +1167,17 @@ export class RunSupervisor {
       // Tokens burn again on a fix turn, so the phase has to say 'agent' or the spend appears
       // to climb during "verifying" — the same lie this task exists to stop telling (RUN-31).
       this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+      // A hand-back is more agent time on the run's clock (RUN-133). Its TOKENS are policed live by
+      // the session's spendGuard; its SECONDS are only knowable here, because the session's own
+      // wall-clock deadline was cleared when its first result landed.
+      const fixStartedAt = Date.now();
       const exit = await ctx.session
         .continueWith(verifyFeedbackPrompt(ctx.spec, result, attempt))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the failure back', { runId: ctx.run.id, err: String(err) });
           return null;
-        });
+        })
+        .finally(() => ctx.tally.chargeTime((Date.now() - fixStartedAt) / 1000));
       // The agent died, errored, or breached its budget trying to fix it. Its last verdict stands;
       // pushing more turns at a session that just failed is how a loop becomes a spend.
       if (!exit || exit.outcome !== 'done') return result;
@@ -1228,12 +1292,15 @@ export class RunSupervisor {
       // fix turn's text, from which we parse the structured RESPONSE block (RUN-79). Captured here,
       // before the floor re-verify below can append its own turns.
       const textBefore = ctx.getSessionText?.().length ?? 0;
+      // Same as the deterministic floor's hand-back: the seconds are charged here (RUN-133).
+      const fixStartedAt = Date.now();
       const exit = await ctx.session
         .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
           return null;
-        });
+        })
+        .finally(() => ctx.tally.chargeTime((Date.now() - fixStartedAt) / 1000));
       const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
       // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
       ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
@@ -1249,6 +1316,7 @@ export class RunSupervisor {
           spec: floorCmd,
           cwd: ctx.worktree.localPath,
           session: ctx.session,
+          tally: ctx.tally,
           phase: 'verifying',
         });
         if (!floor.passed) {
@@ -1354,7 +1422,32 @@ export class RunSupervisor {
     // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
     const diffCmd =
       (this.vcsFor(ctx.repo).kind ?? 'git') === 'git' ? `git diff ${ctx.worktree.baseId}...HEAD` : undefined;
+    // The reviewer spends from the RUN's remaining ceiling, not a fresh copy of it (RUN-133). A
+    // build with a reviewer and a conflict turn used to be handed the dispatched budget three times
+    // over, and no single per-session check could ever notice.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      // Adversarial default, same as a reviewer that crashed: a gate that could not run is not a
+      // gate that passed. `review.ts` turns an `unknown` verdict into `review:no-verdict`, so the
+      // run is gated with its diff kept — and no process was spawned to be killed a moment later.
+      this.log.warn('no budget left for the reviewer — gating rather than reviewing unfunded', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return {
+        verdict: 'unknown',
+        passed: false,
+        findings: `the reviewer could not run: ${reservation.detail}. The diff is kept on its branch; re-dispatch with a larger budget to have it judged.`,
+      };
+    }
+
     let text = '';
+    // Resolved BEFORE the clock starts. The wall-clock dimension bounds AGENT time (RUN-30's
+    // accounting), so charging a slow `[context]` probe to it would spend a run's duration ceiling
+    // on work no agent did — and since RUN-133 that number is subtracted from what the next session
+    // may spend and persisted into a continuation, so the error would compound rather than pass.
+    const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
+    const startedAt = Date.now();
     const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
@@ -1364,7 +1457,7 @@ export class RunSupervisor {
         diffCmd,
         verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
         ledger: ctx.ledger,
-        repoContext: await this.reviewerContext(ctx.repo, ctx.worktree),
+        repoContext: reviewerContext,
       }),
       // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
       // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
@@ -1379,7 +1472,9 @@ export class RunSupervisor {
       // authorship separation absolute: the reviewer cannot claim, move, or comment as anyone.
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
-      budget: ctx.budget,
+      budget: reservation.budget,
+      // …and the live check, so a reviewer cannot outspend the RUN even inside its own allowance.
+      spendGuard: ctx.tally.guard(`review:${ctx.round}`),
       handlers: {
         onText: (t) => {
           text += t;
@@ -1401,6 +1496,9 @@ export class RunSupervisor {
       // A fresh session per round → its exit is that round's own cumulative, so a per-round slot
       // sums rather than overwrites. Then publish the run total, mix and all, as one step.
       ctx.tally.record(`review:${ctx.round}`, exit.telemetry);
+      // …and its wall-clock too (RUN-133), so the next session's reservation is short by what this
+      // one took. Sessions are strictly sequential here, so these sum rather than overlap.
+      ctx.tally.chargeTime((Date.now() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
@@ -1433,7 +1531,20 @@ export class RunSupervisor {
     },
     conflicts: string[],
   ): Promise<{ resolved: boolean; text: string }> {
+    // The last session a run spawns, and the one most likely to find the ceiling already gone
+    // (RUN-133). Unresolved is the honest answer: the caller aborts the rebase and the diff waits on
+    // its branch for a human — which is exactly what an unfixable conflict does anyway.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left for the conflict turn — leaving the rebase unresolved', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return { resolved: false, text: `no budget left to attempt a resolution: ${reservation.detail}` };
+    }
+
     let text = '';
+    const startedAt = Date.now();
     const session = this.startAgent(ctx.driver, {
       runId: `${ctx.run.id}:conflict`,
       kind: 'build', // it is editing its own diff — the build floor, nothing wider
@@ -1446,7 +1557,8 @@ export class RunSupervisor {
       }),
       permission: ctx.permission,
       noriqMcp: ctx.noriqMcp,
-      budget: ctx.budget,
+      budget: reservation.budget,
+      spendGuard: ctx.tally.guard('conflict'),
       handlers: {
         onText: (t) => {
           text += t;
@@ -1467,6 +1579,7 @@ export class RunSupervisor {
       // The conflict turn's spend joins the run whether or not it resolved anything (RUN-59) — the
       // tokens burned either way, on the build's own model (kind:'build', ctx.driver).
       ctx.tally.record('conflict', exit.telemetry);
+      ctx.tally.chargeTime((Date.now() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         return { resolved: false, text: text || `agent exited ${exit.reason ?? 'badly'}` };
@@ -1632,9 +1745,18 @@ export class RunSupervisor {
     this.log.info('resuming a parked run', { runId, agentId: entry.agentId, session: entry.sessionId });
 
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
-    // figures accumulate onto — and keep summing with — everything spent before the park.
-    const tally = new RunTally();
+    // figures accumulate onto — and keep summing with — everything spent before the park. It also
+    // carries the run's ceiling and the park's active seconds (RUN-133), which is what makes the
+    // reservation below the REMAINDER rather than a fresh budget: otherwise "ask a question" is a
+    // way to buy more, and a run could park its way past any limit.
+    const tally = new RunTally(mergeBudget(run.budget, this.deps.defaultBudget), entry.activeSeconds);
     tally.seed('__prior__', telemetryFromSpent(entry.spent));
+    const reservation = tally.reserve();
+    if (!reservation.ok) {
+      // The park outlived its budget. Fail it rather than spawn a session with nothing to spend —
+      // the worktree is kept either way, so the work is not lost.
+      return fail(`${reservation.breach}: ${reservation.detail}; not resuming`);
+    }
 
     // The SAME execute stage `supervise` runs (RUN-131) — including its re-park check, because an
     // agent given an answer may well have a second question and there is no reason the second one
@@ -1664,9 +1786,10 @@ export class RunSupervisor {
         // that model's conversation, and quietly finishing the job on a different one would make
         // "resumed with its context intact" only half true.
         ...resolveModel(run, repo.manifest),
-        // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
-        // budget, and a run could park its way past any limit.
-        budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
+        // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
+        // a run spawns, rather than a resume-only helper beside a reviewer that had none.
+        budget: reservation.budget,
+        spendGuard: tally.guard('primary'),
       },
     });
     if (executed.parked) return executed.parked;
@@ -1802,7 +1925,7 @@ export class RunSupervisor {
       lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
       lockEnforcerFor: (repo, run, worktree, kind, token) =>
         this.lockEnforcerFor(repo, run, worktree, kind, token),
-      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
       context: {
         ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
         ...(this.deps.readDoc ? { read: this.deps.readDoc } : {}),

@@ -1,4 +1,4 @@
-import type { ModelDefault, PermissionProfile, ProjectManifest, Run } from '@noriq-dev/shared';
+import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { RunAgent } from '../src/client';
 import type { AgentDriver, DriverCapabilities, DriverSession } from '../src/drivers/types';
@@ -114,6 +114,8 @@ function harness(
     /** git-shaped by default: a live backend's dispose preserves the work itself (RUN-52). */
     disposePreservesWork?: boolean;
     hasWork?: boolean | 'throws';
+    /** The run's ceiling (RUN-133). Absent = unbounded, which is every other test here. */
+    ceiling?: RunBudget;
   } = {},
 ) {
   const rec: Recorder = {
@@ -193,7 +195,7 @@ function harness(
     ...(over.lockScope ? { resolveLockScope: () => over.lockScope ?? [] } : {}),
     lockScopeBranch: () => 'main',
     lockEnforcerFor: () => undefined,
-    runBudget: () => undefined,
+    runBudget: () => over.ceiling ?? null,
     // No disk: the `[context]` seams are injected, so preparation reads nothing real. Every
     // declared path is "missing", which is the shape a repo with no `[context]` already has.
     context: { probe: async () => false, read: async () => '' },

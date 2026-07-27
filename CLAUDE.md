@@ -53,7 +53,10 @@ The dispatch path:
    with unsaved work.
 5. **`drivers/`** — `AgentDriver` (`drivers/types.ts`) is one interface over `claude.ts` (Claude Agent
    SDK streaming `query()`, not one-shot `claude -p`, so the session stays steerable) and `codex.ts`.
-   `drivers/budget.ts` wraps a session to enforce token/USD/wall-clock ceilings (breach → SIGTERM).
+   `drivers/budget.ts` wraps a session to enforce token/USD/wall-clock ceilings (breach → SIGTERM);
+   `run-budget.ts` sits above it (RUN-133) so those sessions divide ONE run ceiling — every spawn
+   reserves the remainder from `RunTally` rather than receiving a fresh copy of the budget, and a
+   stage with nothing left declines to spawn instead of starting a process to kill.
    **This interface is the ONLY place a vendor's specifics live** (RUN-109…111): each driver declares
    its `capabilities` (in-process hooks, steer, resume, per-model telemetry) and `catalog`, so the
    supervisor reads a capability rather than comparing a driver's name; env sanitization is hoisted

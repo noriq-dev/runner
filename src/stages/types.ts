@@ -55,6 +55,8 @@ export interface StageHost {
     spec: VerifySpec;
     cwd: string;
     session: DriverSession;
+    /** The run's tally (RUN-133) — a hand-back turn's seconds are charged to it. */
+    tally: RunTally;
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;

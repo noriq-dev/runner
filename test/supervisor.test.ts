@@ -3,6 +3,7 @@ import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
+import { totalTokens } from '../src/drivers/budget';
 import type {
   AgentDriver,
   DriverCapabilities,
@@ -47,8 +48,17 @@ class FakeDriver implements AgentDriver {
   /** Text the agent "emits" during each continueWith, in order — models the real driver
    *  streaming a fix turn's output via onText (RUN-79's ledger reads it). Empty = silent. */
   continueTexts: string[] = [];
+  /** Tokens each continueWith turn spends, in order (RUN-133). Default 0 = a free fix turn, which
+   *  is what every pre-RUN-133 test assumed. */
+  continueTokens: number[] = [];
+  /** The primary session's running cumulative, so a fix turn reports a TOTAL the way a real driver
+   *  does rather than a per-turn delta. */
+  private primarySpend = 0;
   /** True once stop() was called — a multiTurn session that nobody closes hangs the daemon. */
   stopped = false;
+  /** True when the budget layer stopped the session DURING a hand-back turn — the RUN-133 run-level
+   *  guard firing, as distinct from settle's ordinary stopSession at the end of every run. */
+  stoppedDuringFix = false;
   /** Mirrors the real drivers' capabilities (RUN-110): claude wires hooks, codex doesn't. */
   capabilities: DriverCapabilities = {
     toolHooks: true,
@@ -98,12 +108,30 @@ class FakeDriver implements AgentDriver {
             // moved to the reviewer session, but the fix turn belongs to the build session.
             const emitted = this.continueTexts.shift();
             if (emitted) opts.handlers?.onText?.(emitted);
+            // A fix turn SPENDS (RUN-133). The fake used to return zero telemetry and emit no tick,
+            // which made the one overrun this task exists to close invisible: the builder's session
+            // is kept open across the reviewer's spend, so a hand-back is the one place a run can
+            // exceed its ceiling while no single session breaches its own. `continueTokens` scripts
+            // it; the default stays 0 so no existing test changes.
+            const spend = this.continueTokens.shift() ?? 0;
+            this.primarySpend += spend;
+            const cumulative = { ...zeroTelemetry(), outputTokens: this.primarySpend };
+            if (spend) opts.handlers?.onTelemetry?.(cumulative);
+            // A real driver's turn ENDS when the budget layer SIGTERMs the session mid-flight. The
+            // tick above is what trips it, so the check has to come after — and this is the only
+            // place a run-level breach is observable, since settle stops every session anyway.
+            if (this.stopped) {
+              this.stoppedDuringFix = true;
+              return { outcome: 'failed', isError: true, reason: 'stopped', telemetry: cumulative };
+            }
             const outcome = this.continueOutcomes.shift() ?? 'done';
             return {
               outcome,
               isError: outcome === 'failed',
               reason: outcome === 'failed' ? 'died mid-fix' : null,
-              telemetry: zeroTelemetry(),
+              // The session's CUMULATIVE, which is what a real driver reports and what the tally's
+              // last-writer-wins slot expects.
+              telemetry: spend ? cumulative : zeroTelemetry(),
             };
           }
         : undefined,
@@ -118,6 +146,10 @@ class FakeDriver implements AgentDriver {
   /** Default spend is 42 output tokens; a test that cares about the model mix (RUN-59) passes its
    *  own telemetry (e.g. a modelUsage breakdown). */
   complete(outcome: 'done' | 'failed', telemetry: Partial<DriverTelemetry> = { outputTokens: 42 }): void {
+    // Keep the fix-turn cumulative continuous with whatever the PRIMARY session reported. A
+    // reviewer/conflict session completing must not rewrite the builder's running total — they are
+    // different sessions with different slots.
+    if (!this.opts?.runId.includes(':')) this.primarySpend = telemetry.outputTokens ?? this.primarySpend;
     this.opts?.handlers?.onExit?.({
       outcome,
       isError: outcome === 'failed',
@@ -3795,5 +3827,174 @@ describe('effectiveKind never answers with a kind that is not one (RUN-132)', ()
     // The dispatched kind says build; the workflow's base says scope, and the daemon holds the
     // manifest — so a client selecting a read-only workflow cannot leave `kind = build` and write.
     expect(effectiveKind({ kind: 'build', workflow: 'docs' }, withDocs)).toBe('scope');
+  });
+});
+
+// RUN-133. The ticket's own acceptance: "a run with builder + reviewer + conflict sessions cannot
+// collectively exceed its dispatched budget, proven by a test." Before this, each `startAgent` was
+// handed a fresh copy of the ceiling and `superviseBudget` watched only that session's telemetry —
+// so a build with a reviewer and a conflict turn could spend the dispatched budget three times and
+// no single check would ever fire.
+describe('one ceiling across the whole run (RUN-133)', () => {
+  const CEILING = (over: Partial<RunBudget> = {}): RunBudget => ({
+    maxTokens: 1000,
+    maxUsd: null,
+    maxDurationSeconds: null,
+    maxRounds: null,
+    ...over,
+  });
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>) => {
+    for (let i = 0; i < 100; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') return true;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    return false;
+  };
+
+  it('the builder gets the whole ceiling — it is the first session to spend', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts[0]?.budget?.maxTokens).toBe(1000);
+    h.claude.complete('done', { outputTokens: 100 });
+    await onReviewTurn(h);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The property that was missing: the reviewer's ceiling is the REMAINDER, so builder + reviewer
+  // sum to the dispatched budget instead of each getting all of it.
+  it('the reviewer gets what is LEFT, not another copy of the ceiling', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 900 }); // the builder burned 900 of 1000
+    expect(await onReviewTurn(h)).toBe(true);
+    const review = h.claude.starts[1]!;
+    expect(review.runId).toBe('run_1:review');
+    expect(review.budget?.maxTokens).toBe(100); // 1000 − 900, not 1000
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // A gate that could not run is not a gate that passed — the same posture as a reviewer that
+  // crashed. And nothing is spawned merely to be SIGTERMed a moment later.
+  it('a builder that spends the whole ceiling leaves no reviewer to spawn — and gates the run', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 1000 }); // exactly the ceiling
+    const exit = await done;
+    expect(h.claude.starts).toHaveLength(1); // the reviewer never started
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:no-verdict');
+    // The findings say WHY, so the comment a human reads is not "the reviewer found problems".
+    expect(h.comments.some((c) => /could not run.*token ceiling/s.test(c.body))).toBe(true);
+  });
+
+  // A dispatch with no ceiling on any dimension is unbounded, and subtracting from `null` must
+  // leave `null` rather than inventing a limit — otherwise the allocator would quietly start
+  // capping runs nobody capped.
+  it('an unbounded run still spawns everything, however much the builder spent', async () => {
+    const h = harness({ manifest: REVIEWED() }); // no defaultBudget, run.budget all null
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 10_000_000 });
+    expect(await onReviewTurn(h)).toBe(true);
+    expect(h.claude.starts[1]?.budget).toEqual({
+      maxTokens: null,
+      maxUsd: null,
+      maxDurationSeconds: null,
+      maxRounds: null,
+    });
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The hole an adversarial review found in the first pass at this task, and the one that defeats
+  // its own acceptance: the builder's session is kept OPEN across the reviewer's spend (RUN-29), so
+  // its reservation is stale by the time it is handed work back. Checking its own cumulative
+  // against that stale number lets the RUN exceed its ceiling while no single session breaches.
+  it('a builder handed work back after the reviewer spent is held to the RUN, not its own snapshot', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    h.claude.continueTokens = [100]; // the fix turn takes the builder's cumulative to exactly 1000
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 900 }); // builder: 900, inside its own 1000 allowance
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: FAIL\nFINDING 1 [High] src/a.ts:1: fix this');
+    h.claude.complete('done', { outputTokens: 50 }); // reviewer: 50 → the run is now at 950
+    await flush();
+    await flush();
+
+    // The builder's OWN cumulative after the fix turn is 900 + 100 = 1000, which is not `> 1000` —
+    // its per-session check is satisfied and always would have been, because its allowance was
+    // computed before the reviewer existed. The RUN is at 1050. Only a guard that can see every
+    // session catches this, which is why the reservation alone was not enough.
+    // Not `stopped` — settle stops every session. This flag is only set when the stop landed
+    // DURING the fix turn, which is the run-level guard and nothing else.
+    expect(h.claude.stoppedDuringFix).toBe(true);
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    // Nowhere near the 3× a per-session ceiling permitted: builder + reviewer + one fix turn, all
+    // out of one budget.
+    expect(totalTokens(exit.telemetry)).toBeLessThan(1100);
+  });
+
+  // The same session, but the spend fits — the guard must not fire on a run that is within budget.
+  it('…and left alone when the hand-back fits inside what is left', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      defaultBudget: CEILING(),
+      verifyResults: [false, true],
+    });
+    h.claude.continueTokens = [100];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 700 });
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+  });
+
+  // The third session, and the one most likely to find the ceiling gone. Unresolved is the honest
+  // answer: the caller aborts the rebase and the diff waits on its branch, exactly as it would for
+  // a conflict the agent could not fix.
+  it('a conflict turn with nothing left leaves the rebase unresolved rather than spawning', async () => {
+    const withLand = REVIEWED();
+    withLand.land = {
+      branch: 'main',
+      strategy: 'rebase',
+      autoPush: false,
+      allowedBranches: [],
+      resolveConflicts: true,
+    } as never;
+    const h = harness({ manifest: withLand, defaultBudget: CEILING(), conflicts: ['src/a.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 400 });
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done', { outputTokens: 600 }); // reviewer takes the rest: 400 + 600 = 1000
+    const exit = await done;
+    // No conflict session was ever started — only the builder and the reviewer.
+    expect(h.claude.starts.map((s) => s.runId)).toEqual(['run_1', 'run_1:review']);
+    expect(exit.reason).toBe('land:conflict');
   });
 });

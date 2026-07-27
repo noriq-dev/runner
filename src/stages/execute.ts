@@ -128,6 +128,10 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
   // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
   // run later stream through the handler above and overwrite this with their fuller cumulative.
   tally.record('primary', exit.telemetry);
+  // This sitting's active stretch joins the run's wall-clock spend (RUN-133), so what the reviewer
+  // and the conflict turn may spend is short by what the agent already took. The tally was seeded
+  // with any PRIOR sitting's seconds at construction, which is why only this sitting is added here.
+  tally.chargeTime((Date.now() - startedAt) / 1000);
   // Carry the RUN's spend rather than this sitting's first-result snapshot. `settle` recomputes the
   // same total before reporting, and `parkIfBlocked` reads the tally directly, so this changes no
   // outcome — it just stops the exit in flight from disagreeing with everything that reads it.

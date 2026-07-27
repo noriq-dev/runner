@@ -82,8 +82,8 @@ export interface PrepareHost {
     kind: RunKind,
     token: string,
   ): LockEnforcer | undefined;
-  /** The run's effective ceiling: the dispatch's, else the machine default. */
-  runBudget(run: Run): RunBudget | undefined;
+  /** The run's effective ceiling: the dispatch's, else the machine default. Null = unbounded. */
+  runBudget(run: Run): RunBudget | null;
   /** How `[context]` paths are probed and read (RUN-128/129) — injected so tests touch no disk. */
   readonly context: { probe?: PathProbe; read?: DocReader; budget?: number };
   readonly continuable?: Pick<ContinuableStore, 'get'>;
@@ -121,6 +121,13 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
   const driver = host.driverFor(tool as AgentTool);
   if (!driver) return refuse(`no driver for tool ${tool}`);
+
+  // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
+  // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
+  // overwriting the server's totals with only what this sitting spends) and the adjudication ledger
+  // (handed to the reviewer later, so it does not relitigate what the earlier sitting settled).
+  // Read up front because the budget gate below needs it, and it is a side-effect-free lookup.
+  const continued = (await host.continuable?.get(run.id)) ?? null;
 
   // Defense in depth (RUN-81): the server decides what to dispatch, but a bug in its phase/plan
   // gate — the removal of plan-task dependency edges left claim_task to enforce phase order
@@ -165,6 +172,37 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // allowlist), which is the property that actually matters: it must not be able to
   // "fix" the code it is judging.
   const readOnly = !wf.worktreeWritable;
+
+  // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
+  // its model mix are the sum across sessions, always consistent with each other. It also holds the
+  // run's ONE ceiling (RUN-133): every later session reserves the remainder from here instead of
+  // receiving its own copy of the budget.
+  const tally = new RunTally(host.runBudget(run), continued?.activeSeconds ?? 0);
+  if (continued) {
+    tally.seed('__prior__', telemetryFromSpent(continued.spent));
+    host.log.info('continuing a failed run — re-seeded prior spend and ledger', {
+      runId: run.id,
+      priorTokens: continued.spent.tokens,
+      ledgerEntries: continued.ledger.length,
+    });
+  }
+
+  // What this sitting's agent may spend — the ceiling on a fresh run, the REMAINDER on a continue
+  // (RUN-133). A continue used to receive a full fresh ceiling on top of everything the failed
+  // sitting had already burned, so "continue a failed run" was a way to buy more budget.
+  //
+  // Checked HERE, with the repo and the driver resolved and NOTHING yet taken. The reservation used
+  // to sit at the end, after the lease, the identity and the predictive locks — so a refusal left a
+  // leased workspace behind (on a live backend, the pool-of-one lease forever) and locks that only
+  // `settle` releases. A gate that costs nothing belongs beside the other gate that costs nothing.
+  const reservation = tally.reserve();
+  if (!reservation.ok) {
+    host.log.warn('run has no budget left before it starts — not spawning', {
+      runId: run.id,
+      breach: reservation.breach,
+    });
+    return refuse(`${reservation.breach}: ${reservation.detail}; not spawning`);
+  }
 
   // A VERIFY run leases from the BUILD it judges, not from HEAD — otherwise it gets a
   // pristine checkout, the `git diff` its prompt orders is empty, and it renders a
@@ -386,24 +424,6 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,
   });
 
-  // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
-  // its model mix are the sum across sessions, always consistent with each other.
-  const tally = new RunTally();
-  // Continue a failed run (RUN-92). The lease above already ADOPTED the kept worktree (RUN-91);
-  // this adds the two things git cannot carry across the fail→continue boundary: the prior spend
-  // (re-seeded so this sitting's reported figures stay CUMULATIVE rather than overwriting the
-  // server's totals with only what this sitting spends) and the adjudication ledger (handed to
-  // the reviewer later so it does not relitigate what the earlier sitting settled).
-  const continued = (await host.continuable?.get(run.id)) ?? null;
-  if (continued) {
-    tally.seed('__prior__', telemetryFromSpent(continued.spent));
-    host.log.info('continuing a failed run — re-seeded prior spend and ledger', {
-      runId: run.id,
-      priorTokens: continued.spent.tokens,
-      ledgerEntries: continued.ledger.length,
-    });
-  }
-
   return {
     ok: true,
     repo,
@@ -438,7 +458,11 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
       // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
       ...resolveModel(run, repo.manifest),
-      budget: host.runBudget(run),
+      budget: reservation.budget,
+      // The live check (RUN-133). `budget` above is a SNAPSHOT, and this session outlives it: it is
+      // kept open for hand-back turns, and the reviewer spends from the same ceiling in between, so
+      // by the time it is handed work back its own allowance is stale.
+      spendGuard: tally.guard('primary'),
     },
   };
 };

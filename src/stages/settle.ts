@@ -134,6 +134,9 @@ async function recordContinuation(host: StageHost, ctx: RunPipeline): Promise<vo
         ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
       },
       ledger: ctx.ledger,
+      // The wall-clock axis carries over too (RUN-133), or a continue would restart the duration
+      // ceiling it just spent — the same loophole tokens had.
+      activeSeconds: ctx.tally.activeSeconds(),
       ...(changedPaths.length ? { changedPaths } : {}),
       failedAt: new Date().toISOString(),
     })
