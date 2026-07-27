@@ -386,6 +386,7 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
           key: 'DV',
           board: null,
           verify: null, // no deterministic floor in this test — the landing flow is the subject
+          context: { requiredReading: [], entryPoints: [], conventions: [] },
           tool: null,
           defaultBranch: 'main',
           land: {

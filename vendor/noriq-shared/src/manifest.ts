@@ -233,6 +233,32 @@ export const WorkflowDef = z.object({
 });
 export type WorkflowDef = z.infer<typeof WorkflowDef>;
 
+/**
+ * What the repo knows about itself and every agent has been made to rediscover (RUN-128).
+ *
+ * A build agent's brief has carried the task and nothing else: no orientation, no conventions,
+ * no "read this first". So each run spends its most valuable early context re-deriving what the
+ * repo already knows and could simply have said — and derives it slightly differently each time.
+ * This is the repo saying it once, in the committed marker, so every teammate's runner briefs
+ * agents identically.
+ *
+ * Declarative on purpose: these are PATHS and short steers, never file contents. The daemon
+ * resolves them against the repo root and confines them there — a committed file naming
+ * `../../.ssh/id_rsa` is a repo asking the daemon to read outside itself, and the answer is no.
+ */
+export const ProjectContext = z.object({
+  // Read these before changing anything. The daemon names them here and (RUN-129) inlines their
+  // contents under a size budget, so order them by how much an agent needs them.
+  requiredReading: z.array(z.string().min(1)).default([]),
+  // Where to start reading the code — architectural entry points, not an index of the repo.
+  entryPoints: z.array(z.string().min(1)).default([]),
+  // Short, non-negotiable steers ("ESM only", "no barrel files"). Deliberately terse: anything
+  // needing a paragraph belongs in a `requiredReading` document, where it can be maintained
+  // as prose rather than rotting in a TOML array.
+  conventions: z.array(z.string().min(1)).default([]),
+});
+export type ProjectContext = z.infer<typeof ProjectContext>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -249,6 +275,10 @@ export const ProjectManifest = z.object({
   // silently rebound. Null = the project's default board, exactly as before.
   board: z.string().min(1).max(80).nullable().default(null),
   verify: VerifySpec.nullable().default(null),
+  // What the repo tells every agent about itself before it starts (RUN-128). Empty = today's
+  // behaviour, a brief carrying only the task. Not part of the security floor: getting this
+  // wrong costs an agent orientation, never safety.
+  context: ProjectContext.prefault({}),
   tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
   defaultBranch: z.string().nullable().default(null),
   // null = no auto-landing; every run's diff waits on its own branch for a human.

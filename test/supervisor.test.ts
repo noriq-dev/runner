@@ -16,6 +16,7 @@ import type {
 import { zeroTelemetry } from '../src/drivers/types';
 import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
+import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
 import {
   type RunReport,
@@ -274,6 +275,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   board: null,
   verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
+  context: { requiredReading: [], entryPoints: [], conventions: [] },
   tool: null,
   defaultBranch: null,
   land: null,
@@ -351,6 +353,10 @@ function harness(
     landRaces?: boolean;
     /** A per-repo backend riding ResolvedRepo (RUN-60) — must win over deps.vcs. */
     repoVcs?: FakeWorktrees;
+    /** Override the stubbed `[context]` seams (RUN-128/129) for a test that exercises them. */
+    pathProbe?: PathProbe;
+    readDoc?: DocReader;
+    contextBudget?: number;
     /** Pre-seed the continuable store (RUN-92) to model a re-dispatched "continue a failed run". */
     continuableSeed?: ContinuableRun;
     /** What the server says when asked whether the run parked (RUN-30). */
@@ -408,6 +414,14 @@ function harness(
     report: (runId, r) => reports.push({ runId, ...r }),
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
+    // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
+    // repo roots (`/repos/repo_a`) do not exist, and a real fs round-trip settles on the
+    // threadpool — LATER than the single `flush()` tick these tests spawn within, which would
+    // strand every one of them waiting on a session that had not been created yet.
+    // Context rendering has its own coverage in test/repo-context.test.ts.
+    pathProbe: over.pathProbe ?? (async () => 'missing'),
+    readDoc: over.readDoc ?? (async () => ''),
+    ...(over.contextBudget !== undefined ? { contextBudget: over.contextBudget } : {}),
     verifyExec: async () => {
       verifyRan = true;
       verifyCalls += 1;
@@ -558,6 +572,135 @@ describe('assemblePrompt', () => {
     });
     expect(p).toMatch(/do NOT need to commit/i);
     expect(p).toMatch(/daemon captures/i);
+  });
+});
+
+describe('the repo context block reaches the brief (RUN-128)', () => {
+  const block = '\n\nThis repo says of itself:\n- Start here: src/daemon.ts';
+
+  it('build carries it, ahead of the brief', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p).toContain('src/daemon.ts');
+    // Orientation before the job: an agent should know the ground rules before it reads the ask.
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
+  });
+
+  it('scope carries it too — exploration benefits most from orientation', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
+  });
+
+  it('a custom workflow gets it without asking (RUN-121 prompts are rendered with the same vars)', () => {
+    const wf = {
+      id: 'docs',
+      promptShape: 'scope' as const,
+      worktreeWritable: false,
+      produces: false,
+      verifyActor: false,
+      usesPlanBase: false,
+      promptRef: 'DOCS-MODE: {{brief}}{{context}}',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: wf,
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+  });
+
+  // The no-op guarantee: a repo that declares no [context] must get the pre-RUN-128 prompt.
+  it('renders byte-identically to before when the repo declared nothing', () => {
+    const args = { agent: testAgent(), server: 'https://s' };
+    for (const kind of ['scope', 'build'] as const) {
+      const withEmpty = assemblePrompt(makeRun({ kind }), manifest(), {
+        ...args,
+        repoContext: '',
+      });
+      const without = assemblePrompt(makeRun({ kind }), manifest(), args);
+      expect(withEmpty).toBe(without);
+      expect(without).not.toContain('This repo says of itself');
+    }
+  });
+});
+
+describe('[context] reaches the spawned agent (RUN-128/129)', () => {
+  // The harness stubs these seams away by default, so prove the wiring end-to-end at least once:
+  // a repo that declares context must have it in the prompt the driver was actually started with.
+  const declaring = () =>
+    manifest({
+      context: {
+        requiredReading: ['CLAUDE.md'],
+        entryPoints: ['src/daemon.ts'],
+        conventions: ['ESM only'],
+      },
+    });
+
+  it('inlines the declared reading and the orientation into the build brief', async () => {
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async () => true,
+      readDoc: async () => '# house rules',
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('This repo says of itself:');
+    expect(prompt).toContain('- Start here: src/daemon.ts');
+    expect(prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(prompt).toContain('----- CLAUDE.md -----');
+    expect(prompt).toContain('# house rules');
+    // Bulk reference first, the ask last — the shape long-context models attend to best.
+    expect(prompt.indexOf('# house rules')).toBeLessThan(prompt.indexOf('Brief:'));
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('drops paths that do not resolve but keeps the conventions — they are words, not files', async () => {
+    const h = harness({ manifest: declaring(), pathProbe: async () => 'missing' });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(prompt).not.toContain('CLAUDE.md'); // nothing inlined, nothing named
+    expect(prompt).not.toContain('Start here');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a repo declaring no [context] at all spawns exactly as before', async () => {
+    const h = harness({ pathProbe: async () => 'missing' });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    expect(h.claude.opts?.prompt ?? '').not.toContain('This repo says of itself');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('honours the budget, truncating rather than crowding out the brief', async () => {
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async () => true,
+      readDoc: async () => 'x'.repeat(5_000),
+      contextBudget: 100,
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('(truncated — 100 of 5000 characters)');
+    expect(prompt).toContain('Brief:'); // the ask survived
+    h.claude.complete('done');
+    await done;
   });
 });
 

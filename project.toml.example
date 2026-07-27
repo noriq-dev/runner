@@ -31,6 +31,32 @@ tool = "claude"
 # The repo's main branch, if the daemon should reference it. Optional.
 defaultBranch = "main"
 
+# ── What this repo tells every agent about itself (RUN-128) ──────────────────
+# Optional. Omit the whole section and briefs read exactly as they did before.
+#
+# Before this existed, an agent's brief carried the task and nothing else, so
+# every run spent its most valuable early context re-deriving the same facts —
+# and derived them slightly differently each time. This is the repo saying them
+# once, in the committed marker, so every teammate's runner briefs identically.
+#
+# Declarative on purpose: PATHS and short steers, never file contents. Paths are
+# resolved against the repo root and CONFINED there — a path pointing outside the
+# checkout (`../../.ssh/id_rsa`, an absolute path, or an in-repo symlink whose
+# target escapes) is refused and logged, never read. A path that simply does not
+# exist is logged too: a required-reading list that quietly shrinks to nothing is
+# worse than one that was never configured, because the repo goes on believing
+# its agents are oriented.
+#
+# [context]
+# # Read before changing anything. Order matters — it is priority.
+# requiredReading = ["docs/ARCHITECTURE.md", "CLAUDE.md"]
+# # Where to start reading the code. Architectural entry points, not an index.
+# entryPoints = ["src/daemon.ts", "src/supervisor.ts"]
+# # Short, non-negotiable steers. Anything needing a paragraph belongs in a
+# # requiredReading document, where it can be maintained as prose rather than
+# # rotting in a TOML array.
+# conventions = ["ESM only, Node >= 20", "import type for type-only imports"]
+
 # ── Default model + reasoning effort, per kind (RUN-33) ──────────────────────
 # Optional, and per KIND on purpose: that is where the difference actually lives.
 # A scope run is exploration and judgment, a build is execution, a verify is

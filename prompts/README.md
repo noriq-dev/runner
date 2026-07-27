@@ -30,6 +30,12 @@ exactly what the agent reads. Keep section tags inside lines: a conditional sent
 own leading newline (see `build.md`). The file's trailing newline is stripped; everything else is
 verbatim.
 
+`{{context}}` is the repo's own orientation block (`[context]` in `.noriq/project.toml`, RUN-128),
+resolved by `src/repo-context.ts` and passed to every prompt family — built-ins and custom
+workflows alike. It carries its own leading blank line and renders to nothing when the repo
+declared none, so inline the tag (`…problems.{{context}}`) and place it **before** the brief:
+ground rules land better read ahead of the ask than after it.
+
 ## Stay agnostic
 
 These prompts run under any driver (Claude, Codex, …), any model, and any VCS backend, so keep them

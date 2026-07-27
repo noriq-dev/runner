@@ -55,6 +55,23 @@ export {
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
 export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from './prompts';
 export {
+  AGENT_INSTRUCTION_FILES,
+  CONTEXT_BUDGET_CHARS,
+  defaultPathProbe,
+  discoverAgentInstructions,
+  loadRepoContext,
+  loadRepoDocs,
+  renderRepoContext,
+  resolveRepoContext,
+  type ContextRejection,
+  type DocReader,
+  type InlinedDoc,
+  type LoadedRepoDocs,
+  type PathProbe,
+  type ResolvedRepoContext,
+  type UnresolvedPath,
+} from './repo-context';
+export {
   parseFindings,
   parseFindingResponses,
   buildLedger,

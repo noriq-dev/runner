@@ -38,6 +38,7 @@ import { LockEnforcer, lockFloorComment } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
+import { type DocReader, type PathProbe, loadRepoContext } from './repo-context';
 import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -189,6 +190,15 @@ export interface RunSupervisorDeps {
    * remain the guarantee. Paths are repo-relative.
    */
   resolveLockScope?: (run: Run) => Promise<string[] | null> | string[] | null;
+  /** How `[context]` paths are checked to exist and stay inside the repo (RUN-128). Injected so
+   *  tests never touch a real tree; omitted → the real fs probe. */
+  pathProbe?: PathProbe;
+  /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
+   *  omitted → the real fs. */
+  readDoc?: DocReader;
+  /** Characters of inlined documentation allowed into one brief (RUN-129). Omitted →
+   *  `CONTEXT_BUDGET_CHARS`. Present for tests and for a future per-repo knob, if one earns itself. */
+  contextBudget?: number;
   /**
    * Is this Run parked on a human, and have they answered? (→ NoriqClient.getParkState, RUN-30)
    *
@@ -509,6 +519,9 @@ export function assemblePrompt(
     /** The resolved workflow (RUN-121). Default: the built-in for run.kind. A custom workflow with
      *  a `promptRef` supplies its own brief; its inherited posture still drives everything else. */
     workflow?: Workflow;
+    /** The repo's own orientation block, already resolved off disk (RUN-128). Optional: a marker
+     *  without `[context]` renders byte-identical prompts to before. */
+    repoContext?: string;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
@@ -530,6 +543,11 @@ export function assemblePrompt(
     server: ctx.server,
   });
 
+  // The repo's `[context]` block (RUN-128). Rendered ahead of the brief for every prompt family,
+  // custom workflows included: what the repo says about itself does not depend on which mode is
+  // reading it, and a workflow author should not have to remember to ask for it.
+  const repoContext = ctx.repoContext ?? '';
+
   const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   if (wf.promptRef) {
     // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
@@ -540,12 +558,13 @@ export function assemblePrompt(
       server: ctx.server,
       brief: run.brief,
       anchor,
+      context: repoContext,
       verifyCmd: manifest.verify?.cmd ?? '',
       reviewer: manifest.verify?.agent ? 'true' : '',
     });
   }
   if (wf.promptShape === 'scope') {
-    return renderPrompt('scope', { identity, brief: run.brief, anchor });
+    return renderPrompt('scope', { identity, brief: run.brief, anchor, context: repoContext });
   }
   if (wf.promptShape === 'build') {
     // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
@@ -565,6 +584,7 @@ export function assemblePrompt(
       reviewer: Boolean(manifest.verify?.agent),
       brief: run.brief,
       anchor,
+      context: repoContext,
     });
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer.
@@ -1778,11 +1798,34 @@ export class RunSupervisor {
       }
     }
 
+    // The repo's `[context]` (RUN-128), resolved against its root and inlined under a budget
+    // (RUN-129). A path that does not resolve is WARNED about rather than dropped in silence: a
+    // required-reading list that quietly shrinks to nothing leaves the repo believing its agents
+    // are oriented when they are not.
+    const repoCtx = await loadRepoContext(repo.root, repo.manifest.context, {
+      probe: this.deps.pathProbe,
+      read: this.deps.readDoc,
+      budget: this.deps.contextBudget,
+    });
+    for (const u of repoCtx.resolved.unresolved) {
+      this.log.warn(
+        `[context] ${u.declared} in ${repo.manifest.key} is ${
+          u.reason === 'outside-repo' ? 'outside the repo — refused' : 'missing'
+        }; not included in the brief`,
+      );
+    }
+    if (repoCtx.loaded.skipped.length) {
+      this.log.warn(
+        `[context] budget spent before ${repoCtx.loaded.skipped.join(', ')} — named in the brief, not inlined`,
+      );
+    }
+
     const prompt = assemblePrompt(run, repo.manifest, {
       agent: runAgent,
       server: this.deps.server,
       task,
       diffCmd,
+      repoContext: repoCtx.rendered,
       // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
       // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
       workflow: run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined,
