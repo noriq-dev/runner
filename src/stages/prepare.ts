@@ -25,20 +25,13 @@
 import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
-import { acceptanceOverflow, enumerateAcceptance } from '../acceptance';
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
-import {
-  type CheckedExecutionSpec,
-  type SpecPathProbe,
-  checkExecutionSpec,
-  renderExecutionSpec,
-  renderUnreadableSpec,
-} from '../execution-spec';
+import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
-import { type DocReader, type PathProbe, loadRepoContext, renderRepoContext } from '../repo-context';
+import type { DocReader, PathProbe } from '../repo-context';
 import { noriqToolNamesFor } from '../security';
 import {
   type AnchorTask,
@@ -46,7 +39,6 @@ import {
   type RunReport,
   RunTally,
   type SupervisorVcs,
-  assemblePrompt,
   effectiveKind,
   resolveAgentTool,
   resolveModel,
@@ -54,13 +46,8 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
-import {
-  type Workflow,
-  clampPermissionToWorkflow,
-  resolveWorkflow,
-  runWorkflow,
-  workflowFor,
-} from '../workflow';
+import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, runWorkflow } from '../workflow';
+import { authorSpecBlock, buildRunBrief } from './brief';
 
 /**
  * What preparation may reach.
@@ -427,47 +414,22 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     }
   }
 
-  // The repo's `[context]` (RUN-128), resolved against its root and inlined under a budget
-  // (RUN-129). A path that does not resolve is WARNED about rather than dropped in silence: a
-  // required-reading list that quietly shrinks to nothing leaves the repo believing its agents
-  // are oriented when they are not.
-  // Read the context out of the RUN'S WORKSPACE, not the discovered checkout (RUN-128/129).
-  // They are different trees: a build forks from the plan base, a continuation adopts a branch
-  // with its own edits, and a verify run leases the build's branch. Inlining the checkout's
-  // CLAUDE.md and then telling the agent not to re-read it would hand it instructions that do
-  // not describe the tree it is standing in. `localPath` is where the agent actually runs.
-  const repoCtx = await loadRepoContext(worktree.localPath, repo.manifest.context, {
-    probe: host.context.probe,
-    read: host.context.read,
-    budget: host.context.budget,
-  });
-  for (const u of repoCtx.resolved.unresolved) {
-    host.log.warn(
-      `[context] ${u.declared} in ${repo.manifest.key} is ${
-        u.reason === 'outside-repo' ? 'outside the repo — refused' : 'missing'
-      }; not included in the brief`,
-    );
-  }
-  if (repoCtx.loaded.skipped.length) {
-    host.log.warn(
-      `[context] budget spent before ${repoCtx.loaded.skipped.join(', ')} — named in the brief, not inlined`,
-    );
-  }
-
-  // The anchor task's spec, checked against THIS checkout before a token is spent (RUN-139). A
-  // stale path is worth telling the agent about — it is the one actor that can act on it — but it
-  // is never fatal: a spec is orientation, and refusing to run because a file moved would make it
-  // a tripwire. The adversarial pre-execution check is RUN-141's own stage.
+  // The brief, assembled by the half of preparation that takes nothing (RUN-169). Everything
+  // above this line ACQUIRES — a workspace lease, an identity, a predictive lock — and unwinds on
+  // failure; everything from here is a pure function of facts already in hand, which is what lets
+  // `resume` build one too.
   const workflow = run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined;
-  const checkedSpec = task?.executionSpec
-    ? await checkExecutionSpec(task.executionSpec, worktree.localPath, {
-        // NOT `host.context.probe`: that seam answers `[context]`'s question (is this worth
-        // putting in the brief) and collapses "could not look" into "missing". This one needs
-        // the kind and the uncertainty (RUN-139).
-        probe: host.context.specProbe,
-        produces: (workflow ?? workflowFor(kind)).produces,
-      })
-    : null;
+  const { checkedSpec, buildPrompt } = await buildRunBrief(host, {
+    run,
+    repo,
+    worktree,
+    task,
+    runAgent,
+    kind,
+    ...(workflow ? { workflow } : {}),
+    ...(diffCmd ? { diffCmd } : {}),
+  });
+
   // Findings go to the RUN'S TRANSCRIPT, not only to daemon stderr — which is what makes the two
   // levels mean something rather than decorate a log line. A `problem` is the spec contradicting
   // the checkout, and it belongs where a human watching this run will see it without reading the
@@ -489,49 +451,12 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     host
       .transcript(run.id)
       .milestone('this task has an execution spec the server could not read — briefed without it');
-  }
-  // A spec the SERVER could not read is not a task without one. Briefing the agent as if it were
-  // unplanned lets whatever the agent then decides become the de-facto plan — the same overwrite
-  // RUN-135's flag exists to prevent, one layer along. So it goes in the PROMPT, not only the log.
-  if (task?.executionSpecUnreadable) {
+    // A spec the SERVER could not read is not a task without one. Briefing the agent as if it were
+    // lets whatever the agent then decides become the de-facto plan — the same overwrite RUN-135's
+    // flag exists to prevent, one layer along. So it goes in the PROMPT, not only the log.
     host.log.warn('[spec] the server holds an unreadable execution spec for this task', { runId: run.id });
   }
-  const renderedSpec = task?.executionSpecUnreadable
-    ? renderUnreadableSpec()
-    : renderExecutionSpec(checkedSpec);
-
-  // One assembly point, called twice at most: once now with whatever spec the task arrived with,
-  // and again by the `plan` stage if it synthesizes one (RUN-140). A closure rather than a second
-  // call site so the facts a prompt is built from cannot drift between the two.
-  const buildPrompt = (
-    specBlock: string,
-    forVerify: ExecutionSpec | null,
-    shape?: 'planner' | 'plan-checker' | 'pattern-mapper',
-    ledger?: string,
-  ) =>
-    assemblePrompt(run, repo.manifest, {
-      agent: runAgent,
-      server: host.server,
-      task,
-      diffCmd,
-      repoContext: repoCtx.rendered,
-      // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
-      // documents differ (RUN-154).
-      repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
-      executionSpec: specBlock,
-      // The definition of done, for the actor that judges (RUN-139), NUMBERED so it can be
-      // answered criterion by criterion rather than in prose (RUN-145). Withholding it made the
-      // gate under-informed rather than independent: a reviewer that has not been told what the
-      // work was commissioned to achieve can pass a build that skipped it, or fail one for leaving
-      // out something the spec explicitly deferred.
-      acceptance: enumerateAcceptance(forVerify),
-      acceptanceOverflow: acceptanceOverflow(forVerify),
-      // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
-      // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
-      ...(shape ? { promptShapeOverride: shape } : {}),
-      ...(ledger !== undefined ? { ledger } : {}),
-      workflow,
-    });
+  const renderedSpec = authorSpecBlock(task, checkedSpec);
 
   const prompt = buildPrompt(renderedSpec, checkedSpec?.spec ?? null);
 
