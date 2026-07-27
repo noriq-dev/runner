@@ -325,7 +325,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   board: null,
   verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
-  context: { requiredReading: [], entryPoints: [], conventions: [] },
+  context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
   tool: null,
   defaultBranch: null,
   land: null,
@@ -780,6 +780,7 @@ describe('[context] reaches the spawned agent (RUN-128/129)', () => {
         requiredReading: ['CLAUDE.md'],
         entryPoints: ['src/daemon.ts'],
         conventions: ['ESM only'],
+        agentInstructions: 'inline' as const,
       },
     });
 
@@ -2647,6 +2648,7 @@ describe('the inline reviewer (RUN-61)', () => {
           requiredReading: ['CLAUDE.md'],
           entryPoints: ['src/daemon.ts'],
           conventions: ['ESM only'],
+          agentInstructions: 'inline' as const,
         },
       },
       pathProbe: async () => true,

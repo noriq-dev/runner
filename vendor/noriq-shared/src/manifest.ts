@@ -256,6 +256,27 @@ export const ProjectContext = z.object({
   // needing a paragraph belongs in a `requiredReading` document, where it can be maintained
   // as prose rather than rotting in a TOML array.
   conventions: z.array(z.string().min(1)).default([]),
+  /**
+   * What to do with the repo's conventional agent-instruction files — CLAUDE.md, AGENTS.md — when
+   * this section declares no `requiredReading` of its own (RUN-155).
+   *
+   * `inline` (the default) reproduces them in the brief, which is RUN-129's behaviour and the
+   * right one for most repos: the file was written to steer a coding agent and every agent that
+   * had to go and find it spent context doing so.
+   *
+   * The other two exist because an empty `requiredReading` cannot say this. After zod defaults an
+   * empty array is indistinguishable from an absent one, so a repo had no way to decline — and two
+   * kinds of repo want to:
+   *
+   * - `name` tells the agent the file exists and leaves it to read it. For a large instructions
+   *   file aimed at humans as much as agents, pre-loading it spends more context than the agent
+   *   would have spent reading the part it needed.
+   * - `off` says nothing at all. For a repo whose CLAUDE.md is not addressed to this kind of agent.
+   *
+   * It governs ONLY the fallback. A repo that declares `requiredReading` has already said what it
+   * wants and that list is always inlined.
+   */
+  agentInstructions: z.enum(['inline', 'name', 'off']).default('inline'),
 });
 export type ProjectContext = z.infer<typeof ProjectContext>;
 

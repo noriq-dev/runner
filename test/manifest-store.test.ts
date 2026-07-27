@@ -129,7 +129,7 @@ describe('changedSections', () => {
     key: 'PROJ',
     board: null,
     verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
-    context: { requiredReading: [], entryPoints: [], conventions: [] },
+    context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
     tool: null,
     defaultBranch: null,
     land: null,

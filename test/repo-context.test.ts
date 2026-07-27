@@ -25,6 +25,7 @@ const ctx = (over: Partial<ProjectContext> = {}): ProjectContext => ({
   requiredReading: [],
   entryPoints: [],
   conventions: [],
+  agentInstructions: 'inline',
   ...over,
 });
 
@@ -607,6 +608,51 @@ describe('loadRepoContext', () => {
     expect(r.resolved.requiredReading).toEqual(['CLAUDE.md']);
     expect(r.rendered).toContain('# repo rules');
     expect(r.rendered).toContain('ESM only');
+  });
+
+  // RUN-155. An empty `requiredReading` cannot say "inline nothing" — after the schema's defaults
+  // it is indistinguishable from an absent one — so a repo whose CLAUDE.md is not addressed to
+  // this kind of agent had no way to opt out.
+  it('inlines nothing and names nothing when the repo says off', async () => {
+    const r = await loadRepoContext('/repo', ctx({ conventions: ['ESM only'], agentInstructions: 'off' }), {
+      probe: async (abs) => abs.endsWith('CLAUDE.md'),
+      read: reader({ 'CLAUDE.md': '# repo rules' }),
+    });
+    expect(r.resolved.requiredReading).toEqual([]);
+    expect(r.rendered).not.toContain('CLAUDE.md');
+    expect(r.rendered).not.toContain('# repo rules');
+    // The rest of the block is untouched — this declines the fallback, not the section.
+    expect(r.rendered).toContain('ESM only');
+  });
+
+  // The middle case, and the reason this is not a boolean: for a large instructions file aimed at
+  // humans as much as agents, pre-loading it costs more context than the agent would have spent
+  // reading the part it needed. So: told it exists, left to read it.
+  it('names the file but does not inline it when the repo says name', async () => {
+    const r = await loadRepoContext('/repo', ctx({ agentInstructions: 'name' }), {
+      probe: async (abs) => abs.endsWith('CLAUDE.md'),
+      read: reader({ 'CLAUDE.md': '# repo rules' }),
+    });
+    expect(r.resolved.requiredReading).toEqual(['CLAUDE.md']);
+    expect(r.rendered).toContain('CLAUDE.md');
+    expect(r.rendered).not.toContain('# repo rules');
+    // …and it must not claim the agent has already read it.
+    expect(r.rendered).not.toMatch(/do not spend a turn re-reading/);
+  });
+
+  // It governs the FALLBACK only. A repo that declared its own reading has already said what it
+  // wants, and reading `name` as "never inline anything" would silently strip that.
+  it.each(['name', 'off'] as const)('still inlines a DECLARED list when set to %s', async (mode) => {
+    const r = await loadRepoContext(
+      '/repo',
+      ctx({ requiredReading: ['docs/ARCH.md'], agentInstructions: mode }),
+      {
+        probe: allExist,
+        read: reader({ 'ARCH.md': '# arch' }),
+      },
+    );
+    expect(r.resolved.requiredReading).toEqual(['docs/ARCH.md']);
+    expect(r.rendered).toContain('# arch');
   });
 
   // An explicit list is a decision; extending it silently would override that decision.

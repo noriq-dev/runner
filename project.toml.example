@@ -36,8 +36,16 @@ defaultBranch = "main"
 # at its root, the daemon inlines it into every scope/build brief by default. Those
 # files are written to steer a coding agent, and ignoring them meant our agents
 # worked from less than the repo had already written down. Declaring
-# `requiredReading` below REPLACES that fallback; there is currently no way to opt
-# out of it entirely (say so if you need one).
+# `requiredReading` below REPLACES that fallback, and `agentInstructions` decides
+# what happens when you declare no reading of your own (RUN-155):
+#
+#   inline  (default) reproduce the file in the brief — right for most repos
+#   name              say it exists and let the agent read it, for a large file
+#                     aimed at humans as much as agents, where pre-loading costs
+#                     more context than reading the part it needs would
+#   off               say nothing at all
+#
+# It governs only the fallback: a declared `requiredReading` is always inlined.
 #
 # Before this existed, an agent's brief carried the task and nothing else, so
 # every run spent its most valuable early context re-deriving the same facts —
@@ -67,6 +75,9 @@ defaultBranch = "main"
 # # requiredReading document, where it can be maintained as prose rather than
 # # rotting in a TOML array.
 # conventions = ["ESM only, Node >= 20", "import type for type-only imports"]
+#
+# # What to do with a CLAUDE.md / AGENTS.md when no requiredReading is declared.
+# agentInstructions = "inline"   # or "name", or "off"
 
 # ── Default model + reasoning effort, per kind (RUN-33) ──────────────────────
 # Optional, and per KIND on purpose: that is where the difference actually lives.

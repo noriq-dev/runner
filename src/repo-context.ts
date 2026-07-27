@@ -484,7 +484,13 @@ export async function loadRepoContext(
   deps: { probe?: PathProbe; read?: DocReader; budget?: number } = {},
 ): Promise<{ resolved: ResolvedRepoContext; loaded: LoadedRepoDocs; rendered: string }> {
   const merged = await resolveWithFallback(root, ctx, deps.probe);
-  const loaded = await loadRepoDocs(root, merged.requiredReading, deps.read, deps.budget);
+  // `name` names the discovered file and leaves the agent to read it (RUN-155): it stays in
+  // `requiredReading`, so the block still says it exists, and it is kept out of the inliner. Only
+  // ever the FALLBACK — a repo that declared its own reading has said what it wants, and that list
+  // is inlined whatever this is set to.
+  const usedFallback = !(ctx?.requiredReading?.length ?? 0);
+  const nameOnly = usedFallback && (ctx?.agentInstructions ?? 'inline') === 'name';
+  const loaded = await loadRepoDocs(root, nameOnly ? [] : merged.requiredReading, deps.read, deps.budget);
   return { resolved: merged, loaded, rendered: renderRepoContext(merged, loaded) };
 }
 
@@ -498,8 +504,12 @@ async function resolveWithFallback(
 ): Promise<ResolvedRepoContext> {
   const resolved = await resolveRepoContext(root, ctx, probe);
   const declaredReading = (ctx?.requiredReading?.length ?? 0) > 0;
-  const reading = declaredReading ? resolved.requiredReading : await discoverAgentInstructions(root, probe);
-  return { ...resolved, requiredReading: reading };
+  if (declaredReading) return resolved;
+  // `off` declines the fallback outright (RUN-155). An empty `requiredReading` could not say this
+  // — after the schema's defaults it is indistinguishable from an absent one — so a repo whose
+  // CLAUDE.md is not addressed to this kind of agent had no way to opt out.
+  if ((ctx?.agentInstructions ?? 'inline') === 'off') return resolved;
+  return { ...resolved, requiredReading: await discoverAgentInstructions(root, probe) };
 }
 
 /**
