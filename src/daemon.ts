@@ -383,6 +383,11 @@ export class Daemon {
       // The line whose absence made RUN-103's predictive layer dead code in production: the dep
       // existed, the supervisor consumed it, and only tests ever supplied one. See its doc above.
       resolveLockScope: continuationLockScope(continuable),
+      // A planned spec is written BACK to the task (RUN-140) — that is what makes planning an
+      // artifact a human can correct and a retry can reuse, rather than a thought inside one run's
+      // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
+      // feature that has never run.
+      saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
       steering,
       logger: this.log,
     });

@@ -23,10 +23,12 @@
  */
 
 import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
+import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
 import {
+  type CheckedExecutionSpec,
   type SpecPathProbe,
   checkExecutionSpec,
   renderExecutionSpec,
@@ -112,6 +114,17 @@ export interface PrepareHost {
 export type PrepareOutcome = { ok: false; reason: string } | ({ ok: true } & PreparedRun);
 
 export interface PreparedRun {
+  /**
+   * The anchor task, iff it is worth PLANNING (RUN-140): present, and carrying neither a spec nor
+   * the server's flag that it has one nobody can read. Null otherwise, which is the `plan` stage's
+   * cue to no-op — re-planning a task that already has a spec would overwrite what someone wrote,
+   * and re-planning one whose spec is merely unreadable would destroy the only copy.
+   */
+  plannedTask: AnchorTask | null;
+  /** The planner's brief, assembled from the same facts as the run's own. */
+  plannerPrompt: string;
+  /** Rebuild the RUN's brief around a spec the planner produced. */
+  rebuildPrompt: (checked: CheckedExecutionSpec | null) => string;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -475,28 +488,46 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     ? renderUnreadableSpec()
     : renderExecutionSpec(checkedSpec);
 
-  const prompt = assemblePrompt(run, repo.manifest, {
-    agent: runAgent,
-    server: host.server,
-    task,
-    diffCmd,
-    repoContext: repoCtx.rendered,
-    // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
-    // documents differ (RUN-154).
-    repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
-    executionSpec: renderedSpec,
-    // The definition of done, alone, for the actor that judges (RUN-139). Withholding it made the
-    // gate under-informed rather than independent: a reviewer that has not been told what the work
-    // was commissioned to achieve can pass a build that skipped it, or fail one for leaving out
-    // something the spec explicitly deferred.
-    executionSpecForVerify: renderExecutionSpec(checkedSpec, { only: 'acceptance' }),
-    // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
-    // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
-    workflow,
-  });
+  // One assembly point, called twice at most: once now with whatever spec the task arrived with,
+  // and again by the `plan` stage if it synthesizes one (RUN-140). A closure rather than a second
+  // call site so the facts a prompt is built from cannot drift between the two.
+  const buildPrompt = (specBlock: string, forVerify: string, shape?: 'planner') =>
+    assemblePrompt(run, repo.manifest, {
+      agent: runAgent,
+      server: host.server,
+      task,
+      diffCmd,
+      repoContext: repoCtx.rendered,
+      // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
+      // documents differ (RUN-154).
+      repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
+      executionSpec: specBlock,
+      // The definition of done, alone, for the actor that judges (RUN-139). Withholding it made the
+      // gate under-informed rather than independent: a reviewer that has not been told what the
+      // work was commissioned to achieve can pass a build that skipped it, or fail one for leaving
+      // out something the spec explicitly deferred.
+      executionSpecForVerify: forVerify,
+      // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
+      // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
+      ...(shape ? { promptShapeOverride: shape } : {}),
+      workflow,
+    });
+
+  const prompt = buildPrompt(renderedSpec, renderExecutionSpec(checkedSpec, { only: 'acceptance' }));
 
   return {
     ok: true,
+    // The `plan` stage (RUN-140) needs two things this scope already has: the planner's own brief,
+    // and the ability to rebuild the RUN's brief once a spec exists. Both are handed over rather
+    // than recomputed, so a planned run's prompt is built from the same facts an unplanned one's is.
+    // `hasExecutionSpec`, not truthiness. A task carrying a normalised-but-empty spec reads as
+    // UNPLANNED to the contract (RUN-134), and object-truthiness would have made one skip planning
+    // forever — the field is no longer null, so nothing would ever fill it.
+    plannedTask:
+      hasExecutionSpec(task?.executionSpec) || task?.executionSpecUnreadable ? null : (task ?? null),
+    plannerPrompt: buildPrompt('', '', 'planner'),
+    rebuildPrompt: (checked) =>
+      buildPrompt(renderExecutionSpec(checked), renderExecutionSpec(checked, { only: 'acceptance' })),
     repo,
     driver,
     workflow: wf,

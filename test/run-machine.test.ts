@@ -18,7 +18,15 @@ const wf = (name: keyof typeof BUILTIN_WORKFLOWS) => BUILTIN_WORKFLOWS[name];
 
 describe('the run pipeline is an ordered, declared sequence', () => {
   it('runs in the one order the daemon depends on', () => {
-    expect(names(RUN_STAGES)).toEqual(['prepare', 'execute', 'verify', 'review', 'integrate', 'settle']);
+    expect(names(RUN_STAGES)).toEqual([
+      'prepare',
+      'plan',
+      'execute',
+      'verify',
+      'review',
+      'integrate',
+      'settle',
+    ]);
   });
 
   // Each of these orderings is a decision with a reason, not an accident of how the code grew.
@@ -46,6 +54,7 @@ describe('which stages a workflow runs', () => {
   it('a build runs the whole pipeline', () => {
     expect(names(stagesFor(wf('build')))).toEqual([
       'prepare',
+      'plan',
       'execute',
       'verify',
       'review',
@@ -81,13 +90,15 @@ describe('what each stage declares', () => {
   });
 
   // The floor that must never move: a stage is a role and a budget, never a permission escalation.
-  // Only `review` runs a judging actor, and the write clamp — not this list — is what enforces it.
-  it('only the review stage spawns a fresh judging actor', () => {
-    expect(RUN_STAGES.filter((s) => s.actor === 'verify').map((s) => s.name)).toEqual(['review']);
+  // `plan` and `review` run a fresh READ-ONLY actor — the planner writes a spec, not code — and the
+  // write clamp, not this list, is what enforces that.
+  it('names every stage that spawns a fresh read-only actor', () => {
+    expect(RUN_STAGES.filter((s) => s.actor === 'verify').map((s) => s.name)).toEqual(['plan', 'review']);
   });
 
   it('names the stages that can spend the run budget, and the ones that provably cannot', () => {
     expect(RUN_STAGES.filter((s) => s.budget === 'run').map((s) => s.name)).toEqual([
+      'plan',
       'execute',
       'review',
       'integrate',
@@ -152,6 +163,7 @@ describe('a workflow declares its stages, and the machine floors the declaration
     expect(names(stagesFor(wf('verify')))).toEqual(['prepare', 'execute', 'verify', 'settle']);
     expect(names(stagesFor(wf('build')))).toEqual([
       'prepare',
+      'plan',
       'execute',
       'verify',
       'review',
@@ -181,8 +193,8 @@ describe('a workflow declares its stages, and the machine floors the declaration
     expect(names(stagesFor(empty))).toContain('settle');
   });
 
-  it('marks exactly the two stages a workflow may decline', () => {
-    expect(RUN_STAGES.filter((s) => s.optional).map((s) => s.name)).toEqual(['review', 'integrate']);
+  it('marks exactly the stages a workflow may decline', () => {
+    expect(RUN_STAGES.filter((s) => s.optional).map((s) => s.name)).toEqual(['plan', 'review', 'integrate']);
   });
 
   it('a workflow can DROP an optional stage — review is the declinable one', () => {
@@ -193,7 +205,15 @@ describe('a workflow declares its stages, and the machine floors the declaration
   // The half that must never work: a posture that produces nothing cannot declare its way into
   // landing a diff. `appliesTo` is the floor, and a declaration is intersected with it.
   it('a non-producing workflow CANNOT declare its way into review or integrate', () => {
-    const greedy = withStages(wf('scope'), ['prepare', 'execute', 'verify', 'review', 'integrate', 'settle']);
+    const greedy = withStages(wf('scope'), [
+      'prepare',
+      'plan',
+      'execute',
+      'verify',
+      'review',
+      'integrate',
+      'settle',
+    ]);
     expect(names(stagesFor(greedy))).toEqual(['prepare', 'execute', 'verify', 'settle']);
   });
 
@@ -206,6 +226,7 @@ describe('a workflow declares its stages, and the machine floors the declaration
       'review',
       'verify',
       'execute',
+      'plan',
       'prepare',
     ]);
     expect(names(stagesFor(inverted))).toEqual(names(stagesFor(wf('build'))));

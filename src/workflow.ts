@@ -124,7 +124,19 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
     produces: true,
     verifyActor: false,
     usesPlanBase: true,
-    stages: [...SPINE, declare('review', 'verify'), declare('integrate', 'run'), declare('settle', 'none')],
+    // `plan` (RUN-140) sits where the machine runs it — between prepare and execute. The order
+    // here is cosmetic: `stagesFor` returns `RUN_STAGES` order whatever a declaration says, which
+    // is why planning cannot end up after the build it was meant to brief. Writing it in the real
+    // order anyway keeps this list readable as the pipeline it describes.
+    stages: [
+      declare('prepare', 'none'),
+      declare('plan', 'verify'),
+      declare('execute', 'run'),
+      declare('verify', 'none'),
+      declare('review', 'verify'),
+      declare('integrate', 'run'),
+      declare('settle', 'none'),
+    ],
   },
   verify: {
     id: 'verify',

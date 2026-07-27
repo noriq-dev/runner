@@ -26,7 +26,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
-import type { SpecPathProbe } from './execution-spec';
+import { type SpecPathProbe, checkExecutionSpec } from './execution-spec';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -45,12 +45,15 @@ import { type StageName, stagesFor } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
+  type PlanHost,
   type PrepareHost,
+  type PreparedRun,
   type RunPipeline,
   type StageHost,
   type StageImpl,
   executeRun,
   integrateStage,
+  planRun,
   prepareRun,
   reviewStage,
   settleStage,
@@ -205,6 +208,9 @@ export interface RunSupervisorDeps {
    *  because it answers a richer question — file vs directory, gone vs could-not-look — that
    *  `[context]` deliberately collapses. Omitted → the real fs probe. */
   specPathProbe?: SpecPathProbe;
+  /** Write a planned spec back onto the anchor task (RUN-140). Omitted → the spec is used for this
+   *  run and not persisted, which costs reusability and a human's chance to correct it. */
+  saveExecutionSpec?: (projectId: string, taskId: string, spec: ExecutionSpec) => Promise<boolean>;
   /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
    *  omitted → the real fs. */
   readDoc?: DocReader;
@@ -647,6 +653,15 @@ export function assemblePrompt(
      *  RUN-154 gave its context, and for the same reason: an actor that judges needs the standard
      *  it is judging against, not the author's working notes. */
     executionSpecForVerify?: string;
+    /**
+     * Render the PLANNER's brief instead of this workflow's own (RUN-140).
+     *
+     * A shape override rather than a workflow of its own: planning is a stage inside a build, not
+     * a different run — same repo, same task, same identity, same budget ledger. Giving it a
+     * `Workflow` would have made it declarable in a manifest, and a repo able to declare its own
+     * planner posture is exactly the widening `clampPermissionToWorkflow` exists to stop.
+     */
+    promptShapeOverride?: 'planner';
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
@@ -663,7 +678,10 @@ export function assemblePrompt(
   const identity = renderPrompt('identity', {
     label: ctx.agent.label,
     agentId: ctx.agent.agentId,
-    kind: run.kind.toUpperCase(),
+    // The PLANNER announces itself as a planner (RUN-140). It ran as "BUILD agent … MODE: PLAN",
+    // which is a contradiction in the first two lines of a prompt, and the half of it that was
+    // wrong was the half describing what the agent may do.
+    kind: ctx.promptShapeOverride === 'planner' ? 'PLAN' : run.kind.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
   });
@@ -686,6 +704,12 @@ export function assemblePrompt(
   // independent, it is under-informed, and it can pass a build that skipped a stated criterion.
   const executionSpec = wf.verifyActor ? (ctx.executionSpecForVerify ?? '') : (ctx.executionSpec ?? '');
 
+  // The planner (RUN-140) reads the same facts as the run it briefs and asks for a spec instead of
+  // the work. Checked BEFORE `promptRef` so a custom workflow cannot shadow it: a repo shaping its
+  // build's brief must not silently reshape the planner that writes that build's spec.
+  if (ctx.promptShapeOverride === 'planner') {
+    return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
+  }
   if (wf.promptRef) {
     // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
     // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
@@ -742,6 +766,49 @@ export function assemblePrompt(
     diffCmd: ctx.diffCmd,
     repoContext,
   });
+}
+
+/**
+ * What fraction of a run's remaining ceiling planning may take (RUN-140).
+ *
+ * A planner handed the whole remainder can spend it and leave the build it was meant to brief with
+ * nothing — a run that produced a perfect plan and no work. A quarter is a judgement, not a
+ * measurement: enough to read a repo and write a spec, and small enough that losing all of it
+ * still leaves a build worth starting.
+ */
+const PLAN_BUDGET_SHARE = 0.25;
+
+/** A budget nothing can be spent under. Handed to a builder whose run has nothing left, so the
+ *  spawn declines by the same rule every other stage does rather than by a special case. */
+const EXHAUSTED_BUDGET = { maxTokens: 0, maxUsd: 0, maxDurationSeconds: 1, maxRounds: null } as const;
+
+/** The planner's share of what the run has left. Null dimensions stay null: an unbounded run does
+ *  not acquire a planning ceiling nobody asked for. */
+function plannerBudget(remaining: RunBudget): RunBudget {
+  const share = (v: number | null) => (v == null ? null : Math.max(1, Math.floor(v * PLAN_BUDGET_SHARE)));
+  return {
+    maxTokens: share(remaining.maxTokens),
+    maxUsd: remaining.maxUsd == null ? null : Math.max(0.01, remaining.maxUsd * PLAN_BUDGET_SHARE),
+    maxDurationSeconds: share(remaining.maxDurationSeconds),
+    maxRounds: remaining.maxRounds,
+  };
+}
+
+/**
+ * The planner's permission profile (RUN-140).
+ *
+ * `clampPermissionToWorkflow` at the verify posture forces `write = false`, which is the floor
+ * every judging actor gets — but `auto` deliberately SURVIVES that clamp (RUN-68, and CLAUDE.md
+ * says so), and `auto` on Claude means bypass-permissions with unrestricted Bash. The planner runs
+ * inside a BUILD's worktree, which is physically writable, so a repo with `[permissions.build]
+ * auto = true` would have handed a "read-only" planner a shell in a writable tree.
+ *
+ * So it is dropped here rather than in the clamp. The clamp's behaviour is a documented, deliberate
+ * boundary a repo opts into for its own agents; this is a NEW actor the repo never opted anything
+ * into, and it has no use for a shell — it reads files and emits JSON.
+ */
+export function plannerPermission(base: PermissionProfile): PermissionProfile {
+  return { ...clampPermissionToWorkflow(base, BUILTIN_WORKFLOWS.verify), auto: false };
 }
 
 export class RunSupervisor {
@@ -1930,6 +1997,12 @@ export class RunSupervisor {
     const prepared = await prepareRun(this.prepareHost(), run);
     if (!prepared.ok) return fail(prepared.reason);
 
+    // `plan` (RUN-140), between prepare and execute because a spec written after the build has
+    // started is a spec nobody read. It no-ops unless the workflow produces, the run has a task,
+    // and that task arrived unplanned — and it can only ever ENRICH the prompt: a planner that
+    // fails leaves `start` exactly as prepare built it.
+    const start = await this.planIfUnplanned(run, prepared);
+
     const executed = await executeRun(this.executeHost(), {
       run,
       repo: prepared.repo,
@@ -1937,7 +2010,7 @@ export class RunSupervisor {
       driver: prepared.driver,
       runAgent: prepared.runAgent,
       tally: prepared.tally,
-      start: prepared.start,
+      start,
       priorActiveSeconds: 0,
     });
     if (executed.parked) return executed.parked;
@@ -1960,6 +2033,103 @@ export class RunSupervisor {
       tail: executed.tail,
       continued: prepared.continued,
     });
+  }
+
+  /**
+   * Run the `plan` stage when it applies, and fold its result into the builder's brief (RUN-140).
+   *
+   * Returns `prepared.start` untouched whenever planning does not apply or does not work, which is
+   * what makes this stage unable to cost a run: every failure path here is "the run proceeds
+   * exactly as it would have without me".
+   */
+  private async planIfUnplanned(run: Run, prepared: PreparedRun): Promise<PreparedRun['start']> {
+    if (!stagesFor(prepared.workflow).some((s) => s.name === 'plan')) return prepared.start;
+    if (!prepared.plannedTask) return prepared.start;
+
+    // The planner spends the RUN's remaining ceiling like any other session (RUN-133) — a run with
+    // nothing left declines to plan rather than starting a process to kill.
+    const reservation = prepared.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left to plan this run — proceeding unplanned', {
+        runId: run.id,
+        breach: reservation.breach,
+      });
+      return prepared.start;
+    }
+
+    const checked = await planRun(this.planHost(), {
+      run,
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      runAgent: prepared.runAgent,
+      tally: prepared.tally,
+      prompt: prepared.plannerPrompt,
+      start: {
+        ...prepared.start,
+        permission: plannerPermission(prepared.permission),
+        // NO MCP. Every other actor gets Noriq because it has to report what it did; the planner
+        // reports nothing — the DAEMON writes its spec back, under the daemon's own token and
+        // behind a re-read that will not clobber a human. Handing it the run agent's connection
+        // would have given a "read-only" actor `update_task`, `claim_task` and `post_comment`,
+        // which are writes the filesystem clamp says nothing about, and the server explicitly
+        // permits a run agent to rewrite an execution spec (RUN-160). The narrowest thing that
+        // can do the job is the thing to hand it.
+        noriqMcp: undefined,
+        ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+        spendGuard: prepared.tally.guard('plan'),
+        clockGuard: prepared.tally.clockGuard(),
+      },
+    }).catch((err) => {
+      // A stage that cannot gate the run must not throw out of it either.
+      this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
+      return null;
+    });
+    if (!checked) return prepared.start;
+
+    // RE-RESERVE. `prepared.start.budget` was computed before planning, so handing it to the
+    // builder unchanged would let a run spend its ceiling twice — exactly the per-session-copy bug
+    // RUN-133 removed. A build with nothing left declines to spawn rather than starting a process
+    // to kill, and the run fails having at least produced a spec somebody can act on.
+    const rest = prepared.tally.reserve();
+    if (!rest.ok) {
+      this.log.warn('planning used what was left of this run', { runId: run.id, breach: rest.breach });
+      this.transcript(run.id).milestone(
+        `planning used the run's remaining budget (${rest.breach}) — nothing left to build with`,
+      );
+    }
+    return {
+      ...prepared.start,
+      prompt: prepared.rebuildPrompt(checked),
+      ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+    };
+  }
+
+  private planHost(): PlanHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      // The planner is a live session like any other: cancellable, and stopped by shutdown. It
+      // used to be outside this, so `run.cancel` during planning found no target and answered
+      // false while the planner — and then the build — carried on.
+      ...(this.deps.steering
+        ? {
+            steering: {
+              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
+                this.deps.steering?.register(runId, session, stop),
+              unregister: (runId: string) => this.deps.steering?.unregister(runId),
+            },
+          }
+        : {}),
+      checkSpec: (spec, root) =>
+        checkExecutionSpec(spec, root, {
+          ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
+          produces: true,
+        }),
+      ...(this.deps.saveExecutionSpec ? { saveSpec: this.deps.saveExecutionSpec } : {}),
+    };
   }
 
   /**

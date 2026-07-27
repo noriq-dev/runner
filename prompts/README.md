@@ -10,6 +10,7 @@ call site — these files are the literal text an agent reads, so they cannot ca
 | `identity.md` | `supervisor.ts` `assemblePrompt` | every scope/build agent (shared header) |
 | `scope.md` | `supervisor.ts` `assemblePrompt` | a scope run (read-only planner) |
 | `build.md` | `supervisor.ts` `assemblePrompt` | a build run (read-write worker) |
+| `planner.md` | `supervisor.ts` `assemblePrompt` (shape override) | the `plan` stage's fresh read-only planner (RUN-140) |
 | `verify-agent.md` | `verify-agent.ts` `assembleVerifyPrompt` | a dispatched verify run (RUN-20) |
 | `reviewer.md` | `verify-reviewer.ts` `assembleReviewerPrompt` | the inline reviewer (RUN-61) |
 | `reviewer-feedback.md` | `verify-reviewer.ts` `reviewerFeedbackPrompt` | the builder, after a reviewer FAIL |

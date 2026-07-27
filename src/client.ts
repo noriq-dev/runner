@@ -1,4 +1,4 @@
-import { ExecutionSpec } from '@noriq-dev/shared';
+import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
@@ -46,7 +46,12 @@ export function parseMcpText(raw: string): unknown {
     error?: { message?: string };
   };
   if (envelope.error) throw new Error(envelope.error.message ?? 'mcp error');
+  // A TOOL-level failure is an HTTP 200 with `isError: true` and the message in the text block —
+  // only a PROTOCOL failure lands in `envelope.error`. Reading the text and ignoring the flag made
+  // every refusal (maintenance mode, an authorization refusal, a validation error) look like a
+  // successful call that returned a string, so a write that never happened reported as done.
   const text = envelope.result?.content?.find((c) => c.type === 'text')?.text;
+  if (envelope.result?.isError) throw new Error(text ?? 'mcp tool error');
   if (text == null) return null;
   try {
     return JSON.parse(text);
@@ -347,6 +352,27 @@ export class NoriqClient {
       // would let a planner overwrite a real one.
       ...readSpec(t.executionSpec, t.executionSpecUnreadable === true),
     };
+  }
+
+  /**
+   * Write a synthesized execution spec back onto the task (RUN-140).
+   *
+   * The point of planning in a separate context is that the plan becomes an ARTIFACT — visible in
+   * the dashboard, correctable by a human before the build acts on it, and reused by a retry
+   * instead of re-derived. A spec that only ever existed inside one run's prompt would have cost
+   * the tokens and bought none of that.
+   *
+   * Re-reads the task first and REFUSES to overwrite a spec that is there now. The decision to
+   * plan was made before a model call that takes minutes, and a human editing the task in that
+   * window is not a race worth losing — the dashboard exists so they can (RUN-137). Not atomic,
+   * and it is not pretending to be: it closes the minutes-wide window, not the milliseconds-wide
+   * one, and the server-side compare-and-set that would close both is a contract change.
+   */
+  async setExecutionSpec(projectId: string, taskId: string, spec: ExecutionSpec): Promise<boolean> {
+    const current = await this.getTask(taskId).catch(() => null);
+    if (current && (hasExecutionSpec(current.executionSpec) || current.executionSpecUnreadable)) return false;
+    await this.mcpCall('update_task', { projectId, taskId, executionSpec: spec });
+    return true;
   }
 
   /**

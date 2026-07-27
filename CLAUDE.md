@@ -81,7 +81,18 @@ under-informed, not independent). Findings reach the agent and, when they are co
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud
 that a spec cannot change an agent's mode, permissions, or what it may publish, because every field
-in it is free text from the server. Most tasks have no spec, and that stays a first-class state.
+in it is free text from the server.
+
+A task that arrives WITHOUT one gets the **`plan` stage** (RUN-140): a fresh read-only agent
+(`src/stages/plan.ts`, `prompts/planner.md`) reads the repo, emits a spec, and the daemon writes it
+back to the task — so the plan is an artifact a human can correct and a retry can reuse, rather than
+a thought inside one build's context. Three things narrow it beyond the usual clamp, each closing
+something the clamp does not: `auto` is dropped (it survives `clampPermissionToWorkflow` by design,
+and on Claude it means unrestricted Bash in a worktree that is writable for the build); it gets **no
+`noriqMcp`**, because a filesystem clamp says nothing about `update_task`; and it may take only a
+quarter of the run's remaining ceiling, after which the builder RE-RESERVES. Planning can never cost
+a run: every failure path leaves it exactly as unplanned as it arrived, which is still a first-class
+state.
 
 Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
 (tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and

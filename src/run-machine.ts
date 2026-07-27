@@ -34,7 +34,7 @@ import type { Workflow } from './workflow';
  * where the terminal report, the continuation record, the lock release, and the workspace decision
  * live, and it is the only stage that runs no matter how the run got there.
  */
-export type StageName = 'prepare' | 'execute' | 'verify' | 'review' | 'integrate' | 'settle';
+export type StageName = 'prepare' | 'plan' | 'execute' | 'verify' | 'review' | 'integrate' | 'settle';
 
 /** Which actor a stage spawns, in the vocabulary the permission floor already uses. */
 export type StageActor =
@@ -125,6 +125,27 @@ export const RUN_STAGES: readonly RunStage[] = [
     ],
     optional: false,
     appliesTo: always,
+  },
+  {
+    name: 'plan',
+    purpose: 'Write the execution spec the builder will be handed, when the task arrived without one.',
+    inputs: ['worktree', 'task', 'tally'],
+    outputs: ['executionSpec', 'prompt'],
+    // A FRESH read-only actor, and the posture is the guarantee rather than the prompt: at the
+    // `verify` posture `clampPermissionToWorkflow` forces write=false at the spawn, so a planner
+    // that decided to start implementing could not (RUN-118/158).
+    actor: 'verify',
+    budget: 'run',
+    retry: { kind: 'none' },
+    // NOTHING. A planner that fails, emits nothing parseable, or has no budget left leaves the run
+    // exactly as it would have been without this stage — unplanned, which is how every run worked
+    // before RUN-134 and how a task with no spec still works. Planning is worth tokens, not a run.
+    terminal: [],
+    optional: true,
+    // Only a workflow that PRODUCES needs a spec written for it: a scope run IS the planner, and a
+    // verify run judges a diff rather than making one. The stage also no-ops when the task already
+    // has a spec — that is the stage's own business, not the sequence's.
+    appliesTo: (wf) => wf.produces,
   },
   {
     name: 'execute',
