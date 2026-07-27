@@ -28,7 +28,6 @@ import { zeroTelemetry } from './drivers/types';
 import {
   type LandOutcome,
   assembleConflictPrompt,
-  landFailureComment,
   parseResolution,
   rejectTargetBranch,
   resolveLandBranch,
@@ -45,24 +44,22 @@ import {
   loadRepoContextBrief,
   renderRepoContext,
 } from './repo-context';
+import { type StageName, stagesFor } from './run-machine';
 import { noriqToolNamesFor, sanitizedAgentEnv } from './security';
+import {
+  type RunPipeline,
+  type StageHost,
+  type StageImpl,
+  integrateStage,
+  reviewStage,
+  settleStage,
+  verifyStage,
+} from './stages';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
-import {
-  type VerifyExec,
-  type VerifySpec,
-  runVerify,
-  verifyFailureComment,
-  verifyFeedbackPrompt,
-  verifyFixRounds,
-} from './verify';
-import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
-import {
-  assembleReviewerPrompt,
-  reviewerFeedbackPrompt,
-  reviewerNoVerdictComment,
-  reviewerRejectionComment,
-} from './verify-reviewer';
+import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
+import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict } from './verify-agent';
+import { assembleReviewerPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, workflowFor } from './workflow';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
@@ -631,6 +628,46 @@ export class RunSupervisor {
       this.transcripts.set(runId, t);
     }
     return t;
+  }
+
+  /**
+   * The surface the pipeline's stages reach (RUN-131), built as an explicit object rather than by
+   * handing the stages `this`.
+   *
+   * Deliberate: satisfying `StageHost` structurally would mean making `landRun`, `enforceLockFloor`
+   * and the rest PUBLIC on an exported class, and a typed caller could then invoke `landRun` with
+   * its own policy — skipping the no-changes gate, the checkpoint, the lock floor, the deterministic
+   * floor and the review that landing is only ever supposed to happen after. A refactor that
+   * publishes a way around the gates it is refactoring has changed the security surface, whatever it
+   * did to the control flow. Closures keep every one of them private.
+   */
+  private stageHost(): StageHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      // A no-op without a comment sink, which is exactly how every call site already treated it.
+      postComment: (projectId, taskId, body) => this.deps.postComment?.(projectId, taskId, body),
+      transcript: (runId) => this.transcript(runId),
+      // Close the transcript with its outcome and forget it — the stream a human reads has to END
+      // (RUN-74), and a map that only ever grows is a leak with a nicer name.
+      endTranscript: (runId, outcome) => {
+        const t = this.transcripts.get(runId);
+        if (!t) return;
+        t.milestone(`run finished: ${outcome}`);
+        t.end();
+        this.transcripts.delete(runId);
+      },
+      vcsFor: (repo) => this.vcsFor(repo),
+      lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
+      withRepoLock: (root, fn) => this.withRepoLock(root, fn),
+      enforceLockFloor: (repo, run, ws, token) => this.enforceLockFloor(repo, run, ws, token),
+      verifyWithFeedback: (ctx) => this.verifyWithFeedback(ctx),
+      reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
+      landRun: (ctx) => this.landRun(ctx),
+      // The run's effective ceiling: the dispatch's, else the machine default (RUN-14).
+      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+      ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+    };
   }
 
   constructor(private readonly deps: RunSupervisorDeps) {
@@ -2055,366 +2092,67 @@ export class RunSupervisor {
      *  seeds the reviewer, and it decides whether the terminal record is refreshed or dropped. */
     continued?: ContinuableRun | null;
   }): Promise<DriverExit> {
-    const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, tally, verifyText, tail } =
-      ctx;
+    const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
     const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
     const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
-    // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
-    // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.
-    let latestLedger: LedgerEntry[] = continued?.ledger ?? [];
-    const budgetRun = { session: ctx.session, stop: ctx.stopSession };
-    let exit = ctx.exit;
-    // Whether the DRIVER succeeded — drives worktree retention (a build with a diff
-    // is kept for the human even if verify then fails).
-    let driverSucceeded = exit.outcome === 'done';
-    // Whether the diff reached the integration branch. Once it has, the run's worktree
-    // and throwaway branch are disposable — that is what stops them accumulating.
-    let landed = false;
 
-    // A build that changed NOTHING is not a success. An agent that bailed (blocked,
-    // refused, or ran out of road) exits clean with a pristine worktree; verifying that
-    // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
-    // review as "done" with an empty diff — a silent no-op reported as success.
-    if (wf.produces && driverSucceeded) {
-      // Can't tell → assume it worked and let verify decide. Declaring `no_changes` reaps the
-      // worktree, so guessing "empty" on a broken probe destroys the diff; guessing "full" at worst
-      // spends a verify run on a tree a human can still see (RUN-152).
-      const changed = await this.vcsFor(repo)
-        .hasWork(worktree)
-        .catch((err) => {
-          this.log.warn('could not tell whether the build produced changes — assuming it did', {
-            runId: run.id,
-            err: String(err),
-          });
-          return true;
-        });
-      if (!changed) {
-        this.log.warn('build produced no changes — skipping verify, not a success', { runId: run.id });
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'no_changes' };
-        driverSucceeded = false;
-      }
+    // The pipeline as an explicit SEQUENCE (RUN-131). What used to be ~390 lines of gates in one
+    // method is now `stagesFor(wf)` — a declared, ordered list this loop walks. Which stages a
+    // workflow runs is the descriptor's `appliesTo`, so the two flag tests that used to be repeated
+    // in every gate (`wf.produces`, `wf.verifyActor`) are stated once, where the sequence is.
+    const pipeline: RunPipeline = {
+      run,
+      repo,
+      worktree,
+      driver,
+      permission,
+      ...(ctx.noriqMcp ? { noriqMcp: ctx.noriqMcp } : {}),
+      task,
+      runAgent,
+      session: ctx.session,
+      stopSession: ctx.stopSession,
+      tally,
+      sessionText: verifyText,
+      ...(ctx.getSessionText ? { getSessionText: ctx.getSessionText } : {}),
+      tail,
+      continued,
+      workflow: wf,
+      exit: ctx.exit,
+      // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
+      // the human even if verify then fails).
+      driverSucceeded: ctx.exit.outcome === 'done',
+      // Whether the diff reached the integration branch. Once it has, the run's worktree and
+      // throwaway branch are disposable — that is what stops them accumulating.
+      landed: false,
+      // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
+      // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.
+      ledger: continued?.ledger ?? [],
+      // Decided by `verify`, once, at the point the pipeline always decided it.
+      landPolicy: null,
+    };
+
+    const host = this.stageHost();
+    for (const s of stagesFor(wf)) {
+      const impl = POST_DRIVER_STAGES[s.name];
+      if (impl) await impl(host, pipeline);
     }
-
-    // Make the diff durable BEFORE anything else can touch the worktree. The agent may
-    // not have (or use) git permissions, and loose files are destroyed by the next
-    // `worktree remove --force` — including the crash-safe reap on the daemon's next
-    // start. Committing here is what makes "a review diff on the branch" true.
-    if (wf.produces && driverSucceeded) {
-      const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
-      await this.vcsFor(repo)
-        .checkpoint(worktree, runCommitMessage(run.id, label))
-        .then((committed) => {
-          if (committed)
-            this.log.info('committed the run diff to its branch', {
-              runId: run.id,
-              workRef: worktree.workRef,
-            });
-        })
-        .catch((err) =>
-          this.log.error('could not commit the run diff — it stays uncommitted', {
-            runId: run.id,
-            err: String(err),
-          }),
-        );
-
-      // The hard floor (RUN-102), AFTER the checkpoint so the diff is preserved on the branch for
-      // a human even when gated: acquire locks over everything this build changed. A conflict
-      // means it touched a path a peer holds (the reactive hook missed it, or this is Codex) —
-      // gate it, do not land it. Marking exit `failed{lock}` (while keeping driverSucceeded, so
-      // the diff + worktree are kept like a verify failure) makes every gate below skip: they key
-      // off `exit.outcome === 'done'`.
-      const floorConflicts = await this.enforceLockFloor(repo, run, worktree, ctx.runAgent.token);
-      if (floorConflicts.length) {
-        this.log.warn('hard lock floor gated the build — it changed paths a peer holds', {
-          runId: run.id,
-          holders: floorConflicts.map((c) => c.holderName ?? c.holder),
-        });
-        this.transcript(run.id).milestone(
-          `🔒 hard lock floor gated this build — it changed ${floorConflicts
-            .map((c) => c.path)
-            .join(', ')}, held by ${floorConflicts.map((c) => c.holderName ?? c.holder).join(', ')}`,
-        );
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, lockFloorComment(floorConflicts));
-        }
-        // Failed, but driverSucceeded STAYS true — so the committed diff and its worktree are
-        // kept for a human, exactly like a verify failure. The gates below all key off
-        // `exit.outcome === 'done'`, so none of them run; landing is likewise skipped.
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'lock' };
-      }
-    }
-
-    // ── Landing (opt-in via the manifest's [land]) ────────────────────────────────
-    // Rebase onto the integration tip → verify THERE → fast-forward in → reap. Verify
-    // runs after the rebase on purpose: two runs can each be green at their own fork
-    // point and broken together, and a gate that never sees the combination can't catch
-    // it. Serialized per repo, because rebase→verify→land is a read-modify-write of one
-    // branch and two runs interleaving would land untested combinations.
-    const landPolicy = wf.produces && driverSucceeded ? (repo.manifest.land ?? null) : null;
-    const floorCmd = cmdVerify(repo.manifest.verify);
-
-    // Deterministic verify floor (RUN-19), when NOT landing — the landing pipeline verifies the
-    // REBASED result instead, which is strictly the better question. Runs BEFORE the reviewer
-    // (RUN-61): the command is cheap and deterministic, so it screens out work not worth an
-    // agent's review — the same reason CI runs the linter before the humans arrive.
-    if (wf.produces && driverSucceeded && exit.outcome === 'done' && !landPolicy && floorCmd) {
-      // Same silence as landing, and the longer of the two in practice: the full suite with
-      // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
-      // the agent on a failure, which flips the phase to 'agent' again — see below.
-      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
-      const result = await this.verifyWithFeedback({
-        run,
-        spec: floorCmd,
-        cwd: worktree.localPath,
-        session: budgetRun.session,
-        phase: 'verifying',
-      });
-      if (result.passed) {
-        this.log.info('deterministic verify passed', { runId: run.id });
-      } else {
-        this.log.warn('deterministic verify FAILED — run gated (not done)', {
-          runId: run.id,
-          exitCode: result.exitCode,
-          timedOut: result.timedOut,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, verifyFailureComment(floorCmd, result));
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify' };
-      }
-    }
-
-    // Inline reviewer (RUN-61): a FRESH agent judges whether the diff satisfies the INTENT — the
-    // question the command cannot ask. Before landing, deliberately: a rebase changes whether the
-    // combination still builds (the command's question, asked post-rebase inside the lock), never
-    // what the diff means — and an agent review inside the repo lock would serialize every other
-    // run on this repo behind a judgment that cannot change.
-    if (wf.produces && driverSucceeded && exit.outcome === 'done' && repo.manifest.verify?.agent) {
-      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
-      const review = await this.reviewWithFeedback({
-        run,
-        repo,
-        worktree,
-        driver,
-        session: budgetRun.session,
-        task,
-        tally,
-        getSessionText: ctx.getSessionText,
-        budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-        priorLedger: continued?.ledger,
-      });
-      latestLedger = review.ledger; // the freshest adjudication state, for the continuable record
-      if (review.passed) {
-        this.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });
-      } else if (review.verdict === 'fail') {
-        this.log.warn('inline reviewer refused the work — run gated (not done)', {
-          runId: run.id,
-          verdict: review.verdict,
-          rounds: review.rounds,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(
-            run.projectId,
-            run.anchor.taskId,
-            reviewerRejectionComment(review.findings, review.rounds),
-          );
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review' };
-      } else {
-        // 'unknown' = the gate never rendered a judgment (reviewer killed, crashed, budget
-        // breach, missing driver, no VERDICT line). NOT a refusal — saying "the reviewer
-        // found problems" about a reviewer somebody killed is a lie in both directions: it
-        // maligns the diff and it hides the infrastructure failure. The run still cannot
-        // pass — silence must not read as a gate that isn't there — but the reason and the
-        // comment say what actually happened, and no fix rounds were burned on a non-report.
-        this.log.warn('inline reviewer rendered NO verdict — run gated, not judged', {
-          runId: run.id,
-          rounds: review.rounds,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(
-            run.projectId,
-            run.anchor.taskId,
-            reviewerNoVerdictComment(review.findings),
-          );
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review:no-verdict' };
-      }
-    }
-
-    if (landPolicy && exit.outcome === 'done') {
-      // The agent process is gone and the spend stops moving here, so without this the
-      // dashboard shows "running" through a rebase → verify → fast-forward that can take a
-      // minute — and a queue behind the repo lock makes it longer (RUN-31).
-      this.deps.report(run.id, { status: 'running', phase: 'landing' });
-      const outcome = await this.withRepoLock(repo.root, () =>
-        this.landRun({
-          run,
-          repo,
-          worktree,
-          policy: landPolicy,
-          session: budgetRun.session,
-          task,
-          driver,
-          permission,
-          noriqMcp,
-          tally,
-          budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-        }),
-      ).catch(
-        (err): LandOutcome => ({
-          landed: false,
-          branch: landPolicy.branch,
-          reason: 'error',
-          detail: String(err),
-        }),
-      );
-
-      if (outcome.landed) {
-        this.log.info('landed', {
-          runId: run.id,
-          branch: outcome.branch,
-          sha: outcome.sha,
-          resolvedByAgent: outcome.resolvedByAgent,
-        });
-      } else {
-        this.log.warn('could not land — the diff stays on its branch', {
-          runId: run.id,
-          branch: outcome.branch,
-          reason: outcome.reason,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, landFailureComment(outcome, run.id));
-        }
-        // The gate rejecting the COMBINATION is a real failure, same as rejecting the
-        // change alone — the run does not reach done either way.
-        // NB: deliberately does NOT clear driverSucceeded — that flag decides whether the
-        // worktree survives, and an unlanded diff is exactly what a human still needs.
-        exit = { ...exit, outcome: 'failed', isError: true, reason: `land:${outcome.reason}` };
-      }
-      landed = outcome.landed;
-    }
-
-    // Every gate that could hand work back has now run, so the session has no more work to do.
-    // It MUST be closed explicitly: a multiTurn run deliberately does not self-close on its first
-    // result (that is the whole point — RUN-29), so nothing else ever shuts the SDK query down,
-    // and an open one keeps the daemon's event loop alive forever. Best-effort: a session that is
-    // already gone is the normal case for every single-turn run.
-    await budgetRun.stop().catch(() => {});
-
-    // Independent verify agent (RUN-20): the run's own output IS the verdict. A
-    // FAIL (or an ambiguous/absent verdict) gates the phase — the run does not
-    // reach done and the findings are surfaced.
-    if (wf.verifyActor && driverSucceeded) {
-      const v = parseVerdict(verifyText);
-      if (v.passed) {
-        this.log.info('verify agent PASS', { runId: run.id });
-      } else {
-        this.log.warn('verify agent gate — phase not cleared', { runId: run.id, verdict: v.verdict });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, verifyAgentComment(v));
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify_agent' };
-      }
-    }
-
-    // The run's true spend + mix, summed across every session that billed (RUN-59): the primary
-    // (with its fix turns), every reviewer round, the conflict resolver, and any prior park — all
-    // recorded into the tally by now. This supersedes the primary session's own first-result
-    // snapshot (`exit.telemetry`), which missed both the sub-sessions and the fix turns.
-    exit = { ...exit, telemetry: tally.total() };
-    this.deps.report(run.id, {
-      status: exit.outcome,
-      agentId: runAgent.agentId,
-      telemetry: exit.telemetry,
-      logTail: tail,
-      exit: { outcome: exit.outcome, reason: exit.reason },
-    });
-
-    // Continue a failed run (RUN-92): a gate-failed build keeps its work (the same condition the
-    // dispose below skips on), so record what a continue must inherit that git cannot carry —
-    // the CUMULATIVE spend (tally.total already folds any prior sitting, so re-seeding the next
-    // continue from it never double-counts: `put` replaces, never adds) and the reviewer's final
-    // ledger. Any OTHER terminal — done, landed, a driver failure, a non-build — leaves nothing to
-    // continue, so drop a record a prior failed sitting may have left (this continuation resolved it).
-    if (this.deps.continuable) {
-      if (wf.produces && exit.outcome === 'failed' && driverSucceeded && !landed) {
-        const spent = exit.telemetry;
-        // What this sitting touched becomes the continuation's declared lock scope (RUN-130).
-        // Best-effort: a backend without `changedPaths`, or a query that errors, simply records
-        // none — the predictive layer then no-ops exactly as it did while nothing was bound.
-        const changedPaths = await (this.vcsFor(repo).changedPaths?.(worktree) ?? Promise.resolve([]))
-          .then((p) => p)
-          .catch(() => [] as string[]);
-        await this.deps.continuable
-          .put({
-            runId: run.id,
-            spent: {
-              tokens: totalTokens(spent),
-              usd: spent.costUsd,
-              ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
-            },
-            ledger: latestLedger,
-            ...(changedPaths.length ? { changedPaths } : {}),
-            failedAt: new Date().toISOString(),
-          })
-          .catch((err) =>
-            this.log.warn('could not persist continuation state', { runId: run.id, err: String(err) }),
-          );
-      } else {
-        await this.deps.continuable.remove(run.id).catch(() => {});
-      }
-    }
-
-    // Keep only what a human still has to act on: a build whose diff did NOT land. Once
-    // it is on the integration branch the worktree and its throwaway branch are dead
-    // weight — reaping them here is what keeps ~/.noriq/worktrees from growing one
-    // directory per run forever. Scope/verify and driver failures are cleaned up as before.
-    //
-    // EXCEPT on a backend whose dispose preserves the work itself (RUN-52): there, skipping
-    // dispose is not "keep the work", it is "hold the pool-of-1 lease forever" — the next run
-    // on this repo would wait on a workspace nobody will ever hand back. Such a backend
-    // shelves/keeps the work server-side inside dispose, so disposing IS keeping.
-    const vcsOut = this.vcsFor(repo);
-    // Release the run's locks on terminal (RUN-104), UNCONDITIONALLY — a kept-work build skips
-    // dispose (below), but its locks must still free so a peer waiting on those files unblocks.
-    // Placed AFTER landing on purpose (RUN-105): the locks are HELD THROUGH the rebase→verify→
-    // fast-forward, so a second run in another worktree on this repo cannot grab a file mid-merge
-    // and race it — locks live server-side, so runs across worktrees see each other's holds — and
-    // they release only once the work is actually on the integration branch.
-    // Best-effort: the server also auto-releases on task settle and via TTL, so a miss here (a
-    // crash before this line, a transient error) costs promptness, never correctness — the same
-    // reason a daemon RESTART needs no lock reconcile of its own: the existing orphaned-run
-    // reconcile fails those runs, which settles their tasks, which releases their locks server-side.
-    if (vcsOut.releaseRunLocks) {
-      await vcsOut
-        .releaseRunLocks(worktree, {
-          projectId: run.projectId,
-          token: ctx.runAgent.token,
-          branch: this.lockScopeBranch(repo, run),
-          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
-        })
-        .catch((err) =>
-          this.log.warn('lock release on terminal failed', { runId: run.id, err: String(err) }),
-        );
-    }
-    if (!(wf.produces && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
-      await vcsOut
-        .dispose(worktree)
-        .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
-    }
-    this.log.info('run finished', { runId: run.id, outcome: exit.outcome, reason: exit.reason });
-    // Close the transcript with the outcome, so the stream a human reads actually ENDS (RUN-74).
-    const transcript = this.transcripts.get(run.id);
-    if (transcript) {
-      transcript.milestone(`run finished: ${exit.outcome}${exit.reason ? ` — ${exit.reason}` : ''}`);
-      transcript.end();
-      this.transcripts.delete(run.id);
-    }
-    return exit;
+    return pipeline.exit;
   }
 }
+
+/**
+ * The stages this method runs. `prepare` and `execute` happen in `supervise`/`resume` BEFORE the
+ * pipeline object exists — they are what BUILDS it — so they are declared in the sequence and
+ * absent here. A stage with no entry is skipped, which is what lets the two halves land separately
+ * without the list ever disagreeing with itself.
+ */
+const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
+  verify: verifyStage,
+  review: reviewStage,
+  integrate: integrateStage,
+  settle: settleStage,
+};
 
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {

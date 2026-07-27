@@ -192,6 +192,17 @@ export {
 } from './drivers/codex';
 export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from './drivers/budget';
 export {
+  RUN_STAGES,
+  declaredTerminals,
+  stage,
+  stagesFor,
+  type RunStage,
+  type StageActor,
+  type StageBudget,
+  type StageName,
+  type StageRetry,
+} from './run-machine';
+export {
   RunSupervisor,
   RunTally,
   assemblePrompt,
