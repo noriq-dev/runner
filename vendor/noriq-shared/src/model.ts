@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ExecutionSpec } from './execution-spec';
 
 // ---------------------------------------------------------------------------
 // Core entities (ROADMAP §4). These schemas are the single source of truth:
@@ -102,6 +103,25 @@ export const Task = z.object({
   claimExpiresAt: z.string().datetime().nullable(),
   openComments: z.number().int().nonnegative().default(0),
   order: z.number().int(),
+  /**
+   * What a builder is told before it is allowed to spend anything (RUN-134/135).
+   *
+   * Optional as well as nullable, because the two admit different things. NULL is a fact about
+   * the task — nobody wrote a spec. ABSENT is a fact about the READ: only the detail surfaces
+   * (`get_task`, `GET /api/tasks/:id`) carry a spec, because a board snapshot ships every task in
+   * a project and renders none of this, and paying the whole feature's payload on every poll to
+   * draw a column of titles would be a poor trade.
+   */
+  executionSpec: ExecutionSpec.nullable().default(null).optional(),
+  /**
+   * The stored spec could not be read (RUN-135) — corrupt JSON, or a shape this schema no longer
+   * accepts. Absent on every healthy task.
+   *
+   * It exists so `executionSpec: null` can be trusted. Anything that PLANS reads a null spec as
+   * "nobody planned this" and writes one, so a corrupt value quietly reported as null would be
+   * overwritten by the next planner run; this is the flag that says "do not conclude that".
+   */
+  executionSpecUnreadable: z.boolean().optional(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });

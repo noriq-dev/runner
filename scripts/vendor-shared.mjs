@@ -7,14 +7,24 @@ import { existsSync } from 'node:fs';
 import { cp, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 
-// Sibling checkout by default (the remote is noriq-dev/noriq, so a fresh clone is
-// `noriq`); pass an explicit path for any other layout.
-const noriq = process.argv[2] ?? path.resolve('../../noriq');
-const srcDir = path.join(noriq, 'packages/shared/src');
+// Where a Noriq checkout usually is, tried in order. Both are "a sibling clone named
+// `noriq`" — the remote is noriq-dev/noriq — and they differ only in whether the two
+// repos sit directly beside each other (`~/git/{runner,noriq}`) or under a shared
+// parent (`~/git/noriq/{runner,noriq}`). Guessing one and failing on the other sent
+// this script's own task hunting for the right invocation; an explicit path still wins.
+const CANDIDATES = ['../../noriq', '../noriq'];
+const shared = (root) => path.join(root, 'packages/shared/src');
+
+const explicit = process.argv[2];
+const srcDir = explicit
+  ? shared(path.resolve(explicit))
+  : CANDIDATES.map((c) => shared(path.resolve(c))).find(existsSync);
 const destDir = path.resolve('vendor/noriq-shared/src');
 
-if (!existsSync(srcDir)) {
-  console.error(`Noriq shared source not found at ${srcDir}`);
+if (!srcDir || !existsSync(srcDir)) {
+  console.error(
+    `Noriq shared source not found at ${srcDir ?? CANDIDATES.map((c) => shared(path.resolve(c))).join(' or ')}`,
+  );
   console.error('pass the Noriq checkout path: npm run vendor:shared -- /path/to/noriq');
   process.exit(1);
 }
