@@ -63,6 +63,7 @@ import {
   type Workflow,
   clampPermissionToWorkflow,
   resolveWorkflow,
+  runWorkflow,
   workflowFor,
 } from './workflow';
 
@@ -299,9 +300,18 @@ export function effectiveKind(
   run: Pick<Run, 'kind' | 'workflow'>,
   manifest: Pick<ProjectManifest, 'workflows'>,
 ): RunKind {
-  if (!run.workflow) return run.kind as RunKind;
-  const wf = resolveWorkflow(run.workflow, manifest);
-  return (wf?.promptShape ?? run.kind) as RunKind;
+  const wf = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  const kind = (wf?.promptShape ?? run.kind) as RunKind;
+  // A kind outside the union degrades to SCOPE rather than being passed through. Everything
+  // downstream indexes a fixed-key record with this — `manifest.permissions[kind]`,
+  // `manifest.defaults[kind]`, `noriqToolNamesFor(kind)` — and an unrecognised key yields
+  // `undefined`, which the write clamp then throws on. A WS dispatch is schema-validated, but a
+  // PARKED run is rehydrated from JSON on disk without revalidation, so this is reachable. Scope
+  // because a fallback that guessed `build` would answer "I don't recognise this" with "then you
+  // may write and land".
+  // `Object.hasOwn`, not `in` — see the note on `isBuiltinId`: `'toString' in BUILTIN_WORKFLOWS` is
+  // true, which would wave through the exact keys this guard exists to catch.
+  return Object.hasOwn(BUILTIN_WORKFLOWS, kind) ? kind : 'scope';
 }
 
 export function resolveModel(
@@ -1305,6 +1315,16 @@ export class RunSupervisor {
     const reviewer = manifest.verify?.agent;
     // The reviewer as a coordinate (RUN-113): `[verify.agent].agent = "codex.gpt-5_6-sol.high"`
     // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields.
+    //
+    // RUN-132 gives the workflow's `review` stage a coordinate slot of its own, which belongs in
+    // this ladder above `[verify.agent]` — a workflow whose point is a harder look ("audit") should
+    // say so on the stage rather than by moving the one setting every other workflow shares. It is
+    // NOT wired here, and deliberately: `WorkflowDef` is the VENDORED wire contract and carries
+    // `base` + `prompt` only, so nothing can set a stage coordinate and the branch would be
+    // unreachable. When the phase-3 vendor refresh grows the field this method needs the run's
+    // workflow threaded in (it has `ctx.run` + the manifest but does not resolve one today) and
+    // `stageOf(wf, 'review')?.agent` folded in ahead of `reviewer?.agent` — which means it also
+    // has to enter the tool/model/effort precedence below, not just the coordinate parse.
     const reviewerCoord = reviewer?.agent ? tryParseCoordinate(reviewer.agent) : null;
     const reviewerTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
     // The reviewer's driver (RUN-70): the repo may put a different VENDOR's model in judgment —
@@ -1581,7 +1601,9 @@ export class RunSupervisor {
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
     const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
-    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
+    // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
+    // posture either way; what the named one adds is its declared stage list.
+    const wf = runWorkflow(run, repo.manifest);
     const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
@@ -1838,13 +1860,16 @@ export class RunSupervisor {
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
-    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
-    const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
+    // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
+    // posture either way; what the named one adds is its declared stage list.
+    const wf = runWorkflow(run, repo.manifest);
 
     // The pipeline as an explicit SEQUENCE (RUN-131). What used to be ~390 lines of gates in one
-    // method is now `stagesFor(wf)` — a declared, ordered list this loop walks. Which stages a
-    // workflow runs is the descriptor's `appliesTo`, so the two flag tests that used to be repeated
-    // in every gate (`wf.produces`, `wf.verifyActor`) are stated once, where the sequence is.
+    // method is now `stagesFor(wf)` — a declared, ordered list this loop walks, so the two flag
+    // tests that used to be repeated in every gate (`wf.produces`, `wf.verifyActor`) are stated
+    // once, where the sequence is. Which stages come back is `(mandatory ∪ the workflow's
+    // declaration) ∩ appliesTo` (RUN-132): the workflow chooses among the optional ones, and the
+    // machine decides what may be chosen and in what order.
     const pipeline: RunPipeline = {
       run,
       repo,

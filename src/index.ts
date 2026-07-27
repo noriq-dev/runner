@@ -112,8 +112,11 @@ export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from 
 export {
   BUILTIN_WORKFLOWS,
   type Workflow,
+  type WorkflowStage,
   clampPermissionToWorkflow,
   resolveWorkflow,
+  runWorkflow,
+  stageOf,
   workflowFor,
 } from './workflow';
 export {
@@ -194,6 +197,7 @@ export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from 
 export {
   RUN_STAGES,
   declaredTerminals,
+  clampStagesToWorkflow,
   stage,
   stagesFor,
   type RunStage,

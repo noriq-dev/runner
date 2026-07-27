@@ -1,4 +1,42 @@
-import type { PermissionProfile, ProjectManifest, RunKind } from '@noriq-dev/shared';
+import type { PermissionProfile, ProjectManifest, Run, RunKind } from '@noriq-dev/shared';
+import { type StageActor, type StageName, clampStagesToWorkflow } from './run-machine';
+
+/**
+ * One stage as the WORKFLOW declares it (RUN-132).
+ *
+ * The division of labour with `RunStage` (run-machine.ts) is the whole design and is worth stating
+ * plainly, because getting it backwards would put a manifest inside the trust boundary:
+ *
+ *   - the MACHINE owns what a stage IS — its order in the sequence, its inputs and outputs, the
+ *     posture its actor runs under, which workflows may run it at all, and whether it may be
+ *     declined;
+ *   - the WORKFLOW owns only whether it runs an OPTIONAL one, and which model does the work.
+ *
+ * So a declaration here can narrow the pipeline and pick an agent, and nothing else. A `role` wider
+ * than the machine's own `actor` is clamped down (`clampStagesToWorkflow`), and the posture that
+ * actually reaches a spawn is still `clampPermissionToWorkflow`'s — a declaration is *reported*,
+ * never granted.
+ */
+export interface WorkflowStage {
+  name: StageName;
+  /**
+   * Which actor this stage runs, in the machine's own vocabulary. Reported, not granted: it may
+   * never exceed the machine's `RunStage.actor`, and a declaration that tries is narrowed at
+   * resolution — so `role` is a statement about the pipeline, never a lever on it.
+   */
+  role: StageActor;
+  /**
+   * The agent coordinate this stage's actor would run under (`claude.opus-4_8.high`, RUN-113).
+   * Null = inherit, which is what every built-in says: the run's own coordinate for a `run` role,
+   * the repo's `[verify.agent]` for a judging one.
+   *
+   * **Declared, not yet consumed.** Nothing can set it — `WorkflowDef` (the vendored contract)
+   * carries `base` + `prompt` only — so no spawn reads it today, and `runReviewer` says where it
+   * would go. It is carried through the clamp untouched because a coordinate chooses a MODEL and
+   * never a posture: the write floor does not care which model is judging.
+   */
+  agent: string | null;
+}
 
 /**
  * A workflow (RUN-116) is the SHAPE of a run — what it may touch, what it produces, and which gates
@@ -39,7 +77,32 @@ export interface Workflow {
   /** A custom prompt (template name or inline text) overriding the base's default brief (RUN-119).
    *  Absent/null on a built-in → the promptShape's own template. Consumed by RUN-121. */
   promptRef?: string | null;
+  /**
+   * The stages this workflow runs (RUN-132) — the pipeline, declared rather than derived.
+   *
+   * It replaces reading `RunStage.appliesTo` as the ONLY answer, but not as the FLOOR. What
+   * `stagesFor` actually runs is `(mandatory ∪ declared) ∩ appliesTo`, which bounds a declaration
+   * from both ends: it can turn an OPTIONAL stage off, it can never turn one on that this posture
+   * may not run, and it can never decline one the machine marks mandatory. Order is not declared
+   * here either — it comes from `RUN_STAGES`, because "reviews before it integrates" is a security
+   * ordering and not a preference.
+   */
+  stages: readonly WorkflowStage[];
 }
+
+/** A stage a built-in declares: the machine's own role, no coordinate — inherit whatever the run or
+ *  the repo already names. Every built-in list is written this way, which is why RUN-132 changes no
+ *  behaviour: the declarations restate exactly what `appliesTo` already computed. */
+const declare = (name: StageName, role: StageActor): WorkflowStage => ({ name, role, agent: null });
+
+/** The stages every workflow runs. Not a convention: `RunStage.optional` marks these mandatory and
+ *  `stagesFor` unions them back in, so omitting one from a declaration changes nothing. Listing them
+ *  here anyway keeps each built-in readable as its whole pipeline rather than as a delta. */
+const SPINE: readonly WorkflowStage[] = [
+  declare('prepare', 'none'),
+  declare('execute', 'run'),
+  declare('verify', 'none'),
+];
 
 /** The three built-in workflows — the `scope`/`build`/`verify` kinds expressed as data, reproducing
  *  today's behavior exactly (RUN-116). Keyed by id for the kind→workflow back-compat map. */
@@ -51,6 +114,8 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
     produces: false,
     verifyActor: false,
     usesPlanBase: false,
+    // Nothing to review and nothing to land: a scope run produces a plan, not a diff.
+    stages: [...SPINE, declare('settle', 'none')],
   },
   build: {
     id: 'build',
@@ -59,6 +124,7 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
     produces: true,
     verifyActor: false,
     usesPlanBase: true,
+    stages: [...SPINE, declare('review', 'verify'), declare('integrate', 'run'), declare('settle', 'none')],
   },
   verify: {
     id: 'verify',
@@ -67,16 +133,31 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
     produces: false,
     verifyActor: true,
     usesPlanBase: true,
+    // A verify run IS the reviewer — it does not spawn another one, and its own verdict is read in
+    // `settle` once the session that wrote it is closed.
+    stages: [...SPINE, declare('settle', 'none')],
   },
 };
 
-/** Resolve a run's workflow (RUN-116). A legacy dispatch carries only a `kind`, which maps to its
- *  matching built-in; RUN-121 will let a `workflow` id name a custom one, falling back to this. */
+/**
+ * Resolve a run's workflow (RUN-116). A legacy dispatch carries only a `kind`, which maps to its
+ * matching built-in; a `workflow` id names a custom one (RUN-121) via `runWorkflow`.
+ *
+ * Falls back to SCOPE for a kind outside the union rather than returning undefined — this is what
+ * `startAgent`'s write clamp calls (RUN-158), and `clampPermissionToWorkflow(profile, undefined)`
+ * would throw on `wf.produces` at exactly the moment the floor is supposed to hold. Scope is the
+ * narrowest posture, so the degenerate answer is also the fail-closed one.
+ */
 export function workflowFor(kind: RunKind): Workflow {
-  return BUILTIN_WORKFLOWS[kind];
+  return Object.hasOwn(BUILTIN_WORKFLOWS, kind) ? BUILTIN_WORKFLOWS[kind] : BUILTIN_WORKFLOWS.scope;
 }
 
-const isBuiltinId = (id: string): id is RunKind => id in BUILTIN_WORKFLOWS;
+// `Object.hasOwn`, never `in`: `'toString' in BUILTIN_WORKFLOWS` is TRUE, and the lookup then hands
+// back `Object.prototype.toString` cast to a Workflow. A dispatch naming `toString`/`constructor`/
+// `__proto__` used to degrade quietly (`wf?.promptShape ?? run.kind` fell through on a function);
+// once a caller reads `wf.stages` it throws instead. Same guard on the manifest's record below — a
+// zod `z.record` is a plain object and carries the same prototype.
+const isBuiltinId = (id: string): id is RunKind => Object.hasOwn(BUILTIN_WORKFLOWS, id);
 
 /**
  * Resolve a workflow by id (RUN-119): a built-in kind name, or a repo-defined `[workflow.<name>]`.
@@ -91,9 +172,46 @@ export function resolveWorkflow(
   manifest: Pick<ProjectManifest, 'workflows'>,
 ): Workflow | undefined {
   if (isBuiltinId(id)) return BUILTIN_WORKFLOWS[id];
-  const custom = manifest.workflows?.[id];
-  if (!custom) return undefined;
-  return { ...BUILTIN_WORKFLOWS[custom.base], id, promptRef: custom.prompt };
+  const defined = manifest.workflows;
+  const custom = defined && Object.hasOwn(defined, id) ? defined[id] : undefined;
+  if (!custom || !Object.hasOwn(BUILTIN_WORKFLOWS, custom.base)) return undefined;
+  const base = BUILTIN_WORKFLOWS[custom.base];
+  // The stage list a custom workflow runs (RUN-132). It inherits the base's verbatim today, which
+  // is also all the committed marker can express: `WorkflowDef` carries `base` + `prompt` and no
+  // stage list, and that schema is the VENDORED wire contract — it grows upstream, with the
+  // phase-3 vendor refresh, not by hand-editing vendor/. What lands here is the mechanism and its
+  // floor: swap the `base.stages` below for the manifest's declared list and the surface is wired,
+  // already clamped, with the tests below already covering what a declaration may and may not do.
+  const stages = clampStagesToWorkflow(base.stages, base);
+  return { ...base, id, promptRef: custom.prompt, stages };
+}
+
+/**
+ * The workflow a run actually executes (RUN-132): its named one when the repo defines it, else its
+ * kind's built-in.
+ *
+ * The posture is identical either way — a custom workflow inherits its base's flags verbatim and
+ * `effectiveKind` (RUN-126) keeps the daemon authoritative about which base that is — so this can
+ * never be an escalation. What a named workflow adds is its prompt (RUN-121) and its stage list.
+ */
+export function runWorkflow(
+  run: Pick<Run, 'kind' | 'workflow'>,
+  manifest: Pick<ProjectManifest, 'workflows'>,
+): Workflow {
+  const named = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  if (named) return named;
+  // A `kind` the wire schema should have rejected falls back to SCOPE — the narrowest posture, not
+  // the nearest one. Unreachable for a real dispatch, and the direction matters anyway: a fallback
+  // that guessed `build` would answer "I don't recognise this" with "then you may write and land".
+  return Object.hasOwn(BUILTIN_WORKFLOWS, run.kind)
+    ? BUILTIN_WORKFLOWS[run.kind as RunKind]
+    : BUILTIN_WORKFLOWS.scope;
+}
+
+/** What this workflow declared for one stage, or undefined when it does not run it. Already
+ *  clamped — a caller reads a coordinate, never a permission. */
+export function stageOf(wf: Workflow, name: StageName): WorkflowStage | undefined {
+  return wf.stages.find((s) => s.name === name);
 }
 
 /**

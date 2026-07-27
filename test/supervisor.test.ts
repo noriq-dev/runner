@@ -23,12 +23,14 @@ import {
   RunSupervisor,
   RunTally,
   assemblePrompt,
+  effectiveKind,
   mergeBudget,
   mergeModelUsage,
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
 import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
+import { BUILTIN_WORKFLOWS } from '../src/workflow';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -615,13 +617,11 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
     expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
   });
 
+  // A `docs` workflow based on scope: it inherits the base's posture AND (RUN-132) its stage list
+  // verbatim — only the prompt is its own.
   const customWf = (promptRef: string) => ({
+    ...BUILTIN_WORKFLOWS.scope,
     id: 'docs',
-    promptShape: 'scope' as const,
-    worktreeWritable: false,
-    produces: false,
-    verifyActor: false,
-    usesPlanBase: false,
     promptRef,
   });
 
@@ -3761,5 +3761,39 @@ describe('an optional dep keeps its own receiver (RUN-131)', () => {
     expect(exit.reason).toMatch(/not claimable yet.*no phase for claude/s);
     // And it really did decline BEFORE the lease — a fail-open would have leased and spawned.
     expect(worktrees.created).toEqual([]);
+  });
+});
+
+// RUN-132. `effectiveKind` is the daemon's authoritative answer to "what posture is this", and its
+// result indexes fixed-key records everywhere downstream — `manifest.permissions[kind]`,
+// `manifest.defaults[kind]`, `noriqToolNamesFor(kind)`. A kind outside the union yields `undefined`
+// from every one of them, and the write clamp then throws on the permission it was handed. A WS
+// dispatch is schema-validated; a PARKED run is rehydrated from JSON on disk without revalidation,
+// which is the path that makes this reachable rather than theoretical.
+describe('effectiveKind never answers with a kind that is not one (RUN-132)', () => {
+  const M = { workflows: {} } as never;
+
+  it('passes a real kind through', () => {
+    expect(effectiveKind({ kind: 'build', workflow: null }, M)).toBe('build');
+    expect(effectiveKind({ kind: 'verify', workflow: null }, M)).toBe('verify');
+  });
+
+  it('degrades an unrecognised kind to scope — the narrowest posture, not the nearest', () => {
+    expect(effectiveKind({ kind: 'deploy' as never, workflow: null }, M)).toBe('scope');
+  });
+
+  // The membership test has to be `Object.hasOwn`: `'toString' in BUILTIN_WORKFLOWS` is true, so an
+  // `in` check waves through exactly the keys the guard exists to catch.
+  it('does not mistake a prototype property for a kind', () => {
+    for (const k of ['toString', 'constructor', '__proto__', 'valueOf']) {
+      expect(effectiveKind({ kind: k as never, workflow: null }, M)).toBe('scope');
+    }
+  });
+
+  it('a custom workflow still decides the posture, and it is still a real kind', () => {
+    const withDocs = { workflows: { docs: { base: 'scope', prompt: null } } } as never;
+    // The dispatched kind says build; the workflow's base says scope, and the daemon holds the
+    // manifest — so a client selecting a read-only workflow cannot leave `kind = build` and write.
+    expect(effectiveKind({ kind: 'build', workflow: 'docs' }, withDocs)).toBe('scope');
   });
 });

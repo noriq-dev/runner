@@ -82,6 +82,19 @@ RUN-116/117 they are *data*, not a `switch`: a `Workflow` descriptor carries `pr
 — it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119): a named
 variant of a built-in `base` that inherits the base's posture verbatim and only swaps in a prompt.
 
+Since RUN-132 a `Workflow` also carries `stages` — its pipeline, declared rather than derived from
+`RunStage.appliesTo`. The division of labour is the design and reversing it would put a manifest
+inside the trust boundary: **the machine owns what a stage IS** (its place in the sequence, its
+actor's posture, which workflows may run it); **the workflow owns only whether it runs one and which
+model does the work**. `stagesFor` runs `(mandatory ∪ declared) ∩ appliesTo` — bounded from both
+ends, so a declaration can switch an *optional* stage off, can never switch on one this posture may
+not run, and can never decline one `RunStage.optional` marks mandatory (only `review` and
+`integrate` are declinable). Order always comes from `RUN_STAGES` — landing before judging is
+landing unreviewed — and `clampStagesToWorkflow` narrows a `role` wider than the machine's `actor`.
+The TOML surface (`[workflow.<name>].stages`, and the per-stage agent coordinate) is **not wired**:
+`WorkflowDef` is the vendored contract and carries `base` + `prompt` only, so a custom workflow
+inherits its base's list until the phase-3 vendor refresh grows the field.
+
 The **write floor is workflow-independent** (RUN-118): `clampPermissionToWorkflow` forces `write =
 false` for any non-producing workflow at every permission site, so "verify executes but never edits"
 is enforced in code, not by trusting the manifest — a custom workflow can never widen its posture.

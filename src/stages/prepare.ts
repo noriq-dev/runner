@@ -44,7 +44,7 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
-import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, workflowFor } from '../workflow';
+import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, runWorkflow } from '../workflow';
 
 /**
  * What preparation may reach.
@@ -152,7 +152,10 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   }
 
   const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
-  const wf = workflowFor(kind); // the run's workflow (RUN-117): read its flags, don't compare kind
+  // The run's workflow (RUN-117): read its flags, don't compare kind. The NAMED one when the repo
+  // defines it (RUN-132) — same posture either way, since a custom inherits its base verbatim and
+  // `effectiveKind` above decided which base that is; what the named one adds is its stage list.
+  const wf = runWorkflow(run, repo.manifest);
   const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
   // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
   // suite and exercise the behavior, which needs a writable tree (node_modules, test

@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { RUN_STAGES, declaredTerminals, stage, stagesFor } from '../src/run-machine';
-import { BUILTIN_WORKFLOWS } from '../src/workflow';
+import {
+  RUN_STAGES,
+  type StageName,
+  clampStagesToWorkflow,
+  declaredTerminals,
+  stage,
+  stagesFor,
+} from '../src/run-machine';
+import { BUILTIN_WORKFLOWS, type Workflow } from '../src/workflow';
 
 // RUN-131. The pipeline used to exist only as control flow across two ~400-line methods, so the
 // ORDER of the stages and which of them a workflow ran could only be learned by reading both in
@@ -125,5 +132,131 @@ describe('what each stage declares', () => {
 
   it('stage() refuses a name that is not in the sequence', () => {
     expect(() => stage('publish' as never)).toThrow(/no such run stage/);
+  });
+});
+
+// RUN-132. Which stages a run executes was `appliesTo` and nothing else — a fact the machine
+// computed, that no workflow could shape. A workflow declares its list now, and the interesting
+// property is the ASYMMETRY: a declaration narrows and never widens, and it never reorders.
+describe('a workflow declares its stages, and the machine floors the declaration', () => {
+  const withStages = (base: Workflow, names: StageName[]): Workflow => ({
+    ...base,
+    stages: names.map((name) => ({ name, role: 'none' as const, agent: null })),
+  });
+
+  // Spelled out rather than compared against `w.stages` — comparing the declaration to itself
+  // would pass no matter what either side said. These are the lists RUN-131's `appliesTo` filter
+  // produced, written down, which is what makes RUN-132 a no-op on today's behaviour.
+  it('the built-ins run exactly what appliesTo used to compute', () => {
+    expect(names(stagesFor(wf('scope')))).toEqual(['prepare', 'execute', 'verify', 'settle']);
+    expect(names(stagesFor(wf('verify')))).toEqual(['prepare', 'execute', 'verify', 'settle']);
+    expect(names(stagesFor(wf('build')))).toEqual([
+      'prepare',
+      'execute',
+      'verify',
+      'review',
+      'integrate',
+      'settle',
+    ]);
+    // …and each one's own declaration agrees with what it runs, so neither can drift alone.
+    for (const w of Object.values(BUILTIN_WORKFLOWS)) {
+      expect(names(stagesFor(w))).toEqual(w.stages.map((s) => s.name));
+    }
+  });
+
+  // The declaration surface is "which OPTIONAL stages" — the four the run's correctness rests on
+  // run whether or not a workflow names them. Without this the comment saying settle is
+  // non-optional would be the only thing enforcing it.
+  it('a workflow cannot decline a mandatory stage by omitting it', () => {
+    // Declares ONLY `review`. The four mandatory stages come back anyway; `integrate` — the other
+    // optional one — is the only thing the omission actually dropped.
+    const stripped = withStages(wf('build'), ['review']);
+    expect(names(stagesFor(stripped))).toEqual(['prepare', 'execute', 'verify', 'review', 'settle']);
+  });
+
+  it('declaring NOTHING still runs the spine — an empty list is not an empty run', () => {
+    const empty = withStages(wf('build'), []);
+    expect(names(stagesFor(empty))).toEqual(['prepare', 'execute', 'verify', 'settle']);
+    // settle above all: it is where the outcome becomes durable and the locks release.
+    expect(names(stagesFor(empty))).toContain('settle');
+  });
+
+  it('marks exactly the two stages a workflow may decline', () => {
+    expect(RUN_STAGES.filter((s) => s.optional).map((s) => s.name)).toEqual(['review', 'integrate']);
+  });
+
+  it('a workflow can DROP an optional stage — review is the declinable one', () => {
+    const noReview = withStages(wf('build'), ['prepare', 'execute', 'verify', 'integrate', 'settle']);
+    expect(names(stagesFor(noReview))).toEqual(['prepare', 'execute', 'verify', 'integrate', 'settle']);
+  });
+
+  // The half that must never work: a posture that produces nothing cannot declare its way into
+  // landing a diff. `appliesTo` is the floor, and a declaration is intersected with it.
+  it('a non-producing workflow CANNOT declare its way into review or integrate', () => {
+    const greedy = withStages(wf('scope'), ['prepare', 'execute', 'verify', 'review', 'integrate', 'settle']);
+    expect(names(stagesFor(greedy))).toEqual(['prepare', 'execute', 'verify', 'settle']);
+  });
+
+  // Landing before judging is landing unreviewed. A workflow names WHICH stages, never in what
+  // sequence — the order comes from RUN_STAGES on the way out.
+  it('a declaration cannot reorder the pipeline, only choose from it', () => {
+    const inverted = withStages(wf('build'), [
+      'settle',
+      'integrate',
+      'review',
+      'verify',
+      'execute',
+      'prepare',
+    ]);
+    expect(names(stagesFor(inverted))).toEqual(names(stagesFor(wf('build'))));
+  });
+
+  it('an unknown stage name is dropped rather than trusted', () => {
+    const bogus = {
+      ...wf('build'),
+      stages: [{ name: 'publish' as never, role: 'run' as const, agent: null }],
+    };
+    expect(clampStagesToWorkflow(bogus.stages, bogus)).toEqual([]);
+  });
+});
+
+describe('clampStagesToWorkflow: the machine owns the actor, the declaration owns the choice', () => {
+  it('drops a stage this posture may not run', () => {
+    const declared = [
+      { name: 'verify' as const, role: 'none' as const, agent: null },
+      { name: 'integrate' as const, role: 'run' as const, agent: null },
+    ];
+    expect(clampStagesToWorkflow(declared, wf('scope')).map((s) => s.name)).toEqual(['verify']);
+    expect(clampStagesToWorkflow(declared, wf('build')).map((s) => s.name)).toEqual(['verify', 'integrate']);
+  });
+
+  // `role` grants nothing on its own — the posture that reaches a spawn is the permission clamp's,
+  // floored again inside startAgent (RUN-158). It is overwritten anyway, and in BOTH directions.
+  it('overwrites a role WIDER than the machine’s own actor', () => {
+    const declared = [{ name: 'review' as const, role: 'run' as const, agent: null }];
+    expect(clampStagesToWorkflow(declared, wf('build'))[0]?.role).toBe('verify'); // not 'run'
+  });
+
+  it('overwrites an UNDERSTATED one too — the stage spawns what the machine says regardless', () => {
+    // `review: none` would read as "this workflow spawns no judge" while the stage goes on spawning
+    // the verify actor. A descriptor lying in the safe direction is still a descriptor lying, and it
+    // is how a reader learns the wrong invariant.
+    const declared = [{ name: 'review' as const, role: 'none' as const, agent: null }];
+    expect(clampStagesToWorkflow(declared, wf('build'))[0]?.role).toBe('verify');
+  });
+
+  it('carries the declared coordinate through untouched — it picks a model, not a posture', () => {
+    const declared = [{ name: 'review' as const, role: 'run' as const, agent: 'codex.gpt-5_6-sol.high' }];
+    expect(clampStagesToWorkflow(declared, wf('build'))[0]).toEqual({
+      name: 'review',
+      role: 'verify', // the machine's, whatever was declared
+      agent: 'codex.gpt-5_6-sol.high', // untouched
+    });
+  });
+
+  it('is the identity on every built-in — they already say what the machine says', () => {
+    for (const w of Object.values(BUILTIN_WORKFLOWS)) {
+      expect(clampStagesToWorkflow(w.stages, w)).toEqual(w.stages);
+    }
   });
 });

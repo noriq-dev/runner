@@ -78,6 +78,17 @@ export interface RunStage {
    * that is the stage's own business, not the sequence's.
    */
   appliesTo: (wf: Workflow) => boolean;
+  /**
+   * Can a workflow decline this stage (RUN-132)? A mandatory stage runs whenever it applies, no
+   * matter what a declaration says — so the declaration surface is exactly "which OPTIONAL stages",
+   * and a repo cannot shed a stage the run's correctness rests on by omitting a line of TOML.
+   *
+   * Four are mandatory and each for a concrete reason rather than caution: without `prepare` there
+   * is no workspace or identity; without `execute` there is no agent; `verify` holds the checkpoint
+   * that makes the diff durable, the hard lock floor, and the landing decision; and `settle` is
+   * where the outcome becomes durable and the run's locks release, so skipping it leaks both.
+   */
+  optional: boolean;
 }
 
 const always = () => true;
@@ -112,6 +123,7 @@ export const RUN_STAGES: readonly RunStage[] = [
       'no identity',
       'lock scope refused',
     ],
+    optional: false,
     appliesTo: always,
   },
   {
@@ -123,6 +135,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     budget: 'run',
     retry: { kind: 'none' },
     terminal: ['failed', 'budget', 'cancelled'],
+    optional: false,
     appliesTo: always,
   },
   {
@@ -136,6 +149,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     budget: 'none',
     retry: { kind: 'feedback', boundedBy: 'MAX_VERIFY_FIXES' },
     terminal: ['no_changes', 'lock', 'lock:unchecked', 'verify'],
+    optional: false,
     appliesTo: always,
   },
   {
@@ -148,6 +162,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     retry: { kind: 'feedback', boundedBy: '[verify.agent].maxRounds' },
     terminal: ['review', 'review:no-verdict'],
     // Only a producing workflow has a diff to review. A verify run IS the reviewer.
+    optional: true,
     appliesTo: (wf) => wf.produces,
   },
   {
@@ -161,6 +176,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     budget: 'run',
     retry: { kind: 'none' },
     terminal: ['land:conflict', 'land:verify', 'land:error'],
+    optional: true,
     appliesTo: (wf) => wf.produces,
   },
   {
@@ -175,14 +191,67 @@ export const RUN_STAGES: readonly RunStage[] = [
     // its own output is the verdict, and that output is only final once the session that wrote it
     // is closed — which is the first thing this stage does. Every other gate has run by now.
     terminal: ['verify_agent'],
+    optional: false,
     appliesTo: always,
   },
 ] as const;
 
-/** The stages a workflow actually runs, in order. The list is the pipeline (RUN-132 will let a
- *  repo-defined workflow name its own). */
+/**
+ * The stages a workflow actually runs, in order (RUN-132).
+ *
+ * Two independent answers have to agree: the workflow's declared list, and the machine's own
+ * `appliesTo`. This returns the INTERSECTION, and that asymmetry is the point — a declaration can
+ * turn a stage OFF, and can never turn one ON that this posture may not run. A scope-based workflow
+ * that names `integrate` gets no integration, because `integrate` applies only to a producing
+ * workflow and no amount of declaring changes what the run produces.
+ *
+ * The ORDER is the machine's, never the declaration's. "Reviews before it integrates" is a security
+ * ordering — landing first and judging afterwards is landing unreviewed — so a workflow names which
+ * stages, never in what sequence.
+ */
 export function stagesFor(wf: Workflow): readonly RunStage[] {
-  return RUN_STAGES.filter((s) => s.appliesTo(wf));
+  const declared = new Set(wf.stages?.map((s) => s.name));
+  // A MANDATORY stage runs whether or not it was declared, so the declaration surface is exactly
+  // "which optional stages" and a repo cannot shed one the run's correctness rests on by leaving a
+  // line out. Without this, `settle` — the terminal report, the lock release, the workspace
+  // decision — would be a workflow's to skip, and the comment saying it isn't would be the only
+  // thing enforcing it.
+  return RUN_STAGES.filter((s) => (!s.optional || declared.has(s.name)) && s.appliesTo(wf));
+}
+
+/**
+ * Narrow a declared stage list to what a workflow's posture actually permits (RUN-132) — the
+ * stage-list sibling of `clampPermissionToWorkflow`, and applied for the same reason: a repo's
+ * committed marker must be able to shape a pipeline without being able to widen one.
+ *
+ * Two things happen, neither of them a widening:
+ *   - a stage the machine says does not apply to this posture is DROPPED;
+ *   - `role` is OVERWRITTEN with the machine's own `actor` — not merely narrowed when too wide.
+ *
+ * The second was a clamp-if-wider first, which left a declaration free to *understate*: `review`
+ * declared `role: 'none'` survived, while the stage still spawns the machine's `verify` actor. That
+ * is a descriptor lying quietly in the safe direction, which is only better than lying in the
+ * dangerous one. Nothing consumes a narrower role, so there is no reason to preserve one — and "the
+ * machine owns the actor" is true in both directions or it is not an invariant. `role` is therefore
+ * *reported*: a declaration says which stages, and the machine says who runs them.
+ *
+ * `agent` is passed through untouched, because a coordinate picks a MODEL and never a posture.
+ *
+ * This does NOT put an undeclared mandatory stage back — `stagesFor` does that at the point of use,
+ * where it cannot be forgotten. This function answers "what does this declaration legally say", not
+ * "what will run".
+ */
+export function clampStagesToWorkflow(
+  declared: readonly { name: StageName; role: StageActor; agent: string | null }[],
+  wf: Workflow,
+): readonly { name: StageName; role: StageActor; agent: string | null }[] {
+  const out: { name: StageName; role: StageActor; agent: string | null }[] = [];
+  for (const d of declared) {
+    const machine = RUN_STAGES.find((s) => s.name === d.name);
+    if (!machine || !machine.appliesTo(wf)) continue;
+    out.push({ ...d, role: machine.actor });
+  }
+  return out;
 }
 
 /** Look one up by name — for the supervisor, which reports the stage it is entering. */
