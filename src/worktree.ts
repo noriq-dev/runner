@@ -209,16 +209,37 @@ export class WorktreeManager {
    * plan, blocked, or simply refused) leaves the worktree pristine; running the verify
    * command over that is pure waste, and worse, a PASS on an empty tree would land the
    * Run in review as a success with nothing in it.
+   *
+   * **Throws rather than answering `false` when git cannot be asked** (RUN-152). This used to
+   * substitute `'0'` for a failed `rev-list`, which made "no committed work" and "the query broke"
+   * the same answer — a fail-OPEN, because every consumer of `false` destroys something: the
+   * lock-refusal guard disposes the workspace (`worktree remove --force` + `branch -D` on a branch
+   * that was never pushed), and the no-changes gate reaps it. On an ADOPTED continuation that is
+   * the prior sitting's committed diff, which exists nowhere else. Both callers already wrapped
+   * this in a `.catch(() => true)`; the swallow inside was what stopped those guards from ever
+   * firing.
    */
   async hasChanges(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<boolean> {
     const { stdout: dirty } = await this.git(['status', '--porcelain'], info.path);
     if (dirty.trim()) return true;
+    // An empty base makes git read `..HEAD` as `HEAD..HEAD` and print a confident 0 — a fail-open
+    // with no error anywhere to catch. A parked record persisted with `baseId: ''` reaches here.
+    if (!info.baseSha.trim()) throw new Error('worktree has no base commit — cannot tell what it produced');
     // Committed work: anything on this branch that isn't on the base it forked from.
-    const { stdout: ahead } = await this.git(
-      ['rev-list', '--count', `${info.baseSha}..HEAD`],
-      info.path,
-    ).catch(() => ({ stdout: '0', stderr: '' }));
-    return Number(ahead.trim() || '0') > 0;
+    const { stdout: ahead } = await this.git(['rev-list', '--count', `${info.baseSha}..HEAD`], info.path);
+    const count = ahead.trim();
+    // `rev-list --count` always prints a number. Anything else means we did not get an answer,
+    // and `Number('')` is 0 — the same fail-open by a shorter route.
+    if (!/^\d+$/.test(count)) {
+      throw new Error(`git rev-list --count gave no usable answer: ${JSON.stringify(ahead)}`);
+    }
+    if (Number(count) > 0) return true;
+    // About to answer "there is nothing here", which is the answer that gets acted on by deleting
+    // things. `base..HEAD` only measures what HEAD points at: with a DETACHED HEAD sitting on the
+    // base, a run branch full of commits measures as zero, and `branch -D` then takes the lot.
+    // Exiting nonzero when HEAD is not on a branch is exactly what `symbolic-ref` is for.
+    await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
+    return false;
   }
 
   /**

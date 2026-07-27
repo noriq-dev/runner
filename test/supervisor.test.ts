@@ -163,8 +163,12 @@ class FakeWorktrees {
       location: { repoRoot: root, branch: `noriq/run/${runId}` },
     };
   };
+  /** When set, `hasWork` REJECTS instead of answering — the "could not ask" case a backend must
+   *  never report as "no work" (RUN-152). */
+  hasWorkError: string | null = null;
   hasWork = async (): Promise<boolean> => {
     this.hasChangesCalls += 1;
+    if (this.hasWorkError) throw new Error(this.hasWorkError);
     return this.changed;
   };
   commits: Array<{ path: string; message: string }> = [];
@@ -1301,6 +1305,23 @@ describe('a build that changes nothing is not a success', () => {
     expect(h.reports.at(-1)).toMatchObject({ status: 'failed', exit: { reason: 'no_changes' } });
   });
 
+  // RUN-152. Declaring `no_changes` REAPS the worktree, so guessing "empty" on a probe that merely
+  // errored destroys the diff. Guessing "full" at worst spends a verify run on a tree a human can
+  // still open. The gate always intended this default; the swallowed error is what stopped it.
+  it('does not call it a no-op when the probe could not answer', async () => {
+    const blind = new FakeWorktrees();
+    blind.hasWorkError = 'fatal: bad object base0000';
+    const h = harness({ repoVcs: blind });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).not.toBe('no_changes');
+    expect(h.verifyRan()).toBe(true); // let the gate decide on the real tree
+    expect(blind.removed).toEqual([]); // and never reap on a guess
+  });
+
   it('still verifies a build that DID change something', async () => {
     const h = harness({ changed: true });
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
@@ -1498,6 +1519,21 @@ describe('dispatch-time predictive locking (RUN-103)', () => {
     const h = harness({ manifest: LANDING(), lockScope: ['src/hot.ts'], repoVcs: pooled });
     await h.supervisor.supervise(buildRun()); // holds work, but disposal is non-destructive here
     expect(pooled.removed).toEqual(['/wt/run_1']);
+  });
+
+  // RUN-152. The guard here always read "could not tell" as work — but `hasWork` used to answer
+  // `false` on a failed probe, so the guard never saw the error and disposed anyway. A transient
+  // git failure on a continuation was therefore enough to force-remove a diff that exists nowhere
+  // else. The backend rejects now; this pins that the refusal path keeps the workspace.
+  it('KEEPS the workspace when it cannot TELL whether there is work', async () => {
+    const blind = new FakeWorktrees();
+    blind.hasWorkError = 'fatal: bad object base0000';
+    blind.lockConflicts = [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }];
+    const h = harness({ manifest: LANDING(), lockScope: ['src/hot.ts'], repoVcs: blind });
+    const exit = await h.supervisor.supervise(buildRun());
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/locked by another run/); // still refused
+    expect(blind.removed).toEqual([]); // …but nothing was destroyed on a guess
   });
 
   it('still disposes an EMPTY workspace on a clash — nothing to lose, nothing to leak', async () => {

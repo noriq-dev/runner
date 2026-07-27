@@ -62,6 +62,18 @@ export type P4Cli = (
   stdin?: string,
 ) => Promise<{ stdout: string; stderr: string }>;
 
+/**
+ * p4 reports emptiness with a NONZERO exit and one of these messages — an ANSWER, not a failure.
+ * Kept narrow on purpose: everything outside it must stay an error (RUN-152).
+ *
+ * Unlike the submit/resolve strings elsewhere in this file, these two are from p4's documented
+ * behaviour, NOT from the measured RUN-55 acceptance session (VCS-SPIKE.md records nothing about
+ * an empty `opened` or `reconcile -n`). Re-check them against a live server before this backend
+ * ships: an emptiness message this regex does not recognise fails CLOSED — the run is treated as
+ * holding work, which costs a wasted verify rather than a deleted diff, but it is still wrong.
+ */
+const P4_NOTHING_HERE = /not opened on this client|no file\(s\) to reconcile/i;
+
 export const realP4Cli: P4Cli = (args, cwd, stdin) =>
   new Promise((resolve, reject) => {
     // PWD must MATCH cwd, and this is measured, not defensive: p4 trusts the PWD env var over
@@ -275,19 +287,31 @@ export class PerforceBackend implements VcsBackend {
     }
   }
 
+  /**
+   * Only p4's own "there is nothing here" is absorbed (RUN-152). Blanket-swallowing both probes
+   * reported "no work" whenever p4 could not be reached at all, and the caller acts on `false` by
+   * disposing the workspace — a fail-open on a destructive decision. The distinction is awkward
+   * here rather than free, because p4 exits NONZERO for emptiness: `opened` on an empty change
+   * says "File(s) not opened on this client", `reconcile -n` says "no file(s) to reconcile". Those
+   * are answers. A dead connection, a bad client, an auth expiry are not.
+   */
   async hasWork(ws: Workspace): Promise<boolean> {
     const loc = p4Location(ws);
-    const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
+    const opened = await this.emptyOrThrow(this.p4(['opened', '-c', loc.change], ws.localPath));
     if (opened.trim()) return true;
     // allwrite hides edits from p4 until a reconcile — preview what one would gather.
-    const { stdout } = await this.p4(['reconcile', '-n'], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
-    return /opened for (add|edit|delete)/.test(stdout);
+    const reconcile = await this.emptyOrThrow(this.p4(['reconcile', '-n'], ws.localPath));
+    return /opened for (add|edit|delete)/.test(reconcile);
+  }
+
+  /** p4 says "nothing here" by failing. Absorb exactly that and let everything else through. */
+  private async emptyOrThrow(call: Promise<{ stdout: string }>): Promise<string> {
+    try {
+      return (await call).stdout;
+    } catch (err) {
+      if (P4_NOTHING_HERE.test(String(err))) return '';
+      throw err;
+    }
   }
 
   async checkpoint(ws: Workspace, _message: string): Promise<boolean> {

@@ -309,6 +309,56 @@ describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)',
   });
 });
 
+// RUN-152. The caller disposes a workspace on `false`, so "p4 could not be reached" must never
+// wear the same answer as "the changelist is empty". Awkward rather than free here, because p4
+// signals emptiness by exiting NONZERO — the fix is to absorb exactly those two messages.
+describe('PerforceBackend — hasWork tells "nothing here" from "could not ask"', () => {
+  /** A p4 that answers `info`, then fails `opened` and `reconcile` with their OWN messages — they
+   *  are different sentences, and feeding one to both would leave the second probe unpinned. */
+  const failing = (over: { opened?: string; reconcile?: string }) => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      const text = args[0] === 'opened' ? over.opened : over.reconcile;
+      if (!text) return { stdout: '', stderr: '' }; // succeeds, empty — not the case under test
+      throw new Error(`p4 ${args[0]} exited 1: ${text}`);
+    };
+    return new PerforceBackend({ p4 });
+  };
+  const EMPTY_OPENED = 'File(s) not opened on this client.';
+  const EMPTY_RECONCILE = '/ws1/... - no file(s) to reconcile.';
+  const ws = {
+    runId: 'run_1',
+    localPath: '/ws1',
+    readOnly: false,
+    baseId: '7',
+    workRef: 'change 42 in client ws1',
+    location: { client: 'ws1', change: '42' },
+  };
+
+  it("reads p4's own emptiness messages as an answer: no work", async () => {
+    const backend = failing({ opened: EMPTY_OPENED, reconcile: EMPTY_RECONCILE });
+    expect(await backend.hasWork(ws)).toBe(false);
+  });
+
+  it('rejects when p4 could not be asked at all', async () => {
+    const backend = failing({ opened: 'Connect to server failed; check $P4PORT.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/Connect to server failed/);
+  });
+
+  it('rejects on an auth expiry rather than reporting the workspace empty', async () => {
+    const backend = failing({ opened: 'Your session has expired, please login again.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/session has expired/);
+  });
+
+  // The SECOND probe is the one a single-message fake would leave untested: `opened` says nothing
+  // is open (true of an allwrite workspace that has never been reconciled) and the reconcile
+  // preview is then the only thing that can see the edits.
+  it('rejects when the reconcile preview fails, even though nothing was opened', async () => {
+    const backend = failing({ opened: EMPTY_OPENED, reconcile: 'Connect to server failed; check $P4PORT.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/Connect to server failed/);
+  });
+});
+
 describe('PerforceBackend — location guard', () => {
   it('refuses a workspace whose location it did not mint', async () => {
     const { backend } = fakes({});

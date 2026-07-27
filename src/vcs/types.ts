@@ -171,8 +171,21 @@ export interface VcsBackend {
    *  which is why this is not named `remove`. Safe to call twice. */
   dispose(ws: Workspace): Promise<void>;
 
-  /** Did this Run actually produce anything — saved or not? A no-op run must not reach verify:
-   *  a PASS over an empty tree would land the Run in review as a success with nothing in it. */
+  /**
+   * Did this Run actually produce anything — saved or not? A no-op run must not reach verify:
+   * a PASS over an empty tree would land the Run in review as a success with nothing in it.
+   *
+   * **`false` means "there is no work", never "the query failed"** (RUN-152). A backend that
+   * cannot tell must REJECT. Both callers act destructively on `false` — one disposes a workspace
+   * (git's dispose is `worktree remove --force` plus `branch -D` on a never-pushed branch), the
+   * other reports the run a no-op and reaps it — so answering "no work" on an error is a fail-open
+   * on a decision that destroys the only copy of a continuation's committed diff.
+   *
+   * A rejection rather than a third `'unknown'` result, deliberately: a string union would make
+   * the destructive branch reachable by accident, since `if (await hasWork(ws))` is truthy for
+   * `'none'` just as it is for `'unknown'`. A rejection cannot be ignored by omission, and it
+   * carries the underlying error for the log.
+   */
   hasWork(ws: Workspace): Promise<boolean>;
 
   /** Make the Run's work durable in the workspace, so it survives a reap and a human can review

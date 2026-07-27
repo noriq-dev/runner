@@ -1802,8 +1802,18 @@ export class RunSupervisor {
           // nothing and wedges every later run on the repo until the daemon restarts. The terminal
           // path below already draws exactly this distinction; this one has to as well.
           const vcsRef = this.vcsFor(repo);
+          // "Could not tell" counts as work (RUN-152). This guard was always written that way; what
+          // was missing is that `hasWork` used to answer `false` on a failed probe, so it never
+          // fired. The backend rejects now, and the choice is made here where it is visible.
           const wouldDestroy =
-            !vcsRef.disposePreservesWork && (await vcsRef.hasWork(worktree).catch(() => true));
+            !vcsRef.disposePreservesWork &&
+            (await vcsRef.hasWork(worktree).catch((err) => {
+              this.log.warn('could not tell whether the workspace holds work — keeping it', {
+                runId: run.id,
+                err: String(err),
+              });
+              return true;
+            }));
           if (wouldDestroy) {
             this.log.warn('lock refusal kept a workspace that holds work — not disposing', {
               runId: run.id,
@@ -2024,9 +2034,18 @@ export class RunSupervisor {
     // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
     // review as "done" with an empty diff — a silent no-op reported as success.
     if (wf.produces && driverSucceeded) {
+      // Can't tell → assume it worked and let verify decide. Declaring `no_changes` reaps the
+      // worktree, so guessing "empty" on a broken probe destroys the diff; guessing "full" at worst
+      // spends a verify run on a tree a human can still see (RUN-152).
       const changed = await this.vcsFor(repo)
         .hasWork(worktree)
-        .catch(() => true); // can't tell → assume it worked and let verify decide
+        .catch((err) => {
+          this.log.warn('could not tell whether the build produced changes — assuming it did', {
+            runId: run.id,
+            err: String(err),
+          });
+          return true;
+        });
       if (!changed) {
         this.log.warn('build produced no changes — skipping verify, not a success', { runId: run.id });
         exit = { ...exit, outcome: 'failed', isError: true, reason: 'no_changes' };

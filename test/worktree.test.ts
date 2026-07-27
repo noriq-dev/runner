@@ -107,6 +107,57 @@ describe('unsaved work survives (real git)', () => {
     await wm.remove(wt);
   });
 
+  // RUN-152. `false` from hasChanges is acted on DESTRUCTIVELY — the lock-refusal guard disposes
+  // the workspace (`worktree remove --force` + `branch -D` on a never-pushed branch) and the
+  // no-changes gate reaps it. Substituting '0' for a failed `rev-list` made "there is no work" and
+  // "git could not be asked" the same answer, so a transient failure on an ADOPTED continuation
+  // could destroy the prior sitting's committed diff. The distinction has to survive in the type.
+  describe('hasChanges cannot answer "no work" for "could not tell"', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('rejects when rev-list fails, rather than reporting an empty worktree', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: '', stderr: '' }; // clean tree, so it asks rev-list
+        throw new Error('fatal: bad object base');
+      });
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/bad object/);
+    });
+
+    // `Number('')` is 0, so an empty answer took the same fail-open by a shorter route.
+    it('rejects when rev-list answers with something that is not a count', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status' ? { stdout: '', stderr: '' } : { stdout: '\n', stderr: '' },
+      );
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/no usable answer/);
+    });
+
+    // `git rev-list --count ..HEAD` is `HEAD..HEAD` — a confident zero with no error to catch.
+    it('rejects when there is no base to measure against', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      await expect(wm.hasChanges({ path: '/wt/run_1', baseSha: '' })).rejects.toThrow(/no base commit/);
+    });
+
+    // `base..HEAD` measures what HEAD POINTS AT. Detached onto the base, a run branch full of
+    // commits measures as zero — and that zero is what `branch -D` would act on.
+    it('rejects when HEAD is detached rather than calling the branch empty', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: '', stderr: '' };
+        if (args[0] === 'rev-list') return { stdout: '0\n', stderr: '' };
+        throw new Error('fatal: ref HEAD is not a symbolic ref'); // git's own detached-HEAD exit
+      });
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/symbolic ref/);
+    });
+
+    it('still answers false for a genuinely empty worktree', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'rev-list' ? { stdout: '0\n', stderr: '' } : { stdout: '', stderr: '' },
+      );
+      expect(await wm.hasChanges(wt)).toBe(false);
+    });
+  });
+
   it('is a no-op when the agent already committed', async () => {
     const wt = await wm.create(repo, 'noopCommit');
     expect(await wm.commitWork(wt, 'nothing to save')).toBe(false);
