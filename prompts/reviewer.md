@@ -26,7 +26,22 @@ Findings that share one root cause are ONE finding, not several. Report the clas
 
 A root cause need not be one transform. When the intent states an invariant that must hold across the whole surface — an operation that must round-trip, a breakdown that must sum, a floor that must never drop, a committed value that must survive untouched — the class is that INVARIANT, and its instances are every place the diff can break it, through mechanisms that need not resemble one another: a trim in one path, a split in another, a substituted default in a third. Do not file these as separate findings that merely share a theme. Name the invariant as the single finding, cite the leak points you found as its evidence, and say what the fix must be — one place the invariant is enforced, not a patch per site. This is the shape per-finding fixing cannot close: patch the sites you name and next round finds one more, until the rounds run out with the promise still leaking. So when the evidence shows it — several instances, unlike mechanisms, one broken promise — say so, and say which it is: the leak points are all enumerable now (bounded, and you list them), or the design has nowhere a single check could enforce the invariant (structural — the builder must add that chokepoint, or the task needs re-dispatching around one). The builder can pivot to a structural fix on that sentence; without it they patch by number until the budget is gone and the run fails with the cause never named.
 
-{{context}}
+{{context}}{{#acceptance}}
+
+ACCEPTANCE CRITERIA — the definition of done this work was commissioned with, before it started. Judge against these as well as your own reading: they are the author's floor, not a limit on what you may raise, and a criterion the author never wrote is not excused by its absence from this list.
+{{acceptance}}
+
+Answer EVERY numbered criterion above. One line each, in exactly this format, anywhere in your report:
+  ACCEPTANCE <n>: <VERIFIED|FAILED|BEHAVIOUR-UNVERIFIED|HUMAN-NEEDED> <evidence>
+  - VERIFIED — you established that it holds. The evidence is what you actually did or read: a file:line you inspected, a test that covers it and passes, a command you ran and what it printed. "The code looks correct" is not evidence, and a VERIFIED with nothing pointed at is recorded as BEHAVIOUR-UNVERIFIED anyway — so pointing at something is the only way to spend it.
+  - FAILED — you established that it does NOT hold. Cite where.
+  - BEHAVIOUR-UNVERIFIED — the code that would satisfy it is present, and nothing you did or found establishes that it DOES. This is the honest answer far more often than it feels like, and it is the one this list exists to collect: a criterion nobody proved is not a criterion met. Reach for it whenever your basis is that the implementation looks right.
+  - HUMAN-NEEDED — it cannot be checked from this workspace at all: a claim about a deployed service, a visual judgement, a migration nobody can run here. Not the same as unverified, and worth distinguishing — one is work somebody can finish, the other is not.
+A criterion you do not answer is recorded as BEHAVIOUR-UNVERIFIED. Skipping one costs you the pass you would have claimed rather than saving you a line.
+
+These lines do not replace your verdict, and they answer a different question from it. The verdict is about whether this change meets the intent, on the rules above; a criterion outcome is the narrower fact of what you personally established while looking. So an unverified criterion is not by itself a FAIL — it is recorded for follow-up, not held against this change — while a requirement the change leaves unmet is a finding and drives the verdict as it always did. When both apply, say both.
+
+A criterion you mark FAILED cannot stand alongside VERDICT: PASS. Write both and the daemon takes the FAIL, because a report that answers its own question twice has not passed anything.{{/acceptance}}
 
 End your response with EXACTLY one line, on its own:
   VERDICT: PASS   — the change fully and honestly satisfies the intent

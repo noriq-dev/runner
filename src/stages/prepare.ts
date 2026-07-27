@@ -25,6 +25,7 @@
 import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
+import { acceptanceOverflow, enumerateAcceptance } from '../acceptance';
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
@@ -131,6 +132,11 @@ export interface PreparedRun {
   /** Rebuild the RUN's brief around a spec the planner produced, plus anything the pre-execution
    *  stages added to it (analogs, repo facts — RUN-143/144). */
   rebuildPrompt: (checked: CheckedExecutionSpec | null, extra?: string) => string;
+  /** The anchor task's spec as it stood when this run was prepared, checked against the checkout.
+   *  Null when the task carries none. The `plan` stage may REPLACE it with one it synthesized, so
+   *  a consumer that needs the spec the run actually executed under takes the plan stage's answer
+   *  rather than this — this is the starting point, not the outcome (RUN-145). */
+  checkedSpec: CheckedExecutionSpec | null;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -499,7 +505,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // call site so the facts a prompt is built from cannot drift between the two.
   const buildPrompt = (
     specBlock: string,
-    forVerify: string,
+    forVerify: ExecutionSpec | null,
     shape?: 'planner' | 'plan-checker' | 'pattern-mapper',
     ledger?: string,
   ) =>
@@ -513,11 +519,13 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       // documents differ (RUN-154).
       repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
       executionSpec: specBlock,
-      // The definition of done, alone, for the actor that judges (RUN-139). Withholding it made the
+      // The definition of done, for the actor that judges (RUN-139), NUMBERED so it can be
+      // answered criterion by criterion rather than in prose (RUN-145). Withholding it made the
       // gate under-informed rather than independent: a reviewer that has not been told what the
       // work was commissioned to achieve can pass a build that skipped it, or fail one for leaving
       // out something the spec explicitly deferred.
-      executionSpecForVerify: forVerify,
+      acceptance: enumerateAcceptance(forVerify),
+      acceptanceOverflow: acceptanceOverflow(forVerify),
       // A repo-defined workflow (RUN-121) supplies its own prompt; its posture is still `kind`'s.
       // An unknown name resolves to undefined → assemblePrompt uses the built-in for run.kind.
       ...(shape ? { promptShapeOverride: shape } : {}),
@@ -525,7 +533,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       workflow,
     });
 
-  const prompt = buildPrompt(renderedSpec, renderExecutionSpec(checkedSpec, { only: 'acceptance' }));
+  const prompt = buildPrompt(renderedSpec, checkedSpec?.spec ?? null);
 
   return {
     ok: true,
@@ -537,25 +545,23 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // forever — the field is no longer null, so nothing would ever fill it.
     plannedTask:
       hasExecutionSpec(task?.executionSpec) || task?.executionSpecUnreadable ? null : (task ?? null),
-    plannerPrompt: buildPrompt('', '', 'planner'),
+    plannerPrompt: buildPrompt('', null, 'planner'),
     // The checker reads a SPEC, so its prompt is built per round from whatever the plan is now
     // (RUN-141) — the same closure, so the facts around the spec cannot drift between rounds.
     // The DETERMINISTIC findings travel with it: a checker that cannot see the repo disagreeing
     // with the plan would raise the same points itself, at model prices.
     mapperPrompt: (checked) =>
-      buildPrompt(renderExecutionSpec(checked, { audience: 'checker' }), '', 'pattern-mapper'),
+      buildPrompt(renderExecutionSpec(checked, { audience: 'checker' }), null, 'pattern-mapper'),
     checkerPrompt: (spec, ledger) =>
       buildPrompt(
         renderExecutionSpec({ spec, findings: checkedSpec?.findings ?? [] }, { audience: 'checker' }),
-        '',
+        null,
         'plan-checker',
         ledger,
       ),
     rebuildPrompt: (checked, extra = '') =>
-      buildPrompt(
-        `${renderExecutionSpec(checked)}${extra}`,
-        renderExecutionSpec(checked, { only: 'acceptance' }),
-      ),
+      buildPrompt(`${renderExecutionSpec(checked)}${extra}`, checked?.spec ?? null),
+    checkedSpec,
     repo,
     driver,
     workflow: wf,

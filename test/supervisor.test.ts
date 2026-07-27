@@ -1,5 +1,5 @@
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
-import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
@@ -20,6 +20,7 @@ import type { ParkedRun } from '../src/parked';
 import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
 import {
+  type AnchorTask,
   type RunReport,
   RunSupervisor,
   RunTally,
@@ -425,6 +426,9 @@ function harness(
     lockScope?: string[] | null;
     /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
     cancelled?: string[];
+    /** The anchor task the server hands back — how a test gives a run an execution spec, and so
+     *  the acceptance criteria its gate must answer (RUN-145). */
+    anchorTask?: AnchorTask | null;
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -518,6 +522,7 @@ function harness(
         }
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
+    ...(over.anchorTask !== undefined ? { resolveTask: async () => over.anchorTask ?? null } : {}),
     ...(over.cancelled
       ? {
           steering: {
@@ -1254,19 +1259,23 @@ describe('assemblePrompt inlines the anchor task', () => {
 
 // RUN-139. The spec reaches the actor that WRITES in full, and the actor that JUDGES as the
 // definition of done alone. Both were wrong in the first cut: the reviewer got nothing.
+//
+// RUN-145 changed the FORM the judge's half arrives in — numbered criteria it answers one by one,
+// not a prose block — so what these assert is that the author's notes still never reach a gate and
+// the criteria still never reach the author's block twice.
 describe('assemblePrompt places the execution spec', () => {
   const ctx = { agent: testAgent(), server: 'https://s' };
   const SPEC = '\n\nEXECUTION SPEC — full, for the author';
-  const ACCEPT = '\n\nWHAT THIS WORK WAS COMMISSIONED TO ACHIEVE';
+  const ACCEPT = [{ id: 1, kind: 'truth' as const, text: 'the daemon reaps orphans on start' }];
 
   it('gives a build agent the whole spec, after the brief it explains', () => {
     const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
       ...ctx,
       executionSpec: SPEC,
-      executionSpecForVerify: ACCEPT,
+      acceptance: ACCEPT,
     });
     expect(p).toContain(SPEC.trim());
-    expect(p).not.toContain(ACCEPT.trim());
+    expect(p).not.toContain(ACCEPT[0]!.text);
     // After the brief, not before: the spec is the ask's own detail, where `[context]` is
     // reference read ahead of the ask.
     expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('EXECUTION SPEC'));
@@ -1281,10 +1290,15 @@ describe('assemblePrompt places the execution spec', () => {
     const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
       ...ctx,
       executionSpec: SPEC,
-      executionSpecForVerify: ACCEPT,
+      acceptance: ACCEPT,
     });
-    expect(p).toContain(ACCEPT.trim());
+    expect(p).toContain(ACCEPT[0]!.text);
     expect(p).not.toContain(SPEC.trim());
+    // …once. Shown the same criteria twice — as a list and again as prose — a model answers the
+    // prose and skips the list, which is the whole reason the second rendering was deleted.
+    expect(p.split(ACCEPT[0]!.text)).toHaveLength(2);
+    // And it is told HOW to answer, or the numbers buy nothing.
+    expect(p).toMatch(/ACCEPTANCE <n>:/);
   });
 
   it('renders nothing anywhere for a task with no spec', () => {
@@ -2300,6 +2314,96 @@ describe('plan-branch fork base (RUN-82)', () => {
   });
 });
 
+// RUN-145. The gate answers the definition of done criterion by criterion, with evidence — and
+// this actor had never been given the criteria in ANY form. RUN-139 handed them to the DISPATCHED
+// verify run and CLAUDE.md said "the verify family"; the family has two members and this is the one
+// that gates every build with a [verify.agent], while the dispatched run is opt-in. Same shape as
+// RUN-158: a rule described as holding everywhere, holding at the site that runs less often.
+describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+
+  const withCriteria = (...truths: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: truths } }),
+  });
+
+  /** Build → reviewer, with the reviewer emitting `reply` as its whole report. */
+  const reviewedWith = async (task: AnchorTask | null, reply: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done'); // the build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.claude.starts[1];
+    if (!review) throw new Error('the reviewer session never started');
+    h.claude.emitText(reply);
+    h.claude.complete('done');
+    return { h, review, exit: await done };
+  };
+
+  it('is shown the numbered criteria and told how to answer them', async () => {
+    const { review } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start', 'no agent ever gets push credentials'),
+      'ACCEPTANCE 1: VERIFIED src/worktree.ts:88\nACCEPTANCE 2: VERIFIED src/security.ts:20\nVERDICT: PASS',
+    );
+    expect(review.prompt).toContain('1. [truth] the daemon reaps orphans on start');
+    expect(review.prompt).toContain('2. [truth] no agent ever gets push credentials');
+    // The numbers buy nothing without the format that spends them.
+    expect(review.prompt).toContain('ACCEPTANCE <n>:');
+    expect(review.prompt).toMatch(/recorded as BEHAVIOUR-UNVERIFIED/);
+  });
+
+  // The report answered its own question twice. Reading it as PASS is not a decision anybody made —
+  // it falls out of which parser ran last.
+  it('gates the run when the reviewer signs off PASS over a criterion it marked FAILED', async () => {
+    const { exit, h } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start'),
+      'ACCEPTANCE 1: FAILED nothing reaps on start\nVERDICT: PASS',
+    );
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.comments.map((c) => c.body).join('\n')).toMatch(/the daemon overrode this PASS/);
+  });
+
+  // Most specs are half-written. Failing every build over a truth nobody could evidence would make
+  // the field a tripwire — but a passing run is the ONLY place such a gap would otherwise vanish,
+  // so it is posted rather than merely logged.
+  it('lets a PASS stand over an unanswered criterion, and says so on the task', async () => {
+    const { exit, h } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start', 'it never pushes'),
+      'ACCEPTANCE 1: VERIFIED src/worktree.ts:88\nVERDICT: PASS',
+    );
+    expect(exit.outcome).toBe('done');
+    const posted = h.comments.map((c) => c.body).join('\n');
+    expect(posted).toMatch(/1 verified, 0 failed, 1 unverified/);
+    expect(posted).toMatch(/it never pushes/);
+  });
+
+  // Most runs carry no spec, and those reviews must look exactly as they did before.
+  it('says nothing about acceptance for a run with no spec', async () => {
+    const { review, h, exit } = await reviewedWith(null, 'VERDICT: PASS');
+    expect(review.prompt).not.toContain('ACCEPTANCE CRITERIA');
+    expect(exit.outcome).toBe('done');
+    expect(h.comments).toEqual([]);
+  });
+});
+
 describe('the inline reviewer (RUN-61)', () => {
   const REVIEWED = (
     cmd: string | null = 'npm test',
@@ -3209,6 +3313,48 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.resumeSessionId).toBe('sess-fake');
     expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
     expect(h.worktrees.created).toHaveLength(1); // only the original
+  });
+
+  // RUN-145. A resume reaches afterDriver by its OWN path, so it was passing no spec at all: the
+  // resumed run's reviewer got an empty checklist while a first-sitting run's got the criteria.
+  // Parking, answering a question and carrying on silently disabled the gate's definition of done —
+  // and worse than "no checklist", `ACCEPTANCE 1: FAILED` followed by `VERDICT: PASS` then passed,
+  // because with no items there was nothing for the override to contradict.
+  it('carries the acceptance criteria into the resumed run’s reviewer', async () => {
+    const REVIEWED = manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+    const h = await parkFirst({
+      manifest: REVIEWED,
+      anchorTask: {
+        key: 'ACME-1',
+        title: 'reap orphans',
+        body: null,
+        executionSpec: ExecutionSpec.parse({
+          acceptance: { observableTruths: ['the daemon reaps orphans on start'] },
+        }),
+      },
+    });
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done'); // the resumed build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(h.claude.opts!.prompt).toContain('1. [truth] the daemon reaps orphans on start');
+    h.claude.emitText('ACCEPTANCE 1: FAILED nothing reaps on start\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await resumed;
+    // The override reaches a resumed run too, which it could not when the checklist was empty.
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'review' });
   });
 
   it('the prompt is the ANSWER, not a fresh briefing', async () => {

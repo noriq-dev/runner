@@ -11,6 +11,7 @@
 // findings itself. This also makes authorship separation absolute: the reviewer cannot claim,
 // move, or comment as anyone, only judge.
 
+import { type AcceptanceItem, renderAcceptanceChecklist } from './acceptance';
 import { type LedgerEntry, renderLedger } from './adjudication';
 import { renderPrompt } from './prompts';
 
@@ -31,6 +32,23 @@ export interface ReviewerPromptContext {
    *  look like this repo's code?", and it was the one told nothing about what this repo's code
    *  looks like. Contents are deliberately not inlined — the diff already owns its context. */
   repoContext?: string;
+  /**
+   * The spec's acceptance criteria, numbered, for a per-item answer (RUN-145).
+   *
+   * This actor had never been given them at all. RUN-139 handed the definition of done to the
+   * DISPATCHED verify run and the note in CLAUDE.md says "the verify family" gets it — but the
+   * family has two members and this is the one that gates every build with a `[verify.agent]`,
+   * while the dispatched run is opt-in. It was judging a diff against the task's title and body
+   * with no idea what the work had been commissioned to achieve, which is the same shape as
+   * RUN-158: a rule described as holding everywhere, holding at the site that ran less often.
+   *
+   * Empty/absent → the section renders nothing and the reviewer behaves exactly as before, which
+   * is the common case: most tasks have no spec.
+   */
+  acceptance?: AcceptanceItem[];
+  /** Criteria the spec named that did not fit the checklist — said out loud, because a list that
+   *  silently stops reads as a contract that happens to be short. */
+  acceptanceOverflow?: number;
 }
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
@@ -93,6 +111,9 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
     intent: ctx.intent,
     context: ctx.repoContext ?? '',
     priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,
+    acceptance: ctx.acceptance?.length
+      ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
+      : null,
   });
 }
 

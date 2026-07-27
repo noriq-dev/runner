@@ -251,11 +251,28 @@ export {
 } from './verify';
 export {
   assembleVerifyPrompt,
+  judgeWithAcceptance,
   parseVerdict,
   verifyAgentComment,
   type Verdict,
   type VerifyVerdict,
 } from './verify-agent';
+export {
+  acceptanceOverflow,
+  acceptanceSummary,
+  enumerateAcceptance,
+  failedAcceptance,
+  reconcileAcceptance,
+  renderAcceptanceChecklist,
+  renderAcceptanceReport,
+  unverifiedAcceptance,
+  MAX_ACCEPTANCE_ITEMS,
+  type AcceptanceEvidence,
+  type AcceptanceItem,
+  type AcceptanceKind,
+  type AcceptanceOutcome,
+  type AcceptanceReport,
+} from './acceptance';
 export {
   assembleReviewerPrompt,
   reviewerFeedbackPrompt,

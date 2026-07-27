@@ -13,6 +13,7 @@
  */
 
 import type { LandPolicy, PermissionProfile, Run, RunBudget, RunPhase } from '@noriq-dev/shared';
+import type { AcceptanceItem } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverExit, DriverSession, NoriqMcp } from '../drivers/types';
@@ -76,6 +77,9 @@ export interface StageHost {
     getSessionText?: () => string;
     budget?: RunBudget;
     priorLedger?: LedgerEntry[];
+    /** The numbered acceptance criteria this gate must answer (RUN-145). */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {
@@ -126,6 +130,13 @@ export interface RunPipeline {
   /** The prior sitting's state on a "continue a failed run" (RUN-92). */
   readonly continued: ContinuableRun | null;
   readonly workflow: Workflow;
+  /** The spec's acceptance criteria, numbered, for the gate to answer one by one (RUN-145).
+   *  Empty when the run carries no spec — which is most runs, and the gate then judges in prose
+   *  exactly as it did before. */
+  readonly acceptance: AcceptanceItem[];
+  /** Criteria the spec named beyond what a checklist carries, so the gate can say its list was
+   *  incomplete rather than reporting on a contract that was quietly truncated. */
+  readonly acceptanceOverflow: number;
 
   // ── the four a stage may move ────────────────────────────────────────────────
   /** The run's fate so far. A gate narrows it; nothing ever widens it back to done. */

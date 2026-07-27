@@ -8,6 +8,7 @@
  * that cannot change.
  */
 
+import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
 import { reviewerNoVerdictComment, reviewerRejectionComment } from '../verify-reviewer';
 import type { RunPipeline, StageHost } from './types';
 
@@ -30,8 +31,26 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     getSessionText: ctx.getSessionText,
     budget: host.runBudget(run),
     priorLedger: ctx.continued?.ledger,
+    acceptance: ctx.acceptance,
+    acceptanceOverflow: ctx.acceptanceOverflow,
   });
   ctx.ledger = review.ledger; // the freshest adjudication state, for the continuable record
+
+  // The per-criterion record (RUN-145) is posted whatever the verdict, and that is the point of
+  // it: on a FAIL it is the most legible part of the report, and on a PASS it is the ONLY place a
+  // criterion nobody could evidence is visible at all — a passing run is exactly where such a gap
+  // would otherwise disappear. Only when there were criteria to answer; a run with no spec gets
+  // no empty scorecard.
+  if (review.acceptance?.entries.length) {
+    host.log.info('acceptance criteria', { runId: run.id, summary: acceptanceSummary(review.acceptance) });
+    host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(review.acceptance)}`);
+    // Anything that is not `verified` is worth a human's eyes, including `human-needed` — that
+    // outcome's whole content is "a person has to do something", so a passing run that never says
+    // so has lost the request entirely.
+    if (!review.passed || acceptanceNeedsAttention(review.acceptance)) {
+      comment(renderAcceptanceReport(review.acceptance));
+    }
+  }
 
   if (review.passed) {
     host.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });

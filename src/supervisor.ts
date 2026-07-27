@@ -11,6 +11,7 @@ import type {
 } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
@@ -77,7 +78,7 @@ import {
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
-import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict } from './verify-agent';
+import { type VerifyVerdict, assembleVerifyPrompt, judgeWithAcceptance } from './verify-agent';
 import { assembleReviewerPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import {
   BUILTIN_WORKFLOWS,
@@ -678,10 +679,18 @@ export function assemblePrompt(
      * judging a diff against acceptance criteria is RUN-145's design, not a free extra here.
      */
     executionSpec?: string;
-    /** The same spec's ACCEPTANCE CRITERIA alone, for the verify family (RUN-139) — the shape
-     *  RUN-154 gave its context, and for the same reason: an actor that judges needs the standard
-     *  it is judging against, not the author's working notes. */
-    executionSpecForVerify?: string;
+    /**
+     * The same spec's ACCEPTANCE CRITERIA, numbered, for the verify family (RUN-139 → RUN-145).
+     *
+     * An actor that judges needs the standard it is judging against, not the author's working
+     * notes about which files to touch and what was deferred — that much was RUN-139. What RUN-145
+     * changes is the FORM: a judge is asked to answer each criterion with an outcome and a piece
+     * of evidence, and it can only do that against criteria that have numbers. The prose rendering
+     * this replaced is gone rather than kept alongside, because a model shown the same criteria
+     * twice answers the paragraph and skips the list.
+     */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
     /**
      * Render the PLANNER's brief instead of this workflow's own (RUN-140).
      *
@@ -745,7 +754,9 @@ export function assemblePrompt(
   // notes about which files to touch and what was deferred. Withholding the whole spec was the
   // first cut and it was wrong: a gate that has not been told what "done" means is not
   // independent, it is under-informed, and it can pass a build that skipped a stated criterion.
-  const executionSpec = wf.verifyActor ? (ctx.executionSpecForVerify ?? '') : (ctx.executionSpec ?? '');
+  // A verify actor gets its standard through the numbered checklist below, not as a spec block —
+  // hence '' here rather than a second rendering of the same criteria (RUN-145).
+  const executionSpec = wf.verifyActor ? '' : (ctx.executionSpec ?? '');
 
   // The planner (RUN-140) reads the same facts as the run it briefs and asks for a spec instead of
   // the work. Checked BEFORE `promptRef` so a custom workflow cannot shadow it: a repo shaping its
@@ -822,11 +833,14 @@ export function assemblePrompt(
   // orientation by NAME only (RUN-154) — it is the actor asked whether a diff looks like this
   // repo's code, so telling it nothing about this repo was backwards, but its context is already
   // carrying the diff and inlining documents on top would crowd out the subject.
-  return assembleVerifyPrompt(`${run.brief}${anchor}${executionSpec}`, {
+  return assembleVerifyPrompt(`${run.brief}${anchor}`, {
     agent: ctx.agent,
     server: ctx.server,
     diffCmd: ctx.diffCmd,
     repoContext,
+    ...(ctx.acceptance?.length
+      ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+      : {}),
   });
 }
 
@@ -1444,6 +1458,9 @@ export class RunSupervisor {
      *  fresh reviewer starts from the findings the earlier sitting already settled instead of
      *  relitigating them. Empty/absent on a normal run. */
     priorLedger?: LedgerEntry[];
+    /** The numbered acceptance criteria every round's reviewer answers (RUN-145). */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
@@ -1607,6 +1624,10 @@ export class RunSupervisor {
     tally: RunTally;
     /** Findings adjudicated in earlier rounds (RUN-79) — empty on the first look. */
     ledger?: LedgerEntry[];
+    /** The numbered acceptance criteria to answer one by one (RUN-145). Empty → this reviewer is
+     *  asked for a verdict in prose, exactly as before. */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -1687,6 +1708,9 @@ export class RunSupervisor {
         verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
         ledger: ctx.ledger,
         repoContext: reviewerContext,
+        ...(ctx.acceptance?.length
+          ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+          : {}),
       }),
       // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
       // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
@@ -1732,13 +1756,21 @@ export class RunSupervisor {
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
+        // Its PARTIAL evidence is still read (RUN-145) — a reviewer killed at criterion 4 already
+        // established something about criteria 1–3, and discarding that would throw away the only
+        // work the spend bought. The verdict stays `unknown` regardless: `judgeWithAcceptance`
+        // demotes a PASS and never promotes anything, so this cannot turn a dead session into a
+        // judgement about the diff.
         return {
+          ...judgeWithAcceptance(text, ctx.acceptance ?? []),
           verdict: 'unknown',
           passed: false,
           findings: text.trim() || `the reviewer exited ${exit.reason ?? 'without a report'}`,
         };
       }
-      return parseVerdict(text);
+      // Verdict AND per-criterion evidence, reconciled together (RUN-145) — a PASS the report's
+      // own acceptance lines contradict is taken as the FAIL it contains.
+      return judgeWithAcceptance(text, ctx.acceptance ?? []);
     } finally {
       this.deps.steering?.unregister(ctx.run.id);
     }
@@ -1983,9 +2015,13 @@ export class RunSupervisor {
     //
     // A DIFF, not a replay: re-sending the whole brief would spend tokens telling a session what
     // it already holds. Silence when nothing moved, which is the common case.
-    const changed = await this.specChangedWhileParked(run, worktree, wf.produces).catch((err) => {
+    const { rendered: changed, checked: resumedSpec } = await this.specChangedWhileParked(
+      run,
+      worktree,
+      wf.produces,
+    ).catch((err) => {
       this.log.warn('could not re-check the spec on resume', { runId, err: String(err) });
-      return '';
+      return { rendered: '', checked: null };
     });
 
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
@@ -2050,6 +2086,7 @@ export class RunSupervisor {
       runAgent,
       session: executed.session,
       stopSession: executed.stopSession,
+      executedSpec: resumedSpec,
       exit: executed.exit,
       tally,
       verifyText: executed.sessionText,
@@ -2112,7 +2149,7 @@ export class RunSupervisor {
     // started is a spec nobody read. It no-ops unless the workflow produces, the run has a task,
     // and that task arrived unplanned — and it can only ever ENRICH the prompt: a planner that
     // fails leaves `start` exactly as prepare built it.
-    const start = await this.planIfUnplanned(run, prepared);
+    const { start, checked: executedSpec } = await this.planIfUnplanned(run, prepared);
 
     // The pre-execution stages are deliberately non-fatal, so a cancel during one of them reads as
     // "that stage produced nothing" — which is exactly how a cancelled run used to reach a build.
@@ -2148,11 +2185,13 @@ export class RunSupervisor {
       getSessionText: executed.getSessionText,
       tail: executed.tail,
       continued: prepared.continued,
+      executedSpec,
     });
   }
 
   /**
-   * The spec's story since the park (RUN-164), rendered, or '' when it has not moved.
+   * The spec's story since the park (RUN-164): what to tell the resumed session, and the checked
+   * spec its GATE will be held to.
    *
    * Re-fetches the anchor task and re-checks it against the workspace as `prepare` would — the two
    * things a resume skips by going straight to `executeRun`. Two independent ways a resumed run's
@@ -2162,18 +2201,29 @@ export class RunSupervisor {
    * Compared as rendered text rather than by deep-equalling the spec: the rendered block is what
    * the session was actually told, and a difference the rendering does not show is a difference
    * that would not have reached the agent anyway.
+   *
+   * `checked` rides along because a resume reaches `afterDriver` by its own path (RUN-145). Without
+   * it the resumed run's reviewer got an EMPTY checklist while a first-sitting run's got the
+   * criteria — so parking, answering a question and carrying on silently disabled the gate's
+   * definition of done. One lookup answers both, so the gate cannot end up judging a different spec
+   * than the one this session was just told about.
    */
-  private async specChangedWhileParked(run: Run, worktree: Workspace, produces: boolean): Promise<string> {
-    if (run.anchor?.type !== 'task') return '';
+  private async specChangedWhileParked(
+    run: Run,
+    worktree: Workspace,
+    produces: boolean,
+  ): Promise<{ rendered: string; checked: CheckedExecutionSpec | null }> {
+    const none = { rendered: '', checked: null };
+    if (run.anchor?.type !== 'task') return none;
     const task = await this.resolveAnchorTask(run.anchor.taskId);
-    if (!task) return '';
-    if (task.executionSpecUnreadable) return renderUnreadableSpec();
-    if (!task.executionSpec) return '';
+    if (!task) return none;
+    if (task.executionSpecUnreadable) return { rendered: renderUnreadableSpec(), checked: null };
+    if (!task.executionSpec) return none;
     const checked = await checkExecutionSpec(task.executionSpec, worktree.localPath, {
       ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
       produces,
     });
-    return renderExecutionSpec(checked);
+    return { rendered: renderExecutionSpec(checked), checked };
   }
 
   /**
@@ -2183,14 +2233,22 @@ export class RunSupervisor {
    * what makes this stage unable to cost a run: every failure path here is "the run proceeds
    * exactly as it would have without me".
    */
-  private async planIfUnplanned(run: Run, prepared: PreparedRun): Promise<PreparedRun['start']> {
+  private async planIfUnplanned(
+    run: Run,
+    prepared: PreparedRun,
+  ): Promise<{ start: PreparedRun['start']; checked: CheckedExecutionSpec | null }> {
+    // The spec this run proceeds under if planning does not happen or does not work — which is
+    // every early return below. The gate downstream is answering ACCEPTANCE CRITERIA (RUN-145), so
+    // it needs the spec the build was actually briefed with, and "the one prepare found" and "the
+    // one the planner wrote" are different answers on different paths.
+    const unplanned = { start: prepared.start, checked: prepared.checkedSpec };
     // Asked before each pre-execution spawn too, not only at the pipeline's boundaries: these
     // stages are minutes long, and a cancel arriving inside one should not be answered by starting
     // the next.
     const stopped = () => this.deps.steering?.isCancelled?.(run.id) ?? false;
-    if (stopped()) return prepared.start;
-    if (!stagesFor(prepared.workflow).some((s) => s.name === 'plan')) return prepared.start;
-    if (!prepared.plannedTask) return prepared.start;
+    if (stopped()) return unplanned;
+    if (!stagesFor(prepared.workflow).some((s) => s.name === 'plan')) return unplanned;
+    if (!prepared.plannedTask) return unplanned;
 
     // The planner spends the RUN's remaining ceiling like any other session (RUN-133) — a run with
     // nothing left declines to plan rather than starting a process to kill.
@@ -2200,7 +2258,7 @@ export class RunSupervisor {
         runId: run.id,
         breach: reservation.breach,
       });
-      return prepared.start;
+      return unplanned;
     }
 
     const planned = await planRun(this.planHost(), {
@@ -2231,7 +2289,7 @@ export class RunSupervisor {
       this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
       return null;
     });
-    if (!planned) return prepared.start;
+    if (!planned) return unplanned;
 
     // The plan checker (RUN-141), through the planner's still-open session. It cannot gate the
     // run: a plan that never clears goes to the builder WITH the findings, because refusing to
@@ -2281,9 +2339,12 @@ export class RunSupervisor {
     }
 
     return {
-      ...prepared.start,
-      prompt: prepared.rebuildPrompt(checked, extra),
-      ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+      checked,
+      start: {
+        ...prepared.start,
+        prompt: prepared.rebuildPrompt(checked, extra),
+        ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+      },
     };
   }
 
@@ -2580,6 +2641,9 @@ export class RunSupervisor {
     /** The prior sitting's continuation state on a "continue a failed run" (RUN-92): its ledger
      *  seeds the reviewer, and it decides whether the terminal record is refreshed or dropped. */
     continued?: ContinuableRun | null;
+    /** The spec this run was actually briefed with — prepare's, or the one the `plan` stage
+     *  synthesized (RUN-145). What the gate answers its acceptance criteria against. */
+    executedSpec?: CheckedExecutionSpec | null;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
@@ -2610,6 +2674,11 @@ export class RunSupervisor {
       tail,
       continued,
       workflow: wf,
+      // Enumerated ONCE, here, so the checklist the gate is shown and the numbers it answers with
+      // are the same list — computing it at each use would let a renumbering slip between them
+      // and silently repoint every answer (RUN-145).
+      acceptance: enumerateAcceptance(ctx.executedSpec?.spec),
+      acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
       // the human even if verify then fails).

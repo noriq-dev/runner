@@ -15,8 +15,9 @@
  *   - the workspace goes last, because everything above may still have needed it.
  */
 
+import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
 import { totalTokens } from '../drivers/budget';
-import { parseVerdict, verifyAgentComment } from '../verify-agent';
+import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
 
 export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
@@ -36,7 +37,21 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // worth stating: it judges the text this run's own session produced, so it is only final once
   // that session is closed. Reading it earlier would mean grading a transcript still being written.
   if (wf.verifyActor && ctx.driverSucceeded) {
-    const v = parseVerdict(ctx.sessionText);
+    // Verdict AND per-criterion evidence together (RUN-145): a report that marks a criterion
+    // FAILED and then signs off PASS is taken as the FAIL it contains, rather than as whichever
+    // half the parser happened to read last.
+    const v = judgeWithAcceptance(ctx.sessionText, ctx.acceptance);
+    if (v.acceptance?.entries.length) {
+      host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(v.acceptance)}`);
+      // Posted on a PASS as well, whenever anything is short of verified: a passing run is the one
+      // place a criterion nobody could evidence — or one explicitly needing a human — would
+      // otherwise vanish entirely.
+      if (!v.passed || acceptanceNeedsAttention(v.acceptance)) {
+        if (run.anchor?.type === 'task') {
+          host.postComment(run.projectId, run.anchor.taskId, renderAcceptanceReport(v.acceptance));
+        }
+      }
+    }
     if (v.passed) {
       host.log.info('verify agent PASS', { runId: run.id });
     } else {

@@ -77,7 +77,18 @@ and consumed by `src/execution-spec.ts`, which CHECKS it against the run's own w
 token is spent — a `modify` whose file is gone, a `create` whose file is already there, a path that
 is a directory — and renders it into the brief as `{{spec}}`. The author gets the whole spec; the
 verify family gets the acceptance criteria alone (a gate not told what done means is
-under-informed, not independent). Findings reach the agent and, when they are contradictions rather
+under-informed, not independent), and since RUN-145 gets them **numbered**, answering each with an
+outcome and a piece of evidence rather than in prose (`src/acceptance.ts`). Prose is what hid the
+criterion nobody checked: the code that would satisfy it is in the diff, so the report says PASS.
+Three rules make the structure mean something — an unnamed criterion comes back
+`behaviour-unverified` rather than passed, a `VERIFIED` pointing at nothing is demoted to it, and a
+`FAILED` criterion cannot stand alongside `VERDICT: PASS` (the daemon takes the FAIL, because a
+report that answers twice has passed nothing). Unverified is recorded and surfaced, never fatal:
+most specs are half-written, and a gate that failed every one would make the field a tripwire.
+This is also where the *inline* reviewer finally got the criteria at all — the same shape as
+RUN-158, a rule described as holding for "the verify family" holding only for the dispatched member
+while the one that gates every build had never been told what done means.
+Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud
 that a spec cannot change an agent's mode, permissions, or what it may publish, because every field

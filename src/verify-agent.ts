@@ -4,6 +4,14 @@
 // intent. This catches what a passing test suite can't: a weakened/deleted test, a
 // spec quietly unmet, a missing edge case. Its verdict gates the phase.
 
+import {
+  type AcceptanceItem,
+  type AcceptanceReport,
+  acceptanceSummary,
+  failedAcceptance,
+  reconcileAcceptance,
+  renderAcceptanceChecklist,
+} from './acceptance';
 import { renderPrompt } from './prompts';
 
 export type Verdict = 'pass' | 'fail' | 'unknown';
@@ -12,6 +20,9 @@ export interface VerifyVerdict {
   verdict: Verdict;
   passed: boolean;
   findings: string;
+  /** Per-criterion evidence (RUN-145). Absent when the actor was given no criteria to answer —
+   *  which is most runs, since most tasks carry no spec. */
+  acceptance?: AcceptanceReport;
 }
 
 export interface VerifyPromptContext {
@@ -28,6 +39,11 @@ export interface VerifyPromptContext {
    *  repo's conventions, so being told nothing about them was backwards; the contents are left
    *  out because the diff already owns this actor's context. Absent = renders as it did before. */
   repoContext?: string;
+  /** The spec's acceptance criteria, numbered, for a per-item answer (RUN-145). Empty/absent →
+   *  the section renders nothing and this actor answers in prose as it did before. */
+  acceptance?: AcceptanceItem[];
+  /** Criteria that did not fit the checklist, named rather than dropped. */
+  acceptanceOverflow?: number;
 }
 
 /** Build the adversarial verify prompt (prompts/verify-agent.md) from the phase specs.
@@ -50,6 +66,9 @@ export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): s
     server: ctx.server,
     diffCmd: ctx.diffCmd ?? null,
     context: ctx.repoContext ?? '',
+    acceptance: ctx.acceptance?.length
+      ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
+      : null,
     specs,
   });
 }
@@ -64,6 +83,45 @@ export function parseVerdict(output: string): VerifyVerdict {
   const last = matches.at(-1); // the final verdict line wins
   const verdict: Verdict = last ? (last[1]!.toUpperCase() === 'PASS' ? 'pass' : 'fail') : 'unknown';
   return { verdict, passed: verdict === 'pass', findings: output.trim() };
+}
+
+/**
+ * Parse a verdict AND its per-criterion evidence, and refuse to accept a report that contradicts
+ * itself (RUN-145).
+ *
+ * A gate that marks a criterion FAILED and then signs off PASS has not passed the work — it has
+ * written two answers and left whoever reads it last to pick. Reading that as PASS is the
+ * fail-open shape, and it is not even a choice anybody made: it falls out of the verdict line
+ * being parsed by one function and the evidence by another. So the daemon decides, here, once.
+ *
+ * Only a PASS is demoted. An `unknown` verdict stays unknown even alongside failed criteria,
+ * because unknown means the gate never rendered a judgment — killed, crashed, out of budget — and
+ * RUN-72's separation of "the work was found wanting" from "the gate did not run" is exactly what
+ * a half-written report from a killed process would destroy. The failed criteria are still
+ * recorded and still surfaced; what they do not do is convert an infrastructure failure into a
+ * verdict about the diff.
+ *
+ * `behaviour-unverified` never moves the verdict. Most specs are half-written, and failing every
+ * build with a truth nobody could evidence would make the field a tripwire rather than a contract.
+ * Those gaps are the record RUN-146 reads.
+ */
+export function judgeWithAcceptance(output: string, items: AcceptanceItem[]): VerifyVerdict {
+  const base = parseVerdict(output);
+  if (!items.length) return base;
+  const acceptance = reconcileAcceptance(items, output);
+  const failed = failedAcceptance(acceptance);
+  if (base.verdict !== 'pass' || !failed.length) return { ...base, acceptance };
+  const cited = failed
+    .map((f) => `  ${f.id}. ${f.item.text}${f.evidence ? ` — ${f.evidence}` : ''}`)
+    .join('\n');
+  return {
+    verdict: 'fail',
+    passed: false,
+    acceptance,
+    findings: `${base.findings}\n\n[the daemon overrode this PASS: the report marks ${failed.length} acceptance criteri${
+      failed.length === 1 ? 'on' : 'a'
+    } FAILED, which a PASS cannot stand alongside — ${acceptanceSummary(acceptance)}]\n${cited}`,
+  };
 }
 
 /** Format a failed verify verdict for a task comment (the phase-gate surface). */

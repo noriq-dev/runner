@@ -16,7 +16,22 @@ Look especially for, within the change:
 Drive the check with whatever tooling the repo gives you — don't just re-run the tests, exercise the behavior, and push at least one path off the happy one (empty input, wrong method, a second run against stale state).
 For code this change touches, dismiss a concern only when the code proves it cannot happen — quote the line; a realistic but uncertain runtime state (a rare-but-reachable error path, a nil on a cold cache, an off-by-one on a boundary the code does not exclude) is not grounds to dismiss, and when the evidence about such code is ambiguous, FAIL: a false PASS ships broken code, a false FAIL costs one more look. This bar is for what the diff changed — not for pre-existing code, and not for behavior the specs did not ask for.
 
-{{context}}
+{{context}}{{#acceptance}}
+
+ACCEPTANCE CRITERIA — the definition of done this work was commissioned with, before it started. Judge against these as well as the specs: they are the author's floor, not a limit on what you may raise.
+{{acceptance}}
+
+Answer EVERY numbered criterion above. One line each, in exactly this format, anywhere in your report:
+  ACCEPTANCE <n>: <VERIFIED|FAILED|BEHAVIOUR-UNVERIFIED|HUMAN-NEEDED> <evidence>
+  - VERIFIED — you established that it holds. The evidence is what you actually did: a file:line you inspected, a test that covers it and passes, a command you ran and what it printed. You have a workspace and tooling here — exercising the behaviour is available to you in a way it is not to a reader of a diff, so prefer running the thing over reading it. "The code looks correct" is not evidence, and a VERIFIED with nothing pointed at is recorded as BEHAVIOUR-UNVERIFIED anyway.
+  - FAILED — you established that it does NOT hold. Cite where.
+  - BEHAVIOUR-UNVERIFIED — the code that would satisfy it is present, and nothing you did or found establishes that it DOES. This is the honest answer far more often than it feels like, and it is the one this list exists to collect: a criterion nobody proved is not a criterion met. Reach for it whenever your basis is that the implementation looks right.
+  - HUMAN-NEEDED — it cannot be checked from this workspace at all: a claim about a deployed service, a visual judgement, a migration nobody can run here. Not the same as unverified — one is work somebody can finish, the other is not.
+A criterion you do not answer is recorded as BEHAVIOUR-UNVERIFIED. Skipping one costs you the pass you would have claimed rather than saving you a line.
+
+These lines do not replace your verdict, and they answer a different question from it. The verdict is about whether THIS DIFF meets the specs, and the rules above are unchanged: where you cannot point to the diff establishing what a spec requires, that is still a FAIL, and ambiguity about code the diff touched still resolves to FAIL. A criterion outcome is the narrower fact of what you personally established while looking — so BEHAVIOUR-UNVERIFIED is the right answer for a criterion you could not exercise, and it does not soften a verdict the rules above already decide. When both apply, say both: FAIL the diff and mark the criterion.
+
+A criterion you mark FAILED cannot stand alongside VERDICT: PASS. Write both and the daemon takes the FAIL.{{/acceptance}}
 
 End your response with EXACTLY one line, on its own:
   VERDICT: PASS   — the diff fully and honestly satisfies the intent

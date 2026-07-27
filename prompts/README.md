@@ -59,12 +59,28 @@ the spec just said, and an agent that reads the contradiction first has nothing 
 and one written before this existed simply renders without it — extra variables are ignored, so
 nothing throws and nothing is injected into a template the daemon does not control.
 
-The verify family gets a **narrower** rendering of the same spec: the acceptance criteria alone,
-placed with the intent. Withholding it entirely was the first cut and it was wrong — a gate that has
-not been told what the work was commissioned to achieve is not independent, it is under-informed,
-and it can pass a build that skipped a stated criterion or fail one for omitting something the spec
-explicitly deferred. What it does not get is the author's working notes (which files, what was
-decided, what is deferred), for the same reason its `[context]` is trimmed.
+The verify family does not get the spec at all. It gets the **acceptance criteria, numbered**
+(`{{acceptance}}`, rendered by `src/acceptance.ts`), and answers them one line each. Withholding
+them entirely was the first cut and it was wrong — a gate that has not been told what the work was
+commissioned to achieve is not independent, it is under-informed, and it can pass a build that
+skipped a stated criterion or fail one for omitting something the spec explicitly deferred. What it
+still does not get is the author's working notes (which files, what was decided, what is deferred),
+for the same reason its `[context]` is trimmed.
+
+RUN-145 made that answer **structured**, and the form is the point. Prose hides the criterion nobody
+checked: the code that would satisfy it is in the diff, so the report says PASS, and nothing
+established that it DOES what the criterion claims. So a gate emits
+`ACCEPTANCE <n>: <VERIFIED|FAILED|BEHAVIOUR-UNVERIFIED|HUMAN-NEEDED> <evidence>`, and three rules in
+`acceptance.ts` keep it honest — a criterion the report never names comes back unverified rather than
+passed, a `VERIFIED` pointing at nothing is demoted to unverified, and a `FAILED` criterion cannot
+stand alongside `VERDICT: PASS` (the daemon takes the FAIL). An unverified criterion is recorded and
+surfaced, never fatal: most specs are half-written, and failing every build over one would make the
+field a tripwire. Both members of the family carry the block — the *inline reviewer* especially,
+which had never been given the criteria in any form and gates every build that configures one, while
+the dispatched verify run is opt-in.
+
+There is deliberately no prose rendering of the criteria for these actors. Shown the same criteria
+as a list and again as a paragraph, a model answers the paragraph and skips the list.
 
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A

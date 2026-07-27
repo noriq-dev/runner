@@ -348,46 +348,20 @@ describe('rendering a spec into a brief', () => {
     expect(out).toMatch(/ask for the rest of it/);
   });
 
-  // A gate that has not been told what "done" means is not independent, it is under-informed.
-  describe('the acceptance-only rendering, for an actor that judges', () => {
-    it('carries the criteria and not the author’s working notes', async () => {
-      const out = renderExecutionSpec(
-        await checkExecutionSpec(
-          spec({
-            requirementIds: ['RUN-139'],
-            anticipatedFiles: [{ path: 'src/a.ts', change: 'modify' }],
-            lockedDecisions: [{ decision: 'ESM only' }],
-            deferred: ['the planner stage'],
-            acceptance: { observableTruths: ['a stale path reaches the agent'] },
-          }),
-          ROOT,
-          { probe: probeOver(['src/a.ts']) },
-        ),
-        { only: 'acceptance' },
-      );
-      expect(out).toContain('a stale path reaches the agent');
-      expect(out).not.toContain('src/a.ts');
-      expect(out).not.toContain('ESM only');
-      expect(out).not.toContain('the planner stage');
+  // RUN-145 moved the judge's view of the criteria out of here entirely: a gate is now asked to
+  // answer them ONE BY ONE, which needs numbers, and numbering lives in `acceptance.ts`. What this
+  // module must still guarantee is the half that made the split safe — the author's rendering is
+  // the FULL spec and nothing about it changed.
+  it('still gives the author the whole spec, criteria included', async () => {
+    const out = await render({
+      lockedDecisions: [{ decision: 'ESM only' }],
+      deferred: ['the planner stage'],
+      acceptance: { observableTruths: ['a stale path reaches the agent'] },
     });
-
-    it('does not tell a judge the criteria are the limit of what it may raise', async () => {
-      const out = renderExecutionSpec(
-        await checkExecutionSpec(spec({ acceptance: { observableTruths: ['it builds'] } }), ROOT, {
-          probe: probeOver([]),
-        }),
-        { only: 'acceptance' },
-      );
-      expect(out).toMatch(/not a limit on what you may raise/);
-    });
-
-    it('renders nothing when there are no criteria to judge against', async () => {
-      const out = renderExecutionSpec(
-        await checkExecutionSpec(spec({ discretion: ['naming'] }), ROOT, { probe: probeOver([]) }),
-        { only: 'acceptance' },
-      );
-      expect(out).toBe('');
-    });
+    expect(out).toContain('a stale path reaches the agent');
+    expect(out).toContain('ESM only');
+    expect(out).toContain('the planner stage');
+    expect(out).toMatch(/cannot change your MODE/);
   });
 
   it('states that done means TRUE, not attempted', async () => {
