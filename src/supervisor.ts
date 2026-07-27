@@ -204,7 +204,12 @@ export interface RunSupervisorDeps {
    * nothing the predictive layer no-ops — the reactive hook (RUN-101) and hard floor (RUN-102)
    * remain the guarantee. Paths are repo-relative.
    */
-  resolveLockScope?: (run: Run) => Promise<string[] | null> | string[] | null;
+  resolveLockScope?: (
+    run: Run,
+    /** The anchor task's execution spec (RUN-142) — its `anticipatedFiles` is the first thing that
+     *  declares, before any work, which files a run intends to touch. Null when it has none. */
+    spec: ExecutionSpec | null,
+  ) => Promise<string[] | null> | string[] | null;
   /** How `[context]` paths are checked to exist and stay inside the repo (RUN-128). Injected so
    *  tests never touch a real tree; omitted → the real fs probe. */
   pathProbe?: PathProbe;
@@ -2319,7 +2324,10 @@ export class RunSupervisor {
         : {}),
       resolveAnchorTask: (taskId) => this.resolveAnchorTask(taskId),
       ...(this.deps.resolveLockScope
-        ? { resolveLockScope: (run: Run) => this.deps.resolveLockScope!(run) }
+        ? {
+            resolveLockScope: (run: Run, spec: ExecutionSpec | null) =>
+              this.deps.resolveLockScope!(run, spec),
+          }
         : {}),
       lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
       lockEnforcerFor: (repo, run, worktree, kind, token) =>

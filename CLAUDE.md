@@ -108,6 +108,15 @@ advisors about work neither has done is worse than building a plan somebody crit
 sees the plan as EVIDENCE, never with the builder's "follow it" framing — it is the one actor whose
 job is to disagree with the spec.
 
+A spec's `anticipatedFiles` is also what **predictive locking** reserves (RUN-142). That layer has
+been bound since RUN-130 but only ever had a continuation's `changedPaths` to work from — what a
+previous sitting touched, which by definition does not exist the first time a task is attempted —
+so it had never held a lock on a first dispatch. `continuationLockScope` now UNIONS the declared
+scope with the touched one: a continued run must not land on what its own previous sitting changed,
+and a spec written before that sitting cannot know about it. A spec the PLANNER synthesized arrives
+after the lock has been taken, so it reserves nothing on that sitting — but it is persisted, so the
+next dispatch of that task locks what it declared.
+
 Every static prompt an agent is handed lives in [prompts/](prompts/) as a markdown template
 (tiny mustache subset; `src/prompts.ts` renders, `prompts/README.md` documents the syntax and
 maps templates to call sites). Edit the words there — code only decides which template fires and

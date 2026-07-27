@@ -87,7 +87,7 @@ export interface PrepareHost {
   createRunAgent?: (runId: string, opts: { label?: string; allowedTools?: string[] }) => Promise<RunAgent>;
   resolveAnchorTask(taskId: string): Promise<AnchorTask | null>;
   /** RUN-103's declared scope resolver. Absent → the predictive layer no-ops. */
-  resolveLockScope?: (run: Run) => Promise<string[] | null> | string[] | null;
+  resolveLockScope?: (run: Run, spec: ExecutionSpec | null) => Promise<string[] | null> | string[] | null;
   lockScopeBranch(repo: ResolvedRepo, run: Run): string | null;
   /** The reactive per-edit enforcer (RUN-101), or undefined when there is no lock layer. */
   lockEnforcerFor(
@@ -351,7 +351,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // No-op without a resolver / declared scope, so the reactive hook + hard floor stay the
   // guarantee.
   if (wf.produces && host.resolveLockScope && host.vcsFor(repo).lock) {
-    const scope = (await host.resolveLockScope(run)) ?? [];
+    const scope = (await host.resolveLockScope(run, task?.executionSpec ?? null)) ?? [];
     if (scope.length) {
       const lockCtx: LockContext = {
         projectId: run.projectId,

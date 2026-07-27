@@ -1,3 +1,4 @@
+import { ExecutionSpec } from '@noriq-dev/shared';
 import type { Run } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { ContinuableRun } from '../src/continuable';
@@ -84,22 +85,22 @@ describe('continuationLockScope', () => {
 
   it('declares the paths the failed sitting changed', async () => {
     const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/a.ts'] }) }));
-    expect(await resolve(run('run_1'))).toEqual(['src/a.ts']);
+    expect(await resolve(run('run_1'), null)).toEqual(['src/a.ts']);
   });
 
   // A first sitting has no prior record — the layer must no-op, exactly as before it was bound.
   it('declares nothing for a run with no continuation record', async () => {
-    expect(await continuationLockScope(store({}))(run('run_1'))).toBeNull();
+    expect(await continuationLockScope(store({}))(run('run_1'), null)).toBeNull();
   });
 
   it('declares nothing when the record carries no paths', async () => {
     const resolve = continuationLockScope(store({ run_1: entry() }));
-    expect(await resolve(run('run_1'))).toBeNull();
+    expect(await resolve(run('run_1'), null)).toBeNull();
   });
 
   it('treats an empty path list as no declaration, not an empty lock', async () => {
     const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: [] }) }));
-    expect(await resolve(run('run_1'))).toBeNull();
+    expect(await resolve(run('run_1'), null)).toBeNull();
   });
 
   // A lock scope is an optimisation; a broken store must never gate a dispatch.
@@ -109,7 +110,40 @@ describe('continuationLockScope', () => {
         throw new Error('corrupt');
       },
     });
-    expect(await resolve(run('run_1'))).toBeNull();
+    expect(await resolve(run('run_1'), null)).toBeNull();
+  });
+
+  // RUN-142. The predictive layer's whole problem was that it only ever had a CONTINUATION's paths —
+  // what a previous sitting touched — which by definition do not exist the first time a task is
+  // attempted. A spec's `anticipatedFiles` is the first thing that declares, before any work, which
+  // files a run intends to touch.
+  describe('the lock scope a spec declares (RUN-142)', () => {
+    const spec = (paths: string[]) =>
+      ExecutionSpec.parse({ anticipatedFiles: paths.map((path) => ({ path })) });
+
+    it('locks what a FIRST sitting declares, with no continuation record at all', async () => {
+      const resolve = continuationLockScope(store({}));
+      expect(await resolve(run('run_1'), spec(['src/a.ts', 'src/b.ts']))).toEqual(['src/a.ts', 'src/b.ts']);
+    });
+
+    // UNION, not preference: a continued run must not land on top of what its previous sitting
+    // touched, and a spec written before that sitting cannot know about it.
+    it('unions the declared scope with what the failed sitting changed', async () => {
+      const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/touched.ts'] }) }));
+      expect(await resolve(run('run_1'), spec(['src/planned.ts']))).toEqual([
+        'src/planned.ts',
+        'src/touched.ts',
+      ]);
+    });
+
+    it('does not double-lock a path both declared and touched', async () => {
+      const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/a.ts'] }) }));
+      expect(await resolve(run('run_1'), spec(['src/a.ts']))).toEqual(['src/a.ts']);
+    });
+
+    it('still declares nothing when neither side has anything', async () => {
+      expect(await continuationLockScope(store({}))(run('run_1'), spec([]))).toBeNull();
+    });
   });
 });
 

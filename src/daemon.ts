@@ -1,4 +1,4 @@
-import type { AgentTool, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
+import type { AgentTool, ExecutionSpec, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
@@ -110,9 +110,20 @@ export interface DaemonHandle {
  */
 export const continuationLockScope =
   (store: { get(runId: string): Promise<ContinuableRun | null> }) =>
-  async (run: Run): Promise<string[] | null> => {
+  async (run: Run, spec: ExecutionSpec | null): Promise<string[] | null> => {
+    // The DECLARED scope first (RUN-142). Until now the predictive layer only ever had a
+    // continuation's `changedPaths` — what a previous sitting touched — which by definition does
+    // not exist the first time a task is attempted, so the layer has never held a lock on a first
+    // dispatch. A spec's `anticipatedFiles` is the first thing that says, before any work, which
+    // files this run intends to touch.
+    //
+    // UNION, not preference: a continued run's scope is what it declared PLUS what it already
+    // touched, because the previous sitting's edits are exactly what a second run must not land
+    // on top of, and a spec written before that sitting cannot know about them.
     const prior = await store.get(run.id).catch(() => null);
-    return prior?.changedPaths?.length ? prior.changedPaths : null;
+    const declared = spec?.anticipatedFiles.map((f) => f.path) ?? [];
+    const scope = [...new Set([...declared, ...(prior?.changedPaths ?? [])])];
+    return scope.length ? scope : null;
   };
 
 /**
