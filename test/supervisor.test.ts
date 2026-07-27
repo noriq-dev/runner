@@ -2448,9 +2448,12 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
       ['one', 's1'],
       ['two', 's2'],
     ]);
-    // The gates that follow belong to the PARENT. Leaving the label set would file the terminal
-    // report under whichever step happened to be last.
+    // The gates that follow belong to the PARENT — the label rides each SESSION, so nothing after
+    // the chain inherits the last step's. On a FAILED chain that would be the step that failed,
+    // which is exactly the wrong answer in the place a human looks first.
     expect(h.transcript.at(-1)!.step).toBeNull();
+    // …and a reviewer round, which runs after the chain, is unlabelled for the same reason.
+    expect(h.transcript.filter((t) => t.role === 'reviewer').every((t) => t.step === null)).toBe(true);
   });
 
   // A spec with no steps must behave exactly as it did before — that is most runs.

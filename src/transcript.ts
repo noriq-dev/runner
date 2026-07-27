@@ -31,31 +31,27 @@ const FLUSH_AFTER_MS = 2500;
  */
 export class RunTranscript {
   private seq = 0;
-  private buf: { role: RunLogRole; round: number | null; text: string } | null = null;
-  /**
-   * Which step of a decomposed run is speaking (RUN-150). Set by the chain at each boundary rather
-   * than passed to every call: `text` is invoked from the driver's onText handler, deep inside a
-   * session that has no idea it is part of a chain, and threading it there would put a chain
-   * concern into every voice's call site.
-   */
-  private step: string | null = null;
+  private buf: { role: RunLogRole; round: number | null; step: string | null; text: string } | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly sink: (segments: RunLogSegment[]) => void) {}
 
   /** Streamed output from a session. Buffered; consecutive same-voice text coalesces. */
-  /** Whose turn it is, until told otherwise. Flushes first: a segment must not span the boundary,
-   *  or the last words of one step would be attributed to the next. */
-  onStep(step: string | null): void {
-    if (step === this.step) return;
-    this.flush();
-    this.step = step;
-  }
-
-  text(role: RunLogRole, text: string, round: number | null = null): void {
+  /**
+   * Streamed output from a session. Buffered; consecutive same-voice text coalesces.
+   *
+   * `step` (RUN-150) travels WITH the call rather than living on this object, and that is not a
+   * style choice — a mutable "current step" is correct only while exactly one session speaks at a
+   * time. The moment steps overlap, changing it for one would relabel the other's output, and the
+   * bug would be a transcript that reads plausibly and attributes the wrong work to the wrong step.
+   * The session already knows which step it is; asking it costs one argument.
+   */
+  text(role: RunLogRole, text: string, round: number | null = null, step: string | null = null): void {
     if (!text) return;
-    if (this.buf && (this.buf.role !== role || this.buf.round !== round)) this.flush();
-    if (!this.buf) this.buf = { role, round, text: '' };
+    if (this.buf && (this.buf.role !== role || this.buf.round !== round || this.buf.step !== step)) {
+      this.flush();
+    }
+    if (!this.buf) this.buf = { role, round, step, text: '' };
     this.buf.text += text;
     if (this.buf.text.length >= SEGMENT_TEXT_CAP) this.flush();
     else if (!this.timer) {
@@ -66,9 +62,9 @@ export class RunTranscript {
 
   /** A daemon milestone ("verify command failed", "reviewer verdict: FAIL round 1", …).
    *  Flushes whatever voice was speaking first, so the ordering a human reads is real. */
-  milestone(text: string): void {
+  milestone(text: string, step: string | null = null): void {
     this.flush();
-    this.emit([{ role: 'system', round: null, text }]);
+    this.emit([{ role: 'system', round: null, step, text }]);
   }
 
   /** Push everything buffered out now (voice switch, session end, terminal report). */
@@ -78,12 +74,12 @@ export class RunTranscript {
       this.timer = undefined;
     }
     if (!this.buf) return;
-    const { role, round, text } = this.buf;
+    const { role, round, step, text } = this.buf;
     this.buf = null;
     // A single oversized buffer becomes several segments, never a rejected frame.
     const parts: string[] = [];
     for (let i = 0; i < text.length; i += SEGMENT_TEXT_CAP) parts.push(text.slice(i, i + SEGMENT_TEXT_CAP));
-    this.emit(parts.map((p) => ({ role, round, text: p })));
+    this.emit(parts.map((p) => ({ role, round, step, text: p })));
   }
 
   /** Terminal: flush and stop the timer. The instance may still be reused by an in-process
@@ -92,11 +88,13 @@ export class RunTranscript {
     this.flush();
   }
 
-  private emit(items: Array<{ role: RunLogRole; round: number | null; text: string }>): void {
+  private emit(
+    items: Array<{ role: RunLogRole; round: number | null; step: string | null; text: string }>,
+  ): void {
     if (!items.length) return;
     const at = new Date().toISOString();
     try {
-      this.sink(items.map((it) => ({ seq: this.seq++, step: this.step, ...it, at })));
+      this.sink(items.map((it) => ({ seq: this.seq++, ...it, at })));
     } catch {
       /* a transcript must never gate a run */
     }

@@ -186,8 +186,11 @@ export type AcceptanceCriteria = z.infer<typeof AcceptanceCriteria>;
  */
 export const ExecutionStep = z.object({
   /** Stable within one spec — what `dependsOn` names and what a transcript
-   *  segment is labelled with. */
-  id: z.string().min(1),
+   *  segment is labelled with. Bounded to what the `run.log` frame accepts for
+   *  that label: an id the wire refuses would pass validation here and then make
+   *  the server silently drop every segment the step ever emitted, since
+   *  transcript frames are fire-and-forget. An identifier, not prose. */
+  id: z.string().min(1).max(64),
   /** One line a human reads in a nested run list. */
   title: z.string().min(1),
   /** What this step expects to touch. The child's lock scope is THIS, not the

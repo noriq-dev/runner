@@ -126,7 +126,11 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
       onText: (t) => {
         sessionText += t;
         tail = (tail + t).slice(-LOG_TAIL_CAP);
-        host.transcript(run.id).text('agent', t);
+        // Labelled by THIS session's own step (RUN-150), not by a "current step" the transcript
+        // holds: the moment two steps overlap, a shared label relabels whichever one did not move
+        // it last, and the result is a transcript that reads plausibly and attributes the wrong
+        // work to the wrong step.
+        host.transcript(run.id).text('agent', t, null, plan.stepId ?? null);
       },
     },
   });
