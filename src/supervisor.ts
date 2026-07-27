@@ -58,7 +58,13 @@ import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/type
 import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
 import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict } from './verify-agent';
 import { assembleReviewerPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
-import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, workflowFor } from './workflow';
+import {
+  BUILTIN_WORKFLOWS,
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  workflowFor,
+} from './workflow';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -691,9 +697,22 @@ export class RunSupervisor {
    * conflict turn, verify-fix — funnels through here so the sanitized child env is a supervisor
    * guarantee, not a per-driver habit. `env` is set BEFORE the caller's opts so an explicit
    * override still wins, but no caller sets it: they all inherit the stripped env by construction.
+   *
+   * The write floor is enforced here too (RUN-158), AFTER the caller's opts so nothing can spread
+   * past it. Every call site already clamps and should keep doing so — the clamp at the site is
+   * where the intent is legible — but "we audited every caller" is a property that decays with the
+   * next caller, and it had already decayed once: `runReviewer` handed `[permissions.verify]` over
+   * raw, so a repo asking for a writable verify posture got a reviewer holding Edit/Write on the
+   * diff it was judging. `opts.kind` is the posture kind at every site (a custom workflow resolves
+   * to its base via `effectiveKind`), so clamping by it here is exactly what the sites compute —
+   * idempotent where they got it right, and the floor where a future one forgets.
    */
   private startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun {
-    return superviseBudget(driver, { env: sanitizedAgentEnv(), ...opts });
+    return superviseBudget(driver, {
+      env: sanitizedAgentEnv(),
+      ...opts,
+      permission: clampPermissionToWorkflow(opts.permission, workflowFor(opts.kind)),
+    });
   }
 
   /**
@@ -1327,7 +1346,13 @@ export class RunSupervisor {
         ledger: ctx.ledger,
         repoContext: await this.reviewerContext(ctx.repo, ctx.worktree),
       }),
-      permission: manifest.permissions.verify,
+      // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
+      // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
+      // a committed manifest handed the reviewer Edit/Write over the very diff it is judging, which
+      // it could then "fix" and PASS. RUN-118's floor was described as applying at every permission
+      // site; this was the site it missed — and the one that matters most, because a dispatched
+      // verify run is opt-in while the inline reviewer gates every build that configures one.
+      permission: clampPermissionToWorkflow(manifest.permissions.verify, BUILTIN_WORKFLOWS.verify),
       // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
       // second inline identity cannot exist — and need not. The reviewer's output IS its report;
       // the daemon parses the verdict and posts the findings itself. This is also what makes

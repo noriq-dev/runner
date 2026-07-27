@@ -2311,6 +2311,32 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.verifyRan()).toBe(true); // the cmd floor still ran first
   });
 
+  // RUN-158. The assertion above passed for the wrong reason: the default `[permissions.verify]`
+  // profile already says `write = false`, so it only ever proved the default. The reviewer's
+  // profile was handed over RAW, so a repo that asked for a writable verify posture got a reviewer
+  // holding Edit/Write over the diff it was judging — free to "fix" the code and then PASS it.
+  // RUN-118's floor is described as applying at every permission site; this was the site it missed,
+  // and the one that matters most: a dispatched verify run is opt-in, the inline reviewer gates
+  // every build that configures one.
+  it('stays read-only even when the manifest asks for a WRITABLE verify posture (RUN-158)', async () => {
+    const writableVerify = REVIEWED();
+    writableVerify.permissions.verify = { ...writableVerify.permissions.verify, write: true };
+    const h = harness({ manifest: writableVerify });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+
+    expect(h.claude.starts[1]!.permission.write).toBe(false);
+    // The build's own agent is untouched — a producing workflow keeps its declared profile, which
+    // is the half of the clamp that must NOT change.
+    expect(h.claude.starts[0]!.permission.write).toBe(true);
+
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
   it('a reviewer AGENT coordinate picks the vendor, model, and effort (RUN-113)', async () => {
     // [verify.agent] agent = "codex.gpt-5_6-sol.high" → a codex reviewer judging a claude build.
     const h = harness({ manifest: REVIEWED('npm test', { agent: 'codex.gpt-5_6-sol.high' }) });

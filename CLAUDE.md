@@ -127,6 +127,14 @@ and should be updated alongside any change here.
   Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
   `write = false` for any non-producing workflow at every permission site, so no manifest — built-in
   kind or custom `[workflow.<name>]` — can hand a verify/scope posture the ability to edit.
+  "Every site" only became true at RUN-158: the *inline* reviewer (`runReviewer`) was handed
+  `[permissions.verify]` raw, which is the spawn that gates every build. The clamp now also runs
+  inside `startAgent`, the single spawn chokepoint, so a new call site inherits the floor instead of
+  having to remember it — clamp at the site anyway, for legibility.
+  What the floor buys, precisely: the **edit tools** are denied (Claude) and the write sandbox is
+  read-only (Codex). It is not "cannot alter a file" — `auto = true` grants unrestricted Bash in a
+  writable tree, by the same deliberate opt-in as `autoPush`. THREAT-MODEL.md states the boundary;
+  don't restate it more strongly than that.
 - **One worktree per Run**; never two runs in one checkout; never force-delete work that exists nowhere
   else.
 - Merging happens only into the branch `[land].branch` names, only after the gate passed *rebased onto
