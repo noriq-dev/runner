@@ -1,5 +1,7 @@
+import type { Run } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { shouldForwardRunStatus, telemetryFrame } from '../src/daemon';
+import type { ContinuableRun } from '../src/continuable';
+import { continuationLockScope, shouldForwardRunStatus, telemetryFrame } from '../src/daemon';
 import { zeroTelemetry } from '../src/drivers/types';
 
 // The daemon's report→frame gate. Untested until now, which is how the same bug shipped
@@ -60,5 +62,53 @@ describe('telemetryFrame', () => {
   it('sends null (no news) only for a phase-only tick with no telemetry', () => {
     const f = telemetryFrame({ telemetry: undefined });
     expect(f).toEqual({ tokensUsed: null, usdSpent: null, modelUsage: null });
+  });
+});
+
+// RUN-130. `resolveLockScope` shipped in RUN-103 and was never bound in daemon.ts — only tests
+// ever supplied one, so the predictive layer never ran in production. These cover the source that
+// closed it, for the reason this file exists: an untested lambda in the wiring is how that
+// happened in the first place.
+describe('continuationLockScope', () => {
+  const run = (id: string) => ({ id }) as Run;
+  const store = (entries: Record<string, ContinuableRun>) => ({
+    get: async (runId: string) => entries[runId] ?? null,
+  });
+  const entry = (over: Partial<ContinuableRun> = {}): ContinuableRun => ({
+    runId: 'run_1',
+    spent: { tokens: 0, usd: 0 },
+    ledger: [],
+    failedAt: '2026-07-26T00:00:00.000Z',
+    ...over,
+  });
+
+  it('declares the paths the failed sitting changed', async () => {
+    const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/a.ts'] }) }));
+    expect(await resolve(run('run_1'))).toEqual(['src/a.ts']);
+  });
+
+  // A first sitting has no prior record — the layer must no-op, exactly as before it was bound.
+  it('declares nothing for a run with no continuation record', async () => {
+    expect(await continuationLockScope(store({}))(run('run_1'))).toBeNull();
+  });
+
+  it('declares nothing when the record carries no paths', async () => {
+    const resolve = continuationLockScope(store({ run_1: entry() }));
+    expect(await resolve(run('run_1'))).toBeNull();
+  });
+
+  it('treats an empty path list as no declaration, not an empty lock', async () => {
+    const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: [] }) }));
+    expect(await resolve(run('run_1'))).toBeNull();
+  });
+
+  // A lock scope is an optimisation; a broken store must never gate a dispatch.
+  it('degrades to no declaration when the store throws', async () => {
+    const resolve = continuationLockScope({
+      get: async () => {
+        throw new Error('corrupt');
+      },
+    });
+    expect(await resolve(run('run_1'))).toBeNull();
   });
 });

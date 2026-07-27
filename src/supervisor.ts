@@ -2252,6 +2252,12 @@ export class RunSupervisor {
     if (this.deps.continuable) {
       if (wf.produces && exit.outcome === 'failed' && driverSucceeded && !landed) {
         const spent = exit.telemetry;
+        // What this sitting touched becomes the continuation's declared lock scope (RUN-130).
+        // Best-effort: a backend without `changedPaths`, or a query that errors, simply records
+        // none — the predictive layer then no-ops exactly as it did while nothing was bound.
+        const changedPaths = await (this.vcsFor(repo).changedPaths?.(worktree) ?? Promise.resolve([]))
+          .then((p) => p)
+          .catch(() => [] as string[]);
         await this.deps.continuable
           .put({
             runId: run.id,
@@ -2261,6 +2267,7 @@ export class RunSupervisor {
               ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
             },
             ledger: latestLedger,
+            ...(changedPaths.length ? { changedPaths } : {}),
             failedAt: new Date().toISOString(),
           })
           .catch((err) =>

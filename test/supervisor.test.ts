@@ -2363,6 +2363,29 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(ok.continuable.entries.has('run_1')).toBe(false); // resolved → nothing left to continue
   });
 
+  // RUN-130: the write half of the predictive lock source. What this sitting changed becomes the
+  // continuation's declared scope, so the paths are taken BEFORE the retry respawns rather than
+  // discovered at the post-build floor after paying for the work again.
+  it('records what the failed sitting changed, as the continuation’s declared lock scope', async () => {
+    const h = harness({ verifyPasses: false });
+    h.worktrees.changedFiles = ['src/a.ts', 'src/b.ts'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('failed');
+    expect(h.continuable.entries.get('run_1')?.changedPaths).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  it('records no scope when the sitting changed nothing the backend can name', async () => {
+    const h = harness({ verifyPasses: false });
+    h.worktrees.changedFiles = [];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.continuable.entries.get('run_1')?.changedPaths).toBeUndefined();
+  });
+
   it('a reviewer with no verdict still GATES the run — but as no-judgment, never as a refusal (RUN-72)', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());

@@ -45,6 +45,21 @@ export interface ContinuableRun {
    * scratch. Empty when the failure was not a reviewer gate (a deterministic verify or land fail).
    */
   ledger: LedgerEntry[];
+  /**
+   * The paths the failed sitting actually changed — the run's declared write scope for its
+   * continuation (RUN-130).
+   *
+   * `RunSupervisorDeps.resolveLockScope` has existed since RUN-103 and was never bound, because no
+   * run carries a declared scope on the wire and nothing else could honestly supply one. A
+   * CONTINUATION can: the prior sitting's diff is on disk, and a run resuming failed work will
+   * almost certainly touch the same files again. Locking them before it respawns is exactly the
+   * race the predictive layer exists to prevent — a peer taking those paths mid-continuation.
+   *
+   * Absent (a first sitting, or a backend without `changedPaths`) means no declared scope, and the
+   * predictive layer no-ops as before. Phase 4 broadens the source to the execution spec's
+   * anticipated files, which covers the first sitting too; this covers the case available today.
+   */
+  changedPaths?: string[];
   failedAt: string;
 }
 

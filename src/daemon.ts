@@ -1,6 +1,6 @@
-import type { AgentTool, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
+import type { AgentTool, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
-import { ContinuableStore } from './continuable';
+import { type ContinuableRun, ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
@@ -84,6 +84,25 @@ export interface DaemonHandle {
   /** Stop live agents, let them report, then close the socket. Await it before exiting. */
   stop(): Promise<void>;
 }
+
+/**
+ * The predictive lock layer's scope source (RUN-130), extracted so it is TESTED rather than
+ * living as an untested lambda in the wiring below — the same reasoning that put
+ * `shouldForwardRunStatus` up here, and for the same reason: this whole layer was silently dead
+ * for want of one line.
+ *
+ * A continuation is the case that can honestly declare a write scope today. Its failed sitting
+ * recorded the paths it changed, and the run resuming that work will almost certainly touch them
+ * again — so taking them before it respawns is precisely the race RUN-103 was built to prevent.
+ * Anything else (a first sitting, a lost record, a backend with no `changedPaths`) yields null,
+ * and the layer no-ops exactly as it did while nothing was bound.
+ */
+export const continuationLockScope =
+  (store: { get(runId: string): Promise<ContinuableRun | null> }) =>
+  async (run: Run): Promise<string[] | null> => {
+    const prior = await store.get(run.id).catch(() => null);
+    return prior?.changedPaths?.length ? prior.changedPaths : null;
+  };
 
 /**
  * Ties the pieces together: register over REST (RUN-9), then hold the long-lived
@@ -276,6 +295,9 @@ export class Daemon {
       getParkState: (runId) => client.getParkState(runId),
       parked,
       continuable,
+      // The line whose absence made RUN-103's predictive layer dead code in production: the dep
+      // existed, the supervisor consumed it, and only tests ever supplied one. See its doc above.
+      resolveLockScope: continuationLockScope(continuable),
       steering,
       logger: this.log,
     });
