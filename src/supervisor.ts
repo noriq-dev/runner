@@ -10,7 +10,7 @@ import type {
   RunPhase,
 } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
-import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
 import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
@@ -2144,29 +2144,51 @@ export class RunSupervisor {
     // step two of five came back, finished step two, and reported DONE having silently skipped the
     // rest of its plan. The chain is recomputed from the spec as it stands NOW, which is the same
     // re-fetch RUN-164 already does, so a spec corrected during the park is the one that governs.
-    const resumedChain = checkSteps(resumedSpec?.spec);
+    // A park written before steps existed (RUN-168) records no position. Its spec may have GAINED
+    // steps since, and chaining it then would treat step one as fresh — erasing the resume session
+    // id, never delivering the human's answer, and replaying work that is already done. Such a park
+    // resumes as the single session it was written as.
+    const resumedChain = entry.stepId ? checkSteps(resumedSpec?.spec) : { steps: [], findings: [] };
+    if (!entry.stepId && checkSteps(resumedSpec?.spec).steps.length) {
+      this.log.info('this park predates step positions — resuming it as the single session it was', {
+        runId,
+      });
+    }
+    // Where the chain picks up, and therefore whether anything is left to brief. Total length is
+    // the wrong question: a two-step chain parked on step two has nothing after it.
+    const resumeAt = resumedChain.steps.findIndex((st) => st.id === entry.stepId);
+    const hasLaterSteps = resumeAt >= 0 && resumeAt < resumedChain.steps.length - 1;
+    // The same range `prepare` computes, resolved only when a later step will need it. A verify
+    // actor's whole subject is the accumulated diff (RUN-21); omitting this falls back to "inspect
+    // the modified files", and a leased build branch is CLEAN — so a resumed verify step would find
+    // nothing to review and could pass the change without ever seeing it. Non-git backends have no
+    // such command and the prompt points at the workspace instead.
+    const resumedDiffCmd =
+      hasLaterSteps && run.verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
+        ? `git diff ${(await this.planBase(repo, run).catch(() => null)) ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
+        : undefined;
     // The RUN's brief, rebuilt on the resume path (RUN-169) — only when there are later steps to
     // brief, since building one costs a `[context]` walk and the common resume has nothing after
     // the session it restores. Never fatal: a resume that cannot build one falls back to what it
     // always sent, which is the pre-RUN-169 behaviour rather than a new failure.
-    const resumedBrief =
-      resumedChain.steps.length > 1
-        ? await buildRunBrief(this.prepareHost(), {
-            run,
-            repo,
-            worktree,
-            task: resumedTask,
-            runAgent,
-            kind,
-            ...(run.workflow ? { workflow: wf } : {}),
-          }).catch((err) => {
-            this.log.warn('could not rebuild the brief on resume — later steps will not run', {
-              runId,
-              err: String(err),
-            });
-            return null;
-          })
-        : null;
+    const resumedBrief = hasLaterSteps
+      ? await buildRunBrief(this.prepareHost(), {
+          run,
+          repo,
+          worktree,
+          task: resumedTask,
+          runAgent,
+          kind,
+          ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
+          ...(run.workflow ? { workflow: wf } : {}),
+        }).catch((err) => {
+          this.log.warn('could not rebuild the brief on resume — later steps will not run', {
+            runId,
+            err: String(err),
+          });
+          return null;
+        })
+      : null;
     const executed = resumedChain.steps.length
       ? await executeChain(this.executeHost(), {
           ...resumeBase,
@@ -2288,7 +2310,12 @@ export class RunSupervisor {
     // What this run was actually briefed with, recorded once (RUN-166). Sent here rather than at
     // dispatch because THIS is where the answer exists: a task that arrived unplanned executes
     // under whatever the planner wrote, which the server never sent and could not have stored.
-    if (executedSpec) this.deps.report(run.id, { status: 'running', executedSpec: executedSpec.spec });
+    // `hasExecutionSpec`, not truthiness: a planner that answered with nothing produces a
+    // normalised-but-EMPTY spec, and reporting that would record "briefed with a vacuous contract"
+    // where the truth is "briefed with none" — the two facts this record exists to distinguish.
+    if (hasExecutionSpec(executedSpec?.spec)) {
+      this.deps.report(run.id, { status: 'running', executedSpec: executedSpec!.spec });
+    }
 
     const chain = checkSteps(executedSpec?.spec);
     const executed = chain.steps.length
