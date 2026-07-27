@@ -556,6 +556,10 @@ function harness(
     parkChecks,
     claimChecks,
     agentCreates,
+    /** Model the run asking a question on its NEXT session end — a park mid-chain. */
+    parkNext: () => {
+      park.state = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
+    },
     /** Model a human rewriting the task's spec while the run is parked. */
     setAnchorTask: (t: AnchorTask | null) => {
       anchorTask = t;
@@ -3747,6 +3751,58 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.prompt).not.toContain('Use B.'); // not the answer to step one's question
     h.claude.complete('done');
     expect(await resumed).toMatchObject({ outcome: 'done' });
+  });
+
+  // RUN-171. `executeChain` gives every step the earlier steps' conclusions, and that hand-off is
+  // the whole argument for a chain of fresh contexts over one long one. A resume rebuilt the array
+  // EMPTY, so a run parked on step two briefed step three with step two's post-answer output alone
+  // — step one's conclusions gone, and step three rediscovering what the run had established.
+  it('carries what the steps before the park concluded into the ones after it', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'three steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+          { id: 's3', title: 'third' },
+        ],
+      }),
+    };
+    // Step one finishes and says something; step two then parks on a question.
+    const h = harness({ anchorTask: task, parkState: { blocked: false } });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.emitText('STEP-ONE-CONCLUSION');
+    h.claude.complete('done');
+    for (let i = 0; i < 300 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.parkNext();
+    h.claude.complete('done'); // step two parks
+    await done;
+
+    const parked = h.parked.entries.get('run_1')!;
+    expect(parked.stepId).toBe('s2');
+    // Step ONE's summary is in the record. The parked step's own is not: it parked mid-turn, so
+    // its state is a question rather than a conclusion, and recording that would hand the next
+    // step a half-thought.
+    expect(parked.priorSteps?.map((p) => p.id)).toEqual(['s1']);
+    expect(parked.priorSteps?.[0]!.text).toContain('STEP-ONE-CONCLUSION');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed step two
+    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    // Step three is briefed with step one's conclusion, not only step two's.
+    expect(h.claude.starts.at(-1)!.prompt).toContain('STEP-ONE-CONCLUSION');
+    h.claude.complete('done');
+    await resumed;
   });
 
   // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step

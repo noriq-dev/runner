@@ -50,6 +50,8 @@ export interface ChainPlan extends Omit<ExecutePlan, 'stepId'> {
   /** Capture the accumulated work between steps, so the next session reads it from the tree.
    *  Returns false when there was nothing to capture, which is not an error. */
   checkpoint: (label: string) => Promise<boolean>;
+  /** What the steps before the resumed one concluded, restored from the park (RUN-171). */
+  priorSteps?: StepSummary[];
   /** Resume a chain from this step, skipping the ones already finished (RUN-168). The FIRST step
    *  run is then the parked one, resumed rather than started — `plan.start` carries its session id.
    *  Absent on a fresh run. */
@@ -108,7 +110,9 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     return { chainFailed: 'steps:parked-step-gone' };
   }
 
-  const prior: StepSummary[] = [];
+  // Seeded from the park on a resume (RUN-171): the steps before this one already concluded
+  // something, and starting empty makes the next step rediscover it.
+  const prior: StepSummary[] = [...(plan.priorSteps ?? [])];
   // The whole run's output, not the last step's. The verify actor's verdict and RUN-145's
   // acceptance evidence are parsed from this, and a decomposed verify run whose FIRST step found
   // the fault would otherwise be cleared by a later step's PASS — the gate reading only the last
@@ -159,6 +163,9 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     const outcome = await executeRun(host, {
       ...plan,
       stepId: step.id,
+      // What a park would need to persist if this step asks a question (RUN-171) — the steps
+      // BEFORE it, since its own conclusions do not exist yet.
+      priorSteps: prior,
       // Its own tally slot, or N steps would overwrite one another's spend and the run would report
       // only the last (RUN-133's accounting is last-writer-wins PER SLOT).
       slot: `step:${step.id}`,

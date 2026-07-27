@@ -24,6 +24,7 @@ import type { logger as defaultLogger } from '../logger';
 import type { ResolvedRepo, RunReport, RunTally } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { Workspace } from '../vcs/types';
+import type { StepSummary } from './chain';
 
 /** How much of the agent's trailing output to stream as the live log tail (RUN-22). */
 export const LOG_TAIL_CAP = 4000;
@@ -55,6 +56,9 @@ export interface ExecuteHost {
     /** Which step was speaking, on a decomposed run (RUN-168) — persisted so a resume knows where
      *  the chain stopped rather than finishing one session and calling the run done. */
     stepId?: string;
+    /** What the steps BEFORE it concluded (RUN-171) — persisted so a resumed chain briefs its
+     *  later steps with the hand-off rather than starting them ignorant. */
+    priorSteps?: StepSummary[];
   }): Promise<DriverExit | null>;
 }
 
@@ -76,6 +80,8 @@ export interface ExecutePlan {
   priorActiveSeconds: number;
   /** Which step this session IS, on a decomposed run (RUN-168). Absent for an undecomposed run. */
   stepId?: string;
+  /** What earlier steps concluded, carried so a park can persist it (RUN-171). */
+  priorSteps?: StepSummary[];
   /**
    * Which tally slot this session's spend records into. Defaults to `primary`, which is every
    * undecomposed run.
@@ -170,6 +176,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
     tally,
     tail,
     ...(plan.stepId ? { stepId: plan.stepId } : {}),
+    ...(plan.priorSteps?.length ? { priorSteps: plan.priorSteps } : {}),
   });
   if (parked) return { parked };
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
 import type { ModelUsage } from './drivers/types';
 import { renderPrompt } from './prompts';
+import type { StepSummary } from './stages/chain';
 import type { Workspace } from './vcs/types';
 
 /**
@@ -86,6 +87,21 @@ export interface ParkedRun {
    * is not deferrable to whenever chains grow their next capability.
    */
   stepId?: string | null;
+  /**
+   * What the steps BEFORE the parked one concluded (RUN-171) — the hand-off a resumed chain would
+   * otherwise start without.
+   *
+   * `executeChain` gives every step the earlier steps' summaries, and that is the whole argument
+   * for a chain of fresh contexts over one long one: each link starts clean but not ignorant. A
+   * resume rebuilt that array empty, so a five-step run parked on step two came back and briefed
+   * step three with step two's post-answer output alone — step one's conclusions gone, and step
+   * three rediscovering what two steps had already established.
+   *
+   * Strictly the steps before it. The parked step's own summary is captured when it FINISHES,
+   * after the resume, exactly as it would have been — its state at park time is a question, not a
+   * conclusion, and recording that as a finding would hand the next step a half-thought.
+   */
+  priorSteps?: StepSummary[];
 }
 
 type ParkedFile = { parked: ParkedRun[] };

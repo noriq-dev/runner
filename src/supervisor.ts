@@ -80,6 +80,7 @@ import {
   worthMapping,
 } from './stages';
 import { authorSpecBlock, buildRunBrief } from './stages/brief';
+import type { StepSummary } from './stages/chain';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -1950,6 +1951,8 @@ export class RunSupervisor {
     tail: string;
     /** Which step of a decomposed run was speaking (RUN-168). */
     stepId?: string;
+    /** What the steps before it concluded (RUN-171). */
+    priorSteps?: StepSummary[];
   }): Promise<DriverExit | null> {
     const { run, exit } = ctx;
     if (!this.deps.parked || !this.deps.getParkState) return null;
@@ -2000,6 +2003,9 @@ export class RunSupervisor {
       // other tooling reads, and a field that appears on every record to say "not applicable" is a
       // shape change for nothing.
       ...(ctx.stepId ? { stepId: ctx.stepId } : {}),
+      // The hand-off a resumed chain would otherwise start without (RUN-171). Omitted when empty,
+      // for the same reason `stepId` is: an undecomposed park keeps the shape it always had.
+      ...(ctx.priorSteps?.length ? { priorSteps: ctx.priorSteps } : {}),
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
@@ -2194,6 +2200,9 @@ export class RunSupervisor {
           ...resumeBase,
           steps: resumedChain.steps,
           ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
+          // What the steps before the parked one concluded (RUN-171) — without it, the step after
+          // the resume rediscovers everything the run had already established.
+          ...(entry.priorSteps?.length ? { priorSteps: entry.priorSteps } : {}),
           // Only when the brief could not be rebuilt: a fresh step with no brief is worse than one
           // that does not run, and saying so beats running it badly.
           ...(resumedBrief ? {} : { stopAfterResumedStep: true }),
