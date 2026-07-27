@@ -62,6 +62,7 @@ export {
   discoverAgentInstructions,
   loadRepoContext,
   loadRepoDocs,
+  openConfined,
   renderRepoContext,
   resolveRepoContext,
   type ContextRejection,

@@ -1,6 +1,8 @@
+import { execFile as execFileCb } from 'node:child_process';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import type { ProjectContext } from '@noriq-dev/shared';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -11,9 +13,12 @@ import {
   discoverAgentInstructions,
   loadRepoContext,
   loadRepoDocs,
+  openConfined,
   renderRepoContext,
   resolveRepoContext,
 } from '../src/repo-context';
+
+const execFile = promisify(execFileCb);
 
 const ctx = (over: Partial<ProjectContext> = {}): ProjectContext => ({
   requiredReading: [],
@@ -126,6 +131,115 @@ describe('defaultPathProbe', () => {
     await symlink(path.join(outside, 'secret'), link);
     expect(await defaultPathProbe(link, root)).toBe('outside-repo');
   });
+
+  // Comparing a RESOLVED target against an UNRESOLVED root rejects everything the moment the
+  // checkout is reached through a link — and a probe that fails closed on every path looks exactly
+  // like a repo that declared a broken list.
+  it('accepts an in-repo file when the root itself is reached through a symlink', async () => {
+    const linkedRoot = path.join(outside, 'root-link');
+    await symlink(root, linkedRoot);
+    expect(await defaultPathProbe(path.join(linkedRoot, 'docs', 'ARCH.md'), linkedRoot)).toBe(true);
+  });
+});
+
+// RUN-151. Confinement used to be check-then-open, so the check did not bind the open. These pin
+// the boundary on the operation that actually reads bytes, against a real tree — a fake reader
+// cannot exhibit a filesystem race, and every symlink here is something a COMMITTED marker can
+// name, which is what makes this a boundary rather than tidiness.
+describe('openConfined', () => {
+  let root: string;
+  let outside: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'noriq-fd-'));
+    outside = await mkdtemp(path.join(tmpdir(), 'noriq-fd-out-'));
+    await writeFile(path.join(root, 'in.md'), 'inside');
+    await writeFile(path.join(outside, 'secret'), 'shh');
+    await mkdir(path.join(root, 'sub'), { recursive: true });
+    await symlink(path.join(outside, 'secret'), path.join(root, 'leak.md'));
+    await symlink(path.join(root, 'in.md'), path.join(root, 'sub', 'alias.md'));
+    await symlink(outside, path.join(root, 'outdir'));
+  });
+
+  afterAll(async () => {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  const readAll = async (abs: string, from = root) => {
+    const fh = await openConfined(abs, from);
+    try {
+      return (await fh.readFile()).toString('utf8');
+    } finally {
+      await fh.close();
+    }
+  };
+
+  it('opens a file inside the repo', async () => {
+    expect(await readAll(path.join(root, 'in.md'))).toBe('inside');
+  });
+
+  it('refuses an in-repo symlink pointing outside the repo', async () => {
+    await expect(readAll(path.join(root, 'leak.md'))).rejects.toThrow(/outside the repo/);
+  });
+
+  // The parent-directory variant: every component is checked because `realpath` resolves the whole
+  // chain, not just the last one.
+  it('refuses a path that leaves the repo through a symlinked parent directory', async () => {
+    await expect(readAll(path.join(root, 'outdir', 'secret'))).rejects.toThrow(/outside the repo/);
+  });
+
+  // A link OUT is the refusal; a link WITHIN is ordinary repo layout and must keep working, which
+  // is why the final component is followed rather than opened with O_NOFOLLOW.
+  it('follows an in-repo symlink to an in-repo file', async () => {
+    expect(await readAll(path.join(root, 'sub', 'alias.md'))).toBe('inside');
+  });
+
+  it('refuses a directory — the reader expects a regular file', async () => {
+    await expect(readAll(path.join(root, 'sub'))).rejects.toThrow(/regular file/);
+  });
+
+  it('still opens the file when the root is reached through a symlink', async () => {
+    const linkedRoot = path.join(outside, 'root-link');
+    await symlink(root, linkedRoot);
+    expect(await readAll(path.join(linkedRoot, 'in.md'), linkedRoot)).toBe('inside');
+  });
+
+  // The property that separates this from check-then-open, and the one the symlink tests above do
+  // NOT prove: they would pass an implementation that validated the path and opened it afterwards.
+  // Here the name is repointed at a different inode AFTER the handle is returned, and the handle
+  // still yields the validated bytes. The race window itself cannot be driven from a test — nothing
+  // can run between the `open` and the check — so this pins the consequence instead.
+  it('reads the descriptor it validated, not the name it was handed', async () => {
+    const p = path.join(root, 'swap.md');
+    await writeFile(p, 'original');
+    const fh = await openConfined(p, root);
+    try {
+      await rm(p);
+      await writeFile(p, 'replaced'); // same name, new inode
+      expect((await fh.readFile()).toString('utf8')).toBe('original');
+    } finally {
+      await fh.close();
+    }
+  });
+
+  // git can commit a symlink pointing at a FIFO, and a BLOCKING open on one waits for a writer that
+  // never arrives — the `isFile` refusal below would never be reached and a committed marker would
+  // hang prompt assembly. The timeout is the assertion: without `O_NONBLOCK` this test hangs rather
+  // than fails, which is exactly the daemon's failure mode.
+  it.skipIf(process.platform === 'win32')(
+    'refuses a FIFO instead of blocking on it forever',
+    async () => {
+      const fifo = path.join(root, 'pipe.md');
+      try {
+        await execFile('mkfifo', [fifo]);
+      } catch {
+        return; // no mkfifo on this box — nothing to assert
+      }
+      await expect(readAll(fifo)).rejects.toThrow(/regular file/);
+    },
+    3000,
+  );
 });
 
 // Against the REAL reader and real files, because the bug these cover is invisible to a fake: a
@@ -179,7 +293,7 @@ describe('defaultDocReader', () => {
   it('reads a bounded window, not the whole file', async () => {
     const big = path.join(root, 'huge.md');
     await writeFile(big, 'x'.repeat(200_000));
-    const raw = await defaultDocReader(big, 10);
+    const raw = await defaultDocReader(big, 10, root);
     expect(raw.length).toBeLessThanOrEqual((10 + 1) * 4);
     expect(raw.length).toBeGreaterThan(10); // still enough to detect the cut
   });
@@ -316,6 +430,25 @@ describe('loadRepoDocs', () => {
     expect(r.docs).toEqual([]);
     expect(r.skipped).toEqual(['../../etc/passwd']);
     expect(reads).toEqual([]); // refused before any open
+  });
+
+  // The lexical guard above cannot see a symlink, so on its own it left the exported entry point
+  // open to an in-repo path whose TARGET is outside. Confinement lives in the reader now, and this
+  // proves the default one is what a caller who supplies no reader actually gets.
+  it('refuses an in-repo symlink pointing outside, using the real reader', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'noriq-docs-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'noriq-docs-out-'));
+    try {
+      await writeFile(path.join(outside, 'secret'), 'shh');
+      await symlink(path.join(outside, 'secret'), path.join(root, 'leak.md'));
+      await writeFile(path.join(root, 'ok.md'), 'fine');
+      const r = await loadRepoDocs(root, ['leak.md', 'ok.md'], undefined, 100);
+      expect(r.docs).toEqual([{ path: 'ok.md', text: 'fine' }]);
+      expect(r.skipped).toEqual(['leak.md']); // refused, and NAMED — never a silent drop
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it('skips — and names — everything after the budget is spent', async () => {

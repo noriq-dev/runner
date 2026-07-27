@@ -1,4 +1,6 @@
+import { constants as FS } from 'node:fs';
 import { open, realpath, stat } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { ProjectContext } from '@noriq-dev/shared';
 
@@ -52,6 +54,14 @@ const contains = (root: string, abs: string): boolean => {
  * The real probe. `stat` (not `lstat`) follows symlinks on purpose — then the RESOLVED target is
  * re-checked against the root, so an in-repo symlink pointing at `/etc/shadow` is refused rather
  * than followed. A path that cannot be statted is simply missing.
+ *
+ * BOTH sides are resolved. Comparing a resolved target against an UNresolved root fails closed the
+ * moment the checkout is reached through a link (`/var/home` → `/home` on this box, `/tmp` on
+ * macOS): every declared path would resolve out from under its own root and the repo would be told
+ * its whole list is outside itself.
+ *
+ * This is a probe, not a gate: it answers "is this worth putting in the brief". The gate that
+ * actually binds is `openConfined` — see RUN-151.
  */
 export const defaultPathProbe: PathProbe = async (abs, root) => {
   try {
@@ -59,9 +69,66 @@ export const defaultPathProbe: PathProbe = async (abs, root) => {
     if (!s.isFile() && !s.isDirectory()) return 'missing';
     // `stat` already followed the link chain; resolve it explicitly and re-check containment,
     // so an in-repo symlink pointing outside is refused rather than silently followed.
-    return contains(root, await realpath(abs)) ? true : 'outside-repo';
+    return contains(await realpath(root), await realpath(abs)) ? true : 'outside-repo';
   } catch {
     return 'missing';
+  }
+};
+
+/**
+ * Open a file and then prove the OPEN DESCRIPTOR is one that lives inside the repo (RUN-151).
+ *
+ * Confinement used to be check-then-open: the probe statted a path and the reader opened it later,
+ * two operations with a window between them. Replacing a checked symlink — or any parent directory
+ * on the way down — inside that window yielded a read from outside the checkout, and since RUN-129
+ * inlines these files' CONTENTS into an agent prompt, that window is an arbitrary-file-read
+ * primitive handed to a committed marker.
+ *
+ * The order is the fix. We open first, so whatever happens to the tree afterwards, the bytes come
+ * from the object we are about to interrogate. Then:
+ *
+ *   - resolve the path again and require it inside the (also resolved) root; and
+ *   - require the resolved path and the descriptor to be the SAME INODE (`dev`/`ino`).
+ *
+ * The identity check is what closes the window rather than merely narrowing it. If the tree was
+ * swapped before our open, the path now resolves elsewhere and the inodes disagree. If it is
+ * swapped after our check, we already hold the descriptor and never consult the path again. Either
+ * way the caller reads the file it validated, not a name that once pointed at it.
+ *
+ * `O_NOFOLLOW` is deliberately NOT used: an in-repo symlink to an in-repo file is legitimate — it
+ * is a link OUT that is refused — and the probe already admits that case. `O_NONBLOCK` IS used, and
+ * it is load-bearing rather than an optimisation: git can commit a symlink pointing at a FIFO, and
+ * a blocking `open` on a FIFO waits for a writer that never comes — the check below would never be
+ * reached, so a committed marker could hang prompt assembly outright. Non-blocking, the open
+ * returns and `isFile()` refuses it. On a regular file the flag has no effect.
+ *
+ * **What this does NOT cover**, stated plainly because the row it backs in THREAT-MODEL.md would
+ * otherwise read as more than it is: an attacker who can already write to the checkout as the
+ * operator can hardlink or bind-mount an outside file to a path that is genuinely inside the repo.
+ * The inodes then match because it really is the same file, and no fd check can tell that from
+ * ordinary repo content. That attacker is inside the boundary already and could simply write the
+ * secret into a tracked file. What is defended here is the case that actually travels: a COMMITTED
+ * marker naming paths, on a box the daemon trusts. `root` is likewise trusted input — it comes from
+ * the daemon's own scan of `scanRoots`, never from the manifest, which supplies only the leaf path.
+ */
+export const openConfined = async (abs: string, root: string): Promise<FileHandle> => {
+  const fh = await open(abs, FS.O_RDONLY | (FS.O_NONBLOCK ?? 0));
+  try {
+    const [realRoot, realAbs] = await Promise.all([realpath(root), realpath(abs)]);
+    if (!contains(realRoot, realAbs)) throw new Error(`refusing to read outside the repo: ${abs}`);
+    // `bigint` on BOTH stats, because this is an identity comparison and not a display. Inode
+    // numbers on modern filesystems run past `Number.MAX_SAFE_INTEGER`, where two distinct inodes
+    // can round to the same double — an identity check that can report equal for unequal files is
+    // not an identity check.
+    const [viaFd, viaPath] = await Promise.all([fh.stat({ bigint: true }), stat(realAbs, { bigint: true })]);
+    if (!viaFd.isFile()) throw new Error(`not a regular file: ${abs}`);
+    if (viaFd.dev !== viaPath.dev || viaFd.ino !== viaPath.ino) {
+      throw new Error(`path changed while opening it: ${abs}`);
+    }
+    return fh;
+  } catch (err) {
+    await fh.close().catch(() => {});
+    throw err;
   }
 };
 
@@ -153,7 +220,15 @@ export interface LoadedRepoDocs {
  * repo hand the daemon a multi-gigabyte in-repo file and stall or OOM it before a single budget
  * character is spent. Injected so tests never touch a real tree.
  */
-export type DocReader = (absPath: string, limit: number) => Promise<string>;
+export type DocReader = (absPath: string, limit: number, root: string) => Promise<string>;
+
+/**
+ * Where confinement lives, so the seam above is not mistaken for the boundary: the DEFAULT reader
+ * is what enforces it, because only the code performing the `open` can bind the check to it. An
+ * injected reader is first-party code inside the trust boundary — the same standing `GitRunner` and
+ * `VerifyExec` have — and it receives `root` so it can honour the same rule. What a committed
+ * manifest reaches in production is `loadRepoContext` → `loadRepoDocs` → `defaultDocReader`.
+ */
 
 /**
  * `limit` is in CHARACTERS, and the byte/character distinction is the whole subtlety here.
@@ -167,9 +242,10 @@ export type DocReader = (absPath: string, limit: number) => Promise<string>;
  * file with more than `limit` characters decodes to more than `limit` — which is all the caller
  * needs to detect the cut. Memory stays bounded at four times the budget.
  */
-export const defaultDocReader: DocReader = async (abs, limit) => {
+export const defaultDocReader: DocReader = async (abs, limit, root) => {
   const want = (limit + 1) * 4;
-  const fh = await open(abs, 'r');
+  // Confined open, and the read below uses THAT descriptor — the path is never resolved again.
+  const fh = await openConfined(abs, root);
   try {
     const buf = Buffer.alloc(want);
     // LOOP. `read()` may return fewer bytes than asked for without being at EOF, and treating a
@@ -236,20 +312,20 @@ export async function loadRepoDocs(
       continue;
     }
     const abs = path.resolve(root, rel);
-    // Confine HERE too, not only at probe time. `resolveRepoContext` checks a path and this opens
-    // it — two operations, so the check does not bind the open. This is also the public entry
-    // point (it is exported), and an unconfined exported reader is a footgun regardless of who
-    // calls it. It does not close the TOCTOU race on its own; it closes the lexical hole.
+    // A cheap lexical refusal before we touch the disk at all. It is NOT the boundary — the real
+    // one is inside the reader, which opens the file and then proves the descriptor is in-repo
+    // (RUN-151). This just means an obviously escaping path never reaches an `open` syscall.
     if (!contains(root, abs)) {
       skipped.push(rel);
       continue;
     }
     let text: string;
     try {
-      text = await read(abs, left);
+      text = await read(abs, left, root);
     } catch {
-      // Resolvable at probe time, unreadable now (permissions, a race with a checkout). Treat it
-      // as skipped rather than failing the run — a brief missing one document still works.
+      // Unreadable, or refused by the reader's confinement check. Either way it is skipped and
+      // NAMED rather than failing the run — a brief missing one document still works, and the
+      // "no silent drops" rule is what keeps a refusal visible to the operator.
       skipped.push(rel);
       continue;
     }
