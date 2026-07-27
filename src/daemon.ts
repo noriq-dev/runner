@@ -318,6 +318,11 @@ export class Daemon {
     // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
     // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
     const lastRunStatus = new Map<string, string>();
+    /** The executed-spec record still owed to the server (RUN-172), per run — see the send below
+     *  for why a single fire-and-forget send was not enough. Cleared when a frame carrying it
+     *  actually goes out, and when the run ends, so a daemon does not hold one per run for its
+     *  whole life. */
+    const pendingSpec = new Map<string, ExecutionSpec>();
     const steering = new SteeringBridge({ logger: this.log });
     const supervisor = new RunSupervisor({
       drivers: {
@@ -345,19 +350,32 @@ export class Daemon {
         //
         // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
         // say "verifying" without claiming the spend is zero.
-        if (rep.telemetry || rep.phase || rep.executedSpec) {
+        // The executed-spec record is sent ONCE by the supervisor, when the spec resolves — and
+        // telemetry is fire-and-forget, so a socket that happens to be down at that moment would
+        // lose it permanently, with nothing to correct it the way a later tick corrects a dropped
+        // spend (RUN-172). Held until a frame actually goes out on a live socket. Re-sending is
+        // free: the server appends only when the spec differs from the last one it holds.
+        if (rep.executedSpec) pendingSpec.set(runId, rep.executedSpec);
+        const spec = pendingSpec.get(runId) ?? null;
+        if (rep.telemetry || rep.phase || spec) {
           // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
           // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
-          held.ws?.sendTelemetry(runId, {
-            ...telemetryFrame(rep),
-            logTail: rep.logTail ?? null,
-            phase: rep.phase ?? null,
-            // Once, when the daemon has resolved it (RUN-166). Rides THIS frame because recording
-            // what a run was briefed with is not a lifecycle transition — run.status has no
-            // running → running edge, so it would be rejected there and silently dropped.
-            executedSpec: rep.executedSpec ?? null,
-          });
+          if (held.ws) {
+            held.ws.sendTelemetry(runId, {
+              ...telemetryFrame(rep),
+              logTail: rep.logTail ?? null,
+              phase: rep.phase ?? null,
+              // Rides THIS frame because recording what a run was briefed with is not a lifecycle
+              // transition — run.status has no running → running edge, so it would be rejected
+              // there and silently dropped.
+              executedSpec: spec,
+            });
+            // Only once it has actually left. `held.ws?.` would have counted a down socket as a
+            // delivery, which is the exact case this exists for.
+            if (spec) pendingSpec.delete(runId);
+          }
         }
+        if (rep.status === 'done' || rep.status === 'failed') pendingSpec.delete(runId);
         if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
           lastRunStatus.set(runId, rep.status);
           // agentId finally has a value to carry: the daemon created the identity, so it no
