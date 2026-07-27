@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { type ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
 import { type PathKind, probePathKind } from './repo-context';
+import { checkSteps, renderSteps } from './steps';
 
 /**
  * The execution spec, checked against the actual checkout and rendered into a brief (RUN-139).
@@ -258,6 +259,12 @@ export function renderExecutionSpec(
       `Explicitly NOT this task. Leave them; naming one you noticed is useful, doing it is scope creep:\n${bullets(spec.deferred)}`,
     );
   }
+
+  // The decomposition, when the planner declared one (RUN-148). Before the acceptance block on
+  // purpose: it is the shape of the work, and a definition of done reads differently once you know
+  // the work is a sequence.
+  const steps = renderSteps(checkSteps(spec));
+  if (steps) parts.push(steps.trimStart());
 
   const { observableTruths, artifacts, links } = spec.acceptance;
   if (observableTruths.length || artifacts.length || links.length) {

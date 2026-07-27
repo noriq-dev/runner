@@ -169,6 +169,43 @@ export const AcceptanceCriteria = z.object({
 export type AcceptanceCriteria = z.infer<typeof AcceptanceCriteria>;
 
 /**
+ * One step of a decomposed run (RUN-148).
+ *
+ * A run whose work does not fit one context becomes a parent over these, each
+ * executed by its own daemon-created session in its own workspace. The shape is
+ * spec-shaped on purpose: a child consumes a step the way any run consumes a
+ * spec, so the whole pre-execution machine — checking against the checkout,
+ * pattern mapping, predictive locking, the acceptance checklist — applies to a
+ * child without a second implementation of any of it.
+ *
+ * Authored by the PLANNER, never derived by the daemon. Which files belong to
+ * one coherent piece of work is a judgement about the work; grouping a spec's
+ * `anticipatedFiles` by directory or by count splits one change across two steps
+ * and merges two unrelated ones, and the actor already judging the work is the
+ * planner.
+ */
+export const ExecutionStep = z.object({
+  /** Stable within one spec — what `dependsOn` names and what a transcript
+   *  segment is labelled with. */
+  id: z.string().min(1),
+  /** One line a human reads in a nested run list. */
+  title: z.string().min(1),
+  /** What this step expects to touch. The child's lock scope is THIS, not the
+   *  parent's union — which is what makes a later wave schedule (RUN-149)
+   *  possible, and is the correct hold for a sequential child anyway. */
+  anticipatedFiles: z.array(AnticipatedFile).default([]),
+  /** Step ids that must finish first. Empty = nothing gates it. Sequential
+   *  execution ignores this and runs in declared order; it is what a wave
+   *  schedule reads. */
+  dependsOn: z.array(z.string().min(1)).default([]),
+  /** The part of the definition of done this step is answerable for. The parent
+   *  still owns the gate — a criterion is a statement about the finished work,
+   *  and a step that satisfies its own slice can leave the whole unmet. */
+  acceptance: AcceptanceCriteria.prefault({}),
+});
+export type ExecutionStep = z.infer<typeof ExecutionStep>;
+
+/**
  * The checked execution spec a run is compiled from.
  *
  * Every field defaults, so `ExecutionSpec.parse({})` is the empty spec and a
@@ -198,6 +235,15 @@ export const ExecutionSpec = z.object({
    *  accepted gap as an omission. */
   deferred: z.array(z.string().min(1)).default([]),
   acceptance: AcceptanceCriteria.prefault({}),
+  /**
+   * The decomposition, when the work does not fit one context (RUN-148).
+   *
+   * EMPTY IS THE COMMON CASE and means a single run, exactly as before — a
+   * planner declares steps only when it judges the work too large for one
+   * agent to hold at once. Nothing downstream may treat an empty `steps` as a
+   * defect: most work is one step and saying so would be noise on every task.
+   */
+  steps: z.array(ExecutionStep).default([]),
 });
 /** A parsed spec: every field present, defaults applied. What a consumer holds. */
 export type ExecutionSpec = z.infer<typeof ExecutionSpec>;
@@ -232,6 +278,7 @@ const populated = {
   discretion: (v) => v.length > 0,
   deferred: (v) => v.length > 0,
   acceptance: (v) => v.observableTruths.length > 0 || v.artifacts.length > 0 || v.links.length > 0,
+  steps: (v) => v.length > 0,
 } satisfies { [K in keyof ExecutionSpec]: (value: ExecutionSpec[K]) => boolean };
 
 /**

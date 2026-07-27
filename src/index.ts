@@ -275,6 +275,13 @@ export {
 } from './acceptance';
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
 export {
+  checkSteps,
+  renderSteps,
+  MAX_STEPS,
+  type CheckedSteps,
+  type StepFinding,
+} from './steps';
+export {
   assembleReviewerPrompt,
   reviewerFeedbackPrompt,
   reviewerRejectionComment,
