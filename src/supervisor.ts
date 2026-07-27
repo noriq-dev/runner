@@ -356,6 +356,13 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  *
  * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
  * inherited from its base — so it doubles as the posture kind.
+ *
+ * NOT a deprecation window, whatever its neighbours are (settled by RUN-163). Accepting a bare
+ * `kind` looks like back-compat for dispatchers that predate `workflow`, and removing it on that
+ * reading would delete a security property: the rule is that the DAEMON decides posture from the
+ * manifest it holds, so no client can escalate write by naming a kind. That has to survive any
+ * tidying of the surrounding compatibility shims, and it is the reason this function exists rather
+ * than reading `run.kind` at each site.
  */
 export function effectiveKind(
   run: Pick<Run, 'kind' | 'workflow'>,

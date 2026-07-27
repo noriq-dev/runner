@@ -178,8 +178,15 @@ export const Run = z.object({
   agentTool: AgentTool,
   // The dispatch's agent COORDINATE (RUN-114): `claude.opus-4_8.high` — the canonical selector,
   // naming tool+model+effort in one string. When set it WINS over agentTool/model/effort below (the
-  // legacy triple, kept for one deprecation window); when null the runner synthesizes a coordinate
-  // FROM that triple, so a dispatcher that never learned the coordinate keeps working unchanged.
+  // legacy triple); when null the runner synthesizes a coordinate FROM that triple, so a dispatcher
+  // that never learned the coordinate keeps working unchanged.
+  //
+  // The triple's window is still OPEN, and RUN-163 checked rather than assumed: the removal
+  // condition is "the second minor release after the dashboard emits coordinates by default", and
+  // the dashboard does not — `RunsView` sends `agent` only when a model or effort is pinned, on the
+  // reasoning that a bare-tool coordinate carries nothing the triple lacks. So the clock has not
+  // started. Closing it means emitting a coordinate unconditionally first, then waiting; until
+  // then the triple is load-bearing for every dispatch that pins nothing.
   agent: z.string().nullable().default(null),
   // The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
   // workflow is a NAMED variant of `kind` (its base): `kind` still carries the posture (so every

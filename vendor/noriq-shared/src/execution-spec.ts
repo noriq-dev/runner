@@ -20,9 +20,15 @@ import { z } from 'zod';
 //
 // Two shape rules the rest of the plan leans on:
 //
-//   1. EVERY field is optional. A spec filled in halfway is valid, and the field
-//      that will hold it (RUN-135) will be nullable — so a dispatch without one
-//      stays valid for the deprecation window, RUN-124's pattern.
+//   1. EVERY field is optional, and the field that holds it (RUN-135) is
+//      nullable. A spec filled in halfway is valid; so is a task with none.
+//
+//      That is PERMANENT, not a deprecation window (settled by RUN-163, which
+//      went looking for windows to close and found this one mislabelled). A task
+//      nobody planned is a legitimate state, not a legacy one: it is what the
+//      planner stage (RUN-140) exists to act on, and what `hasExecutionSpec`
+//      exists to detect. Calling it a window invites someone to close it, and
+//      closing it would make every unplanned dispatch invalid.
 //   2. Absent and empty mean the same thing to a CONSUMER, which is why
 //      `spec ?? emptyExecutionSpec()` is the right way to read one. They mean
 //      different things to a PLANNER, which is what `hasExecutionSpec` answers.

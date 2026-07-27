@@ -10,8 +10,12 @@ server over a WebSocket, discovers marked repos on disk, and spawns/supervises c
 
 This is a standalone repo, deliberately separate from the Noriq server (different runtime, trust, and
 distribution boundary). It depends only on the runtime-neutral (pure zod) wire-contract slice of
-`@noriq-dev/shared`, **vendored** under [vendor/noriq-shared/](vendor/noriq-shared/) until the contract
-freezes. Do not hand-edit vendored files — refresh with `npm run vendor:shared`.
+`@noriq-dev/shared`, **vendored** under [vendor/noriq-shared/](vendor/noriq-shared/). Do not
+hand-edit vendored files — refresh with `npm run vendor:shared`, and land the planar side FIRST: a
+frame the server's schema rejects is dropped silently, and the daemon's telemetry and transcript
+frames are fire-and-forget. [VENDORED-CONTRACT.md](VENDORED-CONTRACT.md) is the standing
+explanation — including why the slice is still vendored rather than published, checked rather than
+assumed (RUN-163), and the condition that would change it.
 
 ## Commands
 
@@ -245,7 +249,10 @@ is enforced in code, not by trusting the manifest — a custom workflow can neve
 
 A dispatch/manifest names the agent as one dotted **coordinate** — `claude.opus-4_8.high` (`.` in a
 model version is written `_`) — parsed by `src/agent-coordinate.ts`. It is canonical; the legacy
-`{tool, model, effort}` triple is derived from it for one deprecation window (`runCoordinate` /
+`{tool, model, effort}` triple is derived from it for a deprecation window that is still OPEN —
+RUN-163 checked: the removal condition is "the second minor release after the dashboard emits
+coordinates by default", and the dashboard sends `agent` only when a model or effort is pinned, so
+the clock has not started (`runCoordinate` /
 `resolveAgentTool` normalize either form, so a legacy dispatch resolves byte-identically).
 
 ### Two-file config
