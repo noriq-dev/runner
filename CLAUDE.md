@@ -159,6 +159,12 @@ The TOML surface (`[workflow.<name>].stages`, and the per-stage agent coordinate
 `WorkflowDef` is the vendored contract and carries `base` + `prompt` only, so a custom workflow
 inherits its base's list until the phase-3 vendor refresh grows the field.
 
+A **resumed** park re-fetches its anchor task and re-checks the spec against the workspace before
+handing the answer over (RUN-164), and sends the DIFFERENCE when either moved — a park lasts up to
+72 hours, so the human who answered may also have corrected the spec, and another run may have
+landed under it. Silence when nothing changed: re-sending the brief would tell a session what it
+already holds.
+
 **Cancelling a run is a fact about the RUN, not about a session** (RUN-165). `SteeringBridge`
 records it and `stopBefore` (run-machine.ts) is asked at every stage boundary, because the pipeline
 is many sessions with gaps between them and every pre-execution stage is deliberately non-fatal —

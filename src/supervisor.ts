@@ -26,7 +26,13 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
-import { type CheckedExecutionSpec, type SpecPathProbe, checkExecutionSpec } from './execution-spec';
+import {
+  type CheckedExecutionSpec,
+  type SpecPathProbe,
+  checkExecutionSpec,
+  renderExecutionSpec,
+  renderUnreadableSpec,
+} from './execution-spec';
 import {
   type LandOutcome,
   assembleConflictPrompt,
@@ -1969,6 +1975,19 @@ export class RunSupervisor {
     this.deps.report(run.id, { status: 'running', phase: 'agent' });
     this.log.info('resuming a parked run', { runId, agentId: entry.agentId, session: entry.sessionId });
 
+    // What changed while it waited (RUN-164). A park can last up to 72 hours: the human answering
+    // may have corrected the spec at the same time — RUN-137 exists so they can — and another run
+    // may have landed, moving a file this one's plan names. A resume otherwise carries on against
+    // a premise nobody re-checked, and neither the agent nor its reviewer learns the goalposts
+    // moved.
+    //
+    // A DIFF, not a replay: re-sending the whole brief would spend tokens telling a session what
+    // it already holds. Silence when nothing moved, which is the common case.
+    const changed = await this.specChangedWhileParked(run, worktree, wf.produces).catch((err) => {
+      this.log.warn('could not re-check the spec on resume', { runId, err: String(err) });
+      return '';
+    });
+
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
     // figures accumulate onto — and keep summing with — everything spent before the park. It also
     // carries the run's ceiling and the park's active seconds (RUN-133), which is what makes the
@@ -2002,7 +2021,7 @@ export class RunSupervisor {
         // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
         // all of it, and re-sending it would both waste the context and confuse a conversation
         // that is mid-thought.
-        prompt: resumePrompt(entry.question, answer),
+        prompt: resumePrompt(entry.question, answer, changed),
         resumeSessionId: entry.sessionId,
         permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
         noriqMcp,
@@ -2130,6 +2149,31 @@ export class RunSupervisor {
       tail: executed.tail,
       continued: prepared.continued,
     });
+  }
+
+  /**
+   * The spec's story since the park (RUN-164), rendered, or '' when it has not moved.
+   *
+   * Re-fetches the anchor task and re-checks it against the workspace as `prepare` would — the two
+   * things a resume skips by going straight to `executeRun`. Two independent ways a resumed run's
+   * premise goes stale, and this catches both: the SPEC changed (a human corrected it while
+   * answering), or the CHECKOUT changed (another run landed and a file the plan names moved).
+   *
+   * Compared as rendered text rather than by deep-equalling the spec: the rendered block is what
+   * the session was actually told, and a difference the rendering does not show is a difference
+   * that would not have reached the agent anyway.
+   */
+  private async specChangedWhileParked(run: Run, worktree: Workspace, produces: boolean): Promise<string> {
+    if (run.anchor?.type !== 'task') return '';
+    const task = await this.resolveAnchorTask(run.anchor.taskId);
+    if (!task) return '';
+    if (task.executionSpecUnreadable) return renderUnreadableSpec();
+    if (!task.executionSpec) return '';
+    const checked = await checkExecutionSpec(task.executionSpec, worktree.localPath, {
+      ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
+      produces,
+    });
+    return renderExecutionSpec(checked);
   }
 
   /**

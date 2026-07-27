@@ -172,5 +172,16 @@ export const expiredParks = (
   });
 
 /** The turn handed to a resumed agent. It has its own context; this is the answer, not a briefing. */
-export const resumePrompt = (question: string | null, answer: string): string =>
-  renderPrompt('resume', { question, answer });
+/**
+ * What the resumed session is handed. The answer IS the prompt — the session already holds the
+ * brief, the task and the repo tour, and re-sending them would waste the context and confuse a
+ * conversation that is mid-thought.
+ *
+ * `changed` is the exception (RUN-164): a park can last up to 72 hours, and a human answering the
+ * question may well have corrected the task's execution spec at the same time — the dashboard
+ * exists so they can (RUN-137). Sending nothing when nothing moved keeps the resume as cheap as it
+ * was; sending the DIFFERENCE when it did is the only way the session learns its own contract
+ * changed under it.
+ */
+export const resumePrompt = (question: string | null, answer: string, changed = ''): string =>
+  renderPrompt('resume', { question, answer, changed });
