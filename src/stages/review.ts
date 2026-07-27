@@ -58,13 +58,15 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // requirements came through clear" is the run's answer, not a consolation prize for a failure —
   // and a passing run is where it is least likely to be asked and most useful to have.
   if (ctx.requirements.length) {
-    const outcomes = requirementOutcomes(ctx.requirements, review.ledger);
+    // `passed` decides what "standing" means. On a PASS the gate read every prior finding and its
+    // rebuttal and cleared the work anyway — that IS the adjudication, and going on to report a
+    // contested finding as an open defect would contradict the verdict of the run printing it.
+    const req = requirementOutcomes(ctx.requirements, review.ledger, { passed: review.passed });
+    const open = req.outcomes.filter((o) => o.standing.length).length;
     host
       .transcript(run.id)
-      .milestone(
-        `requirements: ${outcomes.filter((o) => o.standing.length).length} of ${outcomes.length} still have a finding standing`,
-      );
-    comment(renderRequirementOutcomes(outcomes));
+      .milestone(`requirements: ${open} of ${req.outcomes.length} with a finding still standing`);
+    comment(renderRequirementOutcomes(req));
   }
 
   if (review.passed) {

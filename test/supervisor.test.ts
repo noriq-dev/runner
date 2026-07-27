@@ -2462,7 +2462,7 @@ describe('findings carry requirement ids (RUN-147)', () => {
     );
     const posted = h.comments.map((c) => c.body).join('\n');
     expect(posted).toMatch(/❌ \*\*R-7\*\* — 1 finding\(s\) still standing/);
-    expect(posted).toMatch(/➖ \*\*R-9\*\* — no finding was raised against it/);
+    expect(posted).toMatch(/➖ \*\*R-9\*\* — no finding was recorded against it/);
   });
 
   it('says nothing about requirements for a task that names none', async () => {

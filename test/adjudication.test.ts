@@ -171,6 +171,43 @@ describe('buildLedger', () => {
     expect(led).toHaveLength(2);
   });
 
+  // The failure that decides the whole design. A cross-cutting finding carries NO location, so
+  // matching on the requirement alone would collapse every cross-cutting finding about one
+  // requirement into a single row — and a merge destroys a real finding, where a missed match only
+  // costs a duplicate row. Requirement matching demands a specific location for exactly this.
+  it('never merges two cross-cutting findings that share a requirement', () => {
+    const led = buildLedger(
+      [],
+      [F(1, 'the whole permission model leaks', '', ['R-7']), F(2, 'budgets are not enforced', '', ['R-7'])],
+      [],
+      1,
+    );
+    expect(led).toHaveLength(2);
+  });
+
+  // A re-raise that drops the tag must not drop the association — the requirement is a fact about
+  // the DEFECT, not about this round's wording, and losing it sends the next match back to prose.
+  it('keeps a requirement the entry already carried when a re-raise omits it', () => {
+    const round1 = buildLedger([], [F(1, 'x', 'a.ts:1', ['R-7'])], [], 1);
+    const round2 = buildLedger(round1, [F(1, 'x', 'a.ts:1')], [], 2);
+    expect(round2).toHaveLength(1);
+    expect(round2[0]!.requirements).toEqual(['R-7']);
+  });
+
+  // Findings are now recorded when RAISED, before any response can exist — so a re-raise carrying
+  // no response is the common path, and resetting the entry to 'unanswered' there would throw away
+  // the very rebuttal this ledger exists to carry.
+  it('keeps the builder’s existing adjudication when a re-raise brings no response', () => {
+    const round1 = buildLedger(
+      [],
+      [F(1, 'x', 'a.ts:1', ['R-7'])],
+      [{ id: 1, status: 'contested', pointer: 'commit abc', reason: 'pre-existing' }],
+      1,
+    );
+    const round2 = buildLedger(round1, [F(1, 'x reworded', 'a.ts:1', ['R-7'])], [], 2);
+    expect(round2[0]).toMatchObject({ status: 'contested', pointer: 'commit abc' });
+  });
+
   // A reviewer listing the same requirements in the other order is naming the same thing.
   it('is insensitive to the order requirements are listed in', () => {
     const round1 = buildLedger([], [F(1, 'x', 'a.ts:1', ['R-1', 'R-2'])], [], 1);
@@ -196,10 +233,18 @@ describe('parsing the requirement bracket (RUN-147)', () => {
     });
   });
 
-  // A model will use whichever separator it feels like; rejecting one spelling would silently drop
-  // the association and give back the pre-RUN-147 behaviour with none of the warning.
-  it.each(['R-7,R-9', 'R-7; R-9', 'R-7 R-9'])('accepts %s as two ids', (raw) => {
+  it.each(['R-7,R-9', 'R-7; R-9', 'R-7 , R-9'])('accepts %s as two ids', (raw) => {
     expect(parseFindings(`FINDING 1 [High] [${raw}] a.ts:1: x`)[0]!.requirements).toEqual(['R-7', 'R-9']);
+  });
+
+  // NOT whitespace. The contract puts no shape on a requirement id (RUN-134), so `Customer login`
+  // is a legal one and splitting on spaces would shred it into two that match nothing. A
+  // space-separated bracket yields one odd id, which the summary reports as unrecognised rather
+  // than dropping — visible beats silent.
+  it('keeps a multi-word requirement id whole', () => {
+    expect(parseFindings('FINDING 1 [High] [Customer login] a.ts:1: x')[0]!.requirements).toEqual([
+      'Customer login',
+    ]);
   });
 
   // The bracket is optional and must stay so: every finding written before this, and every task
@@ -229,12 +274,12 @@ describe('what the run can say per requirement (RUN-147)', () => {
     reason: null,
   });
 
-  it('separates still-standing from raised-and-fixed', () => {
-    const out = requirementOutcomes(
+  it('separates still-standing from raised-and-settled', () => {
+    const { outcomes } = requirementOutcomes(
       ['R-1', 'R-2', 'R-3'],
       [entry(['R-1'], 'contested'), entry(['R-2'], 'fixed')],
     );
-    expect(out.map((o) => [o.requirement, o.standing.length, o.fixed.length])).toEqual([
+    expect(outcomes.map((o) => [o.requirement, o.standing.length, o.resolved.length])).toEqual([
       ['R-1', 1, 0],
       ['R-2', 0, 1],
       ['R-3', 0, 0],
@@ -243,14 +288,37 @@ describe('what the run can say per requirement (RUN-147)', () => {
 
   // An unanswered finding is still standing — the builder never rebutted it.
   it('counts an unanswered finding as standing', () => {
-    expect(requirementOutcomes(['R-1'], [entry(['R-1'], 'unanswered')])[0]!.standing).toHaveLength(1);
+    const { outcomes } = requirementOutcomes(['R-1'], [entry(['R-1'], 'unanswered')]);
+    expect(outcomes[0]!.standing).toHaveLength(1);
   });
 
-  // The wording has to be careful: nobody raising a finding is not the same as anyone checking it.
-  // "Met" here would be the unevidenced pass RUN-145 exists to refuse, one field along.
-  it('does not claim a requirement was MET just because nothing was raised against it', () => {
+  // On a PASS the gate read every prior finding AND its rebuttal and cleared the work anyway — that
+  // is the adjudication. Reporting a contested finding as an open defect would have the run
+  // contradict its own verdict, on exactly the runs nobody reads carefully.
+  it('reports nothing as standing once the gate passed', () => {
+    const { outcomes } = requirementOutcomes(
+      ['R-1'],
+      [entry(['R-1'], 'contested'), entry(['R-1'], 'unanswered')],
+      { passed: true },
+    );
+    expect(outcomes[0]!.standing).toHaveLength(0);
+    expect(outcomes[0]!.resolved).toHaveLength(2);
+  });
+
+  // Discarding an id nobody declared reports "no finding was recorded" about a requirement a
+  // finding explicitly named — the most confidently wrong thing this summary could say.
+  it('surfaces a requirement id the spec never declared instead of dropping it', () => {
+    const report = requirementOutcomes(['R-7'], [entry(['R-77'], 'unanswered')]);
+    expect(report.unrecognised).toEqual(['R-77']);
+    expect(renderRequirementOutcomes(report)).toMatch(/does not declare as a requirement/);
+  });
+
+  // Two careful words. Not "met" — nobody objecting is not the same as anyone checking, which is
+  // the unevidenced pass RUN-145 refuses, one field along. And not "raised" — the ledger is
+  // bounded, so this can only speak for what survived it.
+  it('claims neither that a requirement was MET nor that nothing was ever raised', () => {
     const out = renderRequirementOutcomes(requirementOutcomes(['R-1'], []));
-    expect(out).toMatch(/no finding was raised against it/);
+    expect(out).toMatch(/no finding was recorded against it/);
     expect(out).not.toMatch(/\bmet\b/i);
   });
 

@@ -1518,7 +1518,14 @@ export class RunSupervisor {
      * report reads the ledger, so an unrecorded finding is a requirement reported as clear.
      *
      * Entered with no responses, so they read as 'unanswered' — which is exactly true until the
-     * builder answers. The response folds onto the SAME entry later (same key), so nothing is lost.
+     * builder answers. The response folds onto the SAME entry later, and `buildLedger` keeps an
+     * existing adjudication when a re-raise brings none, so nothing is lost.
+     *
+     * Recorded whatever the VERDICT was, including `unknown`. A reviewer that wrote three findings
+     * and then crashed found three real things, and dropping them because it never reached its
+     * verdict line is the same discarding-partial-work mistake RUN-145 fixed for acceptance
+     * evidence. It cannot inflate a failure either: on a PASS nothing counts as standing anyway
+     * (requirementOutcomes), and an `unknown` gates the run on its own terms.
      */
     const record = (v: VerifyVerdict, round: number) => {
       ledger = buildLedger(ledger, parseFindings(v.findings), [], round);
@@ -1527,7 +1534,7 @@ export class RunSupervisor {
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
-    if (verdict.verdict === 'fail') record(verdict, 1);
+    record(verdict, 1);
     if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
 
     for (let round = 1; round <= maxRounds; round++) {
@@ -1611,7 +1618,7 @@ export class RunSupervisor {
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
-      if (verdict.verdict === 'fail') record(verdict, round + 1);
+      record(verdict, round + 1);
       if (verdict.passed) return { ...verdict, rounds: round, ledger };
     }
     return { ...verdict, rounds: maxRounds, ledger };
