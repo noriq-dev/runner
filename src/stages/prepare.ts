@@ -126,8 +126,11 @@ export interface PreparedRun {
   plannerPrompt: string;
   /** The plan checker's brief for one round: the spec as it stands, plus the ledger so far. */
   checkerPrompt: (spec: ExecutionSpec, ledger: string) => string;
-  /** Rebuild the RUN's brief around a spec the planner produced. */
-  rebuildPrompt: (checked: CheckedExecutionSpec | null) => string;
+  /** The pattern mapper's brief: the settled plan, so it knows which files need an analog. */
+  mapperPrompt: (checked: CheckedExecutionSpec) => string;
+  /** Rebuild the RUN's brief around a spec the planner produced, plus anything the pre-execution
+   *  stages added to it (analogs, repo facts — RUN-143/144). */
+  rebuildPrompt: (checked: CheckedExecutionSpec | null, extra?: string) => string;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -497,7 +500,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const buildPrompt = (
     specBlock: string,
     forVerify: string,
-    shape?: 'planner' | 'plan-checker',
+    shape?: 'planner' | 'plan-checker' | 'pattern-mapper',
     ledger?: string,
   ) =>
     assemblePrompt(run, repo.manifest, {
@@ -539,6 +542,8 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // (RUN-141) — the same closure, so the facts around the spec cannot drift between rounds.
     // The DETERMINISTIC findings travel with it: a checker that cannot see the repo disagreeing
     // with the plan would raise the same points itself, at model prices.
+    mapperPrompt: (checked) =>
+      buildPrompt(renderExecutionSpec(checked, { audience: 'checker' }), '', 'pattern-mapper'),
     checkerPrompt: (spec, ledger) =>
       buildPrompt(
         renderExecutionSpec({ spec, findings: checkedSpec?.findings ?? [] }, { audience: 'checker' }),
@@ -546,8 +551,11 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
         'plan-checker',
         ledger,
       ),
-    rebuildPrompt: (checked) =>
-      buildPrompt(renderExecutionSpec(checked), renderExecutionSpec(checked, { only: 'acceptance' })),
+    rebuildPrompt: (checked, extra = '') =>
+      buildPrompt(
+        `${renderExecutionSpec(checked)}${extra}`,
+        renderExecutionSpec(checked, { only: 'acceptance' }),
+      ),
     repo,
     driver,
     workflow: wf,

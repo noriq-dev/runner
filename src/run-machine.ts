@@ -34,7 +34,15 @@ import type { Workflow } from './workflow';
  * where the terminal report, the continuation record, the lock release, and the workspace decision
  * live, and it is the only stage that runs no matter how the run got there.
  */
-export type StageName = 'prepare' | 'plan' | 'execute' | 'verify' | 'review' | 'integrate' | 'settle';
+export type StageName =
+  | 'prepare'
+  | 'plan'
+  | 'pattern-map'
+  | 'execute'
+  | 'verify'
+  | 'review'
+  | 'integrate'
+  | 'settle';
 
 /** Which actor a stage spawns, in the vocabulary the permission floor already uses. */
 export type StageActor =
@@ -145,6 +153,24 @@ export const RUN_STAGES: readonly RunStage[] = [
     // Only a workflow that PRODUCES needs a spec written for it: a scope run IS the planner, and a
     // verify run judges a diff rather than making one. The stage also no-ops when the task already
     // has a spec — that is the stage's own business, not the sequence's.
+    appliesTo: (wf) => wf.produces,
+  },
+  {
+    name: 'pattern-map',
+    purpose: 'Find the file this repo already solves each anticipated change in, and what to copy.',
+    inputs: ['worktree', 'executionSpec'],
+    outputs: ['analogs', 'repoFacts', 'prompt'],
+    // Read-only, like the planner and for the same reasons: `clampPermissionToWorkflow` at the
+    // verify posture, `auto` dropped, no Noriq connection.
+    actor: 'verify',
+    budget: 'run',
+    retry: { kind: 'none' },
+    // Nothing. A builder with no analogs is a builder as well briefed as every one before this
+    // stage existed, which is the bar a stage that cannot gate has to clear.
+    terminal: [],
+    optional: true,
+    // Only a producing workflow writes files to find analogs FOR. It also no-ops when the plan
+    // anticipates none, and when the repo-intel cache already answers at this base.
     appliesTo: (wf) => wf.produces,
   },
   {

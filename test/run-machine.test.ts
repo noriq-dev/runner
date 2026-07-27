@@ -21,6 +21,7 @@ describe('the run pipeline is an ordered, declared sequence', () => {
     expect(names(RUN_STAGES)).toEqual([
       'prepare',
       'plan',
+      'pattern-map',
       'execute',
       'verify',
       'review',
@@ -55,6 +56,7 @@ describe('which stages a workflow runs', () => {
     expect(names(stagesFor(wf('build')))).toEqual([
       'prepare',
       'plan',
+      'pattern-map',
       'execute',
       'verify',
       'review',
@@ -93,12 +95,17 @@ describe('what each stage declares', () => {
   // `plan` and `review` run a fresh READ-ONLY actor — the planner writes a spec, not code — and the
   // write clamp, not this list, is what enforces that.
   it('names every stage that spawns a fresh read-only actor', () => {
-    expect(RUN_STAGES.filter((s) => s.actor === 'verify').map((s) => s.name)).toEqual(['plan', 'review']);
+    expect(RUN_STAGES.filter((s) => s.actor === 'verify').map((s) => s.name)).toEqual([
+      'plan',
+      'pattern-map',
+      'review',
+    ]);
   });
 
   it('names the stages that can spend the run budget, and the ones that provably cannot', () => {
     expect(RUN_STAGES.filter((s) => s.budget === 'run').map((s) => s.name)).toEqual([
       'plan',
+      'pattern-map',
       'execute',
       'review',
       'integrate',
@@ -164,6 +171,7 @@ describe('a workflow declares its stages, and the machine floors the declaration
     expect(names(stagesFor(wf('build')))).toEqual([
       'prepare',
       'plan',
+      'pattern-map',
       'execute',
       'verify',
       'review',
@@ -194,7 +202,12 @@ describe('a workflow declares its stages, and the machine floors the declaration
   });
 
   it('marks exactly the stages a workflow may decline', () => {
-    expect(RUN_STAGES.filter((s) => s.optional).map((s) => s.name)).toEqual(['plan', 'review', 'integrate']);
+    expect(RUN_STAGES.filter((s) => s.optional).map((s) => s.name)).toEqual([
+      'plan',
+      'pattern-map',
+      'review',
+      'integrate',
+    ]);
   });
 
   it('a workflow can DROP an optional stage — review is the declinable one', () => {
@@ -208,6 +221,7 @@ describe('a workflow declares its stages, and the machine floors the declaration
     const greedy = withStages(wf('scope'), [
       'prepare',
       'plan',
+      'pattern-map',
       'execute',
       'verify',
       'review',
@@ -226,6 +240,7 @@ describe('a workflow declares its stages, and the machine floors the declaration
       'review',
       'verify',
       'execute',
+      'pattern-map',
       'plan',
       'prepare',
     ]);

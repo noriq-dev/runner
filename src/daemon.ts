@@ -12,6 +12,7 @@ import { ManifestStore } from './manifest-store';
 import { openMergeRequest } from './merge-request';
 import { ParkedStore } from './parked';
 import { buildRegistration } from './registration';
+import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
 import { type RunReport, RunSupervisor } from './supervisor';
@@ -399,6 +400,10 @@ export class Daemon {
       // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
       // feature that has never run.
       saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+      // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
+      // third time the same lesson has been learned: a dep only tests supply is a feature that has
+      // never run.
+      repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
       steering,
       logger: this.log,
     });

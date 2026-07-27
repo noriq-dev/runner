@@ -15,3 +15,4 @@ export { settleStage } from './settle';
 export type { RunPipeline, StageHost, StageImpl } from './types';
 export * from './plan';
 export * from './plan-check';
+export * from './pattern-map';

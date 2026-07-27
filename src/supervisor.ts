@@ -40,11 +40,13 @@ import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
 import { renderPrompt, renderTemplate } from './prompts';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
+import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
 import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
 import { type StageName, stagesFor } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
+  type PatternMapHost,
   type PlanCheckHost,
   type PlanHost,
   type PlannedRun,
@@ -57,11 +59,14 @@ import {
   checkerFindings,
   executeRun,
   integrateStage,
+  mapPatterns,
   planRun,
   prepareRun,
+  renderAnalogs,
   reviewStage,
   settleStage,
   verifyStage,
+  worthMapping,
 } from './stages';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -220,6 +225,9 @@ export interface RunSupervisorDeps {
   /** Write a planned spec back onto the anchor task (RUN-140). Omitted → the spec is used for this
    *  run and not persisted, which costs reusability and a human's chance to correct it. */
   saveExecutionSpec?: (projectId: string, taskId: string, spec: ExecutionSpec) => Promise<boolean>;
+  /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
+   *  which is exactly the behaviour before it existed. */
+  repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
   /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
    *  omitted → the real fs. */
   readDoc?: DocReader;
@@ -670,7 +678,7 @@ export function assemblePrompt(
      * `Workflow` would have made it declarable in a manifest, and a repo able to declare its own
      * planner posture is exactly the widening `clampPermissionToWorkflow` exists to stop.
      */
-    promptShapeOverride?: 'planner' | 'plan-checker';
+    promptShapeOverride?: 'planner' | 'plan-checker' | 'pattern-mapper';
     /** The adjudication ledger, for the plan checker's own prior-rounds section (RUN-141). */
     ledger?: string;
   },
@@ -697,7 +705,9 @@ export function assemblePrompt(
         ? 'PLAN'
         : ctx.promptShapeOverride === 'plan-checker'
           ? 'PLAN CHECK'
-          : run.kind.toUpperCase(),
+          : ctx.promptShapeOverride === 'pattern-mapper'
+            ? 'PATTERN MAP'
+            : run.kind.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
     // The planner and the checker are spawned with NO `noriqMcp` (RUN-140/141), so the shared
@@ -730,6 +740,15 @@ export function assemblePrompt(
   // build's brief must not silently reshape the planner that writes that build's spec.
   if (ctx.promptShapeOverride === 'planner') {
     return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
+  }
+  if (ctx.promptShapeOverride === 'pattern-mapper') {
+    return renderPrompt('pattern-mapper', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: ctx.executionSpec ?? '',
+    });
   }
   if (ctx.promptShapeOverride === 'plan-checker') {
     return renderPrompt('plan-checker', {
@@ -2159,9 +2178,9 @@ export class RunSupervisor {
     await planned.close(outcome.checked).catch(() => {});
     // Findings the loop never resolved travel WITH the plan. A criticised plan handed over looking
     // like an approved one is the worst of both: the tokens were spent and the warning was not.
-    const extra = checkerFindings(outcome.findings);
-    const checked: CheckedExecutionSpec = extra.length
-      ? { ...outcome.checked, findings: [...outcome.checked.findings, ...extra] }
+    const unresolved = checkerFindings(outcome.findings);
+    const checked: CheckedExecutionSpec = unresolved.length
+      ? { ...outcome.checked, findings: [...outcome.checked.findings, ...unresolved] }
       : outcome.checked;
 
     // RE-RESERVE. `prepared.start.budget` was computed before planning, so handing it to the
@@ -2175,10 +2194,101 @@ export class RunSupervisor {
         `planning used the run's remaining budget (${rest.breach}) — nothing left to build with`,
       );
     }
+    // The pattern map (RUN-144) and the repo facts it caches (RUN-143). Read before spawning: a
+    // cache HIT at this base means an earlier run already derived both from the same tree, so the
+    // stage is skipped rather than paid for again.
+    const extra = await this.mapPatternsIfWorthIt(run, prepared, checked).catch((err) => {
+      this.log.warn('the pattern mapper failed — the builder gets no analogs', {
+        runId: run.id,
+        err: String(err),
+      });
+      return '';
+    });
+
     return {
       ...prepared.start,
-      prompt: prepared.rebuildPrompt(checked),
+      prompt: prepared.rebuildPrompt(checked, extra),
       ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+    };
+  }
+
+  /**
+   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144).
+   *
+   * Returns the brief section to append, or '' — every reason to produce nothing is a reason to
+   * leave the builder exactly as well briefed as it would have been. Skipped when the plan
+   * anticipates no files (there is nothing to find an analog FOR), and when the intel cache
+   * already answers AT THIS BASE: the facts and the analogs come from the same tree, so a fact
+   * that is still current means the analogs would be too.
+   */
+  private async mapPatternsIfWorthIt(
+    run: Run,
+    prepared: PreparedRun,
+    checked: CheckedExecutionSpec | null,
+  ): Promise<string> {
+    if (!stagesFor(prepared.workflow).some((st) => st.name === 'pattern-map')) return '';
+    if (!worthMapping(checked) || !checked) return '';
+
+    const intel = this.deps.repoIntel;
+    const cached = await intel?.get(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
+    if (cached) {
+      this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
+      return renderRepoFacts(cached);
+    }
+
+    const reservation = prepared.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left to map this repo’s patterns', {
+        runId: run.id,
+        breach: reservation.breach,
+      });
+      return '';
+    }
+    const map = await mapPatterns(this.patternMapHost(prepared.tally), {
+      run,
+      driver: prepared.driver,
+      checked,
+      prompt: prepared.mapperPrompt(checked),
+      start: {
+        ...prepared.start,
+        permission: plannerPermission(prepared.permission),
+        noriqMcp: undefined,
+        ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+        spendGuard: prepared.tally.guard('pattern-map'),
+        clockGuard: prepared.tally.clockGuard(),
+      },
+    });
+    if (!map) return '';
+
+    // The facts outlive this run; the analogs do not. Best-effort: a cache that cannot be written
+    // costs the NEXT run its shortcut and this one nothing.
+    if (intel && hasFacts(map.facts)) {
+      await intel
+        .put(prepared.repo.root, prepared.worktree.baseId, map.facts)
+        .catch((err: unknown) =>
+          this.log.warn('could not cache what this run learned', { err: String(err) }),
+        );
+    }
+    return `${renderAnalogs(map.analogs)}${renderRepoFacts(map.facts)}`;
+  }
+
+  private patternMapHost(tally: RunTally): PatternMapHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      ...(this.deps.steering
+        ? {
+            steering: {
+              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
+                this.deps.steering?.register(runId, session, stop),
+              unregister: (runId: string) => this.deps.steering?.unregister(runId),
+            },
+          }
+        : {}),
+      record: (slot, exit) => tally.record(slot, exit.telemetry),
+      charge: (seconds) => tally.chargeTime(seconds),
     };
   }
 

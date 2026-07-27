@@ -108,6 +108,17 @@ advisors about work neither has done is worse than building a plan somebody crit
 sees the plan as EVIDENCE, never with the builder's "follow it" framing — it is the one actor whose
 job is to disagree with the spec.
 
+Then the **pattern mapper** (RUN-144, `src/stages/pattern-map.ts`), for each file the plan
+anticipates: the closest existing file in this repo that does the same job, and what to copy from
+it. gsd-core's rule is the only rule — *name the file and the lines, never the idea* — because
+"follow the repo's error-handling pattern" is something a model already believes it is doing.
+`build.md` has always asked for this in one sentence and given the agent no means to comply; this
+is the means. It is also the only writer of `src/repo-intel.ts` (RUN-143), a `(server, repo, baseId)`
+cache of entry points, layout, conventions and test commands — so a repo that has not moved is not
+re-derived. A cache HIT skips the stage: the facts and the analogs come from the same tree. It is a
+CACHE, not an authority: a corrupt read is a miss, deleting the file costs latency and nothing
+else, and the rendered block says the code in front of you is the truth.
+
 A spec's `anticipatedFiles` is also what **predictive locking** reserves (RUN-142). That layer has
 been bound since RUN-130 but only ever had a continuation's `changedPaths` to work from — what a
 previous sitting touched, which by definition does not exist the first time a task is attempted —

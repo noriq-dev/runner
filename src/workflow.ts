@@ -131,6 +131,7 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
     stages: [
       declare('prepare', 'none'),
       declare('plan', 'verify'),
+      declare('pattern-map', 'verify'),
       declare('execute', 'run'),
       declare('verify', 'none'),
       declare('review', 'verify'),
