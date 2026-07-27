@@ -634,6 +634,65 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
   });
 });
 
+describe('the build brief states its own definition of done (RUN-127)', () => {
+  const build = (over: Partial<ProjectManifest> = {}) =>
+    assemblePrompt(makeRun({ kind: 'build' }), manifest(over), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+
+  it('names the bar as a list, not just "implement the work"', () => {
+    const p = build();
+    expect(p).toContain('Done means all of these, not just the first:');
+    expect(p).toMatch(/no stub, no TODO standing in for the work/);
+  });
+
+  // The gate the daemon cannot enforce: a run that silently under-delivers reads as a pass.
+  it('makes reporting a gap explicitly cheaper than hiding one', () => {
+    expect(build()).toMatch(/Naming a gap costs you nothing here/);
+    expect(build()).toMatch(/presenting unfinished work as done/);
+  });
+
+  it('names the actual verify command when the repo has one', () => {
+    expect(build()).toMatch(/`npm test` passes on what you leave behind/);
+  });
+
+  it('degrades honestly when the repo configures no verify floor', () => {
+    const p = build({ verify: null });
+    expect(p).toContain('the checks this repo already runs still pass');
+    expect(p).not.toContain('passes on what you leave behind');
+  });
+
+  it('only promises a reviewer when one is configured', () => {
+    expect(build()).not.toMatch(/reviewer, reading your diff/); // default manifest: cmd, no agent
+    const withReviewer = build({
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+      },
+    });
+    expect(withReviewer).toMatch(/the reviewer, reading your diff against that intent/);
+  });
+
+  // The bar sits next to the ask, both at the end, where a model attends most.
+  it('places the bar after the brief', () => {
+    const p = build();
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('Done means'));
+  });
+
+  it('is a build-only concern — scope already defines its own success', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).not.toContain('Done means all of these');
+    expect(p).toContain('Success = a proposed plan is emitted');
+  });
+});
+
 describe('[context] reaches the spawned agent (RUN-128/129)', () => {
   // The harness stubs these seams away by default, so prove the wiring end-to-end at least once:
   // a repo that declares context must have it in the prompt the driver was actually started with.

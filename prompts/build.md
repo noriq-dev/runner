@@ -7,3 +7,9 @@ The full check (`{{verifyCmd}}`) is run for you after you finish, and its output
 An independent reviewer agent then examines your diff against the task intent; its report comes back to you if it finds problems.{{/reviewer}}{{context}}
 
 Brief: {{brief}}{{anchor}}
+
+Done means all of these, not just the first:
+- the brief's intent is actually implemented — no stub, no TODO standing in for the work, no branch left unreachable;
+- {{#verifyCmd}}`{{verifyCmd}}` passes on what you leave behind{{/verifyCmd}}{{^verifyCmd}}the checks this repo already runs still pass{{/verifyCmd}};{{#reviewer}}
+- the reviewer, reading your diff against that intent, finds nothing blocking;{{/reviewer}}
+- anything you could not finish, could not check, or deliberately left out is said plainly in your closing message. Naming a gap costs you nothing here — presenting unfinished work as done is the one failure no gate can catch for you.
