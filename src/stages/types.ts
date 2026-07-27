@@ -34,6 +34,9 @@ import type { Workflow } from '../workflow';
 
 /** What every stage may reach. Implemented by `RunSupervisor`. */
 export interface StageHost {
+  /** Drop a terminal run's cancellation record (RUN-165). Optional: a caller with no steering
+   *  bridge has none to drop. */
+  forgetCancellation?(runId: string): void;
   readonly log: typeof defaultLogger;
   /** Report a frame to the server (status, telemetry, phase). Best-effort by contract. */
   report(runId: string, frame: RunReport): void;

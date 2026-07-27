@@ -42,7 +42,7 @@ import { renderPrompt, renderTemplate } from './prompts';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
 import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
 import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
-import { type StageName, stagesFor } from './run-machine';
+import { type StageName, stagesFor, stopBefore } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
@@ -254,6 +254,12 @@ export interface RunSupervisorDeps {
   steering?: {
     register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
     unregister: (runId: string) => void;
+    /** Has an operator cancelled this run (RUN-165)? Asked at every stage boundary, because a
+     *  cancel is a fact about the RUN and the pipeline is many sessions with gaps between them. */
+    isCancelled?: (runId: string) => boolean;
+    /** Drop the record once the run is terminal, so a long-lived daemon does not keep one entry
+     *  per cancelled run for its whole life. */
+    forget?: (runId: string) => void;
   };
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
@@ -921,6 +927,7 @@ export class RunSupervisor {
    */
   private stageHost(): StageHost {
     return {
+      forgetCancellation: (runId) => this.deps.steering?.forget?.(runId),
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       // A no-op without a comment sink, which is exactly how every call site already treated it.
@@ -2071,14 +2078,27 @@ export class RunSupervisor {
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     };
 
+    // A cancel is a fact about the RUN (RUN-165), so it is asked at every boundary rather than
+    // inferred from whether a session happens to be registered. `stopBefore` is the sequence's own
+    // predicate — a new stage that forgets to ask is a bug this file can state.
+    const cancelled = (next: StageName) =>
+      stopBefore(next, this.deps.steering?.isCancelled?.(run.id) ?? false);
+
     const prepared = await prepareRun(this.prepareHost(), run);
     if (!prepared.ok) return fail(prepared.reason);
+    const afterPrepare = cancelled('plan');
+    if (afterPrepare) return fail(afterPrepare.reason);
 
     // `plan` (RUN-140), between prepare and execute because a spec written after the build has
     // started is a spec nobody read. It no-ops unless the workflow produces, the run has a task,
     // and that task arrived unplanned — and it can only ever ENRICH the prompt: a planner that
     // fails leaves `start` exactly as prepare built it.
     const start = await this.planIfUnplanned(run, prepared);
+
+    // The pre-execution stages are deliberately non-fatal, so a cancel during one of them reads as
+    // "that stage produced nothing" — which is exactly how a cancelled run used to reach a build.
+    const afterPlan = cancelled('execute');
+    if (afterPlan) return fail(afterPlan.reason);
 
     const executed = await executeRun(this.executeHost(), {
       run,
@@ -2120,6 +2140,11 @@ export class RunSupervisor {
    * exactly as it would have without me".
    */
   private async planIfUnplanned(run: Run, prepared: PreparedRun): Promise<PreparedRun['start']> {
+    // Asked before each pre-execution spawn too, not only at the pipeline's boundaries: these
+    // stages are minutes long, and a cancel arriving inside one should not be answered by starting
+    // the next.
+    const stopped = () => this.deps.steering?.isCancelled?.(run.id) ?? false;
+    if (stopped()) return prepared.start;
     if (!stagesFor(prepared.workflow).some((s) => s.name === 'plan')) return prepared.start;
     if (!prepared.plannedTask) return prepared.start;
 
@@ -2168,13 +2193,15 @@ export class RunSupervisor {
     // run: a plan that never clears goes to the builder WITH the findings, because refusing to
     // work over a disagreement between two advisors — about work neither has done — is worse than
     // building a plan somebody criticised.
-    const outcome = await this.checkPlanIfConfigured(run, prepared, planned).catch((err) => {
-      this.log.warn('the plan checker failed — the plan stands as planned', {
-        runId: run.id,
-        err: String(err),
-      });
-      return { checked: planned.checked, findings: '' };
-    });
+    const outcome = stopped()
+      ? { checked: planned.checked, findings: '' }
+      : await this.checkPlanIfConfigured(run, prepared, planned).catch((err) => {
+          this.log.warn('the plan checker failed — the plan stands as planned', {
+            runId: run.id,
+            err: String(err),
+          });
+          return { checked: planned.checked, findings: '' };
+        });
     await planned.close(outcome.checked).catch(() => {});
     // Findings the loop never resolved travel WITH the plan. A criticised plan handed over looking
     // like an approved one is the worst of both: the tokens were spent and the warning was not.
@@ -2253,6 +2280,7 @@ export class RunSupervisor {
       });
       return '';
     }
+    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached ?? null);
     const map = await mapPatterns(this.patternMapHost(prepared.tally), {
       run,
       driver: prepared.driver,

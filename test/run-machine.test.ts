@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CANCELLED_REASON,
   RUN_STAGES,
   type StageName,
   clampStagesToWorkflow,
   declaredTerminals,
   stage,
   stagesFor,
+  stopBefore,
 } from '../src/run-machine';
 import { BUILTIN_WORKFLOWS, type Workflow } from '../src/workflow';
 
@@ -294,5 +296,34 @@ describe('clampStagesToWorkflow: the machine owns the actor, the declaration own
     for (const w of Object.values(BUILTIN_WORKFLOWS)) {
       expect(clampStagesToWorkflow(w.stages, w)).toEqual(w.stages);
     }
+  });
+});
+
+// RUN-165. A cancel is a fact about the RUN, and the pipeline is many sessions with gaps between
+// them — so "stop whatever is registered right now" was never the same thing as "stop this run".
+// Every pre-execution stage is deliberately non-fatal, which meant a cancel during one of them
+// read as "that stage produced nothing" and the build started anyway.
+describe('a cancelled run stops at its next boundary', () => {
+  it('stops before every stage that spends anything', () => {
+    for (const next of ['plan', 'pattern-map', 'execute', 'verify', 'review', 'integrate'] as const) {
+      expect(stopBefore(next, true), next).toMatchObject({ stop: true, reason: CANCELLED_REASON });
+    }
+  });
+
+  // Refusing to enter `settle` would leak the terminal report, the locks and the workspace — the
+  // three things it exists to make durable.
+  it('always enters settle, whatever happened', () => {
+    expect(stopBefore('settle', true)).toBeNull();
+  });
+
+  it('stops nothing when the run was not cancelled', () => {
+    for (const next of ['plan', 'execute', 'settle'] as const) {
+      expect(stopBefore(next, false), next).toBeNull();
+    }
+  });
+
+  // The complete set of ways a run can fail has to stay complete.
+  it('declares its reason with the rest of them', () => {
+    expect(declaredTerminals()).toContain(CANCELLED_REASON);
   });
 });

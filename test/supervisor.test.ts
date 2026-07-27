@@ -423,6 +423,8 @@ function harness(
     lockConflicts?: LockConflict[];
     /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
     lockScope?: string[] | null;
+    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
+    cancelled?: string[];
   } = {},
 ) {
   const worktrees = new FakeWorktrees();
@@ -516,6 +518,16 @@ function harness(
         }
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
+    ...(over.cancelled
+      ? {
+          steering: {
+            register: () => {},
+            unregister: () => {},
+            isCancelled: (runId: string) => (over.cancelled ?? []).includes(runId),
+            forget: () => {},
+          },
+        }
+      : {}),
   });
   return {
     supervisor,
@@ -4041,4 +4053,18 @@ describe('one ceiling across the whole run (RUN-133)', () => {
     expect(h.claude.starts.map((s) => s.runId)).toEqual(['run_1', 'run_1:review']);
     expect(exit.reason).toBe('land:conflict');
   });
+});
+
+// RUN-165. The bug, at the level it actually bit: a cancel during a non-fatal pre-execution stage
+// stopped that actor and the pipeline read the dead session as "produced nothing", then built.
+describe('a cancelled run does not go on to build (RUN-165)', () => {
+  it('refuses to spawn the agent when the run was already cancelled', async () => {
+    const h = harness({ cancelled: ['run_1'] });
+    const exit = await h.supervisor.supervise(makeRun({ kind: 'build' }));
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'cancelled' });
+    expect(h.claude.starts).toHaveLength(0);
+  });
+
+  // The control is the rest of this file: every other test here wires no cancellation and reaches
+  // its agent, so a guard that stopped everything could not have got this far.
 });

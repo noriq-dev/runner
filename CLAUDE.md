@@ -159,6 +159,13 @@ The TOML surface (`[workflow.<name>].stages`, and the per-stage agent coordinate
 `WorkflowDef` is the vendored contract and carries `base` + `prompt` only, so a custom workflow
 inherits its base's list until the phase-3 vendor refresh grows the field.
 
+**Cancelling a run is a fact about the RUN, not about a session** (RUN-165). `SteeringBridge`
+records it and `stopBefore` (run-machine.ts) is asked at every stage boundary, because the pipeline
+is many sessions with gaps between them and every pre-execution stage is deliberately non-fatal —
+so "stop whatever is registered right now" let a cancelled run go on to build, and a cancel landing
+between stages found no target at all. `settle` always runs: refusing to enter it would leak the
+terminal report, the locks and the workspace.
+
 The **write floor is workflow-independent** (RUN-118): `clampPermissionToWorkflow` forces `write =
 false` for any non-producing workflow at every permission site, so "verify executes but never edits"
 is enforced in code, not by trusting the manifest — a custom workflow can never widen its posture.

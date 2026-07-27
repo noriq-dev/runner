@@ -101,6 +101,16 @@ export interface RunStage {
 
 const always = () => true;
 
+/**
+ * The terminal a cancelled run ends with (RUN-165).
+ *
+ * Named here rather than at the point of use because it is a property of the SEQUENCE: every stage
+ * boundary is a place a cancel may be discovered, and a reason invented at each of them would
+ * drift. `declaredTerminals()` therefore includes it, which keeps "the complete set of ways a run
+ * can fail" complete.
+ */
+export const CANCELLED_REASON = 'cancelled';
+
 export const RUN_STAGES: readonly RunStage[] = [
   {
     name: 'prepare',
@@ -181,7 +191,7 @@ export const RUN_STAGES: readonly RunStage[] = [
     actor: 'run',
     budget: 'run',
     retry: { kind: 'none' },
-    terminal: ['failed', 'budget', 'cancelled'],
+    terminal: ['failed', 'budget', CANCELLED_REASON],
     optional: false,
     appliesTo: always,
   },
@@ -312,4 +322,31 @@ export function stage(name: StageName): RunStage {
  *  this set means a stage grew one without declaring it. */
 export function declaredTerminals(): readonly string[] {
   return [...new Set(RUN_STAGES.flatMap((s) => s.terminal))];
+}
+
+/**
+ * The terminal a cancelled run ends with (RUN-165).
+ *
+ * Named here rather than at the point of use because it is a property of the SEQUENCE: every stage
+ * boundary is a place a cancel may be discovered, and a reason invented at each of them would
+ * drift. `declaredTerminals()` therefore includes it, which keeps "the complete set of ways a run
+ * can fail" complete.
+ */
+/**
+ * May the pipeline proceed past this boundary?
+ *
+ * A cancel is a fact about the RUN, and the pipeline is many sessions with gaps between them, so
+ * "stop the session that is registered right now" was never the same thing as "stop this run".
+ * Every pre-execution stage is deliberately non-fatal — a planner or a mapper that dies leaves the
+ * run unplanned rather than failed — which meant a cancel during one of them read as "that stage
+ * produced nothing" and the build started anyway.
+ *
+ * A predicate rather than a flag each stage remembers to check: a new stage that forgets is a bug
+ * the sequence should be able to state, and this is the sequence's file.
+ */
+export function stopBefore(next: StageName, cancelled: boolean): { stop: true; reason: string } | null {
+  // `settle` runs whatever happened — it is where the terminal becomes durable, the locks release
+  // and the workspace is decided. Refusing to enter it on a cancel would leak all three.
+  if (!cancelled || next === 'settle') return null;
+  return { stop: true, reason: CANCELLED_REASON };
 }

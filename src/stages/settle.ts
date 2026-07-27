@@ -97,6 +97,9 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       .dispose(worktree)
       .catch((err) => host.log.warn('worktree cleanup failed', { err: String(err) }));
   }
+  // The run is terminal, so its cancellation record has nothing left to protect (RUN-165) —
+  // without this a long-lived daemon keeps one entry per cancelled run for its whole life.
+  host.forgetCancellation?.(run.id);
   host.log.info('run finished', { runId: run.id, outcome: ctx.exit.outcome, reason: ctx.exit.reason });
   host.endTranscript(run.id, `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`);
 };
