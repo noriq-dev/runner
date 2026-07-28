@@ -1987,6 +1987,15 @@ export class RunSupervisor {
     const responses = parseFindingResponses(contestText);
     const answered = buildLedger(args.ledger, args.findings, responses, args.terminalRound);
 
+    // The ids THIS terminal round raised — the response↔terminal-id join, computed ONCE before the
+    // exit branch and the eligibility gate diverge (RUN-179). `buildLedger` already folds a response
+    // solely onto the finding sharing its id, so a `FINDING 99` naming no terminal finding never
+    // enters `answered`; restricting the contested set to the same ids keeps the eligibility side
+    // just as faithful. Without it an unknown id sits in `contested` unqueried — harmless only
+    // because the `every` gate reads per terminal finding — and would buy a fresh adjudicator over
+    // unchanged code the moment that gate were ever weakened to 'at least one survives'.
+    const terminalIds = new Set(args.findings.map((f) => f.id));
+
     // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
     // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
     // the fix loop already avoids — but with the ledger now carrying whatever it said.
@@ -2005,7 +2014,9 @@ export class RunSupervisor {
     // adjudicator's view is not a candidate, so it still stands. What "checkable" means beyond
     // non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
     const contested = new Set(
-      responses.filter((r) => r.status === 'contested' && r.pointer.trim().length > 0).map((r) => r.id),
+      responses
+        .filter((r) => r.status === 'contested' && r.pointer.trim().length > 0 && terminalIds.has(r.id))
+        .map((r) => r.id),
     );
     const loc = (s: string) => s.trim().toLowerCase();
     const visibleToAdjudicator = (f: Finding) =>

@@ -3633,6 +3633,17 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(1); // self-assertion with no pointer → no re-review
   });
 
+  // RUN-179: a contest that CONTESTS with a checkable pointer but names a finding id NO terminal
+  // finding carries (`FINDING 99` against a single `FINDING 1`) clears the eligibility filter's
+  // pointer bar yet leaves the real finding uncontested — so it must NOT buy a fresh adjudicator
+  // whose stochastic PASS could clear the run over unchanged code. Same re-roll the pointer/FIXED
+  // cases deny, one level up.
+  it('a CONTESTED naming an unknown finding id cannot buy a re-adjudication', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 99: CONTESTED src/a.ts:9 — not a real finding');
+    expect(exit.outcome).toBe('failed'); // FINDING 1 was never answerably contested → it stands
+    expect(reviewerStarts(h)).toBe(1); // an unknown id contested → no fresh adjudicator spawned
+  });
+
   it('a contest that answers only SOME terminal findings still fails the run', async () => {
     const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
     // Two findings, one contested with a pointer, the other left unanswered.
