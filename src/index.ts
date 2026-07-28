@@ -253,7 +253,11 @@ export {
   assembleVerifyPrompt,
   judgeWithAcceptance,
   parseVerdict,
+  readEscalation,
   verifyAgentComment,
+  ESCALATION_INSTANCE_FLOOR,
+  type EscalationReading,
+  type ReviewEscalation,
   type Verdict,
   type VerifyVerdict,
 } from './verify-agent';
@@ -285,6 +289,7 @@ export {
 export {
   assembleReviewerPrompt,
   reviewerContestPrompt,
+  reviewerEscalationComment,
   reviewerFeedbackPrompt,
   reviewerRejectionComment,
   type ReviewerPromptContext,

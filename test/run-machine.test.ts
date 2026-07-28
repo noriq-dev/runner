@@ -135,6 +135,7 @@ describe('what each stage declares', () => {
         'verify_agent',
         'review',
         'review:no-verdict',
+        'review:structural',
         'land:conflict',
         'land:verify',
         'land:error',

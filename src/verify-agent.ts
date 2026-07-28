@@ -12,9 +12,29 @@ import {
   reconcileAcceptance,
   renderAcceptanceChecklist,
 } from './acceptance';
+import { parseFindings } from './adjudication';
 import { renderPrompt } from './prompts';
 
 export type Verdict = 'pass' | 'fail' | 'unknown';
+
+/**
+ * The reviewer's STRUCTURAL diagnosis, honoured (RUN-175).
+ *
+ * RUN-90 taught the reviewer to say whether an invariant-class leak is BOUNDED (enumerable now) or
+ * STRUCTURAL (no single enforcement point) — as prose only the builder reads. A run the reviewer
+ * had already diagnosed as structurally unconvergeable still burned every remaining fix round
+ * rediscovering that, then failed anyway. This is the machine-readable half: present on a verdict
+ * only when the daemon checked the evidence and honoured the claim, so a consumer never has to
+ * re-litigate whether an escalation was earned.
+ */
+export interface ReviewEscalation {
+  /** The numbered FINDING this report raised that names the invariant-class. */
+  findingId: number;
+  /** The broken promise, in the reviewer's words — what a human re-dispatches around. */
+  diagnosis: string;
+  /** The distinct `file:line` instances cited as the evidence that the class is real. */
+  instances: string[];
+}
 
 export interface VerifyVerdict {
   verdict: Verdict;
@@ -23,6 +43,11 @@ export interface VerifyVerdict {
   /** Per-criterion evidence (RUN-145). Absent when the actor was given no criteria to answer —
    *  which is most runs, since most tasks carry no spec. */
   acceptance?: AcceptanceReport;
+  /** An HONOURED structural escalation (RUN-175). Only ever set on a clear FAIL whose report
+   *  passed the evidence gate (`readEscalation`), and only by the inline-reviewer path — the
+   *  dispatched verify run has no fix-round loop for a token to short-circuit. Absent otherwise,
+   *  which is every report written before the token existed. */
+  escalation?: ReviewEscalation;
 }
 
 export interface VerifyPromptContext {
@@ -83,6 +108,125 @@ export function parseVerdict(output: string): VerifyVerdict {
   const last = matches.at(-1); // the final verdict line wins
   const verdict: Verdict = last ? (last[1]!.toUpperCase() === 'PASS' ? 'pass' : 'fail') : 'unknown';
   return { verdict, passed: verdict === 'pass', findings: output.trim() };
+}
+
+// `ESCALATE STRUCTURAL FINDING 2: the write floor is re-derived per site — src/a.ts:9, src/b.ts:14`
+//
+// Same forgiving prefix as EVIDENCE_RE, `FINDING` optional, `.`/`)` accepted for the separator —
+// a reviewer that reasoned its way to a real structural diagnosis must not lose it to punctuation.
+// What is NOT forgiven is the evidence, below: a token is easier to emit than RUN-90's paragraph,
+// and a reviewer that can end a run in one word will, so the gate is mechanical and strict.
+const ESCALATION_RE =
+  /^[ \t>*\-–—•\d.)\]]*ESCALATE[ \t]+STRUCTURAL\b(?:[ \t]+FINDING)?[ \t]+(\d+)[ \t]*[:.)][ \t]*(.*)$/gim;
+
+/** A `path:line`-shaped citation — the anchor shape FINDING lines already use. The optional range
+ *  suffix keeps `src/a.ts:10-20` one citation instead of a citation and a stray number. */
+const INSTANCE_RE = /[\w@./\\-]+:\d+(?:[-–]\d+)?/g;
+const DIAGNOSIS_CAP = 300;
+
+/** "Several", made mechanical. RUN-90's prose bar is "several instances + unlike mechanisms + one
+ *  named broken promise, cited"; a machine can count the cited instances and read the diagnosis,
+ *  but cannot judge "unlike mechanisms" — that half stays in the prompt, and this floor is the
+ *  checkable part that cannot be met by one word. */
+export const ESCALATION_INSTANCE_FLOOR = 3;
+
+const capLine = (s: string, n: number): string => {
+  const t = s.trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+};
+
+/** The distinct code sites cited in a stretch of text. A bare `12:30` is a time, not a site, so
+ *  the path part must contain something a path has and a number does not. Deduped case-blind:
+ *  the same site cited three times is one instance, not three. */
+const distinctInstances = (text: string): string[] => {
+  const seen = new Map<string, string>();
+  for (const m of text.match(INSTANCE_RE) ?? []) {
+    const path = m.slice(0, m.indexOf(':'));
+    if (!/[a-z_/\\]/i.test(path)) continue;
+    const key = m.toLowerCase();
+    if (!seen.has(key)) seen.set(key, m);
+  }
+  return [...seen.values()];
+};
+
+export interface EscalationReading {
+  /** The honoured escalation — the token named a FINDING this report raised, cited enough
+   *  distinct instances, and named the promise in words. Null when no token appeared or none
+   *  survived the gate. */
+  escalation: ReviewEscalation | null;
+  /** Why a token that WAS present is ignored — surfaced so the demotion is legible in a log
+   *  rather than mistaken for the daemon never having seen it. Null when no token appeared or
+   *  one was honoured. */
+  demoted: string | null;
+}
+
+/**
+ * Read the reviewer's structural-escalation token off its report, and demote what the evidence
+ * does not carry (RUN-175).
+ *
+ * The RUN-145 posture, applied to a claim that ends runs instead of criteria: an unevidenced
+ * token is demoted, never honoured — the run proceeds as the ordinary FAIL the report already is.
+ * The precedent is `pointsAtSomething`: a claim with nothing pointed at is not the claim. Every
+ * check here fails toward today's behaviour, because the failure modes are asymmetric — a demoted
+ * real escalation costs the fix rounds we spend today, an honoured lazy one converts a run that
+ * might still converge into a failure on one word.
+ *
+ * What the gate demands, each mechanical and each mirroring a piece of RUN-90's prose bar:
+ * - The report's own verdict is FAIL. A PASS is never converted by a token (escalation asserts
+ *   the run cannot converge, which is incoherent alongside a clean pass), and an absent/ambiguous
+ *   verdict means the gate never rendered a judgment for the token to ride on.
+ * - The token names a numbered FINDING this report raised — the invariant-class must occupy a
+ *   number, exactly as RUN-90 requires, so the escalation is anchored to a claim the builder and
+ *   the ledger can see.
+ * - At least ESCALATION_INSTANCE_FLOOR distinct `file:line` instances are cited, on the named
+ *   finding or the token line itself — "several instances, cited", counted.
+ * - The diagnosis names the promise in words: a line that is only citations has evidenced
+ *   something but named nothing to re-dispatch around.
+ *
+ * A report with no token returns `{ null, null }` and the caller's behaviour is byte-identical to
+ * today's — the field this feeds is optional and absent.
+ */
+export function readEscalation(output: string): EscalationReading {
+  const tokens = [...output.matchAll(ESCALATION_RE)];
+  if (!tokens.length) return { escalation: null, demoted: null };
+  if (parseVerdict(output).verdict !== 'fail') {
+    return {
+      escalation: null,
+      demoted:
+        'the report’s own verdict is not FAIL — a token never converts a PASS, and an absent verdict is no judgment to escalate',
+    };
+  }
+  const findings = parseFindings(output);
+  const demotions: string[] = [];
+  for (const m of tokens) {
+    const id = Number(m[1]);
+    const diagnosis = (m[2] ?? '').trim();
+    const finding = findings.find((f) => f.id === id);
+    if (!finding) {
+      demotions.push(`names FINDING ${id}, which this report never raised as a numbered finding`);
+      continue;
+    }
+    const instances = distinctInstances(`${finding.location} ${finding.claim} ${diagnosis}`);
+    if (instances.length < ESCALATION_INSTANCE_FLOOR) {
+      demotions.push(
+        `cites ${instances.length} distinct instance(s); the floor is ${ESCALATION_INSTANCE_FLOOR}`,
+      );
+      continue;
+    }
+    // The named-broken-promise half: strip the citations and require words to remain. Three
+    // alphanumerics is `pointsAtSomething`'s bar — the smallest that rejects punctuation-and-shrug.
+    if ((diagnosis.replace(INSTANCE_RE, ' ').match(/[a-z0-9]/gi)?.length ?? 0) < 3) {
+      demotions.push(
+        'cites instances but names no broken promise — the diagnosis is what a human re-dispatches around',
+      );
+      continue;
+    }
+    return {
+      escalation: { findingId: id, diagnosis: capLine(diagnosis, DIAGNOSIS_CAP), instances },
+      demoted: null,
+    };
+  }
+  return { escalation: null, demoted: demotions[0] ?? null };
 }
 
 /**

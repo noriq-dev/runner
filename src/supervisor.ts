@@ -91,7 +91,12 @@ import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
-import { type VerifyVerdict, assembleVerifyPrompt, judgeWithAcceptance } from './verify-agent';
+import {
+  type VerifyVerdict,
+  assembleVerifyPrompt,
+  judgeWithAcceptance,
+  readEscalation,
+} from './verify-agent';
 import { assembleReviewerPrompt, reviewerContestPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import {
   BUILTIN_WORKFLOWS,
@@ -1575,6 +1580,13 @@ export class RunSupervisor {
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
       if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
+      // An HONOURED structural escalation ends the loop here (RUN-175): the reviewer has diagnosed
+      // an invariant with no single enforcement point and evidenced it, so every remaining fix
+      // round would buy patched sites while the class survives — the RUN-66 death, foreseen
+      // instead of relived. The verdict (escalation riding on it) goes back a FAIL; the review
+      // stage reports the diagnosis and its own terminal reason. The findings are already in the
+      // ledger (recorded when raised), so a continuation still sees them.
+      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -1667,7 +1679,12 @@ export class RunSupervisor {
     // to — the ledger holds no entry a pointer could land on. continueWith is already guaranteed
     // here (the passed/no-continueWith return above narrowed it), and the method re-checks it before
     // the turn regardless, since it is what makes the contest a turn on the live builder session.
-    const terminalFindings = verdict.verdict === 'fail' ? parseFindings(verdict.findings) : [];
+    // …and never for an honoured escalation (RUN-175): the contest exists to let a builder rebut
+    // per-finding claims with pointers, but an escalation is a diagnosis about the DESIGN — that no
+    // single check can hold the promise — and the adjudicator for that is the human the diagnosis
+    // is surfaced to, not one more spent turn. Stopping the spend is the token's whole point.
+    const terminalFindings =
+      verdict.verdict === 'fail' && !verdict.escalation ? parseFindings(verdict.findings) : [];
     if (terminalFindings.length) {
       const contested = await this.contestTerminalFindings(
         { ...ctx, intent },
@@ -1873,7 +1890,23 @@ export class RunSupervisor {
       }
       // Verdict AND per-criterion evidence, reconciled together (RUN-145) — a PASS the report's
       // own acceptance lines contradict is taken as the FAIL it contains.
-      return judgeWithAcceptance(text, ctx.acceptance ?? []);
+      const judged = judgeWithAcceptance(text, ctx.acceptance ?? []);
+      // The structural-escalation token (RUN-175), read only off a clean exit: a crashed reviewer's
+      // half-written token must not end a run the gate never finished judging (the branch above
+      // already forces `unknown`). `readEscalation` gates on the report's OWN verdict line, so a
+      // PASS judgeWithAcceptance demoted cannot smuggle an escalation in — the reviewer that signed
+      // PASS did not judge the run unconvergeable, whatever else its report contradicts. A demotion
+      // is logged rather than silent, so "the daemon ignored it" is legible and distinct from "the
+      // daemon never saw it"; the run then proceeds as the ordinary FAIL the report already is.
+      const escalated = readEscalation(text);
+      if (escalated.demoted) {
+        this.log.info('reviewer escalation token demoted — the run proceeds as an ordinary FAIL', {
+          runId: ctx.run.id,
+          round: ctx.round,
+          why: escalated.demoted,
+        });
+      }
+      return escalated.escalation ? { ...judged, escalation: escalated.escalation } : judged;
     } finally {
       this.deps.steering?.unregister(ctx.run.id);
     }
@@ -3127,6 +3160,9 @@ const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {
   if (v.passed) return `reviewer verdict: PASS (round ${round})`;
-  if (v.verdict === 'fail') return `reviewer verdict: FAIL (round ${round})`;
+  if (v.verdict === 'fail')
+    return v.escalation
+      ? `reviewer verdict: FAIL (round ${round}) — escalated STRUCTURAL, the daemon stops the fix rounds`
+      : `reviewer verdict: FAIL (round ${round})`;
   return `reviewer rendered NO verdict (round ${round}) — stopped, crashed, or wrote no VERDICT line`;
 }

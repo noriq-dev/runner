@@ -10,7 +10,11 @@
 
 import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
 import { renderRequirementOutcomes, requirementOutcomes } from '../adjudication';
-import { reviewerNoVerdictComment, reviewerRejectionComment } from '../verify-reviewer';
+import {
+  reviewerEscalationComment,
+  reviewerNoVerdictComment,
+  reviewerRejectionComment,
+} from '../verify-reviewer';
 import type { RunPipeline, StageHost } from './types';
 
 export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
@@ -79,6 +83,22 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     return;
   }
   if (review.verdict === 'fail') {
+    // An honoured STRUCTURAL escalation (RUN-175): the run still FAILS — failing fast is a report,
+    // never a silent pass — but with the cause named in round 1 rather than rediscovered in round
+    // N, under its own terminal reason so a human can tell "re-dispatch around a chokepoint" from
+    // "the work was found wanting". The escalation only exists on a verdict the evidence gate
+    // honoured; a demoted or absent token lands in the ordinary branch below, byte-identical to
+    // today.
+    if (review.escalation) {
+      host.log.warn('inline reviewer diagnosed the run structurally unconvergeable — fail-fast', {
+        runId: run.id,
+        rounds: review.rounds,
+        finding: review.escalation.findingId,
+      });
+      comment(reviewerEscalationComment(review.escalation, review.findings, review.rounds));
+      ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'review:structural' };
+      return;
+    }
     host.log.warn('inline reviewer refused the work — run gated (not done)', {
       runId: run.id,
       verdict: review.verdict,

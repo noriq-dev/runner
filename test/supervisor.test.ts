@@ -3141,6 +3141,70 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.worktrees.removed).toEqual([]); // the diff is kept — a human still needs it
   });
 
+  // RUN-175. The reviewer could already say STRUCTURAL in prose; only the builder read it, so a
+  // run diagnosed as unconvergeable still burned every fix round rediscovering that. The token is
+  // the machine-readable half — honoured only evidenced, and a FAIL either way.
+  const ESCALATED = [
+    'FINDING 1 [High] src/a.ts:10: the write floor is re-derived per site — also src/b.ts:20 and src/c.ts:30',
+    'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the floor — src/a.ts:10, src/b.ts:20, src/c.ts:30',
+    'VERDICT: FAIL',
+  ].join('\n');
+
+  it('an honoured escalation ends the loop in round 1: no fix turn, a distinct reason, the diagnosis posted (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() }); // maxRounds 2 — none of them spent
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(ESCALATED);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // distinct from a plain 'review' rejection
+    expect(h.claude.continuations).toEqual([]); // the remaining rounds were NOT spent
+    expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer — no contest turn either
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the floor'); // the diagnosis leads
+    expect(body).toContain('src/b.ts:20'); // the evidence shows, rather than asks to be trusted
+    expect(h.worktrees.removed).toEqual([]); // a FAIL, never a silent pass — the diff is kept
+    // The transcript names the fail-fast, so a human reading the stream sees why round 2 never ran.
+    expect(h.transcript.map((s) => s.text).join('\n')).toContain('escalated STRUCTURAL');
+  });
+
+  it('a demoted (under-evidenced) escalation consumes rounds exactly as an ordinary FAIL (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // One cited instance — below the floor of 3, so the token is ignored, not honoured.
+    h.claude.emitText(
+      'FINDING 1 [High] src/a.ts:10: one bad site\nESCALATE STRUCTURAL FINDING 1: feels systemic — src/a.ts:10\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the fix round DID run — the demotion changed nothing
+    h.claude.emitText('Still leaking.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review'); // the ordinary rejection, not the escalation terminal
+    expect(h.claude.continuations).toHaveLength(1); // the manifest's one round was spent, as today
+  });
+
+  it('an escalation token on a PASS changes nothing — the run reaches done (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'ESCALATE STRUCTURAL FINDING 1: everything — src/a.ts:1, src/b.ts:2, src/c.ts:3\nVERDICT: PASS',
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+  });
+
   it('maxRounds 0 is a pure gate: one review, no hand-back', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());
