@@ -984,8 +984,12 @@ describe('RunSupervisor', () => {
     expect(h.worktrees.removed).toEqual([]); // kept for the human to merge
   });
 
-  it('build failure: worktree cleaned up', async () => {
-    const h = harness();
+  it('build failure with NOTHING in the tree: worktree cleaned up', async () => {
+    // This test used to assert the opposite with work present — a crashed build's worktree
+    // removed, harness default changed=true — which is the disposal that destroyed a killed
+    // continuation's three sittings of committed work. The startup reaper has always kept
+    // work-bearing orphans; settle now agrees with it. Cleanup is for EMPTY trees.
+    const h = harness({ changed: false });
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
     await flush();
     h.claude.complete('failed');
@@ -3291,6 +3295,62 @@ describe('the inline reviewer (RUN-61)', () => {
     ok.claude.complete('done');
     await runP;
     expect(ok.continuable.entries.has('run_1')).toBe(false); // resolved → nothing left to continue
+  });
+
+  it('a sitting that CRASHES refreshes the record — history kept, tallies current', async () => {
+    // The live incident: a continuation was killed minutes in, and the blanket remove threw away
+    // the PRIOR sitting's spend, ledger and transcript position — the next continue started
+    // blind, with three sittings of history gone. But "leave it untouched" is wrong in the other
+    // direction: a stale record's spend undercounts the killed sitting (the next ceiling comes
+    // out WIDER), and its lastLogSeq predates the terminal milestone (the next sitting's first
+    // segments collide and vanish). Only a REFRESH loses neither.
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 5, usd: 0 },
+      ledger: [priorLedgerEntry],
+      lastLogSeq: 108,
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ continuableSeed: seed });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed', { outputTokens: 40 }); // died AFTER spending — driverSucceeded false
+    await done;
+    const kept = h.continuable.entries.get('run_1');
+    expect(kept).toBeDefined();
+    expect(kept?.ledger).toEqual([priorLedgerEntry]); // the prior adjudications survive
+    // CUMULATIVE: seed 5 + this sitting's 40. A stale 5 would hand the next sitting the killed
+    // sitting's 40 tokens back as fresh budget.
+    expect(kept?.spent.tokens).toBe(45);
+    // ADVANCED: the terminal milestone was written above 108, so a record still saying 108 would
+    // point the next sitting into rows that already exist.
+    expect(kept?.lastLogSeq).toBeGreaterThan(108);
+  });
+
+  it('a crashed run whose workspace still holds work KEEPS it — never force-delete the only copy', async () => {
+    // driverSucceeded alone was the dispose test, and it destroyed real work: a killed
+    // continuation reads as "driver did not succeed", but its workspace carries every prior
+    // sitting's committed diff on a branch nothing else references. The backend is ASKED now.
+    const h = harness({}); // changed=true: the workspace has work
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    expect(h.worktrees.created.length).toBe(1); // it leased — the assertion below is not vacuous
+    expect(h.worktrees.removed).toEqual([]); // kept for a human, exactly like a gate-fail
+    // (the empty-tree cleanup half lives in 'build failure with NOTHING in the tree' above)
+  });
+
+  it('a probe that cannot answer errs toward KEEPING the workspace', async () => {
+    // A kept empty worktree costs a warning at the next startup sweep; a disposed full one costs
+    // the work. The same fail-closed direction as RUN-152's no-changes probe.
+    const h = harness({});
+    h.worktrees.hasWorkError = 'git exploded';
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    expect(h.worktrees.removed).toEqual([]);
   });
 
   // RUN-130: the write half of the predictive lock source. What this sitting changed becomes the

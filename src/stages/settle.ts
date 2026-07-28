@@ -151,11 +151,21 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   //    otherwise read a workspace that was just released);
   //  - the transcript's own numbering is only final once it is CLOSED, since closing flushes what
   //    was buffered and then appends the terminal milestone (RUN-183).
+  // Whether the workspace still holds work a human (or a continuation) could need. Asked ONCE and
+  // shared by the continuation record and the dispose decision below, so the two cannot disagree
+  // about what exists. `driverSucceeded` alone was the wrong proxy and destroyed real work: a
+  // CANCELLED continuation reads driverSucceeded=false, but its workspace carried three sittings'
+  // committed diffs on a branch nothing else referenced. A probe that cannot answer errs toward
+  // "work exists" — a kept empty worktree costs a warning at the next startup sweep, a disposed
+  // full one costs the work.
+  const hasRemainingWork =
+    wf.produces && !ctx.landed && (ctx.driverSucceeded || (await vcs.hasWork(worktree).catch(() => true)));
+
   const nextLogSeq = host.endTranscript(
     run.id,
     `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`,
   );
-  await recordContinuation(host, ctx, nextLogSeq);
+  await recordContinuation(host, ctx, nextLogSeq, hasRemainingWork);
 
   host.report(run.id, {
     status: ctx.exit.outcome,
@@ -173,7 +183,12 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // not "keep the work", it is "hold the pool-of-1 lease forever" — the next run on this repo would
   // wait on a workspace nobody will ever hand back. Such a backend keeps the work server-side inside
   // dispose, so disposing IS keeping.
-  if (!(wf.produces && ctx.driverSucceeded && !ctx.landed) || vcs.disposePreservesWork) {
+  //
+  // Non-producing workflows never own work (a verify leases the BUILD's branch, which must not be
+  // kept alive on its behalf) — `hasRemainingWork` already folds that in, so they dispose exactly
+  // as before.
+  const keptForHuman = hasRemainingWork && !vcs.disposePreservesWork;
+  if (!keptForHuman) {
     await vcs
       .dispose(worktree)
       .catch((err) => host.log.warn('worktree cleanup failed', { err: String(err) }));
@@ -189,9 +204,25 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
  * dispose above skips on — so record what a continue must inherit that git cannot carry.
  *
  * The CUMULATIVE spend (the tally already folds any prior sitting, so re-seeding the next continue
- * from it never double-counts: `put` replaces, never adds) and the reviewer's final ledger. Any
- * OTHER terminal — done, landed, a driver failure, a non-build — leaves nothing to continue, so a
- * record a prior failed sitting left is dropped: this continuation resolved it.
+ * from it never double-counts: `put` replaces, never adds) and the reviewer's final ledger.
+ *
+ * A record is REMOVED only by the outcome that resolves it: `done`. Every OTHER terminal on a
+ * workspace that still holds work — a gate-fail, but equally a cancel, a crashed driver, a kill
+ * mid-sitting — REFRESHES the record with this sitting's cumulative tally, transcript position and
+ * changed paths. Two wrong versions preceded this one, each losing a different thing:
+ *
+ *   - the blanket remove threw the record away on a kill, so the next continue started blind with
+ *     three sittings of spend, ledger and transcript position gone;
+ *   - "leave it untouched" kept a STALE record, which is worse than it sounds: its spend
+ *     undercounts the killed sitting (the next ceiling comes out WIDER, not tighter), its
+ *     lastLogSeq predates the terminal milestone (the next sitting collides and its first
+ *     segments vanish), and its changedPaths miss what the killed sitting touched (the predictive
+ *     lock layer under-declares).
+ *
+ * The tally makes the refresh safe on every axis: it was seeded from the prior record, so its
+ * totals are cumulative whether or not this sitting got far enough to add anything. The ledger
+ * falls back to the seed for a sitting killed before its review — the prior adjudications are
+ * still the freshest that exist.
  */
 async function recordContinuation(
   host: StageHost,
@@ -199,14 +230,20 @@ async function recordContinuation(
   /** The seq the NEXT sitting must number from (RUN-183) — one past everything this one wrote,
    *  terminal milestone included. */
   lastLogSeq: number,
+  /** Whether the workspace still holds unlanded work — settle's own dispose answer, shared so the
+   *  record and the workspace cannot disagree about what exists. */
+  hasRemainingWork: boolean,
 ): Promise<void> {
   const store = host.continuable;
   if (!store) return;
-  const { run, repo, worktree, workflow: wf } = ctx;
-  if (!(wf.produces && ctx.exit.outcome === 'failed' && ctx.driverSucceeded && !ctx.landed)) {
+  const { run, repo, worktree } = ctx;
+  if (ctx.exit.outcome === 'done') {
     await store.remove(run.id).catch(() => {});
     return;
   }
+  // Nothing to continue: a non-producing run, a landed one, or a workspace with nothing in it.
+  // No record is written and none is removed — a state with no work has nothing to describe.
+  if (!hasRemainingWork) return;
   const spent = ctx.exit.telemetry;
   // What this sitting touched becomes the continuation's declared lock scope (RUN-130).
   // Best-effort: a backend without `changedPaths`, or a query that errors, simply records none —
@@ -222,6 +259,8 @@ async function recordContinuation(
         usd: spent.costUsd,
         ...(spent.modelUsage ? { modelUsage: spent.modelUsage } : {}),
       },
+      // Safe for a sitting killed before its review: the pipeline initializes this from the
+      // continuation seed (supervisor.ts), so the prior adjudications survive the refresh.
       ledger: ctx.ledger,
       // The wall-clock axis carries over too (RUN-133), or a continue would restart the duration
       // ceiling it just spent — the same loophole tokens had.
