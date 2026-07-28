@@ -284,6 +284,7 @@ export {
 } from './steps';
 export {
   assembleReviewerPrompt,
+  reviewerContestPrompt,
   reviewerFeedbackPrompt,
   reviewerRejectionComment,
   type ReviewerPromptContext,

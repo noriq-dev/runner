@@ -154,6 +154,23 @@ export function reviewerFeedbackPrompt(
   });
 }
 
+/**
+ * What the live builder is told after a TERMINAL-round reviewer FAIL (RUN-174): one turn to
+ * CONTEST a finding with a checkable pointer, and no more. Distinct from `reviewerFeedbackPrompt`
+ * on purpose — a fix round is budget for NEW work, and the terminal round is where the run ends, so
+ * a finding raised there for the first time (the RUN-66/RUN-88 dogfood deaths) was never fixable
+ * OR contestable. This buys the one answer it could still get: the builder points at evidence a
+ * fresh reviewer verifies for itself, no code changes.
+ *
+ * The scope rule it leans on — would-a-revert-fix-it — stays SOLELY in `reviewer.md`, which the
+ * judging reviewer reads (RUN-89's other half). Restating it here is a second place it could drift;
+ * the builder contests with a pointer, the mechanical test stays with the judge. The findings cap
+ * mirrors `reviewerFeedbackPrompt`'s (a report longer than this has stopped being actionable).
+ */
+export function reviewerContestPrompt(findings: string): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
+}
+
 /** Format a final reviewer rejection for a task comment (the gate surface). */
 export function reviewerRejectionComment(findings: string, rounds: number): string {
   const tried = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : '';
