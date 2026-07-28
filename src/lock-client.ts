@@ -69,6 +69,27 @@ interface ToolReply {
 
 const NOT_ENABLED = /not enabled|locking (is )?off|locking disabled/i;
 
+/**
+ * The server's answer when this identity was never granted the tool — the run-agent floor (RUN-47)
+ * does not list it, so it is not in the catalogue.
+ *
+ * On the RELEASE path this is the EXPECTED answer, not an edge case: no kind is granted
+ * `release_lock` or `list_locks`, because the agent shares the run's identity and would then be
+ * able to drop the daemon's own hard-floor locks (see `security.ts`). The server releases a
+ * task-anchored run's locks when the run settles, so the daemon's release was only ever
+ * promptness — the no-op is the design, and warning on every run would train people to ignore
+ * the log.
+ *
+ * Deliberately NOT honoured on acquire, where a missing tool means the floor never ran. Reading
+ * that as "no locks needed" would turn a misconfiguration into a silent fail-open over exactly
+ * the paths the floor exists to guard, so the run gates instead, loudly.
+ *
+ * Matched against the SPECIFIC tool being called rather than any "tool … not found" prose: the
+ * server echoes paths and titles in error text, and a lock path is attacker-adjacent input.
+ */
+const toolMissing = (name: string, text: string): boolean =>
+  new RegExp(`tool\\s+${name}\\s+not found`, 'i').test(text);
+
 export class LockClient {
   private readonly base: string;
   private readonly fetchImpl: typeof fetch;
@@ -123,7 +144,7 @@ export class LockClient {
       ...(sel.paths?.length ? { paths: sel.paths } : {}),
     });
     if (reply.isError) {
-      if (NOT_ENABLED.test(reply.text)) return { released: [] };
+      if (NOT_ENABLED.test(reply.text) || toolMissing('release_lock', reply.text)) return { released: [] };
       throw new Error(`release_lock: ${reply.text.slice(0, 300)}`);
     }
     const body = reply.body as { released?: string[] };
@@ -139,7 +160,7 @@ export class LockClient {
   async releaseAllMine(token: string, projectId: string): Promise<{ released: string[] }> {
     const reply = await this.callTool(token, 'list_locks', { projectId, mine: true });
     if (reply.isError) {
-      if (NOT_ENABLED.test(reply.text)) return { released: [] };
+      if (NOT_ENABLED.test(reply.text) || toolMissing('list_locks', reply.text)) return { released: [] };
       throw new Error(`list_locks: ${reply.text.slice(0, 300)}`);
     }
     const body = reply.body as { enabled?: boolean; locks?: Array<{ id: string }> };

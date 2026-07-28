@@ -277,6 +277,57 @@ describe('LockClient under a bound run-agent token (RUN-177)', () => {
     ).rejects.toThrow(/lock mcp initialize → 401/);
   });
 
+  it('releases nothing, quietly — no kind is granted the release tools, so this is the NORMAL path', async () => {
+    // Not an edge case: `release_lock`/`list_locks` are deliberately on no kind's floor, because
+    // the agent shares the run's identity and would otherwise be able to drop the hard floor's own
+    // locks. The server releases on run settle, so the daemon's release is pure promptness — and
+    // warning on every single run would train people to ignore the log.
+    const fetchImpl = fakeMcp(
+      () => ({ isError: true, text: 'MCP error -32602: Tool list_locks not found' }),
+      { bound: true },
+    );
+    await expect(client(fetchImpl).releaseAllMine('run-token', 'prj_x')).resolves.toEqual({ released: [] });
+  });
+
+  it('the same holds for a direct release by id', async () => {
+    const fetchImpl = fakeMcp(
+      () => ({ isError: true, text: 'MCP error -32602: Tool release_lock not found' }),
+      { bound: true },
+    );
+    await expect(client(fetchImpl).release('run-token', 'prj_x', { lockIds: ['lk_1'] })).resolves.toEqual({
+      released: [],
+    });
+  });
+
+  it('matches the tool it CALLED, not any "not found" prose the server echoes back', async () => {
+    // `reply.text` can contain server prose about a path, and a lock path is attacker-adjacent
+    // input — an agent controls what it asks to lock. A loose /tool \w+ not found/ would let a
+    // path like `tool foo not found` turn a genuine release failure into a silent success.
+    const fetchImpl = fakeMcp(
+      () => ({
+        isError: true,
+        text: 'cannot release lock on path "tool foo not found[" — malformed pattern',
+      }),
+      { bound: true },
+    );
+    await expect(client(fetchImpl).release('run-token', 'prj_x', { lockIds: ['lk_1'] })).rejects.toThrow(
+      /release_lock/,
+    );
+  });
+
+  it('but a MISSING acquire tool still gates — a floor that cannot run must never read as "no locks needed"', async () => {
+    // The asymmetry is the point. On release, an ungranted tool means nothing is held. On
+    // acquire, it means the check did not happen — and treating that as success would fail open
+    // over exactly the paths the floor exists to guard.
+    const fetchImpl = fakeMcp(
+      () => ({ isError: true, text: 'MCP error -32602: Tool acquire_lock not found' }),
+      { bound: true },
+    );
+    await expect(
+      client(fetchImpl).acquire('run-token', { projectId: 'prj_x', paths: ['a'] }),
+    ).rejects.toThrow(/acquire_lock/);
+  });
+
   it('lets a locking-disabled project answer for itself: enabled=false, no conflicts, no gate', async () => {
     // The end-to-end shape of the live failure. prj_run has file locking OFF, so the floor had
     // nothing to check — but initialize threw before the project could say so, and two finished

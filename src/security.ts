@@ -150,6 +150,31 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     'resolve_comment',
     'attach_ref',
     'update_task',
+    // File locking (RUN-97..107, granted at RUN-177) — and ONLY the acquire half, deliberately.
+    //
+    // The daemon takes locks AS the run's agent: the reactive per-edit hook and the hard floor
+    // before landing both authenticate with the run's token. Without this the daemon is refused by
+    // a floor it declared itself, which is what gated two finished builds on the first live
+    // dispatch — the floor could not complete, reported `unchecked`, and failed runs that had done
+    // nothing wrong.
+    //
+    // `release_lock` and `list_locks` stay OUT, and the reason is the whole design. Since RUN-47
+    // the floor IS the advertised catalogue, so anything the daemon may call, the agent may call —
+    // they are one identity. Granting release would let the agent drop the very locks the hard
+    // floor took, mid-run, before landing: RUN-105 holds those locks THROUGH the
+    // rebase→verify→fast-forward precisely so a peer cannot take a file mid-merge, and an agent
+    // that can release them makes that guarantee something the agent may opt out of. The daemon
+    // loses nothing it needs — the server already releases a task-anchored run's locks when the
+    // run settles (`releaseLocksForTask`, "run settled: <outcome>"), on any status change off
+    // in_progress, and on claim TTL. Its own terminal release was always documented as
+    // promptness, never correctness; it now no-ops, and the server does the work.
+    //
+    // `check_locks` stays out because nothing in the daemon calls it on this path.
+    //
+    // What this does still hand a build agent is the ability to acquire broadly — `paths: ["**"]`
+    // would block cooperating peers for the run's life. That is unavoidable while daemon and agent
+    // share one identity, and it is bounded by run-settle and TTL rather than indefinite.
+    'acquire_lock',
   ],
   verify: [
     'set_agent_identity',
