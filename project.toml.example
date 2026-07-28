@@ -86,6 +86,8 @@ defaultBranch = "main"
 # Put tsc in `cmd`: vitest/esbuild do NOT catch type errors.
 [verify]
 cmd = "npm run typecheck && npm test"
+# timeoutSeconds = 600   # blank = this built-in default; a timeout GATES the run. A [verify]
+#                        # key — keep it up here, above [verify.agent], or it binds to nothing.
 #
 # [verify.agent]                 # the inline reviewer (all fields optional)
 # tool = "codex"                 # review on a DIFFERENT driver than the builder (RUN-70) —
@@ -106,7 +108,6 @@ cmd = "npm run typecheck && npm test"
 # worktree, under the run's budget, and holds NO Noriq credential — its whole output is its
 # report; the daemon parses the verdict and posts the findings. With [land], the reviewer
 # judges intent BEFORE landing; `cmd` still re-runs on the REBASED result (see below).
-# timeoutSeconds = 600   # default 600; null = the built-in default
 #
 # WHICH SHELL `cmd` RUNS UNDER (RUN-42)
 # Unset = the platform's own: `sh` on macOS/Linux, **cmd.exe on Windows**.
@@ -125,7 +126,8 @@ cmd = "npm run typecheck && npm test"
 # one behaviour everywhere. Git for Windows ships bash, and this daemon already
 # requires git — so `bash` is a safe pin in practice:
 #
-# shell = "bash"
+# shell = "bash"          # a [verify] key, like timeoutSeconds — it belongs above any
+#                         # [verify.agent] table you uncomment, or it binds to nothing.
 #
 # Not the default, because a pin that turns out to be absent fails the gate outright,
 # which is worse than cmd.exe handling the common case correctly.

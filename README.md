@@ -148,6 +148,13 @@ that command. It also tells you whether the repo sits under one of your scan roo
 the one thing you can't easily check yourself: a perfect marker outside them is never
 discovered, never dispatchable, and reports no error anywhere.
 
+The wizard has two tiers. The **quick** tier is the default: the essentials above (key, driver,
+verify command, the optional inline reviewer, a landing branch) and nothing else. `--advanced` —
+or a yes to the wizard's one trailing question, which is the same fork — adds the **advanced**
+tier: per-kind model/effort defaults, the `[land]` envelope beyond the branch, extra build
+allow/deny rules, and the default branch. Every advanced question defaults to exactly what the
+quick tier writes, so Enter all the way through changes nothing in the file.
+
 Auto-landing stays off unless you name a branch, and it never guesses one.
 [`project.toml.example`](project.toml.example) is the annotated reference for everything
 `init-project` doesn't ask about.

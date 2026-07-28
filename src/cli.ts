@@ -39,9 +39,11 @@ auth options:
   --device         Force the device-code flow — for a box with no browser (SSH, CI)
 
 init-project options:
-  --advanced       Also curate the advanced options (per-kind model/effort defaults, the
-                   [land] envelope, build allow/deny rules, the default branch);
-                   without it, one trailing question offers the same fork
+  --advanced       Start in the advanced tier: after the quick questions (key, driver, verify
+                   command, reviewer, landing branch), also curate per-kind model/effort
+                   defaults, the [land] envelope, build allow/deny rules, and the default
+                   branch. Without it the quick tier runs alone, and one trailing question
+                   offers the same fork
 
 Environment:
   NORIQ_TOKEN      A token to use as-is; overrides the stored credentials.
