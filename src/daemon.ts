@@ -1,29 +1,43 @@
-import type { AgentTool, RunKind, RunModelMix, RunnerConfig } from '@noriq-dev/shared';
+import type { AgentTool, ExecutionSpec, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
 import { NoriqClient } from './client';
+import { type ContinuableRun, ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
 import { resolveLandBranch } from './land';
+import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { openMergeRequest } from './merge-request';
 import { ParkedStore } from './parked';
 import { buildRegistration } from './registration';
+import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
-import { type RunReport, RunSupervisor } from './supervisor';
+import { type RunReport, RunSupervisor, type RunSupervisorDeps } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
 import { detectVcs } from './vcs/detect';
 import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
 import { PerforceBackend } from './vcs/perforce';
+import type { VcsBackend } from './vcs/types';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
-import { WsClient } from './ws-client';
+import { WsClient, type WsFactory } from './ws-client';
 
 /** How long shutdown waits for stopped runs to report a terminal status. */
 const SHUTDOWN_DRAIN_MS = 5_000;
+
+/**
+ * How often the daemon re-runs the orphan sweep (RUN-153).
+ *
+ * Long on purpose. This reclaims disk, never work: a leaked workspace holds either nothing or a
+ * copy of something already durable, so the cost of waiting is a directory sitting around. The
+ * sweep shells out to git per repo, and doing that every minute to catch a leak that happens on a
+ * lock refusal would spend far more than it saves.
+ */
+const ORPHAN_SWEEP_INTERVAL_MS = 30 * 60_000;
 
 /**
  * Is this report worth a `run.status` frame? Status transitions are the point, but a report
@@ -65,7 +79,7 @@ export function shouldForwardRunStatus(
 export function telemetryFrame(rep: Pick<RunReport, 'telemetry'>): {
   tokensUsed: number | null;
   usdSpent: number | null;
-  modelUsage: RunModelMix | null;
+  modelUsage: RunModelUsage | null;
 } {
   if (!rep.telemetry) return { tokensUsed: null, usdSpent: null, modelUsage: null };
   return {
@@ -84,6 +98,128 @@ export interface DaemonHandle {
 }
 
 /**
+ * The slice of the supervisor the daemon actually drives (RUN-173). Injected so a test can capture
+ * the wired-up `report` callback — the closure that owes the executed-spec record and must hold it
+ * until a frame carrying it actually leaves the socket — and exercise delivery/retention without a
+ * real run and its whole pipeline. `RunSupervisor` satisfies it; the return types widen to
+ * `Promise<unknown>` because the daemon fires these and never reads their result.
+ */
+export interface SupervisorLike {
+  supervise(run: Run): Promise<unknown>;
+  resume(runId: string, answer: string): Promise<unknown>;
+  expireStaleParks(): Promise<number>;
+}
+
+/**
+ * The predictive lock layer's scope source (RUN-130), extracted so it is TESTED rather than
+ * living as an untested lambda in the wiring below — the same reasoning that put
+ * `shouldForwardRunStatus` up here, and for the same reason: this whole layer was silently dead
+ * for want of one line.
+ *
+ * A continuation is the case that can honestly declare a write scope today. Its failed sitting
+ * recorded the paths it changed, and the run resuming that work will almost certainly touch them
+ * again — so taking them before it respawns is precisely the race RUN-103 was built to prevent.
+ * Anything else (a first sitting, a lost record, a backend with no `changedPaths`) yields null,
+ * and the layer no-ops exactly as it did while nothing was bound.
+ */
+export const continuationLockScope =
+  (store: { get(runId: string): Promise<ContinuableRun | null> }) =>
+  async (run: Run, spec: ExecutionSpec | null): Promise<string[] | null> => {
+    // The DECLARED scope first (RUN-142). Until now the predictive layer only ever had a
+    // continuation's `changedPaths` — what a previous sitting touched — which by definition does
+    // not exist the first time a task is attempted, so the layer has never held a lock on a first
+    // dispatch. A spec's `anticipatedFiles` is the first thing that says, before any work, which
+    // files this run intends to touch.
+    //
+    // UNION, not preference: a continued run's scope is what it declared PLUS what it already
+    // touched, because the previous sitting's edits are exactly what a second run must not land
+    // on top of, and a spec written before that sitting cannot know about them.
+    const prior = await store.get(run.id).catch(() => null);
+    const declared = spec?.anticipatedFiles.map((f) => f.path) ?? [];
+    const scope = [...new Set([...declared, ...(prior?.changedPaths ?? [])])];
+    return scope.length ? scope : null;
+  };
+
+/**
+ * The orphan sweep (RUN-153), run at start AND on a timer — extracted here for the same reason
+ * `continuationLockScope` is: this file's wiring is where a whole layer once sat dead and silent,
+ * and a sweep that never fires (or one that reaps a live run) fails exactly as quietly.
+ *
+ * What it removes: a workspace nothing will ever come back for. A lock refusal that deliberately
+ * KEEPS one holding work (RUN-130), and one kept because its `hasWork` probe merely errored
+ * (RUN-152) — the latter has no continuation record, so no later dispatch adopts it. Left alone
+ * those accumulate for the daemon's lifetime, which is the whole reason this runs on a timer.
+ *
+ * What it must never remove is the harder half, and it takes BOTH inputs. A live run's workspace
+ * is indistinguishable from a leaked one by inspection, and can be legitimately EMPTY (an agent
+ * that has not written a file yet) — so the reap's own work-bearing check cannot spare it, and
+ * `isActive` must. A parked or continuable run is worse: nothing is supervising it at all, so it
+ * is not active by definition, and it too can be pristine. Only `reserved` knows. "Every prior
+ * process is gone" makes a workspace unsupervised, not unwanted — which is why the startup sweep
+ * needs `reserved` just as much as the periodic one does, and gets it.
+ */
+export function orphanSweep(deps: {
+  repos: ReadonlyArray<{ root: string }>;
+  vcsFor: (root: string) => Pick<VcsBackend, 'reapOrphans'>;
+  /** Runs supervising RIGHT NOW. Live, not a snapshot — a resume can start mid-sweep. */
+  isActive: (runId: string) => boolean;
+  /**
+   * Runs nothing is supervising but something is HOLDING a workspace for: parked runs waiting on
+   * a human (RUN-30) and continuable failures a later dispatch adopts (RUN-91). These are the
+   * cases `active` cannot see and the reap's work-bearing check cannot save — a park can be
+   * pristine (a scope run that asked before writing), and a continuation kept after an uncertain
+   * probe may hold no diff at all. Both would otherwise be swept as leaks, and the resume that
+   * came back for them would find nothing there.
+   */
+  reserved: () => Promise<string[]>;
+  logger?: typeof defaultLogger;
+}): (periodic: boolean) => Promise<{ reaped: number; kept: string[] }> {
+  const log = deps.logger ?? defaultLogger;
+  return async (periodic) => {
+    let reaped = 0;
+    const kept: string[] = [];
+    // Resolved fresh per sweep, and FAIL CLOSED: a store we could not read is not a store with
+    // nothing in it. Sweeping on that assumption is how the reaper deletes the one worktree a
+    // parked run is waiting to come home to.
+    let held: Set<string>;
+    try {
+      held = new Set(await deps.reserved());
+    } catch (err) {
+      log.warn('skipping the orphan sweep — could not read what is being held', { err: String(err) });
+      return { reaped: 0, kept: [] };
+    }
+    const isOwned = (runId: string) => deps.isActive(runId) || held.has(runId);
+    for (const r of deps.repos) {
+      reaped += await deps
+        .vcsFor(r.root)
+        .reapOrphans(r.root, { onSkip: (p) => kept.push(p), isOwned })
+        .catch((err) => {
+          // One repo's git failing must not skip the rest, and must never take the daemon down.
+          log.warn('orphan sweep failed for a repo', { repo: r.root, err: String(err) });
+          return 0;
+        });
+    }
+    if (reaped) {
+      log.info(
+        periodic
+          ? `swept ${reaped} leaked worktree(s) no run will come back for`
+          : `reaped ${reaped} orphaned worktree(s) from a prior run`,
+      );
+    }
+    // Never silently discard an agent's output: a worktree with unsaved work outlives the reap,
+    // and the human is told where it is rather than left to find out later. Startup only — a
+    // legitimately kept workspace repeated every half hour is a warning operators learn to
+    // scroll past, which costs more than it buys.
+    if (kept.length && !periodic) {
+      log.warn(`kept ${kept.length} orphaned worktree(s) holding unsaved work — review or delete by hand`, {
+        worktrees: kept,
+      });
+    }
+    return { reaped, kept };
+  };
+}
+
+/**
  * Ties the pieces together: register over REST (RUN-9), then hold the long-lived
  * WS connection (RUN-10) that receives dispatches and makes idle-agent steering
  * possible. Actually spawning/supervising agent processes on run.assigned lands
@@ -94,16 +230,45 @@ export class Daemon {
   private readonly log: typeof defaultLogger;
   private readonly getToken: () => Promise<string>;
   private readonly refreshToken?: () => Promise<string>;
+  /** Injected seams (RUN-173) — real defaults in production, fakes in a `daemon.start()` harness.
+   *  Every one of these is how start() is driven end to end without a socket, HTTP, or ~/.noriq. */
+  private readonly connect?: WsFactory;
+  private readonly fetchImpl?: typeof fetch;
+  private readonly createSupervisor: (deps: RunSupervisorDeps) => SupervisorLike;
+  private readonly parkedStore?: ParkedStore;
+  private readonly continuableStore?: ContinuableStore;
+  private readonly stateFile?: string;
 
   constructor(
     private readonly config: RunnerConfig,
     /** A literal token, or a TokenSource-shaped provider that keeps itself fresh. */
     token: string | { get(): Promise<string>; refresh(): Promise<string> },
-    deps: { logger?: typeof defaultLogger } = {},
+    deps: {
+      logger?: typeof defaultLogger;
+      /** WS socket factory — the real `ws` by default, a fake that never dials in tests. */
+      connect?: WsFactory;
+      /** fetch for the REST client — global `fetch` by default, a fake in tests so start()
+       *  registers and reconciles without a real HTTP request. */
+      fetchImpl?: typeof fetch;
+      /** How the supervisor is built — `new RunSupervisor` by default. A test supplies a factory
+       *  that captures the wired-up `report` callback (the executed-spec retention closure). */
+      createSupervisor?: (deps: RunSupervisorDeps) => SupervisorLike;
+      /** On-disk stores and state file — default to ~/.noriq; a test points them at a temp dir so
+       *  a fully-driven start() writes nothing to the operator's home. */
+      parked?: ParkedStore;
+      continuable?: ContinuableStore;
+      stateFile?: string;
+    } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
     this.getToken = typeof token === 'string' ? async () => token : () => token.get();
     this.refreshToken = typeof token === 'string' ? undefined : () => token.refresh();
+    this.connect = deps.connect;
+    this.fetchImpl = deps.fetchImpl;
+    this.createSupervisor = deps.createSupervisor ?? ((d) => new RunSupervisor(d));
+    this.parkedStore = deps.parked;
+    this.continuableStore = deps.continuable;
+    this.stateFile = deps.stateFile;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -111,6 +276,7 @@ export class Daemon {
       server: this.config.server,
       token: () => this.getToken(),
       onUnauthorized: this.refreshToken,
+      fetchImpl: this.fetchImpl,
     });
     const repos = await discoverRepos(this.config.scanRoots);
     this.log.info(`discovered ${repos.length} repo(s)`, {
@@ -121,7 +287,11 @@ export class Daemon {
     // repo to its backend by DETECTION (RUN-60) — git by `.git` at the root, Diversion by the
     // dv registry, never a manifest field (a committed lie would travel). Git remains the
     // machine default; a repo the detector cannot place falls back to it, loudly.
-    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
+    // The Noriq lock view (RUN-98), shared across every backend: git delegates to it outright,
+    // Perforce/Diversion mirror their native locks into it. One instance — it holds a per-token
+    // MCP session cache — authenticating each call as the RUN's agent, not the daemon (RUN-97 §2).
+    const locks = new LockClient({ server: this.config.server });
+    const vcs = new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }), locks);
     const detections = await detectVcs(repos.map((r) => r.root));
     const backendFor = new Map<string, GitBackend | DiversionBackend | PerforceBackend>();
     for (const r of repos) {
@@ -130,45 +300,48 @@ export class Daemon {
         // One instance PER REPO, constructed once: it carries the repo id and the pool-of-1
         // lease queue — a per-run instance would silently disable the lease. One daemon per
         // machine is the operating assumption on this backend (the lease is in-process).
-        backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId }));
+        backendFor.set(r.root, new DiversionBackend({ repoId: d.repoId, locks }));
       } else if (d?.kind === 'perforce') {
         // Same per-repo, once-only rule: the pool-of-1 lease lives in the instance (RUN-52).
-        backendFor.set(r.root, new PerforceBackend());
+        backendFor.set(r.root, new PerforceBackend({ locks }));
       } else {
         backendFor.set(r.root, vcs);
       }
       this.log.info(`repo ${r.name} → ${d?.kind ?? 'git'}`, { root: r.root, why: d?.reason });
     }
 
-    // Crash-safe cleanup: a fresh start means every prior local process is gone,
-    // so any leftover noriq/run/* worktree is orphaned — reap it before we begin.
-    let reaped = 0;
-    const kept: string[] = [];
-    for (const r of repos) {
-      reaped += await (backendFor.get(r.root) ?? vcs).reapOrphans(r.root, {
-        onSkip: (p) => kept.push(p),
-      });
-    }
-    if (reaped) this.log.info(`reaped ${reaped} orphaned worktree(s) from a prior run`);
-    // Never silently discard an agent's output: a worktree with unsaved work outlives
-    // the reap, and the human is told where it is rather than left to find out later.
-    if (kept.length) {
-      this.log.warn(
-        `kept ${kept.length} orphaned worktree(s) holding unsaved work — review or delete by hand`,
-        {
-          worktrees: kept,
-        },
-      );
-    }
+    // Runs parked on a human (RUN-30). On disk, because that is the point: the answer may come
+    // tomorrow, and a daemon that forgot across a restart would strand both the run and the
+    // worktree holding its work.
+    const parked = this.parkedStore ?? new ParkedStore();
+    // Continuation state for a "continue a failed run" (RUN-91/92): a failed build's spend and
+    // adjudication ledger, kept on disk beside the worktree it belongs to so a re-dispatch of the
+    // same run id re-seeds instead of resetting. Same rationale as `parked` — survive a restart.
+    const continuable = this.continuableStore ?? new ContinuableStore();
 
-    const state = await loadState();
+    // Both stores are constructed HERE, before the first sweep, and not down beside the rest of
+    // the supervisor's deps where they used to live: the sweep must know what they are holding
+    // before it deletes anything. "Every prior process is gone" makes a workspace unsupervised,
+    // not unwanted — a persisted park or continuation is precisely a workspace whose owner is
+    // coming back, and it survives the restart on purpose.
+    const sweepOrphans = orphanSweep({
+      repos,
+      vcsFor: (root) => backendFor.get(root) ?? vcs,
+      // `this.active` is exact for a LIVE run: added before `supervise`, removed in its `finally`.
+      isActive: (runId) => this.active.has(runId),
+      reserved: async () => [...(await parked.list()).map((p) => p.run.id), ...(await continuable.runIds())],
+      logger: this.log,
+    });
+    await sweepOrphans(false);
+
+    const state = await loadState(this.stateFile);
     const tools = this.config.tools ?? detectTools();
     const registration = buildRegistration(
       { label: this.config.label, concurrency: this.config.concurrency, tools, runnerId: state.runnerId },
       repos,
     );
     const runner = await client.registerRunner(registration);
-    await saveState({ runnerId: runner.id });
+    await saveState({ runnerId: runner.id }, this.stateFile);
     this.log.info('registered with Noriq', {
       runnerId: runner.id,
       status: runner.status,
@@ -184,16 +357,17 @@ export class Daemon {
     // effect on the next dispatch instead of waiting for someone to restart the daemon.
     const manifests = new ManifestStore({ logger: this.log });
     for (const r of repos) manifests.seed(r.root, r.manifest);
-    // Runs parked on a human (RUN-30). On disk, because that is the point: the answer may come
-    // tomorrow, and a daemon that forgot across a restart would strand both the run and the
-    // worktree holding its work.
-    const parked = new ParkedStore();
     const held: { ws?: WsClient } = {};
     // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
     // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
     const lastRunStatus = new Map<string, string>();
+    /** The executed-spec record still owed to the server (RUN-172), per run — see the send below
+     *  for why a single fire-and-forget send was not enough. Cleared when a frame carrying it
+     *  actually goes out, and when the run ends, so a daemon does not hold one per run for its
+     *  whole life. */
+    const pendingSpec = new Map<string, ExecutionSpec>();
     const steering = new SteeringBridge({ logger: this.log });
-    const supervisor = new RunSupervisor({
+    const supervisor = this.createSupervisor({
       drivers: {
         claude: new ClaudeDriver({ logger: this.log }),
         codex: new CodexDriver({ logger: this.log }),
@@ -219,15 +393,34 @@ export class Daemon {
         //
         // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
         // say "verifying" without claiming the spend is zero.
-        if (rep.telemetry || rep.phase) {
+        // The executed-spec record is sent ONCE by the supervisor, when the spec resolves — and
+        // telemetry is fire-and-forget, so a socket that happens to be down at that moment would
+        // lose it permanently, with nothing to correct it the way a later tick corrects a dropped
+        // spend (RUN-172). Held until a frame actually goes out on a live socket. Re-sending is
+        // free: the server appends only when the spec differs from the last one it holds.
+        if (rep.executedSpec) pendingSpec.set(runId, rep.executedSpec);
+        const spec = pendingSpec.get(runId) ?? null;
+        if (rep.telemetry || rep.phase || spec) {
           // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
           // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
-          held.ws?.sendTelemetry(runId, {
-            ...telemetryFrame(rep),
-            logTail: rep.logTail ?? null,
-            phase: rep.phase ?? null,
-          });
+          if (held.ws) {
+            const left = held.ws.sendTelemetry(runId, {
+              ...telemetryFrame(rep),
+              logTail: rep.logTail ?? null,
+              phase: rep.phase ?? null,
+              // Rides THIS frame because recording what a run was briefed with is not a lifecycle
+              // transition — run.status has no running → running edge, so it would be rejected
+              // there and silently dropped.
+              executedSpec: spec,
+            });
+            // Clear the pending record ONLY once the frame actually LEFT the socket — that is what
+            // sendTelemetry's boolean reports. A down socket still sets `held.ws`, so keying the
+            // clear on its presence counted a dropped frame as a delivery and lost the record with
+            // nothing to correct it; retaining it lets the next live frame re-send (RUN-172/173).
+            if (spec && left) pendingSpec.delete(runId);
+          }
         }
+        if (rep.status === 'done' || rep.status === 'failed') pendingSpec.delete(runId);
         if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
           lastRunStatus.set(runId, rep.status);
           // agentId finally has a value to carry: the daemon created the identity, so it no
@@ -265,6 +458,19 @@ export class Daemon {
       // the daemon asks the row rather than trying to observe the call.
       getParkState: (runId) => client.getParkState(runId),
       parked,
+      continuable,
+      // The line whose absence made RUN-103's predictive layer dead code in production: the dep
+      // existed, the supervisor consumed it, and only tests ever supplied one. See its doc above.
+      resolveLockScope: continuationLockScope(continuable),
+      // A planned spec is written BACK to the task (RUN-140) — that is what makes planning an
+      // artifact a human can correct and a retry can reuse, rather than a thought inside one run's
+      // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
+      // feature that has never run.
+      saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+      // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
+      // third time the same lesson has been learned: a dep only tests supply is a feature that has
+      // never run.
+      repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
       steering,
       logger: this.log,
     });
@@ -280,6 +486,7 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
+      connect: this.connect,
       freeSlots: () => Math.max(0, this.config.concurrency - this.active.size),
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
@@ -346,6 +553,29 @@ export class Daemon {
       updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);
       updateTimer.unref();
     }
+
+    // The leak sweep (RUN-153). No config knob: the interval only decides how long a leaked
+    // directory sits on disk, and a default that holds beats a dial nobody tunes. `unref`'d for
+    // the same reason the update check is — disk tidying must never be why a daemon won't exit —
+    // and self-chained rather than `setInterval` so a slow sweep can never overlap itself.
+    let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopping = false;
+    // The sweep currently running, so shutdown can JOIN it. `clearTimeout` cancels the next one;
+    // it cannot cancel git subprocesses already in flight, and returning from `stop()` while a
+    // reaper is mid-`worktree remove` is how a shutdown races its own cleanup.
+    let sweepInFlight: Promise<unknown> = Promise.resolve();
+    const scheduleSweep = () => {
+      sweepTimer = setTimeout(() => {
+        if (stopping) return;
+        sweepInFlight = sweepOrphans(true)
+          .catch((err) => this.log.warn('orphan sweep failed', { err: String(err) }))
+          .then(() => {
+            if (!stopping) scheduleSweep();
+          });
+      }, ORPHAN_SWEEP_INTERVAL_MS);
+      sweepTimer.unref();
+    };
+    scheduleSweep();
 
     /**
      * Open a merge request for every plan that finished and still owes one (RUN-28).
@@ -483,6 +713,10 @@ export class Daemon {
       .catch((err) => this.log.warn('could not reconcile parked runs', { err: String(err) }));
 
     const stop = async (): Promise<void> => {
+      // FIRST, before anything that takes time: the drain below is seconds long, and a sweep that
+      // starts inside it would be reaping on behalf of a daemon that is already leaving.
+      stopping = true;
+      if (sweepTimer) clearTimeout(sweepTimer);
       // SIGTERM live agents BEFORE the socket closes. A spawned claude/codex isn't in the
       // daemon's teardown path, so exiting first orphans it: still editing the worktree,
       // still spending, with its only ceiling (the budget enforcer) dead.
@@ -505,6 +739,9 @@ export class Daemon {
       // definition: we are on our way out, and failing to announce it is not worth delaying
       // or failing the shutdown over. The server still reconciles a runner that never says it.
       if (updateTimer) clearInterval(updateTimer);
+      // Join a sweep that was already running when stop() was called — `clearTimeout` cancels the
+      // NEXT one, never git commands already in flight.
+      await sweepInFlight.catch(() => {});
       await client
         .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
         .catch((err) =>

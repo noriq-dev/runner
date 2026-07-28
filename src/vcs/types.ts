@@ -1,3 +1,5 @@
+import type { LockConflict, LockGrant } from '../lock-client';
+
 /**
  * The VCS seam (RUN-49): the nine outcomes the daemon needs from source control, named as
  * outcomes rather than git verbs. This is VCS-SPIKE.md §2 made real — the operation set was
@@ -105,6 +107,33 @@ export type PublishResult =
 export type ShareResult = { ok: true } | { ok: false; detail: string };
 
 /**
+ * What a lock op needs beyond the workspace (RUN-98): which project, whose identity holds the
+ * lock, the scope branch, and the task to auto-release against.
+ *
+ * `token` is the RUN's bound agent token (RUN-43), NOT the daemon's — so the daemon's
+ * predictive acquire and the in-agent hook's reactive acquire share ONE holder and never fight
+ * each other, and the server's auto-release-on-task-settle covers cleanup (RUN-97 §2).
+ */
+export interface LockContext {
+  projectId: string;
+  token: string;
+  /** Scope branch = the run's LANDING TARGET, not its throwaway worktree branch (RUN-97 §5).
+   *  null/absent → lock across all branches. */
+  branch?: string | null;
+  /** Link locks to the anchor task so they auto-release when it settles. */
+  taskId?: string | null;
+}
+
+/**
+ * The outcome of an acquire. `enabled:false` on an `ok:true` result means the project has file
+ * locking turned OFF — a no-op grant the caller proceeds past, distinct from a real grant. A
+ * conflict is all-or-nothing: nothing was taken, and `conflicts` names who to coordinate with.
+ */
+export type LockOutcome =
+  | { ok: true; enabled: boolean; locks: LockGrant[] }
+  | { ok: false; conflicts: LockConflict[] };
+
+/**
  * One VCS backend. Git today; Diversion (RUN-51) and Perforce (RUN-52) are the candidates the
  * shape was proven against on paper (VCS-SPIKE.md §3/§4) — pending the hands-on discoveries
  * (RUN-54/55) before either is built.
@@ -142,8 +171,21 @@ export interface VcsBackend {
    *  which is why this is not named `remove`. Safe to call twice. */
   dispose(ws: Workspace): Promise<void>;
 
-  /** Did this Run actually produce anything — saved or not? A no-op run must not reach verify:
-   *  a PASS over an empty tree would land the Run in review as a success with nothing in it. */
+  /**
+   * Did this Run actually produce anything — saved or not? A no-op run must not reach verify:
+   * a PASS over an empty tree would land the Run in review as a success with nothing in it.
+   *
+   * **`false` means "there is no work", never "the query failed"** (RUN-152). A backend that
+   * cannot tell must REJECT. Both callers act destructively on `false` — one disposes a workspace
+   * (git's dispose is `worktree remove --force` plus `branch -D` on a never-pushed branch), the
+   * other reports the run a no-op and reaps it — so answering "no work" on an error is a fail-open
+   * on a decision that destroys the only copy of a continuation's committed diff.
+   *
+   * A rejection rather than a third `'unknown'` result, deliberately: a string union would make
+   * the destructive branch reachable by accident, since `if (await hasWork(ws))` is truthy for
+   * `'none'` just as it is for `'unknown'`. A rejection cannot be ignored by omission, and it
+   * carries the underlying error for the log.
+   */
   hasWork(ws: Workspace): Promise<boolean>;
 
   /** Make the Run's work durable in the workspace, so it survives a reap and a human can review
@@ -201,6 +243,52 @@ export interface VcsBackend {
    * the local repo (the run id is in the branch name — no external state); a live backend's
    * registry is the server's, which is that backend's documented cost. Returns the count
    * actually removed.
+   *
+   * `isOwned` names the runs THIS daemon still holds, so the sweep can also run periodically
+   * (RUN-153) rather than only at startup. At startup it is never needed — every prior process is
+   * gone — but mid-flight a live run's workspace looks exactly like a leaked one and may be
+   * legitimately empty, so nothing else can tell them apart. Absent = the startup meaning.
    */
-  reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number>;
+  reapOrphans(
+    repoRoot: string,
+    opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
+  ): Promise<number>;
+
+  /**
+   * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and
+   * callers treat absence as "no enforcement here" — exactly how the supervisor treats its other
+   * optional deps (checkClaimable, getParkState). The three shipped backends implement it:
+   *  - git has no native lock → delegates to Noriq's lock primitive (the common case);
+   *  - Perforce/Diversion use their native locks and mirror into the Noriq view for a unified
+   *    dashboard.
+   * Uniform to the supervisor either way (RUN-97 §1).
+   */
+
+  /** Acquire exclusive locks over `paths` for this Run, all-or-nothing. A conflict returns
+   *  `{ ok:false, conflicts }` and takes nothing; a locking-disabled project returns
+   *  `{ ok:true, enabled:false }`. Re-acquiring one's own paths renews them. */
+  lock?(ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome>;
+
+  /** Release locks this Run holds — by grant id or by the exact paths taken. Safe with nothing
+   *  held (already auto-released on task settle, or expired). */
+  unlock?(ws: Workspace, sel: { lockIds?: string[]; paths?: string[] }, ctx: LockContext): Promise<void>;
+
+  /** Look without taking (read-only): who holds locks colliding with `paths` on the scope
+   *  branch, and which are already ours. The dispatch-time precheck (RUN-103) runs BEFORE any
+   *  lease, so this takes `repoRoot`, not a Workspace. */
+  queryLocks?(
+    repoRoot: string,
+    paths: string[],
+    ctx: LockContext,
+  ): Promise<{ enabled: boolean; conflicts: LockConflict[]; mine: LockGrant[] }>;
+
+  /** The repo-relative paths this Run touched (uncommitted + committed since its base) — the
+   *  hard-floor lock gate acquires them before the diff is made durable (RUN-102). Optional: a
+   *  backend that cannot enumerate them omits it and the floor is skipped for that backend. */
+  changedPaths?(ws: Workspace): Promise<string[]>;
+
+  /** Release EVERY lock this Run holds, on its terminal path (RUN-104) — prompt cleanup so peers
+   *  unblock sooner. For a task-anchored run the server also auto-releases on task settle, and
+   *  TTL covers a crash, so this is promptness, not correctness. */
+  releaseRunLocks?(ws: Workspace, ctx: LockContext): Promise<void>;
 }

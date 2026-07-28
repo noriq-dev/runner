@@ -114,9 +114,34 @@ describe('SteeringBridge', () => {
     expect(box.stops).toBe(1); // then stop → SIGTERM + supervisor teardown
   });
 
-  it('cancelRun on an unknown run is a no-op', async () => {
+  // A cancel arriving BETWEEN stages has nothing to stop and is still a cancel (RUN-165). Answering
+  // false and letting the next stage spawn is how an operator pays for a run they ended.
+  it('cancelRun with no live session still cancels the RUN', async () => {
     const bridge = new SteeringBridge();
-    expect(await bridge.cancelRun('nope')).toBe(false);
+    expect(await bridge.cancelRun('run_nobody')).toBe(true);
+    expect(bridge.isCancelled('run_nobody')).toBe(true);
+  });
+
+  it('a run nobody cancelled is not cancelled', () => {
+    expect(new SteeringBridge().isCancelled('run_1')).toBe(false);
+  });
+
+  // The fact has to outlive the session that was live when it arrived — that is the entire bug.
+  it('stays cancelled after the session it stopped is gone', async () => {
+    const bridge = new SteeringBridge();
+    const session = new FakeSession('run_1');
+    register(bridge, session);
+    await bridge.cancelRun('run_1');
+    bridge.unregister('run_1');
+    expect(bridge.isCancelled('run_1')).toBe(true);
+  });
+
+  // …but not forever: a long-lived daemon must not keep one entry per cancelled run for its life.
+  it('forgets a run once it is terminal', async () => {
+    const bridge = new SteeringBridge();
+    await bridge.cancelRun('run_1');
+    bridge.forget('run_1');
+    expect(bridge.isCancelled('run_1')).toBe(false);
   });
 });
 

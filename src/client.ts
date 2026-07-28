@@ -1,3 +1,4 @@
+import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
@@ -6,6 +7,31 @@ export interface TaskBrief {
   key: string;
   title: string;
   body: string | null;
+  /**
+   * What this task was commissioned with (RUN-134…139). Null = nobody wrote one, which is every
+   * task before the contract grew this and plenty after.
+   */
+  executionSpec: ExecutionSpec | null;
+  /**
+   * The server holds a spec it could not parse (RUN-135). NOT the same as having none: absence
+   * reads as "nobody planned this", and something that plans would then write over it. Carried so
+   * the daemon can say so rather than brief an agent as if the task were unplanned.
+   */
+  executionSpecUnreadable: boolean;
+}
+
+/** Parse a wire spec at the boundary. Absent → no spec; present but unparseable → flagged, never
+ *  silently absent (RUN-135's distinction, enforced on this side of the wire too). */
+function readSpec(
+  raw: unknown,
+  serverSaidUnreadable: boolean,
+): Pick<TaskBrief, 'executionSpec' | 'executionSpecUnreadable'> {
+  if (serverSaidUnreadable) return { executionSpec: null, executionSpecUnreadable: true };
+  if (raw == null) return { executionSpec: null, executionSpecUnreadable: false };
+  const parsed = ExecutionSpec.safeParse(raw);
+  return parsed.success
+    ? { executionSpec: parsed.data, executionSpecUnreadable: false }
+    : { executionSpec: null, executionSpecUnreadable: true };
 }
 
 /**
@@ -20,7 +46,12 @@ export function parseMcpText(raw: string): unknown {
     error?: { message?: string };
   };
   if (envelope.error) throw new Error(envelope.error.message ?? 'mcp error');
+  // A TOOL-level failure is an HTTP 200 with `isError: true` and the message in the text block —
+  // only a PROTOCOL failure lands in `envelope.error`. Reading the text and ignoring the flag made
+  // every refusal (maintenance mode, an authorization refusal, a validation error) look like a
+  // successful call that returned a string, so a write that never happened reported as done.
   const text = envelope.result?.content?.find((c) => c.type === 'text')?.text;
+  if (envelope.result?.isError) throw new Error(text ?? 'mcp tool error');
   if (text == null) return null;
   try {
     return JSON.parse(text);
@@ -215,8 +246,16 @@ export class NoriqClient {
     });
   }
 
-  /** The daemon's live MCP session id (RUN-73). Null until the first call initializes. */
+  /**
+   * The daemon's live MCP session id (RUN-73), and whether the handshake has happened at all.
+   *
+   * Two fields because they answer different questions (RUN-177): a BOUND token is issued no
+   * session id, so `null` is a legitimate post-handshake state and cannot also mean "not yet
+   * initialized" — collapsing them re-handshakes on every call. The daemon's own token is
+   * unbound today and always gets an id; this holds the invariant for whoever passes a bound one.
+   */
   private mcpSessionId: string | null = null;
+  private mcpInitialized = false;
 
   private async mcpHeaders(): Promise<Record<string, string>> {
     return {
@@ -233,7 +272,7 @@ export class NoriqClient {
    * every gate comment (verify failure, reviewer rejection, land failure) silently never
    * posted. The session id rides the `mcp-session-id` response header.
    */
-  private async mcpInitialize(): Promise<string> {
+  private async mcpInitialize(): Promise<string | null> {
     const headers = await this.mcpHeaders();
     const res = await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
@@ -251,20 +290,21 @@ export class NoriqClient {
     });
     const sid = res.headers.get('mcp-session-id');
     const raw = await res.text();
-    if (!res.ok || !sid) {
-      throw new Error(
-        `mcp initialize → ${res.status}${sid ? '' : ' (no mcp-session-id header)'}: ${raw.slice(0, 200)}`,
-      );
+    // A missing session id is an ANSWER — the token is bound and needs none — so only a non-2xx
+    // is fatal (RUN-177).
+    if (!res.ok) {
+      throw new Error(`mcp initialize → ${res.status}: ${raw.slice(0, 200)}`);
     }
     // The spec's follow-up; some transports won't serve requests until it arrives.
     await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
-      headers: { ...headers, 'mcp-session-id': sid },
+      headers: { ...headers, ...(sid ? { 'mcp-session-id': sid } : {}) },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
     }).catch(() => {
       /* best-effort — the tool call below is the real probe */
     });
     this.mcpSessionId = sid;
+    this.mcpInitialized = true;
     return sid;
   }
 
@@ -273,10 +313,10 @@ export class NoriqClient {
    *  lazily and re-initializes ONCE on a session the server no longer knows — worker
    *  isolates recycle sessions at will, so the retry is load-bearing, not polish. */
   private async mcpCall(name: string, args: Record<string, unknown>): Promise<unknown> {
-    const attempt = async (sid: string): Promise<{ res: Response; raw: string }> => {
+    const attempt = async (sid: string | null): Promise<{ res: Response; raw: string }> => {
       const res = await this.fetchImpl(`${this.base}/mcp`, {
         method: 'POST',
-        headers: { ...(await this.mcpHeaders()), 'mcp-session-id': sid },
+        headers: { ...(await this.mcpHeaders()), ...(sid ? { 'mcp-session-id': sid } : {}) },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 1,
@@ -286,10 +326,14 @@ export class NoriqClient {
       });
       return { res, raw: await res.text() };
     };
-    let { res, raw } = await attempt(this.mcpSessionId ?? (await this.mcpInitialize()));
-    if (res.status === 400 || res.status === 404) {
+    const sid = this.mcpInitialized ? this.mcpSessionId : await this.mcpInitialize();
+    let { res, raw } = await attempt(sid);
+    // Only a SESSION can go stale, so a bound token (no session id) skips the retry — a 400/404
+    // there is the server's real answer, not a recycled isolate.
+    if (sid !== null && (res.status === 400 || res.status === 404)) {
       // The session died with its isolate (or expired). One fresh handshake, one retry.
       this.mcpSessionId = null;
+      this.mcpInitialized = false;
       ({ res, raw } = await attempt(await this.mcpInitialize()));
     }
     if (!res.ok) throw new Error(`${name} → ${res.status}: ${raw.slice(0, 300)}`);
@@ -305,10 +349,43 @@ export class NoriqClient {
   /** An anchor task's human-readable content, so the prompt can inline it instead of
    *  handing the agent an opaque id it has to go look up. */
   async getTask(taskId: string): Promise<TaskBrief | null> {
-    const out = (await this.mcpCall('get_task', { taskId })) as { task?: Partial<TaskBrief> } | null;
+    const out = (await this.mcpCall('get_task', { taskId })) as {
+      task?: Partial<TaskBrief> & { executionSpec?: unknown; executionSpecUnreadable?: unknown };
+    } | null;
     const t = out?.task;
     if (!t?.key || !t?.title) return null;
-    return { key: t.key, title: t.title, body: t.body ?? null };
+    return {
+      key: t.key,
+      title: t.title,
+      body: t.body ?? null,
+      // Parsed through the contract rather than trusted: this arrives from a server the daemon
+      // does not control, and the whole point of a vendored schema is that the wire is checked at
+      // the boundary. A spec that does not parse is dropped to null and FLAGGED — a server on a
+      // newer contract than this daemon is exactly the case where silently reporting "no spec"
+      // would let a planner overwrite a real one.
+      ...readSpec(t.executionSpec, t.executionSpecUnreadable === true),
+    };
+  }
+
+  /**
+   * Write a synthesized execution spec back onto the task (RUN-140).
+   *
+   * The point of planning in a separate context is that the plan becomes an ARTIFACT — visible in
+   * the dashboard, correctable by a human before the build acts on it, and reused by a retry
+   * instead of re-derived. A spec that only ever existed inside one run's prompt would have cost
+   * the tokens and bought none of that.
+   *
+   * Re-reads the task first and REFUSES to overwrite a spec that is there now. The decision to
+   * plan was made before a model call that takes minutes, and a human editing the task in that
+   * window is not a race worth losing — the dashboard exists so they can (RUN-137). Not atomic,
+   * and it is not pretending to be: it closes the minutes-wide window, not the milliseconds-wide
+   * one, and the server-side compare-and-set that would close both is a contract change.
+   */
+  async setExecutionSpec(projectId: string, taskId: string, spec: ExecutionSpec): Promise<boolean> {
+    const current = await this.getTask(taskId).catch(() => null);
+    if (current && (hasExecutionSpec(current.executionSpec) || current.executionSpecUnreadable)) return false;
+    await this.mcpCall('update_task', { projectId, taskId, executionSpec: spec });
+    return true;
   }
 
   /**

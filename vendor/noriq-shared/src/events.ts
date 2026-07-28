@@ -15,6 +15,12 @@ export const EventVerb = z.enum([
   'task.created',
   'task.updated',
   'task.status_changed',
+  // The execution SPEC changed (RUN-162), distinguished from `task.updated` on purpose: a spec is
+  // the contract a build is judged against, so "somebody edited this task" and "somebody moved the
+  // goalposts" are different facts and a reviewer needs to be able to see the second one without
+  // reading every edit. Carries a before/after summary, never the specs themselves — the event log
+  // is a record of what happened, not a second copy of the data.
+  'task.spec_changed',
   'task.claimed',
   'task.released',
   'task.claim_expired',

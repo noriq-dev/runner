@@ -70,6 +70,37 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
     expect(noriqToolNamesFor('build')).not.toContain('create_plan');
   });
 
+  it('a build can TAKE a lock, because the daemon takes them as the run (RUN-177)', () => {
+    // The reactive per-edit hook and the hard floor before landing both authenticate with the
+    // RUN's token. Omitting this made the daemon refuse itself: the floor could not complete,
+    // reported `unchecked`, and failed two builds that had done nothing wrong.
+    expect(noriqToolNamesFor('build')).toContain('acquire_lock');
+  });
+
+  it('but NO kind may release one — the agent shares the run’s identity (RUN-177)', () => {
+    // The load-bearing half. Since RUN-47 the floor IS the catalogue, so anything the daemon may
+    // call the agent may call. Granting release would let the agent drop the hard floor's own
+    // locks mid-run, before landing — and RUN-105 holds them THROUGH the rebase→verify→
+    // fast-forward precisely so a peer cannot take a file mid-merge. The guarantee has to be
+    // something the agent cannot opt out of, so the tool is simply absent.
+    //
+    // The daemon loses nothing it needs: the server releases a task-anchored run's locks on
+    // settle, on any status change off in_progress, and on claim TTL.
+    for (const kind of KINDS) {
+      expect(noriqToolNamesFor(kind), kind).not.toContain('release_lock');
+      expect(noriqToolNamesFor(kind), kind).not.toContain('list_locks');
+    }
+  });
+
+  it('the kinds that never write take no locks either', () => {
+    // Locks exist to stop two writers colliding. A posture that cannot edit has nothing to
+    // reserve, and the floor rations authority to what the job needs.
+    for (const kind of ['scope', 'verify'] as RunKind[]) {
+      expect(noriqToolNamesFor(kind), kind).not.toContain('acquire_lock');
+      expect(noriqToolNamesFor(kind), kind).not.toContain('check_locks');
+    }
+  });
+
   it('scope can TEND the plan it mints, but not mint claimable work outside the gate (RUN-69)', () => {
     const scope = noriqToolNamesFor('scope');
     // A live scope run promised to cut its plan's artifact phase-edges, found the floor said

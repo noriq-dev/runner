@@ -82,6 +82,36 @@ describe('WorktreeManager (real git)', () => {
     expect(reaped).toBe(before.length);
     expect(await wm.listManaged(repo)).toHaveLength(0);
   });
+
+  // RUN-153: the same reap has to run PERIODICALLY, and mid-flight a live run's worktree looks
+  // exactly like an orphan — it may be pristine (an agent that has not written yet), so the
+  // work-bearing check cannot spare it either. Only the daemon knows, so it has to be asked.
+  it('reapOrphans spares a worktree the daemon still owns, empty or not', async () => {
+    const mine = await wm.create(repo, 'runLive'); // pristine — reapable on every other rule
+    const leaked = await wm.create(repo, 'runLeaked');
+    const reaped = await wm.reapOrphans(repo, { isOwned: (id) => id === 'runLive' });
+
+    expect(reaped).toBe(1);
+    expect((await wm.listManaged(repo)).map((w) => w.runId)).toEqual(['runLive']);
+    expect(existsSync(leaked.path)).toBe(false);
+    await wm.remove(mine);
+  });
+
+  // Ownership is asked TWICE, because several async git calls run between the two. A parked run
+  // resumed inside that window is added to the daemon's live set before it touches its worktree,
+  // so only the second question can see it — and the first would already have condemned it.
+  it('re-asks ownership immediately before deleting, so a resume mid-sweep is safe', async () => {
+    const wt = await wm.create(repo, 'runResumed');
+    let asked = 0;
+    const reaped = await wm.reapOrphans(repo, {
+      // Unowned on the way in, owned by the time the delete is due — the resume landed mid-sweep.
+      isOwned: () => ++asked > 1,
+    });
+
+    expect(reaped).toBe(0);
+    expect(existsSync(wt.path)).toBe(true);
+    await wm.remove(wt);
+  });
 });
 
 describe('unsaved work survives (real git)', () => {
@@ -107,10 +137,178 @@ describe('unsaved work survives (real git)', () => {
     await wm.remove(wt);
   });
 
+  // RUN-152. `false` from hasChanges is acted on DESTRUCTIVELY — the lock-refusal guard disposes
+  // the workspace (`worktree remove --force` + `branch -D` on a never-pushed branch) and the
+  // no-changes gate reaps it. Substituting '0' for a failed `rev-list` made "there is no work" and
+  // "git could not be asked" the same answer, so a transient failure on an ADOPTED continuation
+  // could destroy the prior sitting's committed diff. The distinction has to survive in the type.
+  describe('hasChanges cannot answer "no work" for "could not tell"', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('rejects when rev-list fails, rather than reporting an empty worktree', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: '', stderr: '' }; // clean tree, so it asks rev-list
+        throw new Error('fatal: bad object base');
+      });
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/bad object/);
+    });
+
+    // `Number('')` is 0, so an empty answer took the same fail-open by a shorter route.
+    it('rejects when rev-list answers with something that is not a count', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status' ? { stdout: '', stderr: '' } : { stdout: '\n', stderr: '' },
+      );
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/no usable answer/);
+    });
+
+    // `git rev-list --count ..HEAD` is `HEAD..HEAD` — a confident zero with no error to catch.
+    it('rejects when there is no base to measure against', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      await expect(wm.hasChanges({ path: '/wt/run_1', baseSha: '' })).rejects.toThrow(/no base commit/);
+    });
+
+    // `base..HEAD` measures what HEAD POINTS AT. Detached onto the base, a run branch full of
+    // commits measures as zero — and that zero is what `branch -D` would act on.
+    it('rejects when HEAD is detached rather than calling the branch empty', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: '', stderr: '' };
+        if (args[0] === 'rev-list') return { stdout: '0\n', stderr: '' };
+        throw new Error('fatal: ref HEAD is not a symbolic ref'); // git's own detached-HEAD exit
+      });
+      await expect(wm.hasChanges(wt)).rejects.toThrow(/symbolic ref/);
+    });
+
+    it('still answers false for a genuinely empty worktree', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'rev-list' ? { stdout: '0\n', stderr: '' } : { stdout: '', stderr: '' },
+      );
+      expect(await wm.hasChanges(wt)).toBe(false);
+    });
+  });
+
   it('is a no-op when the agent already committed', async () => {
     const wt = await wm.create(repo, 'noopCommit');
     expect(await wm.commitWork(wt, 'nothing to save')).toBe(false);
     await wm.remove(wt);
+  });
+
+  it('changedPaths lists BOTH uncommitted and committed-since-base files (the hard-floor set, RUN-102)', async () => {
+    const wt = await wm.create(repo, 'changedRun');
+    // One committed change…
+    await writeFile(path.join(wt.path, 'committed.ts'), 'export const c = 1;\n');
+    await wm.commitWork(wt, 'noriq run changedRun: committed work');
+    // …and one still in the working tree.
+    await writeFile(path.join(wt.path, 'dirty.ts'), 'export const d = 2;\n');
+
+    const paths = (await wm.changedPaths(wt)).sort();
+    expect(paths).toEqual(['committed.ts', 'dirty.ts']);
+    await wm.remove(wt);
+  });
+
+  it('changedPaths is empty for a run that touched nothing', async () => {
+    const wt = await wm.create(repo, 'untouchedRun');
+    expect(await wm.changedPaths(wt)).toEqual([]);
+    await wm.remove(wt);
+  });
+
+  // RUN-156. `[]` from here means "this run changed nothing", and the hard lock floor reads that
+  // as nothing to lock — a PASS. Both probes used to swallow their errors, so a git failure made
+  // the floor a silent no-op that reported success; for a driver with no in-process hook that was
+  // the run's ONLY acquisition, so a build could land over a path a peer holds and no line
+  // anywhere would say the check never ran.
+  describe('changedPaths cannot answer "nothing changed" for "could not tell"', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('rejects when the working-tree probe fails', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') throw new Error('fatal: not a git repository');
+        return { stdout: '', stderr: '' };
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/not a git repository/);
+    });
+
+    // A PARTIAL answer is refused too: locking the paths one probe managed to report looks exactly
+    // like a floor that ran, while everything the other would have named goes unlocked.
+    it('rejects when the committed probe fails, rather than reporting a partial set', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'status') return { stdout: ' M src/a.ts\0', stderr: '' };
+        throw new Error('fatal: bad object base');
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/bad object/);
+    });
+
+    // `..HEAD` is `HEAD..HEAD` to git — a confident zero paths, with no error to catch. The floor
+    // reads zero paths as nothing to lock, which is a pass.
+    it('rejects when there is no base to measure against', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      await expect(wm.changedPaths({ path: '/wt/run_1', baseSha: '' })).rejects.toThrow(/no base commit/);
+    });
+
+    // Detached at the base, a run branch full of commits reports no changed paths — and it is that
+    // BRANCH that lands, so the floor would check an empty tree and publish the unchecked branch.
+    it('rejects an empty answer from a detached HEAD rather than calling it "changed nothing"', async () => {
+      const wm = withGit(async (args) => {
+        if (args[0] === 'symbolic-ref') throw new Error('fatal: ref HEAD is not a symbolic ref');
+        return { stdout: '', stderr: '' };
+      });
+      await expect(wm.changedPaths(wt)).rejects.toThrow(/symbolic ref/);
+    });
+
+    it('still answers [] for a run that genuinely changed nothing', async () => {
+      const wm = withGit(async () => ({ stdout: '', stderr: '' }));
+      expect(await wm.changedPaths(wt)).toEqual([]);
+    });
+  });
+
+  // Git's human output C-QUOTES anything non-ASCII under the default core.quotePath, so a floor
+  // reading it locks a path that does not exist and leaves the real one free — a silent under-lock
+  // wearing the appearance of a floor that ran. `-z` emits raw bytes, NUL-separated.
+  describe('changedPaths reads paths git can round-trip, not git’s display form', () => {
+    const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+      new WorktreeManager({ baseDir: base, git });
+    const wt = { path: '/wt/run_1', baseSha: 'base' };
+
+    it('asks both probes for -z output', async () => {
+      const calls: string[][] = [];
+      const wm = withGit(async (args) => {
+        calls.push(args);
+        return { stdout: 'x.ts\0', stderr: '' };
+      });
+      await wm.changedPaths(wt);
+      expect(calls.find((a) => a[0] === 'status')).toContain('-z');
+      expect(calls.find((a) => a[0] === 'diff')).toContain('-z');
+    });
+
+    it('keeps a non-ASCII filename intact instead of its escaped spelling', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status'
+          ? { stdout: ' M src/café.ts\0', stderr: '' }
+          : { stdout: 'src/naïve.ts\0', stderr: '' },
+      );
+      expect((await wm.changedPaths(wt)).sort()).toEqual(['src/café.ts', 'src/naïve.ts']);
+    });
+
+    // In -z a rename is TWO fields, destination first. Reading the source as its own entry would
+    // mangle the entry after it — so it is consumed, not parsed.
+    it('takes a rename’s destination and does not mistake its source for the next entry', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status'
+          ? { stdout: 'R  src/new.ts\0src/old.ts\0 M src/after.ts\0', stderr: '' }
+          : { stdout: '', stderr: '' },
+      );
+      expect((await wm.changedPaths(wt)).sort()).toEqual(['src/after.ts', 'src/new.ts']);
+    });
+
+    it('does not split a filename that happens to contain " -> "', async () => {
+      const wm = withGit(async (args) =>
+        args[0] === 'status' ? { stdout: ' M src/a -> b.ts\0', stderr: '' } : { stdout: '', stderr: '' },
+      );
+      expect(await wm.changedPaths(wt)).toEqual(['src/a -> b.ts']);
+    });
   });
 
   it('NEVER reaps a worktree holding uncommitted work', async () => {
@@ -465,5 +663,77 @@ describe('rebaseInProgress survives a Windows git path (RUN-42)', () => {
       },
     });
     expect(await wm.rebaseInProgress({ path: '/wt/run_1' })).toBe(true);
+  });
+});
+
+describe('continue a failed run adopts the kept worktree (RUN-91)', () => {
+  it('re-creating a run id whose branch exists reuses the worktree and its committed work', async () => {
+    // First attempt: an agent commits work, then the run "fails" — the daemon keeps the worktree.
+    const first = await wm.create(repo, 'continueRun');
+    await writeFile(path.join(first.path, 'attempt.ts'), 'export const tries = 1;\n');
+    await wm.commitWork(first, 'noriq run continueRun: first attempt');
+    const { stdout: firstHead } = await git(['rev-parse', 'HEAD'], first.path);
+
+    // The continue dispatch (PLNR-180) re-sends the SAME run id. create() must ADOPT, never throw
+    // on the existing branch, and never re-fork away the committed work.
+    const again = await wm.create(repo, 'continueRun');
+    expect(again.branch).toBe(first.branch);
+    expect(samePath(again.path, first.path)).toBe(true);
+    expect(existsSync(path.join(again.path, 'attempt.ts'))).toBe(true);
+    const { stdout: againHead } = await git(['rev-parse', 'HEAD'], again.path);
+    expect(againHead.trim()).toBe(firstHead.trim()); // same tip — resumed, not restarted
+
+    // baseSha is the fork point (merge-base with the target), so the accumulated diff still counts.
+    const { stdout: fork } = await git(['merge-base', again.branch, 'main'], repo);
+    expect(again.baseSha).toBe(fork.trim());
+    expect(await wm.hasChanges(again)).toBe(true);
+
+    await wm.remove(again);
+  });
+
+  it("adopt recognizes a registered worktree despite git's other-slash spelling (RUN-95)", async () => {
+    // The Windows CI failure: the daemon builds `C:\Users\RUNNER~1\…` while porcelain prints
+    // `C:/Users/…`, so a verbatim compare said "unregistered" and `worktree add` collided with
+    // the checkout it should have adopted. Driven through an injected git that reports the
+    // OPPOSITE slash spelling of the computed path, so the split reproduces on every OS; the
+    // real-git adopt path is covered by the tests around this one.
+    const dir = path.join(base, `${path.basename(repo)}-continueWin`);
+    const flipped = dir.includes('\\') ? dir.replace(/\\/g, '/') : dir.replace(/\//g, '\\');
+    const calls: string[][] = [];
+    const fake = new WorktreeManager({
+      baseDir: base,
+      git: async (args: string[]) => {
+        calls.push(args);
+        if (args[0] === 'worktree' && args[1] === 'list')
+          return {
+            stdout: `worktree ${flipped}\nHEAD abc\nbranch refs/heads/${runBranch('continueWin')}\n`,
+            stderr: '',
+          };
+        if (args[0] === 'merge-base') return { stdout: 'base\n', stderr: '' };
+        if (args[0] === 'worktree' && args[1] === 'add')
+          throw new Error('adopt must not re-add a registered worktree');
+        return { stdout: '', stderr: '' }; // rev-parse --verify: branch "exists"
+      },
+    });
+    const adopted = await fake.create(repo, 'continueWin');
+    expect(adopted.branch).toBe(runBranch('continueWin'));
+    expect(adopted.baseSha).toBe('base');
+    expect(calls.some((a) => a[0] === 'worktree' && a[1] === 'add')).toBe(false);
+  });
+
+  it('re-attaches a worktree when the branch was kept but its checkout was pruned', async () => {
+    const first = await wm.create(repo, 'continuePruned');
+    await writeFile(path.join(first.path, 'work.ts'), 'export const y = 2;\n');
+    await wm.commitWork(first, 'noriq run continuePruned: work');
+    // A reap that spared committed work can leave the branch while pruning the checkout dir.
+    await git(['worktree', 'remove', '--force', first.path], repo);
+    expect(existsSync(first.path)).toBe(false);
+    expect((await git(['branch', '--list', first.branch], repo)).stdout.trim()).not.toBe('');
+
+    const again = await wm.create(repo, 'continuePruned');
+    expect(samePath(again.path, first.path)).toBe(true);
+    expect(existsSync(path.join(again.path, 'work.ts'))).toBe(true); // re-attached to the branch tip
+
+    await wm.remove(again);
   });
 });

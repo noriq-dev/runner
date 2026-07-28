@@ -10,6 +10,9 @@ export interface RunLogSegment {
   seq: number;
   role: RunLogRole;
   round: number | null;
+  /** Which step of a decomposed run said it (RUN-150). Null for an undecomposed run, which is
+   *  most of them, and for anything the parent's own gates say after the chain ends. */
+  step: string | null;
   text: string;
   at: string;
 }
@@ -28,16 +31,55 @@ const FLUSH_AFTER_MS = 2500;
  */
 export class RunTranscript {
   private seq = 0;
-  private buf: { role: RunLogRole; round: number | null; text: string } | null = null;
+  private buf: { role: RunLogRole; round: number | null; step: string | null; text: string } | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly sink: (segments: RunLogSegment[]) => void) {}
 
+  /**
+   * The next seq this transcript will hand out — what a continuation has to resume FROM (RUN-183).
+   *
+   * The server stores segments under `PRIMARY KEY (run_id, seq)` and writes them with `INSERT OR
+   * IGNORE`, which is what makes redelivery after a reconnect a no-op. A second sitting of the
+   * same run that restarts its numbering at 0 therefore collides with every row the first sitting
+   * wrote, and its transcript is discarded in silence — measured live at 49 minutes of work and
+   * zero recorded segments.
+   */
+  nextSeq(): number {
+    return this.seq;
+  }
+
+  /**
+   * Continue the numbering from a previous sitting (RUN-183).
+   *
+   * Refuses once anything has been emitted: a transcript that has already spoken has a stream a
+   * reader is following, and moving its numbering underneath them would reorder what they see.
+   * Idempotent and safe to call before the first segment, which is the only moment it applies.
+   */
+  seedFrom(seq: number): void {
+    // Only before anything has been EMITTED. Buffered text has not been sent yet, so it is no
+    // obstacle — it will simply go out under the resumed numbering, which is what we want.
+    // Refusing after the fact matters: a transcript that has already spoken has a reader following
+    // it, and moving its numbering underneath them would reorder what they see.
+    if (this.seq === 0 && seq > 0) this.seq = seq;
+  }
+
   /** Streamed output from a session. Buffered; consecutive same-voice text coalesces. */
-  text(role: RunLogRole, text: string, round: number | null = null): void {
+  /**
+   * Streamed output from a session. Buffered; consecutive same-voice text coalesces.
+   *
+   * `step` (RUN-150) travels WITH the call rather than living on this object, and that is not a
+   * style choice — a mutable "current step" is correct only while exactly one session speaks at a
+   * time. The moment steps overlap, changing it for one would relabel the other's output, and the
+   * bug would be a transcript that reads plausibly and attributes the wrong work to the wrong step.
+   * The session already knows which step it is; asking it costs one argument.
+   */
+  text(role: RunLogRole, text: string, round: number | null = null, step: string | null = null): void {
     if (!text) return;
-    if (this.buf && (this.buf.role !== role || this.buf.round !== round)) this.flush();
-    if (!this.buf) this.buf = { role, round, text: '' };
+    if (this.buf && (this.buf.role !== role || this.buf.round !== round || this.buf.step !== step)) {
+      this.flush();
+    }
+    if (!this.buf) this.buf = { role, round, step, text: '' };
     this.buf.text += text;
     if (this.buf.text.length >= SEGMENT_TEXT_CAP) this.flush();
     else if (!this.timer) {
@@ -48,9 +90,9 @@ export class RunTranscript {
 
   /** A daemon milestone ("verify command failed", "reviewer verdict: FAIL round 1", …).
    *  Flushes whatever voice was speaking first, so the ordering a human reads is real. */
-  milestone(text: string): void {
+  milestone(text: string, step: string | null = null): void {
     this.flush();
-    this.emit([{ role: 'system', round: null, text }]);
+    this.emit([{ role: 'system', round: null, step, text }]);
   }
 
   /** Push everything buffered out now (voice switch, session end, terminal report). */
@@ -60,12 +102,12 @@ export class RunTranscript {
       this.timer = undefined;
     }
     if (!this.buf) return;
-    const { role, round, text } = this.buf;
+    const { role, round, step, text } = this.buf;
     this.buf = null;
     // A single oversized buffer becomes several segments, never a rejected frame.
     const parts: string[] = [];
     for (let i = 0; i < text.length; i += SEGMENT_TEXT_CAP) parts.push(text.slice(i, i + SEGMENT_TEXT_CAP));
-    this.emit(parts.map((p) => ({ role, round, text: p })));
+    this.emit(parts.map((p) => ({ role, round, step, text: p })));
   }
 
   /** Terminal: flush and stop the timer. The instance may still be reused by an in-process
@@ -74,7 +116,9 @@ export class RunTranscript {
     this.flush();
   }
 
-  private emit(items: Array<{ role: RunLogRole; round: number | null; text: string }>): void {
+  private emit(
+    items: Array<{ role: RunLogRole; round: number | null; step: string | null; text: string }>,
+  ): void {
     if (!items.length) return;
     const at = new Date().toISOString();
     try {

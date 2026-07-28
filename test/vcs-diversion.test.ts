@@ -3,6 +3,31 @@ import type { AgentDriver, DriverExit, DriverStartOptions } from '../src/drivers
 import { zeroTelemetry } from '../src/drivers/types';
 import { RunSupervisor } from '../src/supervisor';
 import { DiversionBackend, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
+import type { LockDelegate } from '../src/vcs/git';
+
+/** A fake Noriq lock view (the authoritative coordination layer), recording calls. */
+function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
+  const calls: Array<{ method: string; token: string }> = [];
+  const locks: LockDelegate = {
+    acquire: async (token) => {
+      calls.push({ method: 'acquire', token });
+      return acquireResult as never;
+    },
+    release: async (token) => {
+      calls.push({ method: 'release', token });
+      return { released: [] };
+    },
+    check: async (token) => {
+      calls.push({ method: 'check', token });
+      return { enabled: true, conflicts: [], mine: [] };
+    },
+    releaseAllMine: async (token) => {
+      calls.push({ method: 'releaseAllMine', token });
+      return { released: [] };
+    },
+  };
+  return { locks, calls };
+}
 
 // The backend is orchestration over two injected transports — the API (merges, branches) and
 // the CLI (anything that must materialize files, which is the sync agent's job). These tests
@@ -27,6 +52,10 @@ function fakes(over: {
   /** What `dv commit` prints (or an Error to throw). */
   commit?: string | Error;
   currentBranch?: string;
+  /** The Noriq lock view to inject (RUN-100). */
+  locks?: LockDelegate;
+  /** Model a non-Pro workspace: the soft-lock endpoint answers 402 (native degrades). */
+  softLockUnavailable?: boolean;
 }) {
   const branches: Record<string, string> = over.branches ?? { main: 'dv.commit.10' };
   const mergeQueue = [...(over.mergeResponses ?? [])];
@@ -66,6 +95,13 @@ function fakes(over: {
     if (method === 'GET' && apiPath.includes('/merges/')) {
       return { status: 200, body: over.mergeDetails ?? { conflicts: [] } };
     }
+    if (apiPath.endsWith('/locks')) {
+      // The native soft-lock endpoint (Pro-gated). realDvHttp resolves any non-2xx into a body,
+      // never a throw — but the backend's nativeSoftLock ignores the outcome either way.
+      return over.softLockUnavailable
+        ? { status: 402, body: { error: 'Pro required' } }
+        : { status: 200, body: {} };
+    }
     throw new Error(`fake has no answer for ${method} ${apiPath}`);
   };
 
@@ -81,7 +117,7 @@ function fakes(over: {
     return { stdout: '', stderr: '' };
   };
 
-  const backend = new DiversionBackend({ repoId: 'dv.repo.test', http, cli });
+  const backend = new DiversionBackend({ repoId: 'dv.repo.test', http, cli, locks: over.locks });
   return { backend, calls, branches };
 }
 
@@ -142,6 +178,24 @@ describe('DiversionBackend — lease/dispose (the pool-of-1)', () => {
     expect(calls.map((c) => c.what)).toEqual(['dv checkout main --discard-changes --ignore-shelf']);
     // No DELETE /branches call: the branch is server-side, durable, team-visible history, and
     // may hold the only committed copy of unlanded work.
+  });
+
+  it('continue a failed run: adopts the run’s existing branch, never re-POSTs it (RUN-93)', async () => {
+    // A kept prior attempt: the run's own branch already exists server-side with its work on it.
+    const { backend, calls } = fakes({
+      branches: { main: 'dv.commit.10', 'noriq/run/run_1': 'dv.commit.work' },
+    });
+    const ws = await backend.lease('/repo', 'run_1');
+    expect(ws.workRef).toBe('noriq/run/run_1');
+    // Base is the current line head, so hasWork sees the branch's own commit as work.
+    expect(ws.baseId).toBe('dv.commit.10');
+    expect(await backend.hasWork(ws)).toBe(true);
+    // It checked the existing branch out and did NOT POST a fresh one (which would 409).
+    expect(calls.some((c) => c.what === 'dv checkout noriq/run/run_1 --discard-changes --ignore-shelf')).toBe(
+      true,
+    );
+    expect(calls.some((c) => c.what.startsWith('POST') && c.what.includes('/branches?'))).toBe(false);
+    await backend.dispose(ws);
   });
 });
 
@@ -253,6 +307,42 @@ describe('DiversionBackend — the rest of the surface', () => {
     expect(await backend.checkpoint(ws, 'msg')).toBe(false);
   });
 
+  // RUN-157. `branchHead` mapped BOTH a 404 and a 200-without-commit_id to null, and `hasWork`
+  // maps null to false — so a response the backend could not read reported "no work", which the
+  // caller acts on by disposing. A 404 is an ANSWER (a run that has committed nothing has no
+  // branch yet); a branch the server says exists and then declines to describe is not.
+  describe('hasWork tells "no commits yet" from "could not read the answer"', () => {
+    const ws = {
+      runId: 'run_1',
+      localPath: '/repo',
+      readOnly: false,
+      baseId: 'dv.commit.1',
+      workRef: 'noriq/run/run_1',
+      location: { repoId: 'dv.repo.x', branch: 'noriq/run/run_1', baseBranch: 'main' },
+    };
+    /** A workspace with no uncommitted edits, so the answer turns entirely on the branch lookup. */
+    const cleanCli: DvCli = async () => ({ stdout: '', stderr: '' });
+    const withBranchGet = (body: unknown, status = 200) =>
+      new DiversionBackend({
+        repoId: 'dv.repo.x',
+        cli: cleanCli,
+        http: async () => ({ status, body }) as never,
+      });
+
+    it('a branch that does not exist yet is no work — the ordinary state of a fresh lease', async () => {
+      expect(await withBranchGet(null, 404).hasWork(ws)).toBe(false);
+    });
+
+    it('rejects a branch the server says exists but will not describe', async () => {
+      const backend = withBranchGet({ branch_id: 'noriq/run/run_1' }); // 200, no commit_id
+      await expect(backend.hasWork(ws)).rejects.toThrow(/reported no commit/);
+    });
+
+    it('still reports work when the branch has moved past the base', async () => {
+      expect(await withBranchGet({ commit_id: 'dv.commit.9' }).hasWork(ws)).toBe(true);
+    });
+  });
+
   it('reapOrphans destroys nothing — a dead run’s work is already durable server-side', async () => {
     const { backend } = fakes({
       branches: { main: 'dv.commit.10', 'noriq/run/run_dead': 'dv.commit.11' },
@@ -283,6 +373,14 @@ describe('DiversionBackend — the rest of the surface', () => {
 describe('RunSupervisor over DiversionBackend — the interface survives a live-model backend', () => {
   class InstantDriver implements AgentDriver {
     readonly tool = 'claude' as const;
+    readonly capabilities = {
+      toolHooks: true,
+      steer: true,
+      interrupt: true,
+      resumableSession: true,
+      perModelTelemetry: true,
+    };
+    readonly catalog = { models: [], efforts: [] };
     opts?: DriverStartOptions;
     start(opts: DriverStartOptions) {
       this.opts = opts;
@@ -324,6 +422,12 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
           key: 'DV',
           board: null,
           verify: null, // no deterministic floor in this test — the landing flow is the subject
+          context: {
+            requiredReading: [],
+            entryPoints: [],
+            conventions: [],
+            agentInstructions: 'inline' as const,
+          },
           tool: null,
           defaultBranch: 'main',
           land: {
@@ -340,10 +444,11 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
             verify: { write: false, allow: [], deny: [], auto: false },
           },
           defaults: {
-            scope: { model: null, effort: null },
-            build: { model: null, effort: null },
-            verify: { model: null, effort: null },
+            scope: { agent: null, model: null, effort: null },
+            build: { agent: null, model: null, effort: null },
+            verify: { agent: null, model: null, effort: null },
           },
+          workflows: {},
         },
       }),
       report: () => {},
@@ -397,5 +502,50 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
       'POST /repos/dv.repo.test/merges?base_id=noriq%2Fintegration&other_id=noriq%2Frun%2Frun_dv1',
     );
     expect(branches['noriq/integration']).toBe('dv.commit.31'); // the landed head
+  });
+});
+
+describe('DiversionBackend — locking (RUN-100): Noriq view authoritative, soft lock degrades', () => {
+  const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
+
+  it('acquires the Noriq view AND posts a native soft lock on a Pro workspace', async () => {
+    const { locks, calls: lockCalls } = fakeLocks({
+      ok: true,
+      enabled: true,
+      locks: [{ id: 'lk', path: 'a.ts' }],
+    });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/repo', 'run_1');
+    const out = await backend.lock(ws, ['a.ts'], ctx);
+    expect(out).toEqual({ ok: true, enabled: true, locks: [{ id: 'lk', path: 'a.ts' }] });
+    expect(lockCalls[0]).toMatchObject({ method: 'acquire', token: 'run-token' });
+    expect(calls.some((c) => c.what === 'POST /repos/dv.repo.test/locks')).toBe(true);
+  });
+
+  it('degrades to the Noriq layer alone when soft locks are unavailable (non-Pro) — grant still stands', async () => {
+    const { locks } = fakeLocks({ ok: true, enabled: true, locks: [] });
+    const { backend } = fakes({ locks, softLockUnavailable: true });
+    const ws = await backend.lease('/repo', 'run_1');
+    // The native 402 must not fail the grant the Noriq view made.
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({ ok: true, enabled: true, locks: [] });
+  });
+
+  it('a Noriq conflict is all-or-nothing — no native soft lock attempted', async () => {
+    const { locks } = fakeLocks({ ok: false, conflicts: [{ path: 'a.ts', holder: 'agt_other' }] });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/repo', 'run_1');
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({
+      ok: false,
+      conflicts: [{ path: 'a.ts', holder: 'agt_other' }],
+    });
+    expect(calls.some((c) => c.what.endsWith('/locks'))).toBe(false);
+  });
+
+  it('no lock view wired → disabled, no HTTP', async () => {
+    const { backend, calls } = fakes({});
+    const ws = await backend.lease('/repo', 'run_1');
+    const before = calls.length;
+    expect(await backend.lock(ws, ['a.ts'], ctx)).toEqual({ ok: true, enabled: false, locks: [] });
+    expect(calls.slice(before).some((c) => c.what.endsWith('/locks'))).toBe(false);
   });
 });

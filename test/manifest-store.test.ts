@@ -213,7 +213,8 @@ describe('changedSections', () => {
   const m = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
     key: 'PROJ',
     board: null,
-    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
+    verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
+    context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
     tool: null,
     defaultBranch: null,
     land: null,
@@ -224,10 +225,11 @@ describe('changedSections', () => {
     },
     // No per-kind model/effort: this repo takes whatever the tool defaults to (RUN-33).
     defaults: {
-      scope: { model: null, effort: null },
-      build: { model: null, effort: null },
-      verify: { model: null, effort: null },
+      scope: { agent: null, model: null, effort: null },
+      build: { agent: null, model: null, effort: null },
+      verify: { agent: null, model: null, effort: null },
     },
+    workflows: {},
     ...over,
   });
 
@@ -237,7 +239,10 @@ describe('changedSections', () => {
 
   it('names each section that actually differs', () => {
     expect(
-      changedSections(m(), m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null, agent: null } })),
+      changedSections(
+        m(),
+        m({ verify: { cmd: 'npm ci', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null } }),
+      ),
     ).toEqual(['verify']);
     expect(
       changedSections(

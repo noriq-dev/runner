@@ -447,16 +447,16 @@ describe('runInitProject', () => {
   });
 
   it('takes the land branch only when one is typed', async () => {
-    // key, tool, cmd, shell, timeout, reviewer?, land — the advanced knobs left blank
-    const res = await run(['ACME', 'claude', 'npm test', '', '', '', 'noriq/integration']);
+    // key, tool, cmd, shell, timeout, rounds, reviewer?, land — the advanced knobs left blank
+    const res = await run(['ACME', 'claude', 'npm test', '', '', '', '', 'noriq/integration']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.land?.branch).toBe('noriq/integration');
     expect(parsed.land?.autoPush).toBe(false); // the daemon must not publish because a wizard ran
   });
 
   it('writes the inline reviewer when chosen, with its model (RUN-61)', async () => {
-    // key, tool, cmd, shell, timeout, reviewer?, model, effort, rounds, land
-    const res = await run(['ACME', 'claude', 'npm test', '', '', 'y', 'claude-opus-4-8', '', '', '']);
+    // key, tool, cmd, shell, timeout, rounds, reviewer?, model, effort, rounds, land
+    const res = await run(['ACME', 'claude', 'npm test', '', '', '', 'y', 'claude-opus-4-8', '', '', '']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.verify?.cmd).toBe('npm test');
     expect(parsed.verify?.agent?.model).toBe('claude-opus-4-8');
@@ -472,11 +472,12 @@ describe('runInitProject', () => {
   });
 
   it('writes the advanced verify knobs when answered (RUN-63)', async () => {
-    // key, tool, cmd, shell, timeout, reviewer?, model, effort, rounds, land
-    const res = await run(['ACME', 'claude', 'npm test', 'bash', '900', 'y', '', 'xhigh', '0', '']);
+    // key, tool, cmd, shell, timeout, floor rounds, reviewer?, model, effort, rounds, land
+    const res = await run(['ACME', 'claude', 'npm test', 'bash', '900', '3', 'y', '', 'xhigh', '0', '']);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.verify?.shell).toBe('bash');
     expect(parsed.verify?.timeoutSeconds).toBe(900);
+    expect(parsed.verify?.maxRounds).toBe(3); // the floor's own bound (RUN-94)
     expect(parsed.verify?.agent?.effort).toBe('xhigh');
     expect(parsed.verify?.agent?.maxRounds).toBe(0); // 0 = a pure gate, not "unset"
   });
@@ -496,7 +497,7 @@ describe('runInitProject', () => {
 
   it('no reviewer → no effort or rounds question (RUN-63)', async () => {
     const asked: string[] = [];
-    const answers = asker(['ACME', 'claude', 'npm test', '', '', '', '']); // reviewer declined
+    const answers = asker(['ACME', 'claude', 'npm test', '', '', '', '', '']); // reviewer declined
     await run([], {
       ask: async (q, fallback) => {
         asked.push(q);
@@ -504,8 +505,9 @@ describe('runInitProject', () => {
       },
     });
     expect(asked.some((q) => /shell/i.test(q))).toBe(true); // the cmd DID unlock its knobs
+    expect(asked.some((q) => /re-verify rounds/i.test(q))).toBe(true); // the floor's own (RUN-94)
     expect(asked.some((q) => /effort/i.test(q))).toBe(false);
-    expect(asked.some((q) => /rounds/i.test(q))).toBe(false);
+    expect(asked.some((q) => /re-review rounds/i.test(q))).toBe(false); // the reviewer's stayed gated
   });
 
   it('re-asks on a bad timeout, effort, or rounds instead of writing an invalid manifest (RUN-63)', async () => {
@@ -518,6 +520,8 @@ describe('runInitProject', () => {
       '-5', // timeout: not positive → re-ask
       '2147484', // timeout: * 1000 overflows Node's 2³¹−1 ms timer (fires at ~1 ms) → re-ask
       '120',
+      '9', // floor rounds: out of the 0–5 bound → re-ask (RUN-94)
+      '1',
       'y', // reviewer
       '', // model: driver default
       'ultra', // effort: not in the enum → re-ask
@@ -528,6 +532,7 @@ describe('runInitProject', () => {
     ]);
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
     expect(parsed.verify?.timeoutSeconds).toBe(120);
+    expect(parsed.verify?.maxRounds).toBe(1);
     expect(parsed.verify?.agent?.effort).toBe('high');
     expect(parsed.verify?.agent?.maxRounds).toBe(3);
   });
@@ -593,8 +598,8 @@ describe('runInitProject', () => {
 
   it('--advanced skips the fork question and asks the six [defaults] questions', async () => {
     const res = await run(
-      // key   tool      verify      shell/timeout  rev  land  s.model            s.eff   b.model/eff  v.model  v.eff
-      ['ACME', 'claude', 'npm test', '', '', '', '', 'claude-opus-4-8', 'high', '', '', '', 'xhigh'],
+      // key   tool      verify      shell/timeout/rounds  rev  land  s.model         s.eff   b.model/eff  v.model  v.eff
+      ['ACME', 'claude', 'npm test', '', '', '', '', '', 'claude-opus-4-8', 'high', '', '', '', 'xhigh'],
       { advanced: true },
     );
     const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
@@ -894,6 +899,84 @@ describe('runInitProject', () => {
     });
     expect(lines.join('\n')).toMatch(/no dry-run/);
     expect(lines.join('\n')).toMatch(/syncs to the cloud/);
+  });
+
+  // The setup copy speaks the detected backend, not git-by-assumption (RUN-84). These drive the
+  // prompts by MATCHING the question text, not by position, because a server-backed VCS skips
+  // whole questions (agent conflict-resolution, the push/merge-request tail) — a positional list
+  // would silently answer the wrong prompt the moment the order changes.
+  const askBy = (rules: Array<[RegExp, string]>) => async (q: string, fallback?: string) =>
+    rules.find(([re]) => re.test(q))?.[1] ?? fallback ?? '';
+
+  it('a Diversion repo lands in Diversion words: merged, no push, dv commit (RUN-84)', async () => {
+    const asked: string[] = [];
+    const lines: string[] = [];
+    const res = await run([], {
+      advanced: true,
+      detectVcsFor: async () => ({ kind: 'diversion', repoId: 'dv.repo.x', reason: 'registry' }),
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return askBy([
+          [/Project KEY/, 'ACME'],
+          [/Agent driver/, 'claude'],
+          [/Auto-land to which branch/, 'noriq/integration'],
+        ])(q, fallback);
+      },
+      out: (l) => lines.push(l),
+    });
+
+    // The [land] gate reads "merged", never "rebased".
+    expect(asked.some((q) => /verify passes on the merged result/i.test(q))).toBe(true);
+    expect(asked.some((q) => /rebased/i.test(q))).toBe(false);
+    // Agent conflict-resolution is not even offered — conflicts are server-side.
+    expect(asked.some((q) => /resolve mechanical/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/resolved server-side/);
+    // The push / merge-request tail is git-only: neither question appears.
+    expect(asked.some((q) => /push/i.test(q))).toBe(false);
+    expect(asked.some((q) => /merge-request/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/already reaches the server/);
+    // The commit hint is `dv`, not `git add`.
+    expect(lines.join('\n')).toMatch(/dv commit -a -m "Add Noriq marker"/);
+    expect(lines.join('\n')).not.toMatch(/git add/);
+
+    const parsed = ProjectManifest.parse(parseToml(await readFile(res.manifestPath, 'utf8')));
+    expect(parsed.land?.branch).toBe('noriq/integration');
+    expect(parsed.land?.autoPush).toBe(false); // server-backed: nothing to push, MR flow is git-only
+    // The rendered [land] block explains the server-side landing instead of git push knobs.
+    const toml = await readFile(res.manifestPath, 'utf8');
+    expect(toml).toMatch(/reaches the server directly/);
+    expect(toml).not.toMatch(/git log/);
+  });
+
+  it('a Perforce repo lands to a stream, resolves headless, and submits — never pushes (RUN-84)', async () => {
+    const asked: string[] = [];
+    const lines: string[] = [];
+    await run([], {
+      advanced: true,
+      detectVcsFor: async () => ({ kind: 'perforce', reason: '.p4config' }),
+      ask: async (q, fallback) => {
+        asked.push(q);
+        return askBy([
+          [/Project KEY/, 'ACME'],
+          [/Agent driver/, 'claude'],
+          [/Auto-land to which branch/, 'main-stream'],
+        ])(q, fallback);
+      },
+      out: (l) => lines.push(l),
+    });
+
+    expect(asked.some((q) => /verify passes on the merged result/i.test(q))).toBe(true);
+    // p4 resolve runs headless, so the agent-resolution question IS offered — in merge words.
+    expect(asked.some((q) => /resolve mechanical merge conflicts/i.test(q))).toBe(true);
+    // The landing target is a stream, and the override question says so.
+    expect(asked.some((q) => /Stream globs a dispatch may land on/i.test(q))).toBe(true);
+    // Perforce submits to the depot — no separate remote to push.
+    expect(asked.some((q) => /push/i.test(q))).toBe(false);
+    expect(lines.join('\n')).toMatch(/p4 add .* && p4 submit -d "Add Noriq marker"/);
+    // RUN-65's identity section speaks the backend too (the merge reconciliation): the TOML key
+    // stays `defaultBranch`, but a Perforce operator is asked about a stream, never a branch.
+    expect(asked.some((q) => /Default stream \(blank = the run's own base\)/i.test(q))).toBe(true);
+    expect(asked.some((q) => /Default branch/i.test(q))).toBe(false);
   });
 });
 
@@ -1206,6 +1289,7 @@ describe('RUN-67 round-trip matrix — everything the wizard can write, discover
         'npm run check',
         'bash',
         '900',
+        '3', // failing-cmd fix rounds (RUN-94) — a question main added after the branch forked
         'y',
         'claude-opus-4-8',
         'high',
@@ -1233,12 +1317,15 @@ describe('RUN-67 round-trip matrix — everything the wizard can write, discover
     expect(parsed.verify?.cmd).toBe('npm run check');
     expect(parsed.verify?.shell).toBe('bash');
     expect(parsed.verify?.timeoutSeconds).toBe(900);
+    expect(parsed.verify?.maxRounds).toBe(3);
     expect(parsed.verify?.agent?.model).toBe('claude-opus-4-8');
     expect(parsed.verify?.agent?.effort).toBe('high');
     expect(parsed.verify?.agent?.maxRounds).toBe(1);
-    expect(parsed.defaults.scope).toEqual({ model: 'claude-opus-4-8', effort: 'high' });
-    expect(parsed.defaults.build).toEqual({ model: null, effort: 'low' });
-    expect(parsed.defaults.verify).toEqual({ model: null, effort: 'xhigh' });
+    // `agent: null` — the coordinate slot (RUN-113) grew onto ModelDefault after this branch
+    // forked; the wizard does not ask for one, so it round-trips as its schema default.
+    expect(parsed.defaults.scope).toEqual({ agent: null, model: 'claude-opus-4-8', effort: 'high' });
+    expect(parsed.defaults.build).toEqual({ agent: null, model: null, effort: 'low' });
+    expect(parsed.defaults.verify).toEqual({ agent: null, model: null, effort: 'xhigh' });
     expect(parsed.land?.branch).toBe('noriq/plan-<planKey>');
     expect(parsed.land?.onlyWhenVerifyPasses).toBe(false);
     expect(parsed.land?.resolveConflicts).toBe(false);

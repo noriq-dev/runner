@@ -44,9 +44,12 @@ describe('NoriqClient', () => {
       label: 'l',
       version: '1.2.3',
       tools: ['claude'],
+      agents: [],
       kinds: ['build'],
       maxConcurrency: 1,
-      repos: [{ id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main' }],
+      repos: [
+        { id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main', workflows: [] },
+      ],
     });
     expect(runner.id).toBe('rnr_1');
     expect(runner.repos[0]?.projectId).toBe('prj_aaa');
@@ -136,7 +139,13 @@ describe('MCP session lifecycle (RUN-73)', () => {
   it('initializes once, sends the session header on every tool call, and reuses the session', async () => {
     const srv = fakeMcpServer();
     const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
-    expect(await client.getTask('task_1')).toEqual({ key: 'K-1', title: 'T', body: null });
+    expect(await client.getTask('task_1')).toEqual({
+      key: 'K-1',
+      title: 'T',
+      body: null,
+      executionSpec: null,
+      executionSpecUnreadable: false,
+    });
     await client.getTask('task_2');
     expect(srv.mintedCount()).toBe(1); // ONE handshake, N calls
     const calls = srv.frames.filter((f) => f.method === 'tools/call');
@@ -169,7 +178,13 @@ describe('MCP session lifecycle (RUN-73)', () => {
     // no longer knows. That must cost one retry, not an anchor prompt or a lost comment.
     const srv = fakeMcpServer({ forgetAfterMint: 1 });
     const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
-    expect(await client.getTask('task_1')).toEqual({ key: 'K-1', title: 'T', body: null });
+    expect(await client.getTask('task_1')).toEqual({
+      key: 'K-1',
+      title: 'T',
+      body: null,
+      executionSpec: null,
+      executionSpecUnreadable: false,
+    });
     expect(srv.mintedCount()).toBe(2); // the forgotten one + the retry's
   });
 

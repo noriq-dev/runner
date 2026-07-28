@@ -1,10 +1,35 @@
 import { execFile } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
+
+/**
+ * Normalize a path for comparing what the DAEMON built against what GIT reports (RUN-95).
+ *
+ * On Windows one directory has several spellings: path.join says `C:\Users\RUNNER~1\…`
+ * (backslashes, possibly the 8.3 short form) while git porcelain prints `C:/Users/…`. Comparing
+ * them verbatim concluded a registered worktree wasn't — so a continue's adopt path ran
+ * `worktree add` into the existing checkout and every Windows continue failed. realpath collapses
+ * the short/long split where the path exists (falling back for one that doesn't), slashes are
+ * unified, and win32 compares case-insensitively because its filesystems do.
+ */
+export function comparableWorktreePath(p: string): string {
+  // Slashes FIRST: a backslashed spelling is not even absolute to POSIX path.resolve, which
+  // would silently prefix the cwd and defeat the comparison this exists for.
+  const unified = p.replace(/\\/g, '/');
+  let resolved = unified;
+  try {
+    resolved = realpathSync.native(unified);
+  } catch {
+    // Not on disk (e.g. a pruned checkout still listed as prunable) — compare as spelled.
+  }
+  const posix = path.resolve(resolved).replace(/\\/g, '/');
+  return process.platform === 'win32' ? posix.toLowerCase() : posix;
+}
 
 /** Where per-Run worktrees are created (outside any repo). */
 export const DEFAULT_WORKTREES_DIR = path.join(os.homedir(), '.noriq', 'worktrees');
@@ -101,12 +126,64 @@ export class WorktreeManager {
     return path.join(this.baseDir, `${path.basename(repoRoot)}-${runId}`);
   }
 
+  /** Does the run's throwaway branch already exist locally? True only for a kept, gate-failed
+   *  prior attempt at this exact run id (RUN-91) — a fresh run's id has never been minted. */
+  private async branchExists(repoRoot: string, branch: string): Promise<boolean> {
+    try {
+      await this.git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repoRoot);
+      return true;
+    } catch {
+      return false; // rev-parse --quiet exits non-zero (no output) when the ref is absent
+    }
+  }
+
+  /** Is `dir` still a registered worktree of this repo? (A reap can spare a branch but prune its
+   *  worktree; then a continue must re-attach one rather than assume the checkout is there.) */
+  private async worktreeRegistered(repoRoot: string, dir: string): Promise<boolean> {
+    const { stdout } = await this.git(['worktree', 'list', '--porcelain'], repoRoot);
+    // Never compare the spellings verbatim (RUN-95): git prints forward slashes where this
+    // daemon built platform ones, which on Windows read as "not registered" for a worktree
+    // that very much was — and the adopt path then collided with its own checkout.
+    const want = comparableWorktreePath(dir);
+    return stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .some(
+        (line) =>
+          line.startsWith('worktree ') && comparableWorktreePath(line.slice('worktree '.length)) === want,
+      );
+  }
+
   /** Create the Run's isolated worktree + throwaway branch. */
   async create(repoRoot: string, runId: string, opts: CreateWorktreeOptions = {}): Promise<WorktreeInfo> {
     await mkdir(this.baseDir, { recursive: true });
     const branch = runBranch(runId);
     const dir = this.worktreePath(repoRoot, runId);
     const baseRef = opts.baseRef ?? 'HEAD';
+
+    // Continue a failed run (RUN-91). A gate-failed build is KEPT, not disposed, so its branch and
+    // worktree survive on disk; the server re-dispatches the SAME run id (PLNR-180) and "resume"
+    // is inferred from exactly this — the branch already existing. Adopt it: `worktree add -b`
+    // would fail on the branch, and re-forking would discard the work the prior attempt committed.
+    // The fork point is recovered as the branch's merge-base with the target, so the diff still
+    // spans the WHOLE accumulated change rather than only what this sitting adds.
+    if (await this.branchExists(repoRoot, branch)) {
+      if (!(await this.worktreeRegistered(repoRoot, dir))) {
+        await this.git(['worktree', 'add', dir, branch], repoRoot); // branch kept, worktree pruned
+      }
+      const { stdout: forkSha } = await this.git(['merge-base', branch, baseRef], repoRoot);
+      // No setReadOnly on adopt: a continue is a build (writable), and re-chmod'ing a tree full of
+      // the prior attempt's work is both pointless and a fight with the agent about to edit it.
+      return {
+        runId,
+        repoRoot,
+        path: dir,
+        branch,
+        readOnly: opts.readOnly ?? false,
+        baseSha: forkSha.trim(),
+      };
+    }
+
     // Pin the fork point BEFORE the agent can move HEAD — this is what "did it change
     // anything?" is measured against later.
     const { stdout: baseSha } = await this.git(['rev-parse', baseRef], repoRoot);
@@ -132,16 +209,94 @@ export class WorktreeManager {
    * plan, blocked, or simply refused) leaves the worktree pristine; running the verify
    * command over that is pure waste, and worse, a PASS on an empty tree would land the
    * Run in review as a success with nothing in it.
+   *
+   * **Throws rather than answering `false` when git cannot be asked** (RUN-152). This used to
+   * substitute `'0'` for a failed `rev-list`, which made "no committed work" and "the query broke"
+   * the same answer — a fail-OPEN, because every consumer of `false` destroys something: the
+   * lock-refusal guard disposes the workspace (`worktree remove --force` + `branch -D` on a branch
+   * that was never pushed), and the no-changes gate reaps it. On an ADOPTED continuation that is
+   * the prior sitting's committed diff, which exists nowhere else. Both callers already wrapped
+   * this in a `.catch(() => true)`; the swallow inside was what stopped those guards from ever
+   * firing.
    */
   async hasChanges(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<boolean> {
     const { stdout: dirty } = await this.git(['status', '--porcelain'], info.path);
     if (dirty.trim()) return true;
+    // An empty base makes git read `..HEAD` as `HEAD..HEAD` and print a confident 0 — a fail-open
+    // with no error anywhere to catch. A parked record persisted with `baseId: ''` reaches here.
+    if (!info.baseSha.trim()) throw new Error('worktree has no base commit — cannot tell what it produced');
     // Committed work: anything on this branch that isn't on the base it forked from.
-    const { stdout: ahead } = await this.git(
-      ['rev-list', '--count', `${info.baseSha}..HEAD`],
+    const { stdout: ahead } = await this.git(['rev-list', '--count', `${info.baseSha}..HEAD`], info.path);
+    const count = ahead.trim();
+    // `rev-list --count` always prints a number. Anything else means we did not get an answer,
+    // and `Number('')` is 0 — the same fail-open by a shorter route.
+    if (!/^\d+$/.test(count)) {
+      throw new Error(`git rev-list --count gave no usable answer: ${JSON.stringify(ahead)}`);
+    }
+    if (Number(count) > 0) return true;
+    // About to answer "there is nothing here", which is the answer that gets acted on by deleting
+    // things. `base..HEAD` only measures what HEAD points at: with a DETACHED HEAD sitting on the
+    // base, a run branch full of commits measures as zero, and `branch -D` then takes the lot.
+    // Exiting nonzero when HEAD is not on a branch is exactly what `symbolic-ref` is for.
+    await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
+    return false;
+  }
+
+  /**
+   * The repo-relative paths this run touched — uncommitted (working tree) PLUS committed since
+   * the base it forked from (RUN-102). The hard-floor lock gate acquires these as the run's
+   * holder before the diff is made durable, so a write the reactive hook never saw (a Codex run,
+   * or a Bash write its parser bailed on) still cannot land over a path a peer holds.
+   *
+   * **Throws rather than returning a partial or empty set** (RUN-156). Both probes used to swallow
+   * their errors, so "this run changed nothing" and "git would not tell me what it changed" arrived
+   * as the same `[]` — and the floor treats an empty set as nothing to lock, which is a PASS. That
+   * is a fail-open on the one layer that is the FIRST acquisition for a driver with no in-process
+   * hook: a build could land over a path a peer holds and no line anywhere would say so.
+   *
+   * A partial answer is refused for the same reason. Locking the paths one probe managed to report
+   * looks exactly like a floor that ran, while the paths the other probe would have named go
+   * unlocked — a silent under-lock is worse than a loud failure, because only one of them gets
+   * looked at.
+   *
+   * Both probes are read with `-z`, which is the same requirement wearing different clothes. Git's
+   * human output C-QUOTES anything non-ASCII or unusual under the default `core.quotePath`, so
+   * `src/é.ts` arrives as `"src/\303\251.ts"` — and a floor that locks that string has locked a path
+   * that does not exist while leaving the real one free. `-z` emits raw bytes with NUL separators:
+   * no quoting to undo, and no ambiguity for a filename containing a newline or ` -> `.
+   */
+  async changedPaths(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<string[]> {
+    // Same guard as `hasChanges`, and for the same reason: git reads `..HEAD` as `HEAD..HEAD` and
+    // reports a confident zero paths. Here that is a floor with nothing to lock, which reads as a
+    // pass.
+    if (!info.baseSha.trim()) throw new Error('worktree has no base commit — cannot tell what it changed');
+    const set = new Set<string>();
+
+    // `XY <path>\0`, and for a rename/copy `XY <new>\0<old>\0` — two fields, destination FIRST.
+    const { stdout: porc } = await this.git(['status', '--porcelain', '-z'], info.path);
+    const fields = porc.split('\0');
+    for (let i = 0; i < fields.length; i++) {
+      const entry = fields[i];
+      if (!entry) continue;
+      const status = entry.slice(0, 2);
+      const p = entry.slice(3);
+      // The rename's SOURCE is the next field. Consumed rather than parsed: the write this floor
+      // is protecting is the destination, and treating a source as its own entry would mangle the
+      // one after it.
+      if (status.includes('R') || status.includes('C')) i += 1;
+      if (p) set.add(p);
+    }
+
+    const { stdout: committed } = await this.git(
+      ['diff', '--name-only', '-z', `${info.baseSha}..HEAD`],
       info.path,
-    ).catch(() => ({ stdout: '0', stderr: '' }));
-    return Number(ahead.trim() || '0') > 0;
+    );
+    for (const p of committed.split('\0')) if (p) set.add(p);
+
+    // About to answer "this run changed nothing" — the answer the floor reads as a pass. Detached
+    // at the base, a run branch full of commits reports no paths, and it is that BRANCH that lands.
+    if (!set.size) await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
+    return [...set];
   }
 
   /** Tear down a worktree + delete its (never-pushed) branch. Safe to call twice. */
@@ -433,9 +588,19 @@ export class WorktreeManager {
    * A worktree with uncommitted changes or commits of its own is an agent's output that
    * nothing else has a copy of; `git worktree remove --force` would destroy it silently.
    * Skip those and let a human decide. Returns the count actually removed.
+   *
+   * `isOwned` is what lets this run PERIODICALLY rather than only at startup (RUN-153). At start
+   * the question does not arise — every prior process is dead, so every managed worktree is by
+   * definition an orphan. Mid-flight it is the whole question: a live run's worktree is
+   * indistinguishable from a leaked one by inspection, and it can be legitimately empty (an agent
+   * that has not written yet), so `hasUnsavedWork` would not save it. The daemon answers from
+   * what it owns; a caller that passes nothing gets the startup meaning unchanged.
    */
-  async reapOrphans(repoRoot: string, opts: { onSkip?: (path: string) => void } = {}): Promise<number> {
-    const managed = await this.listManaged(repoRoot);
+  async reapOrphans(
+    repoRoot: string,
+    opts: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean } = {},
+  ): Promise<number> {
+    const managed = (await this.listManaged(repoRoot)).filter((w) => !opts.isOwned?.(w.runId));
     // An orphan's fork point died with the daemon that made it, so measure against the
     // primary worktree's HEAD: commits the branch holds that the repo doesn't.
     const { stdout: mainHead } = await this.git(['rev-parse', 'HEAD'], repoRoot).catch(() => ({
@@ -449,6 +614,11 @@ export class WorktreeManager {
         opts.onSkip?.(w.path);
         continue;
       }
+      // Asked AGAIN, immediately before the delete. The filter above ran before several async git
+      // calls, and a parked run can be resumed inside that window — it is added to the daemon's
+      // live set before it touches its worktree, so the second question catches it and the first
+      // one could not.
+      if (opts.isOwned?.(w.runId)) continue;
       await this.remove({ repoRoot, path: w.path, branch: w.branch });
       removed += 1;
     }

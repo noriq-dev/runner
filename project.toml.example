@@ -31,6 +31,54 @@ tool = "claude"
 # The repo's main branch, if the daemon should reference it. Optional.
 defaultBranch = "main"
 
+# ── What this repo tells every agent about itself (RUN-128/129) ──────────────
+# Optional — but NOT inert when omitted: if this repo has a CLAUDE.md or AGENTS.md
+# at its root, the daemon inlines it into every scope/build brief by default. Those
+# files are written to steer a coding agent, and ignoring them meant our agents
+# worked from less than the repo had already written down. Declaring
+# `requiredReading` below REPLACES that fallback, and `agentInstructions` decides
+# what happens when you declare no reading of your own (RUN-155):
+#
+#   inline  (default) reproduce the file in the brief — right for most repos
+#   name              say it exists and let the agent read it, for a large file
+#                     aimed at humans as much as agents, where pre-loading costs
+#                     more context than reading the part it needs would
+#   off               say nothing at all
+#
+# It governs only the fallback: a declared `requiredReading` is always inlined.
+#
+# Before this existed, an agent's brief carried the task and nothing else, so
+# every run spent its most valuable early context re-deriving the same facts —
+# and derived them slightly differently each time. This is the repo saying them
+# once, in the committed marker, so every teammate's runner briefs identically.
+#
+# Declarative on purpose: PATHS and short steers, never file contents. Paths are
+# resolved against the repo root and CONFINED there — a path pointing outside the
+# checkout (`../../.ssh/id_rsa`, an absolute path, or an in-repo symlink whose
+# target escapes) is refused and logged, never read. A path that simply does not
+# exist is logged too: a required-reading list that quietly shrinks to nothing is
+# worse than one that was never configured, because the repo goes on believing
+# its agents are oriented.
+#
+# [context]
+# # Read before changing anything. Order matters — it is priority: files are
+# # inlined in this order until the budget runs out, so put what an agent cannot
+# # work without first. The file that crosses the line is included as a marked
+# # fragment and the agent is told to read the rest itself; later ones are named.
+# # Declaring this list replaces the CLAUDE.md/AGENTS.md fallback described above —
+# # including when every path in it fails to resolve (you get warnings, not a
+# # silent substitution).
+# requiredReading = ["docs/ARCHITECTURE.md", "CLAUDE.md"]
+# # Where to start reading the code. Architectural entry points, not an index.
+# entryPoints = ["src/daemon.ts", "src/supervisor.ts"]
+# # Short, non-negotiable steers. Anything needing a paragraph belongs in a
+# # requiredReading document, where it can be maintained as prose rather than
+# # rotting in a TOML array.
+# conventions = ["ESM only, Node >= 20", "import type for type-only imports"]
+#
+# # What to do with a CLAUDE.md / AGENTS.md when no requiredReading is declared.
+# agentInstructions = "inline"   # or "name", or "off"
+
 # ── Default model + reasoning effort, per kind (RUN-33) ──────────────────────
 # Optional, and per KIND on purpose: that is where the difference actually lives.
 # A scope run is exploration and judgment, a build is execution, a verify is
@@ -62,6 +110,34 @@ defaultBranch = "main"
 #
 # [defaults.verify]
 # effort = "xhigh"             # adversarial reasoning; inherit the tool's model
+#
+# Or spell any of these as one agent COORDINATE (RUN-113) — <tool>.<model>.<effort>,
+# a dotted model version written with underscores (opus-4_8 = opus-4.8). When set,
+# `agent` wins over the model/effort pair above:
+#
+# [defaults.build]
+# agent = "claude.opus-4_8.high"
+#
+# [defaults.scope]
+# agent = "codex.gpt-5_6-sol.high"   # a different vendor, in one line
+
+# ---------------------------------------------------------------------------
+# Custom workflows (RUN-119) — named variants of a built-in run kind.
+# ---------------------------------------------------------------------------
+# A workflow inherits the security POSTURE of its `base` (one of scope/build/verify)
+# and cannot escape it — a scope-based workflow is read-only because scope is, no
+# matter what. What it varies is the PROMPT the agent is briefed with. The three
+# built-ins are always available and need no declaration; a name that collides with
+# one is ignored (you cannot redefine `build`). {{brief}}, {{anchor}}, {{identity}}
+# are available in the prompt.
+#
+# [workflow.docs]
+# base = "scope"                       # read-only, produces a plan — like scope
+# prompt = "Survey {{brief}} and write a docs-update plan. Do NOT change code."
+#
+# [workflow.hotfix]
+# base = "build"                       # writes + is gated by verify/land — like build
+# prompt = "Ship the smallest safe fix for {{brief}}. {{anchor}}"
 
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this
@@ -88,6 +164,9 @@ defaultBranch = "main"
 cmd = "npm run typecheck && npm test"
 # timeoutSeconds = 600   # blank = this built-in default; a timeout GATES the run. A [verify]
 #                        # key — keep it up here, above [verify.agent], or it binds to nothing.
+# maxRounds = 2                  # failing-cmd → fix → re-verify rounds handed back to the LIVE
+#                                # agent before the run stops and a human picks it up (RUN-94).
+#                                # 0 = a pure gate, no hand-back. Blank = 2.
 #
 # [verify.agent]                 # the inline reviewer (all fields optional)
 # tool = "codex"                 # review on a DIFFERENT driver than the builder (RUN-70) —

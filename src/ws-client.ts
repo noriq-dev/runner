@@ -1,5 +1,13 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
-import type { AgentTool, Run, RunKind, RunModelMix, RunPhase, RunStatus } from '@noriq-dev/shared';
+import type {
+  AgentTool,
+  ExecutionSpec,
+  Run,
+  RunKind,
+  RunModelUsage,
+  RunPhase,
+  RunStatus,
+} from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
 
@@ -9,6 +17,11 @@ export interface WsSocket {
   on(event: string, listener: (...args: unknown[]) => void): void;
   send(data: string): void;
   close(code?: number, reason?: string): void;
+  /** Destroy the socket without a closing handshake. A HALF-OPEN socket — the peer gone without a
+   *  FIN, the suspend/resume case — will never complete `close()`'s handshake, so the liveness
+   *  check (RUN-176) must be able to tear down unilaterally. Optional: `ws` provides it, a fake
+   *  may rely on `close()` being used as the fallback. */
+  terminate?(): void;
 }
 export type WsFactory = (url: string, headers: Record<string, string>) => WsSocket;
 
@@ -68,6 +81,13 @@ export interface WsClientOptions {
 
 const defaultConnect: WsFactory = (url, headers) => new WebSocket(url, { headers }) as unknown as WsSocket;
 
+/**
+ * Silent heartbeat intervals before a socket is declared half-open (RUN-176). Three at the default
+ * 30s beat = ~90s to detection — generous against a pong that is merely slow, short enough that a
+ * daemon back from suspend reconnects before a human wonders why the dashboard shows it offline.
+ */
+export const DEAD_AFTER_SILENT_BEATS = 3;
+
 /** Convert an https/http server origin to the wss/ws /ws/runner/:id endpoint. */
 export function runnerWsUrl(server: string, runnerId: string): string {
   const base = server.replace(/\/+$/, '').replace(/^http/, 'ws');
@@ -93,6 +113,9 @@ export class WsClient {
   private everConnected = false;
   private reconnectAttempt = 0;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  /** Heartbeat intervals since the last INBOUND frame (RUN-176). Reset by any received frame;
+   *  crossing the deadline means the socket is half-open and gets terminated. */
+  private silentBeats = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   // Runs the daemon believes are live (non-terminal) — re-asserted on reconnect.
   private readonly liveRuns = new Map<string, Record<string, unknown>>();
@@ -169,18 +192,25 @@ export class WsClient {
   }
 
   /** Report live spend + a log tail for a Run (RUN-22). Non-transitional: this is a
-   *  best-effort telemetry tick, never re-asserted on reconnect (not in liveRuns). */
+   *  best-effort telemetry tick, never re-asserted on reconnect (not in liveRuns).
+   *
+   *  @returns whether the frame actually reached the socket — the same signal `sendRunStatus`
+   *  leans on. Telemetry is fire-and-forget, but the executed-spec record it can carry is owed
+   *  exactly once (RUN-172), so the daemon uses this to hold that record until a frame carrying it
+   *  leaves, rather than counting a down socket as a delivery (RUN-173). */
   sendTelemetry(
     runId: string,
     t: {
       tokensUsed?: number | null;
       usdSpent?: number | null;
-      modelUsage?: RunModelMix | null;
+      modelUsage?: RunModelUsage | null;
       logTail?: string | null;
       phase?: RunPhase | null;
+      /** The spec this run was briefed with (RUN-166) — once, then null. */
+      executedSpec?: ExecutionSpec | null;
     },
-  ): void {
-    this.sendRaw({
+  ): boolean {
+    return this.sendRaw({
       type: 'run.telemetry',
       runId,
       tokensUsed: t.tokensUsed ?? null,
@@ -191,6 +221,9 @@ export class WsClient {
       logTail: t.logTail ?? null,
       // Null = no news, not "clear it" — the server COALESCEs every field on this frame.
       phase: t.phase ?? null,
+      // Write-once server-side (RUN-166): what a run was briefed with is a fact about a moment
+      // that has passed, so a redelivered frame must not replace it with a later view.
+      executedSpec: t.executedSpec ?? null,
       at: new Date().toISOString(),
     });
   }
@@ -233,9 +266,18 @@ export class WsClient {
       return;
     }
     this.sock = sock;
-    sock.on('open', () => this.handleOpen());
-    sock.on('message', (data: unknown) => this.handleMessage(data));
-    sock.on('close', () => this.handleClose());
+    // Every handler is SCOPED to the socket that registered it (RUN-176). Sockets outlive their
+    // tenure — a terminated one can still emit a late 'close', a slow one a late 'message' — and
+    // an unscoped handler would let a dead socket stop the live one's heartbeat, clear its slot,
+    // stack a second reconnect timer, or reset its liveness counter. A stale event now simply
+    // finds it is not the current socket and does nothing.
+    sock.on('open', () => {
+      if (this.sock === sock) this.handleOpen();
+    });
+    sock.on('message', (data: unknown) => {
+      if (this.sock === sock) this.handleMessage(data);
+    });
+    sock.on('close', () => this.handleClose(sock));
     sock.on('error', (err: unknown) => this.log.warn('ws error', { err: String(err) }));
   }
 
@@ -270,6 +312,11 @@ export class WsClient {
   }
 
   private handleMessage(data: unknown): void {
+    // ANY inbound frame is proof of life (RUN-176) — before parsing, deliberately: a frame this
+    // client's contract version cannot parse still travelled the wire, and liveness is a transport
+    // question. Requiring a pong specifically would tear down a healthy connection busy with run
+    // traffic whose pong is merely late.
+    this.silentBeats = 0;
     let parsed: ReturnType<typeof RunnerServerMessage.safeParse>;
     try {
       parsed = RunnerServerMessage.safeParse(JSON.parse(String(data)));
@@ -343,23 +390,76 @@ export class WsClient {
     });
   }
 
-  private handleClose(): void {
+  /**
+   * The one transition out of a socket's life, idempotent and scoped (RUN-176): only the CURRENT
+   * socket's close moves the state, so the liveness teardown can call this directly (guaranteeing
+   * the transition even on a transport whose close never completes) while the real 'close' event —
+   * arriving later, or twice — finds the work already done and does nothing.
+   */
+  private handleClose(sock?: WsSocket): void {
+    if (sock && this.sock !== sock) return; // a past life's echo — the current socket is not yours
     this.stopHeartbeat();
     this.sock = undefined;
     if (!this.stopped) this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
+    // `stopped` re-checked HERE, not only at the call sites: the async token path can reject after
+    // stop() ran, and rescheduling from that catch would keep a shut-down daemon dialling and
+    // logging forever. One timer at a time, for the same shape of reason — a doubled close must
+    // not stack a second ladder beside the first.
+    if (this.stopped || this.reconnectTimer) return;
     const delay = Math.min(this.opts.reconnectBaseMs * 2 ** this.reconnectAttempt, this.opts.reconnectMaxMs);
     this.reconnectAttempt += 1;
     this.log.debug('ws reconnect scheduled', { delayMs: delay, attempt: this.reconnectAttempt });
-    this.reconnectTimer = setTimeout(() => this.open(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.open();
+    }, delay);
   }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.silentBeats = 0;
     this.heartbeatTimer = setInterval(() => {
+      // The liveness deadline (RUN-176), counted in BEATS rather than wall-clock. The daemon used
+      // to survive suspend/resume as a live process on a dead socket: writes into a half-open
+      // socket succeed into the kernel buffer, no FIN ever arrives, so `close` never fires and the
+      // reconnect ladder — which works on every real close — is simply never entered. The daemon
+      // believed it was connected; the server had long dropped it; dispatches found nobody.
+      //
+      // Beats, not a timestamp, on purpose: after a resume, timers fire late and in a burst, and a
+      // wall-clock deadline would also misfire across a paused process. Teardown lands on the
+      // THIRD consecutive silent tick (~90s at the default beat): by then two pings and the hello
+      // have all gone unanswered — with the server answering every ping (deployed behaviour), a
+      // healthy idle connection never accumulates even two.
+      this.silentBeats += 1;
+      if (this.silentBeats >= DEAD_AFTER_SILENT_BEATS) {
+        this.log.warn('ws heard nothing for the liveness deadline — assuming half-open, reconnecting', {
+          silentBeats: this.silentBeats,
+          heartbeatMs: this.opts.heartbeatMs,
+        });
+        const sock = this.sock;
+        // TERMINATE, not close: a half-open socket will never complete the closing handshake, and
+        // a `close()` that waits for one would leave us exactly where we started. The transition
+        // itself is GUARANTEED by the finally — handleClose is idempotent and socket-scoped, so
+        // whichever of {the finally, ws's own 'close' event} arrives second finds the work done.
+        // Without that, a terminate() that throws (already-destroyed socket) or a fallback close()
+        // that never emits would re-create the exact hang this deadline exists to break.
+        try {
+          if (sock) (sock.terminate ?? sock.close).call(sock);
+        } catch {
+          /* the transition below is the part that matters */
+        } finally {
+          this.handleClose(sock);
+        }
+        return;
+      }
       this.sendRaw({ type: 'heartbeat', freeSlots: this.opts.freeSlots() });
+      // The probe the deadline depends on: the server answers `ping` with `pong` (deployed), so a
+      // healthy connection hears SOMETHING every interval even when no runs are moving. The
+      // heartbeat alone cannot serve — the server records it and deliberately says nothing back.
+      this.sendRaw({ type: 'ping' });
     }, this.opts.heartbeatMs);
   }
 

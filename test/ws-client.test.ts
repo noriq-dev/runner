@@ -11,6 +11,9 @@ import {
 class FakeSocket implements WsSocket {
   sent: string[] = [];
   closed = false;
+  /** Optional, like the interface: a test that cares assigns one; the rest exercise the
+   *  close() fallback (RUN-176). */
+  terminate?: () => void;
   private listeners = new Map<string, Array<(...a: unknown[]) => void>>();
   constructor(
     readonly url: string,
@@ -105,18 +108,159 @@ describe('WsClient', () => {
     client.stop();
   });
 
-  it('heartbeats free capacity on the interval', () => {
+  it('heartbeats free capacity on the interval, with a liveness ping alongside (RUN-176)', () => {
     let slots = 2;
     const client = makeClient({ freeSlots: () => slots });
     client.start();
     const s = sockets[0]!;
     s.emit('open');
     vi.advanceTimersByTime(1000);
-    expect(s.msgs().at(-1)).toEqual({ type: 'heartbeat', freeSlots: 2 });
+    expect(s.msgs().at(-2)).toEqual({ type: 'heartbeat', freeSlots: 2 });
+    // The probe the liveness deadline depends on: the server answers ping with pong, so a healthy
+    // idle connection hears something every beat. The heartbeat alone cannot serve — the server
+    // records it and deliberately says nothing back.
+    expect(s.msgs().at(-1)).toEqual({ type: 'ping' });
     slots = 0;
     vi.advanceTimersByTime(1000);
-    expect(s.msgs().at(-1)).toEqual({ type: 'heartbeat', freeSlots: 0 });
+    expect(s.msgs().at(-2)).toEqual({ type: 'heartbeat', freeSlots: 0 });
     client.stop();
+  });
+
+  // RUN-176. The daemon survived suspend/resume as a live process on a dead socket: writes into a
+  // half-open socket succeed into the kernel buffer, no FIN ever arrives, `close` never fires, and
+  // the reconnect ladder — correct on every real close — was simply never entered. 14 hours
+  // "online" with the server long gone.
+  describe('the half-open socket is detected and torn down (RUN-176)', () => {
+    it('terminates and reconnects after the silent-beat deadline', () => {
+      const client = makeClient();
+      client.start();
+      const s = sockets[0]!;
+      s.emit('open');
+      // Teardown lands on the third consecutive silent tick — ~90s at the real 30s beat —
+      // and not a beat sooner: a pong that is merely slow must not cost a healthy connection.
+      vi.advanceTimersByTime(2000);
+      expect(s.closed).toBe(false); // two silent beats: still within the deadline
+      vi.advanceTimersByTime(1000);
+      expect(s.closed).toBe(true); // torn down (fallback path: no terminate on the fake)
+      // …and the ordinary ladder took over: a fresh socket was dialled.
+      vi.advanceTimersByTime(1000); // reconnectBaseMs
+      expect(sockets.length).toBe(2);
+      client.stop();
+    });
+
+    it('reconnects even when terminate THROWS or close never emits — the transition is guaranteed', () => {
+      // The re-created hang a review caught: a destroyed socket's terminate() throws, or a
+      // transport's close() neither completes nor emits 'close' — either way the deadline must
+      // still reach the reconnect ladder, or we are wedged exactly as before, one layer up.
+      const client = makeClient({
+        connect: (url, headers) => {
+          const s = new FakeSocket(url, headers);
+          s.terminate = () => {
+            throw new Error('already destroyed');
+          };
+          s.close = () => {}; // and close never emits either
+          sockets.push(s);
+          return s;
+        },
+      });
+      client.start();
+      sockets[0]!.emit('open');
+      vi.advanceTimersByTime(3000);
+      vi.advanceTimersByTime(1000); // reconnectBaseMs
+      expect(sockets.length).toBe(2); // reconnected regardless
+      client.stop();
+    });
+
+    it('a token rejection landing AFTER stop() does not keep dialling', async () => {
+      // The shutdown race: stop() lands while openAsync is awaiting the token provider, the
+      // provider then rejects, and the catch used to reschedule — a shut-down daemon dialling and
+      // warning forever. `stopped` is re-checked inside scheduleReconnect now.
+      let rejectToken!: (e: Error) => void;
+      const client = makeClient({
+        token: () =>
+          new Promise((_, rej) => {
+            rejectToken = rej;
+          }),
+      });
+      client.start();
+      client.stop();
+      rejectToken(new Error('refresh failed'));
+      await Promise.resolve(); // let the catch run
+      await Promise.resolve();
+      vi.advanceTimersByTime(60_000);
+      expect(sockets.length).toBe(0); // never dialled, never rescheduled
+    });
+
+    it('a dead socket’s LATE close cannot disturb its replacement', () => {
+      // Handlers are socket-scoped: a terminated socket may still emit 'close' afterwards, and an
+      // unscoped handler would stop the new socket's heartbeat and stack a second reconnect.
+      const client = makeClient();
+      client.start();
+      const first = sockets[0]!;
+      first.emit('open');
+      vi.advanceTimersByTime(3000); // deadline → torn down, transition ran
+      vi.advanceTimersByTime(1000); // reconnect dialled
+      expect(sockets.length).toBe(2);
+      const second = sockets[1]!;
+      second.emit('open');
+      first.emit('close'); // the echo from the dead socket's actual close
+      vi.advanceTimersByTime(1000);
+      // The new socket's heartbeat is still running (it sent this beat) and no third dial happened.
+      expect(second.msgs().some((m) => m.type === 'heartbeat')).toBe(true);
+      expect(sockets.length).toBe(2);
+      client.stop();
+    });
+
+    it('prefers terminate() over close() — a half-open socket never completes the handshake', () => {
+      let terminated = 0;
+      const client = makeClient({
+        connect: (url, headers) => {
+          const s = new FakeSocket(url, headers);
+          s.terminate = () => {
+            terminated += 1;
+            s.close(); // ws's terminate destroys and emits close; the fake models that
+          };
+          sockets.push(s);
+          return s;
+        },
+      });
+      client.start();
+      sockets[0]!.emit('open');
+      vi.advanceTimersByTime(4000);
+      expect(terminated).toBe(1);
+      client.stop();
+    });
+
+    it('any inbound frame is proof of life — pongs reset the deadline', () => {
+      const client = makeClient();
+      client.start();
+      const s = sockets[0]!;
+      s.emit('open');
+      // Healthy idle connection: the server answers each beat's ping.
+      for (let i = 0; i < 10; i++) {
+        vi.advanceTimersByTime(1000);
+        s.emit('message', JSON.stringify({ type: 'pong' }));
+      }
+      expect(s.closed).toBe(false);
+      expect(sockets.length).toBe(1); // never reconnected
+      client.stop();
+    });
+
+    it('run traffic counts as life even when pongs go missing', () => {
+      // Requiring the pong specifically would tear down a healthy connection that is busy — a
+      // frame is a frame, whatever its type, and liveness is a transport question.
+      const client = makeClient();
+      client.start();
+      const s = sockets[0]!;
+      s.emit('open');
+      for (let i = 0; i < 6; i++) {
+        vi.advanceTimersByTime(1000);
+        s.emit('message', JSON.stringify({ type: 'run.assigned', run: RUN }));
+      }
+      expect(s.closed).toBe(false);
+      expect(sockets.length).toBe(1);
+      client.stop();
+    });
   });
 
   it('routes registered / run.assigned / run.cancel to handlers', () => {

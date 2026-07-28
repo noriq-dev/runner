@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { AgentTool, RunBudget, RunEffort } from './runner';
+import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
@@ -75,6 +75,11 @@ export type KindPermissions = z.infer<typeof KindPermissions>;
  * an ordinary thing to want, and so is the reverse.
  */
 export const ModelDefault = z.object({
+  // The agent coordinate (RUN-113): `claude.opus-4_8.high` — the canonical per-kind selector.
+  // When set it WINS; `model`/`effort` below are the legacy triple, kept as the fallback for one
+  // deprecation window. A free string (the runner's coordinate parser validates it), not an enum —
+  // model ids are the vendor's and change weekly, exactly the reason `model` is a free string.
+  agent: z.string().nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
 });
@@ -112,6 +117,10 @@ export const VerifyReviewer = z.object({
    * vendor's) — name `model` here or take the tool's own default. A tool with no driver on the
    * machine fails the gate loudly rather than silently reviewing with the builder's vendor.
    */
+  // The reviewer's agent coordinate (RUN-113): `codex.gpt-5_6-sol.high` names tool+model+effort in
+  // one string. When set it WINS over `tool`/`model`/`effort` below (the legacy triple), and its
+  // tool segment IS honored — a reviewer on a different vendor is the whole point of RUN-70.
+  agent: z.string().nullable().default(null),
   tool: AgentTool.nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
@@ -147,6 +156,15 @@ export const VerifySpec = z
      * cmd.exe handling the common case correctly.
      */
     shell: z.string().min(1).nullable().default(null),
+    /**
+     * How many FAIL→fix→re-verify rounds the daemon hands a failing `cmd` back to the LIVE
+     * builder before the run stops and a human picks it up (RUN-94). The floor half of the
+     * knob `[verify.agent]` already commits: RUN-29 wired the feedback loop but hardcoded
+     * RUN-21's K=2, so a repo whose suite needs a wider bound (or a pure gate) had no say.
+     * 0 = one verify, no hand-back. The budget still applies underneath — a loop cannot
+     * outrun its ceiling. Only meaningful with `cmd`; the reviewer's loop is `agent.maxRounds`.
+     */
+    maxRounds: z.number().int().min(0).max(5).default(2),
     agent: VerifyReviewer.nullable().default(null),
   })
   .refine((v) => v.cmd !== null || v.agent !== null, {
@@ -212,6 +230,70 @@ export const LandPolicy = z.object({
 });
 export type LandPolicy = z.infer<typeof LandPolicy>;
 
+/**
+ * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
+ * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
+ * because scope is, and no field here can change that (the write floor is enforced in the runner,
+ * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
+ * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
+ * (scope/build/verify) are always present and need no declaration.
+ */
+export const WorkflowDef = z.object({
+  // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
+  base: RunKind,
+  // A prompt template name or inline text overriding the base's default brief (RUN-121). Null =
+  // use the base's own prompt, exactly as the built-in kind would.
+  prompt: z.string().nullable().default(null),
+});
+export type WorkflowDef = z.infer<typeof WorkflowDef>;
+
+/**
+ * What the repo knows about itself and every agent has been made to rediscover (RUN-128).
+ *
+ * A build agent's brief has carried the task and nothing else: no orientation, no conventions,
+ * no "read this first". So each run spends its most valuable early context re-deriving what the
+ * repo already knows and could simply have said — and derives it slightly differently each time.
+ * This is the repo saying it once, in the committed marker, so every teammate's runner briefs
+ * agents identically.
+ *
+ * Declarative on purpose: these are PATHS and short steers, never file contents. The daemon
+ * resolves them against the repo root and confines them there — a committed file naming
+ * `../../.ssh/id_rsa` is a repo asking the daemon to read outside itself, and the answer is no.
+ */
+export const ProjectContext = z.object({
+  // Read these before changing anything. The daemon names them here and (RUN-129) inlines their
+  // contents under a size budget, so order them by how much an agent needs them.
+  requiredReading: z.array(z.string().min(1)).default([]),
+  // Where to start reading the code — architectural entry points, not an index of the repo.
+  entryPoints: z.array(z.string().min(1)).default([]),
+  // Short, non-negotiable steers ("ESM only", "no barrel files"). Deliberately terse: anything
+  // needing a paragraph belongs in a `requiredReading` document, where it can be maintained
+  // as prose rather than rotting in a TOML array.
+  conventions: z.array(z.string().min(1)).default([]),
+  /**
+   * What to do with the repo's conventional agent-instruction files — CLAUDE.md, AGENTS.md — when
+   * this section declares no `requiredReading` of its own (RUN-155).
+   *
+   * `inline` (the default) reproduces them in the brief, which is RUN-129's behaviour and the
+   * right one for most repos: the file was written to steer a coding agent and every agent that
+   * had to go and find it spent context doing so.
+   *
+   * The other two exist because an empty `requiredReading` cannot say this. After zod defaults an
+   * empty array is indistinguishable from an absent one, so a repo had no way to decline — and two
+   * kinds of repo want to:
+   *
+   * - `name` tells the agent the file exists and leaves it to read it. For a large instructions
+   *   file aimed at humans as much as agents, pre-loading it spends more context than the agent
+   *   would have spent reading the part it needed.
+   * - `off` says nothing at all. For a repo whose CLAUDE.md is not addressed to this kind of agent.
+   *
+   * It governs ONLY the fallback. A repo that declares `requiredReading` has already said what it
+   * wants and that list is always inlined.
+   */
+  agentInstructions: z.enum(['inline', 'name', 'off']).default('inline'),
+});
+export type ProjectContext = z.infer<typeof ProjectContext>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -228,6 +310,10 @@ export const ProjectManifest = z.object({
   // silently rebound. Null = the project's default board, exactly as before.
   board: z.string().min(1).max(80).nullable().default(null),
   verify: VerifySpec.nullable().default(null),
+  // What the repo tells every agent about itself before it starts (RUN-128). Empty = today's
+  // behaviour, a brief carrying only the task. Not part of the security floor: getting this
+  // wrong costs an agent orientation, never safety.
+  context: ProjectContext.prefault({}),
   tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
   defaultBranch: z.string().nullable().default(null),
   // null = no auto-landing; every run's diff waits on its own branch for a human.
@@ -237,6 +323,10 @@ export const ProjectManifest = z.object({
   // still override per run. Not part of the security floor — unlike `permissions`, getting this
   // wrong costs money or quality, never safety.
   defaults: KindDefaults.prefault({}),
+  // Repo-defined workflows (RUN-119), keyed by name: named variants of a built-in kind with their
+  // own prompt. The three built-ins are always available and are NOT listed here; a name that
+  // collides with a built-in is ignored in favour of the built-in (a repo cannot redefine `build`).
+  workflows: z.record(z.string(), WorkflowDef).default({}),
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
 

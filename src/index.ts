@@ -62,6 +62,27 @@ export {
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
 export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from './prompts';
 export {
+  AGENT_INSTRUCTION_FILES,
+  CONTEXT_BUDGET_CHARS,
+  REVIEWER_CONTEXT_MAX_CHARS,
+  defaultDocReader,
+  defaultPathProbe,
+  discoverAgentInstructions,
+  loadRepoContext,
+  loadRepoContextBrief,
+  loadRepoDocs,
+  openConfined,
+  renderRepoContext,
+  resolveRepoContext,
+  type ContextRejection,
+  type DocReader,
+  type InlinedDoc,
+  type LoadedRepoDocs,
+  type PathProbe,
+  type ResolvedRepoContext,
+  type UnresolvedPath,
+} from './repo-context';
+export {
   parseFindings,
   parseFindingResponses,
   buildLedger,
@@ -79,6 +100,7 @@ export {
   resumePrompt,
   type ParkedRun,
 } from './parked';
+export { ContinuableStore, DEFAULT_CONTINUABLE_PATH, type ContinuableRun } from './continuable';
 export {
   defaultKey,
   detectEcosystem,
@@ -93,8 +115,33 @@ export {
   type LandChoices,
   type ManifestChoices,
 } from './init-project';
+export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
+export {
+  BUILTIN_WORKFLOWS,
+  type Workflow,
+  type WorkflowStage,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  runWorkflow,
+  stageOf,
+  workflowFor,
+} from './workflow';
+export {
+  type AgentCoordinate,
+  coordinateFromParts,
+  formatCoordinate,
+  mergeCoordinate,
+  parseCoordinate,
+  tryParseCoordinate,
+} from './agent-coordinate';
 export { detectTools } from './tools';
-export { buildRegistration, type RegistrationParams, type RunnerRegistration } from './registration';
+export {
+  agentCatalog,
+  buildRegistration,
+  type AdvertisedAgent,
+  type RegistrationParams,
+  type RunnerRegistration,
+} from './registration';
 export {
   NoriqClient,
   type NoriqClientOptions,
@@ -124,6 +171,8 @@ export {
 export { AsyncQueue } from './async-queue';
 export {
   type AgentDriver,
+  type DriverCapabilities,
+  type DriverCatalog,
   type DriverSession,
   type DriverStartOptions,
   type DriverHandlers,
@@ -152,11 +201,43 @@ export {
   type CodexSandbox,
 } from './drivers/codex';
 export { superviseBudget, totalTokens, type BudgetRun, type BudgetBreach } from './drivers/budget';
+export { reserveFromRun, exceedsRun, type BudgetReservation, type RunSpend } from './run-budget';
+export {
+  RUN_STAGES,
+  declaredTerminals,
+  clampStagesToWorkflow,
+  stage,
+  stagesFor,
+  type RunStage,
+  type StageActor,
+  type StageBudget,
+  type StageName,
+  type StageRetry,
+} from './run-machine';
+export {
+  prepareRun,
+  executeRun,
+  LOG_TAIL_CAP,
+  type PrepareHost,
+  type PrepareOutcome,
+  type PreparedRun,
+  type ExecuteHost,
+  type ExecuteOutcome,
+  type ExecutePlan,
+  type RunPipeline,
+  type StageHost,
+  type StageImpl,
+} from './stages';
 export {
   RunSupervisor,
   RunTally,
   assemblePrompt,
   cmdVerify,
+  runCommitMessage,
+  runCoordinate,
+  resolveAgentTool,
+  resolveModel,
+  effectiveKind,
   mergeBudget,
   mergeModelUsage,
   telemetryFromSpent,
@@ -168,6 +249,8 @@ export { RunTranscript, nullTranscript, type RunLogRole, type RunLogSegment } fr
 export {
   runVerify,
   verifyFailureComment,
+  verifyFixRounds,
+  MAX_VERIFY_FIXES,
   DEFAULT_VERIFY_TIMEOUT_SECONDS,
   type VerifySpec,
   type VerifyResult,
@@ -175,13 +258,45 @@ export {
 } from './verify';
 export {
   assembleVerifyPrompt,
+  judgeWithAcceptance,
   parseVerdict,
+  readEscalation,
   verifyAgentComment,
+  ESCALATION_INSTANCE_FLOOR,
+  type EscalationReading,
+  type ReviewEscalation,
   type Verdict,
   type VerifyVerdict,
 } from './verify-agent';
 export {
+  acceptanceOverflow,
+  acceptanceSummary,
+  enumerateAcceptance,
+  failedAcceptance,
+  reconcileAcceptance,
+  renderAcceptanceChecklist,
+  renderAcceptanceReport,
+  unverifiedAcceptance,
+  MAX_ACCEPTANCE_ITEMS,
+  type AcceptanceEvidence,
+  type AcceptanceItem,
+  type AcceptanceKind,
+  type AcceptanceOutcome,
+  type AcceptanceReport,
+} from './acceptance';
+export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
+export {
+  checkSteps,
+  planWaves,
+  renderSteps,
+  MAX_STEPS,
+  type CheckedSteps,
+  type StepFinding,
+} from './steps';
+export {
   assembleReviewerPrompt,
+  reviewerContestPrompt,
+  reviewerEscalationComment,
   reviewerFeedbackPrompt,
   reviewerRejectionComment,
   type ReviewerPromptContext,
@@ -189,13 +304,37 @@ export {
 export type {
   IntegrateResult,
   LeaseOptions,
+  LockContext,
+  LockOutcome,
   PublishResult,
   ShareResult,
   VcsBackend,
   Workspace,
 } from './vcs/types';
-export { GitBackend, type GitOps } from './vcs/git';
+export {
+  LockClient,
+  parseToolReply,
+  type AcquireInput,
+  type AcquireResult,
+  type CheckResult,
+  type LockClientOptions,
+  type LockConflict,
+  type LockGrant,
+} from './lock-client';
+export { GitBackend, type GitOps, type LockDelegate } from './vcs/git';
+export {
+  LockEnforcer,
+  lockFloorComment,
+  denyReason,
+  extractPaths,
+  parseBashTargets,
+  lockPathsForTool,
+  toRepoRelative,
+  type LockEnforcerDeps,
+  type LockAcquireOutcome,
+} from './lock-hooks';
 export { detectVcs, parseDvRepoList, type DetectDeps, type VcsDetection } from './vcs/detect';
+export { VCS_VOCAB, vocabFor, type VcsKind, type VcsVocab } from './vcs/vocab';
 export { PerforceBackend, realP4Cli, type P4Cli, type PerforceBackendOpts } from './vcs/perforce';
 export {
   DiversionBackend,
@@ -213,9 +352,11 @@ export {
   runBranch,
   setReadOnly,
   setWritable,
+  comparableWorktreePath,
   DEFAULT_WORKTREES_DIR,
   WORKTREE_BRANCH_PREFIX,
   type WorktreeInfo,
   type CreateWorktreeOptions,
   type GitRunner,
 } from './worktree';
+export * from './repo-intel';

@@ -64,3 +64,51 @@ describe('RunTranscript', () => {
     ]);
   });
 });
+
+// A CONTINUED run is a second sitting under the SAME run id, and the server stores segments under
+// PRIMARY KEY (run_id, seq) written with INSERT OR IGNORE — the dedupe that makes redelivery after
+// a reconnect harmless. A sitting that numbers from zero therefore collides with everything the
+// last one wrote and is discarded without a word (RUN-183). Measured live: 49 minutes of work,
+// zero recorded segments, and no way for a human to tell working from stalled.
+describe('a continuation resumes the numbering (RUN-183)', () => {
+  it('numbers above the previous sitting instead of colliding with it', () => {
+    const first: RunLogSegment[] = [];
+    const a = new RunTranscript((s) => first.push(...s));
+    a.text('agent', 'sitting one');
+    a.flush();
+    a.milestone('run finished: failed');
+    const resumeFrom = a.nextSeq();
+
+    const second: RunLogSegment[] = [];
+    const b = new RunTranscript((s) => second.push(...s));
+    b.seedFrom(resumeFrom);
+    b.text('agent', 'sitting two');
+    b.flush();
+
+    // Not one seq in common — every segment of the second sitting is a row the server will accept.
+    const used = new Set(first.map((s) => s.seq));
+    expect(second.every((s) => !used.has(s.seq))).toBe(true);
+    expect(second[0]!.seq).toBe(resumeFrom);
+  });
+
+  it('refuses to reseed once it has already spoken', () => {
+    // A transcript with a reader following it must not have its numbering moved underneath them.
+    const out: RunLogSegment[] = [];
+    const t = new RunTranscript((s) => out.push(...s));
+    t.text('agent', 'already talking');
+    t.flush();
+    t.seedFrom(500);
+    t.text('agent', 'next');
+    t.flush();
+    expect(out[1]!.seq).toBe(1); // continued its own stream, not the seed
+  });
+
+  it('an older continuation record (no seq) starts at zero, exactly as before', () => {
+    const out: RunLogSegment[] = [];
+    const t = new RunTranscript((s) => out.push(...s));
+    t.seedFrom(0);
+    t.text('agent', 'x');
+    t.flush();
+    expect(out[0]!.seq).toBe(0);
+  });
+});

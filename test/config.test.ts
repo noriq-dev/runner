@@ -14,7 +14,7 @@ describe('parseRunnerConfig', () => {
     expect(cfg.server).toBe('https://noriq.example');
     expect(cfg.concurrency).toBe(1); // default
     expect(cfg.tools).toBeNull(); // default
-    expect(cfg.budget).toEqual({ maxTokens: null, maxUsd: null, maxDurationSeconds: null });
+    expect(cfg.budget).toEqual({ maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null });
     expect(cfg.scanRoots).toEqual([path.resolve('/home/you/code')]);
   });
 

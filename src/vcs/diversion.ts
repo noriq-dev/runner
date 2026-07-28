@@ -3,7 +3,16 @@ import { readFile, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { IntegrateResult, LeaseOptions, PublishResult, VcsBackend, Workspace } from './types';
+import type { LockDelegate } from './git';
+import type {
+  IntegrateResult,
+  LeaseOptions,
+  LockContext,
+  LockOutcome,
+  PublishResult,
+  VcsBackend,
+  Workspace,
+} from './types';
 
 const execFileP = promisify(execFile);
 
@@ -135,6 +144,11 @@ export interface DiversionBackendOpts {
   repoId: string;
   http?: DvHttp;
   cli?: DvCli;
+  /** The Noriq lock view (RUN-100). Diversion's own soft locks are Pro-gated, so the runner's
+   *  cross-run coordination + the unified dashboard live in the Noriq lock primitive (the same
+   *  primitive git uses); the native soft lock is layered on best-effort and DEGRADES to the
+   *  Noriq layer alone when the workspace isn't Pro. Absent → native only / reports disabled. */
+  locks?: LockDelegate;
 }
 
 interface MergeConflict {
@@ -153,6 +167,7 @@ export class DiversionBackend implements VcsBackend {
   private readonly repoId: string;
   private readonly http: DvHttp;
   private readonly cli: DvCli;
+  private readonly locks?: LockDelegate;
   /**
    * The pool-of-1 lease: one exclusive occupant of the repo's workspace at a time, in-process.
    * A promise chain rather than a mutex object so a crashed lease (rejected promise) does not
@@ -168,18 +183,30 @@ export class DiversionBackend implements VcsBackend {
     this.repoId = opts.repoId;
     this.http = opts.http ?? realDvHttp();
     this.cli = opts.cli ?? realDvCli;
+    this.locks = opts.locks;
   }
 
   private api(method: string, p: string, body?: unknown) {
     return this.http(method, `/repos/${encodeURIComponent(this.repoId)}${p}`, body);
   }
 
+  /**
+   * The branch's tip, or null when the branch does not exist yet — which is an ANSWER: a run that
+   * has committed nothing has no branch, and that is the ordinary state of a fresh lease.
+   *
+   * A 200 carrying no `commit_id` is not that (RUN-157). It is a branch the server says exists and
+   * then declines to describe, and it used to collapse into the same null — so `hasWork` reported
+   * "no work" for a response it could not read at all, and the caller acts on `false` by disposing.
+   */
   private async branchHead(branch: string): Promise<string | null> {
     const res = await this.api('GET', `/branches/${encodeURIComponent(branch)}`);
     if (res.status === 404) return null;
     if (res.status !== 200) throw new Error(`branch lookup for ${branch} failed: HTTP ${res.status}`);
     const b = res.body as { commit_id?: string; branch_id?: string };
-    return b.commit_id ?? null;
+    if (!b.commit_id) {
+      throw new Error(`branch ${branch} exists but reported no commit — cannot tell what it holds`);
+    }
+    return b.commit_id;
   }
 
   async lease(repoRoot: string, runId: string, opts?: LeaseOptions): Promise<Workspace> {
@@ -202,6 +229,26 @@ export class DiversionBackend implements VcsBackend {
       const branch = `noriq/run/${runId}`;
       const { stdout: baseBranchRaw } = await this.cli(['branch-name'], repoRoot);
       const baseBranch = baseBranchRaw.trim();
+
+      // Continue a failed run (RUN-93): the run's OWN branch already exists server-side from a kept
+      // prior attempt — dispose preserves it (§9), so a re-dispatch of the same run id finds it
+      // here. Adopt it: `POST /branches` would 409 on the existing name, and re-forking would
+      // abandon the work the prior attempt committed. `hasWork` compares the branch head to
+      // `baseId`, so the current line head as base makes the branch's own commits read as work.
+      const priorHead = opts?.fromRunId ? null : await this.branchHead(branch);
+      if (priorHead !== null) {
+        const baseId = (await this.branchHead(baseBranch)) ?? priorHead;
+        await this.cli(['checkout', branch, '--discard-changes', '--ignore-shelf'], repoRoot);
+        return {
+          runId,
+          localPath: repoRoot,
+          readOnly: opts?.readOnly ?? false,
+          baseId,
+          workRef: branch,
+          location: { repoId: this.repoId, branch, baseBranch } satisfies DvLocation,
+        };
+      }
+
       const from = opts?.fromRunId ? `noriq/run/${opts.fromRunId}` : baseBranch;
 
       const baseId = await this.branchHead(from);
@@ -430,5 +477,63 @@ export class DiversionBackend implements VcsBackend {
       if (b.branch_name?.startsWith('noriq/run/')) opts?.onSkip?.(b.branch_name);
     }
     return 0;
+  }
+
+  /**
+   * Locking on Diversion (RUN-100): the Noriq lock view is the AUTHORITATIVE cross-run
+   * coordination layer (same primitive as git — so two runner runs contend uniformly and the
+   * dashboard is unified), and Diversion's own SOFT LOCK is layered on best-effort after a grant.
+   *
+   * Soft locks are Pro-gated: on a non-Pro workspace the native call fails, and locking DEGRADES
+   * to the Noriq layer alone (RUN-100) — which is fully functional, just without dv's own file
+   * indicator. The native call never fails the grant the Noriq view already made. The exact dv
+   * soft-lock endpoint shape is confirmed at the RUN-107 dogfood against a live Pro workspace;
+   * until then the degrade path is the guaranteed one.
+   */
+  async lock(ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> {
+    if (!this.locks || paths.length === 0) return { ok: true, enabled: false, locks: [] };
+    const r = await this.locks.acquire(ctx.token, {
+      projectId: ctx.projectId,
+      paths,
+      branch: ctx.branch,
+      taskId: ctx.taskId,
+    });
+    if (!r.ok) return { ok: false, conflicts: r.conflicts };
+    if (r.enabled) await this.nativeSoftLock(ws, paths, 'acquire');
+    return { ok: true, enabled: r.enabled, locks: r.locks };
+  }
+
+  async unlock(
+    ws: Workspace,
+    sel: { lockIds?: string[]; paths?: string[] },
+    ctx: LockContext,
+  ): Promise<void> {
+    if (!this.locks) return;
+    if (sel.paths?.length) await this.nativeSoftLock(ws, sel.paths, 'release');
+    await this.locks.release(ctx.token, ctx.projectId, sel);
+  }
+
+  async queryLocks(_repoRoot: string, paths: string[], ctx: LockContext) {
+    if (!this.locks || paths.length === 0) return { enabled: false, conflicts: [], mine: [] };
+    return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
+  }
+
+  /** Release the run's Noriq-view locks (RUN-104); dv soft locks (Pro) release with the
+   *  workspace's branch switch on dispose. */
+  async releaseRunLocks(_ws: Workspace, ctx: LockContext): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.releaseAllMine(ctx.token, ctx.projectId);
+  }
+
+  /** Best-effort Diversion soft lock over `paths`. Guarded whole: any failure (Pro-gated, offline,
+   *  endpoint drift) degrades silently to the Noriq layer, which already decided the outcome. */
+  private async nativeSoftLock(ws: Workspace, paths: string[], verb: 'acquire' | 'release'): Promise<void> {
+    try {
+      const loc = dvLocation(ws);
+      const method = verb === 'acquire' ? 'POST' : 'DELETE';
+      await this.api(method, '/locks', { branch: loc.branch, paths });
+    } catch {
+      /* soft locks are Pro-gated — the Noriq layer stands (RUN-100 graceful degrade) */
+    }
   }
 }

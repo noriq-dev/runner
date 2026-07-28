@@ -9,47 +9,103 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
-import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
+import type { ExecutionSpec } from '@noriq-dev/shared';
+import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
+import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
+import {
+  type Finding,
+  type LedgerEntry,
+  buildLedger,
+  parseFindingResponses,
+  parseFindings,
+} from './adjudication';
+import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
-import { superviseBudget, totalTokens } from './drivers/budget';
+import type { ContinuableRun, ContinuableStore } from './continuable';
+import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
   AgentDriver,
   DriverExit,
   DriverSession,
+  DriverStartOptions,
   DriverTelemetry,
   ModelUsage,
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
 import {
+  type CheckedExecutionSpec,
+  type SpecPathProbe,
+  checkExecutionSpec,
+  renderExecutionSpec,
+  renderUnreadableSpec,
+} from './execution-spec';
+import {
   type LandOutcome,
   assembleConflictPrompt,
-  landFailureComment,
   parseResolution,
   rejectTargetBranch,
   resolveLandBranch,
 } from './land';
+import type { LockConflict } from './lock-client';
+import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
-import { renderPrompt } from './prompts';
-import { noriqToolNamesFor } from './security';
+import { renderPrompt, renderTemplate } from './prompts';
+import { buildRepairSpec } from './repair';
+import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
+import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
+import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
+import { type StageName, stagesFor, stopBefore } from './run-machine';
+import { sanitizedAgentEnv } from './security';
+import {
+  type ExecuteHost,
+  type PatternMapHost,
+  type PlanCheckHost,
+  type PlanHost,
+  type PlannedRun,
+  type PrepareHost,
+  type PreparedRun,
+  type RunPipeline,
+  type StageHost,
+  type StageImpl,
+  checkPlan,
+  checkerFindings,
+  executeChain,
+  executeRun,
+  integrateStage,
+  mapPatterns,
+  planRun,
+  prepareRun,
+  renderAnalogs,
+  renderPriorSteps,
+  renderStepFocus,
+  reviewStage,
+  settleStage,
+  verifyStage,
+  worthMapping,
+} from './stages';
+import { authorSpecBlock, buildRunBrief } from './stages/brief';
+import type { StepSummary } from './stages/chain';
+import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
-import type { VcsBackend, Workspace } from './vcs/types';
+import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
+import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
 import {
-  MAX_VERIFY_FIXES,
-  type VerifyExec,
-  type VerifySpec,
-  runVerify,
-  verifyFailureComment,
-  verifyFeedbackPrompt,
-} from './verify';
-import { type VerifyVerdict, assembleVerifyPrompt, parseVerdict, verifyAgentComment } from './verify-agent';
+  type VerifyVerdict,
+  assembleVerifyPrompt,
+  judgeWithAcceptance,
+  readEscalation,
+} from './verify-agent';
+import { assembleReviewerPrompt, reviewerContestPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import {
-  assembleReviewerPrompt,
-  reviewerFeedbackPrompt,
-  reviewerNoVerdictComment,
-  reviewerRejectionComment,
-} from './verify-reviewer';
+  BUILTIN_WORKFLOWS,
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  runWorkflow,
+  workflowFor,
+} from './workflow';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -82,7 +138,9 @@ export type SupervisorVcs = Pick<
 > &
   // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
-  Partial<Pick<VcsBackend, 'kind'>>;
+  // lock/unlock/queryLocks are optional the same way (RUN-98): a fake or lock-less backend omits
+  // them, and the supervisor treats absence as "no lock layer" (RUN-101/103).
+  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths' | 'releaseRunLocks'>>;
 
 export interface ResolvedRepo {
   root: string;
@@ -110,11 +168,19 @@ export interface RunReport {
   telemetry?: DriverTelemetry;
   /** Rolling tail of the agent's output for the live dashboard (RUN-22), tail-capped. */
   logTail?: string;
+  /**
+   * The execution spec this run was actually briefed with (RUN-166) — sent ONCE, when it is
+   * resolved, and absent on every other frame.
+   *
+   * The daemon is the writer rather than the server at dispatch, and that is the decision. A run
+   * whose task carried no spec gets one from the `plan` stage: a spec the server never sent and
+   * could not have recorded. Those are exactly the runs where "what was this agent told?" matters
+   * most, because nobody wrote the contract beforehand — so a dispatch-time copy would be empty
+   * precisely where it is needed.
+   */
+  executedSpec?: ExecutionSpec;
   exit?: Record<string, unknown> | null;
 }
-
-/** How much of the agent's trailing output to stream as the live log tail. */
-const LOG_TAIL_CAP = 4000;
 
 export interface RunSupervisorDeps {
   /** One driver per tool (claude/codex). */
@@ -169,6 +235,42 @@ export interface RunSupervisorDeps {
    */
   checkClaimable?: (taskId: string) => Promise<{ claimable: boolean; reason: string | null } | null>;
   /**
+   * Dispatch-time predictive locking (RUN-103): the DECLARED file scope of a run, if one is
+   * known, so the daemon can take its locks before the agent starts and refuse a dispatch that
+   * would clash — extending the RUN-81 phase-gate backstop from "is the task claimable" to "are
+   * its files free".
+   *
+   * Honest by construction: no run carries a declared scope on the wire today, so this is a
+   * PLUGGABLE resolver (a future dispatch field / task metadata), and when it is absent or yields
+   * nothing the predictive layer no-ops — the reactive hook (RUN-101) and hard floor (RUN-102)
+   * remain the guarantee. Paths are repo-relative.
+   */
+  resolveLockScope?: (
+    run: Run,
+    /** The anchor task's execution spec (RUN-142) — its `anticipatedFiles` is the first thing that
+     *  declares, before any work, which files a run intends to touch. Null when it has none. */
+    spec: ExecutionSpec | null,
+  ) => Promise<string[] | null> | string[] | null;
+  /** How `[context]` paths are checked to exist and stay inside the repo (RUN-128). Injected so
+   *  tests never touch a real tree; omitted → the real fs probe. */
+  pathProbe?: PathProbe;
+  /** How an execution spec's paths are checked (RUN-139). A separate seam from `pathProbe`
+   *  because it answers a richer question — file vs directory, gone vs could-not-look — that
+   *  `[context]` deliberately collapses. Omitted → the real fs probe. */
+  specPathProbe?: SpecPathProbe;
+  /** Write a planned spec back onto the anchor task (RUN-140). Omitted → the spec is used for this
+   *  run and not persisted, which costs reusability and a human's chance to correct it. */
+  saveExecutionSpec?: (projectId: string, taskId: string, spec: ExecutionSpec) => Promise<boolean>;
+  /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
+   *  which is exactly the behaviour before it existed. */
+  repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
+  /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
+   *  omitted → the real fs. */
+  readDoc?: DocReader;
+  /** Characters of inlined documentation allowed into one brief (RUN-129). Omitted →
+   *  `CONTEXT_BUDGET_CHARS`. Present for tests and for a future per-repo knob, if one earns itself. */
+  contextBudget?: number;
+  /**
    * Is this Run parked on a human, and have they answered? (→ NoriqClient.getParkState, RUN-30)
    *
    * The server is the authority: only it saw the `request_input`, because the agent reaches
@@ -178,12 +280,22 @@ export interface RunSupervisorDeps {
   getParkState?: (runId: string) => Promise<ParkState>;
   /** Where parked runs are remembered across restarts (RUN-30). Omitted → parking is off. */
   parked?: Pick<ParkedStore, 'park' | 'get' | 'unpark' | 'list'>;
+  /** Where a failed build's continuation state (spend + adjudication ledger) is kept, so a
+   *  "continue a failed run" (RUN-91/92) re-seeds instead of resetting. Omitted → a continue still
+   *  works off the kept worktree, but reports only its own sitting's spend and re-derives findings. */
+  continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
   /** How long a park may sit before the daemon fails it (RUN-30). Default: DEFAULT_PARK_TTL_HOURS. */
   parkTtlHours?: number;
   /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
   steering?: {
     register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
     unregister: (runId: string) => void;
+    /** Has an operator cancelled this run (RUN-165)? Asked at every stage boundary, because a
+     *  cancel is a fact about the RUN and the pipeline is many sessions with gaps between them. */
+    isCancelled?: (runId: string) => boolean;
+    /** Drop the record once the run is terminal, so a long-lived daemon does not keep one entry
+     *  per cancelled run for its whole life. */
+    forget?: (runId: string) => void;
   };
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
@@ -209,6 +321,9 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
     maxTokens: runBudget?.maxTokens ?? fallback?.maxTokens ?? null,
     maxUsd: runBudget?.maxUsd ?? fallback?.maxUsd ?? null,
     maxDurationSeconds: runBudget?.maxDurationSeconds ?? fallback?.maxDurationSeconds ?? null,
+    // The reviewer-round override (PLNR-180/RUN-91) is the dispatch's alone — the machine fallback
+    // never sets it — but it merges per-dimension like the rest so it survives to the supervisor.
+    maxRounds: runBudget?.maxRounds ?? fallback?.maxRounds ?? null,
   };
 }
 
@@ -223,37 +338,76 @@ export function mergeBudget(runBudget?: RunBudget | null, fallback?: RunBudget |
  * model must still inherit the repo's effort for that kind, or the one field it set would
  * silently erase the other.
  */
-export function resolveModel(
-  run: Pick<Run, 'kind' | 'model' | 'effort'>,
-  manifest: ProjectManifest,
-): { model?: string; effort?: RunEffort } {
-  const repo = manifest.defaults?.[run.kind as RunKind];
-  const model = run.model ?? repo?.model ?? null;
-  const effort = run.effort ?? repo?.effort ?? null;
-  // Undefined rather than null: these become DriverStartOptions fields, and the drivers treat
-  // "absent" as "don't pass it", which is what lets the tool apply its own default.
-  return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+/**
+ * The dispatch's effective coordinate (RUN-114): the `agent` string when present, else one
+ * synthesized from the legacy `{agentTool, model, effort}` triple. A malformed wire coordinate
+ * falls back to the triple rather than sinking the run — the triple is always well-formed (its
+ * fields are wire-validated), so there is a safe answer. This is the ONE place the runner reconciles
+ * new-form and legacy-form dispatches; everything downstream reads a coordinate.
+ */
+export function runCoordinate(run: Pick<Run, 'agent' | 'agentTool' | 'model' | 'effort'>): AgentCoordinate {
+  const fromTriple = coordinateFromParts(run.agentTool, run.model, run.effort);
+  if (!run.agent) return fromTriple;
+  return tryParseCoordinate(run.agent) ?? fromTriple;
+}
+
+/** The driver a run selects — its coordinate's tool (RUN-114). Identical to `agentTool` for a
+ *  legacy dispatch that carries no coordinate. */
+export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' | 'effort'>): string {
+  return runCoordinate(run).tool;
 }
 
 /**
- * What a resumed run may still spend (RUN-30).
+ * The kind whose POSTURE a run actually runs under (RUN-126) — the daemon's authoritative answer,
+ * not the dispatcher's. When a run selects a custom `workflow`, its posture IS that workflow's base
+ * (a `docs` workflow based on `scope` is read-only), so the base wins over whatever `kind` the
+ * dispatch carried. This closes the footgun where a UI (or any client) selects a read-only workflow
+ * but leaves `kind = build`: the daemon holds the manifest and decides, so a mismatched dispatched
+ * kind can never escalate write. No workflow (or an unknown name) → the dispatched `kind` stands.
  *
- * Tokens and USD carry over as plain remainders: a run that parks and resumes has one budget for
- * its whole life, not one per sitting. Wall-clock does NOT — `activeSeconds` counts only time the
- * agent was actually running, because the wait for a human is not the run's fault and charging it
- * would mean any question answered after a lunch break returns to a run that is already dead.
+ * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
+ * inherited from its base — so it doubles as the posture kind.
  *
- * Floors at 1 rather than 0: a remainder of exactly zero would read as "no limit" to the budget
- * supervisor, turning an exhausted run into an unlimited one — the precise inversion of intent.
+ * NOT a deprecation window, whatever its neighbours are (settled by RUN-163). Accepting a bare
+ * `kind` looks like back-compat for dispatchers that predate `workflow`, and removing it on that
+ * reading would delete a security property: the rule is that the DAEMON decides posture from the
+ * manifest it holds, so no client can escalate write by naming a kind. That has to survive any
+ * tidying of the surrounding compatibility shims, and it is the reason this function exists rather
+ * than reading `run.kind` at each site.
  */
-export function remainingBudget(budget: RunBudget | null, spent: ParkedRun): RunBudget | undefined {
-  if (!budget) return undefined;
-  const left = (max: number | null, used: number) => (max == null ? null : Math.max(1, max - used));
-  return {
-    maxTokens: left(budget.maxTokens, spent.spent.tokens),
-    maxUsd: budget.maxUsd == null ? null : Math.max(0.01, budget.maxUsd - spent.spent.usd),
-    maxDurationSeconds: left(budget.maxDurationSeconds, spent.activeSeconds),
-  };
+export function effectiveKind(
+  run: Pick<Run, 'kind' | 'workflow'>,
+  manifest: Pick<ProjectManifest, 'workflows'>,
+): RunKind {
+  const wf = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  const kind = (wf?.promptShape ?? run.kind) as RunKind;
+  // A kind outside the union degrades to SCOPE rather than being passed through. Everything
+  // downstream indexes a fixed-key record with this — `manifest.permissions[kind]`,
+  // `manifest.defaults[kind]`, `noriqToolNamesFor(kind)` — and an unrecognised key yields
+  // `undefined`, which the write clamp then throws on. A WS dispatch is schema-validated, but a
+  // PARKED run is rehydrated from JSON on disk without revalidation, so this is reachable. Scope
+  // because a fallback that guessed `build` would answer "I don't recognise this" with "then you
+  // may write and land".
+  // `Object.hasOwn`, not `in` — see the note on `isBuiltinId`: `'toString' in BUILTIN_WORKFLOWS` is
+  // true, which would wave through the exact keys this guard exists to catch.
+  return Object.hasOwn(BUILTIN_WORKFLOWS, kind) ? kind : 'scope';
+}
+
+export function resolveModel(
+  run: Pick<Run, 'kind' | 'agent' | 'agentTool' | 'model' | 'effort'>,
+  manifest: ProjectManifest,
+): { model?: string; effort?: RunEffort } {
+  const repo = manifest.defaults?.[run.kind as RunKind];
+  // Precedence, most specific first: the dispatch coordinate (RUN-114, which already folds the
+  // agent string OR the legacy triple) → the repo `[defaults.<kind>].agent` coordinate (RUN-113) →
+  // the repo's legacy model/effort pair → the tool's own default (absence).
+  const dispatch = runCoordinate(run);
+  const repoCoord = repo?.agent ? tryParseCoordinate(repo.agent) : null;
+  const model = dispatch.model ?? repoCoord?.model ?? repo?.model ?? null;
+  const effort = dispatch.effort ?? repoCoord?.effort ?? repo?.effort ?? null;
+  // Undefined rather than null: these become DriverStartOptions fields, and the drivers treat
+  // "absent" as "don't pass it", which is what lets the tool apply its own default.
+  return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
 /** Sum two model mixes model-by-model, field-by-field (RUN-59). Absent on both sides → absent. */
@@ -280,6 +434,20 @@ export const mergeModelUsage = (
   }
   return out;
 };
+
+/**
+ * Fold ONE session's aggregate telemetry into the unattributed bucket (RUN-86). Reads the four
+ * token classes + cost off a `DriverTelemetry` (whose field names differ from `ModelUsage`'s:
+ * `cacheReadTokens`→`cacheReadInputTokens`, `costUsd`→`costUSD`) and adds them in — so the bucket
+ * carries exactly what this session contributed to the run totals, and the mix keeps summing.
+ */
+const addUnattributed = (acc: ModelUsage | undefined, t: DriverTelemetry): ModelUsage => ({
+  inputTokens: (acc?.inputTokens ?? 0) + t.inputTokens,
+  outputTokens: (acc?.outputTokens ?? 0) + t.outputTokens,
+  cacheReadInputTokens: (acc?.cacheReadInputTokens ?? 0) + t.cacheReadTokens,
+  cacheCreationInputTokens: (acc?.cacheCreationInputTokens ?? 0) + t.cacheCreationTokens,
+  costUSD: (acc?.costUSD ?? 0) + t.costUsd,
+});
 
 /** A park's prior spend, rehydrated as a telemetry snapshot to SEED a resumed run's tally (RUN-59).
  *  Prior tokens land in inputTokens — the split across the four buckets is not recoverable from the
@@ -308,18 +476,112 @@ export const telemetryFromSpent = (spent: ParkedRun['spent']): DriverTelemetry =
  * latest snapshot is the authoritative one — picking "the largest" would let a live over-count (or a
  * mix-less interim tick) beat the result that supersedes it.
  *
- * The aggregate mix is all-or-nothing: it exists only if EVERY slot that spent anything attributed
- * that spend by model. One un-attributed session (codex, the claude usage-fallback, a pre-RUN-59
- * park) → the run reports NO mix, not a partial one — a breakdown that omits a spending model would
- * not sum to the total beside it, which is the one thing the tooltip must never do.
+ * The mix must SUM to the run total beside it — that is the one thing the tooltip must never break.
+ * RUN-59 kept that by making the mix all-or-nothing: one un-attributed spending session (codex, the
+ * claude usage-fallback, a pre-RUN-59 park) dropped the WHOLE mix. But that discarded a Claude
+ * builder's perfectly good breakdown just because its reviewer was codex — the run showed "not
+ * reported" beside real, attributable spend. RUN-86 keeps the sum without the loss: un-attributable
+ * spend is folded into ONE reserved `(unattributed)` bucket carrying exactly what those sessions
+ * contributed to `acc`, so attributed models + the bucket still land on the total. The bucket is a
+ * real key the dashboard renders as "unattributed"; only a genuinely spend-less run has no mix.
  */
 export class RunTally {
   private readonly slots = new Map<string, DriverTelemetry>();
+  /** Agent-active seconds charged to this run so far — the wall-clock dimension's spend. Separate
+   *  from the slots because time is not telemetry: it accumulates, it is never last-writer-wins. */
+  private active = 0;
+
+  /**
+   * The run's ONE ceiling (RUN-133). Held here because the tally is already the run's cumulative
+   * spend and is already threaded to every place a session starts — so "what is left" is a
+   * subtraction on numbers this object has, rather than a second object following it everywhere.
+   * The POLICY is still `reserveFromRun`'s; this only carries the inputs.
+   *
+   * Null/absent = unbounded, which is what every existing caller and test means by omitting it.
+   */
+  constructor(
+    private readonly ceiling: RunBudget | null = null,
+    priorActiveSeconds = 0,
+  ) {
+    this.active = priorActiveSeconds;
+  }
 
   /** Record a session's latest snapshot. Last-writer-wins per slot (see class doc). */
   record(slot: string, t: DriverTelemetry): void {
     this.slots.set(slot, t);
   }
+
+  /** Charge a finished session's active stretch to the run. Sessions are strictly sequential in
+   *  this daemon — builder, then reviewer, then conflict turn — so these sum rather than overlap. */
+  chargeTime(seconds: number): void {
+    this.active += Math.max(0, seconds);
+  }
+
+  /** Agent-active seconds burned so far, including any prior sitting's. */
+  activeSeconds(): number {
+    return this.active;
+  }
+
+  /**
+   * What the NEXT session may spend: the run's ceiling minus everything already spent (RUN-133).
+   *
+   * Every `startAgent` goes through this instead of taking a fresh copy of the ceiling, which is
+   * what makes a run's total spend bounded rather than bounded-per-session. `{ ok: false }` means
+   * the caller must not spawn at all — see `reserveFromRun` for why that is a result and not a
+   * one-token budget.
+   */
+  reserve(): BudgetReservation {
+    return reserveFromRun(this.ceiling, { telemetry: this.total(), activeSeconds: this.active });
+  }
+
+  /**
+   * A LIVE spend check for one session, for `DriverStartOptions.spendGuard` (RUN-133).
+   *
+   * A reservation is a snapshot, and a session can outlive it: the builder's is computed before it
+   * starts, then the reviewer spends from the same ceiling, and the builder is handed work back.
+   * Checking its own cumulative against that stale allowance lets the RUN exceed its budget while
+   * no session ever breaches. This folds the live tick into the run's view under `slot` — the same
+   * last-writer-wins slot the session's result will land in — and asks the allocator.
+   *
+   * Recording rather than probing a copy is deliberate: the write is idempotent (a later tick and
+   * finally the authoritative result overwrite it), and it keeps ONE definition of the run's spend.
+   * It does not report anything; who publishes a frame is still each call site's decision (RUN-59).
+   */
+  guard(slot: string): (t: DriverTelemetry) => string | null {
+    return (t) => {
+      // A PROBE, never a write. Recording the live tick looked equivalent — same slot, and the
+      // authoritative result overwrites it moments later — but `stop()` fires an exit carrying ZERO
+      // telemetry, and last-writer-wins then erased the session's real spend from the run's total.
+      // A read-only check also keeps RUN-59's reporting contract exactly: a reviewer's live ticks
+      // still never enter the tally, so no frame can show a total climbing past a stale mix.
+      const probe = new Map(this.slots);
+      probe.set(slot, t);
+      // `exceedsRun`, NOT `reserve()`: a running session is over only when the run is strictly OVER
+      // its ceiling. `reserve()` answers "may I start another one", where landing exactly on the
+      // number is a no — using it here killed a session that spent precisely what it was allowed.
+      return exceedsRun(this.ceiling, { telemetry: this.sum(probe.values()), activeSeconds: this.active });
+    };
+  }
+
+  /**
+   * The wall-clock counterpart of `guard`, for `DriverStartOptions.clockGuard` (RUN-159): seconds
+   * left on the run, right now.
+   *
+   * Reads `active` rather than probing like `guard` does, because time is not telemetry — a
+   * session's stretch is charged once, when it ends, so there is no in-flight figure to swap in.
+   * That also means the answer EXCLUDES the caller's own running stretch, which is correct: the
+   * session's own budget already covers that half, and the arming side takes the tighter of the two.
+   */
+  clockGuard(): () => number | null {
+    return () => {
+      const max = this.ceiling?.maxDurationSeconds;
+      return max == null ? null : Math.max(0, max - this.active);
+    };
+  }
+
+  /* `active` is only as good as the clock its callers time with, which is why every one of them
+   * uses `monotonicMs` — a wall-clock step would otherwise hand this ledger seconds nobody spent
+   * (or credit back seconds that were), and the budget layer would enforce against the drift. */
 
   /** Seed a slot only if empty — used for a park's prior spend, which must not clobber a live
    *  session that already recorded under the same slot. */
@@ -328,10 +590,20 @@ export class RunTally {
   }
 
   total(): DriverTelemetry {
+    return this.sum(this.slots.values());
+  }
+
+  /** Sum an arbitrary set of slot snapshots. Split out so `guard` can total a PROBE — the live
+   *  slots with one session's in-flight tick swapped in — without writing that tick anywhere. */
+  private sum(snapshots: Iterable<DriverTelemetry>): DriverTelemetry {
     const acc = zeroTelemetry();
     let mix: Record<string, ModelUsage> | undefined;
-    let complete = true;
-    for (const t of this.slots.values()) {
+    // Spend from mix-less sessions, collected into the one reserved bucket (RUN-86) instead of
+    // nuking the whole mix. Each such session adds its OWN aggregate — the same numbers it puts in
+    // `acc` — so the bucket + the attributed models sum back to the total (codex lands here at $0,
+    // matching that `acc.costUsd` already books it at $0).
+    let unattributed: ModelUsage | undefined;
+    for (const t of snapshots) {
       acc.inputTokens += t.inputTokens;
       acc.outputTokens += t.outputTokens;
       acc.cacheReadTokens += t.cacheReadTokens;
@@ -341,18 +613,38 @@ export class RunTally {
       const spent =
         t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens > 0 || t.costUsd > 0;
       if (t.modelUsage) mix = mergeModelUsage(mix, t.modelUsage);
-      else if (spent) complete = false; // a spending session with no mix breaks the sum
+      else if (spent) unattributed = addUnattributed(unattributed, t);
     }
-    if (complete && mix) acc.modelUsage = mix;
+    // A mix exists if ANYTHING was attributed or anything was unattributed; only a spend-less run
+    // leaves both undefined (→ no mix, the daemon sends `{}` → the honest "not reported").
+    if (mix || unattributed) {
+      acc.modelUsage = { ...mix, ...(unattributed ? { [UNATTRIBUTED_MODEL_ID]: unattributed } : {}) };
+    }
     return acc;
   }
 }
 
 /** The anchor task's human-readable content, inlined into the prompt. */
+/**
+ * What the hard lock floor (RUN-102) concluded. `conflicts` is what it FOUND; `unknownScope` is
+ * the case it could not look at all (RUN-156) — kept apart because an empty `conflicts` used to
+ * mean both, and one of those is a pass while the other is a floor that never ran.
+ */
+export interface LockFloorOutcome {
+  conflicts: LockConflict[];
+  /** Set when the floor could not COMPLETE its check — the scope could not be enumerated, or the
+   *  lock service did not answer. Carries the underlying reason for the log and the comment. */
+  unchecked?: string;
+}
+
 export interface AnchorTask {
   key: string;
   title: string;
   body: string | null;
+  /** What this task was commissioned with (RUN-139). Null = nobody wrote one. */
+  executionSpec?: ExecutionSpec | null;
+  /** The SERVER holds a spec it could not read (RUN-135) — not the same as having none. */
+  executionSpecUnreadable?: boolean;
 }
 
 /**
@@ -361,7 +653,24 @@ export interface AnchorTask {
  * narrows through here instead of trusting the field.
  */
 export function cmdVerify(verify: ProjectManifest['verify']): VerifySpec | null {
-  return verify?.cmd ? { cmd: verify.cmd, timeoutSeconds: verify.timeoutSeconds, shell: verify.shell } : null;
+  return verify?.cmd
+    ? {
+        cmd: verify.cmd,
+        timeoutSeconds: verify.timeoutSeconds,
+        shell: verify.shell,
+        maxRounds: verify.maxRounds,
+      }
+    : null;
+}
+
+/**
+ * Commit message for a run checkpoint (RUN-96): WHAT changed on the subject line, the runner's
+ * attribution in the body. The old `noriq run <id>: <label>` order made every agent commit read
+ * identically in one-line history — the id nobody scans pushed the task key/title everybody
+ * scans off the right edge.
+ */
+export function runCommitMessage(runId: string, label: string): string {
+  return `${label}\n\nnoriq run ${runId}`;
 }
 
 /** Render the anchor. A bare task id tells the agent nothing — inline the title/body
@@ -383,7 +692,53 @@ function renderAnchor(run: Run, task?: AnchorTask | null): string {
 export function assemblePrompt(
   run: Run,
   manifest: ProjectManifest,
-  ctx: { agent: RunAgent; server: string; task?: AnchorTask | null; diffCmd?: string },
+  ctx: {
+    agent: RunAgent;
+    server: string;
+    task?: AnchorTask | null;
+    diffCmd?: string;
+    /** The resolved workflow (RUN-121). Default: the built-in for run.kind. A custom workflow with
+     *  a `promptRef` supplies its own brief; its inherited posture still drives everything else. */
+    workflow?: Workflow;
+    /** The repo's own orientation block, already resolved off disk (RUN-128). Optional: a marker
+     *  with neither a `[context]` nor a CLAUDE.md/AGENTS.md renders as it did before RUN-128. */
+    repoContext?: string;
+    /** The same facts with no inlined documents, for the verify family (RUN-154). */
+    repoContextBrief?: string;
+    /**
+     * The anchor task's execution spec, already checked against the checkout and rendered
+     * (RUN-139). A string for the same reason `repoContext` is: checking touches the disk, and
+     * prompt assembly stays synchronous and pure.
+     *
+     * Empty for a task with no spec, which stays the common case — every task filed before the
+     * contract grew one, and plenty since. The verify family does NOT receive it: a reviewer
+     * judging a diff against acceptance criteria is RUN-145's design, not a free extra here.
+     */
+    executionSpec?: string;
+    /**
+     * The same spec's ACCEPTANCE CRITERIA, numbered, for the verify family (RUN-139 → RUN-145).
+     *
+     * An actor that judges needs the standard it is judging against, not the author's working
+     * notes about which files to touch and what was deferred — that much was RUN-139. What RUN-145
+     * changes is the FORM: a judge is asked to answer each criterion with an outcome and a piece
+     * of evidence, and it can only do that against criteria that have numbers. The prose rendering
+     * this replaced is gone rather than kept alongside, because a model shown the same criteria
+     * twice answers the paragraph and skips the list.
+     */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
+    /**
+     * Render the PLANNER's brief instead of this workflow's own (RUN-140).
+     *
+     * A shape override rather than a workflow of its own: planning is a stage inside a build, not
+     * a different run — same repo, same task, same identity, same budget ledger. Giving it a
+     * `Workflow` would have made it declarable in a manifest, and a repo able to declare its own
+     * planner posture is exactly the widening `clampPermissionToWorkflow` exists to stop.
+     */
+    promptShapeOverride?: 'planner' | 'plan-checker' | 'pattern-mapper';
+    /** The adjudication ledger, for the plan checker's own prior-rounds section (RUN-141). */
+    ledger?: string;
+  },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
   // The daemon created this identity before the process existed and handed it a token that
@@ -399,15 +754,96 @@ export function assemblePrompt(
   const identity = renderPrompt('identity', {
     label: ctx.agent.label,
     agentId: ctx.agent.agentId,
-    kind: run.kind.toUpperCase(),
+    // The PLANNER announces itself as a planner (RUN-140). It ran as "BUILD agent … MODE: PLAN",
+    // which is a contradiction in the first two lines of a prompt, and the half of it that was
+    // wrong was the half describing what the agent may do.
+    kind:
+      ctx.promptShapeOverride === 'planner'
+        ? 'PLAN'
+        : ctx.promptShapeOverride === 'plan-checker'
+          ? 'PLAN CHECK'
+          : ctx.promptShapeOverride === 'pattern-mapper'
+            ? 'PATTERN MAP'
+            : run.kind.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
+    // The planner and the checker are spawned with NO `noriqMcp` (RUN-140/141), so the shared
+    // identity's "report your work through Noriq, call request_input if you are stuck" would be
+    // instructions to use tools that are not there — and a compliant model that tries one instead
+    // of answering produces no verdict, which is how an unchecked plan slips through.
+    noriq: !ctx.promptShapeOverride,
   });
 
-  if (run.kind === 'scope') {
-    return renderPrompt('scope', { identity, brief: run.brief, anchor });
+  // The repo's `[context]` block (RUN-128), rendered ahead of the brief for the scope and build
+  // families. A custom workflow's own prompt receives it as `{{context}}` but must PLACE that tag
+  // to get it — a template we do not control cannot have text injected into it. The verify family
+  // gets the NAMES-ONLY rendering instead (RUN-154), for the reason below.
+  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
+  // Which rendering an actor gets follows what it IS, not which template it uses. `verifyActor` is
+  // the flag that means "this one judges" — so a repo-defined workflow based on `verify` (RUN-119)
+  // gets the bounded, explicitly-untrusted block through its own `{{context}}` too, instead of 16k
+  // of inlined documents. Note it is NOT `produces`: scope produces a plan rather than a diff, but
+  // it is an author reading the repo, not a gate deciding on it.
+  const repoContext = (wf.verifyActor ? ctx.repoContextBrief : ctx.repoContext) ?? '';
+  // The verify family gets the ACCEPTANCE CRITERIA only — the same trim its context gets
+  // (RUN-154), for the same reason: what it needs is the standard, not the author's working
+  // notes about which files to touch and what was deferred. Withholding the whole spec was the
+  // first cut and it was wrong: a gate that has not been told what "done" means is not
+  // independent, it is under-informed, and it can pass a build that skipped a stated criterion.
+  // A verify actor gets its standard through the numbered checklist below, not as a spec block —
+  // hence '' here rather than a second rendering of the same criteria (RUN-145).
+  const executionSpec = wf.verifyActor ? '' : (ctx.executionSpec ?? '');
+
+  // The planner (RUN-140) reads the same facts as the run it briefs and asks for a spec instead of
+  // the work. Checked BEFORE `promptRef` so a custom workflow cannot shadow it: a repo shaping its
+  // build's brief must not silently reshape the planner that writes that build's spec.
+  if (ctx.promptShapeOverride === 'planner') {
+    return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
   }
-  if (run.kind === 'build') {
+  if (ctx.promptShapeOverride === 'pattern-mapper') {
+    return renderPrompt('pattern-mapper', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: ctx.executionSpec ?? '',
+    });
+  }
+  if (ctx.promptShapeOverride === 'plan-checker') {
+    return renderPrompt('plan-checker', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: ctx.executionSpec ?? '',
+      ledger: ctx.ledger ?? '',
+    });
+  }
+  if (wf.promptRef) {
+    // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
+    // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
+    // workflow's inherited posture (write floor, gates) still governs everything else.
+    return renderTemplate(wf.promptRef, {
+      identity,
+      server: ctx.server,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: executionSpec,
+      verifyCmd: manifest.verify?.cmd ?? '',
+      reviewer: manifest.verify?.agent ? 'true' : '',
+    });
+  }
+  if (wf.promptShape === 'scope') {
+    return renderPrompt('scope', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      spec: executionSpec,
+    });
+  }
+  if (wf.promptShape === 'build') {
     // The agent is NOT told to run the verify command (RUN-29). It used to be, and the daemon then
     // ran the SAME command itself as the actual gate — so the agent paid tokens and about a minute
     // to answer a question that got asked again, properly, right afterwards. Its run was advisory;
@@ -425,14 +861,93 @@ export function assemblePrompt(
       reviewer: Boolean(manifest.verify?.agent),
       brief: run.brief,
       anchor,
+      context: repoContext,
+      spec: executionSpec,
     });
   }
-  // verify kind (RUN-20): a fresh, independent, adversarial reviewer.
+  // verify kind (RUN-20): a fresh, independent, adversarial reviewer. It receives the repo's
+  // orientation by NAME only (RUN-154) — it is the actor asked whether a diff looks like this
+  // repo's code, so telling it nothing about this repo was backwards, but its context is already
+  // carrying the diff and inlining documents on top would crowd out the subject.
   return assembleVerifyPrompt(`${run.brief}${anchor}`, {
     agent: ctx.agent,
     server: ctx.server,
     diffCmd: ctx.diffCmd,
+    repoContext,
+    ...(ctx.acceptance?.length
+      ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+      : {}),
   });
+}
+
+/**
+ * What fraction of a run's remaining ceiling planning may take (RUN-140).
+ *
+ * A planner handed the whole remainder can spend it and leave the build it was meant to brief with
+ * nothing — a run that produced a perfect plan and no work. A quarter is a judgement, not a
+ * measurement: enough to read a repo and write a spec, and small enough that losing all of it
+ * still leaves a build worth starting.
+ */
+const PLAN_BUDGET_SHARE = 0.25;
+
+/** A budget nothing can be spent under. Handed to a builder whose run has nothing left, so the
+ *  spawn declines by the same rule every other stage does rather than by a special case. */
+const EXHAUSTED_BUDGET = { maxTokens: 0, maxUsd: 0, maxDurationSeconds: 1, maxRounds: null } as const;
+
+/** The planner's share of what the run has left. Null dimensions stay null: an unbounded run does
+ *  not acquire a planning ceiling nobody asked for. */
+function plannerBudget(remaining: RunBudget): RunBudget {
+  const share = (v: number | null) => (v == null ? null : Math.max(1, Math.floor(v * PLAN_BUDGET_SHARE)));
+  return {
+    maxTokens: share(remaining.maxTokens),
+    maxUsd: remaining.maxUsd == null ? null : Math.max(0.01, remaining.maxUsd * PLAN_BUDGET_SHARE),
+    maxDurationSeconds: share(remaining.maxDurationSeconds),
+    maxRounds: remaining.maxRounds,
+  };
+}
+
+/**
+ * The planner's permission profile (RUN-140).
+ *
+ * `clampPermissionToWorkflow` at the verify posture forces `write = false`, which is the floor
+ * every judging actor gets — but `auto` deliberately SURVIVES that clamp (RUN-68, and CLAUDE.md
+ * says so), and `auto` on Claude means bypass-permissions with unrestricted Bash. The planner runs
+ * inside a BUILD's worktree, which is physically writable, so a repo with `[permissions.build]
+ * auto = true` would have handed a "read-only" planner a shell in a writable tree.
+ *
+ * So it is dropped here rather than in the clamp. The clamp's behaviour is a documented, deliberate
+ * boundary a repo opts into for its own agents; this is a NEW actor the repo never opted anything
+ * into, and it has no use for a shell — it reads files and emits JSON.
+ */
+export function plannerPermission(base: PermissionProfile): PermissionProfile {
+  return { ...clampPermissionToWorkflow(base, BUILTIN_WORKFLOWS.verify), auto: false };
+}
+
+/** The tighter of two remainders, per dimension. Null on either side means "unbounded there", so
+ *  the other one wins; null on both leaves the dimension unbounded. */
+function tighter(a: RunBudget | undefined, b: RunBudget | undefined): RunBudget | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const min = (x: number | null, y: number | null) => (x == null ? y : y == null ? x : Math.min(x, y));
+  return {
+    maxTokens: min(a.maxTokens, b.maxTokens),
+    maxUsd: min(a.maxUsd, b.maxUsd),
+    maxDurationSeconds: min(a.maxDurationSeconds, b.maxDurationSeconds),
+    maxRounds: a.maxRounds ?? b.maxRounds,
+  };
+}
+
+/** Add two telemetry snapshots. Used for the planning phase's own running total, which is a SUM
+ *  across sessions rather than the tally's last-writer-wins per slot. */
+function sumTelemetry(a: DriverTelemetry, b: DriverTelemetry): DriverTelemetry {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+    costUsd: a.costUsd + b.costUsd,
+    numTurns: a.numTurns + b.numTurns,
+  };
 }
 
 export class RunSupervisor {
@@ -455,6 +970,55 @@ export class RunSupervisor {
     return t;
   }
 
+  /**
+   * The surface the pipeline's stages reach (RUN-131), built as an explicit object rather than by
+   * handing the stages `this`.
+   *
+   * Deliberate: satisfying `StageHost` structurally would mean making `landRun`, `enforceLockFloor`
+   * and the rest PUBLIC on an exported class, and a typed caller could then invoke `landRun` with
+   * its own policy — skipping the no-changes gate, the checkpoint, the lock floor, the deterministic
+   * floor and the review that landing is only ever supposed to happen after. A refactor that
+   * publishes a way around the gates it is refactoring has changed the security surface, whatever it
+   * did to the control flow. Closures keep every one of them private.
+   */
+  private stageHost(): StageHost {
+    return {
+      forgetCancellation: (runId) => this.deps.steering?.forget?.(runId),
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      // A no-op without a comment sink, which is exactly how every call site already treated it.
+      postComment: (projectId, taskId, body) => this.deps.postComment?.(projectId, taskId, body),
+      transcript: (runId) => this.transcript(runId),
+      // Close the transcript with its outcome and forget it — the stream a human reads has to END
+      // (RUN-74), and a map that only ever grows is a leak with a nicer name.
+      endTranscript: (runId, outcome) => {
+        const t = this.transcripts.get(runId);
+        if (!t) return 0;
+        t.milestone(`run finished: ${outcome}`);
+        t.end();
+        // Read AFTER closing and before forgetting it: closing flushes whatever was buffered and
+        // then appends the milestone, so the number of seqs it consumes is not fixed. Returning
+        // the real value is what stops a continuation numbering into rows that already exist
+        // (RUN-183) — the caller must never try to derive this by counting.
+        const next = t.nextSeq();
+        this.transcripts.delete(runId);
+        return next;
+      },
+      vcsFor: (repo) => this.vcsFor(repo),
+      lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
+      withRepoLock: (root, fn) => this.withRepoLock(root, fn),
+      enforceLockFloor: (repo, run, ws, token) => this.enforceLockFloor(repo, run, ws, token),
+      verifyWithFeedback: (ctx) => this.verifyWithFeedback(ctx),
+      reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
+      landRun: (ctx) => this.landRun(ctx),
+      // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
+      // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
+      // that the run's sessions divide one ceiling rather than each receiving a copy of it.
+      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
+      ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+    };
+  }
+
   constructor(private readonly deps: RunSupervisorDeps) {
     this.log = deps.logger ?? defaultLogger;
   }
@@ -462,6 +1026,138 @@ export class RunSupervisor {
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
   private vcsFor(repo: ResolvedRepo): SupervisorVcs {
     return repo.vcs ?? this.deps.vcs;
+  }
+
+  /**
+   * The ONE way this supervisor starts a driver (RUN-109). Every agent spawn — main run, reviewer,
+   * conflict turn, verify-fix — funnels through here so the sanitized child env is a supervisor
+   * guarantee, not a per-driver habit. `env` is set BEFORE the caller's opts so an explicit
+   * override still wins, but no caller sets it: they all inherit the stripped env by construction.
+   *
+   * The write floor is enforced here too (RUN-158), AFTER the caller's opts so nothing can spread
+   * past it. Every call site already clamps and should keep doing so — the clamp at the site is
+   * where the intent is legible — but "we audited every caller" is a property that decays with the
+   * next caller, and it had already decayed once: `runReviewer` handed `[permissions.verify]` over
+   * raw, so a repo asking for a writable verify posture got a reviewer holding Edit/Write on the
+   * diff it was judging. `opts.kind` is the posture kind at every site (a custom workflow resolves
+   * to its base via `effectiveKind`), so clamping by it here is exactly what the sites compute —
+   * idempotent where they got it right, and the floor where a future one forgets.
+   */
+  private startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun {
+    return superviseBudget(driver, {
+      env: sanitizedAgentEnv(),
+      ...opts,
+      permission: clampPermissionToWorkflow(opts.permission, workflowFor(opts.kind)),
+    });
+  }
+
+  /**
+   * The branch a run's file locks are scoped to (RUN-97 §5): the branch it will LAND on, where
+   * two runs actually contend — not its throwaway `noriq/run/<id>` worktree branch (on which
+   * they'd never collide). The `[land]` target when configured, else the dispatch's target, else
+   * the repo default. null → all-branches, the safe fallback when nothing names a target.
+   */
+  private lockScopeBranch(repo: ResolvedRepo, run: Run): string | null {
+    if (repo.manifest.land) return resolveLandBranch(repo.manifest.land.branch, run.planKey);
+    return run.targetBranch ?? repo.manifest.defaultBranch ?? null;
+  }
+
+  /**
+   * The reactive per-edit lock enforcer for a build (RUN-101), or undefined when there is no
+   * lock layer to enforce through. Bound to the run's workspace + agent token + scope branch, so
+   * the driver's PreToolUse hook locks each path the agent edits, as that run's holder. Only for
+   * `build`: scope and verify never write, so they never take a write lock.
+   */
+  private lockEnforcerFor(
+    repo: ResolvedRepo,
+    run: Run,
+    worktree: Workspace,
+    kind: RunKind,
+    token: string,
+  ): LockEnforcer | undefined {
+    const vcs = this.vcsFor(repo);
+    if (!workflowFor(kind).produces || !vcs.lock || !vcs.unlock) return undefined;
+    const ctx: LockContext = {
+      projectId: run.projectId,
+      token,
+      branch: this.lockScopeBranch(repo, run),
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    };
+    return new LockEnforcer({
+      root: worktree.localPath,
+      lock: (paths) => vcs.lock!(worktree, paths, ctx),
+      release: (paths) => vcs.unlock!(worktree, { paths }, ctx).then(() => undefined),
+      onDeny: (paths, conflicts) => {
+        this.log.info('lock hook denied an edit to a peer-held path', {
+          runId: run.id,
+          paths,
+          holders: conflicts.map((c) => c.holderName ?? c.holder),
+        });
+        // Surface it in the run view (RUN-106) via the transcript pipeline (RUN-74): the human
+        // watching sees WHY an edit was blocked, and by whom.
+        this.transcript(run.id).milestone(
+          `🔒 lock hook blocked an edit to ${paths.join(', ')} — held by ${conflicts
+            .map((c) => c.holderName ?? c.holder)
+            .join(', ')}`,
+        );
+      },
+    });
+  }
+
+  /**
+   * The hard floor (RUN-102): before a build's diff is made durable, acquire locks over EVERY
+   * path it changed, as the run's holder. For a Claude build this is an idempotent renew of what
+   * the reactive hook already took; for a Codex build (no in-process hook) it is the FIRST
+   * acquisition — and a conflict means the run edited a path a peer holds, so the run is gated
+   * rather than allowed to clobber. Daemon-side, so no token ever reaches the agent's shell.
+   *
+   * Three outcomes, and the third is the one RUN-156 added: the floor could not COMPLETE its check.
+   * That used to arrive as a pass, by two different routes — a failed enumeration became an empty
+   * path set (nothing to lock), and a failed lock call became `{ ok: true }`. Both reported success
+   * for a check that never happened.
+   *
+   * Both now fail CLOSED, and the earlier draft of this fix got that wrong. It kept the lock call
+   * failing OPEN on the grounds that "the reactive hook and the dispatch-time check are still
+   * standing" — which is false in exactly the case this floor exists for. A Codex build has no
+   * in-process hook, and a first sitting declares no predictive scope, so for that run this call IS
+   * the only acquisition and its failure means nothing was checked at all.
+   *
+   * What gating costs is bounded and what it prevents is not: the diff is checkpointed just above,
+   * `driverSucceeded` stays true so the workspace is kept, and the run is recorded continuable — so
+   * a Noriq blip costs a re-dispatch, while the alternative is landing over a peer's held file with
+   * no line anywhere saying the check was skipped.
+   *
+   * A project with locking genuinely DISABLED still passes: that is a service saying `enabled:
+   * false`, which is an answer.
+   */
+  private async enforceLockFloor(
+    repo: ResolvedRepo,
+    run: Run,
+    worktree: Workspace,
+    token: string,
+  ): Promise<LockFloorOutcome> {
+    const vcs = this.vcsFor(repo);
+    if (!vcs.lock || !vcs.changedPaths) return { conflicts: [] };
+    let paths: string[];
+    try {
+      paths = await vcs.changedPaths(worktree);
+    } catch (err) {
+      return { conflicts: [], unchecked: `could not read what this run changed: ${err}` };
+    }
+    if (!paths.length) return { conflicts: [] };
+    const ctx: LockContext = {
+      projectId: run.projectId,
+      token,
+      branch: this.lockScopeBranch(repo, run),
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    };
+    let outcome: LockOutcome;
+    try {
+      outcome = await vcs.lock(worktree, paths, ctx);
+    } catch (err) {
+      return { conflicts: [], unchecked: `the lock service did not answer: ${err}` };
+    }
+    return { conflicts: outcome.ok ? [] : outcome.conflicts };
   }
 
   /**
@@ -628,6 +1324,7 @@ export class RunSupervisor {
             spec: rebaseGate,
             cwd: worktree.localPath,
             session: ctx.session,
+            tally: ctx.tally,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
         : await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec });
@@ -640,7 +1337,7 @@ export class RunSupervisor {
       // autoPush, pushed) result would silently drop the fix and land the broken combination the
       // gate just rejected. Same working-tree-vs-committed split as the inline reviewer's. A clean
       // tree (gate passed first try, or the sessionless runVerify path) is a no-op checkpoint.
-      await vcs.checkpoint(worktree, `noriq run ${run.id}: landing fix`).catch((err) => {
+      await vcs.checkpoint(worktree, runCommitMessage(run.id, 'landing fix')).catch((err) => {
         this.log.warn('could not commit the landing fix — the branch may fast-forward without it', {
           runId: run.id,
           err: String(err),
@@ -688,8 +1385,9 @@ export class RunSupervisor {
    * re-derived a failure whose exact output the daemon already had. Now the same session gets the
    * command, the code and the output, fixes it, and the gate re-runs.
    *
-   * Bounded (RUN-21's K=2): an agent that cannot fix it in two tries will not on the third — it
-   * will keep spending. The budget still applies underneath, so a loop cannot outrun its ceiling.
+   * Bounded (RUN-21's K=2, since RUN-94 the repo may commit its own `[verify] maxRounds`): an
+   * agent that cannot fix it in a couple of tries will usually keep spending, so the default
+   * stays tight. The budget still applies underneath, so a loop cannot outrun its ceiling.
    */
   /** The verify command's outcome, in the transcript (RUN-74): a pass is one system line, a
    *  failure also carries the output tail in the 'verify' voice — the part a human reads. */
@@ -714,6 +1412,10 @@ export class RunSupervisor {
     spec: VerifySpec;
     cwd: string;
     session: DriverSession;
+    /** The run's cross-session tally (RUN-133): a hand-back turn's active seconds are charged to
+     *  it when the turn ends, which is what a later session's reservation — and the live
+     *  `clockGuard` re-arming this session's own deadline (RUN-159) — is short by. */
+    tally: RunTally;
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
@@ -725,7 +1427,10 @@ export class RunSupervisor {
     // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
     if (result.passed || !ctx.session.continueWith) return result;
 
-    for (let attempt = 1; attempt <= MAX_VERIFY_FIXES; attempt++) {
+    // The repo's committed bound, else the daemon's K=2 (RUN-94). 0 = a pure gate: the verdict
+    // stands and no fix turn is spent — the repo said so, in the commit.
+    const rounds = verifyFixRounds(ctx.spec);
+    for (let attempt = 1; attempt <= rounds; attempt++) {
       this.log.info('verify failed — handing it back to the live agent', {
         runId: ctx.run.id,
         attempt,
@@ -734,15 +1439,27 @@ export class RunSupervisor {
       // Tokens burn again on a fix turn, so the phase has to say 'agent' or the spend appears
       // to climb during "verifying" — the same lie this task exists to stop telling (RUN-31).
       this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+      // A hand-back is more agent time on the run's clock (RUN-133). Its TOKENS are policed live by
+      // the session's spendGuard and its SECONDS by the deadline re-armed around this turn
+      // (RUN-159) — but the deadline is enforcement, not accounting: charging the stretch here is
+      // what makes the next session's reservation, and the next turn's own deadline, short by it.
+      const fixStartedAt = monotonicMs();
       const exit = await ctx.session
         .continueWith(verifyFeedbackPrompt(ctx.spec, result, attempt))
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the failure back', { runId: ctx.run.id, err: String(err) });
           return null;
-        });
+        })
+        .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       // The agent died, errored, or breached its budget trying to fix it. Its last verdict stands;
-      // pushing more turns at a session that just failed is how a loop becomes a spend.
-      if (!exit || exit.outcome !== 'done') return result;
+      // pushing more turns at a session that just failed is how a loop becomes a spend. The RUN's
+      // reason stays the gate's, deliberately — the failing verify is what a human must act on —
+      // so the turn's own reason is logged here or it is lost (RUN-159).
+      if (!exit || exit.outcome !== 'done') {
+        if (exit?.reason)
+          this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
+        return result;
+      }
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
       this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
@@ -779,9 +1496,27 @@ export class RunSupervisor {
      *  block can be captured and fed into the next reviewer's ledger (RUN-79). */
     getSessionText?: () => string;
     budget?: RunBudget;
-  }): Promise<VerifyVerdict & { rounds: number }> {
+    /** A prior attempt's adjudication ledger, on a "continue a failed run" (RUN-92): the first
+     *  fresh reviewer starts from the findings the earlier sitting already settled instead of
+     *  relitigating them. Empty/absent on a normal run. */
+    priorLedger?: LedgerEntry[];
+    /** The numbered acceptance criteria every round's reviewer answers (RUN-145). */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
+    /** The requirement ids a finding may name (RUN-147). */
+    requirements?: string[];
+    /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
+    verifyRan?: boolean;
+  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
-    const maxRounds = reviewer?.maxRounds ?? 0;
+    // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
+    const manifestRounds = reviewer?.maxRounds ?? 0;
+    // A "continue a failed run" dispatch (PLNR-180) carries budget.maxRounds — a fresh reviewer-
+    // round budget for the kept worktree. The manifest clamps it: the server never reads the repo
+    // owner's [verify.agent].maxRounds, so it can't be widened past what the owner committed
+    // (RUN-91). Null (a normal dispatch) → the manifest's own value, unchanged.
+    const maxRounds =
+      ctx.budget?.maxRounds != null ? Math.min(ctx.budget.maxRounds, manifestRounds) : manifestRounds;
     // The same intent a dispatched verify run would get: the anchor task's text, else the brief.
     const intent = ctx.task
       ? `${ctx.task.key} — ${ctx.task.title}${ctx.task.body ? `\n\n${ctx.task.body}` : ''}`
@@ -800,7 +1535,7 @@ export class RunSupervisor {
     // the fixes in rather than fast-forwarding past uncommitted work.
     const foldFixIntoBranch = (label: string) =>
       this.vcsFor(ctx.repo)
-        .checkpoint(ctx.worktree, `noriq run ${ctx.run.id}: ${label}`)
+        .checkpoint(ctx.worktree, runCommitMessage(ctx.run.id, label))
         .catch((err) => {
           this.log.warn('could not commit before re-review — the reviewer may not see the fix', {
             runId: ctx.run.id,
@@ -811,20 +1546,53 @@ export class RunSupervisor {
 
     // The cross-round adjudication ledger (RUN-79): findings raised in earlier rounds plus the
     // builder's structured rebuttal to each, carried to every fresh reviewer so a settled finding
-    // is verified rather than relitigated. Empty on the first look.
-    let ledger: LedgerEntry[] = [];
+    // is verified rather than relitigated. Seeded from a prior attempt on a continue (RUN-92);
+    // empty on the first look of a normal run.
+    let ledger: LedgerEntry[] = ctx.priorLedger ?? [];
+
+    /**
+     * Fold a round's findings into the ledger AS SOON AS THEY ARE RAISED, rather than only when a
+     * fix turn follows them.
+     *
+     * They used to enter inside the fix loop, which meant the LAST round's findings never entered
+     * at all — including the terminal ones that actually failed the run, which are the ones a human
+     * most wants recorded. A repo with `maxRounds = 0` (a pure gate, no hand-back) had an empty
+     * ledger however much its reviewer found. RUN-147 makes that visible: the per-requirement
+     * report reads the ledger, so an unrecorded finding is a requirement reported as clear.
+     *
+     * Entered with no responses, so they read as 'unanswered' — which is exactly true until the
+     * builder answers. The response folds onto the SAME entry later, and `buildLedger` keeps an
+     * existing adjudication when a re-raise brings none, so nothing is lost.
+     *
+     * Recorded whatever the VERDICT was, including `unknown`. A reviewer that wrote three findings
+     * and then crashed found three real things, and dropping them because it never reached its
+     * verdict line is the same discarding-partial-work mistake RUN-145 fixed for acceptance
+     * evidence. It cannot inflate a failure either: on a PASS nothing counts as standing anyway
+     * (requirementOutcomes), and an `unknown` gates the run on its own terms.
+     */
+    const record = (v: VerifyVerdict, round: number) => {
+      ledger = buildLedger(ledger, parseFindings(v.findings), [], round);
+    };
 
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
-    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0 };
+    record(verdict, 1);
+    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
 
     for (let round = 1; round <= maxRounds; round++) {
       // Only a clear FAIL is a refusal. 'unknown' means NO JUDGMENT — the reviewer was killed,
       // crashed, breached its ceiling, or never wrote a VERDICT line (RUN-72's dogfood: a human
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
-      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1 };
+      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
+      // An HONOURED structural escalation ends the loop here (RUN-175): the reviewer has diagnosed
+      // an invariant with no single enforcement point and evidenced it, so every remaining fix
+      // round would buy patched sites while the class survives — the RUN-66 death, foreseen
+      // instead of relived. The verdict (escalation riding on it) goes back a FAIL; the review
+      // stage reports the diagnosis and its own terminal reason. The findings are already in the
+      // ledger (recorded when raised), so a continuation still sees them.
+      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -842,18 +1610,37 @@ export class RunSupervisor {
       // fix turn's text, from which we parse the structured RESPONSE block (RUN-79). Captured here,
       // before the floor re-verify below can append its own turns.
       const textBefore = ctx.getSessionText?.().length ?? 0;
+      // Same as the deterministic floor's hand-back: the seconds are charged here (RUN-133).
+      const fixStartedAt = monotonicMs();
       const exit = await ctx.session
-        .continueWith(reviewerFeedbackPrompt(verdict.findings, round, maxRounds))
+        .continueWith(
+          reviewerFeedbackPrompt(
+            verdict.findings,
+            round,
+            maxRounds,
+            // The gate's own evidence, turned into what is left to do (RUN-146). Built from THIS
+            // round's verdict, so a criterion the builder satisfied last round is not re-issued as
+            // outstanding work.
+            buildRepairSpec(verdict.acceptance, findings),
+          ),
+        )
         .catch((err): DriverExit | null => {
           this.log.warn('could not hand the report back', { runId: ctx.run.id, err: String(err) });
           return null;
-        });
+        })
+        .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
       // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
       ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
-      if (!exit || exit.outcome !== 'done') return { ...verdict, rounds: round };
+      // Same as the floor's hand-back: the run keeps the reviewer's reason, so the turn's own
+      // reason is logged here or nobody ever learns the session ran out (RUN-159).
+      if (!exit || exit.outcome !== 'done') {
+        if (exit?.reason)
+          this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
+        return { ...verdict, rounds: round, ledger };
+      }
       this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
       // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
       // deterministic floor re-runs (with its own bounded feedback) before the re-review.
@@ -863,6 +1650,7 @@ export class RunSupervisor {
           spec: floorCmd,
           cwd: ctx.worktree.localPath,
           session: ctx.session,
+          tally: ctx.tally,
           phase: 'verifying',
         });
         if (!floor.passed) {
@@ -870,6 +1658,7 @@ export class RunSupervisor {
             verdict: 'fail',
             passed: false,
             rounds: round,
+            ledger,
             findings: `the fix for the reviewer's findings broke the deterministic check (\`${floorCmd.cmd}\`):\n${floor.output.slice(-4000)}`,
           };
         }
@@ -879,9 +1668,60 @@ export class RunSupervisor {
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
-      if (verdict.passed) return { ...verdict, rounds: round };
+      record(verdict, round + 1);
+      if (verdict.passed) return { ...verdict, rounds: round, ledger };
     }
-    return { ...verdict, rounds: maxRounds };
+    // RUN-174: one adjudication turn before the run reports a TERMINAL-round FAIL. The terminal
+    // round is where the run ENDS, so a finding raised there for the first time was never fixable
+    // OR contestable — both the RUN-66 and RUN-88 dogfood runs died exactly this way, on [medium]
+    // findings nobody could answer. The builder gets ONE turn to CONTEST a finding with a pointer
+    // (it may NOT change code), then a FRESH reviewer judges the SAME diff plus that new ledger
+    // evidence. Deliberately not a fix round: a fix round is budget for new work, and giving the
+    // terminal round one would only move the terminal round.
+    //
+    // Fires only for a clean `fail` that named findings the builder can answer BY NUMBER. An
+    // `unknown` is a non-report already returned above (verdict.verdict !== 'fail'), with nothing to
+    // contest; a FAIL that wrote no numbered FINDING line gives the RESPONSE block nothing to key
+    // to — the ledger holds no entry a pointer could land on. continueWith is already guaranteed
+    // here (the passed/no-continueWith return above narrowed it), and the method re-checks it before
+    // the turn regardless, since it is what makes the contest a turn on the live builder session.
+    // …and never for an honoured escalation (RUN-175): the contest exists to let a builder rebut
+    // per-finding claims with pointers, but an escalation is a diagnosis about the DESIGN — that no
+    // single check can hold the promise — and the adjudicator for that is the human the diagnosis
+    // is surfaced to, not one more spent turn. Stopping the spend is the token's whole point.
+    const terminalFindings =
+      verdict.verdict === 'fail' && !verdict.escalation ? parseFindings(verdict.findings) : [];
+    if (terminalFindings.length) {
+      const contested = await this.contestTerminalFindings(
+        { ...ctx, intent },
+        { verdict, findings: terminalFindings, terminalRound: maxRounds + 1, rounds: maxRounds, ledger },
+      );
+      if (contested) return contested;
+    }
+    return { ...verdict, rounds: maxRounds, ledger };
+  }
+
+  /**
+   * The repo's orientation for a judging actor (RUN-154), resolved HERE rather than threaded from
+   * the run's own context. The inline reviewer is reached by two entry paths — a run that finished
+   * in one sitting and one resumed days later in a different process (RUN-30) — and only the first
+   * ever assembled a prompt, so only the first has a resolved context to pass down. Resolving at
+   * the point of use is what makes both paths behave the same, and it is names-only, so it costs
+   * a handful of stats and reads no files.
+   *
+   * Never fatal: a reviewer with no orientation is exactly the reviewer we had before this, so a
+   * broken `[context]` degrades the review rather than failing the gate.
+   */
+  private async reviewerContext(repo: ResolvedRepo, ws: Workspace): Promise<string> {
+    return loadRepoContextBrief(ws.localPath, repo.manifest.context, { probe: this.deps.pathProbe })
+      .then((c) => c.rendered)
+      .catch((err) => {
+        this.log.warn('could not resolve [context] for the reviewer — reviewing without it', {
+          repo: repo.manifest.key,
+          err: String(err),
+        });
+        return '';
+      });
   }
 
   /** One fresh reviewer session over the build's worktree. Read-only profile, no Noriq
@@ -900,19 +1740,41 @@ export class RunSupervisor {
     tally: RunTally;
     /** Findings adjudicated in earlier rounds (RUN-79) — empty on the first look. */
     ledger?: LedgerEntry[];
+    /** The numbered acceptance criteria to answer one by one (RUN-145). Empty → this reviewer is
+     *  asked for a verdict in prose, exactly as before. */
+    acceptance?: AcceptanceItem[];
+    acceptanceOverflow?: number;
+    /** The requirement ids a finding may name (RUN-147). */
+    requirements?: string[];
+    /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
+    verifyRan?: boolean;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
+    // The reviewer as a coordinate (RUN-113): `[verify.agent].agent = "codex.gpt-5_6-sol.high"`
+    // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields.
+    //
+    // RUN-132 gives the workflow's `review` stage a coordinate slot of its own, which belongs in
+    // this ladder above `[verify.agent]` — a workflow whose point is a harder look ("audit") should
+    // say so on the stage rather than by moving the one setting every other workflow shares. It is
+    // NOT wired here, and deliberately: `WorkflowDef` is the VENDORED wire contract and carries
+    // `base` + `prompt` only, so nothing can set a stage coordinate and the branch would be
+    // unreachable. When the phase-3 vendor refresh grows the field this method needs the run's
+    // workflow threaded in (it has `ctx.run` + the manifest but does not resolve one today) and
+    // `stageOf(wf, 'review')?.agent` folded in ahead of `reviewer?.agent` — which means it also
+    // has to enter the tool/model/effort precedence below, not just the coordinate parse.
+    const reviewerCoord = reviewer?.agent ? tryParseCoordinate(reviewer.agent) : null;
+    const reviewerTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
     // The reviewer's driver (RUN-70): the repo may put a different VENDOR's model in judgment —
     // the strongest form of the reviewer's independence. Fail-closed when the named tool has no
     // driver here: silently reviewing with the builder's own vendor would defeat the choice, the
     // same reasoning that makes an absent `shell` pin fail the cmd gate outright (RUN-42).
-    const driver = reviewer?.tool ? this.deps.drivers[reviewer.tool] : ctx.driver;
+    const driver = reviewerTool ? this.deps.drivers[reviewerTool as AgentTool] : ctx.driver;
     if (!driver) {
       return {
         verdict: 'unknown',
         passed: false,
-        findings: `the manifest asks for a '${reviewer?.tool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent].tool`,
+        findings: `the manifest asks for a '${reviewerTool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent]`,
       };
     }
     // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
@@ -920,32 +1782,79 @@ export class RunSupervisor {
     // the reviewer names its own tool: model names are vendor-specific and [defaults.verify]
     // may name the other vendor's, so the fallback is severed and the tool's own default holds.
     // Effort still falls through — it is tool-agnostic intent, mapped per driver.
-    const model = reviewer?.model ?? (reviewer?.tool ? null : (manifest.defaults?.verify?.model ?? null));
-    const effort = reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
+    const model =
+      reviewerCoord?.model ??
+      reviewer?.model ??
+      (reviewerTool ? null : (manifest.defaults?.verify?.model ?? null));
+    const effort = reviewerCoord?.effort ?? reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
     // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
     // work, so a bare `git diff` shows nothing — the range is the review. A live backend
     // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
     const diffCmd =
       (this.vcsFor(ctx.repo).kind ?? 'git') === 'git' ? `git diff ${ctx.worktree.baseId}...HEAD` : undefined;
+    // The reviewer spends from the RUN's remaining ceiling, not a fresh copy of it (RUN-133). A
+    // build with a reviewer and a conflict turn used to be handed the dispatched budget three times
+    // over, and no single per-session check could ever notice.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      // Adversarial default, same as a reviewer that crashed: a gate that could not run is not a
+      // gate that passed. `review.ts` turns an `unknown` verdict into `review:no-verdict`, so the
+      // run is gated with its diff kept — and no process was spawned to be killed a moment later.
+      this.log.warn('no budget left for the reviewer — gating rather than reviewing unfunded', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return {
+        verdict: 'unknown',
+        passed: false,
+        findings: `the reviewer could not run: ${reservation.detail}. The diff is kept on its branch; re-dispatch with a larger budget to have it judged.`,
+      };
+    }
+
     let text = '';
-    const session = superviseBudget(driver, {
+    // Resolved BEFORE the clock starts. The wall-clock dimension bounds AGENT time (RUN-30's
+    // accounting), so charging a slow `[context]` probe to it would spend a run's duration ceiling
+    // on work no agent did — and since RUN-133 that number is subtracted from what the next session
+    // may spend and persisted into a continuation, so the error would compound rather than pass.
+    const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
+    const startedAt = monotonicMs();
+    const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
       cwd: ctx.worktree.localPath,
       prompt: assembleReviewerPrompt({
         intent: ctx.intent,
         diffCmd,
-        verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
+        // Split in two (RUN-177) because the two states are different facts and only one of them
+        // was ever told. A landing run's deterministic command runs AFTER this review, against the
+        // rebased result — telling the reviewer it "already passed" is false there, and it is
+        // instructed not to re-run it, so it cannot find out.
+        verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
+        verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
         ledger: ctx.ledger,
+        repoContext: reviewerContext,
+        ...(ctx.acceptance?.length
+          ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+          : {}),
+        ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
       }),
-      permission: manifest.permissions.verify,
+      // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
+      // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
+      // a committed manifest handed the reviewer Edit/Write over the very diff it is judging, which
+      // it could then "fix" and PASS. RUN-118's floor was described as applying at every permission
+      // site; this was the site it missed — and the one that matters most, because a dispatched
+      // verify run is opt-in while the inline reviewer gates every build that configures one.
+      permission: clampPermissionToWorkflow(manifest.permissions.verify, BUILTIN_WORKFLOWS.verify),
       // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
       // second inline identity cannot exist — and need not. The reviewer's output IS its report;
       // the daemon parses the verdict and posts the findings itself. This is also what makes
       // authorship separation absolute: the reviewer cannot claim, move, or comment as anyone.
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
-      budget: ctx.budget,
+      budget: reservation.budget,
+      // …and the live check, so a reviewer cannot outspend the RUN even inside its own allowance.
+      spendGuard: ctx.tally.guard(`review:${ctx.round}`),
+      clockGuard: ctx.tally.clockGuard(),
       handlers: {
         onText: (t) => {
           text += t;
@@ -967,19 +1876,253 @@ export class RunSupervisor {
       // A fresh session per round → its exit is that round's own cumulative, so a per-round slot
       // sums rather than overwrites. Then publish the run total, mix and all, as one step.
       ctx.tally.record(`review:${ctx.round}`, exit.telemetry);
+      // …and its wall-clock too (RUN-133), so the next session's reservation is short by what this
+      // one took. Sessions are strictly sequential here, so these sum rather than overlap.
+      ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         // Adversarial default: a reviewer that crashed or breached its ceiling cleared nothing.
+        // Its PARTIAL evidence is still read (RUN-145) — a reviewer killed at criterion 4 already
+        // established something about criteria 1–3, and discarding that would throw away the only
+        // work the spend bought. The verdict stays `unknown` regardless: `judgeWithAcceptance`
+        // demotes a PASS and never promotes anything, so this cannot turn a dead session into a
+        // judgement about the diff.
         return {
+          ...judgeWithAcceptance(text, ctx.acceptance ?? []),
           verdict: 'unknown',
           passed: false,
           findings: text.trim() || `the reviewer exited ${exit.reason ?? 'without a report'}`,
         };
       }
-      return parseVerdict(text);
+      // Verdict AND per-criterion evidence, reconciled together (RUN-145) — a PASS the report's
+      // own acceptance lines contradict is taken as the FAIL it contains.
+      const judged = judgeWithAcceptance(text, ctx.acceptance ?? []);
+      // The structural-escalation token (RUN-175), read only off a clean exit: a crashed reviewer's
+      // half-written token must not end a run the gate never finished judging (the branch above
+      // already forces `unknown`). `readEscalation` gates on the report's OWN verdict line, so a
+      // PASS judgeWithAcceptance demoted cannot smuggle an escalation in — the reviewer that signed
+      // PASS did not judge the run unconvergeable, whatever else its report contradicts. A demotion
+      // is logged rather than silent, so "the daemon ignored it" is legible and distinct from "the
+      // daemon never saw it"; the run then proceeds as the ordinary FAIL the report already is.
+      const escalated = readEscalation(text);
+      if (escalated.demoted) {
+        this.log.info('reviewer escalation token demoted — the run proceeds as an ordinary FAIL', {
+          runId: ctx.run.id,
+          round: ctx.round,
+          why: escalated.demoted,
+        });
+      }
+      return escalated.escalation ? { ...judged, escalation: escalated.escalation } : judged;
     } finally {
       this.deps.steering?.unregister(ctx.run.id);
     }
+  }
+
+  /**
+   * The RUN-174 contest turn: one adjudication turn after a TERMINAL-round FAIL, before the run
+   * reports. Returns the FINAL result iff the contest RAN — a PASS only when every terminal finding
+   * drew a checkable CONTESTED response AND a fresh reviewer verified those pointers hold; otherwise
+   * the terminal FAIL (its ledger now carrying whatever the builder said). Returns `null` when the
+   * contest DECLINED — nothing left to fund it (RUN-133) — so the caller reports the terminal FAIL
+   * exactly as it does today.
+   *
+   * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
+   * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
+   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, or a
+   * finding a ledger cap dropped cannot clear it — the run then fails without even spawning the
+   * reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
+   * enough.
+   *
+   * No checkpoint after the builder turn, deliberately — the "may NOT change code" rule. `runReviewer`
+   * inspects `git diff baseId...HEAD`, a committed range, so an un-checkpointed edit is invisible to
+   * it: the fresh reviewer reads the SAME diff the terminal round judged, plus the new ledger
+   * evidence. That is what keeps this a judgment over unchanged code rather than a disguised fix
+   * round, and it holds whatever the builder's live permission profile allows.
+   *
+   * One look only. This is not a contest/fix loop — the fresh reviewer's verdict is final, so a
+   * builder self-assertion that no reviewer re-checks cannot clear a finding, and a surviving finding
+   * does not earn another turn.
+   */
+  private async contestTerminalFindings(
+    ctx: {
+      run: Run;
+      repo: ResolvedRepo;
+      worktree: Workspace;
+      driver: AgentDriver;
+      /** The live build session — the contest turn runs here (a continuation, not a new spawn). */
+      session: DriverSession;
+      intent: string;
+      tally: RunTally;
+      getSessionText?: () => string;
+      budget?: RunBudget;
+      acceptance?: AcceptanceItem[];
+      acceptanceOverflow?: number;
+      requirements?: string[];
+      verifyRan?: boolean;
+    },
+    args: {
+      /** The terminal verdict — the report a survive reports, so the human sees the findings just
+       *  contested rather than a fresh reviewer's paraphrase of them. */
+      verdict: VerifyVerdict;
+      findings: Finding[];
+      /** Where the terminal findings already sit in the ledger (recorded when raised), so the
+       *  builder's responses fold onto the SAME entries. */
+      terminalRound: number;
+      /** Fix rounds spent (maxRounds) — the `rounds` the caller would have reported. */
+      rounds: number;
+      ledger: LedgerEntry[];
+    },
+  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }) | null> {
+    const transcript = this.transcript(ctx.run.id);
+    const stand = (ledger: LedgerEntry[]) => ({ ...args.verdict, rounds: args.rounds, ledger });
+
+    // Reserve FIRST, before the builder turn: the terminal turn is the run's most likely to find the
+    // ceiling already gone (RUN-133, same as resolveConflict). Declining spends nothing where
+    // spawning-to-kill would spend a process — and `null` tells the caller to report the terminal
+    // FAIL untouched.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left for the terminal contest turn — reporting the FAIL as it stands', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return null;
+    }
+    if (!ctx.session.continueWith) return null;
+
+    this.log.info('handing the terminal findings to the builder for one contest turn (no code change)', {
+      runId: ctx.run.id,
+      findings: args.findings.length,
+    });
+    transcript.milestone(
+      'the terminal review FAILed — one contest turn (no code change) before the run reports',
+    );
+    // A turn burns tokens — the phase must say so (RUN-31), same as the fix loop.
+    this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+
+    // The delta after the turn is exactly the contest's text, from which the structured RESPONSE
+    // block is parsed (RUN-79) — snapshotted before the turn as the fix loop does.
+    const textBefore = ctx.getSessionText?.().length ?? 0;
+    const startedAt = monotonicMs();
+    const exit = await ctx.session
+      .continueWith(reviewerContestPrompt(args.verdict.findings))
+      .catch((err): DriverExit | null => {
+        this.log.warn('could not hand the terminal findings back for a contest', {
+          runId: ctx.run.id,
+          err: String(err),
+        });
+        return null;
+      })
+      .finally(() => ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000));
+
+    // The response↔terminal-finding join, computed ONCE here — before the ledger fold, the exit
+    // branch, and the eligibility gate below all read it (RUN-179 criterion 4). A response is
+    // EVIDENCE only when it points at something AND names an id THIS terminal round raised: a
+    // pointerless self-assertion is persuasion the next reviewer cannot check, and a `FINDING 99`
+    // naming no terminal finding is context from nowhere. Folding this ONE `matched` set — not the
+    // raw responses — is what keeps the ledger the verifiable-pointer record RUN-79 designed, and
+    // stops the join being re-derived, divergently, at each site.
+    const contestText = ctx.getSessionText?.().slice(textBefore) ?? '';
+    const responses = parseFindingResponses(contestText);
+    const terminalIds = new Set(args.findings.map((f) => f.id));
+    const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
+
+    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
+    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
+    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
+    // one the terminal round judged.
+    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
+
+    // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
+    // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
+    // the fix loop already avoids — but with the ledger now carrying whatever it said.
+    if (!exit || exit.outcome !== 'done') {
+      if (exit?.reason)
+        this.log.info('the contest turn ended early', { runId: ctx.run.id, reason: exit.reason });
+      return stand(answered);
+    }
+
+    // ── the canonical reconciliation (RUN-174) ────────────────────────────────────────────────
+    // ONE place decides whether the contest cleared the run, so no exit can clear a finding another
+    // would have kept. Of the `matched` evidence above, a terminal finding is a CANDIDATE to clear
+    // only when the builder CONTESTED it (a `FIXED` changed nothing here) AND that contest is VISIBLE
+    // to the adjudicator — its entry survived the ledger cap into what the fresh reviewer is handed.
+    // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
+    // pointer or a response for another id never reached `matched` at all. What "checkable" means
+    // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
+    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
+    const loc = (s: string) => s.trim().toLowerCase();
+    const visibleToAdjudicator = (f: Finding) =>
+      answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));
+    if (!args.findings.every((f) => contested.has(f.id) && visibleToAdjudicator(f))) {
+      // At least one terminal finding was not answerably contested, so it stands and the run fails as
+      // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
+      // Nothing is spawned to be killed; the contest turn already happened above.
+      this.log.info('a terminal finding was not answerably contested — the findings stand', {
+        runId: ctx.run.id,
+        contested: contested.size,
+        findings: args.findings.length,
+      });
+      transcript.milestone('the terminal findings were not all contested — the run fails');
+      return stand(answered);
+    }
+
+    // Every terminal finding has a checkable contest the adjudicator can see: ONE fresh reviewer
+    // verifies the pointers over the SAME diff plus the ledger. One look only — not a contest/fix loop.
+    const readjudged = await this.runReviewer({ ...ctx, round: args.rounds + 2, ledger: answered });
+    transcript.milestone(reviewVerdictMilestone(readjudged, args.rounds + 2));
+    const settled = buildLedger(answered, parseFindings(readjudged.findings), [], args.rounds + 2);
+
+    // RUN-175: the contest's fresh look is a reviewer round like any other, and the token is a
+    // per-round judgement honoured when raised — so an HONOURED escalation from this adjudicator
+    // must ride out rather than be replaced by the pre-contest verdict below, which would report
+    // the one run a reviewer proved unconvergeable as a plain rejection with the diagnosis written
+    // and unread. Its OWN report is what survives (not the terminal round's): the escalation's
+    // finding number points into that report, and the terminal findings it did not clear are in
+    // the ledger it carries. An escalation only ever rides a FAIL, so this cannot shadow the
+    // contest-cleared PASS branch beneath it.
+    if (readjudged.escalation) {
+      this.log.info(
+        'the contest’s fresh reviewer escalated STRUCTURAL — the run fails with the cause named',
+        {
+          runId: ctx.run.id,
+        },
+      );
+      transcript.milestone('the contest’s fresh look escalated STRUCTURAL — the run fails');
+      return { ...readjudged, rounds: args.rounds, ledger: settled };
+    }
+
+    // The PASS is DAEMON-decided, not taken on the reviewer's word: it clears the run only if the
+    // fresh reviewer PASSed AND re-raised none of the terminal findings. A pointer it rejected it
+    // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not
+    // cleared it — either way the finding stands, the same posture judgeWithAcceptance takes for a
+    // FAILED criterion under a PASS.
+    const reraised = new Set(
+      parseFindings(readjudged.findings)
+        .map((f) => loc(f.location))
+        .filter(Boolean),
+    );
+    const stillStanding = args.findings.filter((f) => reraised.has(loc(f.location)));
+    if (readjudged.passed && stillStanding.length === 0) {
+      this.log.info('the contest cleared every terminal finding — the fresh reviewer PASSed', {
+        runId: ctx.run.id,
+      });
+      transcript.milestone('the contest cleared the terminal findings — the run passes');
+      return { ...readjudged, rounds: args.rounds, ledger: settled };
+    }
+    // The findings stand: the run fails as it does today (the terminal report), but the ledger now
+    // carries the builder's pointers and the fresh look — so a human, and a continuation, sees the
+    // contest happened. A re-raise under a PASS lands here too (the daemon takes the FAIL), as does
+    // an `unknown` re-adjudication (crashed / no budget) — a gate that could not run cleared nothing.
+    this.log.info('the terminal findings stand after the contest — the run fails', {
+      runId: ctx.run.id,
+      overrodePass: readjudged.passed && stillStanding.length > 0,
+    });
+    transcript.milestone('the terminal findings stand after the contest — the run fails');
+    return stand(settled);
   }
 
   /** Give the build agent one bounded turn to resolve its own conflict, in place. */
@@ -999,8 +2142,21 @@ export class RunSupervisor {
     },
     conflicts: string[],
   ): Promise<{ resolved: boolean; text: string }> {
+    // The last session a run spawns, and the one most likely to find the ceiling already gone
+    // (RUN-133). Unresolved is the honest answer: the caller aborts the rebase and the diff waits on
+    // its branch for a human — which is exactly what an unfixable conflict does anyway.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left for the conflict turn — leaving the rebase unresolved', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return { resolved: false, text: `no budget left to attempt a resolution: ${reservation.detail}` };
+    }
+
     let text = '';
-    const session = superviseBudget(ctx.driver, {
+    const startedAt = monotonicMs();
+    const session = this.startAgent(ctx.driver, {
       runId: `${ctx.run.id}:conflict`,
       kind: 'build', // it is editing its own diff — the build floor, nothing wider
       cwd: ctx.worktree.localPath,
@@ -1012,7 +2168,9 @@ export class RunSupervisor {
       }),
       permission: ctx.permission,
       noriqMcp: ctx.noriqMcp,
-      budget: ctx.budget,
+      budget: reservation.budget,
+      spendGuard: ctx.tally.guard('conflict'),
+      clockGuard: ctx.tally.clockGuard(),
       handlers: {
         onText: (t) => {
           text += t;
@@ -1033,6 +2191,7 @@ export class RunSupervisor {
       // The conflict turn's spend joins the run whether or not it resolved anything (RUN-59) — the
       // tokens burned either way, on the build's own model (kind:'build', ctx.driver).
       ctx.tally.record('conflict', exit.telemetry);
+      ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000);
       this.deps.report(ctx.run.id, { status: 'running', telemetry: ctx.tally.total() });
       if (exit.outcome !== 'done') {
         return { resolved: false, text: text || `agent exited ${exit.reason ?? 'badly'}` };
@@ -1080,6 +2239,10 @@ export class RunSupervisor {
     /** The run's trailing output, so the park report carries the last thing it said — usually
      *  the question itself, which is what a human opening the dashboard wants to read. */
     tail: string;
+    /** Which step of a decomposed run was speaking (RUN-168). */
+    stepId?: string;
+    /** What the steps before it concluded (RUN-171). */
+    priorSteps?: StepSummary[];
   }): Promise<DriverExit | null> {
     const { run, exit } = ctx;
     if (!this.deps.parked || !this.deps.getParkState) return null;
@@ -1125,6 +2288,14 @@ export class RunSupervisor {
         ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
       },
       activeSeconds: ctx.activeSeconds,
+      // Where the chain stopped (RUN-168). Omitted entirely for an undecomposed run, so its park
+      // record is byte-identical to one written before chains existed — a park is a persisted file
+      // other tooling reads, and a field that appears on every record to say "not applicable" is a
+      // shape change for nothing.
+      ...(ctx.stepId ? { stepId: ctx.stepId } : {}),
+      // The hand-off a resumed chain would otherwise start without (RUN-171). Omitted when empty,
+      // for the same reason `stepId` is: an undecomposed park keeps the shape it always had.
+      ...(ctx.priorSteps?.length ? { priorSteps: ctx.priorSteps } : {}),
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
@@ -1157,7 +2328,6 @@ export class RunSupervisor {
     const entry = await this.deps.parked?.unpark(runId);
     if (!entry) return null;
     const { run } = entry;
-    const kind = run.kind as RunKind;
 
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
@@ -1167,8 +2337,13 @@ export class RunSupervisor {
 
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const driver = this.deps.drivers[run.agentTool as AgentTool];
-    if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
+    // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
+    // posture either way; what the named one adds is its declared stage list.
+    const wf = runWorkflow(run, repo.manifest);
+    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
+    const driver = this.deps.drivers[tool as AgentTool];
+    if (!driver) return fail(`no driver for tool ${tool}`);
     if (!entry.sessionId) return fail('parked run has no session to resume');
 
     // The workspace is REUSED, never re-leased: it holds the work the agent did before it
@@ -1193,87 +2368,166 @@ export class RunSupervisor {
     this.deps.report(run.id, { status: 'running', phase: 'agent' });
     this.log.info('resuming a parked run', { runId, agentId: entry.agentId, session: entry.sessionId });
 
-    let verifyText = '';
-    let tail = '';
+    // What changed while it waited (RUN-164). A park can last up to 72 hours: the human answering
+    // may have corrected the spec at the same time — RUN-137 exists so they can — and another run
+    // may have landed, moving a file this one's plan names. A resume otherwise carries on against
+    // a premise nobody re-checked, and neither the agent nor its reviewer learns the goalposts
+    // moved.
+    //
+    // A DIFF, not a replay: re-sending the whole brief would spend tokens telling a session what
+    // it already holds. Silence when nothing moved, which is the common case.
+    const {
+      rendered: changed,
+      checked: resumedSpec,
+      task: resumedTask,
+    } = await this.specChangedWhileParked(run, worktree, wf.produces).catch((err) => {
+      this.log.warn('could not re-check the spec on resume', { runId, err: String(err) });
+      return { rendered: '', checked: null, task: null };
+    });
+
     // The resumed run's tally (RUN-59), SEEDED with the park's prior spend + mix so this sitting's
-    // figures accumulate onto — and keep summing with — everything spent before the park.
-    const tally = new RunTally();
+    // figures accumulate onto — and keep summing with — everything spent before the park. It also
+    // carries the run's ceiling and the park's active seconds (RUN-133), which is what makes the
+    // reservation below the REMAINDER rather than a fresh budget: otherwise "ask a question" is a
+    // way to buy more, and a run could park its way past any limit.
+    const tally = new RunTally(mergeBudget(run.budget, this.deps.defaultBudget), entry.activeSeconds);
     tally.seed('__prior__', telemetryFromSpent(entry.spent));
-    const startedAt = Date.now();
-    const budgetRun = superviseBudget(driver, {
+    const reservation = tally.reserve();
+    if (!reservation.ok) {
+      // The park outlived its budget. Fail it rather than spawn a session with nothing to spend —
+      // the worktree is kept either way, so the work is not lost.
+      return fail(`${reservation.breach}: ${reservation.detail}; not resuming`);
+    }
+
+    // The SAME execute stage `supervise` runs (RUN-131) — including its re-park check, because an
+    // agent given an answer may well have a second question and there is no reason the second one
+    // is worth less than the first. Everything that differs about a resume is resolved here, in
+    // `start`, rather than by a second copy of the spawn-and-await loop.
+    const resumeStart = {
       runId: run.id,
       kind,
       cwd: worktree.localPath,
       // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
       // all of it, and re-sending it would both waste the context and confuse a conversation
       // that is mid-thought.
-      prompt: resumePrompt(entry.question, answer),
+      prompt: resumePrompt(entry.question, answer, changed),
       resumeSessionId: entry.sessionId,
-      permission: repo.manifest.permissions[kind],
+      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
-      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
+      multiTurn: wf.produces && Boolean(repo.manifest.verify),
       // The same model it was running before it parked (RUN-33): the session being resumed is
       // that model's conversation, and quietly finishing the job on a different one would make
       // "resumed with its context intact" only half true.
       ...resolveModel(run, repo.manifest),
-      // The REMAINDER, never a fresh ceiling — otherwise "ask a question" is a way to buy more
-      // budget, and a run could park its way past any limit.
-      budget: remainingBudget(mergeBudget(run.budget, this.deps.defaultBudget), entry),
-      handlers: {
-        onTelemetry: (t) => {
-          tally.record('primary', t);
-          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
-        },
-        onText: (t) => {
-          verifyText += t;
-          tail = (tail + t).slice(-LOG_TAIL_CAP);
-          this.transcript(run.id).text('agent', t);
-        },
-      },
-    });
-    this.deps.steering?.register(run.id, budgetRun.session, budgetRun.stop);
-    let exit: DriverExit;
-    try {
-      exit = await budgetRun.done;
-    } finally {
-      this.deps.steering?.unregister(run.id);
-    }
-    // Record this sitting's terminal result (captures a driver/fake that emits no separate tick),
-    // then the run's spend is cumulative across the park — the tally already folds the seeded prior.
-    tally.record('primary', exit.telemetry);
-    exit = { ...exit, telemetry: tally.total() };
-
-    // It can park AGAIN. An agent given an answer may well have a second question, and there is
-    // no reason the second one is worth less than the first.
-    const reparked = await this.parkIfBlocked({
+      // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
+      // a run spawns, rather than a resume-only helper beside a reviewer that had none.
+      budget: reservation.budget,
+      spendGuard: tally.guard('primary'),
+      clockGuard: tally.clockGuard(),
+    };
+    const resumeBase = {
       run,
       repo,
       worktree,
-      exit,
-      session: budgetRun.session,
+      driver,
       runAgent,
-      activeSeconds: entry.activeSeconds + (Date.now() - startedAt) / 1000,
       tally,
-      tail,
-    });
-    if (reparked) return reparked;
+      priorActiveSeconds: entry.activeSeconds,
+      start: resumeStart,
+    };
+    // A resumed CHAIN picks up where it parked and runs the steps that never got to (RUN-168).
+    // Without this a resume restored one session, ran it, and returned — so a run that parked on
+    // step two of five came back, finished step two, and reported DONE having silently skipped the
+    // rest of its plan. The chain is recomputed from the spec as it stands NOW, which is the same
+    // re-fetch RUN-164 already does, so a spec corrected during the park is the one that governs.
+    // A park written before steps existed (RUN-168) records no position. Its spec may have GAINED
+    // steps since, and chaining it then would treat step one as fresh — erasing the resume session
+    // id, never delivering the human's answer, and replaying work that is already done. Such a park
+    // resumes as the single session it was written as.
+    const resumedChain = entry.stepId ? checkSteps(resumedSpec?.spec) : { steps: [], findings: [] };
+    if (!entry.stepId && checkSteps(resumedSpec?.spec).steps.length) {
+      this.log.info('this park predates step positions — resuming it as the single session it was', {
+        runId,
+      });
+    }
+    // Where the chain picks up, and therefore whether anything is left to brief. Total length is
+    // the wrong question: a two-step chain parked on step two has nothing after it.
+    const resumeAt = resumedChain.steps.findIndex((st) => st.id === entry.stepId);
+    const hasLaterSteps = resumeAt >= 0 && resumeAt < resumedChain.steps.length - 1;
+    // The same range `prepare` computes, resolved only when a later step will need it. A verify
+    // actor's whole subject is the accumulated diff (RUN-21); omitting this falls back to "inspect
+    // the modified files", and a leased build branch is CLEAN — so a resumed verify step would find
+    // nothing to review and could pass the change without ever seeing it. Non-git backends have no
+    // such command and the prompt points at the workspace instead.
+    const resumedDiffCmd =
+      hasLaterSteps && run.verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
+        ? `git diff ${(await this.planBase(repo, run).catch(() => null)) ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
+        : undefined;
+    // The RUN's brief, rebuilt on the resume path (RUN-169) — only when there are later steps to
+    // brief, since building one costs a `[context]` walk and the common resume has nothing after
+    // the session it restores. Never fatal: a resume that cannot build one falls back to what it
+    // always sent, which is the pre-RUN-169 behaviour rather than a new failure.
+    const resumedBrief = hasLaterSteps
+      ? await buildRunBrief(this.prepareHost(), {
+          run,
+          repo,
+          worktree,
+          task: resumedTask,
+          runAgent,
+          kind,
+          ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
+          ...(run.workflow ? { workflow: wf } : {}),
+        }).catch((err) => {
+          this.log.warn('could not rebuild the brief on resume — later steps will not run', {
+            runId,
+            err: String(err),
+          });
+          return null;
+        })
+      : null;
+    const executed = resumedChain.steps.length
+      ? await executeChain(this.executeHost(), {
+          ...resumeBase,
+          steps: resumedChain.steps,
+          ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
+          // What the steps before the parked one concluded (RUN-171) — without it, the step after
+          // the resume rediscovers everything the run had already established.
+          ...(entry.priorSteps?.length ? { priorSteps: entry.priorSteps } : {}),
+          // Only when the brief could not be rebuilt: a fresh step with no brief is worse than one
+          // that does not run, and saying so beats running it badly.
+          ...(resumedBrief ? {} : { stopAfterResumedStep: true }),
+          // A fresh step gets the RUN's brief, not the resume's (RUN-169). The resume prompt is
+          // deliberately only the question and the human's answer, because the session it restores
+          // already holds everything else — but a session opened AFTERWARDS holds nothing, and
+          // handing it an answer to a question it never asked was worse than not running it. So
+          // the brief is rebuilt here, from the same assembler `prepare` uses.
+          stepPrompt: (step, i, prior) =>
+            `${resumedBrief?.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null) ?? resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
+          checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
+        })
+      : await executeRun(this.executeHost(), resumeBase);
+    // The parked step is gone from the recomputed plan (RUN-168). Reported the way every other
+    // unresumable park is: the workspace is KEPT, because it holds work that exists nowhere else.
+    if ('chainFailed' in executed) return fail(executed.chainFailed);
+    if (executed.parked) return executed.parked;
 
     return this.afterDriver({
       run,
       repo,
       worktree,
       driver,
-      permission: repo.manifest.permissions[kind],
+      permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
       task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
       runAgent,
-      session: budgetRun.session,
-      stopSession: budgetRun.stop,
-      exit,
+      session: executed.session,
+      stopSession: executed.stopSession,
+      executedSpec: resumedSpec,
+      exit: executed.exit,
       tally,
-      verifyText,
-      getSessionText: () => verifyText,
-      tail,
+      verifyText: executed.sessionText,
+      getSessionText: executed.getSessionText,
+      tail: executed.tail,
     });
   }
 
@@ -1303,264 +2557,522 @@ export class RunSupervisor {
     return stale.length;
   }
 
-  /** Run one dispatched Run to completion. Never throws — failures are reported. */
+  /**
+   * Run one dispatched Run to completion. Never throws — failures are reported.
+   *
+   * Three lines of pipeline (RUN-131): prepare it, execute it, then walk the post-driver stages.
+   * The ~260 lines of setup that used to sit here are `stages/prepare.ts`, and the ~60 that spawned
+   * and awaited the agent are `stages/execute.ts` — which `resume` now shares rather than repeats.
+   */
   async supervise(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
-      return {
-        outcome: 'failed',
-        isError: true,
-        reason,
-        telemetry: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-          costUsd: 0,
-          numTurns: 0,
-        },
-      };
+      return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     };
 
-    const repo = await this.deps.resolveRepo(run.repoRef);
-    if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const driver = this.deps.drivers[run.agentTool as AgentTool];
-    if (!driver) return fail(`no driver for tool ${run.agentTool}`);
+    // A cancel is a fact about the RUN (RUN-165), so it is asked at every boundary rather than
+    // inferred from whether a session happens to be registered. `stopBefore` is the sequence's own
+    // predicate — a new stage that forgets to ask is a bug this file can state.
+    const cancelled = (next: StageName) =>
+      stopBefore(next, this.deps.steering?.isCancelled?.(run.id) ?? false);
 
-    // Defense in depth (RUN-81): the server decides what to dispatch, but a bug in its phase/plan
-    // gate — the removal of plan-task dependency edges left claim_task to enforce phase order
-    // itself — must not let the daemon spawn an agent on a task that isn't unlocked yet (a phase-2
-    // task offered while phase 1 is only in review). The gate lives server-side (phase_tasks), so
-    // ask before spawning. This runs BEFORE the worktree lease so a declined run costs nothing.
-    // Fail OPEN: only a definite `{ claimable: false }` stops the spawn; an absent probe or a
-    // transient error leaves a legitimately-dispatched run untouched.
-    if (run.anchor?.type === 'task' && this.deps.checkClaimable) {
-      const gate = await this.deps.checkClaimable(run.anchor.taskId).catch((err) => {
-        this.log.warn('claimability probe failed — spawning anyway (fail open)', {
-          runId: run.id,
-          err: String(err),
-        });
-        return null;
-      });
-      if (gate && !gate.claimable) {
-        this.log.warn('anchor task is not claimable yet — declining to spawn (phase gate)', {
-          runId: run.id,
-          taskId: run.anchor.taskId,
-          reason: gate.reason,
-        });
-        return fail(
-          `anchor task ${run.anchor.taskId} is not claimable yet — its plan phase is not unlocked${
-            gate.reason ? ` (${gate.reason})` : ''
-          }; not spawning`,
-        );
-      }
-    }
+    const prepared = await prepareRun(this.prepareHost(), run);
+    if (!prepared.ok) return fail(prepared.reason);
+    const afterPrepare = cancelled('plan');
+    if (afterPrepare) return fail(afterPrepare.reason);
 
-    const kind = run.kind as RunKind;
-    const permission = repo.manifest.permissions[kind];
-    // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
-    // suite and exercise the behavior, which needs a writable tree (node_modules, test
-    // temp files, .wrangler state) — chmod'ing it read-only makes that instruction
-    // impossible and reduces the adversarial gate to reading by eye. Verify is still
-    // barred from EDITING by its profile (no Edit/Write tools + an enumerated bash
-    // allowlist), which is the property that actually matters: it must not be able to
-    // "fix" the code it is judging.
-    const readOnly = kind === 'scope';
+    // `plan` (RUN-140), between prepare and execute because a spec written after the build has
+    // started is a spec nobody read. It no-ops unless the workflow produces, the run has a task,
+    // and that task arrived unplanned — and it can only ever ENRICH the prompt: a planner that
+    // fails leaves `start` exactly as prepare built it.
+    const { start, checked: executedSpec } = await this.planIfUnplanned(run, prepared);
 
-    // A VERIFY run leases from the BUILD it judges, not from HEAD — otherwise it gets a
-    // pristine checkout, the `git diff` its prompt orders is empty, and it renders a
-    // verdict on code nobody changed. `verifiesRunId` is what carries that link. By run id,
-    // not by ref (RUN-50): how a run's work is NAMED — a branch, a shelved change — is the
-    // backend's own convention, and this file no longer knows it.
-    const verifiesRunId = run.kind === 'verify' ? (run.verifiesRunId ?? null) : null;
+    // The pre-execution stages are deliberately non-fatal, so a cancel during one of them reads as
+    // "that stage produced nothing" — which is exactly how a cancelled run used to reach a build.
+    const afterPlan = cancelled('execute');
+    if (afterPlan) return fail(afterPlan.reason);
 
-    // The plan's working branch, when this run belongs to one and it exists (RUN-82). A build
-    // FORKS from it (so it sees predecessors' landed work and lands as a fast-forward); a verify
-    // run is MEASURED against it (below). A verify run still leases from the build it judges
-    // (fromRunId), so `fromTarget` is only meaningful — and only passed — for a build.
-    const planBase = kind === 'build' || kind === 'verify' ? await this.planBase(repo, run) : null;
-
-    let worktree: Workspace;
-    try {
-      worktree = await this.vcsFor(repo).lease(repo.root, run.id, {
-        readOnly,
-        fromRunId: verifiesRunId ?? undefined,
-        ...(kind === 'build' && planBase ? { fromTarget: planBase } : {}),
-      });
-    } catch (err) {
-      // A verify run whose build is gone (reaped, or built on another machine) must fail
-      // loudly: silently falling back to HEAD would hand back a confident PASS on an empty
-      // diff, which is worse than no gate at all.
-      if (verifiesRunId) {
-        return fail(
-          `cannot verify ${verifiesRunId}: its work is not in this repo — ${(err as Error).message}`,
-        );
-      }
-      return fail(`workspace setup failed: ${(err as Error).message}`);
-    }
-    // dispatched → running, and the first phase (RUN-31). The status half is the real
-    // transition; the phase half rides the telemetry frame the daemon splits this into.
-    this.deps.report(run.id, { status: 'running', worktreePath: worktree.localPath, phase: 'agent' });
-    this.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.localPath });
-
-    // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
-    // a lookup failure degrades to the bare id rather than sinking the run.
-    const task: AnchorTask | null =
-      run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null;
-
-    // The agent's identity AND its Noriq access, in one step (RUN-43). The daemon creates
-    // the agent up front and receives a token bound to it: the process cannot be anyone
-    // else, and we know who our own child is without scraping its output for an `agt_`.
-    //
-    // This token is per-run and least-privilege. It replaces handing every spawned process
-    // the DAEMON's own token — the credential that can register runners and reach every
-    // project its human can. The server revokes this one when the Run goes terminal.
-    //
-    // Without an identity the agent cannot claim or report, so fail loudly rather than
-    // spawn something that can only no-op.
-    let runAgent: RunAgent | undefined;
-    let noriqMcp: NoriqMcp | undefined;
-    if (this.deps.createRunAgent) {
-      try {
-        // Declare the kind's Noriq tool floor with the identity (RUN-47): the server then
-        // advertises exactly what the driver will permit, so the model never sees a tool it
-        // cannot call. Same list the driver enforces — one policy, two views.
-        runAgent = await this.deps.createRunAgent(run.id, {
-          label: `${run.kind}-${run.id.slice(-6)}`,
-          allowedTools: noriqToolNamesFor(run.kind),
-        });
-        noriqMcp = { url: `${this.deps.server.replace(/\/+$/, '')}/mcp`, token: runAgent.token };
-        // Say who is working this Run as soon as we know — which is now BEFORE the process
-        // starts, rather than never.
-        this.deps.report(run.id, { status: 'running', agentId: runAgent.agentId });
-        this.log.info('run agent created', {
-          runId: run.id,
-          agentId: runAgent.agentId,
-          label: runAgent.label,
-        });
-      } catch (err) {
-        await this.vcsFor(repo)
-          .dispose(worktree)
-          .catch(() => {});
-        return fail(`could not create the Noriq agent for this run: ${(err as Error).message}`);
-      }
-    }
-
-    // Branching from the build's branch isn't enough on its own: that checkout is CLEAN,
-    // so a bare `git diff` still shows nothing. Point the verifier at the range that is
-    // actually under review — everything the build added since it forked. Three dots =
-    // "since the merge base", so an unrelated main moving on doesn't pollute the review.
-    // The base is the plan's working branch when the build forked from one (RUN-82) — else the
-    // build measured against main would re-include every predecessor task's landed work — falling
-    // back to the default branch. Only a git-shaped backend gets a diff command; a live backend
-    // (Perforce/Diversion) has no `git diff` to run, so the prompt falls back to inspecting the
-    // workspace's files (same gate the inline reviewer uses).
-    const diffCmd =
-      verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
-        ? `git diff ${planBase ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
-        : undefined;
-
-    // No identity → no prompt worth sending. assemblePrompt now TELLS the agent who it is,
-    // which it can only do if the daemon actually made someone.
-    if (!runAgent) {
-      await this.vcsFor(repo)
-        .dispose(worktree)
-        .catch(() => {});
-      return fail('no Noriq identity for this run — the daemon must create the agent before spawning it');
-    }
-    const prompt = assemblePrompt(run, repo.manifest, {
-      agent: runAgent,
-      server: this.deps.server,
-      task,
-      diffCmd,
-    });
-    let verifyText = ''; // accumulated agent output — the verify verdict is parsed from it
-    let tail = ''; // rolling tail of the same output, capped, for the live dashboard (RUN-22)
-    // Every session that bills to this run records into one tally (RUN-59), so the run's spend AND
-    // its model mix are the sum across sessions, always consistent with each other.
-    const tally = new RunTally();
-    // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
-    // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
-    const startedAt = Date.now();
-    const budgetRun = superviseBudget(driver, {
-      runId: run.id,
-      kind,
-      cwd: worktree.localPath,
-      prompt,
-      permission,
-      noriqMcp,
-      // Keep the session alive past its first result ONLY when a feedback loop is possible: a
-      // build, with a verify command to fail. Scope and verify runs want today's behaviour —
-      // finish and close — and a session nobody closes hangs the daemon (see the finally below).
-      multiTurn: kind === 'build' && Boolean(repo.manifest.verify),
-      // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
-      // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
-      ...resolveModel(run, repo.manifest),
-      budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-      handlers: {
-        // Each telemetry tick carries the current spend AND the latest log tail, so the dashboard
-        // sees burn + output without a status transition per tick. The primary session — including
-        // its fix turns, which stream through these same handlers — records into the tally, and the
-        // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
-        // knows the split), so the mix appears when the result lands, not before.
-        onTelemetry: (t) => {
-          tally.record('primary', t);
-          this.deps.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
-        },
-        onText: (t) => {
-          verifyText += t;
-          tail = (tail + t).slice(-LOG_TAIL_CAP);
-          this.transcript(run.id).text('agent', t);
-        },
-      },
-    });
-    // Steerable + cancellable while it runs (RUN-16/18).
-    this.deps.steering?.register(run.id, budgetRun.session, budgetRun.stop);
-
-    let exit: DriverExit;
-    try {
-      exit = await budgetRun.done;
-    } finally {
-      this.deps.steering?.unregister(run.id);
-    }
-    // The terminal result, recorded authoritatively (RUN-59): a driver whose result carries a mix
-    // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
-    // run later stream through the handler above and overwrite this with their fuller cumulative.
-    tally.record('primary', exit.telemetry);
-
-    // The session ending is ambiguous (RUN-30): an agent that asked a human a question ends its
-    // turn exactly like one that finished. Only the server knows which, so ask it before treating
-    // this as terminal — everything below destroys context that a parked run still needs.
-    const parked = await this.parkIfBlocked({
+    const base = {
       run,
-      repo,
-      worktree,
-      exit,
-      session: budgetRun.session,
-      runAgent,
-      activeSeconds: (Date.now() - startedAt) / 1000,
-      tally,
-      tail,
-    });
-    if (parked) return parked;
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      runAgent: prepared.runAgent,
+      tally: prepared.tally,
+      start,
+      priorActiveSeconds: 0,
+    };
+    // A spec that declared a runnable decomposition runs as a CHAIN of sessions (RUN-168), one per
+    // step; anything else is one session, exactly as before. `checkSteps` has already dropped a
+    // decomposition it could not run, so an empty list here means "run this as one" rather than
+    // "something was wrong" — which is why there is no branch for the failure.
+    // What this run was actually briefed with, recorded once (RUN-166). Sent here rather than at
+    // dispatch because THIS is where the answer exists: a task that arrived unplanned executes
+    // under whatever the planner wrote, which the server never sent and could not have stored.
+    // `hasExecutionSpec`, not truthiness: a planner that answered with nothing produces a
+    // normalised-but-EMPTY spec, and reporting that would record "briefed with a vacuous contract"
+    // where the truth is "briefed with none" — the two facts this record exists to distinguish.
+    if (hasExecutionSpec(executedSpec?.spec)) {
+      this.deps.report(run.id, { status: 'running', executedSpec: executedSpec!.spec });
+    }
+
+    const chain = checkSteps(executedSpec?.spec);
+    const executed = chain.steps.length
+      ? await executeChain(this.executeHost(), {
+          ...base,
+          steps: chain.steps,
+          stepPrompt: (step, i, prior) =>
+            `${start.prompt}${renderStepFocus(step, i, chain.steps.length)}${renderPriorSteps(prior)}`,
+          checkpoint: (label) =>
+            this.vcsFor(prepared.repo).checkpoint(prepared.worktree, runCommitMessage(run.id, label)),
+        })
+      : await executeRun(this.executeHost(), base);
+    // A chain that could not start at all (RUN-168) — no session, so nothing to settle around.
+    if ('chainFailed' in executed) return fail(executed.chainFailed);
+    if (executed.parked) return executed.parked;
 
     return this.afterDriver({
       run,
-      repo,
-      worktree,
-      driver,
-      permission,
-      noriqMcp,
-      task,
-      runAgent,
-      session: budgetRun.session,
-      stopSession: budgetRun.stop,
-      exit,
-      tally,
-      verifyText,
-      getSessionText: () => verifyText,
-      tail,
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      permission: prepared.permission,
+      ...(prepared.noriqMcp ? { noriqMcp: prepared.noriqMcp } : {}),
+      task: prepared.task,
+      runAgent: prepared.runAgent,
+      session: executed.session,
+      stopSession: executed.stopSession,
+      exit: executed.exit,
+      tally: prepared.tally,
+      verifyText: executed.sessionText,
+      getSessionText: executed.getSessionText,
+      tail: executed.tail,
+      continued: prepared.continued,
+      executedSpec,
     });
+  }
+
+  /**
+   * The spec's story since the park (RUN-164): what to tell the resumed session, and the checked
+   * spec its GATE will be held to.
+   *
+   * Re-fetches the anchor task and re-checks it against the workspace as `prepare` would — the two
+   * things a resume skips by going straight to `executeRun`. Two independent ways a resumed run's
+   * premise goes stale, and this catches both: the SPEC changed (a human corrected it while
+   * answering), or the CHECKOUT changed (another run landed and a file the plan names moved).
+   *
+   * Compared as rendered text rather than by deep-equalling the spec: the rendered block is what
+   * the session was actually told, and a difference the rendering does not show is a difference
+   * that would not have reached the agent anyway.
+   *
+   * `checked` rides along because a resume reaches `afterDriver` by its own path (RUN-145). Without
+   * it the resumed run's reviewer got an EMPTY checklist while a first-sitting run's got the
+   * criteria — so parking, answering a question and carrying on silently disabled the gate's
+   * definition of done. One lookup answers both, so the gate cannot end up judging a different spec
+   * than the one this session was just told about.
+   */
+  private async specChangedWhileParked(
+    run: Run,
+    worktree: Workspace,
+    produces: boolean,
+  ): Promise<{ rendered: string; checked: CheckedExecutionSpec | null; task: AnchorTask | null }> {
+    const none = { rendered: '', checked: null, task: null };
+    if (run.anchor?.type !== 'task') return none;
+    const task = await this.resolveAnchorTask(run.anchor.taskId);
+    if (!task) return none;
+    // The TASK rides back too (RUN-169): a resumed chain needs it to rebuild a brief for the steps
+    // that never ran, and re-fetching it a second line later would be a second answer to a
+    // question that can change between the two.
+    if (task.executionSpecUnreadable) return { rendered: renderUnreadableSpec(), checked: null, task };
+    if (!task.executionSpec) return { ...none, task };
+    const checked = await checkExecutionSpec(task.executionSpec, worktree.localPath, {
+      ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
+      produces,
+    });
+    return { rendered: renderExecutionSpec(checked), checked, task };
+  }
+
+  /**
+   * Run the `plan` stage when it applies, and fold its result into the builder's brief (RUN-140).
+   *
+   * Returns `prepared.start` untouched whenever planning does not apply or does not work, which is
+   * what makes this stage unable to cost a run: every failure path here is "the run proceeds
+   * exactly as it would have without me".
+   */
+  private async planIfUnplanned(
+    run: Run,
+    prepared: PreparedRun,
+  ): Promise<{ start: PreparedRun['start']; checked: CheckedExecutionSpec | null }> {
+    // The spec this run proceeds under if planning does not happen or does not work — which is
+    // every early return below. The gate downstream is answering ACCEPTANCE CRITERIA (RUN-145), so
+    // it needs the spec the build was actually briefed with, and "the one prepare found" and "the
+    // one the planner wrote" are different answers on different paths.
+    const unplanned = { start: prepared.start, checked: prepared.checkedSpec };
+    // Asked before each pre-execution spawn too, not only at the pipeline's boundaries: these
+    // stages are minutes long, and a cancel arriving inside one should not be answered by starting
+    // the next.
+    const stopped = () => this.deps.steering?.isCancelled?.(run.id) ?? false;
+    if (stopped()) return unplanned;
+    if (!stagesFor(prepared.workflow).some((s) => s.name === 'plan')) return unplanned;
+    if (!prepared.plannedTask) return unplanned;
+
+    // The planner spends the RUN's remaining ceiling like any other session (RUN-133) — a run with
+    // nothing left declines to plan rather than starting a process to kill.
+    const reservation = prepared.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left to plan this run — proceeding unplanned', {
+        runId: run.id,
+        breach: reservation.breach,
+      });
+      return unplanned;
+    }
+
+    const planned = await planRun(this.planHost(), {
+      run,
+      repo: prepared.repo,
+      worktree: prepared.worktree,
+      driver: prepared.driver,
+      runAgent: prepared.runAgent,
+      tally: prepared.tally,
+      prompt: prepared.plannerPrompt,
+      start: {
+        ...prepared.start,
+        permission: plannerPermission(prepared.permission),
+        // NO MCP. Every other actor gets Noriq because it has to report what it did; the planner
+        // reports nothing — the DAEMON writes its spec back, under the daemon's own token and
+        // behind a re-read that will not clobber a human. Handing it the run agent's connection
+        // would have given a "read-only" actor `update_task`, `claim_task` and `post_comment`,
+        // which are writes the filesystem clamp says nothing about, and the server explicitly
+        // permits a run agent to rewrite an execution spec (RUN-160). The narrowest thing that
+        // can do the job is the thing to hand it.
+        noriqMcp: undefined,
+        ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+        spendGuard: prepared.tally.guard('plan'),
+        clockGuard: prepared.tally.clockGuard(),
+      },
+    }).catch((err) => {
+      // A stage that cannot gate the run must not throw out of it either.
+      this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
+      return null;
+    });
+    if (!planned) return unplanned;
+
+    // The plan checker (RUN-141), through the planner's still-open session. It cannot gate the
+    // run: a plan that never clears goes to the builder WITH the findings, because refusing to
+    // work over a disagreement between two advisors — about work neither has done — is worse than
+    // building a plan somebody criticised.
+    const outcome = stopped()
+      ? { checked: planned.checked, findings: '' }
+      : await this.checkPlanIfConfigured(run, prepared, planned).catch((err) => {
+          this.log.warn('the plan checker failed — the plan stands as planned', {
+            runId: run.id,
+            err: String(err),
+          });
+          return { checked: planned.checked, findings: '' };
+        });
+    await planned.close(outcome.checked).catch(() => {});
+    // Findings the loop never resolved travel WITH the plan. A criticised plan handed over looking
+    // like an approved one is the worst of both: the tokens were spent and the warning was not.
+    const unresolved = checkerFindings(outcome.findings);
+    const checked: CheckedExecutionSpec = unresolved.length
+      ? { ...outcome.checked, findings: [...outcome.checked.findings, ...unresolved] }
+      : outcome.checked;
+
+    // The pattern map (RUN-144) and the repo facts it caches (RUN-143).
+    const extra = await this.mapPatternsIfWorthIt(run, prepared, checked).catch((err) => {
+      this.log.warn('the pattern mapper failed — the builder gets no analogs', {
+        runId: run.id,
+        err: String(err),
+      });
+      return '';
+    });
+
+    // RE-RESERVE, and AFTER the pre-execution stages rather than before them:
+    // `prepared.start.budget` was computed before any of this ran, so handing it to the builder
+    // unchanged would let a run spend its ceiling twice — the per-session-copy bug RUN-133 removed.
+    // Reserving before the pattern map was the same mistake one stage smaller: the builder would
+    // have been told it could spend what the mapper then spent, and killed by the run guard
+    // partway into work its own allowance said it could do.
+    const rest = prepared.tally.reserve();
+    if (!rest.ok) {
+      this.log.warn('the pre-execution stages used what was left of this run', {
+        runId: run.id,
+        breach: rest.breach,
+      });
+      this.transcript(run.id).milestone(
+        `planning used the run's remaining budget (${rest.breach}) — nothing left to build with`,
+      );
+    }
+
+    return {
+      checked,
+      start: {
+        ...prepared.start,
+        prompt: prepared.rebuildPrompt(checked, extra),
+        ...(rest.ok ? (rest.budget ? { budget: rest.budget } : {}) : { budget: EXHAUSTED_BUDGET }),
+      },
+    };
+  }
+
+  /**
+   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144).
+   *
+   * Returns the brief section to append, or '' — every reason to produce nothing is a reason to
+   * leave the builder exactly as well briefed as it would have been. Skipped when the plan
+   * anticipates no files (there is nothing to find an analog FOR), and when the intel cache
+   * already answers AT THIS BASE: the facts and the analogs come from the same tree, so a fact
+   * that is still current means the analogs would be too.
+   */
+  private async mapPatternsIfWorthIt(
+    run: Run,
+    prepared: PreparedRun,
+    checked: CheckedExecutionSpec | null,
+  ): Promise<string> {
+    if (!stagesFor(prepared.workflow).some((st) => st.name === 'pattern-map')) return '';
+    if (!worthMapping(checked) || !checked) return '';
+
+    // The FACTS are cacheable and the ANALOGS are not: facts describe the repo whatever the task
+    // is, analogs are about THIS task's files. A cache hit therefore short-circuits the facts half
+    // and nothing else — an earlier version skipped the whole stage on a hit, which meant a warm
+    // cache produced a WORSE brief than a cold one at the very thing this stage exists for.
+    //
+    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
+    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
+    // checkout against a fork point, and a later fresh run at that fork point would read them.
+    const intel = prepared.continued ? undefined : this.deps.repoIntel;
+    const cached = await intel?.get(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
+    if (cached) this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
+
+    const reservation = prepared.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left to map this repo’s patterns', {
+        runId: run.id,
+        breach: reservation.breach,
+      });
+      return '';
+    }
+    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached ?? null);
+    const map = await mapPatterns(this.patternMapHost(prepared.tally), {
+      run,
+      driver: prepared.driver,
+      checked,
+      prompt: prepared.mapperPrompt(checked),
+      start: {
+        ...prepared.start,
+        permission: plannerPermission(prepared.permission),
+        noriqMcp: undefined,
+        ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+        spendGuard: prepared.tally.guard('pattern-map'),
+        clockGuard: prepared.tally.clockGuard(),
+      },
+    });
+    if (!map) return renderRepoFacts(cached ?? null);
+
+    // The facts outlive this run; the analogs do not. Written only on a MISS — a hit means an
+    // earlier run already derived them from this same tree. Best-effort either way: a cache that
+    // cannot be written costs the NEXT run its shortcut and this one nothing.
+    if (intel && !cached && hasFacts(map.facts)) {
+      await intel
+        .put(prepared.repo.root, prepared.worktree.baseId, map.facts)
+        .catch((err: unknown) =>
+          this.log.warn('could not cache what this run learned', { err: String(err) }),
+        );
+    }
+    return `${renderAnalogs(map.analogs)}${renderRepoFacts(cached ?? map.facts)}`;
+  }
+
+  private patternMapHost(tally: RunTally): PatternMapHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      ...(this.deps.steering
+        ? {
+            steering: {
+              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
+                this.deps.steering?.register(runId, session, stop),
+              unregister: (runId: string) => this.deps.steering?.unregister(runId),
+            },
+          }
+        : {}),
+      record: (slot, exit) => tally.record(slot, exit.telemetry),
+      charge: (seconds) => tally.chargeTime(seconds),
+    };
+  }
+
+  /**
+   * The plan-checker loop (RUN-141), when the repo asked for one.
+   *
+   * Gated on `[verify.agent]` — the same section that opts a repo into the diff reviewer, and for
+   * the same reason: a repo that wants an independent judgement on its WORK is the one that wants
+   * an independent judgement on its PLAN, and a second knob would be two ways to say one thing.
+   * `maxRounds` bounds the revisions exactly as it bounds the builder's fix turns.
+   */
+  private async checkPlanIfConfigured(
+    run: Run,
+    prepared: PreparedRun,
+    planned: PlannedRun,
+  ): Promise<{ checked: CheckedExecutionSpec; findings: string }> {
+    const reviewer = prepared.repo.manifest.verify?.agent;
+    if (!reviewer) return { checked: planned.checked, findings: '' };
+
+    const result = await checkPlan(this.planCheckHost(planned, prepared.tally, planned.envelope), {
+      run,
+      driver: prepared.driver,
+      checked: planned.checked,
+      maxRounds: reviewer.maxRounds,
+      prompt: (spec, ledger) => prepared.checkerPrompt(spec, ledger),
+      start: {
+        ...prepared.start,
+        // Same narrowing as the planner's, and for the same two reasons: `auto` survives the write
+        // clamp, and a filesystem clamp says nothing about the control plane. A checker emits a
+        // report and nothing else.
+        permission: plannerPermission(prepared.permission),
+        noriqMcp: undefined,
+      },
+    });
+    return { checked: result.checked, findings: result.findings };
+  }
+
+  /**
+   * The checker's host. One PLANNING ENVELOPE is shared by the planner and every checker round —
+   * `plannerBudget` applied per round would compound (a quarter of a shrinking remainder, six
+   * times, is most of the run), and the documented policy is that planning takes a quarter, not
+   * that each planning SESSION does.
+   *
+   * No steering: registering a checker under the run id would overwrite the planner's entry, and
+   * the checker's own cleanup would then leave nothing registered — so a cancel arriving during a
+   * revision would find no target at all. The planner stays registered for the whole loop, which
+   * is the session that actually outlives it.
+   */
+  private planCheckHost(planned: PlannedRun, tally: RunTally, envelope: RunBudget | null): PlanCheckHost {
+    // What the whole planning phase may still spend, tracked here because the tally is the RUN's
+    // ledger and knows nothing about phases.
+    let spentInPhase = zeroTelemetry();
+    let secondsInPhase = 0;
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      revise: (feedback) => planned.revise(feedback),
+      reserve: () => {
+        // Two ceilings, and the tighter wins: what the RUN has left (so the builder is not starved
+        // by an over-eager loop) and what the PLANNING PHASE has left (so the loop cannot take a
+        // fresh quarter each round).
+        const run = tally.reserve();
+        if (!run.ok) return { ok: false, breach: run.breach };
+        const phase = reserveFromRun(envelope, { telemetry: spentInPhase, activeSeconds: secondsInPhase });
+        if (!phase.ok) return { ok: false, breach: phase.breach };
+        const tightest = tighter(run.budget, phase.budget);
+        return { ok: true, ...(tightest ? { budget: tightest } : {}) };
+      },
+      guards: (slot) => ({
+        spendGuard: tally.guard(slot),
+        clockGuard: tally.clockGuard(),
+      }),
+      record: (slot, exit) => {
+        tally.record(slot, exit.telemetry);
+        spentInPhase = sumTelemetry(spentInPhase, exit.telemetry);
+      },
+      charge: (seconds) => {
+        tally.chargeTime(seconds);
+        secondsInPhase += Math.max(0, seconds);
+      },
+    };
+  }
+
+  private planHost(): PlanHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      // The planner is a live session like any other: cancellable, and stopped by shutdown. It
+      // used to be outside this, so `run.cancel` during planning found no target and answered
+      // false while the planner — and then the build — carried on.
+      ...(this.deps.steering
+        ? {
+            steering: {
+              register: (runId: string, session: DriverSession, stop: () => Promise<void>) =>
+                this.deps.steering?.register(runId, session, stop),
+              unregister: (runId: string) => this.deps.steering?.unregister(runId),
+            },
+          }
+        : {}),
+      checkSpec: (spec, root) =>
+        checkExecutionSpec(spec, root, {
+          ...(this.deps.specPathProbe ? { probe: this.deps.specPathProbe } : {}),
+          produces: true,
+        }),
+      ...(this.deps.saveExecutionSpec ? { saveSpec: this.deps.saveExecutionSpec } : {}),
+    };
+  }
+
+  /**
+   * The surface `prepare` reaches — see `stageHost` for why this is closures, not `this`.
+   *
+   * Every optional dep is re-wrapped in an arrow rather than copied by reference, and that is not
+   * ceremony: `this.deps.checkClaimable(id)` calls with `deps` as the receiver, and handing the bare
+   * function over would silently call it with the HOST as the receiver instead. A dep written as a
+   * method (`checkClaimable() { return this.client... }`) satisfies the declared type and would
+   * start throwing — which the claimability probe swallows as a transient failure and fails OPEN,
+   * spawning a run the phase gate meant to decline. The daemon passes arrows today; the contract is
+   * public, so it must not depend on that.
+   */
+  private prepareHost(): PrepareHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      postComment: (projectId, taskId, body) => this.deps.postComment?.(projectId, taskId, body),
+      transcript: (runId) => this.transcript(runId),
+      server: this.deps.server,
+      resolveRepo: (repoRef) => this.deps.resolveRepo(repoRef),
+      driverFor: (tool) => this.deps.drivers[tool as AgentTool],
+      vcsFor: (repo) => this.vcsFor(repo),
+      ...(this.deps.checkClaimable
+        ? { checkClaimable: (taskId: string) => this.deps.checkClaimable!(taskId) }
+        : {}),
+      planBase: (repo, run) => this.planBase(repo, run),
+      ...(this.deps.createRunAgent
+        ? {
+            createRunAgent: (runId: string, opts: { label?: string; allowedTools?: string[] }) =>
+              this.deps.createRunAgent!(runId, opts),
+          }
+        : {}),
+      resolveAnchorTask: (taskId) => this.resolveAnchorTask(taskId),
+      ...(this.deps.resolveLockScope
+        ? {
+            resolveLockScope: (run: Run, spec: ExecutionSpec | null) =>
+              this.deps.resolveLockScope!(run, spec),
+          }
+        : {}),
+      lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
+      lockEnforcerFor: (repo, run, worktree, kind, token) =>
+        this.lockEnforcerFor(repo, run, worktree, kind, token),
+      runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
+      context: {
+        ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
+        ...(this.deps.specPathProbe ? { specProbe: this.deps.specPathProbe } : {}),
+        ...(this.deps.readDoc ? { read: this.deps.readDoc } : {}),
+        ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
+      },
+      ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+    };
+  }
+
+  /** The surface `execute` reaches. `startAgent` is here — and nowhere wider — because it is the
+   *  one place the sanitized child env is applied (RUN-109). */
+  private executeHost(): ExecuteHost {
+    return {
+      log: this.log,
+      report: (runId, frame) => this.deps.report(runId, frame),
+      transcript: (runId) => this.transcript(runId),
+      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      ...(this.deps.steering ? { steering: this.deps.steering } : {}),
+      parkIfBlocked: (ctx) => this.parkIfBlocked(ctx),
+    };
   }
 
   /**
@@ -1592,272 +3104,90 @@ export class RunSupervisor {
      *  to capture the builder's structured response block (RUN-79). */
     getSessionText?: () => string;
     tail: string;
+    /** The prior sitting's continuation state on a "continue a failed run" (RUN-92): its ledger
+     *  seeds the reviewer, and it decides whether the terminal record is refreshed or dropped. */
+    continued?: ContinuableRun | null;
+    /** The spec this run was actually briefed with — prepare's, or the one the `plan` stage
+     *  synthesized (RUN-145). What the gate answers its acceptance criteria against. */
+    executedSpec?: CheckedExecutionSpec | null;
   }): Promise<DriverExit> {
-    const { run, repo, worktree, driver, permission, noriqMcp, task, runAgent, tally, verifyText, tail } =
-      ctx;
-    const kind = run.kind as RunKind;
-    const budgetRun = { session: ctx.session, stop: ctx.stopSession };
-    let exit = ctx.exit;
-    // Whether the DRIVER succeeded — drives worktree retention (a build with a diff
-    // is kept for the human even if verify then fails).
-    let driverSucceeded = exit.outcome === 'done';
-    // Whether the diff reached the integration branch. Once it has, the run's worktree
-    // and throwaway branch are disposable — that is what stops them accumulating.
-    let landed = false;
+    const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
+    const continued = ctx.continued ?? null;
+    // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
+    // posture either way; what the named one adds is its declared stage list.
+    const wf = runWorkflow(run, repo.manifest);
 
-    // A build that changed NOTHING is not a success. An agent that bailed (blocked,
-    // refused, or ran out of road) exits clean with a pristine worktree; verifying that
-    // burns the full suite to re-test untouched HEAD, and a PASS would land the Run in
-    // review as "done" with an empty diff — a silent no-op reported as success.
-    if (kind === 'build' && driverSucceeded) {
-      const changed = await this.vcsFor(repo)
-        .hasWork(worktree)
-        .catch(() => true); // can't tell → assume it worked and let verify decide
-      if (!changed) {
-        this.log.warn('build produced no changes — skipping verify, not a success', { runId: run.id });
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'no_changes' };
-        driverSucceeded = false;
-      }
+    // The pipeline as an explicit SEQUENCE (RUN-131). What used to be ~390 lines of gates in one
+    // method is now `stagesFor(wf)` — a declared, ordered list this loop walks, so the two flag
+    // tests that used to be repeated in every gate (`wf.produces`, `wf.verifyActor`) are stated
+    // once, where the sequence is. Which stages come back is `(mandatory ∪ the workflow's
+    // declaration) ∩ appliesTo` (RUN-132): the workflow chooses among the optional ones, and the
+    // machine decides what may be chosen and in what order.
+    const pipeline: RunPipeline = {
+      run,
+      repo,
+      worktree,
+      driver,
+      permission,
+      ...(ctx.noriqMcp ? { noriqMcp: ctx.noriqMcp } : {}),
+      task,
+      runAgent,
+      session: ctx.session,
+      stopSession: ctx.stopSession,
+      tally,
+      sessionText: verifyText,
+      ...(ctx.getSessionText ? { getSessionText: ctx.getSessionText } : {}),
+      tail,
+      continued,
+      workflow: wf,
+      // Enumerated ONCE, here, so the checklist the gate is shown and the numbers it answers with
+      // are the same list — computing it at each use would let a renumbering slip between them
+      // and silently repoint every answer (RUN-145).
+      acceptance: enumerateAcceptance(ctx.executedSpec?.spec),
+      acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
+      requirements: ctx.executedSpec?.spec.requirementIds ?? [],
+      exit: ctx.exit,
+      // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
+      // the human even if verify then fails).
+      driverSucceeded: ctx.exit.outcome === 'done',
+      // Whether the diff reached the integration branch. Once it has, the run's worktree and
+      // throwaway branch are disposable — that is what stops them accumulating.
+      landed: false,
+      // The ledger carried into the terminal continuable record (RUN-92): the reviewer's final one
+      // when it runs, else whatever a prior sitting left — a pre-review failure adds nothing.
+      ledger: continued?.ledger ?? [],
+      // Decided by `verify`, once, at the point the pipeline always decided it.
+      landPolicy: null,
+    };
+
+    const host = this.stageHost();
+    for (const s of stagesFor(wf)) {
+      const impl = POST_DRIVER_STAGES[s.name];
+      if (impl) await impl(host, pipeline);
     }
-
-    // Make the diff durable BEFORE anything else can touch the worktree. The agent may
-    // not have (or use) git permissions, and loose files are destroyed by the next
-    // `worktree remove --force` — including the crash-safe reap on the daemon's next
-    // start. Committing here is what makes "a review diff on the branch" true.
-    if (kind === 'build' && driverSucceeded) {
-      const label = task ? `${task.key} ${task.title}` : (run.brief || run.id).slice(0, 60);
-      await this.vcsFor(repo)
-        .checkpoint(worktree, `noriq run ${run.id}: ${label}`)
-        .then((committed) => {
-          if (committed)
-            this.log.info('committed the run diff to its branch', {
-              runId: run.id,
-              workRef: worktree.workRef,
-            });
-        })
-        .catch((err) =>
-          this.log.error('could not commit the run diff — it stays uncommitted', {
-            runId: run.id,
-            err: String(err),
-          }),
-        );
-    }
-
-    // ── Landing (opt-in via the manifest's [land]) ────────────────────────────────
-    // Rebase onto the integration tip → verify THERE → fast-forward in → reap. Verify
-    // runs after the rebase on purpose: two runs can each be green at their own fork
-    // point and broken together, and a gate that never sees the combination can't catch
-    // it. Serialized per repo, because rebase→verify→land is a read-modify-write of one
-    // branch and two runs interleaving would land untested combinations.
-    const landPolicy = kind === 'build' && driverSucceeded ? (repo.manifest.land ?? null) : null;
-    const floorCmd = cmdVerify(repo.manifest.verify);
-
-    // Deterministic verify floor (RUN-19), when NOT landing — the landing pipeline verifies the
-    // REBASED result instead, which is strictly the better question. Runs BEFORE the reviewer
-    // (RUN-61): the command is cheap and deterministic, so it screens out work not worth an
-    // agent's review — the same reason CI runs the linter before the humans arrive.
-    if (kind === 'build' && driverSucceeded && !landPolicy && floorCmd) {
-      // Same silence as landing, and the longer of the two in practice: the full suite with
-      // no token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to
-      // the agent on a failure, which flips the phase to 'agent' again — see below.
-      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
-      const result = await this.verifyWithFeedback({
-        run,
-        spec: floorCmd,
-        cwd: worktree.localPath,
-        session: budgetRun.session,
-        phase: 'verifying',
-      });
-      if (result.passed) {
-        this.log.info('deterministic verify passed', { runId: run.id });
-      } else {
-        this.log.warn('deterministic verify FAILED — run gated (not done)', {
-          runId: run.id,
-          exitCode: result.exitCode,
-          timedOut: result.timedOut,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, verifyFailureComment(floorCmd, result));
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify' };
-      }
-    }
-
-    // Inline reviewer (RUN-61): a FRESH agent judges whether the diff satisfies the INTENT — the
-    // question the command cannot ask. Before landing, deliberately: a rebase changes whether the
-    // combination still builds (the command's question, asked post-rebase inside the lock), never
-    // what the diff means — and an agent review inside the repo lock would serialize every other
-    // run on this repo behind a judgment that cannot change.
-    if (kind === 'build' && driverSucceeded && exit.outcome === 'done' && repo.manifest.verify?.agent) {
-      this.deps.report(run.id, { status: 'running', phase: 'verifying' });
-      const review = await this.reviewWithFeedback({
-        run,
-        repo,
-        worktree,
-        driver,
-        session: budgetRun.session,
-        task,
-        tally,
-        getSessionText: ctx.getSessionText,
-        budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-      });
-      if (review.passed) {
-        this.log.info('inline reviewer PASS', { runId: run.id, rounds: review.rounds });
-      } else if (review.verdict === 'fail') {
-        this.log.warn('inline reviewer refused the work — run gated (not done)', {
-          runId: run.id,
-          verdict: review.verdict,
-          rounds: review.rounds,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(
-            run.projectId,
-            run.anchor.taskId,
-            reviewerRejectionComment(review.findings, review.rounds),
-          );
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review' };
-      } else {
-        // 'unknown' = the gate never rendered a judgment (reviewer killed, crashed, budget
-        // breach, missing driver, no VERDICT line). NOT a refusal — saying "the reviewer
-        // found problems" about a reviewer somebody killed is a lie in both directions: it
-        // maligns the diff and it hides the infrastructure failure. The run still cannot
-        // pass — silence must not read as a gate that isn't there — but the reason and the
-        // comment say what actually happened, and no fix rounds were burned on a non-report.
-        this.log.warn('inline reviewer rendered NO verdict — run gated, not judged', {
-          runId: run.id,
-          rounds: review.rounds,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(
-            run.projectId,
-            run.anchor.taskId,
-            reviewerNoVerdictComment(review.findings),
-          );
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'review:no-verdict' };
-      }
-    }
-
-    if (landPolicy && exit.outcome === 'done') {
-      // The agent process is gone and the spend stops moving here, so without this the
-      // dashboard shows "running" through a rebase → verify → fast-forward that can take a
-      // minute — and a queue behind the repo lock makes it longer (RUN-31).
-      this.deps.report(run.id, { status: 'running', phase: 'landing' });
-      const outcome = await this.withRepoLock(repo.root, () =>
-        this.landRun({
-          run,
-          repo,
-          worktree,
-          policy: landPolicy,
-          session: budgetRun.session,
-          task,
-          driver,
-          permission,
-          noriqMcp,
-          tally,
-          budget: mergeBudget(run.budget, this.deps.defaultBudget) ?? undefined,
-        }),
-      ).catch(
-        (err): LandOutcome => ({
-          landed: false,
-          branch: landPolicy.branch,
-          reason: 'error',
-          detail: String(err),
-        }),
-      );
-
-      if (outcome.landed) {
-        this.log.info('landed', {
-          runId: run.id,
-          branch: outcome.branch,
-          sha: outcome.sha,
-          resolvedByAgent: outcome.resolvedByAgent,
-        });
-      } else {
-        this.log.warn('could not land — the diff stays on its branch', {
-          runId: run.id,
-          branch: outcome.branch,
-          reason: outcome.reason,
-        });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, landFailureComment(outcome, run.id));
-        }
-        // The gate rejecting the COMBINATION is a real failure, same as rejecting the
-        // change alone — the run does not reach done either way.
-        // NB: deliberately does NOT clear driverSucceeded — that flag decides whether the
-        // worktree survives, and an unlanded diff is exactly what a human still needs.
-        exit = { ...exit, outcome: 'failed', isError: true, reason: `land:${outcome.reason}` };
-      }
-      landed = outcome.landed;
-    }
-
-    // Every gate that could hand work back has now run, so the session has no more work to do.
-    // It MUST be closed explicitly: a multiTurn run deliberately does not self-close on its first
-    // result (that is the whole point — RUN-29), so nothing else ever shuts the SDK query down,
-    // and an open one keeps the daemon's event loop alive forever. Best-effort: a session that is
-    // already gone is the normal case for every single-turn run.
-    await budgetRun.stop().catch(() => {});
-
-    // Independent verify agent (RUN-20): the run's own output IS the verdict. A
-    // FAIL (or an ambiguous/absent verdict) gates the phase — the run does not
-    // reach done and the findings are surfaced.
-    if (kind === 'verify' && driverSucceeded) {
-      const v = parseVerdict(verifyText);
-      if (v.passed) {
-        this.log.info('verify agent PASS', { runId: run.id });
-      } else {
-        this.log.warn('verify agent gate — phase not cleared', { runId: run.id, verdict: v.verdict });
-        if (run.anchor?.type === 'task') {
-          this.deps.postComment?.(run.projectId, run.anchor.taskId, verifyAgentComment(v));
-        }
-        exit = { ...exit, outcome: 'failed', isError: true, reason: 'verify_agent' };
-      }
-    }
-
-    // The run's true spend + mix, summed across every session that billed (RUN-59): the primary
-    // (with its fix turns), every reviewer round, the conflict resolver, and any prior park — all
-    // recorded into the tally by now. This supersedes the primary session's own first-result
-    // snapshot (`exit.telemetry`), which missed both the sub-sessions and the fix turns.
-    exit = { ...exit, telemetry: tally.total() };
-    this.deps.report(run.id, {
-      status: exit.outcome,
-      agentId: runAgent.agentId,
-      telemetry: exit.telemetry,
-      logTail: tail,
-      exit: { outcome: exit.outcome, reason: exit.reason },
-    });
-
-    // Keep only what a human still has to act on: a build whose diff did NOT land. Once
-    // it is on the integration branch the worktree and its throwaway branch are dead
-    // weight — reaping them here is what keeps ~/.noriq/worktrees from growing one
-    // directory per run forever. Scope/verify and driver failures are cleaned up as before.
-    //
-    // EXCEPT on a backend whose dispose preserves the work itself (RUN-52): there, skipping
-    // dispose is not "keep the work", it is "hold the pool-of-1 lease forever" — the next run
-    // on this repo would wait on a workspace nobody will ever hand back. Such a backend
-    // shelves/keeps the work server-side inside dispose, so disposing IS keeping.
-    const vcsOut = this.vcsFor(repo);
-    if (!(kind === 'build' && driverSucceeded && !landed) || vcsOut.disposePreservesWork) {
-      await vcsOut
-        .dispose(worktree)
-        .catch((err) => this.log.warn('worktree cleanup failed', { err: String(err) }));
-    }
-    this.log.info('run finished', { runId: run.id, outcome: exit.outcome, reason: exit.reason });
-    // Close the transcript with the outcome, so the stream a human reads actually ENDS (RUN-74).
-    const transcript = this.transcripts.get(run.id);
-    if (transcript) {
-      transcript.milestone(`run finished: ${exit.outcome}${exit.reason ? ` — ${exit.reason}` : ''}`);
-      transcript.end();
-      this.transcripts.delete(run.id);
-    }
-    return exit;
+    return pipeline.exit;
   }
 }
+
+/**
+ * The stages this method runs. `prepare` and `execute` are absent by construction, not by omission:
+ * they happen BEFORE the pipeline object exists — they are what BUILDS it — so they take a run and
+ * return one rather than narrowing a context they were handed, and `supervise` calls them directly.
+ * A stage with no entry here is simply not part of the post-driver walk.
+ */
+const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
+  verify: verifyStage,
+  review: reviewStage,
+  integrate: integrateStage,
+  settle: settleStage,
+};
 
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {
   if (v.passed) return `reviewer verdict: PASS (round ${round})`;
-  if (v.verdict === 'fail') return `reviewer verdict: FAIL (round ${round})`;
+  if (v.verdict === 'fail')
+    return v.escalation
+      ? `reviewer verdict: FAIL (round ${round}) — escalated STRUCTURAL, the daemon stops the fix rounds`
+      : `reviewer verdict: FAIL (round ${round})`;
   return `reviewer rendered NO verdict (round ${round}) — stopped, crashed, or wrote no VERDICT line`;
 }

@@ -1,10 +1,13 @@
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { AsyncQueue } from '../async-queue';
+import type { LockEnforcer } from '../lock-hooks';
 import type { logger as Logger } from '../logger';
 import { noriqToolNamesFor, sanitizedAgentEnv } from '../security';
 import {
   type AgentDriver,
+  type DriverCapabilities,
+  type DriverCatalog,
   type DriverExit,
   type DriverSession,
   type DriverStartOptions,
@@ -105,6 +108,8 @@ export interface SdkQueryOptions {
   maxTurns?: number;
   maxBudgetUsd?: number;
   mcpServers?: Record<string, SdkMcpHttpServer>;
+  /** In-process hooks (RUN-101): PreToolUse denies an edit to a locked path, Stop releases. */
+  hooks?: Partial<Record<'PreToolUse' | 'Stop' | 'SubagentStop', SdkHookMatcher[]>>;
   /** Ignore all ambient MCP config (user settings, .mcp.json, plugins). */
   strictMcpConfig?: boolean;
   /**
@@ -120,6 +125,33 @@ export interface SdkQueryOptions {
    *  for a byte-faithful transcript (RUN-77). */
   includePartialMessages?: boolean;
 }
+/**
+ * Narrow mirror of the SDK's in-process hook shape (RUN-101), the same anti-corruption pattern
+ * as the message mirrors above — we emit exactly this (verified against sdk.d.ts `HookCallback` /
+ * `PreToolUseHookSpecificOutput`), and tests inject a fake `queryFn` that invokes it.
+ */
+export interface SdkHookInput {
+  hook_event_name: string;
+  tool_name?: string;
+  tool_input?: unknown;
+}
+export interface SdkHookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'PreToolUse';
+    permissionDecision?: 'allow' | 'deny' | 'ask' | 'defer';
+    permissionDecisionReason?: string;
+  };
+}
+export type SdkHookCallback = (
+  input: SdkHookInput,
+  toolUseId: string | undefined,
+  opts: { signal: AbortSignal },
+) => Promise<SdkHookOutput>;
+export interface SdkHookMatcher {
+  matcher?: string;
+  hooks: SdkHookCallback[];
+}
+
 export type QueryFn = (args: {
   prompt: AsyncIterable<SdkUserMessage>;
   options?: SdkQueryOptions;
@@ -143,6 +175,47 @@ export const NORIQ_MCP_NAME = 'noriq';
  *  per-kind Noriq floor a Claude-only property); this only applies the SDK's prefix. */
 export const noriqToolsFor = (kind: RunKind): string[] =>
   noriqToolNamesFor(kind).map((t) => `mcp__${NORIQ_MCP_NAME}__${t}`);
+
+/**
+ * The PreToolUse + Stop hook option that wires an in-process LockEnforcer into the SDK (RUN-101).
+ * PreToolUse asks the enforcer to lock the tool's write set; a conflict → `permissionDecision:
+ * 'deny'` with the conflict text, which the SDK feeds back to the model. Stop releases.
+ */
+export function lockHooks(enforcer: LockEnforcer): NonNullable<SdkQueryOptions['hooks']> {
+  return {
+    PreToolUse: [
+      {
+        hooks: [
+          async (input): Promise<SdkHookOutput> => {
+            const reason = await enforcer.guard(
+              input.tool_name ?? '',
+              (input.tool_input as Record<string, unknown>) ?? {},
+            );
+            return reason
+              ? {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: reason,
+                  },
+                }
+              : {};
+          },
+        ],
+      },
+    ],
+    Stop: [
+      {
+        hooks: [
+          async (): Promise<SdkHookOutput> => {
+            await enforcer.releaseHeld();
+            return {};
+          },
+        ],
+      },
+    ],
+  };
+}
 
 export function mapPermission(
   profile: PermissionProfile,
@@ -283,8 +356,28 @@ export interface ClaudeDriverDeps {
  * interrupt(). Applies the per-kind permission profile and parses the stream-json
  * telemetry (tokens / USD) back to the Run. Completes on the first `result`.
  */
+/**
+ * Claude's advertised coordinate menu (RUN-115). A suggestion for the picker, not a whitelist —
+ * `model` is free-form on the wire, so a newer id the daemon has never heard of still dispatches.
+ * Newest-first; the SDK takes every RunEffort verbatim.
+ */
+export const CLAUDE_CATALOG: DriverCatalog = {
+  models: ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5', 'claude-fable-5'],
+  efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+};
+
 export class ClaudeDriver implements AgentDriver {
   readonly tool = 'claude' as const;
+  // The Agent SDK gives us all four (RUN-110): in-process hooks (lockHooks below), soft steer +
+  // interrupt on the streaming session, a resumable session id, and a per-model spend aggregate.
+  readonly capabilities: DriverCapabilities = {
+    toolHooks: true,
+    steer: true,
+    interrupt: true,
+    resumableSession: true,
+    perModelTelemetry: true,
+  };
+  readonly catalog: DriverCatalog = CLAUDE_CATALOG;
   private readonly queryFn: QueryFn;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
 
@@ -304,13 +397,11 @@ export class ClaudeDriver implements AgentDriver {
       options: {
         cwd: opts.cwd,
         model: opts.model,
-        // The agent's shell environment, with the daemon's OAuth token and cloud/git
-        // credentials stripped, and git's credential paths neutered. Without this the
-        // spawned `claude` inherits process.env verbatim: an allowlisted `npm test` that
-        // shells out could read NORIQ_TOKEN, and `git push` could still prompt. The codex
-        // driver and the verify runner have always sanitized — this path never did, which
-        // made the security model's central claim false for the DEFAULT tool.
-        env: sanitizedAgentEnv(),
+        // The agent's shell environment: the daemon's OAuth token and cloud/git creds stripped,
+        // git's credential paths neutered. Handed down pre-sanitized by the supervisor (RUN-109),
+        // so this guarantee no longer depends on the driver remembering to do it; the `??` is the
+        // test-only fallback for a start with no supervisor-provided env.
+        env: opts.env ?? sanitizedAgentEnv(),
         permissionMode: perm.permissionMode,
         allowedTools: perm.allowedTools,
         disallowedTools: perm.disallowedTools,
@@ -333,6 +424,12 @@ export class ClaudeDriver implements AgentDriver {
               },
             }
           : {}),
+        // Reactive file locking (RUN-101): a PreToolUse hook denies an edit to a path another
+        // agent holds, a Stop hook releases what this session took. Runs IN-PROCESS in the
+        // daemon (the enforcer holds the run's token + lock client), so the credential never
+        // enters the agent's shell — the whole reason sanitizedAgentEnv strips it. Injected by
+        // the runner, so it cannot be skipped: the guaranteed variant of the PLNR client hook.
+        ...(opts.lockEnforcer ? { hooks: lockHooks(opts.lockEnforcer) } : {}),
         // ONLY the server we just injected. Otherwise a supervised agent silently
         // inherits the operator's personal MCP config (~/.claude.json, .mcp.json,
         // plugins) — their connectors, their credentials, none of it in the manifest.
@@ -524,6 +621,18 @@ export class ClaudeDriver implements AgentDriver {
         // the SDK session open and the daemon would never exit.
         closeSession();
         finish({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        // Settle a turn that was IN FLIGHT. `finish` is one-shot and was consumed by the session's
+        // first result, so under multiTurn it does nothing here — and `continueWith`'s promise has
+        // its own resolver, which only the result stream ever calls. Stopping mid-hand-back would
+        // otherwise leave the caller awaiting a turn that can never arrive: the process is gone,
+        // the stream is closed, and `reviewWithFeedback`/`verifyWithFeedback` wait forever, which
+        // hangs the run and pins its worktree. Reachable since RUN-133 gave the budget layer a
+        // reason to stop a session DURING a hand-back (the run-level spend guard).
+        const pending = awaitingTurn;
+        if (pending) {
+          awaitingTurn = null;
+          pending({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        }
       },
       done: () => donePromise,
     };

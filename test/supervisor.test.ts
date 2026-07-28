@@ -1,8 +1,13 @@
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
-import { describe, expect, it } from 'vitest';
+import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+import { describe, expect, it, vi } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
+import type { ContinuableRun } from '../src/continuable';
+import { totalTokens } from '../src/drivers/budget';
 import type {
   AgentDriver,
+  DriverCapabilities,
+  DriverCatalog,
   DriverExit,
   DriverSession,
   DriverStartOptions,
@@ -10,19 +15,25 @@ import type {
   ModelUsage,
 } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
+import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
+import { LOCK_RELEASE_TIMEOUT_MS } from '../src/stages/settle';
 import {
+  type AnchorTask,
   type RunReport,
   RunSupervisor,
   RunTally,
   assemblePrompt,
+  effectiveKind,
   mergeBudget,
   mergeModelUsage,
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
-import type { Workspace } from '../src/vcs/types';
+import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
+import { BUILTIN_WORKFLOWS } from '../src/workflow';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -39,9 +50,37 @@ class FakeDriver implements AgentDriver {
   /** Text the agent "emits" during each continueWith, in order — models the real driver
    *  streaming a fix turn's output via onText (RUN-79's ledger reads it). Empty = silent. */
   continueTexts: string[] = [];
+  /** Tokens each continueWith turn spends, in order (RUN-133). Default 0 = a free fix turn, which
+   *  is what every pre-RUN-133 test assumed. */
+  continueTokens: number[] = [];
+  /** The primary session's running cumulative, so a fix turn reports a TOTAL the way a real driver
+   *  does rather than a per-turn delta. */
+  private primarySpend = 0;
   /** True once stop() was called — a multiTurn session that nobody closes hangs the daemon. */
   stopped = false;
-  constructor(readonly tool: 'claude' | 'codex') {}
+  /** True when the budget layer stopped the session DURING a hand-back turn — the RUN-133 run-level
+   *  guard firing, as distinct from settle's ordinary stopSession at the end of every run. */
+  stoppedDuringFix = false;
+  /** Mirrors the real drivers' capabilities (RUN-110): claude wires hooks, codex doesn't. */
+  capabilities: DriverCapabilities = {
+    toolHooks: true,
+    steer: true,
+    interrupt: true,
+    resumableSession: true,
+    perModelTelemetry: true,
+  };
+  catalog: DriverCatalog = { models: [], efforts: [] };
+  constructor(readonly tool: 'claude' | 'codex') {
+    if (tool === 'codex') {
+      this.capabilities = {
+        toolHooks: false,
+        steer: true,
+        interrupt: true,
+        resumableSession: false,
+        perModelTelemetry: false,
+      };
+    }
+  }
   start(opts: DriverStartOptions): DriverSession {
     this.opts = opts;
     this.starts.push(opts);
@@ -71,12 +110,30 @@ class FakeDriver implements AgentDriver {
             // moved to the reviewer session, but the fix turn belongs to the build session.
             const emitted = this.continueTexts.shift();
             if (emitted) opts.handlers?.onText?.(emitted);
+            // A fix turn SPENDS (RUN-133). The fake used to return zero telemetry and emit no tick,
+            // which made the one overrun this task exists to close invisible: the builder's session
+            // is kept open across the reviewer's spend, so a hand-back is the one place a run can
+            // exceed its ceiling while no single session breaches its own. `continueTokens` scripts
+            // it; the default stays 0 so no existing test changes.
+            const spend = this.continueTokens.shift() ?? 0;
+            this.primarySpend += spend;
+            const cumulative = { ...zeroTelemetry(), outputTokens: this.primarySpend };
+            if (spend) opts.handlers?.onTelemetry?.(cumulative);
+            // A real driver's turn ENDS when the budget layer SIGTERMs the session mid-flight. The
+            // tick above is what trips it, so the check has to come after — and this is the only
+            // place a run-level breach is observable, since settle stops every session anyway.
+            if (this.stopped) {
+              this.stoppedDuringFix = true;
+              return { outcome: 'failed', isError: true, reason: 'stopped', telemetry: cumulative };
+            }
             const outcome = this.continueOutcomes.shift() ?? 'done';
             return {
               outcome,
               isError: outcome === 'failed',
               reason: outcome === 'failed' ? 'died mid-fix' : null,
-              telemetry: zeroTelemetry(),
+              // The session's CUMULATIVE, which is what a real driver reports and what the tally's
+              // last-writer-wins slot expects.
+              telemetry: spend ? cumulative : zeroTelemetry(),
             };
           }
         : undefined,
@@ -91,6 +148,10 @@ class FakeDriver implements AgentDriver {
   /** Default spend is 42 output tokens; a test that cares about the model mix (RUN-59) passes its
    *  own telemetry (e.g. a modelUsage breakdown). */
   complete(outcome: 'done' | 'failed', telemetry: Partial<DriverTelemetry> = { outputTokens: 42 }): void {
+    // Keep the fix-turn cumulative continuous with whatever the PRIMARY session reported. A
+    // reviewer/conflict session completing must not rewrite the builder's running total — they are
+    // different sessions with different slots.
+    if (!this.opts?.runId.includes(':')) this.primarySpend = telemetry.outputTokens ?? this.primarySpend;
     this.opts?.handlers?.onExit?.({
       outcome,
       isError: outcome === 'failed',
@@ -138,8 +199,12 @@ class FakeWorktrees {
       location: { repoRoot: root, branch: `noriq/run/${runId}` },
     };
   };
+  /** When set, `hasWork` REJECTS instead of answering — the "could not ask" case a backend must
+   *  never report as "no work" (RUN-152). */
+  hasWorkError: string | null = null;
   hasWork = async (): Promise<boolean> => {
     this.hasChangesCalls += 1;
+    if (this.hasWorkError) throw new Error(this.hasWorkError);
     return this.changed;
   };
   commits: Array<{ path: string; message: string }> = [];
@@ -149,6 +214,55 @@ class FakeWorktrees {
   };
   dispose = async (ws: Workspace): Promise<void> => {
     this.removed.push(ws.localPath);
+  };
+
+  // ── locking (RUN-98/102) ─────────────────────────────────────────────────────
+  /** Paths this run "changed" — the hard floor acquires these before landing. Empty (default)
+   *  → the floor no-ops, so every existing test is unaffected. */
+  changedFiles: string[] = [];
+  /** Conflicts the lock layer returns; empty = granted. */
+  lockConflicts: LockConflict[] = [];
+  /** Every acquire the supervisor made through the seam (floor + reactive). */
+  lockCalls: Array<{ paths: string[]; ctx: LockContext }> = [];
+  releases: Array<{ paths?: string[] }> = [];
+  /** When set, `changedPaths` REJECTS — git could not say what the run touched (RUN-156). */
+  changedPathsError: string | null = null;
+  changedPaths = async (): Promise<string[]> => {
+    if (this.changedPathsError) throw new Error(this.changedPathsError);
+    return this.changedFiles;
+  };
+  /** When set, `lock` REJECTS — the service did not answer at all (RUN-156). */
+  lockError: string | null = null;
+  /** A project with locking genuinely off: the service ANSWERS `enabled:false`. */
+  lockingDisabled = false;
+  lock = async (_ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> => {
+    this.lockCalls.push({ paths, ctx });
+    if (this.lockError) throw new Error(this.lockError);
+    if (this.lockingDisabled) return { ok: true, enabled: false, locks: [] };
+    return this.lockConflicts.length
+      ? { ok: false, conflicts: this.lockConflicts }
+      : { ok: true, enabled: true, locks: paths.map((p) => ({ id: p, path: p })) };
+  };
+  unlock = async (_ws: Workspace, sel: { lockIds?: string[]; paths?: string[] }): Promise<void> => {
+    this.releases.push({ paths: sel.paths });
+  };
+  /** Every terminal release-all (RUN-104), by the run's holder token. */
+  releasedAll: string[] = [];
+  /** Ordered log of landing, lock-release and the terminal report. The release is bounded on both
+   *  sides: AFTER landing so locks are held through the merge (RUN-105), and BEFORE the terminal
+   *  report, which is what retires the agent the release authenticates as (RUN-177). */
+  timeline: Array<'land' | 'release' | 'report'> = [];
+  /** A lock service that accepts the request and never answers — the hang the settle path must
+   *  survive, which no `.catch()` can rescue (RUN-177). */
+  hangRelease = false;
+  releaseRunLocks = async (_ws: Workspace, ctx: LockContext): Promise<void> => {
+    if (this.hangRelease) return new Promise<void>(() => {});
+    // Record on a LATER tick, deliberately. Recording synchronously would make the timeline read
+    // `['release', 'report']` even if settle stopped awaiting the release at all — the ordering
+    // assertions would pass against the very regression they exist to catch.
+    await Promise.resolve();
+    this.releasedAll.push(ctx.token);
+    this.timeline.push('release');
   };
 
   // ── landing ────────────────────────────────────────────────────────────────
@@ -191,6 +305,7 @@ class FakeWorktrees {
     // fromRef preserved in the recording via workRef, so the assertions still name the run
     // branch that reached publish — the fake reads its own display field, never location.
     this.landings.push({ branch, fromRef: ws.workRef });
+    this.timeline.push('land');
     return { ok: true, sha: 'landedsha' };
   };
   /** Non-empty → git refuses the landing with this message (e.g. a checked-out branch). */
@@ -214,11 +329,12 @@ const perm = (write: boolean): PermissionProfile => ({
   deny: [],
   auto: false,
 });
-const noModel = (): ModelDefault => ({ model: null, effort: null });
+const noModel = (): ModelDefault => ({ agent: null, model: null, effort: null });
 const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   key: 'PROJ',
   board: null,
-  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, agent: null },
+  verify: { cmd: 'npm test', timeoutSeconds: null, shell: null, maxRounds: 2, agent: null },
+  context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
   tool: null,
   defaultBranch: null,
   land: null,
@@ -226,6 +342,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   // No per-kind model/effort by default: this repo takes whatever the tool defaults to,
   // which is what every run got before RUN-33 existed.
   defaults: { scope: noModel(), build: noModel(), verify: noModel() },
+  workflows: {},
   ...over,
 });
 
@@ -249,16 +366,23 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   brief: 'ship the thing',
   repoRef: 'repo_a',
   agentTool: 'claude',
+  // No coordinate by default (RUN-114): a legacy-shaped dispatch — the runner synthesizes one
+  // from agentTool/model/effort below, so behaviour is identical to before the coordinate existed.
+  agent: null,
+  // No custom workflow by default (RUN-121): the run's kind selects the built-in.
+  workflow: null,
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,
-  budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null },
+  budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null },
   status: 'dispatched',
   // Not yet started, so nothing to report (RUN-31). The daemon sets the phase; the server
   // only ever reads it back to us.
   phase: null,
   exit: null,
   worktreePath: null,
+  // The server's read-path field (RUN-59); the daemon only ever WRITES the mix via telemetry.
+  modelUsage: null,
   createdBy: 'usr_1',
   createdAt: '2026-07-14T00:00:00.000Z',
   updatedAt: '2026-07-14T00:00:00.000Z',
@@ -288,6 +412,12 @@ function harness(
     landRaces?: boolean;
     /** A per-repo backend riding ResolvedRepo (RUN-60) — must win over deps.vcs. */
     repoVcs?: FakeWorktrees;
+    /** Override the stubbed `[context]` seams (RUN-128/129) for a test that exercises them. */
+    pathProbe?: PathProbe;
+    readDoc?: DocReader;
+    contextBudget?: number;
+    /** Pre-seed the continuable store (RUN-92) to model a re-dispatched "continue a failed run". */
+    continuableSeed?: ContinuableRun;
     /** What the server says when asked whether the run parked (RUN-30). */
     parkState?: Partial<ParkState>;
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
@@ -297,22 +427,48 @@ function harness(
      *  returns ({claimable:false} declines the spawn, null = probe unavailable → fail open).
      *  Absent = the dep is not wired at all (the pre-RUN-81 daemon). */
     claimGate?: { claimable: boolean; reason: string | null } | null;
+    /** The paths a build "changed" — the hard lock floor (RUN-102) acquires these. */
+    changedFiles?: string[];
+    /** Conflicts the lock layer returns when the floor acquires; empty = granted. */
+    lockConflicts?: LockConflict[];
+    hangRelease?: boolean;
+    /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
+    lockScope?: string[] | null;
+    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
+    cancelled?: string[];
+    /** The anchor task the server hands back — how a test gives a run an execution spec, and so
+     *  the acceptance criteria its gate must answer (RUN-145). */
+    anchorTask?: AnchorTask | null;
   } = {},
 ) {
+  // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
+  // (RUN-164) — a test of a resumed chain has to be able to model that.
+  let anchorTask = over.anchorTask ?? null;
   const worktrees = new FakeWorktrees();
   if (over.changed === false) worktrees.changed = false;
   if (over.createFails) worktrees.createFails = true;
   if (over.conflicts) worktrees.conflicts = over.conflicts;
   if (over.stillConflicted) worktrees.stillConflicted = over.stillConflicted;
   if (over.landRaces) worktrees.landRaces = true;
+  if (over.changedFiles) worktrees.changedFiles = over.changedFiles;
+  if (over.lockConflicts) worktrees.lockConflicts = over.lockConflicts;
+  if (over.hangRelease) worktrees.hangRelease = true;
   const reports: Array<{ runId: string } & RunReport> = [];
-  const transcript: Array<{ seq: number; role: string; round: number | null; text: string }> = [];
+  const transcript: Array<{
+    seq: number;
+    role: string;
+    round: number | null;
+    step: string | null;
+    text: string;
+  }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
   let verifyRan = false;
   let verifyCalls = 0;
   const parked = new FakeParked();
+  const continuable = new FakeContinuable();
+  if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
   const claimChecks: string[] = [];
   const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
@@ -330,9 +486,21 @@ function harness(
             manifest: over.manifest ?? manifest(),
             ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
           },
-    report: (runId, r) => reports.push({ runId, ...r }),
+    report: (runId, r) => {
+      reports.push({ runId, ...r });
+      // Only the TERMINAL report carries `exit` — and only that one retires the run agent.
+      if (r.exit) worktrees.timeline.push('report');
+    },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
+    // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
+    // repo roots (`/repos/repo_a`) do not exist, and a real fs round-trip settles on the
+    // threadpool — LATER than the single `flush()` tick these tests spawn within, which would
+    // strand every one of them waiting on a session that had not been created yet.
+    // Context rendering has its own coverage in test/repo-context.test.ts.
+    pathProbe: over.pathProbe ?? (async () => 'missing'),
+    readDoc: over.readDoc ?? (async () => ''),
+    ...(over.contextBudget !== undefined ? { contextBudget: over.contextBudget } : {}),
     verifyExec: async () => {
       verifyRan = true;
       verifyCalls += 1;
@@ -355,6 +523,7 @@ function harness(
     server: 'https://noriq.example',
     defaultBudget: over.defaultBudget,
     parked,
+    continuable,
     parkTtlHours: over.parkTtlHours,
     getParkState: async (runId) => {
       parkChecks.push(runId);
@@ -376,6 +545,18 @@ function harness(
           },
         }
       : {}),
+    ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
+    ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
+    ...(over.cancelled
+      ? {
+          steering: {
+            register: () => {},
+            unregister: () => {},
+            isCancelled: (runId: string) => (over.cancelled ?? []).includes(runId),
+            forget: () => {},
+          },
+        }
+      : {}),
   });
   return {
     supervisor,
@@ -386,9 +567,18 @@ function harness(
     claude,
     codex,
     parked,
+    continuable,
     parkChecks,
     claimChecks,
     agentCreates,
+    /** Model the run asking a question on its NEXT session end — a park mid-chain. */
+    parkNext: () => {
+      park.state = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
+    },
+    /** Model a human rewriting the task's spec while the run is parked. */
+    setAnchorTask: (t: AnchorTask | null) => {
+      anchorTask = t;
+    },
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
       park.state = { blocked: false };
@@ -411,6 +601,21 @@ class FakeParked {
     const e = this.entries.get(id) ?? null;
     this.entries.delete(id);
     return e;
+  };
+}
+
+/** The continuable store (RUN-92), in memory — what supervise() reads to re-seed a continuation
+ *  and writes at a gate-fail. On-disk behaviour is pinned in continuable.test.ts. */
+class FakeContinuable {
+  entries = new Map<string, ContinuableRun>();
+  puts: ContinuableRun[] = [];
+  put = async (e: ContinuableRun): Promise<void> => {
+    this.puts.push(e);
+    this.entries.set(e.runId, e);
+  };
+  get = async (id: string): Promise<ContinuableRun | null> => this.entries.get(id) ?? null;
+  remove = async (id: string): Promise<void> => {
+    this.entries.delete(id);
   };
 }
 
@@ -465,6 +670,233 @@ describe('assemblePrompt', () => {
     });
     expect(p).toMatch(/do NOT need to commit/i);
     expect(p).toMatch(/daemon captures/i);
+  });
+});
+
+describe('the repo context block reaches the brief (RUN-128)', () => {
+  const block = '\n\nThis repo says of itself:\n- Start here: src/daemon.ts';
+
+  it('build carries it, ahead of the brief', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p).toContain('src/daemon.ts');
+    // Orientation before the job: an agent should know the ground rules before it reads the ask.
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
+  });
+
+  it('scope carries it too — exploration benefits most from orientation', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Brief:'));
+  });
+
+  // A `docs` workflow based on scope: it inherits the base's posture AND (RUN-132) its stage list
+  // verbatim — only the prompt is its own.
+  const customWf = (promptRef: string) => ({
+    ...BUILTIN_WORKFLOWS.scope,
+    id: 'docs',
+    promptRef,
+  });
+
+  // A custom prompt is a template we do not control, so the block cannot be injected into it —
+  // the author must place `{{context}}`. Documented in prompts/README.md; asserted here so the
+  // limitation stays visible rather than being discovered by a workflow author.
+  it('a custom workflow that places {{context}} gets the block', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: customWf('DOCS-MODE: {{brief}}{{context}}'),
+      repoContext: block,
+    });
+    expect(p).toContain('This repo says of itself:');
+  });
+
+  it('a custom workflow that omits the tag silently does without it', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: customWf('DOCS-MODE: {{brief}}'),
+      repoContext: block,
+    });
+    expect(p).not.toContain('This repo says of itself');
+  });
+
+  // The no-op guarantee: a repo that declares no [context] must get the pre-RUN-128 prompt.
+  it('renders byte-identically to before when the repo declared nothing', () => {
+    const args = { agent: testAgent(), server: 'https://s' };
+    for (const kind of ['scope', 'build'] as const) {
+      const withEmpty = assemblePrompt(makeRun({ kind }), manifest(), {
+        ...args,
+        repoContext: '',
+      });
+      const without = assemblePrompt(makeRun({ kind }), manifest(), args);
+      expect(withEmpty).toBe(without);
+      expect(without).not.toContain('This repo says of itself');
+    }
+  });
+});
+
+describe('the build brief states its own definition of done (RUN-127)', () => {
+  const build = (over: Partial<ProjectManifest> = {}) =>
+    assemblePrompt(makeRun({ kind: 'build' }), manifest(over), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+
+  it('names the bar as a list, not just "implement the work"', () => {
+    const p = build();
+    expect(p).toContain('Done means all of these, not just the first:');
+    expect(p).toMatch(/no stub, no TODO standing in for the work/);
+  });
+
+  // The gate the daemon cannot enforce: a run that silently under-delivers reads as a pass.
+  it('makes reporting a gap explicitly cheaper than hiding one', () => {
+    expect(build()).toMatch(/Naming a gap costs you nothing here/);
+    expect(build()).toMatch(/presenting unfinished work as done/);
+  });
+
+  it('names the actual verify command when the repo has one', () => {
+    expect(build()).toMatch(/`npm test` passes on what you leave behind/);
+  });
+
+  it('degrades honestly when the repo configures no verify floor', () => {
+    const p = build({ verify: null });
+    expect(p).toContain('the checks this repo already runs still pass');
+    expect(p).not.toContain('passes on what you leave behind');
+  });
+
+  it('only promises a reviewer when one is configured', () => {
+    expect(build()).not.toMatch(/reviewer, reading your diff/); // default manifest: cmd, no agent
+    const withReviewer = build({
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+      },
+    });
+    expect(withReviewer).toMatch(/the reviewer, reading your diff against that intent/);
+  });
+
+  // The bar sits next to the ask, both at the end, where a model attends most.
+  it('places the bar after the brief', () => {
+    const p = build();
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('Done means'));
+  });
+
+  it('is a build-only concern — scope already defines its own success', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).not.toContain('Done means all of these');
+    expect(p).toContain('Success = a proposed plan is emitted');
+  });
+});
+
+describe('[context] reaches the spawned agent (RUN-128/129)', () => {
+  // The harness stubs these seams away by default, so prove the wiring end-to-end at least once:
+  // a repo that declares context must have it in the prompt the driver was actually started with.
+  const declaring = () =>
+    manifest({
+      context: {
+        requiredReading: ['CLAUDE.md'],
+        entryPoints: ['src/daemon.ts'],
+        conventions: ['ESM only'],
+        agentInstructions: 'inline' as const,
+      },
+    });
+
+  // The tree the context is read from must be the one the agent stands in. A build forks from the
+  // plan base and a continuation adopts its own branch, so the discovered checkout's CLAUDE.md can
+  // describe a different tree entirely — and the prompt then tells the agent not to re-read it.
+  it('reads the context out of the run’s workspace, not the discovered checkout', async () => {
+    const seen: string[] = [];
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async (abs) => {
+        seen.push(abs);
+        return true;
+      },
+      readDoc: async (abs) => {
+        seen.push(abs);
+        return '# house rules';
+      },
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((p) => p.startsWith('/wt/run_1'))).toBe(true);
+    expect(seen.some((p) => p.startsWith('/repos/'))).toBe(false);
+  });
+
+  it('inlines the declared reading and the orientation into the build brief', async () => {
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async () => true,
+      readDoc: async () => '# house rules',
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('This repo says of itself:');
+    expect(prompt).toContain('- Start here: src/daemon.ts');
+    expect(prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(prompt).toContain('----- CLAUDE.md -----');
+    expect(prompt).toContain('# house rules');
+    // Bulk reference first, the ask last — the shape long-context models attend to best.
+    expect(prompt.indexOf('# house rules')).toBeLessThan(prompt.indexOf('Brief:'));
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('drops paths that do not resolve but keeps the conventions — they are words, not files', async () => {
+    const h = harness({ manifest: declaring(), pathProbe: async () => 'missing' });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(prompt).not.toContain('CLAUDE.md'); // nothing inlined, nothing named
+    expect(prompt).not.toContain('Start here');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a repo declaring no [context] at all spawns exactly as before', async () => {
+    const h = harness({ pathProbe: async () => 'missing' });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    expect(h.claude.opts?.prompt ?? '').not.toContain('This repo says of itself');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('honours the budget, truncating rather than crowding out the brief', async () => {
+    const h = harness({
+      manifest: declaring(),
+      pathProbe: async () => true,
+      // Honours `limit` like the real reader: the budget bounds the READ, not just the kept slice.
+      readDoc: async (_abs, limit) => 'x'.repeat(limit + 1),
+      contextBudget: 100,
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('(FIRST 100 characters only — the rest was not read)');
+    expect(prompt).toContain('Brief:'); // the ask survived
+    h.claude.complete('done');
+    await done;
   });
 });
 
@@ -551,8 +983,12 @@ describe('RunSupervisor', () => {
     expect(h.worktrees.removed).toEqual([]); // kept for the human to merge
   });
 
-  it('build failure: worktree cleaned up', async () => {
-    const h = harness();
+  it('build failure with NOTHING in the tree: worktree cleaned up', async () => {
+    // This test used to assert the opposite with work present — a crashed build's worktree
+    // removed, harness default changed=true — which is the disposal that destroyed a killed
+    // continuation's three sittings of committed work. The startup reaper has always kept
+    // work-bearing orphans; settle now agrees with it. Cleanup is for EMPTY trees.
+    const h = harness({ changed: false });
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
     await flush();
     h.claude.complete('failed');
@@ -585,6 +1021,122 @@ describe('RunSupervisor', () => {
     expect(h.codex.opts?.cwd).toBe('/wt/run_1'); // codex driver started
     expect(h.claude.opts).toBeUndefined();
     h.codex.complete('done');
+    await done;
+  });
+
+  it('a dispatch AGENT coordinate overrides agentTool + carries model/effort (RUN-114)', async () => {
+    // Legacy agentTool says claude, but the coordinate names codex — the coordinate wins.
+    const h = harness();
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'claude', agent: 'codex.gpt-5_6-sol.high' }),
+    );
+    await flush();
+    expect(h.codex.opts?.cwd).toBe('/wt/run_1'); // the coordinate's driver started
+    expect(h.claude.opts).toBeUndefined();
+    expect(h.codex.opts?.model).toBe('gpt-5.6-sol'); // unescaped from the coordinate
+    expect(h.codex.opts?.effort).toBe('high');
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('a legacy dispatch with no coordinate still resolves identically (RUN-114 back-compat)', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', agent: null, model: 'gpt-5.3-codex', effort: 'low' }),
+    );
+    await flush();
+    expect(h.codex.opts?.cwd).toBe('/wt/run_1');
+    expect(h.codex.opts?.model).toBe('gpt-5.3-codex');
+    expect(h.codex.opts?.effort).toBe('low');
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('hands a lock enforcer only to a driver with in-process hooks (RUN-110)', async () => {
+    // claude declares toolHooks → gets the reactive PreToolUse enforcer (RUN-101)
+    const ha = harness();
+    const a = ha.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'claude' }));
+    await flush();
+    expect(ha.claude.opts?.lockEnforcer).toBeDefined();
+    ha.claude.complete('done');
+    await a;
+
+    // codex has no hooks → no enforcer handed to it; the hard floor (RUN-102) is its only guard
+    const hb = harness();
+    const b = hb.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'codex' }));
+    await flush();
+    expect(hb.codex.opts?.lockEnforcer).toBeUndefined();
+    hb.codex.complete('done');
+    await b;
+  });
+
+  it('keys lock enforcement off capabilities, not the driver NAME (RUN-111)', async () => {
+    // A driver that calls itself 'claude' but declares no in-process hooks must NOT get an
+    // enforcer — the supervisor reads the capability, never the vendor name. This is the guard
+    // that keeps the driver map the ONLY place a tool identity matters.
+    const claude = new FakeDriver('claude');
+    claude.capabilities = { ...claude.capabilities, toolHooks: false };
+    const codex = new FakeDriver('codex');
+    const h = harness({ drivers: { claude, codex } });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', agentTool: 'claude' }));
+    await flush();
+    expect(claude.opts?.lockEnforcer).toBeUndefined();
+    claude.complete('done');
+    await done;
+  });
+
+  it('a custom workflow supplies its own prompt but inherits its base posture (RUN-121)', async () => {
+    const m = manifest({
+      workflows: { docs: { base: 'scope', prompt: 'DOCS-MODE: survey {{brief}} read-only' } },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'scope', workflow: 'docs', brief: 'the auth module' }),
+    );
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('DOCS-MODE: survey the auth module read-only');
+    expect(h.claude.opts?.permission.write).toBe(false); // inherited scope posture: read-only
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a workflow BASE overrides a mismatched dispatched kind — no write escalation (RUN-126)', async () => {
+    // The footgun closed daemon-side: dispatch says kind=build (writable) but names a scope-based
+    // workflow. The daemon holds the manifest, so the base wins — the run is READ-ONLY regardless.
+    const m = manifest({
+      workflows: { docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}' } },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'docs' }));
+    await flush();
+    expect(h.claude.opts?.permission.write).toBe(false); // base=scope posture, not dispatched build
+    expect(h.claude.opts?.kind).toBe('scope'); // the driver runs under the effective kind
+    expect(h.claude.opts?.prompt).toContain('DOCS: survey'); // custom prompt still applies
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('an unknown workflow name falls back to the built-in for the kind (RUN-121)', async () => {
+    const h = harness();
+    const done = h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    await flush();
+    // no throw, and the scope built-in prompt is used
+    expect(h.claude.opts?.prompt).toContain('MODE: SCOPE');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a verify run stays read-only even if the manifest grants write (RUN-118 floor)', async () => {
+    // The workflow-independent floor: a non-producing workflow can never be handed write, no matter
+    // what [permissions.verify] says — "verify executes but never edits" is not a manifest's to undo.
+    const m = manifest({
+      permissions: { scope: perm(false), build: perm(true), verify: perm(true) },
+    });
+    const h = harness({ manifest: m });
+    const done = h.supervisor.supervise(makeRun({ kind: 'verify' }));
+    await flush();
+    expect(h.claude.opts?.permission.write).toBe(false); // clamped, despite verify: perm(true)
+    h.claude.complete('done');
     await done;
   });
 
@@ -742,9 +1294,62 @@ describe('assemblePrompt inlines the anchor task', () => {
   });
 });
 
+// RUN-139. The spec reaches the actor that WRITES in full, and the actor that JUDGES as the
+// definition of done alone. Both were wrong in the first cut: the reviewer got nothing.
+//
+// RUN-145 changed the FORM the judge's half arrives in — numbered criteria it answers one by one,
+// not a prose block — so what these assert is that the author's notes still never reach a gate and
+// the criteria still never reach the author's block twice.
+describe('assemblePrompt places the execution spec', () => {
+  const ctx = { agent: testAgent(), server: 'https://s' };
+  const SPEC = '\n\nEXECUTION SPEC — full, for the author';
+  const ACCEPT = [{ id: 1, kind: 'truth' as const, text: 'the daemon reaps orphans on start' }];
+
+  it('gives a build agent the whole spec, after the brief it explains', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      ...ctx,
+      executionSpec: SPEC,
+      acceptance: ACCEPT,
+    });
+    expect(p).toContain(SPEC.trim());
+    expect(p).not.toContain(ACCEPT[0]!.text);
+    // After the brief, not before: the spec is the ask's own detail, where `[context]` is
+    // reference read ahead of the ask.
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('EXECUTION SPEC'));
+  });
+
+  it('gives a scope agent the whole spec too — it is an author, not a gate', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), { ...ctx, executionSpec: SPEC });
+    expect(p).toContain(SPEC.trim());
+  });
+
+  it('gives the verify actor the acceptance criteria and NOT the author’s working notes', () => {
+    const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
+      ...ctx,
+      executionSpec: SPEC,
+      acceptance: ACCEPT,
+    });
+    expect(p).toContain(ACCEPT[0]!.text);
+    expect(p).not.toContain(SPEC.trim());
+    // …once. Shown the same criteria twice — as a list and again as prose — a model answers the
+    // prose and skips the list, which is the whole reason the second rendering was deleted.
+    expect(p.split(ACCEPT[0]!.text)).toHaveLength(2);
+    // And it is told HOW to answer, or the numbers buy nothing.
+    expect(p).toMatch(/ACCEPTANCE <n>:/);
+  });
+
+  it('renders nothing anywhere for a task with no spec', () => {
+    for (const kind of ['scope', 'build', 'verify'] as const) {
+      const p = assemblePrompt(makeRun({ kind }), manifest(), ctx);
+      expect(p, kind).not.toContain('EXECUTION SPEC');
+      expect(p, kind).not.toContain('COMMISSIONED TO ACHIEVE');
+    }
+  });
+});
+
 describe('mergeBudget', () => {
-  const machine: RunBudget = { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 };
-  const empty: RunBudget = { maxTokens: null, maxUsd: null, maxDurationSeconds: null };
+  const machine: RunBudget = { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null };
+  const empty: RunBudget = { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null };
 
   it('falls back to the machine ceilings when the Run carries none', () => {
     // The dashboard dispatch form leaves these blank by default — without the
@@ -755,15 +1360,21 @@ describe('mergeBudget', () => {
 
   it('lets the Run win per-dimension, not whole-object', () => {
     // Setting only maxUsd must NOT silently drop the machine's token/time ceilings.
-    expect(mergeBudget({ maxTokens: null, maxUsd: 1, maxDurationSeconds: null }, machine)).toEqual({
+    expect(
+      mergeBudget({ maxTokens: null, maxUsd: 1, maxDurationSeconds: null, maxRounds: null }, machine),
+    ).toEqual({
       maxTokens: 500_000,
       maxUsd: 1,
       maxDurationSeconds: 1800,
+      maxRounds: null,
     });
   });
 
   it('honours an explicit Run budget above the machine default (default, not clamp)', () => {
-    expect(mergeBudget({ maxTokens: null, maxUsd: 50, maxDurationSeconds: null }, machine)?.maxUsd).toBe(50);
+    expect(
+      mergeBudget({ maxTokens: null, maxUsd: 50, maxDurationSeconds: null, maxRounds: null }, machine)
+        ?.maxUsd,
+    ).toBe(50);
   });
 
   it('stays unbounded only when nothing is configured anywhere', () => {
@@ -775,7 +1386,7 @@ describe('mergeBudget', () => {
 describe('RunSupervisor budget defaults', () => {
   it('runs a budget-less dispatch under the machine ceilings from runner.toml', async () => {
     const { supervisor, claude } = harness({
-      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 },
+      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null },
     });
     const run = supervisor.supervise(makeRun({ kind: 'scope' }));
     await flush();
@@ -783,15 +1394,23 @@ describe('RunSupervisor budget defaults', () => {
     await run;
 
     // The whole point: an unbudgeted dispatch must not reach the driver unbounded.
-    expect(claude.opts?.budget).toEqual({ maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 });
+    expect(claude.opts?.budget).toEqual({
+      maxTokens: 500_000,
+      maxUsd: 5,
+      maxDurationSeconds: 1800,
+      maxRounds: null,
+    });
   });
 
   it('still lets an explicit Run budget take precedence', async () => {
     const { supervisor, claude } = harness({
-      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800 },
+      defaultBudget: { maxTokens: 500_000, maxUsd: 5, maxDurationSeconds: 1800, maxRounds: null },
     });
     const run = supervisor.supervise(
-      makeRun({ kind: 'scope', budget: { maxTokens: null, maxUsd: 1, maxDurationSeconds: null } }),
+      makeRun({
+        kind: 'scope',
+        budget: { maxTokens: null, maxUsd: 1, maxDurationSeconds: null, maxRounds: null },
+      }),
     );
     await flush();
     claude.complete('done');
@@ -836,6 +1455,23 @@ describe('a build that changes nothing is not a success', () => {
     expect(h.reports.at(-1)).toMatchObject({ status: 'failed', exit: { reason: 'no_changes' } });
   });
 
+  // RUN-152. Declaring `no_changes` REAPS the worktree, so guessing "empty" on a probe that merely
+  // errored destroys the diff. Guessing "full" at worst spends a verify run on a tree a human can
+  // still open. The gate always intended this default; the swallowed error is what stopped it.
+  it('does not call it a no-op when the probe could not answer', async () => {
+    const blind = new FakeWorktrees();
+    blind.hasWorkError = 'fatal: bad object base0000';
+    const h = harness({ repoVcs: blind });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).not.toBe('no_changes');
+    expect(h.verifyRan()).toBe(true); // let the gate decide on the real tree
+    expect(blind.removed).toEqual([]); // and never reap on a guess
+  });
+
   it('still verifies a build that DID change something', async () => {
     const h = harness({ changed: true });
     const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
@@ -876,6 +1512,12 @@ describe("the run's diff is made durable", () => {
     expect(h.worktrees.commits).toEqual([
       { path: '/wt/run_1', message: expect.stringContaining('noriq run run_1') },
     ]);
+    // Subject line first, attribution in the body (RUN-96): one-line history must show WHAT
+    // changed (task key + title), never a wall of identical run ids.
+    const [subject, blank, attribution] = h.worktrees.commits[0]!.message.split('\n');
+    expect(subject).toBe('ship the thing'); // the run's brief — what a human scans for
+    expect(blank).toBe('');
+    expect(attribution).toBe('noriq run run_1');
   });
 
   it('commits BEFORE verify, so a gated build still leaves a reviewable diff', async () => {
@@ -906,6 +1548,331 @@ describe("the run's diff is made durable", () => {
     h.claude.complete('failed');
     await done;
     expect(h.worktrees.commits).toEqual([]);
+  });
+});
+
+describe('the hard lock floor (RUN-102)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('acquires locks over the build’s changed paths, as the run holder, before landing', async () => {
+    const h = harness({ manifest: LANDING(), changedFiles: ['src/a.ts', 'src/b.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    // The floor ran on exactly the changed set, scoped to the landing branch, as the run agent.
+    const floor = h.worktrees.lockCalls.find((c) => c.paths.includes('src/a.ts'));
+    expect(floor?.paths).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(floor?.ctx.branch).toBe('noriq/integration'); // the [land] target, not noriq/run/*
+    expect(floor?.ctx.token).toBe('plnrt_bound_to_agt_run1'); // held as the run's agent, not the daemon
+    expect(h.worktrees.landings).toHaveLength(1); // clean acquire → it landed
+  });
+
+  it('GATES a build that changed a path a peer holds — kept for review, never landed', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_peer', holderName: 'peer', taskKey: 'RUN-2' }],
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('lock'); // gated by the floor, not verify
+    expect(h.worktrees.commits).toHaveLength(1); // the diff IS committed first…
+    expect(h.worktrees.landings).toEqual([]); // …but never lands over the peer
+    expect(h.worktrees.removed).toEqual([]); // and the worktree is kept for a human
+    expect(h.comments.some((c) => c.body.includes('src/shared.ts') && c.body.includes('peer'))).toBe(true);
+  });
+
+  // RUN-156. An empty changed set means "nothing to lock", which the floor reads as a PASS — so a
+  // failure to ENUMERATE arrived as a floor that silently did not run. For a driver with no
+  // in-process hook this is the run's ONLY acquisition, so the build would land over whatever a
+  // peer holds with nothing anywhere saying the check was skipped.
+  it('GATES when it cannot tell what the build changed — a floor that locked nothing is not a pass', async () => {
+    const blind = new FakeWorktrees();
+    blind.changedPathsError = 'fatal: not a git repository';
+    const h = harness({ manifest: LANDING(), repoVcs: blind });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('lock:unchecked'); // distinct from a real conflict — it IS different
+    expect(blind.lockCalls).toEqual([]); // nothing was locked, which is the whole problem
+    expect(blind.landings).toEqual([]); // …so it must not land
+    expect(blind.commits).toHaveLength(1); // the diff is committed first — gating costs a re-dispatch
+    expect(blind.removed).toEqual([]); // …and the worktree is kept for a human
+    expect(h.comments.some((c) => c.body.includes('could not check this run'))).toBe(true);
+  });
+
+  // The other route to the same hole, and the one my first fix left open: a lock service that does
+  // not answer used to become `{ ok: true }`. The justification was that the reactive hook and the
+  // dispatch-time check still stood — false for a Codex build on a first sitting, which has
+  // neither, so that call IS the only acquisition.
+  it('GATES when the lock service does not answer — not just when git does not', async () => {
+    const blind = new FakeWorktrees();
+    blind.changedFiles = ['src/a.ts'];
+    blind.lockError = 'ECONNREFUSED';
+    const h = harness({ manifest: LANDING(), repoVcs: blind });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('lock:unchecked');
+    expect(blind.landings).toEqual([]);
+    expect(blind.removed).toEqual([]); // kept, and continuable — the cost is a re-dispatch
+  });
+
+  // A project with locking genuinely OFF is a service answering, not one failing.
+  it('a locking-disabled project still passes the floor', async () => {
+    const off = new FakeWorktrees();
+    off.changedFiles = ['src/a.ts'];
+    off.lockingDisabled = true;
+    const h = harness({ manifest: LANDING(), repoVcs: off });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(off.landings).toHaveLength(1);
+  });
+
+  it('no changed paths → the floor is a no-op (nothing acquired)', async () => {
+    const h = harness({ manifest: LANDING(), changedFiles: [] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.lockCalls).toEqual([]); // never touched the lock layer
+    expect(h.worktrees.landings).toHaveLength(1);
+  });
+
+  it('surfaces a lock gate in the run transcript, for the run view (RUN-106)', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_peer', holderName: 'peer' }],
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    const text = h.transcript.map((s) => s.text).join('\n');
+    expect(text).toMatch(/🔒 hard lock floor gated this build.*src\/shared\.ts.*peer/s);
+  });
+});
+
+describe('dispatch-time predictive locking (RUN-103)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('takes the declared scope before the agent starts, then runs', async () => {
+    const h = harness({ manifest: LANDING(), lockScope: ['src/x.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    // The FIRST acquire is the predictive one, on the declared scope, before any driver output.
+    expect(h.worktrees.lockCalls[0]?.paths).toEqual(['src/x.ts']);
+    expect(h.claude.starts).toHaveLength(1); // the agent still ran
+  });
+
+  it('REFUSES a dispatch whose declared scope clashes — no agent spawned, worktree disposed', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+      // Disposal is now conditional on the workspace being EMPTY (RUN-130): this scenario is a
+      // fresh lease, so it still disposes. The case where it must NOT is covered two tests down.
+      changed: false,
+    });
+    const exit = await h.supervisor.supervise(buildRun());
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/locked by another run/);
+    expect(h.claude.starts).toHaveLength(0); // never spawned — refused, not raced
+    expect(h.worktrees.removed).toEqual(['/wt/run_1']); // the just-leased worktree is disposed
+    expect(h.comments.some((c) => c.body.includes('src/hot.ts'))).toBe(true);
+  });
+
+  // RUN-130's sharp edge. A CONTINUATION adopts its kept worktree and branch (RUN-91) — and a
+  // continuation is exactly what declares a scope, so this refusal fires precisely where the
+  // workspace holds the prior sitting's committed diff. Disposing it force-removes the worktree
+  // and -D's a never-pushed branch: work that exists nowhere else, destroyed by a lock conflict.
+  it('KEEPS a workspace that holds work when the scope clashes — never force-deletes a continuation', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+    });
+    const exit = await h.supervisor.supervise(buildRun()); // `changed` defaults true → holds work
+    expect(exit.outcome).toBe('failed');
+    expect(h.claude.starts).toHaveLength(0); // still refused, not raced
+    expect(h.worktrees.removed).toEqual([]); // …but the work survives the refusal
+  });
+
+  // Only GIT's dispose destroys. A live backend's dispose RETURNS THE LEASE, so skipping it there
+  // preserves nothing and wedges every later run on the repo until the daemon restarts.
+  it('still disposes on a clash when the backend preserves work — dispose is the lease release', async () => {
+    const pooled = new FakeWorktrees();
+    // `repoVcs` wins over deps.vcs (RUN-60), so the conflict has to be armed on THIS instance.
+    (pooled as { disposePreservesWork?: boolean }).disposePreservesWork = true;
+    pooled.lockConflicts = [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }];
+    const h = harness({ manifest: LANDING(), lockScope: ['src/hot.ts'], repoVcs: pooled });
+    await h.supervisor.supervise(buildRun()); // holds work, but disposal is non-destructive here
+    expect(pooled.removed).toEqual(['/wt/run_1']);
+  });
+
+  // RUN-152. The guard here always read "could not tell" as work — but `hasWork` used to answer
+  // `false` on a failed probe, so the guard never saw the error and disposed anyway. A transient
+  // git failure on a continuation was therefore enough to force-remove a diff that exists nowhere
+  // else. The backend rejects now; this pins that the refusal path keeps the workspace.
+  it('KEEPS the workspace when it cannot TELL whether there is work', async () => {
+    const blind = new FakeWorktrees();
+    blind.hasWorkError = 'fatal: bad object base0000';
+    blind.lockConflicts = [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }];
+    const h = harness({ manifest: LANDING(), lockScope: ['src/hot.ts'], repoVcs: blind });
+    const exit = await h.supervisor.supervise(buildRun());
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/locked by another run/); // still refused
+    expect(blind.removed).toEqual([]); // …but nothing was destroyed on a guess
+  });
+
+  it('still disposes an EMPTY workspace on a clash — nothing to lose, nothing to leak', async () => {
+    const h = harness({
+      manifest: LANDING(),
+      lockScope: ['src/hot.ts'],
+      lockConflicts: [{ path: 'src/hot.ts', holder: 'agt_peer', holderName: 'peer' }],
+      changed: false, // a fresh lease with nothing in it
+    });
+    await h.supervisor.supervise(buildRun());
+    expect(h.worktrees.removed).toEqual(['/wt/run_1']);
+  });
+
+  it('no resolver wired → predictive layer is silent (the common case today)', async () => {
+    const h = harness({ manifest: LANDING() }); // lockScope absent
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.claude.starts).toHaveLength(1);
+  });
+});
+
+describe('lock release on terminal (RUN-104)', () => {
+  it('releases the run’s locks as its holder on EVERY terminal path (kept-work build included)', async () => {
+    // A build that changed something but did not land is KEPT (worktree not disposed) — its locks
+    // must still release so a peer unblocks. The release fires regardless of retention.
+    const h = harness({ verifyPasses: false }); // gated → kept, not landed
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.removed).toEqual([]); // kept for the human…
+    expect(h.worktrees.releasedAll).toEqual(['plnrt_bound_to_agt_run1']); // …but locks released
+  });
+
+  it('releases on a clean landed build too', async () => {
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(h.worktrees.releasedAll).toEqual(['plnrt_bound_to_agt_run1']);
+  });
+
+  it('HOLDS locks through the merge and releases AFTER landing, never before (RUN-105)', async () => {
+    // Two runs land onto one integration branch serially; the first must keep its locks until its
+    // work is actually on the branch, or the second could grab a file mid-landing and race it.
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.timeline).toEqual(['land', 'release', 'report']); // land first, THEN release
+  });
+
+  it('releases BEFORE the terminal report, which is what revokes the token it releases with (RUN-177)', async () => {
+    // Reporting a terminal status makes the server retire the run's agent. The release
+    // authenticates AS that agent, so below the report it is a 401 by construction — which is
+    // exactly what the first live dispatch logged. Harmless only while the floor was failing
+    // before it acquired anything; a real leak the moment that was fixed.
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    const release = h.worktrees.timeline.indexOf('release');
+    const report = h.worktrees.timeline.indexOf('report');
+    expect(release).toBeGreaterThanOrEqual(0);
+    expect(report).toBeGreaterThan(release);
+  });
+
+  it('settles anyway when the lock service accepts the release and never answers (RUN-177)', async () => {
+    // The regression the isolated `withTimeout` tests cannot catch: settle awaiting the release
+    // DIRECTLY. A hung lock service would then leave this run non-terminal server-side, its agent
+    // un-retired, its continuation unrecorded and its runner slot held for the daemon's whole life.
+    vi.useFakeTimers();
+    try {
+      const h = harness({ hangRelease: true });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+      );
+      await vi.advanceTimersByTimeAsync(0); // stands in for flush() under fake timers
+      h.claude.complete('done');
+      // Reach settle, then walk past the bound. Without it this await never returns.
+      await vi.advanceTimersByTimeAsync(LOCK_RELEASE_TIMEOUT_MS + 1);
+      await done;
+
+      // The terminal report went out despite the release never answering — only the TERMINAL one
+      // carries `exit`, so this is not satisfied by the earlier `running` reports.
+      expect(h.reports.at(-1)?.exit).toBeDefined();
+      expect(h.worktrees.timeline).toContain('report');
+      expect(h.worktrees.timeline).not.toContain('release'); // it never answered, so it never recorded
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases before the terminal report on a GATED build too, not just a landed one', async () => {
+    // The kept-work path reports `failed` and skips dispose — the release still has to beat the
+    // report there, and that is the path the live runs actually took.
+    const h = harness({ verifyPasses: false });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.timeline).toEqual(['release', 'report']);
+  });
+
+  it('a run in one worktree is gated by a lock a run in ANOTHER worktree holds (RUN-105)', async () => {
+    // Locks live server-side, so two runs on the same repo (each in its own worktree) see each
+    // other's holds — the peer conflict here IS another worktree's run. The hard floor gates the
+    // second rather than letting it clobber the first's file.
+    const h = harness({
+      manifest: LANDING(),
+      changedFiles: ['src/shared.ts'],
+      lockConflicts: [{ path: 'src/shared.ts', holder: 'agt_worktree_b', holderName: 'run in worktree B' }],
+    });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    expect((await done).reason).toBe('lock');
+    expect(h.worktrees.landings).toEqual([]); // the two never land over each other
   });
 });
 
@@ -1084,6 +2051,37 @@ describe('verify feedback loop (RUN-29)', () => {
     expect(exit.reason).toBe('verify'); // gated to a human
     expect(h.claude.continuations).toHaveLength(2); // K=2, not forever
     expect(h.comments.some((c) => c.body.includes('npm test'))).toBe(true); // and said why
+  });
+
+  it("honors a repo's committed [verify] maxRounds over the K=2 default (RUN-94)", async () => {
+    // The bound is the repo's to commit, not the daemon's to hardcode: a long-tail suite may
+    // earn 4 rounds. The default stays 2 — this widens only where a manifest says so.
+    const wider = manifest();
+    if (wider.verify) wider.verify.maxRounds = 4;
+    const h = harness({ verifyPasses: false, manifest: wider });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('verify'); // still gated in the end…
+    expect(h.claude.continuations).toHaveLength(4); // …but after the committed 4 rounds
+    // The last hand-back says it IS the last — the prompt's warning tracks the real bound.
+    expect(h.claude.continuations[3]).toContain('last attempt');
+    expect(h.claude.continuations[2]).not.toContain('last attempt');
+  });
+
+  it('maxRounds = 0 is a pure gate — the verdict stands, no fix turn is spent', async () => {
+    const gateOnly = manifest();
+    if (gateOnly.verify) gateOnly.verify.maxRounds = 0;
+    const h = harness({ verifyPasses: false, manifest: gateOnly });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    const exit = await done;
+
+    expect(exit.reason).toBe('verify');
+    expect(h.claude.continuations).toEqual([]); // the repo said so, in the commit
   });
 
   it('stops pushing turns at a session that died trying', async () => {
@@ -1410,6 +2408,476 @@ describe('plan-branch fork base (RUN-82)', () => {
   });
 });
 
+// RUN-145. The gate answers the definition of done criterion by criterion, with evidence — and
+// this actor had never been given the criteria in ANY form. RUN-139 handed them to the DISPATCHED
+// verify run and CLAUDE.md said "the verify family"; the family has two members and this is the one
+// that gates every build with a [verify.agent], while the dispatched run is opt-in. Same shape as
+// RUN-158: a rule described as holding everywhere, holding at the site that runs less often.
+// RUN-168. A decomposed spec runs as a chain of sessions, one per step. The point is that each
+// starts FRESH — not carrying the previous step's exploration — and inherits its conclusions
+// instead. A chain of fresh contexts beats one long context only if each link gets the hand-off.
+// RUN-166. A task's spec is a live row anyone may edit at any point, so "what was this builder
+// told?" was inferred from the current row rather than answered — and once verification grades a
+// run against per-acceptance-item evidence (RUN-145), which criteria applied to THIS run stops
+// being a curiosity and becomes the input to a gate.
+describe('a run records the spec it was briefed with (RUN-166)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const withSpec = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: ['it reaps on start'] } }),
+  });
+
+  it('reports it once, and it is the spec the agent was actually briefed with', async () => {
+    const h = harness({ anchorTask: withSpec() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    const reported = h.reports.filter((r) => r.executedSpec);
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.executedSpec!.acceptance.observableTruths).toEqual(['it reaps on start']);
+  });
+
+  // Nothing to record for a task nobody planned and no planner ran on — and a run with no spec
+  // must not report an empty one, which would read as "briefed with nothing" rather than "no
+  // spec". The daemon says nothing instead.
+  it('says nothing for a run with no spec', async () => {
+    const h = harness({ anchorTask: null });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.reports.filter((r) => r.executedSpec)).toHaveLength(0);
+  });
+});
+
+describe('a decomposed run is a chain of sessions (RUN-168)', () => {
+  const twoSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'the contract, then its consumer',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'land the contract', anticipatedFiles: [{ path: 'src/a.ts', change: 'create' }] },
+        { id: 's2', title: 'consume it', dependsOn: ['s1'] },
+      ],
+    }),
+  });
+
+  const threeSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'three steps',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'first' },
+        { id: 's2', title: 'second' },
+        { id: 's3', title: 'third' },
+      ],
+    }),
+  });
+
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+
+  it('spawns one session per step, each with its own brief, and lands only at the end', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('step one done');
+    h.claude.complete('done'); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('step two done');
+    h.claude.complete('done'); // s2
+    const exit = await done;
+
+    expect(h.claude.starts).toHaveLength(2);
+    expect(h.claude.starts[0]!.prompt).toContain('YOU ARE DOING STEP 1 OF 2: land the contract');
+    expect(h.claude.starts[1]!.prompt).toContain('YOU ARE DOING STEP 2 OF 2: consume it');
+    // A FRESH session, not the previous step's continued — that is the whole reason to decompose.
+    expect(h.claude.starts[1]!.resumeSessionId).toBeUndefined();
+    // …carrying what step one concluded, so it does not rediscover it.
+    expect(h.claude.starts[1]!.prompt).toContain('WHAT THE EARLIER STEPS DID');
+    expect(h.claude.starts[1]!.prompt).toContain('step one done');
+    expect(exit.outcome).toBe('done');
+  });
+
+  // Continuing past a failed step would build later steps on a foundation the run already knows is
+  // broken, and would report a run that did half its plan as one that did all of it. Three steps
+  // and a failure in the MIDDLE, because failing the only session is what a run did before this
+  // existed — it would pass with the feature removed and prove nothing about chains.
+  it('stops at the step that failed, having run the ones before it', async () => {
+    const h = harness({ anchorTask: threeSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('one done');
+    h.claude.complete('done'); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.complete('failed'); // s2
+    const exit = await done;
+    expect(h.claude.starts).toHaveLength(2); // s1 ran, s2 failed, s3 never started
+    expect(exit).toMatchObject({ outcome: 'failed' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/step 2\/3 did not finish/);
+  });
+
+  // The tally is last-writer-wins PER SLOT, so steps sharing `primary` would leave the run's total
+  // showing only the last one — and the live guard, named per step, would be probing a different
+  // figure from the one being written.
+  it('records each step’s spend in its own slot, so the run total is the whole chain', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 100 }); // s1
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.complete('done', { outputTokens: 30 }); // s2
+    const exit = await done;
+    // 130, not 30. Sharing a slot would have reported only the last step.
+    expect(exit.telemetry?.outputTokens).toBe(130);
+  });
+
+  it('says in the transcript which step is speaking, and which never ran', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    const said = h.transcript.map((t) => t.text).join('\n');
+    expect(said).toContain('step 1/2 — land the contract [s1]');
+    expect(said).toMatch(/the remaining steps did not run/);
+  });
+
+  // RUN-150. Without this a five-step run reads as one undifferentiated stream and an operator has
+  // no idea what is actually happening — the whole reason a decomposition is worth watching.
+  it('labels each step’s transcript segments, and stops labelling once the chain is over', async () => {
+    const h = harness({ anchorTask: twoSteps() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.emitText('one');
+    h.claude.complete('done');
+    for (let i = 0; i < 200 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('two');
+    h.claude.complete('done');
+    await done;
+
+    const said = h.transcript.filter((t) => t.text === 'one' || t.text === 'two');
+    expect(said.map((t) => [t.text, t.step])).toEqual([
+      ['one', 's1'],
+      ['two', 's2'],
+    ]);
+    // The gates that follow belong to the PARENT — the label rides each SESSION, so nothing after
+    // the chain inherits the last step's. On a FAILED chain that would be the step that failed,
+    // which is exactly the wrong answer in the place a human looks first.
+    expect(h.transcript.at(-1)!.step).toBeNull();
+    // …and a reviewer round, which runs after the chain, is unlabelled for the same reason.
+    expect(h.transcript.filter((t) => t.role === 'reviewer').every((t) => t.step === null)).toBe(true);
+  });
+
+  // A spec with no steps must behave exactly as it did before — that is most runs.
+  it('runs a spec with no steps as one session, as always', async () => {
+    const h = harness({ anchorTask: null });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.claude.starts).toHaveLength(1);
+    expect(h.claude.starts[0]!.prompt).not.toContain('YOU ARE DOING STEP');
+  });
+});
+
+describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+
+  const withCriteria = (...truths: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: truths } }),
+  });
+
+  /** Build → reviewer, with the reviewer emitting `reply` as its whole report. */
+  const reviewedWith = async (task: AnchorTask | null, reply: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done'); // the build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.claude.starts[1];
+    if (!review) throw new Error('the reviewer session never started');
+    h.claude.emitText(reply);
+    h.claude.complete('done');
+    return { h, review, exit: await done };
+  };
+
+  it('is shown the numbered criteria and told how to answer them', async () => {
+    const { review } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start', 'no agent ever gets push credentials'),
+      'ACCEPTANCE 1: VERIFIED src/worktree.ts:88\nACCEPTANCE 2: VERIFIED src/security.ts:20\nVERDICT: PASS',
+    );
+    expect(review.prompt).toContain('1. [truth] the daemon reaps orphans on start');
+    expect(review.prompt).toContain('2. [truth] no agent ever gets push credentials');
+    // The numbers buy nothing without the format that spends them.
+    expect(review.prompt).toContain('ACCEPTANCE <n>:');
+    expect(review.prompt).toMatch(/recorded as BEHAVIOUR-UNVERIFIED/);
+  });
+
+  // The report answered its own question twice. Reading it as PASS is not a decision anybody made —
+  // it falls out of which parser ran last.
+  it('gates the run when the reviewer signs off PASS over a criterion it marked FAILED', async () => {
+    const { exit, h } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start'),
+      'ACCEPTANCE 1: FAILED nothing reaps on start\nVERDICT: PASS',
+    );
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.comments.map((c) => c.body).join('\n')).toMatch(/the daemon overrode this PASS/);
+  });
+
+  // Most specs are half-written. Failing every build over a truth nobody could evidence would make
+  // the field a tripwire — but a passing run is the ONLY place such a gap would otherwise vanish,
+  // so it is posted rather than merely logged.
+  it('lets a PASS stand over an unanswered criterion, and says so on the task', async () => {
+    const { exit, h } = await reviewedWith(
+      withCriteria('the daemon reaps orphans on start', 'it never pushes'),
+      'ACCEPTANCE 1: VERIFIED src/worktree.ts:88\nVERDICT: PASS',
+    );
+    expect(exit.outcome).toBe('done');
+    const posted = h.comments.map((c) => c.body).join('\n');
+    expect(posted).toMatch(/1 verified, 0 failed, 1 unverified/);
+    expect(posted).toMatch(/it never pushes/);
+  });
+
+  // Most runs carry no spec, and those reviews must look exactly as they did before.
+  it('says nothing about acceptance for a run with no spec', async () => {
+    const { review, h, exit } = await reviewedWith(null, 'VERDICT: PASS');
+    expect(review.prompt).not.toContain('ACCEPTANCE CRITERIA');
+    expect(exit.outcome).toBe('done');
+    expect(h.comments).toEqual([]);
+  });
+});
+
+// RUN-146. The report is an argument; the fix turn needs a specification. The daemon already holds
+// what is outstanding as data, so it leads with it rather than making the builder reconstruct it
+// from prose every round.
+// RUN-147. A finding tied to the requirement it threatens survives a fresh reviewer's rewording,
+// and the run can say which requirements came through clear.
+describe('findings carry requirement ids (RUN-147)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+
+  const taskRequiring = (...requirementIds: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ requirementIds }),
+  });
+
+  const reviewedWith = async (task: AnchorTask | null, reply: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.claude.starts[1]!;
+    h.claude.emitText(reply);
+    h.claude.complete('done');
+    return { h, review, exit: await done };
+  };
+
+  it('tells the reviewer which requirements exist and how to name one', async () => {
+    const { review } = await reviewedWith(taskRequiring('R-7', 'R-9'), 'VERDICT: PASS');
+    expect(review.prompt).toContain('traceable to these requirements: R-7, R-9');
+    expect(review.prompt).toContain('FINDING <n> [<severity>] [<requirement ids>] <file:line>');
+    // The reason, not just the format — a rule with no rationale is one a model drops under load.
+    expect(review.prompt).toMatch(/survives rewording because it is not wording/);
+    // …and the guard against stretching to fit.
+    expect(review.prompt).toMatch(/a wrong association is worse than no association/);
+  });
+
+  it('reports per requirement when the run ends, including the ones nothing was raised against', async () => {
+    // maxRounds 0 makes the first review the TERMINAL one, so the finding draws a RUN-174 contest
+    // turn (no code change). The builder streams no rebuttal, so nothing is contested and the
+    // finding stands with no re-review — R-7 is reported open.
+    const { h } = await reviewedWith(
+      taskRequiring('R-7', 'R-9'),
+      'FINDING 1 [High] [R-7] src/a.ts:1: it never reaps\nVERDICT: FAIL',
+    );
+    const posted = h.comments.map((c) => c.body).join('\n');
+    expect(posted).toMatch(/❌ \*\*R-7\*\* — 1 finding\(s\) still standing/);
+    expect(posted).toMatch(/➖ \*\*R-9\*\* — no finding was recorded against it/);
+  });
+
+  it('says nothing about requirements for a task that names none', async () => {
+    const { review, h } = await reviewedWith(null, 'VERDICT: PASS');
+    expect(review.prompt).not.toContain('traceable to these requirements');
+    expect(h.comments.map((c) => c.body).join('\n')).not.toContain('Requirements');
+  });
+});
+
+describe('a failing gate hands back a specification (RUN-146)', () => {
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 1,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 1 },
+      },
+    });
+
+  const taskWith = (...truths: string[]): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'reap orphans',
+    body: null,
+    executionSpec: ExecutionSpec.parse({ acceptance: { observableTruths: truths } }),
+  });
+
+  /** Build → reviewer FAILs with `report` → the builder's fix turn. Returns that turn's text. */
+  const fixTurnAfter = async (task: AnchorTask | null, report: string) => {
+    const h = harness({ manifest: REVIEWED(), anchorTask: task });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done'); // build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    h.claude.emitText(report);
+    h.claude.complete('done'); // reviewer round 1
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.continuations.length) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const turn = h.claude.continuations[0] ?? '';
+    // Let the run finish so nothing is left pending.
+    for (let i = 0; i < 200 && h.claude.starts.length < 3; i++) await new Promise((r) => setTimeout(r, 0));
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done.catch(() => {});
+    return turn;
+  };
+
+  it('leads with the outstanding criteria, and keeps the report as the evidence behind them', async () => {
+    const turn = await fixTurnAfter(
+      taskWith('it reaps orphans on start'),
+      'FINDING 1 [High] src/worktree.ts:88: reapOrphans is never called\nACCEPTANCE 1: FAILED nothing reaps\nVERDICT: FAIL',
+    );
+    expect(turn).toMatch(/WHAT IS STILL OUTSTANDING/);
+    expect(turn).toMatch(/NOT SATISFIED[\s\S]*it reaps orphans on start/);
+    expect(turn).toContain('Files the report names: src/worktree.ts');
+    // The findings are still there in full — the builder answers them number by number, and the
+    // ledger (RUN-79) depends on that block existing.
+    expect(turn).toContain('reapOrphans is never called');
+    expect(turn).toMatch(/FINDING <n>: FIXED/);
+    // Specification first, evidence second.
+    expect(turn.indexOf('WHAT IS STILL OUTSTANDING')).toBeLessThan(turn.indexOf('Its report'));
+  });
+
+  // The failure this exists to prevent: a builder told only "not satisfied" rewrites code that was
+  // already correct to satisfy a gate that merely could not see it.
+  it('tells the builder an unverified criterion usually needs evidence, not a code change', async () => {
+    const turn = await fixTurnAfter(
+      taskWith('it never pushes'),
+      'FINDING 1 [Med] src/a.ts:1: something else\nACCEPTANCE 1: BEHAVIOUR-UNVERIFIED nothing covers it\nVERDICT: FAIL',
+    );
+    expect(turn).toMatch(/NOT ESTABLISHED[\s\S]*usually NOT a code defect/);
+    expect(turn).toMatch(/prefer making it demonstrable/);
+    // …and the trap closed: a characterization test is not evidence.
+    expect(turn).toMatch(/merely records what the code does today is not evidence/);
+  });
+
+  // A spec built once and reused would tell round 2 to fix what round 1 already fixed — and the
+  // builder, told a criterion is still outstanding when it is not, either re-does the work or
+  // starts distrusting the block. Each round's spec comes from THAT round's verdict.
+  it('reflects the round it is handed to, not the first one', async () => {
+    const h = harness({
+      manifest: manifest({
+        verify: {
+          cmd: null,
+          timeoutSeconds: null,
+          shell: null,
+          maxRounds: 2,
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+        },
+      }),
+      anchorTask: taskWith('it reaps orphans', 'it never pushes'),
+    });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    const awaitReview = async (n: number) => {
+      for (let i = 0; i < 300; i++) {
+        if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= n) return;
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      throw new Error(`reviewer ${n} never started`);
+    };
+    await awaitReview(2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: x\nACCEPTANCE 1: FAILED nothing reaps\nVERDICT: FAIL');
+    h.claude.complete('done'); // round 1
+    await awaitReview(3);
+    // Round 1's criterion is fixed; a DIFFERENT one now fails.
+    h.claude.emitText(
+      'FINDING 2 [High] src/b.ts:1: y\nACCEPTANCE 1: VERIFIED src/a.ts:9\nACCEPTANCE 2: FAILED it pushes\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 2
+    for (let i = 0; i < 300 && h.claude.continuations.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await awaitReview(4);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+
+    const [first, second] = h.claude.continuations;
+    expect(first).toContain('it reaps orphans');
+    expect(second).toContain('it never pushes');
+    // The one round 2's reviewer just marked VERIFIED must not be re-issued as outstanding work.
+    expect(second).not.toMatch(/NOT SATISFIED[\s\S]*it reaps orphans/);
+    expect(second).toMatch(/1 other criterion is already satisfied/);
+  });
+
+  // Every run without a spec, which is most of them, must get exactly the hand-back it got before.
+  it('adds nothing for a run with no criteria', async () => {
+    const turn = await fixTurnAfter(null, 'FINDING 1 [High] src/a.ts:1: broken\nVERDICT: FAIL');
+    expect(turn).not.toContain('WHAT IS STILL OUTSTANDING');
+    expect(turn).toContain('broken');
+  });
+});
+
 describe('the inline reviewer (RUN-61)', () => {
   const REVIEWED = (
     cmd: string | null = 'npm test',
@@ -1420,7 +2888,8 @@ describe('the inline reviewer (RUN-61)', () => {
         cmd,
         timeoutSeconds: null,
         shell: null,
-        agent: { tool: null, model: null, effort: null, maxRounds: 2, ...agent },
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2, ...agent },
       },
     });
 
@@ -1434,6 +2903,56 @@ describe('the inline reviewer (RUN-61)', () => {
     }
     throw new Error('the reviewer session never started');
   };
+
+  // RUN-154. The reviewer is the actor asked whether a diff looks like this repo's code, and it was
+  // the one told nothing about what this repo's code looks like. Names only — its context already
+  // carries the diff — and resolved at the point of use, so a run RESUMED in a later process gets
+  // it too (only the first sitting ever assembles a prompt with the run's own context in scope).
+  it("carries the repo's own conventions, by name, without inlining the documents", async () => {
+    const reads: string[] = [];
+    const h = harness({
+      manifest: {
+        ...REVIEWED('npm test'),
+        context: {
+          requiredReading: ['CLAUDE.md'],
+          entryPoints: ['src/daemon.ts'],
+          conventions: ['ESM only'],
+          agentInstructions: 'inline' as const,
+        },
+      },
+      pathProbe: async () => true,
+      readDoc: async (abs) => {
+        reads.push(abs);
+        return '# house rules';
+      },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+
+    const review = h.claude.starts[1]!;
+    expect(review.prompt).toContain('QUOTED FROM THE REPOSITORY UNDER REVIEW');
+    expect(review.prompt).toContain('- Conventions (non-negotiable): ESM only');
+    expect(review.prompt).toContain('CLAUDE.md');
+    expect(review.prompt).toMatch(/before judging the diff/);
+    // The document itself stays out: the diff is what this actor's context is for.
+    expect(review.prompt).not.toContain('# house rules');
+    // Exactly ONE read in the whole run — the builder's. The reviewer's loader added none: it
+    // resolves paths and never opens them, which is what "names only" has to mean to be worth it.
+    expect(reads).toEqual(['/wt/run_1/CLAUDE.md']);
+    // The daemon's verdict rules come AFTER repo-controlled text — last word to the side that is
+    // not written by the repository being judged.
+    expect(review.prompt.indexOf('QUOTED FROM THE REPOSITORY')).toBeLessThan(
+      review.prompt.indexOf('End your response with EXACTLY one line'),
+    );
+    // …and the BUILDER still gets it inlined — the two actors want different things.
+    expect(h.claude.starts[0]?.prompt).toContain('# house rules');
+
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
 
   it('spawns a fresh read-only session with NO Noriq credential, and a PASS reaches done', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { model: 'claude-opus-4-8', effort: 'high' }) });
@@ -1457,6 +2976,51 @@ describe('the inline reviewer (RUN-61)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('done');
     expect(h.verifyRan()).toBe(true); // the cmd floor still ran first
+  });
+
+  // RUN-158. The assertion above passed for the wrong reason: the default `[permissions.verify]`
+  // profile already says `write = false`, so it only ever proved the default. The reviewer's
+  // profile was handed over RAW, so a repo that asked for a writable verify posture got a reviewer
+  // holding Edit/Write over the diff it was judging — free to "fix" the code and then PASS it.
+  // RUN-118's floor is described as applying at every permission site; this was the site it missed,
+  // and the one that matters most: a dispatched verify run is opt-in, the inline reviewer gates
+  // every build that configures one.
+  it('stays read-only even when the manifest asks for a WRITABLE verify posture (RUN-158)', async () => {
+    const writableVerify = REVIEWED();
+    writableVerify.permissions.verify = { ...writableVerify.permissions.verify, write: true };
+    const h = harness({ manifest: writableVerify });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+
+    expect(h.claude.starts[1]!.permission.write).toBe(false);
+    // The build's own agent is untouched — a producing workflow keeps its declared profile, which
+    // is the half of the clamp that must NOT change.
+    expect(h.claude.starts[0]!.permission.write).toBe(true);
+
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a reviewer AGENT coordinate picks the vendor, model, and effort (RUN-113)', async () => {
+    // [verify.agent] agent = "codex.gpt-5_6-sol.high" → a codex reviewer judging a claude build.
+    const h = harness({ manifest: REVIEWED('npm test', { agent: 'codex.gpt-5_6-sol.high' }) });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn runs on claude
+    for (let i = 0; i < 50; i++) {
+      if (h.codex.starts.some((s) => s.runId === 'run_1:review')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    expect(review).toBeDefined();
+    expect(review?.model).toBe('gpt-5.6-sol'); // unescaped from the coordinate
+    expect(review?.effort).toBe('high');
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    await done;
   });
 
   it('hands a FAIL report back to the builder, then a FRESH reviewer passes the fix', async () => {
@@ -1580,6 +3144,70 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.worktrees.removed).toEqual([]); // the diff is kept — a human still needs it
   });
 
+  // RUN-175. The reviewer could already say STRUCTURAL in prose; only the builder read it, so a
+  // run diagnosed as unconvergeable still burned every fix round rediscovering that. The token is
+  // the machine-readable half — honoured only evidenced, and a FAIL either way.
+  const ESCALATED = [
+    'FINDING 1 [High] src/a.ts:10: the write floor is re-derived per site — also src/b.ts:20 and src/c.ts:30',
+    'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the floor — src/a.ts:10, src/b.ts:20, src/c.ts:30',
+    'VERDICT: FAIL',
+  ].join('\n');
+
+  it('an honoured escalation ends the loop in round 1: no fix turn, a distinct reason, the diagnosis posted (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() }); // maxRounds 2 — none of them spent
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(ESCALATED);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // distinct from a plain 'review' rejection
+    expect(h.claude.continuations).toEqual([]); // the remaining rounds were NOT spent
+    expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer — no contest turn either
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the floor'); // the diagnosis leads
+    expect(body).toContain('src/b.ts:20'); // the evidence shows, rather than asks to be trusted
+    expect(h.worktrees.removed).toEqual([]); // a FAIL, never a silent pass — the diff is kept
+    // The transcript names the fail-fast, so a human reading the stream sees why round 2 never ran.
+    expect(h.transcript.map((s) => s.text).join('\n')).toContain('escalated STRUCTURAL');
+  });
+
+  it('a demoted (under-evidenced) escalation consumes rounds exactly as an ordinary FAIL (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // One cited instance — below the floor of 3, so the token is ignored, not honoured.
+    h.claude.emitText(
+      'FINDING 1 [High] src/a.ts:10: one bad site\nESCALATE STRUCTURAL FINDING 1: feels systemic — src/a.ts:10\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the fix round DID run — the demotion changed nothing
+    h.claude.emitText('Still leaking.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review'); // the ordinary rejection, not the escalation terminal
+    expect(h.claude.continuations).toHaveLength(1); // the manifest's one round was spent, as today
+  });
+
+  it('an escalation token on a PASS changes nothing — the run reaches done (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'ESCALATE STRUCTURAL FINDING 1: everything — src/a.ts:1, src/b.ts:2, src/c.ts:3\nVERDICT: PASS',
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+  });
+
   it('maxRounds 0 is a pure gate: one review, no hand-back', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());
@@ -1592,6 +3220,228 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.reason).toBe('review');
     expect(h.claude.continuations).toEqual([]); // never handed back
     expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer
+  });
+
+  // A "continue a failed run" dispatch (PLNR-180/RUN-91) carries budget.maxRounds — a fresh
+  // reviewer-round budget for the kept worktree — clamped by the repo's committed ceiling.
+  const continueRun = (maxRounds: number) =>
+    makeRun({
+      kind: 'build',
+      anchor: { type: 'task', taskId: 'task_9' },
+      budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds },
+    });
+
+  it('budget.maxRounds narrows the reviewer rounds: 0 is a pure gate over a manifest that allows 2 (RUN-91)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 2 }) });
+    const done = h.supervisor.supervise(continueRun(0));
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toEqual([]); // dispatch said 0 → never handed back, despite manifest 2
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(1);
+  });
+
+  it('budget.maxRounds cannot WIDEN past the manifest ceiling — the repo owner clamps it (RUN-91)', async () => {
+    // The manifest allows one fix round; a continue asking for five gets one, not five.
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(continueRun(5));
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('VERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review'); // gated after the manifest's single fix round, not five
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(2); // initial + 1
+  });
+
+  // Continuation continuity (RUN-92): a re-dispatched failed run re-seeds from the record the prior
+  // sitting left, so spend stays cumulative and the ledger is not relitigated.
+  const priorLedgerEntry = {
+    id: 1,
+    round: 2,
+    severity: 'high',
+    requirements: [],
+    location: 'src/auth.ts:42',
+    claim: 'THE-PRIOR-FINDING-ABOUT-AUTH',
+    status: 'fixed' as const,
+    pointer: 'src/auth.ts:50',
+    reason: 'guarded now',
+  };
+
+  it('re-seeds the prior sitting spend so a continuation reports CUMULATIVE totals (RUN-92)', async () => {
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 1000, usd: 0.5 },
+      ledger: [],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed, verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { inputTokens: 40, costUsd: 0.1 }); // the build turn's spend
+    await onReviewTurn(h, 2);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done', { inputTokens: 20, costUsd: 0.05 }); // the reviewer's spend
+    await done;
+    const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
+    // prior 1000 (seeded into inputTokens) + build 40 + reviewer 20 = 1060 — never a reset to 60.
+    expect(terminal?.telemetry?.inputTokens).toBe(1060);
+    expect(terminal?.telemetry?.costUsd).toBeCloseTo(0.65);
+  });
+
+  it('hands the prior adjudication ledger to the FIRST reviewer of a continuation (RUN-92)', async () => {
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 10, usd: 0 },
+      ledger: [priorLedgerEntry],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // The very first review of the continuation already carries the settled finding — it verifies
+    // the pointer instead of raising it fresh (the whole point of not relitigating).
+    expect(h.claude.starts[1]?.prompt).toContain('THE-PRIOR-FINDING-ABOUT-AUTH');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('records a continuable entry when a build gate-fails, and clears it when one passes (RUN-92)', async () => {
+    // Fail: the reviewer refuses through its one fix round → gated, worktree kept, record written.
+    const failed = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const runF = failed.supervisor.supervise(buildRun());
+    await flush();
+    failed.claude.complete('done');
+    await onReviewTurn(failed, 2);
+    failed.claude.emitText('FINDING 1 [high] src/auth.ts:9: the 401 path is untested\nVERDICT: FAIL');
+    failed.claude.complete('done');
+    await onReviewTurn(failed, 3);
+    failed.claude.emitText('FINDING 1 [high] src/auth.ts:9: still untested\nVERDICT: FAIL');
+    failed.claude.complete('done');
+    // The terminal round FAILed — RUN-174's contest turn runs, but the builder streams no rebuttal,
+    // so nothing is contested and the run gate-fails with the finding on the record (no re-review).
+    await runF;
+    const record = failed.continuable.puts.at(-1);
+    expect(record?.runId).toBe('run_1');
+    expect(record?.ledger.length).toBeGreaterThan(0); // the reviewer's finding is carried forward
+    expect(failed.continuable.entries.has('run_1')).toBe(true);
+
+    // The next sitting's transcript must number ABOVE everything this one wrote (RUN-183). The
+    // server keys segments on (runId, seq) with INSERT OR IGNORE, so an overlap is not a clash —
+    // it is silence, and a continued run showed a human nothing at all for 49 minutes.
+    const highest = Math.max(...failed.transcript.map((s) => s.seq));
+    expect(record?.lastLogSeq).toBeGreaterThan(highest);
+    // Derived from the closed transcript rather than counted by the caller: closing FLUSHES what
+    // was buffered and then appends a terminal milestone, so "one more than before" is not
+    // reliably true and a caller that assumed it would hand out a number already used.
+    expect(record?.lastLogSeq).toBe(highest + 1);
+
+    // Pass: a build that satisfies the gate clears any record a prior failed sitting left.
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 5, usd: 0 },
+      ledger: [priorLedgerEntry],
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const ok = harness({ manifest: REVIEWED('npm test'), continuableSeed: seed, verifyResults: [true] });
+    const runP = ok.supervisor.supervise(buildRun());
+    await flush();
+    ok.claude.complete('done');
+    await onReviewTurn(ok, 2);
+    ok.claude.emitText('VERDICT: PASS');
+    ok.claude.complete('done');
+    await runP;
+    expect(ok.continuable.entries.has('run_1')).toBe(false); // resolved → nothing left to continue
+  });
+
+  it('a sitting that CRASHES refreshes the record — history kept, tallies current', async () => {
+    // The live incident: a continuation was killed minutes in, and the blanket remove threw away
+    // the PRIOR sitting's spend, ledger and transcript position — the next continue started
+    // blind, with three sittings of history gone. But "leave it untouched" is wrong in the other
+    // direction: a stale record's spend undercounts the killed sitting (the next ceiling comes
+    // out WIDER), and its lastLogSeq predates the terminal milestone (the next sitting's first
+    // segments collide and vanish). Only a REFRESH loses neither.
+    const seed: ContinuableRun = {
+      runId: 'run_1',
+      spent: { tokens: 5, usd: 0 },
+      ledger: [priorLedgerEntry],
+      lastLogSeq: 108,
+      failedAt: '2026-07-17T00:00:00.000Z',
+    };
+    const h = harness({ continuableSeed: seed });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed', { outputTokens: 40 }); // died AFTER spending — driverSucceeded false
+    await done;
+    const kept = h.continuable.entries.get('run_1');
+    expect(kept).toBeDefined();
+    expect(kept?.ledger).toEqual([priorLedgerEntry]); // the prior adjudications survive
+    // CUMULATIVE: seed 5 + this sitting's 40. A stale 5 would hand the next sitting the killed
+    // sitting's 40 tokens back as fresh budget.
+    expect(kept?.spent.tokens).toBe(45);
+    // ADVANCED: the terminal milestone was written above 108, so a record still saying 108 would
+    // point the next sitting into rows that already exist.
+    expect(kept?.lastLogSeq).toBeGreaterThan(108);
+  });
+
+  it('a crashed run whose workspace still holds work KEEPS it — never force-delete the only copy', async () => {
+    // driverSucceeded alone was the dispose test, and it destroyed real work: a killed
+    // continuation reads as "driver did not succeed", but its workspace carries every prior
+    // sitting's committed diff on a branch nothing else references. The backend is ASKED now.
+    const h = harness({}); // changed=true: the workspace has work
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    expect(h.worktrees.created.length).toBe(1); // it leased — the assertion below is not vacuous
+    expect(h.worktrees.removed).toEqual([]); // kept for a human, exactly like a gate-fail
+    // (the empty-tree cleanup half lives in 'build failure with NOTHING in the tree' above)
+  });
+
+  it('a probe that cannot answer errs toward KEEPING the workspace', async () => {
+    // A kept empty worktree costs a warning at the next startup sweep; a disposed full one costs
+    // the work. The same fail-closed direction as RUN-152's no-changes probe.
+    const h = harness({});
+    h.worktrees.hasWorkError = 'git exploded';
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    await done;
+    expect(h.worktrees.removed).toEqual([]);
+  });
+
+  // RUN-130: the write half of the predictive lock source. What this sitting changed becomes the
+  // continuation's declared scope, so the paths are taken BEFORE the retry respawns rather than
+  // discovered at the post-build floor after paying for the work again.
+  it('records what the failed sitting changed, as the continuation’s declared lock scope', async () => {
+    const h = harness({ verifyPasses: false });
+    h.worktrees.changedFiles = ['src/a.ts', 'src/b.ts'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('failed');
+    expect(h.continuable.entries.get('run_1')?.changedPaths).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  it('records no scope when the sitting changed nothing the backend can name', async () => {
+    const h = harness({ verifyPasses: false });
+    h.worktrees.changedFiles = [];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.continuable.entries.get('run_1')?.changedPaths).toBeUndefined();
   });
 
   it('a reviewer with no verdict still GATES the run — but as no-judgment, never as a refusal (RUN-72)', async () => {
@@ -1664,6 +3514,28 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.claude.starts).toHaveLength(1);
   });
 
+  it('hands the driver a sanitized env — stripping is a supervisor guarantee (RUN-109)', async () => {
+    const prev = process.env.NORIQ_TOKEN;
+    process.env.NORIQ_TOKEN = 'super-secret-daemon-token';
+    try {
+      const h = harness({ manifest: manifest({ verify: null }) });
+      const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+      await flush();
+      const env = h.claude.starts[0]?.env;
+      expect(env).toBeDefined();
+      // the daemon's OAuth token never reaches the agent's shell — regardless of driver
+      expect(env?.NORIQ_TOKEN).toBeUndefined();
+      // git can neither prompt nor push with a credential helper
+      expect(env?.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env?.GIT_ASKPASS).toBe('/bin/false');
+      h.claude.complete('done');
+      await done;
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, 'NORIQ_TOKEN');
+      else process.env.NORIQ_TOKEN = prev;
+    }
+  });
+
   it('with [land]: the reviewer judges intent BEFORE landing, and a PASS lands', async () => {
     const h = harness({
       manifest: {
@@ -1672,7 +3544,8 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
-          agent: { tool: null, model: null, effort: null, maxRounds: 2 },
+          maxRounds: 2,
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
         },
       },
     });
@@ -1696,7 +3569,8 @@ describe('the inline reviewer (RUN-61)', () => {
           cmd: 'npm test',
           timeoutSeconds: null,
           shell: null,
-          agent: { tool: null, model: null, effort: null, maxRounds: 0 },
+          maxRounds: 2,
+          agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
         },
       },
     });
@@ -1748,7 +3622,7 @@ describe('the inline reviewer (RUN-61)', () => {
 
   it('naming a tool severs the [defaults.verify].model fallback — model names are vendor-specific', async () => {
     const m = REVIEWED('npm test', { tool: 'codex' });
-    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'high' }; // the OTHER vendor's model
+    m.defaults.verify = { agent: null, model: 'claude-sonnet-5', effort: 'high' }; // the OTHER vendor's model
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -1763,7 +3637,7 @@ describe('the inline reviewer (RUN-61)', () => {
 
   it('the reviewer model falls back to [defaults.verify] when the agent block names none', async () => {
     const m = REVIEWED();
-    m.defaults.verify = { model: 'claude-sonnet-5', effort: 'xhigh' };
+    m.defaults.verify = { agent: null, model: 'claude-sonnet-5', effort: 'xhigh' };
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -1774,6 +3648,281 @@ describe('the inline reviewer (RUN-61)', () => {
     h.claude.emitText('VERDICT: PASS');
     h.claude.complete('done');
     await done;
+  });
+});
+
+// RUN-174. Both the RUN-66 and RUN-88 dogfood runs died in the TERMINAL review — the round with no
+// fix budget behind it — on findings raised there for the first time, neither fixable NOR
+// contestable. The contest turn is the one answer such a finding could still get: one builder turn
+// to CONTEST with a pointer (no code change), then a fresh reviewer judges the same diff plus that
+// evidence. It is not another fix round, and it can never cost a run that had nothing to spend.
+describe('the terminal-round contest turn (RUN-174)', () => {
+  const REVIEWED = (maxRounds = 0, cmd: string | null = 'npm test') =>
+    manifest({
+      verify: {
+        cmd,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>, atLeastStarts: number) => {
+    for (let i = 0; i < 300; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= atLeastStarts) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error(`the reviewer session (>= ${atLeastStarts} starts) never began`);
+  };
+
+  /** Build → terminal reviewer FAILs with one finding → the builder's contest turn streams
+   *  `contest` (null = stays silent) → the run settles. For the cases where the contest does NOT
+   *  earn a re-review, so `done` resolves without a second reviewer to drive. */
+  const terminalContestFails = async (contest: string | null) => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    if (contest !== null) h.claude.continueTexts = [contest];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs
+    const exit = await done;
+    return { h, exit };
+  };
+  const reviewerStarts = (h: ReturnType<typeof harness>) =>
+    h.claude.starts.filter((s) => s.runId === 'run_1:review').length;
+
+  it('a contested terminal finding a fresh reviewer clears PASSES the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    // The builder points at evidence the finding is wrong — no code change.
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the guard already covers this'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs
+    // The contest turn (a continuation of the live builder) runs, then a FRESH reviewer looks once
+    // more — it is starts[2], not another fix turn.
+    await onReviewTurn(h, 3);
+    expect(h.claude.continuations.some((c) => /contest/i.test(c))).toBe(true);
+    // The fresh reviewer got the builder's pointer as ledger evidence to verify for itself.
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toMatch(/PRIOR ADJUDICATIONS/);
+    expect(readjudged).toContain('CONTESTED (src/a.ts:9)');
+    h.claude.emitText('The pointer holds — out of scope.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // the contest cleared the finding
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(2); // one extra look
+  });
+
+  it('a terminal finding that survives the contest still fails the run, and never checkpoints', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('The pointer does not hold.\nVERDICT: FAIL'); // the finding stands
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.comments.at(-1)?.body).toMatch(/does not satisfy the intent/);
+    // The "may NOT change code" rule: the contest turn adds NO checkpoint (a FIX round folds one in
+    // as "reviewer fix round N" so the fresh reviewer sees the change), so the re-adjudication read
+    // the same diff the terminal round judged — only the one pre-review checkpoint was taken.
+    expect(h.worktrees.commits.some((c) => /fix round/i.test(c.message))).toBe(false);
+    expect(h.worktrees.commits.filter((c) => /pre-review checkpoint/i.test(c.message))).toHaveLength(1);
+    expect(h.worktrees.removed).toEqual([]); // the diff is kept for a human
+  });
+
+  // RUN-175: the contest's fresh adjudicator is a reviewer round like any other, so an honoured
+  // escalation it raises must ride out — not be replaced by the pre-contest verdict, which would
+  // report the one run a reviewer proved unconvergeable as a plain rejection, diagnosis unread.
+  it('an honoured escalation from the contest’s fresh reviewer fail-fasts with the diagnosis (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the guard already covers this'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs, token-free — the contest turn runs
+    await onReviewTurn(h, 3);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/a.ts:1: the guard floor is re-derived per site — also src/b.ts:2 and src/c.ts:3',
+        'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the guard floor — src/a.ts:1, src/b.ts:2, src/c.ts:3',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // the fresh adjudicator escalates instead of merely re-raising
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // not the plain 'review' rejection
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the guard floor'); // the diagnosis surfaced
+  });
+
+  // The leak the RUN-174 gate closes: a fresh re-review is not a free reroll of the verdict. Unless
+  // the builder actually CONTESTED a finding with a checkable pointer, the finding stands and NO
+  // reviewer is spawned to possibly-PASS over it (criterion 4).
+  it('a terminal finding nobody contests stands — no fresh reviewer re-rolls the verdict', async () => {
+    const { h, exit } = await terminalContestFails(null); // the builder streams no rebuttal
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toHaveLength(1); // the contest turn DID happen…
+    expect(reviewerStarts(h)).toBe(1); // …but no re-review followed a non-contest
+  });
+
+  it('a FIXED response cannot clear a terminal finding — nothing was changed to fix', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 1: FIXED src/a.ts:9 — added the guard');
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // a FIXED is not a contest → no re-review
+  });
+
+  it('a CONTESTED with no checkable pointer cannot clear a terminal finding', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 1: CONTESTED'); // no pointer given
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // self-assertion with no pointer → no re-review
+  });
+
+  // RUN-179: a contest that CONTESTS with a checkable pointer but names a finding id NO terminal
+  // finding carries (`FINDING 99` against a single `FINDING 1`) clears the eligibility filter's
+  // pointer bar yet leaves the real finding uncontested — so it must NOT buy a fresh adjudicator
+  // whose stochastic PASS could clear the run over unchanged code. Same re-roll the pointer/FIXED
+  // cases deny, one level up.
+  it('a CONTESTED naming an unknown finding id cannot buy a re-adjudication', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 99: CONTESTED src/a.ts:9 — not a real finding');
+    expect(exit.outcome).toBe('failed'); // FINDING 1 was never answerably contested → it stands
+    expect(reviewerStarts(h)).toBe(1); // an unknown id contested → no fresh adjudicator spawned
+  });
+
+  it('a contest that answers only SOME terminal findings still fails the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    // Two findings, one contested with a pointer, the other left unanswered.
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/a.ts:1: guard A missing\nFINDING 2 [High] src/b.ts:1: guard B missing\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // finding 2 was never contested → it stands
+    expect(reviewerStarts(h)).toBe(1); // not every finding contested → no re-review
+  });
+
+  // Criterion 7: a rebuttal the builder streams before the turn dies must survive into the ledger,
+  // so a continuation's fresh reviewer sees it as a prior adjudication rather than relitigating it.
+  it('folds a streamed contest response into the ledger even when the contest turn then fails', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    h.claude.continueOutcomes = ['failed']; // streams the rebuttal, then dies
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the terminal FAIL stands after a dead contest turn
+    expect(reviewerStarts(h)).toBe(1); // …and no re-review followed it
+    // The rebuttal survived into the persisted continuable ledger.
+    const record = h.continuable.puts.at(-1);
+    const entry = record?.ledger.find((e) => e.id === 1);
+    expect(entry?.status).toBe('contested');
+    expect(entry?.pointer).toContain('src/a.ts:9');
+  });
+
+  // RUN-179: the single matched-response join runs BEFORE the ledger fold, so a POINTERLESS contest
+  // streamed before the turn dies is persuasion with nothing to check — it is discarded, not
+  // persisted as a contested rebuttal a continuation's fresh reviewer would then have to relitigate.
+  it('does NOT persist a pointerless contest as a rebuttal, even from a crashed contest turn', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED']; // a self-assertion with no pointer
+    h.claude.continueOutcomes = ['failed']; // streams it, then dies
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    const record = h.continuable.puts.at(-1);
+    const entry = record?.ledger.find((e) => e.id === 1);
+    expect(entry).toBeDefined(); // the finding is still in the ledger…
+    expect(entry?.status).toBe('unanswered'); // …but the pointerless contest was not folded as evidence
+    expect(entry?.pointer).toBeNull();
+  });
+
+  // The PASS is the daemon's to accept, not the reviewer's to assert: a malformed report that lists
+  // a terminal finding and then signs PASS has cleared nothing (criterion 3/4). This also covers the
+  // pointer a fresh reviewer rejects — it re-raises the finding, and the daemon takes the FAIL.
+  it('a fresh PASS that still re-raises a terminal finding does NOT clear the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED x — trust me'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    // The fresh reviewer rejects the pointer — it re-raises the finding — yet signs PASS anyway.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is STILL missing\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the daemon overrode the PASS — the finding was re-raised
+    expect(exit.reason).toBe('review');
+  });
+
+  it('declines the contest when the run has nothing left to spend, and reports the FAIL as-is', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      defaultBudget: { maxTokens: 1000, maxUsd: null, maxDurationSeconds: null, maxRounds: null },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 0 }); // the builder spent nothing…
+    await onReviewTurn(h, 2);
+    // …and the terminal reviewer spends exactly the ceiling filing its finding — within its OWN
+    // session allowance (the whole 1000), but leaving the run with nothing for a contest turn.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done', { outputTokens: 1000 });
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toEqual([]); // no contest turn was handed back
+    expect(h.claude.starts).toHaveLength(2); // build + the one reviewer — nothing re-adjudicated
+  });
+
+  it('never contests an UNKNOWN terminal verdict — a non-report has nothing to answer', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // A numbered finding but no VERDICT line → 'unknown'. The finding is parseable, but an unknown
+    // is a non-report (killed / crashed / no verdict), so there is nothing to contest.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:no-verdict');
+    expect(h.claude.continuations).toEqual([]); // no contest turn
+    expect(h.claude.starts).toHaveLength(2); // build + the one reviewer
   });
 });
 
@@ -2049,6 +4198,174 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(h.worktrees.created).toHaveLength(1); // only the original
   });
 
+  // RUN-168 recorded WHERE a chain parked; RUN-169 is what lets the rest of it run. Before the
+  // first, a resume restored one session and reported the run DONE having silently skipped its
+  // plan. Between them, it finished the parked step and reported incomplete — honest, but a
+  // decomposed run that asked one question cost a re-dispatch, and decomposed runs are exactly the
+  // long ones most likely to ask.
+  it('a resumed chain runs the steps that never got to', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: task });
+    // It parked on step one, and the record says so — without that the resume has no idea a chain
+    // is in flight, let alone where it stopped.
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed step-one session
+    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const second = h.claude.starts.at(-1)!;
+    // A FRESH session for step two, with the RUN's brief — not the resume prompt, which is only
+    // the question and the answer and would leave it with no idea what repo it is in.
+    expect(second.resumeSessionId).toBeUndefined();
+    expect(second.prompt).toContain('YOU ARE DOING STEP 2 OF 2: second');
+    expect(second.prompt).toContain('ship the thing'); // the run's own brief
+    expect(second.prompt).not.toContain('Use B.'); // not the answer to step one's question
+    h.claude.complete('done');
+    expect(await resumed).toMatchObject({ outcome: 'done' });
+  });
+
+  // RUN-171. `executeChain` gives every step the earlier steps' conclusions, and that hand-off is
+  // the whole argument for a chain of fresh contexts over one long one. A resume rebuilt the array
+  // EMPTY, so a run parked on step two briefed step three with step two's post-answer output alone
+  // — step one's conclusions gone, and step three rediscovering what the run had established.
+  it('carries what the steps before the park concluded into the ones after it', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'three steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+          { id: 's3', title: 'third' },
+        ],
+      }),
+    };
+    // Step one finishes and says something; step two then parks on a question.
+    const h = harness({ anchorTask: task, parkState: { blocked: false } });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.emitText('STEP-ONE-CONCLUSION');
+    h.claude.complete('done');
+    for (let i = 0; i < 300 && h.claude.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.parkNext();
+    h.claude.complete('done'); // step two parks
+    await done;
+
+    const parked = h.parked.entries.get('run_1')!;
+    expect(parked.stepId).toBe('s2');
+    // Step ONE's summary is in the record. The parked step's own is not: it parked mid-turn, so
+    // its state is a question rather than a conclusion, and recording that would hand the next
+    // step a half-thought.
+    expect(parked.priorSteps?.map((p) => p.id)).toEqual(['s1']);
+    expect(parked.priorSteps?.[0]!.text).toContain('STEP-ONE-CONCLUSION');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed step two
+    for (let i = 0; i < 300 && h.claude.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    // Step three is briefed with step one's conclusion, not only step two's.
+    expect(h.claude.starts.at(-1)!.prompt).toContain('STEP-ONE-CONCLUSION');
+    h.claude.complete('done');
+    await resumed;
+  });
+
+  // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step
+  // that parked can be gone from the recomputed chain. Restarting from the top would redo landed
+  // work and skipping to the end would abandon it — neither is a guess worth making.
+  it('stops rather than guessing when the parked step is gone from the new plan', async () => {
+    const parkedWith: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: parkedWith });
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+    // A human rewrote the plan while it waited; the step it parked on no longer exists.
+    h.setAnchorTask({
+      ...parkedWith,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 'x1', title: 'rethought' },
+          { id: 'x2', title: 'also rethought' },
+        ],
+      }),
+    });
+    h.answerIt();
+    const exit = await h.supervisor.resume('run_1', 'Use B.');
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:parked-step-gone' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/its plan no longer declares/);
+  });
+
+  // RUN-145. A resume reaches afterDriver by its OWN path, so it was passing no spec at all: the
+  // resumed run's reviewer got an empty checklist while a first-sitting run's got the criteria.
+  // Parking, answering a question and carrying on silently disabled the gate's definition of done —
+  // and worse than "no checklist", `ACCEPTANCE 1: FAILED` followed by `VERDICT: PASS` then passed,
+  // because with no items there was nothing for the override to contradict.
+  it('carries the acceptance criteria into the resumed run’s reviewer', async () => {
+    const REVIEWED = manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+    const h = await parkFirst({
+      manifest: REVIEWED,
+      anchorTask: {
+        key: 'ACME-1',
+        title: 'reap orphans',
+        body: null,
+        executionSpec: ExecutionSpec.parse({
+          acceptance: { observableTruths: ['the daemon reaps orphans on start'] },
+        }),
+      },
+    });
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.claude.complete('done'); // the resumed build turn
+    for (let i = 0; i < 200; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(h.claude.opts!.prompt).toContain('1. [truth] the daemon reaps orphans on start');
+    h.claude.emitText('ACCEPTANCE 1: FAILED nothing reaps on start\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await resumed;
+    // The override reaches a resumed run too, which it could not when the checklist was empty.
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'review' });
+  });
+
   it('the prompt is the ANSWER, not a fresh briefing', async () => {
     const h = await parkFirst({ verifyResults: [true] });
     h.answerIt();
@@ -2081,7 +4398,9 @@ describe('resuming a parked run (RUN-30)', () => {
   it('inherits the REMAINING budget, never a fresh one', async () => {
     // Otherwise "ask a question" is a way to buy more budget, and a run could park its way past
     // any ceiling.
-    const h = await parkFirst({ defaultBudget: { maxTokens: 1000, maxUsd: 5, maxDurationSeconds: 600 } });
+    const h = await parkFirst({
+      defaultBudget: { maxTokens: 1000, maxUsd: 5, maxDurationSeconds: 600, maxRounds: null },
+    });
     h.answerIt();
     const parked = await h.parked.get('run_1');
     expect(parked!.spent.tokens).toBe(42); // what the fake driver burned
@@ -2096,7 +4415,9 @@ describe('resuming a parked run (RUN-30)', () => {
   it('does not charge the run for the time a human took to answer', async () => {
     // Wall-clock counts ACTIVE time only. Charging the wait would mean every question answered
     // after lunch returns to a run that is already dead — a slower way to lose the work.
-    const h = await parkFirst({ defaultBudget: { maxTokens: null, maxUsd: null, maxDurationSeconds: 600 } });
+    const h = await parkFirst({
+      defaultBudget: { maxTokens: null, maxUsd: null, maxDurationSeconds: 600, maxRounds: null },
+    });
     h.answerIt();
     const parked = await h.parked.get('run_1');
     expect(parked!.activeSeconds).toBeLessThan(5); // the test's own runtime, not a wall-clock age
@@ -2210,15 +4531,20 @@ describe('choosing a model + effort (RUN-33)', () => {
     manifest({
       defaults: {
         // What the task's own argument asks for: kinds differ, so a repo says so once.
-        scope: { model: 'claude-opus-4-8', effort: 'high' },
-        build: { model: 'claude-sonnet-5', effort: 'medium' },
-        verify: { model: null, effort: 'xhigh' },
+        scope: { agent: null, model: 'claude-opus-4-8', effort: 'high' },
+        build: { agent: null, model: 'claude-sonnet-5', effort: 'medium' },
+        verify: { agent: null, model: null, effort: 'xhigh' },
         ...over,
       },
     });
 
   it('the dispatch wins — a human chose, for this run', () => {
-    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: 'max' }, MODELS())).toEqual({
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: 'max' },
+        MODELS(),
+      ),
+    ).toEqual({
       model: 'claude-fable-5',
       effort: 'max',
     });
@@ -2226,11 +4552,15 @@ describe('choosing a model + effort (RUN-33)', () => {
 
   it('falls back to the repo’s default for THAT kind', () => {
     // The point of per-kind: scope is exploration and judgment, build is execution.
-    expect(resolveModel({ kind: 'scope', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'scope', model: null, effort: null }, MODELS()),
+    ).toEqual({
       model: 'claude-opus-4-8',
       effort: 'high',
     });
-    expect(resolveModel({ kind: 'build', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, MODELS()),
+    ).toEqual({
       model: 'claude-sonnet-5',
       effort: 'medium',
     });
@@ -2239,20 +4569,63 @@ describe('choosing a model + effort (RUN-33)', () => {
   it('merges per FIELD — naming only a model keeps the repo’s effort', () => {
     // Whole-object merge would mean the one field a dispatcher set silently erased the other,
     // which is the bug mergeBudget already exists to avoid.
-    expect(resolveModel({ kind: 'build', model: 'claude-fable-5', effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: null },
+        MODELS(),
+      ),
+    ).toEqual({
       model: 'claude-fable-5',
       effort: 'medium', // the repo's
+    });
+  });
+
+  it('a repo [defaults].agent COORDINATE supplies the model+effort (RUN-113)', () => {
+    const m = MODELS({ build: { agent: 'claude.opus-4_8.high', model: null, effort: null } });
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, m),
+    ).toEqual({
+      model: 'opus-4.8', // unescaped from the coordinate
+      effort: 'high',
+    });
+  });
+
+  it('the coordinate wins over the legacy model/effort pair, dispatch still overrides both', () => {
+    // agent set AND model/effort set on the same block → the coordinate is authoritative...
+    const m = MODELS({ build: { agent: 'claude.opus-4_8.high', model: 'claude-sonnet-5', effort: 'low' } });
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null }, m),
+    ).toEqual({
+      model: 'opus-4.8',
+      effort: 'high',
+    });
+    // ...but a dispatch value still beats the repo default, coordinate or not.
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: 'claude-fable-5', effort: null },
+        m,
+      ),
+    ).toEqual({
+      model: 'claude-fable-5',
+      effort: 'high', // from the coordinate, since the dispatch named no effort
     });
   });
 
   it('says NOTHING when nobody chose — the tool keeps its own default', () => {
     // The pre-RUN-33 behaviour, and it must stay reachable: absent, not null, because the
     // drivers only pass through what is present.
-    expect(resolveModel({ kind: 'build', model: null, effort: null }, manifest())).toEqual({});
+    expect(
+      resolveModel(
+        { agent: null, agentTool: 'claude', kind: 'build', model: null, effort: null },
+        manifest(),
+      ),
+    ).toEqual({});
   });
 
   it('an effort with no model is a normal thing to want', () => {
-    expect(resolveModel({ kind: 'verify', model: null, effort: null }, MODELS())).toEqual({
+    expect(
+      resolveModel({ agent: null, agentTool: 'claude', kind: 'verify', model: null, effort: null }, MODELS()),
+    ).toEqual({
       effort: 'xhigh',
     });
   });
@@ -2399,19 +4772,38 @@ describe('the run model mix (RUN-59)', () => {
       expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 540 }) });
     });
 
-    it('drops the whole mix when any spending slot could not attribute it (codex build)', () => {
+    it('folds un-attributable spend into the (unattributed) bucket, keeping the sum (RUN-86)', () => {
       const t = new RunTally();
-      t.record('primary', tel({ inputTokens: 200 })); // codex — spend, no mix
+      t.record('primary', tel({ inputTokens: 200 })); // codex build — spend, no per-model mix
       t.record('review:1', tel({ inputTokens: 20, modelUsage: { sonnet: mix({ inputTokens: 20 }) } }));
       const total = t.total();
-      expect(total.inputTokens).toBe(220); // totals still count both sessions
-      expect(total.modelUsage).toBeUndefined(); // but a partial mix would not sum — so: not reported
+      expect(total.inputTokens).toBe(220);
+      // sonnet is attributed; codex's 200 lands in the reserved bucket — together they still sum,
+      // instead of the old behaviour that discarded sonnet's real breakdown too.
+      expect(total.modelUsage).toEqual({
+        sonnet: mix({ inputTokens: 20 }),
+        [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }),
+      });
+      const summed = Object.values(total.modelUsage ?? {}).reduce((a, u) => a + u.inputTokens, 0);
+      expect(summed).toBe(total.inputTokens);
     });
 
-    it('a zero-spend slot with no mix does not block the aggregate', () => {
+    it('an all-codex run reports only the (unattributed) bucket, still summing (RUN-86)', () => {
+      const t = new RunTally();
+      t.record('primary', tel({ inputTokens: 150 })); // codex: tokens, no mix, no cost
+      expect(t.total().modelUsage).toEqual({ [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 150 }) });
+    });
+
+    it('a spend-less run reports no mix — the only "not reported" case left (RUN-86)', () => {
+      const t = new RunTally();
+      t.record('primary', tel()); // phase-only tick: no spend, no mix
+      expect(t.total().modelUsage).toBeUndefined();
+    });
+
+    it('a zero-spend slot with no mix does not manufacture an empty bucket', () => {
       const t = new RunTally();
       t.record('primary', tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100 }) } }));
-      t.record('conflict', tel()); // spent nothing, reported no mix — must not veto
+      t.record('conflict', tel()); // spent nothing, reported no mix — must not add an unattributed key
       expect(t.total().modelUsage).toEqual({ opus: mix({ inputTokens: 100 }) });
     });
 
@@ -2437,12 +4829,23 @@ describe('the run model mix (RUN-59)', () => {
       expect(opus?.costUSD).toBeCloseTo(0.3);
     });
 
-    it('a pre-RUN-59 park (spend, no mix) yields NO breakdown rather than one that does not add up', () => {
+    it('a pre-RUN-59 park (spend, no mix) lands in the (unattributed) bucket, still summing (RUN-86)', () => {
       const t = new RunTally();
-      t.seed('__prior__', telemetryFromSpent({ tokens: 42, usd: 0.2 })); // no modelUsage
+      t.seed('__prior__', telemetryFromSpent({ tokens: 42, usd: 0.2 })); // no modelUsage → unattributed
       t.record('primary', tel({ outputTokens: 8, modelUsage: { opus: mix({ outputTokens: 8 }) } }));
-      expect(t.total().inputTokens + t.total().outputTokens).toBe(50);
-      expect(t.total().modelUsage).toBeUndefined();
+      const total = t.total();
+      expect(total.inputTokens + total.outputTokens).toBe(50);
+      expect(total.modelUsage).toEqual({
+        opus: mix({ outputTokens: 8 }),
+        // telemetryFromSpent puts prior tokens in inputTokens and usd in costUSD.
+        [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 42, costUSD: 0.2 }),
+      });
+    });
+
+    it('the reserved bucket key is exactly the wire literal the dashboard renders (RUN-86/87)', () => {
+      // Imported straight from the vendored @noriq-dev/shared now (RUN-87 refreshed it); this pins
+      // the byte-identical value the runner emits and the dashboard keys on.
+      expect(UNATTRIBUTED_MODEL_ID).toBe('(unattributed)');
     });
   });
 
@@ -2454,7 +4857,8 @@ describe('the run model mix (RUN-59)', () => {
         cmd: 'npm test',
         timeoutSeconds: null,
         shell: null,
-        agent: { tool: null, model: null, effort: null, maxRounds: 2 },
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
       },
     });
     const h = harness({ manifest: reviewed });
@@ -2491,14 +4895,15 @@ describe('the run model mix (RUN-59)', () => {
     expect(exit.telemetry.modelUsage).toEqual(runMix);
   });
 
-  it('a codex build + a claude reviewer reports NO mix — never a partial one', async () => {
+  it('a codex build + a claude reviewer reports the claude mix + an (unattributed) bucket (RUN-86)', async () => {
     const reviewed = manifest({
       tool: 'codex',
       verify: {
         cmd: 'npm test',
         timeoutSeconds: null,
         shell: null,
-        agent: { tool: 'claude', model: null, effort: null, maxRounds: 2 },
+        maxRounds: 2,
+        agent: { agent: null, tool: 'claude', model: null, effort: null, maxRounds: 2 },
       },
     });
     const h = harness({ manifest: reviewed });
@@ -2519,7 +4924,12 @@ describe('the run model mix (RUN-59)', () => {
     expect(exit.outcome).toBe('done');
     const terminal = h.reports.filter((r) => r.status === 'done').at(-1);
     expect(terminal?.telemetry?.inputTokens).toBe(220); // totals count both
-    expect(terminal?.telemetry?.modelUsage).toBeUndefined(); // but the mix is not reported
+    // The claude reviewer's real breakdown survives; codex's un-attributable 200 lands in the
+    // reserved bucket, so the mix still sums to the total (RUN-86) instead of being dropped whole.
+    expect(terminal?.telemetry?.modelUsage).toEqual({
+      'claude-sonnet-4-5': mix({ inputTokens: 20 }),
+      [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }),
+    });
   });
 
   it('persists the run mix into the park and re-seeds it on resume, still summing', async () => {
@@ -2558,4 +4968,258 @@ describe('the run model mix (RUN-59)', () => {
     );
     expect(summed).toBe(total.inputTokens + total.outputTokens);
   });
+});
+
+// RUN-131. The extraction moved the optional deps onto a stage host, and a bare function copied
+// across changes what `this` is when it runs: `this.deps.checkClaimable(id)` calls with `deps` as
+// the receiver, `host.checkClaimable(id)` calls with the HOST. A dep written as a method — which
+// the declared type allows — would start throwing, and the claimability probe swallows a throw as
+// a transient failure and fails OPEN. That is the phase gate silently ceasing to exist.
+describe('an optional dep keeps its own receiver (RUN-131)', () => {
+  it('a method-style checkClaimable still declines the spawn', async () => {
+    const worktrees = new FakeWorktrees();
+    const claude = new FakeDriver('claude');
+    const reports: Array<{ runId: string } & RunReport> = [];
+    // `drivers` is deliberately the member it reads: the deps object has one and the stage host
+    // does not, so a lost receiver is a TypeError rather than a silent coincidence.
+    const deps = {
+      drivers: { claude },
+      vcs: worktrees,
+      resolveRepo: () => ({ root: '/repos/repo_a', manifest: manifest() }),
+      report: (runId: string, r: RunReport) => reports.push({ runId, ...r }),
+      createRunAgent: async () => testAgent(),
+      server: 'https://noriq.example',
+      pathProbe: async () => 'missing' as const,
+      readDoc: async () => '',
+      async checkClaimable(_taskId: string) {
+        const tools = Object.keys(this.drivers).join(',');
+        return { claimable: false, reason: `no phase for ${tools}` };
+      },
+    };
+    const supervisor = new RunSupervisor(deps);
+    const exit = await supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/not claimable yet.*no phase for claude/s);
+    // And it really did decline BEFORE the lease — a fail-open would have leased and spawned.
+    expect(worktrees.created).toEqual([]);
+  });
+});
+
+// RUN-132. `effectiveKind` is the daemon's authoritative answer to "what posture is this", and its
+// result indexes fixed-key records everywhere downstream — `manifest.permissions[kind]`,
+// `manifest.defaults[kind]`, `noriqToolNamesFor(kind)`. A kind outside the union yields `undefined`
+// from every one of them, and the write clamp then throws on the permission it was handed. A WS
+// dispatch is schema-validated; a PARKED run is rehydrated from JSON on disk without revalidation,
+// which is the path that makes this reachable rather than theoretical.
+describe('effectiveKind never answers with a kind that is not one (RUN-132)', () => {
+  const M = { workflows: {} } as never;
+
+  it('passes a real kind through', () => {
+    expect(effectiveKind({ kind: 'build', workflow: null }, M)).toBe('build');
+    expect(effectiveKind({ kind: 'verify', workflow: null }, M)).toBe('verify');
+  });
+
+  it('degrades an unrecognised kind to scope — the narrowest posture, not the nearest', () => {
+    expect(effectiveKind({ kind: 'deploy' as never, workflow: null }, M)).toBe('scope');
+  });
+
+  // The membership test has to be `Object.hasOwn`: `'toString' in BUILTIN_WORKFLOWS` is true, so an
+  // `in` check waves through exactly the keys the guard exists to catch.
+  it('does not mistake a prototype property for a kind', () => {
+    for (const k of ['toString', 'constructor', '__proto__', 'valueOf']) {
+      expect(effectiveKind({ kind: k as never, workflow: null }, M)).toBe('scope');
+    }
+  });
+
+  it('a custom workflow still decides the posture, and it is still a real kind', () => {
+    const withDocs = { workflows: { docs: { base: 'scope', prompt: null } } } as never;
+    // The dispatched kind says build; the workflow's base says scope, and the daemon holds the
+    // manifest — so a client selecting a read-only workflow cannot leave `kind = build` and write.
+    expect(effectiveKind({ kind: 'build', workflow: 'docs' }, withDocs)).toBe('scope');
+  });
+});
+
+// RUN-133. The ticket's own acceptance: "a run with builder + reviewer + conflict sessions cannot
+// collectively exceed its dispatched budget, proven by a test." Before this, each `startAgent` was
+// handed a fresh copy of the ceiling and `superviseBudget` watched only that session's telemetry —
+// so a build with a reviewer and a conflict turn could spend the dispatched budget three times and
+// no single check would ever fire.
+describe('one ceiling across the whole run (RUN-133)', () => {
+  const CEILING = (over: Partial<RunBudget> = {}): RunBudget => ({
+    maxTokens: 1000,
+    maxUsd: null,
+    maxDurationSeconds: null,
+    maxRounds: null,
+    ...over,
+  });
+  const REVIEWED = () =>
+    manifest({
+      verify: {
+        cmd: 'npm test',
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 2,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds: 2 },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>) => {
+    for (let i = 0; i < 100; i++) {
+      if (h.claude.opts?.runId === 'run_1:review') return true;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    return false;
+  };
+
+  it('the builder gets the whole ceiling — it is the first session to spend', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts[0]?.budget?.maxTokens).toBe(1000);
+    h.claude.complete('done', { outputTokens: 100 });
+    await onReviewTurn(h);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The property that was missing: the reviewer's ceiling is the REMAINDER, so builder + reviewer
+  // sum to the dispatched budget instead of each getting all of it.
+  it('the reviewer gets what is LEFT, not another copy of the ceiling', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 900 }); // the builder burned 900 of 1000
+    expect(await onReviewTurn(h)).toBe(true);
+    const review = h.claude.starts[1]!;
+    expect(review.runId).toBe('run_1:review');
+    expect(review.budget?.maxTokens).toBe(100); // 1000 − 900, not 1000
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // A gate that could not run is not a gate that passed — the same posture as a reviewer that
+  // crashed. And nothing is spawned merely to be SIGTERMed a moment later.
+  it('a builder that spends the whole ceiling leaves no reviewer to spawn — and gates the run', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 1000 }); // exactly the ceiling
+    const exit = await done;
+    expect(h.claude.starts).toHaveLength(1); // the reviewer never started
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:no-verdict');
+    // The findings say WHY, so the comment a human reads is not "the reviewer found problems".
+    expect(h.comments.some((c) => /could not run.*token ceiling/s.test(c.body))).toBe(true);
+  });
+
+  // A dispatch with no ceiling on any dimension is unbounded, and subtracting from `null` must
+  // leave `null` rather than inventing a limit — otherwise the allocator would quietly start
+  // capping runs nobody capped.
+  it('an unbounded run still spawns everything, however much the builder spent', async () => {
+    const h = harness({ manifest: REVIEWED() }); // no defaultBudget, run.budget all null
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 10_000_000 });
+    expect(await onReviewTurn(h)).toBe(true);
+    expect(h.claude.starts[1]?.budget).toEqual({
+      maxTokens: null,
+      maxUsd: null,
+      maxDurationSeconds: null,
+      maxRounds: null,
+    });
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The hole an adversarial review found in the first pass at this task, and the one that defeats
+  // its own acceptance: the builder's session is kept OPEN across the reviewer's spend (RUN-29), so
+  // its reservation is stale by the time it is handed work back. Checking its own cumulative
+  // against that stale number lets the RUN exceed its ceiling while no single session breaches.
+  it('a builder handed work back after the reviewer spent is held to the RUN, not its own snapshot', async () => {
+    const h = harness({ manifest: REVIEWED(), defaultBudget: CEILING() });
+    h.claude.continueTokens = [100]; // the fix turn takes the builder's cumulative to exactly 1000
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 900 }); // builder: 900, inside its own 1000 allowance
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: FAIL\nFINDING 1 [High] src/a.ts:1: fix this');
+    h.claude.complete('done', { outputTokens: 50 }); // reviewer: 50 → the run is now at 950
+    await flush();
+    await flush();
+
+    // The builder's OWN cumulative after the fix turn is 900 + 100 = 1000, which is not `> 1000` —
+    // its per-session check is satisfied and always would have been, because its allowance was
+    // computed before the reviewer existed. The RUN is at 1050. Only a guard that can see every
+    // session catches this, which is why the reservation alone was not enough.
+    // Not `stopped` — settle stops every session. This flag is only set when the stop landed
+    // DURING the fix turn, which is the run-level guard and nothing else.
+    expect(h.claude.stoppedDuringFix).toBe(true);
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    // Nowhere near the 3× a per-session ceiling permitted: builder + reviewer + one fix turn, all
+    // out of one budget.
+    expect(totalTokens(exit.telemetry)).toBeLessThan(1100);
+  });
+
+  // The same session, but the spend fits — the guard must not fire on a run that is within budget.
+  it('…and left alone when the hand-back fits inside what is left', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      defaultBudget: CEILING(),
+      verifyResults: [false, true],
+    });
+    h.claude.continueTokens = [100];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 700 });
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+  });
+
+  // The third session, and the one most likely to find the ceiling gone. Unresolved is the honest
+  // answer: the caller aborts the rebase and the diff waits on its branch, exactly as it would for
+  // a conflict the agent could not fix.
+  it('a conflict turn with nothing left leaves the rebase unresolved rather than spawning', async () => {
+    const withLand = REVIEWED();
+    withLand.land = {
+      branch: 'main',
+      strategy: 'rebase',
+      autoPush: false,
+      allowedBranches: [],
+      resolveConflicts: true,
+    } as never;
+    const h = harness({ manifest: withLand, defaultBudget: CEILING(), conflicts: ['src/a.ts'] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 400 });
+    expect(await onReviewTurn(h)).toBe(true);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done', { outputTokens: 600 }); // reviewer takes the rest: 400 + 600 = 1000
+    const exit = await done;
+    // No conflict session was ever started — only the builder and the reviewer.
+    expect(h.claude.starts.map((s) => s.runId)).toEqual(['run_1', 'run_1:review']);
+    expect(exit.reason).toBe('land:conflict');
+  });
+});
+
+// RUN-165. The bug, at the level it actually bit: a cancel during a non-fatal pre-execution stage
+// stopped that actor and the pipeline read the dead session as "produced nothing", then built.
+describe('a cancelled run does not go on to build (RUN-165)', () => {
+  it('refuses to spawn the agent when the run was already cancelled', async () => {
+    const h = harness({ cancelled: ['run_1'] });
+    const exit = await h.supervisor.supervise(makeRun({ kind: 'build' }));
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'cancelled' });
+    expect(h.claude.starts).toHaveLength(0);
+  });
+
+  // The control is the rest of this file: every other test here wires no cancellation and reaches
+  // its agent, so a guard that stopped everything could not have got this far.
 });

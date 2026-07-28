@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
 import type { ModelUsage } from './drivers/types';
 import { renderPrompt } from './prompts';
+import type { StepSummary } from './stages/chain';
 import type { Workspace } from './vcs/types';
 
 /**
@@ -76,6 +77,31 @@ export interface ParkedRun {
   parkedAt: string;
   /** The question the agent asked, for the log and for the resume turn. */
   question: string | null;
+  /**
+   * Which STEP of a decomposed run was speaking when it parked (RUN-168), or null/absent for an
+   * undecomposed run and every park written before this existed.
+   *
+   * Without it a resume restores one session, runs it, and stops — so a chain that parked on step
+   * two of five would come back, finish step two, and report the run DONE having silently skipped
+   * the rest of its plan. That is a correctness bug rather than a missing feature, which is why it
+   * is not deferrable to whenever chains grow their next capability.
+   */
+  stepId?: string | null;
+  /**
+   * What the steps BEFORE the parked one concluded (RUN-171) — the hand-off a resumed chain would
+   * otherwise start without.
+   *
+   * `executeChain` gives every step the earlier steps' summaries, and that is the whole argument
+   * for a chain of fresh contexts over one long one: each link starts clean but not ignorant. A
+   * resume rebuilt that array empty, so a five-step run parked on step two came back and briefed
+   * step three with step two's post-answer output alone — step one's conclusions gone, and step
+   * three rediscovering what two steps had already established.
+   *
+   * Strictly the steps before it. The parked step's own summary is captured when it FINISHES,
+   * after the resume, exactly as it would have been — its state at park time is a question, not a
+   * conclusion, and recording that as a finding would hand the next step a half-thought.
+   */
+  priorSteps?: StepSummary[];
 }
 
 type ParkedFile = { parked: ParkedRun[] };
@@ -172,5 +198,16 @@ export const expiredParks = (
   });
 
 /** The turn handed to a resumed agent. It has its own context; this is the answer, not a briefing. */
-export const resumePrompt = (question: string | null, answer: string): string =>
-  renderPrompt('resume', { question, answer });
+/**
+ * What the resumed session is handed. The answer IS the prompt — the session already holds the
+ * brief, the task and the repo tour, and re-sending them would waste the context and confuse a
+ * conversation that is mid-thought.
+ *
+ * `changed` is the exception (RUN-164): a park can last up to 72 hours, and a human answering the
+ * question may well have corrected the task's execution spec at the same time — the dashboard
+ * exists so they can (RUN-137). Sending nothing when nothing moved keeps the resume as cheap as it
+ * was; sending the DIFFERENCE when it did is the only way the session learns its own contract
+ * changed under it.
+ */
+export const resumePrompt = (question: string | null, answer: string, changed = ''): string =>
+  renderPrompt('resume', { question, answer, changed });

@@ -1,5 +1,31 @@
 import { describe, expect, it } from 'vitest';
+import type { LockDelegate } from '../src/vcs/git';
 import { type P4Cli, PerforceBackend } from '../src/vcs/perforce';
+
+/** A fake Noriq lock view (the authoritative coordination layer) that records calls and returns
+ *  a configurable acquire result. */
+function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
+  const calls: Array<{ method: string; token: string; args: unknown }> = [];
+  const locks: LockDelegate = {
+    acquire: async (token, input) => {
+      calls.push({ method: 'acquire', token, args: input });
+      return acquireResult as never;
+    },
+    release: async (token, projectId, sel) => {
+      calls.push({ method: 'release', token, args: { projectId, sel } });
+      return { released: [] };
+    },
+    check: async (token, input) => {
+      calls.push({ method: 'check', token, args: input });
+      return { enabled: true, conflicts: [], mine: [] };
+    },
+    releaseAllMine: async (token, projectId) => {
+      calls.push({ method: 'releaseAllMine', token, args: { projectId } });
+      return { released: [] };
+    },
+  };
+  return { locks, calls };
+}
 
 // Orchestration tests over an injected p4 — the fake answers with the MEASURED outputs from
 // RUN-55's real p4d session (VCS-SPIKE.md §10): the submit out-of-date refusal text, the
@@ -22,6 +48,8 @@ function fakes(over: {
   submitRefuses?: string;
   /** changes -l output (for the reaper / fromRunId lookup). */
   changesLong?: string;
+  /** The Noriq lock view to inject (RUN-99). */
+  locks?: LockDelegate;
 }) {
   const calls: Call[] = [];
   const writes: Array<{ path: string; content: string }> = [];
@@ -70,6 +98,7 @@ function fakes(over: {
         stderr: '',
       };
     }
+    if (args[0] === 'lock' || args[0] === 'unlock') return { stdout: '', stderr: '' };
     if (args[0] === 'print') return { stdout: 'printed depot rev\n', stderr: '' };
     if (args[0] === 'merge3')
       return {
@@ -91,6 +120,7 @@ function fakes(over: {
     writeFileFn: async (path, content) => {
       writes.push({ path, content });
     },
+    locks: over.locks,
   });
   return { backend, calls, writes };
 }
@@ -110,6 +140,21 @@ describe('PerforceBackend — lease/dispose', () => {
     expect(calls.find((c) => c.what === 'p4 change -i')?.stdin).toContain('noriq run run_1');
     // Writable lease flipped the client to allwrite (agents write; they don't p4 edit).
     expect(calls.find((c) => c.what === 'p4 client -i')?.stdin).toContain('allwrite');
+  });
+
+  it('continue a failed run: unshelves the prior attempt’s changelist into this sitting (RUN-93)', async () => {
+    // A kept prior attempt at run_1 was shelved at dispose; its changelist still names the run.
+    const { backend, calls } = fakes({
+      changesLong: 'Change 30 on 2026/07/16 by noriq@ws1 *pending*\n\n\tnoriq run run_1\n\n',
+    });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(ws.location).toEqual({ client: 'ws1', change: '42' }); // this sitting's fresh changelist
+    // The prior work is unshelved straight INTO changelist 42 (not the default, where reconcile -c
+    // would skip it), then the stale shelf + changelist are dropped so they can't re-match.
+    expect(calls.some((c) => c.what === 'p4 unshelve -s 30 -c 42')).toBe(true);
+    expect(calls.some((c) => c.what === 'p4 shelve -d -c 30')).toBe(true);
+    expect(calls.some((c) => c.what === 'p4 change -d 30')).toBe(true);
+    await backend.dispose(ws);
   });
 
   it('a read-only lease keeps noallwrite — the OS enforces the scope floor for free', async () => {
@@ -255,12 +300,155 @@ describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)',
     expect(kept[0]).toContain('shelved server-side');
   });
 
+  // RUN-153. Once this runs on a TIMER rather than only at startup, an owned changelist is one an
+  // agent is writing into right now — and this reaper's cleanup is `shelve` then `revert`, which
+  // would undo the working tree out from under it.
+  it('leaves a changelist the daemon still owns alone — the sweep now runs mid-flight', async () => {
+    const { backend, calls } = fakes({
+      changesLong: 'Change 42 on 2026/07/16 by noriq@ws1 *pending*\n\n\tnoriq run run_live\n\n',
+      opened: '//depot/a.txt#1 - edit change 42\n',
+    });
+    expect(await backend.reapOrphans('/ws1', { isOwned: (id) => id === 'run_live' })).toBe(0);
+    expect(calls.some((c) => c.what.startsWith('p4 shelve'))).toBe(false);
+    expect(calls.some((c) => c.what.startsWith('p4 revert'))).toBe(false);
+  });
+
   it('ignores pending changelists that are not noriq runs — a human’s work is not ours to touch', async () => {
     const { backend, calls } = fakes({
       changesLong: 'Change 9 on 2026/07/16 by montana@ws1 *pending*\n\n\thand-written WIP\n\n',
     });
     expect(await backend.reapOrphans('/ws1')).toBe(0);
     expect(calls.some((c) => c.what.startsWith('p4 shelve'))).toBe(false);
+  });
+});
+
+// RUN-152. The caller disposes a workspace on `false`, so "p4 could not be reached" must never
+// wear the same answer as "the changelist is empty". Awkward rather than free here, because p4
+// signals emptiness by exiting NONZERO — the fix is to absorb exactly those two messages.
+describe('PerforceBackend — hasWork tells "nothing here" from "could not ask"', () => {
+  /** A p4 that answers `info`, then fails `opened` and `reconcile` with their OWN messages — they
+   *  are different sentences, and feeding one to both would leave the second probe unpinned. */
+  const failing = (over: { opened?: string; reconcile?: string }) => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      const text = args[0] === 'opened' ? over.opened : over.reconcile;
+      if (!text) return { stdout: '', stderr: '' }; // succeeds, empty — not the case under test
+      throw new Error(`p4 ${args[0]} exited 1: ${text}`);
+    };
+    return new PerforceBackend({ p4 });
+  };
+  const EMPTY_OPENED = 'File(s) not opened on this client.';
+  const EMPTY_RECONCILE = '/ws1/... - no file(s) to reconcile.';
+  const ws = {
+    runId: 'run_1',
+    localPath: '/ws1',
+    readOnly: false,
+    baseId: '7',
+    workRef: 'change 42 in client ws1',
+    location: { client: 'ws1', change: '42' },
+  };
+
+  it("reads p4's own emptiness messages as an answer: no work", async () => {
+    const backend = failing({ opened: EMPTY_OPENED, reconcile: EMPTY_RECONCILE });
+    expect(await backend.hasWork(ws)).toBe(false);
+  });
+
+  it('rejects when p4 could not be asked at all', async () => {
+    const backend = failing({ opened: 'Connect to server failed; check $P4PORT.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/Connect to server failed/);
+  });
+
+  it('rejects on an auth expiry rather than reporting the workspace empty', async () => {
+    const backend = failing({ opened: 'Your session has expired, please login again.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/session has expired/);
+  });
+
+  // The SECOND probe is the one a single-message fake would leave untested: `opened` says nothing
+  // is open (true of an allwrite workspace that has never been reconciled) and the reconcile
+  // preview is then the only thing that can see the edits.
+  it('rejects when the reconcile preview fails, even though nothing was opened', async () => {
+    const backend = failing({ opened: EMPTY_OPENED, reconcile: 'Connect to server failed; check $P4PORT.' });
+    await expect(backend.hasWork(ws)).rejects.toThrow(/Connect to server failed/);
+  });
+});
+
+// RUN-157. Both of these acted on a swallowed probe: dispose DELETED a changelist it could not
+// read, and checkpoint reported "nothing to save" for a p4 it could not reach. The second is the
+// quieter one — the supervisor ignores checkpoint's boolean, so the run continued to its gates with
+// no durable copy and nothing anywhere saying so.
+describe('PerforceBackend — dispose and checkpoint stop acting on a swallowed probe', () => {
+  const ws = {
+    runId: 'run_1',
+    localPath: '/ws1',
+    readOnly: false,
+    baseId: '7',
+    workRef: 'change 42 in client ws1',
+    location: { client: 'ws1', change: '42' },
+  };
+  /** A p4 that answers `info`, fails the named command with `text`, and succeeds at everything else. */
+  const failing = (cmd: string, text: string) => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === cmd) throw new Error(`p4 ${cmd} exited 1: ${text}`);
+      return { stdout: '', stderr: '' };
+    };
+    return { backend: new PerforceBackend({ p4 }), calls };
+  };
+
+  it('dispose PRESERVES a changelist it could not read, rather than deleting it', async () => {
+    // An allwrite workspace's edits are invisible to p4 until a reconcile, so "could not ask"
+    // cannot be read as "there is nothing in here" — that work has never been shelved.
+    const { backend, calls } = failing('opened', 'Connect to server failed; check $P4PORT.');
+    await backend.dispose(ws);
+    expect(calls.some((c) => c.startsWith('change -d'))).toBe(false); // never the destructive branch
+    // RECONCILE first, and this is the whole point rather than a detail: `shelve` captures only
+    // files already OPEN in the changelist, and on allwrite an agent's edits are not open until
+    // something gathers them. A shelve without it preserves an empty changelist and calls it done.
+    const order = calls.map((c) => c.split(' ')[0]);
+    expect(order.indexOf('reconcile')).toBeGreaterThan(-1);
+    expect(order.indexOf('reconcile')).toBeLessThan(order.indexOf('shelve'));
+    expect(order.indexOf('shelve')).toBeLessThan(order.indexOf('revert'));
+  });
+
+  // Reverting after a shelf that did not land destroys the only copy to tidy a workspace.
+  it('does NOT revert when the shelf failed — the local copy is all there is', async () => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'opened') return { stdout: '//depot/a.txt#1 - edit change 42\n', stderr: '' };
+      if (args[0] === 'shelve') throw new Error('p4 shelve exited 1: Connect to server failed.');
+      return { stdout: '', stderr: '' };
+    };
+    await new PerforceBackend({ p4 }).dispose(ws);
+    expect(calls.some((c) => c.startsWith('shelve'))).toBe(true); // it tried…
+    expect(calls.some((c) => c.startsWith('revert'))).toBe(false); // …and stopped when it failed
+  });
+
+  it('dispose still deletes an empty changelist when p4 SAYS it is empty', async () => {
+    const { backend, calls } = failing('opened', 'File(s) not opened on this client.');
+    await backend.dispose(ws);
+    expect(calls.some((c) => c.startsWith('change -d'))).toBe(true);
+    expect(calls.some((c) => c.startsWith('shelve'))).toBe(false);
+  });
+
+  it('checkpoint rejects when p4 could not be reached, instead of reporting nothing to save', async () => {
+    const { backend } = failing('reconcile', 'Connect to server failed; check $P4PORT.');
+    await expect(backend.checkpoint(ws, 'msg')).rejects.toThrow(/Connect to server failed/);
+  });
+
+  // The SECOND probe, which a single-failure fake leaves untested: reconcile can succeed (it
+  // gathered something) while `opened` is the call that cannot reach the server.
+  it('checkpoint rejects when the second probe is the one that fails', async () => {
+    const { backend } = failing('opened', 'Your session has expired, please login again.');
+    await expect(backend.checkpoint(ws, 'msg')).rejects.toThrow(/session has expired/);
+  });
+
+  it('checkpoint still returns false when there was genuinely nothing to gather', async () => {
+    const { backend } = failing('reconcile', '/ws1/... - no file(s) to reconcile.');
+    expect(await backend.checkpoint(ws, 'msg')).toBe(false);
   });
 });
 
@@ -276,5 +464,64 @@ describe('PerforceBackend — location guard', () => {
       location: { repoId: 'dv.repo.x', branch: 'b', baseBranch: 'main' }, // Diversion-shaped
     };
     await expect(backend.publish(alien, 'x')).rejects.toThrow(/Perforce location/);
+  });
+});
+
+describe('PerforceBackend — locking (RUN-99): Noriq view authoritative, p4 lock as the native floor', () => {
+  const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
+
+  it('acquires the Noriq view AND lays a native p4 lock on the run’s changelist', async () => {
+    const { locks, calls: lockCalls } = fakeLocks({
+      ok: true,
+      enabled: true,
+      locks: [{ id: 'lk', path: 'a.txt' }],
+    });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    const out = await backend.lock(ws, ['a.txt'], ctx);
+
+    expect(out).toEqual({ ok: true, enabled: true, locks: [{ id: 'lk', path: 'a.txt' }] });
+    // Noriq is the coordination truth, held as the RUN token…
+    expect(lockCalls[0]).toMatchObject({ method: 'acquire', token: 'run-token' });
+    // …and the native p4 lock names the run's changelist (42) as the enforcement floor.
+    expect(calls.some((c) => c.what === 'p4 lock -c 42 a.txt')).toBe(true);
+  });
+
+  it('a Noriq conflict is all-or-nothing — no native p4 lock is attempted', async () => {
+    const { locks } = fakeLocks({ ok: false, conflicts: [{ path: 'a.txt', holder: 'agt_other' }] });
+    const { backend, calls } = fakes({ locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    const out = await backend.lock(ws, ['a.txt'], ctx);
+    expect(out).toEqual({ ok: false, conflicts: [{ path: 'a.txt', holder: 'agt_other' }] });
+    expect(calls.some((c) => c.what.startsWith('p4 lock'))).toBe(false);
+  });
+
+  it('a failing native p4 lock never fails the grant (best-effort floor)', async () => {
+    const { locks } = fakeLocks({ ok: true, enabled: true, locks: [] });
+    // p4 that throws on `lock` — the grant must still stand.
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o') return { stdout: 'Options: allwrite\n', stderr: '' };
+      if (args[0] === 'sync') return { stdout: '', stderr: '' };
+      if (args.includes('changes') && args.includes('-m1')) return { stdout: '7\n', stderr: '' };
+      if (args.includes('changes')) return { stdout: '', stderr: '' };
+      if (args.includes('change') && args.includes('-o'))
+        return { stdout: 'Change: new\nDescription:\n\tnoriq run run_1\n', stderr: '' };
+      if (args[0] === 'change' && args[1] === '-i') return { stdout: 'Change 42 created.\n', stderr: '' };
+      if (args[0] === 'opened') return { stdout: '', stderr: '' };
+      if (args[0] === 'lock') throw new Error('file(s) not opened on this client');
+      return { stdout: '', stderr: '' };
+    };
+    const backend = new PerforceBackend({ p4, locks });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(await backend.lock(ws, ['a.txt'], ctx)).toEqual({ ok: true, enabled: true, locks: [] });
+  });
+
+  it('with no lock view wired, locking reports disabled and touches no p4', async () => {
+    const { backend, calls } = fakes({});
+    const ws = await backend.lease('/ws1', 'run_1');
+    const before = calls.length;
+    expect(await backend.lock(ws, ['a.txt'], ctx)).toEqual({ ok: true, enabled: false, locks: [] });
+    expect(calls.slice(before).some((c) => c.what.startsWith('p4 lock'))).toBe(false);
   });
 });

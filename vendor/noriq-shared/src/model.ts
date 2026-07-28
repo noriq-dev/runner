@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ExecutionSpec } from './execution-spec';
 
 // ---------------------------------------------------------------------------
 // Core entities (ROADMAP §4). These schemas are the single source of truth:
@@ -13,8 +14,28 @@ export const TaskStatus = z.enum([
   'review',
   'done',
   'cancelled',
+  // A gate-failed task (0049). A WIRE-only status DERIVED from tasks.failed_at — the DB column
+  // stays within its CHECK (D1 cannot rebuild tasks to widen it; see 0049) — exactly as
+  // RunnerStatus carries 'offboarded', derived from offboarded_at.
+  'failed',
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
+
+/**
+ * Is this task finished with — nothing further will happen to it? `done` and `cancelled`
+ * are both terminal: one succeeded, one was abandoned, and NEITHER is still owed work.
+ *
+ * This exists because "finished" was re-derived at every call site and the copies drifted
+ * (PLNR-229): the server's phase-order gate and the dispatch pump correctly read
+ * `NOT IN ('done','cancelled')`, while the Plans view asked `!== 'done'` — so one cancelled
+ * task pinned a plan to that phase forever, showing as unfinished work that could never be
+ * finished. A gate and a progress bar disagreeing about what "settled" means is exactly the
+ * bug, so the predicate lives once, beside the status it reads.
+ *
+ * NB `failed` is deliberately NOT settled: a gate-failed task is re-armable and still owed.
+ */
+export const isSettledTaskStatus = (status: string | null | undefined): boolean =>
+  status === 'done' || status === 'cancelled';
 
 export const AgentRole = z.enum(['orchestrator', 'worker']);
 export type AgentRole = z.infer<typeof AgentRole>;
@@ -98,6 +119,25 @@ export const Task = z.object({
   claimExpiresAt: z.string().datetime().nullable(),
   openComments: z.number().int().nonnegative().default(0),
   order: z.number().int(),
+  /**
+   * What a builder is told before it is allowed to spend anything (RUN-134/135).
+   *
+   * Optional as well as nullable, because the two admit different things. NULL is a fact about
+   * the task — nobody wrote a spec. ABSENT is a fact about the READ: only the detail surfaces
+   * (`get_task`, `GET /api/tasks/:id`) carry a spec, because a board snapshot ships every task in
+   * a project and renders none of this, and paying the whole feature's payload on every poll to
+   * draw a column of titles would be a poor trade.
+   */
+  executionSpec: ExecutionSpec.nullable().default(null).optional(),
+  /**
+   * The stored spec could not be read (RUN-135) — corrupt JSON, or a shape this schema no longer
+   * accepts. Absent on every healthy task.
+   *
+   * It exists so `executionSpec: null` can be trusted. Anything that PLANS reads a null spec as
+   * "nobody planned this" and writes one, so a corrupt value quietly reported as null would be
+   * overwritten by the next planner run; this is the flag that says "do not conclude that".
+   */
+  executionSpecUnreadable: z.boolean().optional(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });

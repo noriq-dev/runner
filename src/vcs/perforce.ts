@@ -2,7 +2,16 @@ import { spawn } from 'node:child_process';
 import { rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { IntegrateResult, LeaseOptions, PublishResult, VcsBackend, Workspace } from './types';
+import type { LockDelegate } from './git';
+import type {
+  IntegrateResult,
+  LeaseOptions,
+  LockContext,
+  LockOutcome,
+  PublishResult,
+  VcsBackend,
+  Workspace,
+} from './types';
 
 /**
  * Perforce, as a VcsBackend (RUN-52).
@@ -53,6 +62,18 @@ export type P4Cli = (
   stdin?: string,
 ) => Promise<{ stdout: string; stderr: string }>;
 
+/**
+ * p4 reports emptiness with a NONZERO exit and one of these messages — an ANSWER, not a failure.
+ * Kept narrow on purpose: everything outside it must stay an error (RUN-152).
+ *
+ * Unlike the submit/resolve strings elsewhere in this file, these two are from p4's documented
+ * behaviour, NOT from the measured RUN-55 acceptance session (VCS-SPIKE.md records nothing about
+ * an empty `opened` or `reconcile -n`). Re-check them against a live server before this backend
+ * ships: an emptiness message this regex does not recognise fails CLOSED — the run is treated as
+ * holding work, which costs a wasted verify rather than a deleted diff, but it is still wrong.
+ */
+const P4_NOTHING_HERE = /not opened on this client|no file\(s\) to reconcile/i;
+
 export const realP4Cli: P4Cli = (args, cwd, stdin) =>
   new Promise((resolve, reject) => {
     // PWD must MATCH cwd, and this is measured, not defensive: p4 trusts the PWD env var over
@@ -101,6 +122,11 @@ export interface PerforceBackendOpts {
   p4?: P4Cli;
   /** Injectable for tests — writes the merge3 marker file into the workspace. */
   writeFileFn?: (p: string, content: string) => Promise<void>;
+  /** The Noriq lock view (RUN-99). Perforce has real exclusive locks, but the runner's cross-run
+   *  coordination + the unified dashboard live in the Noriq lock primitive — so acquire/release
+   *  mirror there (authoritative for conflicts), and `p4 lock` is layered on as the native
+   *  enforcement floor. Absent → the native layer only, and queryLocks/lock report `enabled:false`. */
+  locks?: LockDelegate;
 }
 
 export class PerforceBackend implements VcsBackend {
@@ -108,12 +134,14 @@ export class PerforceBackend implements VcsBackend {
   readonly disposePreservesWork = true;
   private readonly p4: P4Cli;
   private readonly write: (p: string, content: string) => Promise<void>;
+  private readonly locks?: LockDelegate;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly held = new Map<string, () => void>();
 
   constructor(opts: PerforceBackendOpts = {}) {
     this.p4 = opts.p4 ?? realP4Cli;
     this.write = opts.writeFileFn ?? ((p, c) => writeFile(p, c, 'utf8'));
+    this.locks = opts.locks;
   }
 
   private async clientName(cwd: string): Promise<string> {
@@ -186,6 +214,12 @@ export class PerforceBackend implements VcsBackend {
         await this.p4(['unshelve', '-s', buildChange], repoRoot);
       }
 
+      // Continue a failed run (RUN-93): a prior attempt at THIS run id shelved its work at dispose
+      // (disposePreservesWork), and reapOrphans above spared it — a shelved changelist has no
+      // opened files, so it is not re-cleaned. Find it now, BEFORE minting this sitting's
+      // changelist, so `findRunChange` cannot match the one we are about to create.
+      const priorChange = opts?.fromRunId ? null : await this.findRunChange(repoRoot, runId);
+
       // The run's pending changelist. Its description IS the crash-recovery record (the reaper
       // greps for it), mirroring git's run-id-in-the-branch-name. `--field` does the spec
       // surgery so no regex of ours can corrupt it — the exact pattern RUN-55 measured.
@@ -196,6 +230,17 @@ export class PerforceBackend implements VcsBackend {
       const created = await this.p4(['change', '-i'], repoRoot, changeSpec);
       const change = created.stdout.match(/Change (\d+) created/)?.[1];
       if (!change) throw new Error(`could not create a changelist: ${created.stdout}`);
+
+      if (priorChange && priorChange !== change) {
+        // Unshelve the prior attempt's work straight INTO this sitting's changelist — into the
+        // named one, not the default, because `reconcile -c` at checkpoint SKIPS files already
+        // opened elsewhere (the exact trap the lease self-heal above exists for), so work left in
+        // the default would never make it into the submit. Then drop the stale shelf + changelist
+        // so it stops matching `findRunChange` and cannot accumulate as an orphan.
+        await this.p4(['unshelve', '-s', priorChange, '-c', change], repoRoot);
+        await this.p4(['shelve', '-d', '-c', priorChange], repoRoot).catch(() => {});
+        await this.p4(['change', '-d', priorChange], repoRoot).catch(() => {});
+      }
 
       return {
         runId,
@@ -218,19 +263,46 @@ export class PerforceBackend implements VcsBackend {
     return m?.[1] ?? null;
   }
 
+  /**
+   * Give the workspace back. Deleting the changelist is the DESTRUCTIVE branch, and it is only
+   * taken when p4 said there is nothing in it (RUN-157).
+   *
+   * This used to swallow the probe outright, so a p4 that could not be reached read as "nothing
+   * opened" and the changelist was deleted — on an allwrite workspace whose edits were never
+   * reconciled, that work was never shelved and leaks into whoever leases next. A backend that
+   * advertises `disposePreservesWork` has to actually preserve it.
+   *
+   * An unreadable probe therefore takes the PRESERVE branch, and preserving is three steps rather
+   * than two. `shelve` only captures files that are OPEN in the changelist, and on an allwrite
+   * client an agent's edits are not open until something reconciles them — which is exactly the
+   * work at risk here. So: reconcile (gather what is on disk), shelve (make it durable), then
+   * revert. Reverting is conditional on the shelf actually landing: discarding the local copy
+   * because a shelve we could not verify "probably worked" is the same mistake one layer down.
+   */
   async dispose(ws: Workspace): Promise<void> {
     const loc = p4Location(ws);
     try {
-      const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-        stdout: '',
-        stderr: '',
-      }));
+      let opened: string;
+      try {
+        opened = (await this.p4(['opened', '-c', loc.change], ws.localPath)).stdout;
+      } catch (err) {
+        // "File(s) not opened on this client" is p4 ANSWERING empty; anything else means we could
+        // not ask, and an unaskable changelist is not an empty one.
+        opened = P4_NOTHING_HERE.test(String(err)) ? '' : 'unknown — assume this holds work';
+      }
       if (opened.trim()) {
-        // Unlanded work: durable FIRST (§5's shelve-then-clean — another workspace can recover
-        // it byte-for-byte, measured), then clean. This is what makes always-dispose safe on a
+        // Unlanded work: durable FIRST (§5's shelve-then-clean — another workspace can recover it
+        // byte-for-byte, measured), then clean. This is what makes always-dispose safe on a
         // pool-of-1 backend.
-        await this.p4(['shelve', '-f', '-c', loc.change], ws.localPath).catch(() => {});
-        await this.p4(['revert', '-c', loc.change, '//...'], ws.localPath).catch(() => {});
+        await this.p4(['reconcile', '-c', loc.change], ws.localPath).catch(() => {});
+        const shelved = await this.p4(['shelve', '-f', '-c', loc.change], ws.localPath).then(
+          () => true,
+          () => false,
+        );
+        // A failed shelf leaves the ONLY copy on disk. Reverting then would destroy it to tidy a
+        // workspace — the pool pays for that with a dirty checkout the next lease has to sync over,
+        // which is recoverable in a way the work is not. The changelist survives for the reaper.
+        if (shelved) await this.p4(['revert', '-c', loc.change, '//...'], ws.localPath).catch(() => {});
       } else {
         // Nothing opened (landed, or a no-op run): delete the empty changelist. p4 REFUSES if
         // a shelf exists — the shelf is the orphan record, and it outlives the lease on purpose.
@@ -242,29 +314,47 @@ export class PerforceBackend implements VcsBackend {
     }
   }
 
+  /**
+   * Only p4's own "there is nothing here" is absorbed (RUN-152). Blanket-swallowing both probes
+   * reported "no work" whenever p4 could not be reached at all, and the caller acts on `false` by
+   * disposing the workspace — a fail-open on a destructive decision. The distinction is awkward
+   * here rather than free, because p4 exits NONZERO for emptiness: `opened` on an empty change
+   * says "File(s) not opened on this client", `reconcile -n` says "no file(s) to reconcile". Those
+   * are answers. A dead connection, a bad client, an auth expiry are not.
+   */
   async hasWork(ws: Workspace): Promise<boolean> {
     const loc = p4Location(ws);
-    const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
+    const opened = await this.emptyOrThrow(this.p4(['opened', '-c', loc.change], ws.localPath));
     if (opened.trim()) return true;
     // allwrite hides edits from p4 until a reconcile — preview what one would gather.
-    const { stdout } = await this.p4(['reconcile', '-n'], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
-    return /opened for (add|edit|delete)/.test(stdout);
+    const reconcile = await this.emptyOrThrow(this.p4(['reconcile', '-n'], ws.localPath));
+    return /opened for (add|edit|delete)/.test(reconcile);
   }
 
+  /** p4 says "nothing here" by failing. Absorb exactly that and let everything else through. */
+  private async emptyOrThrow(call: Promise<{ stdout: string }>): Promise<string> {
+    try {
+      return (await call).stdout;
+    } catch (err) {
+      if (P4_NOTHING_HERE.test(String(err))) return '';
+      throw err;
+    }
+  }
+
+  /**
+   * `false` means "there was nothing to save", never "the save could not be attempted" (RUN-157).
+   *
+   * Both probes used to be swallowed, so a p4 outage returned `false` — and the supervisor ignores
+   * checkpoint's boolean, so the run continued to its gates with no durable copy and not one line
+   * anywhere saying so. Propagating instead reaches the supervisor's own handler, which logs "could
+   * not commit the run diff — it stays uncommitted". p4's emptiness messages are still absorbed:
+   * a reconcile with nothing to gather is an answer.
+   */
   async checkpoint(ws: Workspace, _message: string): Promise<boolean> {
     const loc = p4Location(ws);
     // Gather what the agent actually changed into the run's changelist…
-    await this.p4(['reconcile', '-c', loc.change], ws.localPath).catch(() => {});
-    const { stdout: opened } = await this.p4(['opened', '-c', loc.change], ws.localPath).catch(() => ({
-      stdout: '',
-      stderr: '',
-    }));
+    await this.emptyOrThrow(this.p4(['reconcile', '-c', loc.change], ws.localPath));
+    const opened = await this.emptyOrThrow(this.p4(['opened', '-c', loc.change], ws.localPath));
     if (!opened.trim()) return false;
     // …then shelve: the durable server-side copy. This WRITES THE DEPOT before any gate runs —
     // RUN-48's accepted trade, in THREAT-MODEL.md in the operator's own terms. (The message is
@@ -405,7 +495,10 @@ export class PerforceBackend implements VcsBackend {
    * unshelve it byte-for-byte), then revert the workspace clean. Shelved orphans are REPORTED
    * via onSkip, never deleted; the server is the registry a human consults.
    */
-  async reapOrphans(repoRoot: string, opts?: { onSkip?: (path: string) => void }): Promise<number> {
+  async reapOrphans(
+    repoRoot: string,
+    opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
+  ): Promise<number> {
     const { stdout } = await this.p4(['changes', '-s', 'pending', '-l'], repoRoot).catch(() => ({
       stdout: '',
       stderr: '',
@@ -414,6 +507,9 @@ export class PerforceBackend implements VcsBackend {
     for (const m of stdout.matchAll(/Change (\d+)[^\n]*\n\n\s*noriq run (\S+)/g)) {
       const change = m[1];
       if (!change) continue;
+      // A LIVE run's changelist is what this would otherwise shelve and revert out from under the
+      // agent still writing into it (RUN-153). At startup nothing is owned and this never fires.
+      if (m[2] && opts?.isOwned?.(m[2])) continue;
       const { stdout: opened } = await this.p4(['opened', '-c', change], repoRoot).catch(() => ({
         stdout: '',
         stderr: '',
@@ -426,5 +522,67 @@ export class PerforceBackend implements VcsBackend {
       opts?.onSkip?.(`change ${change} (noriq run ${m[2]}) — shelved server-side`);
     }
     return cleaned;
+  }
+
+  /**
+   * Locking on Perforce (RUN-99): TWO layers, both real.
+   *
+   *  1. The Noriq lock view is the AUTHORITATIVE cross-run coordination layer — the same
+   *     primitive git uses, so two runner runs on one depot contend the same way everywhere and
+   *     the dashboard shows one unified picture. Conflicts are decided here.
+   *  2. `p4 lock` is the NATIVE enforcement floor, layered on after a grant: it locks whichever
+   *     of the paths are already opened in the run's changelist against another client's submit.
+   *     Best-effort — a path the agent has not opened yet is simply not p4-locked (predictive
+   *     scope is a Noriq concept; p4's is opened-file granular), and a failure never fails the
+   *     grant the Noriq view already made.
+   *
+   * A foreign client's raw `p4 lock` (a human at a workstation) is NOT yet reflected as a Noriq
+   * conflict — surfacing that needs live-server fstat parsing and is a follow-up; the runner's
+   * own runs coordinate fully today.
+   */
+  async lock(ws: Workspace, paths: string[], ctx: LockContext): Promise<LockOutcome> {
+    if (!this.locks || paths.length === 0) return { ok: true, enabled: false, locks: [] };
+    const r = await this.locks.acquire(ctx.token, {
+      projectId: ctx.projectId,
+      paths,
+      branch: ctx.branch,
+      taskId: ctx.taskId,
+    });
+    if (!r.ok) return { ok: false, conflicts: r.conflicts };
+    if (r.enabled) await this.nativeLock(ws, paths, 'lock');
+    return { ok: true, enabled: r.enabled, locks: r.locks };
+  }
+
+  async unlock(
+    ws: Workspace,
+    sel: { lockIds?: string[]; paths?: string[] },
+    ctx: LockContext,
+  ): Promise<void> {
+    if (!this.locks) return;
+    if (sel.paths?.length) await this.nativeLock(ws, sel.paths, 'unlock');
+    await this.locks.release(ctx.token, ctx.projectId, sel);
+  }
+
+  async queryLocks(_repoRoot: string, paths: string[], ctx: LockContext) {
+    if (!this.locks || paths.length === 0) return { enabled: false, conflicts: [], mine: [] };
+    return this.locks.check(ctx.token, { projectId: ctx.projectId, paths, branch: ctx.branch });
+  }
+
+  /** Release the run's Noriq-view locks (RUN-104). Native p4 locks release with the changelist on
+   *  dispose/submit, so only the view needs an explicit drop. */
+  async releaseRunLocks(_ws: Workspace, ctx: LockContext): Promise<void> {
+    if (!this.locks) return;
+    await this.locks.releaseAllMine(ctx.token, ctx.projectId);
+  }
+
+  /** Best-effort native `p4 lock`/`p4 unlock` over the opened subset of `paths`. Guarded whole:
+   *  the Noriq view already decided the outcome, so nothing here may throw into that decision. */
+  private async nativeLock(ws: Workspace, paths: string[], verb: 'lock' | 'unlock'): Promise<void> {
+    try {
+      const loc = p4Location(ws);
+      await this.p4([verb, '-c', loc.change, ...paths], ws.localPath);
+    } catch {
+      /* a path not opened in this change, or no p4 lock permission — the Noriq view stands */
+    }
   }
 }

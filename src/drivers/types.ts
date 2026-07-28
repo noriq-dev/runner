@@ -1,4 +1,5 @@
 import type { AgentTool, PermissionProfile, RunBudget, RunEffort, RunKind } from '@noriq-dev/shared';
+import type { LockEnforcer } from '../lock-hooks';
 
 // The common driver contract — one interface over both the Claude Agent SDK
 // (RUN-12) and the Codex protocol-mode driver (RUN-13). A driver turns a Run into
@@ -6,9 +7,9 @@ import type { AgentTool, PermissionProfile, RunBudget, RunEffort, RunKind } from
 
 /**
  * What ONE model spent (RUN-59) — the SDK's own per-model aggregate, keys un-renamed. Mirrors the
- * wire contract's `RunModelUsage`; kept as a local interface for the same anti-corruption reason
- * the driver mirrors the rest of the SDK's shape (see claude.ts). All four token classes, so a
- * breakdown sums to the run total shown beside it.
+ * wire contract's `RunModelMix` (a mix's per-model value); kept as a local interface for the same
+ * anti-corruption reason the driver mirrors the rest of the SDK's shape (see claude.ts). All four
+ * token classes, so a breakdown sums to the run total shown beside it.
  */
 export interface ModelUsage {
   inputTokens: number;
@@ -120,8 +121,59 @@ export interface DriverStartOptions {
   effort?: RunEffort;
   /** Ceilings for daemon-side budget enforcement (RUN-14). */
   budget?: RunBudget;
+  /**
+   * A LIVE spend check for this session, consulted on every telemetry tick (RUN-133). Returns the
+   * dimension that is gone, or null to continue; a non-null answer stops the session exactly as a
+   * `budget` breach does.
+   *
+   * It exists because `budget` is a SNAPSHOT and a session can outlive it. A build's session is
+   * kept open for hand-back turns (RUN-29/30), and between two of those turns the reviewer spends
+   * from the same run ceiling — so the builder's original allowance is stale by the time it is
+   * handed work back, and comparing its own cumulative against that stale number lets the RUN
+   * exceed its budget while no single session ever breaches. The guard asks the run's allocator
+   * instead, which knows what every session has spent.
+   *
+   * Absent → `budget` alone decides, which is what every test fake and any caller without a run
+   * ledger means. Present → it wins for tokens/USD; the wall-clock deadline is still `budget`'s.
+   */
+  spendGuard?: (t: DriverTelemetry) => string | null;
+  /**
+   * The wall-clock counterpart of `spendGuard` (RUN-159): how many seconds the RUN has left, asked
+   * each time a stretch of agent work is armed. Null (or absent) = unbounded on that axis.
+   *
+   * Same staleness it exists to fix, different axis. `budget.maxDurationSeconds` is this session's
+   * allowance at the moment it was reserved; a multiTurn session outlives that, and the seconds a
+   * reviewer spends between two hand-back turns are the run's, not free. Without this the builder
+   * would be re-armed against its own original allowance and the run's total could exceed its
+   * ceiling by however much every other session took.
+   *
+   * The tighter of the two remainders wins, so a caller with no run ledger loses nothing.
+   */
+  clockGuard?: () => number | null;
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */
   noriqMcp?: NoriqMcp;
+  /**
+   * Reactive per-edit file locking (RUN-101). When present, a driver that supports in-process
+   * tool-use hooks (Claude) wires it as a PreToolUse deny + a Stop release — the runner's
+   * GUARANTEED, unskippable variant of the PLNR client hook, run in-process so the run's token
+   * never enters the agent's shell. A driver without such hooks (Codex) ignores it and relies on
+   * the hard floor (RUN-102) + its native sandbox instead.
+   */
+  lockEnforcer?: LockEnforcer;
+  /**
+   * The sanitized process environment the agent MUST run under (RUN-109).
+   *
+   * Computed ONCE by the supervisor (`sanitizedAgentEnv`) and handed down, so the trust boundary
+   * — no daemon token, no cloud/git creds, no git push/prompt — is a SUPERVISOR guarantee that
+   * holds no matter who spawns, rather than a thing each driver remembers to do. It used to live
+   * inside claude.ts/codex.ts because they spawn the local process; a future driver that runs the
+   * agent elsewhere still receives this and must ship it to wherever the process actually runs.
+   *
+   * Absent only in tests, where a driver falls back to `sanitizedAgentEnv()` so the default is
+   * still safe. A driver that needs one credential IN the env (codex's MCP bearer token, which has
+   * no header option) adds ONLY that, on top of this already-stripped base.
+   */
+  env?: NodeJS.ProcessEnv;
   handlers?: DriverHandlers;
 }
 
@@ -159,7 +211,53 @@ export interface DriverSession {
   continueWith?(text: string): Promise<DriverExit>;
 }
 
+/**
+ * What a driver's runtime can and cannot do (RUN-110).
+ *
+ * The claude/codex asymmetry used to be implicit — the supervisor handed every driver a
+ * `lockEnforcer` and simply trusted claude to wire it and codex to ignore it; per-model telemetry
+ * "just wasn't there" for codex. This makes those differences a declared contract the supervisor
+ * reads, so behaviour keys off a capability, not a driver's NAME — and a future driver (a remote
+ * executor) declares what it supports rather than the supervisor knowing it by hard-coded tool id.
+ */
+export interface DriverCapabilities {
+  /**
+   * In-process tool-use hooks — the reactive per-edit lock layer (RUN-101): PreToolUse deny +
+   * Stop release. false → the driver ignores `lockEnforcer` and the daemon-side hard floor
+   * (RUN-102) is the ONLY lock guard for its runs (this is the Codex posture).
+   */
+  toolHooks: boolean;
+  /** Soft steer: `pushInput` injects a next-turn user message into a live session. */
+  steer: boolean;
+  /** Hard interrupt of the current inference (`interrupt`). */
+  interrupt: boolean;
+  /** A resumable session id for park/resume (RUN-30). false → a parked run of this driver cannot
+   *  bring its context back and must restart (Codex has no resume). */
+  resumableSession: boolean;
+  /** Per-model spend attribution (RUN-59). false → its spend lands in the `(unattributed)` bucket
+   *  (RUN-86) rather than a per-model breakdown (Codex reports tokens but no split, no cost). */
+  perModelTelemetry: boolean;
+}
+
+/**
+ * A driver's advertised menu (RUN-115): the model ids and efforts it can build coordinates from,
+ * so the dashboard can offer a real picker (`claude.<model>.<effort>`) instead of a free-text box.
+ * Deliberately a SUGGESTION, not a whitelist — `model` stays free-form on the wire (vendors ship
+ * models weekly), so a coordinate naming a model not in this list is still accepted; the catalog
+ * only seeds the common choices.
+ */
+export interface DriverCatalog {
+  /** Known/suggested model ids for this driver, newest-first. May be stale; not enforced. */
+  models: string[];
+  /** The efforts this driver meaningfully distinguishes (codex collapses xhigh/max into high). */
+  efforts: RunEffort[];
+}
+
 export interface AgentDriver {
   readonly tool: AgentTool;
+  /** What this driver's runtime supports — read by the supervisor instead of branching on `tool`. */
+  readonly capabilities: DriverCapabilities;
+  /** The models + efforts this driver advertises for the coordinate picker (RUN-115). */
+  readonly catalog: DriverCatalog;
   start(opts: DriverStartOptions): DriverSession;
 }

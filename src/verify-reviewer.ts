@@ -11,8 +11,11 @@
 // findings itself. This also makes authorship separation absolute: the reviewer cannot claim,
 // move, or comment as anyone, only judge.
 
+import { type AcceptanceItem, renderAcceptanceChecklist } from './acceptance';
 import { type LedgerEntry, renderLedger } from './adjudication';
 import { renderPrompt } from './prompts';
+import { type RepairSpec, renderRepairSpec } from './repair';
+import type { ReviewEscalation } from './verify-agent';
 
 export interface ReviewerPromptContext {
   /** What the diff is supposed to achieve — the anchor task's text, or the run brief. */
@@ -20,13 +23,48 @@ export interface ReviewerPromptContext {
   /** How to inspect the accumulated diff. Absent on a non-git backend — the prompt then
    *  points at the working tree instead of a command it can't run. */
   diffCmd?: string;
-  /** The deterministic floor's command, when one is configured — the reviewer is told it
-   *  already passed so it spends its turns on what the command CANNOT check. */
-  verifyCmd?: string | null;
+  /**
+   * The deterministic floor's command, split by whether it has actually RUN yet (RUN-177).
+   *
+   * At most one is ever set. `verifyPassed` is the original sentence — spend your turns on what a
+   * green suite cannot prove. `verifyPending` is the landing path, where the command runs after
+   * this review against the rebased result: the reviewer is still told not to re-run it (the real
+   * gate is coming), but it is no longer told a suite passed when nothing has run. A gate that
+   * cannot re-run the command has no way to discover the premise was false.
+   */
+  verifyPassed?: string | null;
+  verifyPending?: string | null;
   /** Findings already raised and answered in earlier rounds (RUN-79). Empty/absent on the
    *  first look — a fresh reviewer with no history yet. Rendered into the PRIOR ADJUDICATIONS
    *  section so a settled finding is verified, not relitigated. */
   ledger?: LedgerEntry[];
+  /** The repo's own orientation, NAMES ONLY (RUN-154). This is the actor being asked "does this
+   *  look like this repo's code?", and it was the one told nothing about what this repo's code
+   *  looks like. Contents are deliberately not inlined — the diff already owns its context. */
+  repoContext?: string;
+  /**
+   * The spec's acceptance criteria, numbered, for a per-item answer (RUN-145).
+   *
+   * This actor had never been given them at all. RUN-139 handed the definition of done to the
+   * DISPATCHED verify run and the note in CLAUDE.md says "the verify family" gets it — but the
+   * family has two members and this is the one that gates every build with a `[verify.agent]`,
+   * while the dispatched run is opt-in. It was judging a diff against the task's title and body
+   * with no idea what the work had been commissioned to achieve, which is the same shape as
+   * RUN-158: a rule described as holding everywhere, holding at the site that ran less often.
+   *
+   * Empty/absent → the section renders nothing and the reviewer behaves exactly as before, which
+   * is the common case: most tasks have no spec.
+   */
+  acceptance?: AcceptanceItem[];
+  /** Criteria the spec named that did not fit the checklist — said out loud, because a list that
+   *  silently stops reads as a contract that happens to be short. */
+  acceptanceOverflow?: number;
+  /**
+   * The requirement ids this work is traceable to (RUN-147), so a finding can name what it
+   * threatens. Empty/absent → the reviewer is never asked to tag, and the ledger keys on prose
+   * exactly as it did before.
+   */
+  requirements?: string[];
 }
 
 /** The prompt for one fresh reviewer session (prompts/reviewer.md). Read-only, no identity,
@@ -52,13 +90,48 @@ export interface ReviewerPromptContext {
  *  PRIOR ADJUDICATIONS section (adjudication.ts). The reviewer stays fresh on the DIFF but is no
  *  longer amnesiac about what was already settled — it verifies each pointer rather than trusting
  *  it, so a real finding still lands and a rebutted one is not relitigated. Empty ledger → the
- *  section renders nothing, so the first look is unchanged. */
+ *  section renders nothing, so the first look is unchanged.
+ *
+ *  Two rules earned by the RUN-66/RUN-88 dogfood, where both runs died in the TERMINAL review —
+ *  the one with no fix budget behind it — on findings raised for the first time there:
+ *
+ *  The revert test makes the scope rule mechanical rather than a matter of taste. RUN-76 already
+ *  said "not this author's to answer for"; RUN-88 shows that stating it is not enough. Asked to
+ *  delete a security-shaped field that never did anything, the reviewer failed the run because
+ *  manifests still carrying the dead key get no migration warning — true, and equally true before
+ *  the diff, which neither created the false assurance nor worsened it. A reviewer whose subject
+ *  IS a false assurance will find one and charge it to whoever touched the file last. "Would a
+ *  revert fix it?" is checkable in a way "is this pre-existing?" is not. It settles SCOPE only, and
+ *  says so in both directions: it never licenses dismissing a defect the diff does own, which is
+ *  the failure mode of every rule that makes flagging harder.
+ *
+ *  Collapsing a CLASS into one numbered finding is what makes a bounded round budget survivable.
+ *  RUN-66 spent all three rounds on one root cause — a wizard that re-derived committed values
+ *  through lossy transforms — and the reviewer reported a fresh sample of it each round (values
+ *  withheld from the fallback, then transforms run over the answer, then a sibling's truthiness
+ *  gating the read). Every finding was correct and none was a repeat, so the ledger above had
+ *  nothing to catch: the builder patched the cited lines, the class survived, and the run failed on
+ *  instance nine of it. The NUMBER is the mechanism, not the prose: the builder answers this report
+ *  number by number and fixes what each number cites, so a class named in a preamble above four
+ *  instance lines still buys four patched lines. It has to occupy a number to be answered as one.
+ *  Instance-reporting is also what the "concrete failure at a file/line" bar quietly incentivises,
+ *  so the rule has to be stated against it — measured on this template, a reviewer handed the four
+ *  RUN-66 round-1 defects as raw notes now returns one finding naming the cause and citing the
+ *  other three as evidence, where the pre-rule wording returned four. That converges the fix in one
+ *  round, or proves the work is bigger than the rounds left — either beats learning it last round,
+ *  which is the RUN-66 outcome this exists to stop. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
-    verifyCmd: ctx.verifyCmd ?? null,
+    verifyPassed: ctx.verifyPassed ?? null,
+    verifyPending: ctx.verifyPending ?? null,
     intent: ctx.intent,
+    context: ctx.repoContext ?? '',
     priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,
+    acceptance: ctx.acceptance?.length
+      ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
+      : null,
+    requirements: ctx.requirements?.length ? ctx.requirements.join(', ') : null,
   });
 }
 
@@ -67,17 +140,66 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
  * verify feedback: the report, in context, to the session that can act on it. The findings
  * cap mirrors the comment surface (a report longer than this has stopped being actionable).
  */
-export function reviewerFeedbackPrompt(findings: string, round: number, maxRounds: number): string {
+export function reviewerFeedbackPrompt(
+  findings: string,
+  round: number,
+  maxRounds: number,
+  /** What is still outstanding, as a specification (RUN-146). Absent → the hand-back is the report
+   *  alone, exactly as it was — which is every run whose task carries no acceptance criteria. */
+  repair?: RepairSpec | null,
+): string {
   return renderPrompt('reviewer-feedback', {
     findings: findings.slice(-6000),
+    repair: repair ? renderRepairSpec(repair) : null,
     last: round >= maxRounds,
   });
+}
+
+/**
+ * What the live builder is told after a TERMINAL-round reviewer FAIL (RUN-174): one turn to
+ * CONTEST a finding with a checkable pointer, and no more. Distinct from `reviewerFeedbackPrompt`
+ * on purpose — a fix round is budget for NEW work, and the terminal round is where the run ends, so
+ * a finding raised there for the first time (the RUN-66/RUN-88 dogfood deaths) was never fixable
+ * OR contestable. This buys the one answer it could still get: the builder points at evidence a
+ * fresh reviewer verifies for itself, no code changes.
+ *
+ * The scope rule it leans on — would-a-revert-fix-it — stays SOLELY in `reviewer.md`, which the
+ * judging reviewer reads (RUN-89's other half). Restating it here is a second place it could drift;
+ * the builder contests with a pointer, the mechanical test stays with the judge. The findings cap
+ * mirrors `reviewerFeedbackPrompt`'s (a report longer than this has stopped being actionable).
+ */
+export function reviewerContestPrompt(findings: string): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
 }
 
 /** Format a final reviewer rejection for a task comment (the gate surface). */
 export function reviewerRejectionComment(findings: string, rounds: number): string {
   const tried = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : '';
   return `🔍 The inline reviewer found the work does not satisfy the intent${tried} — this run did not pass the gate and cannot reach done.\n\n${findings.slice(-6000)}`;
+}
+
+/**
+ * Format an HONOURED structural escalation for a task comment (RUN-175) — the fail-fast surface.
+ *
+ * Distinct from `reviewerRejectionComment` because the human's next move is different: a rejection
+ * says "the work was found wanting, read the findings"; this says "the reviewer showed the work
+ * CANNOT converge under per-finding fixing, and the daemon stopped paying for rounds that would
+ * only rediscover that". The diagnosis leads — it is the one sentence a re-dispatch is written
+ * around — and the cited instances follow, because an escalation is only ever honoured evidenced
+ * and the comment should show the evidence rather than ask to be trusted.
+ */
+export function reviewerEscalationComment(
+  escalation: ReviewEscalation,
+  findings: string,
+  rounds: number,
+): string {
+  const spent = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : ' on its first look';
+  return [
+    `🔍 The inline reviewer diagnosed this run as STRUCTURALLY unconvergeable${spent} — finding ${escalation.findingId}: ${escalation.diagnosis}`,
+    `Instances cited: ${escalation.instances.join(', ')}`,
+    'The daemon stopped the remaining fix rounds rather than spending them rediscovering this: per-site patches cannot close an invariant that has no single enforcement point. The diff is kept on its branch — the path forward is a chokepoint that enforces the promise in one place, so re-dispatch the task around one rather than re-running this gate.',
+    findings.slice(-6000),
+  ].join('\n\n');
 }
 
 /** The gate never rendered a judgment (reviewer killed, crashed, budget breach, missing

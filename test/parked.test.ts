@@ -149,3 +149,30 @@ describe('resumePrompt', () => {
     expect(resumePrompt(null, 'Use B.')).not.toContain('Your question');
   });
 });
+
+// RUN-164. A park can last up to 72 hours. A human answering the question may have corrected the
+// task's execution spec at the same time — the dashboard exists so they can — and another run may
+// have landed under this one. A resume that says nothing about either carries on against a premise
+// nobody re-checked.
+describe('what a resumed session is told changed while it waited', () => {
+  it('says nothing when nothing moved, so a resume stays as cheap as it was', () => {
+    const p = resumePrompt('may I use zod?', 'yes');
+    expect(p).toContain('yes');
+    expect(p).not.toMatch(/REPLACES what you were told/);
+  });
+
+  // The session already holds the brief; what it does NOT hold is the fact that its contract moved.
+  it('marks the new plan as replacing what the session was told before', () => {
+    const p = resumePrompt('may I use zod?', 'yes', '\n\nEXECUTION SPEC — the corrected one');
+    expect(p).toMatch(/REPLACES what you were told before it/);
+    expect(p).toMatch(/where the two disagree, this is the one that counts/);
+    expect(p).toContain('the corrected one');
+  });
+
+  it('still carries the answer and the question alongside it', () => {
+    const p = resumePrompt('may I use zod?', 'yes', 'the new plan');
+    expect(p).toContain('may I use zod?');
+    expect(p).toContain('yes');
+    expect(p).toContain('Carry on from where you stopped.');
+  });
+});

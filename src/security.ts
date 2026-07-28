@@ -50,7 +50,8 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
 }
 
 /**
- * sanitizedAgentEnv + the one Noriq token codex needs, in the env, deliberately.
+ * Why codex re-adds ONE token to the sanitized env, deliberately (the exception the codex driver
+ * makes on top of `sanitizedAgentEnv`).
  *
  * This bends the rule above and it is worth being honest about why. The Claude driver puts
  * the credential on the MCP transport's Authorization header, so it never touches the shell.
@@ -58,7 +59,7 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
  * streamable-HTTP MCP server's token is read from the process environment or codex cannot
  * authenticate at all. There is no third choice short of a local proxy.
  *
- * What makes the trade acceptable is WHICH token this now is (RUN-43). It is minted per Run,
+ * What makes the trade acceptable is WHICH token this is (RUN-43). It is minted per Run,
  * bound to exactly one agent in one project, and revoked by the server the moment the Run
  * goes terminal — so a build agent that reads it out of its own env gains the ability to act
  * as itself, in the project it is already working, until its run ends. Before this, codex got
@@ -66,14 +67,10 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
  * is a worse failure and a silent one. The alternative — passing the DAEMON's token, which
  * can register runners and reach every project its human can — is the thing this replaces.
  *
- * If codex ever grows header support, delete this and use it.
+ * Since RUN-109 the codex driver composes `{ ...opts.env, [CODEX_MCP_TOKEN_ENV]: token }` on the
+ * supervisor-sanitized base rather than re-sanitizing here. If codex ever grows header support,
+ * drop the re-add entirely.
  */
-export function agentEnvWithMcpToken(
-  token: string,
-  base: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  return { ...sanitizedAgentEnv(base), [CODEX_MCP_TOKEN_ENV]: token };
-}
 
 /**
  * Reaching a human — available to EVERY kind (RUN-32).
@@ -153,6 +150,31 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     'resolve_comment',
     'attach_ref',
     'update_task',
+    // File locking (RUN-97..107, granted at RUN-177) — and ONLY the acquire half, deliberately.
+    //
+    // The daemon takes locks AS the run's agent: the reactive per-edit hook and the hard floor
+    // before landing both authenticate with the run's token. Without this the daemon is refused by
+    // a floor it declared itself, which is what gated two finished builds on the first live
+    // dispatch — the floor could not complete, reported `unchecked`, and failed runs that had done
+    // nothing wrong.
+    //
+    // `release_lock` and `list_locks` stay OUT, and the reason is the whole design. Since RUN-47
+    // the floor IS the advertised catalogue, so anything the daemon may call, the agent may call —
+    // they are one identity. Granting release would let the agent drop the very locks the hard
+    // floor took, mid-run, before landing: RUN-105 holds those locks THROUGH the
+    // rebase→verify→fast-forward precisely so a peer cannot take a file mid-merge, and an agent
+    // that can release them makes that guarantee something the agent may opt out of. The daemon
+    // loses nothing it needs — the server already releases a task-anchored run's locks when the
+    // run settles (`releaseLocksForTask`, "run settled: <outcome>"), on any status change off
+    // in_progress, and on claim TTL. Its own terminal release was always documented as
+    // promptness, never correctness; it now no-ops, and the server does the work.
+    //
+    // `check_locks` stays out because nothing in the daemon calls it on this path.
+    //
+    // What this does still hand a build agent is the ability to acquire broadly — `paths: ["**"]`
+    // would block cooperating peers for the run's life. That is unavoidable while daemon and agent
+    // share one identity, and it is bounded by run-settle and TTL rather than indefinite.
+    'acquire_lock',
   ],
   verify: [
     'set_agent_identity',

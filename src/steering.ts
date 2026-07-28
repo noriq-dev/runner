@@ -46,6 +46,23 @@ interface SteerTarget {
 
 export class SteeringBridge {
   private readonly targets = new Map<string, SteerTarget>();
+  /**
+   * Runs an operator has cancelled (RUN-165).
+   *
+   * Cancelling used to mean only "stop whatever session is registered right now", and a pipeline
+   * is many sessions with gaps between them. A cancel landing during a planner, a plan checker or
+   * a pattern mapper stopped that one actor — and every one of those stages is deliberately
+   * non-fatal, so the pipeline read the dead session as "this stage produced nothing" and started
+   * the build. A cancel landing BETWEEN stages found nothing registered at all and answered false.
+   *
+   * So the fact has to outlive the session. This set is the fact; `isCancelled` is how the stage
+   * machine asks, and `RUN_STAGES` is where the check belongs rather than in each new stage's
+   * memory.
+   *
+   * Bounded by `forget`, called when a run reaches a terminal — otherwise a long-lived daemon
+   * accumulates one entry per cancelled run forever.
+   */
+  private readonly cancelled = new Set<string>();
   private readonly log: typeof defaultLogger;
 
   constructor(deps: { logger?: typeof defaultLogger } = {}) {
@@ -94,8 +111,15 @@ export class SteeringBridge {
   /** run.cancel/stop (RUN-18): hard-interrupt the current inference, then SIGTERM
    *  the process — the supervisor's teardown removes the worktree. */
   async cancelRun(runId: string): Promise<boolean> {
+    // Recorded FIRST, and recorded whether or not anything is running. A cancel that arrives
+    // between two stages has nothing to stop and is still a cancel — answering false and letting
+    // the next stage spawn is how an operator pays for a run they ended.
+    this.cancelled.add(runId);
     const target = this.targets.get(runId);
-    if (!target) return false;
+    if (!target) {
+      this.log.info('run cancelled with no live session — the pipeline stops at its next stage', { runId });
+      return true;
+    }
     try {
       await target.session.interrupt();
     } catch (err) {
@@ -104,6 +128,18 @@ export class SteeringBridge {
     await target.stop();
     this.log.info('run cancelled — SIGTERM + teardown', { runId });
     return true;
+  }
+
+  /** Has this run been cancelled? Asked at every stage boundary — a cancel is a fact about the
+   *  RUN, not about whichever session happened to be live when it arrived. */
+  isCancelled(runId: string): boolean {
+    return this.cancelled.has(runId);
+  }
+
+  /** Drop a run's cancellation record once it is terminal. Without this a long-lived daemon keeps
+   *  one entry per cancelled run for its whole life. */
+  forget(runId: string): void {
+    this.cancelled.delete(runId);
   }
 
   /**

@@ -1,8 +1,9 @@
 import { ProjectManifest, VerifySpec } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { parseVerdict } from '../src/verify-agent';
+import { parseVerdict, readEscalation } from '../src/verify-agent';
 import {
   assembleReviewerPrompt,
+  reviewerEscalationComment,
   reviewerFeedbackPrompt,
   reviewerRejectionComment,
 } from '../src/verify-reviewer';
@@ -19,7 +20,7 @@ describe('the [verify] choice (RUN-61) — schema', () => {
   it('agent-only parses — a reviewer with no deterministic floor is a real choice', () => {
     const m = ProjectManifest.parse({ ...base, verify: { agent: {} } });
     expect(m.verify?.cmd).toBeNull();
-    expect(m.verify?.agent).toEqual({ tool: null, model: null, effort: null, maxRounds: 2 });
+    expect(m.verify?.agent).toEqual({ agent: null, tool: null, model: null, effort: null, maxRounds: 2 });
   });
 
   it('both parse, with the reviewer keeping its own model/effort', () => {
@@ -28,7 +29,13 @@ describe('the [verify] choice (RUN-61) — schema', () => {
       verify: { cmd: 'npm test', agent: { model: 'claude-opus-4-8', effort: 'high', maxRounds: 1 } },
     });
     expect(m.verify?.cmd).toBe('npm test');
-    expect(m.verify?.agent).toEqual({ tool: null, model: 'claude-opus-4-8', effort: 'high', maxRounds: 1 });
+    expect(m.verify?.agent).toEqual({
+      agent: null,
+      tool: null,
+      model: 'claude-opus-4-8',
+      effort: 'high',
+      maxRounds: 1,
+    });
   });
 
   it('a [verify] section with NEITHER is refused — silence must not read as a gate', () => {
@@ -42,11 +49,34 @@ describe('the [verify] choice (RUN-61) — schema', () => {
 });
 
 describe('assembleReviewerPrompt', () => {
+  // On a landing repo the deterministic command runs AFTER the review, against the rebased result
+  // (`stages/verify.ts` skips it when `[land]` is configured). The reviewer used to be told it
+  // "already passed" regardless — a false premise handed to a gate that is also told not to re-run
+  // it, so it had no way to find out (RUN-177).
+  it('does not claim the deterministic check passed when it has not run yet', () => {
+    const p = assembleReviewerPrompt({
+      intent: 'RUN-9 — make the thing work',
+      diffCmd: 'git diff abc...HEAD',
+      verifyPending: 'npm run check',
+    });
+    expect(p).toContain('npm run check');
+    expect(p).not.toMatch(/already passed/);
+    expect(p).toMatch(/has NOT run yet/);
+    // Still told not to burn turns on it — the point was never to invite a re-run.
+    expect(p).toMatch(/do not re-run it here/i);
+  });
+
+  it('says nothing about a deterministic check when the repo configures none', () => {
+    const p = assembleReviewerPrompt({ intent: 'x', diffCmd: 'git diff a...HEAD' });
+    expect(p).not.toMatch(/already passed/);
+    expect(p).not.toMatch(/has NOT run yet/);
+  });
+
   it('is adversarial, read-only, and carries the intent and the diff command', () => {
     const p = assembleReviewerPrompt({
       intent: 'RUN-9 — make the thing work',
       diffCmd: 'git diff abc...HEAD',
-      verifyCmd: 'npm test',
+      verifyPassed: 'npm test',
     });
     expect(p).toMatch(/INDEPENDENT, adversarial/);
     expect(p).toMatch(/Do NOT modify any files/);
@@ -64,6 +94,27 @@ describe('assembleReviewerPrompt', () => {
     expect(p).not.toMatch(/set_agent_identity/);
     expect(p).not.toMatch(/MCP/);
     expect(p).toMatch(/no project-management access/);
+  });
+
+  // RUN-154. This is the actor being asked "does this look like this repo's code?" while being
+  // told nothing about what this repo's code looks like. Names only — the diff already owns its
+  // context, and a reviewer is read-only by definition, so a named file is one it can just read.
+  it("carries the repo's own orientation, by name", () => {
+    const p = assembleReviewerPrompt({
+      intent: 'x',
+      repoContext:
+        "\n\nThis repo says of itself:\n- This repo's rules are written down in: CLAUDE.md — read them before judging the diff against them",
+    });
+    expect(p).toContain('This repo says of itself:');
+    expect(p).toContain('CLAUDE.md');
+    expect(p).toMatch(/before judging the diff/);
+    expect(p.indexOf('This repo says of itself:')).toBeLessThan(p.indexOf('Intent to review against'));
+  });
+
+  it('renders exactly as before when the repo declares nothing', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).not.toContain('This repo says of itself');
+    expect(p).toMatch(/VERDICT: PASS/);
   });
 
   it('points at the working tree when there is no diff command (live VCS backends)', () => {
@@ -119,6 +170,7 @@ describe('assembleReviewerPrompt', () => {
           id: 1,
           round: 1,
           severity: 'High',
+          requirements: [],
           location: 'src/init.ts:357',
           claim: 'detectVcs runs on every init',
           status: 'contested',
@@ -135,6 +187,26 @@ describe('assembleReviewerPrompt', () => {
     // The entry itself, with the checkable pointer.
     expect(p).toContain('detectVcs runs on every init');
     expect(p).toContain('CONTESTED (commit 11f19c8)');
+  });
+
+  // RUN-175. The token has to be at least as hard to earn as RUN-90's prose — a reviewer that can
+  // end a run in one word will — so the prompt states the evidence bar, the demotion, and the cost.
+  it('teaches the escalation token, gated on the structural evidence bar (RUN-175)', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).toContain('ESCALATE STRUCTURAL FINDING <n>');
+    expect(p).toMatch(/only when — the full evidence bar above is met/);
+    expect(p).toMatch(/demotes the line to an ordinary FAIL/);
+    expect(p).toMatch(/three distinct file:line instances/);
+    expect(p).toMatch(/never because a problem feels systemic/);
+    // A bounded class must stay a listed class — the token is not a louder FAIL.
+    expect(p).toMatch(/BOUNDED class is never an escalation/);
+    // …and the daemon's parser honours the exact line the prompt teaches.
+    const taught = [
+      'FINDING 1 [High] src/a.ts:1: the promise leaks — src/b.ts:2, src/c.ts:3',
+      'ESCALATE STRUCTURAL FINDING 1: the floor has no single enforcement point — src/a.ts:1, src/b.ts:2, src/c.ts:3',
+      'VERDICT: FAIL',
+    ].join('\n');
+    expect(readEscalation(taught).escalation?.findingId).toBe(1);
   });
 
   it('its verdict line round-trips through the shared parser', () => {
@@ -161,6 +233,36 @@ describe('reviewer feedback + rejection surfaces', () => {
   it('the rejection comment names the rounds spent', () => {
     expect(reviewerRejectionComment('findings', 2)).toMatch(/after 2 fix rounds/);
     expect(reviewerRejectionComment('findings', 0)).not.toMatch(/after/);
+  });
+
+  // RUN-175. The human's next move differs from a rejection — re-dispatch around a chokepoint,
+  // not "read the findings and try again" — so the diagnosis leads and the evidence shows.
+  it('the escalation comment leads with the diagnosis and shows the cited instances (RUN-175)', () => {
+    const c = reviewerEscalationComment(
+      {
+        findingId: 3,
+        diagnosis: 'the write floor has no single enforcement point',
+        instances: ['src/a.ts:10', 'src/b.ts:20', 'src/c.ts:30'],
+      },
+      'FINDING 3 [High] src/a.ts:10: the floor leaks\nVERDICT: FAIL',
+      1,
+    );
+    expect(c).toMatch(/STRUCTURALLY unconvergeable after 1 fix round/);
+    expect(c).toContain('finding 3: the write floor has no single enforcement point');
+    expect(c).toContain('src/a.ts:10, src/b.ts:20, src/c.ts:30');
+    expect(c).toMatch(/stopped the remaining fix rounds/);
+    expect(c).toMatch(/re-dispatch the task around one/);
+    expect(c).toContain('the floor leaks'); // the report itself still rides along
+  });
+
+  it('the escalation comment says so when the FIRST look ended the run — no rounds were spent', () => {
+    const c = reviewerEscalationComment(
+      { findingId: 1, diagnosis: 'd', instances: ['a.ts:1', 'b.ts:2', 'c.ts:3'] },
+      'findings',
+      0,
+    );
+    expect(c).toMatch(/on its first look/);
+    expect(c).not.toMatch(/after 0 fix/);
   });
 
   it('requires a structured RESPONSE block so the next reviewer can adjudicate (RUN-79)', () => {

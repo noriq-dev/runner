@@ -29,7 +29,16 @@ export interface ManifestStoreDeps {
 }
 
 /** Top-level sections worth naming when the file changes under us. */
-const SECTIONS = ['key', 'verify', 'tool', 'defaultBranch', 'land', 'permissions'] as const;
+const SECTIONS = [
+  'key',
+  'verify',
+  'context',
+  'tool',
+  'defaultBranch',
+  'land',
+  'permissions',
+  'workflows',
+] as const;
 
 /** Which parts of the manifest actually differ. */
 export function changedSections(a: ProjectManifest, b: ProjectManifest): string[] {

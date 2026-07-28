@@ -1,6 +1,34 @@
-import type { AgentTool, RunKind } from '@noriq-dev/shared';
+import type { AgentTool, RunEffort, RunKind } from '@noriq-dev/shared';
 import type { DiscoveredRepo } from './discovery';
+import { CLAUDE_CATALOG } from './drivers/claude';
+import { CODEX_CATALOG } from './drivers/codex';
+import type { DriverCatalog } from './drivers/types';
 import { VERSION } from './version';
+
+/** The static per-tool coordinate menus (RUN-115), keyed by tool so registration can advertise the
+ *  menu for each installed driver WITHOUT a live driver instance (registration precedes their
+ *  construction). Mirrors each driver's own `catalog` field. */
+const DRIVER_CATALOGS: Record<AgentTool, DriverCatalog> = {
+  claude: CLAUDE_CATALOG,
+  codex: CODEX_CATALOG,
+};
+
+/** One advertised driver: the coordinate menu the dashboard renders as `<tool>.<model>.<effort>`. */
+export interface AdvertisedAgent {
+  tool: AgentTool;
+  models: string[];
+  efforts: RunEffort[];
+}
+
+/** The coordinate catalog for the installed tools (RUN-115) — what the dashboard's agent picker
+ *  reads. A tool with no known catalog still advertises itself with empty menus (free-form only). */
+export function agentCatalog(tools: AgentTool[]): AdvertisedAgent[] {
+  return tools.map((tool) => ({
+    tool,
+    models: DRIVER_CATALOGS[tool]?.models ?? [],
+    efforts: DRIVER_CATALOGS[tool]?.efforts ?? [],
+  }));
+}
 
 export interface RegistrationParams {
   label: string;
@@ -21,6 +49,9 @@ export interface RunnerRegistration {
    *  RUNNER_PROTOCOL_VERSION in the WS hello, which answers "can we talk at all". */
   version: string;
   tools: AgentTool[];
+  /** The coordinate menu per installed tool (RUN-115) — models + efforts for the dashboard picker.
+   *  Additive to `tools`; a server that does not yet read it simply ignores it. */
+  agents: AdvertisedAgent[];
   kinds: RunKind[];
   maxConcurrency: number;
   repos: Array<{
@@ -32,6 +63,15 @@ export interface RunnerRegistration {
     board: string | null;
     name: string;
     defaultBranch: string | null;
+    /**
+     * This repo's custom workflow NAMES (RUN-121; matches shared `RunnerRepo.workflows`). The wire
+     * carries just the choice — the base + prompt stay the runner's authority in the committed
+     * manifest, and the DAEMON resolves a selected name to its base posture (`effectiveKind`,
+     * RUN-126), so a mismatched dispatched `kind` can never escalate write. The three built-ins are
+     * implicit and not listed. (RUN-125 briefly advertised the base here; reverted — the daemon,
+     * which holds the manifest, is the right authority, not the dashboard.)
+     */
+    workflows: string[];
   }>;
 }
 
@@ -51,6 +91,8 @@ export function buildRegistration(
     // is "can we talk", this is "what code is this".
     version: VERSION,
     tools: params.tools,
+    // The coordinate catalog for the installed tools (RUN-115) — what the dashboard picker reads.
+    agents: agentCatalog(params.tools),
     kinds: params.kinds ?? DEFAULT_KINDS,
     maxConcurrency: params.concurrency,
     repos: discovered.map((r) => ({
@@ -59,6 +101,10 @@ export function buildRegistration(
       board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
+      // The repo's custom workflow names (RUN-121) — the three built-ins are always available and
+      // are not listed. The daemon resolves each to its base posture at dispatch (RUN-126), so the
+      // wire carries just the name (matches shared RunnerRepo.workflows: string[]).
+      workflows: Object.keys(r.manifest.workflows ?? {}),
     })),
   };
 }

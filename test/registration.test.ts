@@ -31,8 +31,8 @@ describe('buildRegistration', () => {
     expect(reg.tools).toEqual(['claude']);
     expect(reg.kinds).toEqual(['scope', 'build', 'verify']);
     expect(reg.repos).toEqual([
-      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main' },
-      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null },
+      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main', workflows: [] },
+      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null, workflows: [] },
     ]);
     expect('runnerId' in reg).toBe(false); // omitted on first registration
   });
@@ -45,6 +45,42 @@ describe('buildRegistration', () => {
     expect(reg.runnerId).toBe('rnr_1');
     expect(reg.kinds).toEqual(['build']);
     expect(reg.repos).toEqual([]);
+  });
+
+  it('advertises custom workflow NAMES (RUN-121; base stays the runner’s authority, RUN-126)', () => {
+    const withWorkflows: DiscoveredRepo[] = [
+      {
+        id: 'repo_w',
+        root: '/x/w',
+        projectKey: 'WWW',
+        name: 'w',
+        defaultBranch: 'main',
+        manifest: {
+          key: 'WWW',
+          board: null,
+          workflows: {
+            docs: { base: 'scope', prompt: 'survey it' },
+            hotfix: { base: 'build', prompt: null },
+          },
+        } as never,
+      },
+    ];
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, withWorkflows);
+    // Names only — the daemon resolves each to its base posture (effectiveKind), so the wire needn't
+    // carry it, and this matches shared RunnerRepo.workflows: string[].
+    expect(reg.repos[0]?.workflows).toEqual(['docs', 'hotfix']);
+  });
+
+  it('advertises the coordinate catalog per installed tool (RUN-115)', () => {
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude', 'codex'] }, []);
+    const claude = reg.agents.find((a) => a.tool === 'claude');
+    const codex = reg.agents.find((a) => a.tool === 'codex');
+    expect(claude?.models).toContain('claude-opus-4-8');
+    expect(claude?.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    // codex advertises no effort above its own high — it cannot distinguish xhigh/max
+    expect(codex?.efforts).toEqual(['low', 'medium', 'high']);
+    // a runner with no tools advertises no agents
+    expect(buildRegistration({ label: 'l', concurrency: 1, tools: [] }, []).agents).toEqual([]);
   });
 });
 
