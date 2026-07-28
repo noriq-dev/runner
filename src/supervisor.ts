@@ -12,7 +12,13 @@ import type {
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
-import { type LedgerEntry, buildLedger, parseFindingResponses, parseFindings } from './adjudication';
+import {
+  type Finding,
+  type LedgerEntry,
+  buildLedger,
+  parseFindingResponses,
+  parseFindings,
+} from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
@@ -85,8 +91,13 @@ import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
-import { type VerifyVerdict, assembleVerifyPrompt, judgeWithAcceptance } from './verify-agent';
-import { assembleReviewerPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
+import {
+  type VerifyVerdict,
+  assembleVerifyPrompt,
+  judgeWithAcceptance,
+  readEscalation,
+} from './verify-agent';
+import { assembleReviewerPrompt, reviewerContestPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import {
   BUILTIN_WORKFLOWS,
   type Workflow,
@@ -1575,6 +1586,13 @@ export class RunSupervisor {
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
       if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
+      // An HONOURED structural escalation ends the loop here (RUN-175): the reviewer has diagnosed
+      // an invariant with no single enforcement point and evidenced it, so every remaining fix
+      // round would buy patched sites while the class survives — the RUN-66 death, foreseen
+      // instead of relived. The verdict (escalation riding on it) goes back a FAIL; the review
+      // stage reports the diagnosis and its own terminal reason. The findings are already in the
+      // ledger (recorded when raised), so a continuation still sees them.
+      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -1652,6 +1670,33 @@ export class RunSupervisor {
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       record(verdict, round + 1);
       if (verdict.passed) return { ...verdict, rounds: round, ledger };
+    }
+    // RUN-174: one adjudication turn before the run reports a TERMINAL-round FAIL. The terminal
+    // round is where the run ENDS, so a finding raised there for the first time was never fixable
+    // OR contestable — both the RUN-66 and RUN-88 dogfood runs died exactly this way, on [medium]
+    // findings nobody could answer. The builder gets ONE turn to CONTEST a finding with a pointer
+    // (it may NOT change code), then a FRESH reviewer judges the SAME diff plus that new ledger
+    // evidence. Deliberately not a fix round: a fix round is budget for new work, and giving the
+    // terminal round one would only move the terminal round.
+    //
+    // Fires only for a clean `fail` that named findings the builder can answer BY NUMBER. An
+    // `unknown` is a non-report already returned above (verdict.verdict !== 'fail'), with nothing to
+    // contest; a FAIL that wrote no numbered FINDING line gives the RESPONSE block nothing to key
+    // to — the ledger holds no entry a pointer could land on. continueWith is already guaranteed
+    // here (the passed/no-continueWith return above narrowed it), and the method re-checks it before
+    // the turn regardless, since it is what makes the contest a turn on the live builder session.
+    // …and never for an honoured escalation (RUN-175): the contest exists to let a builder rebut
+    // per-finding claims with pointers, but an escalation is a diagnosis about the DESIGN — that no
+    // single check can hold the promise — and the adjudicator for that is the human the diagnosis
+    // is surfaced to, not one more spent turn. Stopping the spend is the token's whole point.
+    const terminalFindings =
+      verdict.verdict === 'fail' && !verdict.escalation ? parseFindings(verdict.findings) : [];
+    if (terminalFindings.length) {
+      const contested = await this.contestTerminalFindings(
+        { ...ctx, intent },
+        { verdict, findings: terminalFindings, terminalRound: maxRounds + 1, rounds: maxRounds, ledger },
+      );
+      if (contested) return contested;
     }
     return { ...verdict, rounds: maxRounds, ledger };
   }
@@ -1851,10 +1896,233 @@ export class RunSupervisor {
       }
       // Verdict AND per-criterion evidence, reconciled together (RUN-145) — a PASS the report's
       // own acceptance lines contradict is taken as the FAIL it contains.
-      return judgeWithAcceptance(text, ctx.acceptance ?? []);
+      const judged = judgeWithAcceptance(text, ctx.acceptance ?? []);
+      // The structural-escalation token (RUN-175), read only off a clean exit: a crashed reviewer's
+      // half-written token must not end a run the gate never finished judging (the branch above
+      // already forces `unknown`). `readEscalation` gates on the report's OWN verdict line, so a
+      // PASS judgeWithAcceptance demoted cannot smuggle an escalation in — the reviewer that signed
+      // PASS did not judge the run unconvergeable, whatever else its report contradicts. A demotion
+      // is logged rather than silent, so "the daemon ignored it" is legible and distinct from "the
+      // daemon never saw it"; the run then proceeds as the ordinary FAIL the report already is.
+      const escalated = readEscalation(text);
+      if (escalated.demoted) {
+        this.log.info('reviewer escalation token demoted — the run proceeds as an ordinary FAIL', {
+          runId: ctx.run.id,
+          round: ctx.round,
+          why: escalated.demoted,
+        });
+      }
+      return escalated.escalation ? { ...judged, escalation: escalated.escalation } : judged;
     } finally {
       this.deps.steering?.unregister(ctx.run.id);
     }
+  }
+
+  /**
+   * The RUN-174 contest turn: one adjudication turn after a TERMINAL-round FAIL, before the run
+   * reports. Returns the FINAL result iff the contest RAN — a PASS only when every terminal finding
+   * drew a checkable CONTESTED response AND a fresh reviewer verified those pointers hold; otherwise
+   * the terminal FAIL (its ledger now carrying whatever the builder said). Returns `null` when the
+   * contest DECLINED — nothing left to fund it (RUN-133) — so the caller reports the terminal FAIL
+   * exactly as it does today.
+   *
+   * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
+   * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
+   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, or a
+   * finding a ledger cap dropped cannot clear it — the run then fails without even spawning the
+   * reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
+   * enough.
+   *
+   * No checkpoint after the builder turn, deliberately — the "may NOT change code" rule. `runReviewer`
+   * inspects `git diff baseId...HEAD`, a committed range, so an un-checkpointed edit is invisible to
+   * it: the fresh reviewer reads the SAME diff the terminal round judged, plus the new ledger
+   * evidence. That is what keeps this a judgment over unchanged code rather than a disguised fix
+   * round, and it holds whatever the builder's live permission profile allows.
+   *
+   * One look only. This is not a contest/fix loop — the fresh reviewer's verdict is final, so a
+   * builder self-assertion that no reviewer re-checks cannot clear a finding, and a surviving finding
+   * does not earn another turn.
+   */
+  private async contestTerminalFindings(
+    ctx: {
+      run: Run;
+      repo: ResolvedRepo;
+      worktree: Workspace;
+      driver: AgentDriver;
+      /** The live build session — the contest turn runs here (a continuation, not a new spawn). */
+      session: DriverSession;
+      intent: string;
+      tally: RunTally;
+      getSessionText?: () => string;
+      budget?: RunBudget;
+      acceptance?: AcceptanceItem[];
+      acceptanceOverflow?: number;
+      requirements?: string[];
+      verifyRan?: boolean;
+    },
+    args: {
+      /** The terminal verdict — the report a survive reports, so the human sees the findings just
+       *  contested rather than a fresh reviewer's paraphrase of them. */
+      verdict: VerifyVerdict;
+      findings: Finding[];
+      /** Where the terminal findings already sit in the ledger (recorded when raised), so the
+       *  builder's responses fold onto the SAME entries. */
+      terminalRound: number;
+      /** Fix rounds spent (maxRounds) — the `rounds` the caller would have reported. */
+      rounds: number;
+      ledger: LedgerEntry[];
+    },
+  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }) | null> {
+    const transcript = this.transcript(ctx.run.id);
+    const stand = (ledger: LedgerEntry[]) => ({ ...args.verdict, rounds: args.rounds, ledger });
+
+    // Reserve FIRST, before the builder turn: the terminal turn is the run's most likely to find the
+    // ceiling already gone (RUN-133, same as resolveConflict). Declining spends nothing where
+    // spawning-to-kill would spend a process — and `null` tells the caller to report the terminal
+    // FAIL untouched.
+    const reservation = ctx.tally.reserve();
+    if (!reservation.ok) {
+      this.log.warn('no budget left for the terminal contest turn — reporting the FAIL as it stands', {
+        runId: ctx.run.id,
+        breach: reservation.breach,
+      });
+      return null;
+    }
+    if (!ctx.session.continueWith) return null;
+
+    this.log.info('handing the terminal findings to the builder for one contest turn (no code change)', {
+      runId: ctx.run.id,
+      findings: args.findings.length,
+    });
+    transcript.milestone(
+      'the terminal review FAILed — one contest turn (no code change) before the run reports',
+    );
+    // A turn burns tokens — the phase must say so (RUN-31), same as the fix loop.
+    this.deps.report(ctx.run.id, { status: 'running', phase: 'agent' });
+
+    // The delta after the turn is exactly the contest's text, from which the structured RESPONSE
+    // block is parsed (RUN-79) — snapshotted before the turn as the fix loop does.
+    const textBefore = ctx.getSessionText?.().length ?? 0;
+    const startedAt = monotonicMs();
+    const exit = await ctx.session
+      .continueWith(reviewerContestPrompt(args.verdict.findings))
+      .catch((err): DriverExit | null => {
+        this.log.warn('could not hand the terminal findings back for a contest', {
+          runId: ctx.run.id,
+          err: String(err),
+        });
+        return null;
+      })
+      .finally(() => ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000));
+
+    // The response↔terminal-finding join, computed ONCE here — before the ledger fold, the exit
+    // branch, and the eligibility gate below all read it (RUN-179 criterion 4). A response is
+    // EVIDENCE only when it points at something AND names an id THIS terminal round raised: a
+    // pointerless self-assertion is persuasion the next reviewer cannot check, and a `FINDING 99`
+    // naming no terminal finding is context from nowhere. Folding this ONE `matched` set — not the
+    // raw responses — is what keeps the ledger the verifiable-pointer record RUN-79 designed, and
+    // stops the join being re-derived, divergently, at each site.
+    const contestText = ctx.getSessionText?.().slice(textBefore) ?? '';
+    const responses = parseFindingResponses(contestText);
+    const terminalIds = new Set(args.findings.map((f) => f.id));
+    const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
+
+    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
+    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
+    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
+    // one the terminal round judged.
+    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
+
+    // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
+    // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
+    // the fix loop already avoids — but with the ledger now carrying whatever it said.
+    if (!exit || exit.outcome !== 'done') {
+      if (exit?.reason)
+        this.log.info('the contest turn ended early', { runId: ctx.run.id, reason: exit.reason });
+      return stand(answered);
+    }
+
+    // ── the canonical reconciliation (RUN-174) ────────────────────────────────────────────────
+    // ONE place decides whether the contest cleared the run, so no exit can clear a finding another
+    // would have kept. Of the `matched` evidence above, a terminal finding is a CANDIDATE to clear
+    // only when the builder CONTESTED it (a `FIXED` changed nothing here) AND that contest is VISIBLE
+    // to the adjudicator — its entry survived the ledger cap into what the fresh reviewer is handed.
+    // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
+    // pointer or a response for another id never reached `matched` at all. What "checkable" means
+    // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
+    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
+    const loc = (s: string) => s.trim().toLowerCase();
+    const visibleToAdjudicator = (f: Finding) =>
+      answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));
+    if (!args.findings.every((f) => contested.has(f.id) && visibleToAdjudicator(f))) {
+      // At least one terminal finding was not answerably contested, so it stands and the run fails as
+      // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
+      // Nothing is spawned to be killed; the contest turn already happened above.
+      this.log.info('a terminal finding was not answerably contested — the findings stand', {
+        runId: ctx.run.id,
+        contested: contested.size,
+        findings: args.findings.length,
+      });
+      transcript.milestone('the terminal findings were not all contested — the run fails');
+      return stand(answered);
+    }
+
+    // Every terminal finding has a checkable contest the adjudicator can see: ONE fresh reviewer
+    // verifies the pointers over the SAME diff plus the ledger. One look only — not a contest/fix loop.
+    const readjudged = await this.runReviewer({ ...ctx, round: args.rounds + 2, ledger: answered });
+    transcript.milestone(reviewVerdictMilestone(readjudged, args.rounds + 2));
+    const settled = buildLedger(answered, parseFindings(readjudged.findings), [], args.rounds + 2);
+
+    // RUN-175: the contest's fresh look is a reviewer round like any other, and the token is a
+    // per-round judgement honoured when raised — so an HONOURED escalation from this adjudicator
+    // must ride out rather than be replaced by the pre-contest verdict below, which would report
+    // the one run a reviewer proved unconvergeable as a plain rejection with the diagnosis written
+    // and unread. Its OWN report is what survives (not the terminal round's): the escalation's
+    // finding number points into that report, and the terminal findings it did not clear are in
+    // the ledger it carries. An escalation only ever rides a FAIL, so this cannot shadow the
+    // contest-cleared PASS branch beneath it.
+    if (readjudged.escalation) {
+      this.log.info(
+        'the contest’s fresh reviewer escalated STRUCTURAL — the run fails with the cause named',
+        {
+          runId: ctx.run.id,
+        },
+      );
+      transcript.milestone('the contest’s fresh look escalated STRUCTURAL — the run fails');
+      return { ...readjudged, rounds: args.rounds, ledger: settled };
+    }
+
+    // The PASS is DAEMON-decided, not taken on the reviewer's word: it clears the run only if the
+    // fresh reviewer PASSed AND re-raised none of the terminal findings. A pointer it rejected it
+    // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not
+    // cleared it — either way the finding stands, the same posture judgeWithAcceptance takes for a
+    // FAILED criterion under a PASS.
+    const reraised = new Set(
+      parseFindings(readjudged.findings)
+        .map((f) => loc(f.location))
+        .filter(Boolean),
+    );
+    const stillStanding = args.findings.filter((f) => reraised.has(loc(f.location)));
+    if (readjudged.passed && stillStanding.length === 0) {
+      this.log.info('the contest cleared every terminal finding — the fresh reviewer PASSed', {
+        runId: ctx.run.id,
+      });
+      transcript.milestone('the contest cleared the terminal findings — the run passes');
+      return { ...readjudged, rounds: args.rounds, ledger: settled };
+    }
+    // The findings stand: the run fails as it does today (the terminal report), but the ledger now
+    // carries the builder's pointers and the fresh look — so a human, and a continuation, sees the
+    // contest happened. A re-raise under a PASS lands here too (the daemon takes the FAIL), as does
+    // an `unknown` re-adjudication (crashed / no budget) — a gate that could not run cleared nothing.
+    this.log.info('the terminal findings stand after the contest — the run fails', {
+      runId: ctx.run.id,
+      overrodePass: readjudged.passed && stillStanding.length > 0,
+    });
+    transcript.milestone('the terminal findings stand after the contest — the run fails');
+    return stand(settled);
   }
 
   /** Give the build agent one bounded turn to resolve its own conflict, in place. */
@@ -2917,6 +3185,9 @@ const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {
   if (v.passed) return `reviewer verdict: PASS (round ${round})`;
-  if (v.verdict === 'fail') return `reviewer verdict: FAIL (round ${round})`;
+  if (v.verdict === 'fail')
+    return v.escalation
+      ? `reviewer verdict: FAIL (round ${round}) — escalated STRUCTURAL, the daemon stops the fix rounds`
+      : `reviewer verdict: FAIL (round ${round})`;
   return `reviewer rendered NO verdict (round ${round}) — stopped, crashed, or wrote no VERDICT line`;
 }

@@ -2724,6 +2724,9 @@ describe('findings carry requirement ids (RUN-147)', () => {
   });
 
   it('reports per requirement when the run ends, including the ones nothing was raised against', async () => {
+    // maxRounds 0 makes the first review the TERMINAL one, so the finding draws a RUN-174 contest
+    // turn (no code change). The builder streams no rebuttal, so nothing is contested and the
+    // finding stands with no re-review — R-7 is reported open.
     const { h } = await reviewedWith(
       taskRequiring('R-7', 'R-9'),
       'FINDING 1 [High] [R-7] src/a.ts:1: it never reaps\nVERDICT: FAIL',
@@ -3142,6 +3145,70 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(h.worktrees.removed).toEqual([]); // the diff is kept — a human still needs it
   });
 
+  // RUN-175. The reviewer could already say STRUCTURAL in prose; only the builder read it, so a
+  // run diagnosed as unconvergeable still burned every fix round rediscovering that. The token is
+  // the machine-readable half — honoured only evidenced, and a FAIL either way.
+  const ESCALATED = [
+    'FINDING 1 [High] src/a.ts:10: the write floor is re-derived per site — also src/b.ts:20 and src/c.ts:30',
+    'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the floor — src/a.ts:10, src/b.ts:20, src/c.ts:30',
+    'VERDICT: FAIL',
+  ].join('\n');
+
+  it('an honoured escalation ends the loop in round 1: no fix turn, a distinct reason, the diagnosis posted (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() }); // maxRounds 2 — none of them spent
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(ESCALATED);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // distinct from a plain 'review' rejection
+    expect(h.claude.continuations).toEqual([]); // the remaining rounds were NOT spent
+    expect(h.claude.starts).toHaveLength(2); // build + exactly one reviewer — no contest turn either
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the floor'); // the diagnosis leads
+    expect(body).toContain('src/b.ts:20'); // the evidence shows, rather than asks to be trusted
+    expect(h.worktrees.removed).toEqual([]); // a FAIL, never a silent pass — the diff is kept
+    // The transcript names the fail-fast, so a human reading the stream sees why round 2 never ran.
+    expect(h.transcript.map((s) => s.text).join('\n')).toContain('escalated STRUCTURAL');
+  });
+
+  it('a demoted (under-evidenced) escalation consumes rounds exactly as an ordinary FAIL (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 1 }), verifyResults: [true, true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // One cited instance — below the floor of 3, so the token is ignored, not honoured.
+    h.claude.emitText(
+      'FINDING 1 [High] src/a.ts:10: one bad site\nESCALATE STRUCTURAL FINDING 1: feels systemic — src/a.ts:10\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the fix round DID run — the demotion changed nothing
+    h.claude.emitText('Still leaking.\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.reason).toBe('review'); // the ordinary rejection, not the escalation terminal
+    expect(h.claude.continuations).toHaveLength(1); // the manifest's one round was spent, as today
+  });
+
+  it('an escalation token on a PASS changes nothing — the run reaches done (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'ESCALATE STRUCTURAL FINDING 1: everything — src/a.ts:1, src/b.ts:2, src/c.ts:3\nVERDICT: PASS',
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+  });
+
   it('maxRounds 0 is a pure gate: one review, no hand-back', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { maxRounds: 0 }) });
     const done = h.supervisor.supervise(buildRun());
@@ -3263,6 +3330,8 @@ describe('the inline reviewer (RUN-61)', () => {
     await onReviewTurn(failed, 3);
     failed.claude.emitText('FINDING 1 [high] src/auth.ts:9: still untested\nVERDICT: FAIL');
     failed.claude.complete('done');
+    // The terminal round FAILed — RUN-174's contest turn runs, but the builder streams no rebuttal,
+    // so nothing is contested and the run gate-fails with the finding on the record (no re-review).
     await runF;
     const record = failed.continuable.puts.at(-1);
     expect(record?.runId).toBe('run_1');
@@ -3580,6 +3649,281 @@ describe('the inline reviewer (RUN-61)', () => {
     h.claude.emitText('VERDICT: PASS');
     h.claude.complete('done');
     await done;
+  });
+});
+
+// RUN-174. Both the RUN-66 and RUN-88 dogfood runs died in the TERMINAL review — the round with no
+// fix budget behind it — on findings raised there for the first time, neither fixable NOR
+// contestable. The contest turn is the one answer such a finding could still get: one builder turn
+// to CONTEST with a pointer (no code change), then a fresh reviewer judges the same diff plus that
+// evidence. It is not another fix round, and it can never cost a run that had nothing to spend.
+describe('the terminal-round contest turn (RUN-174)', () => {
+  const REVIEWED = (maxRounds = 0, cmd: string | null = 'npm test') =>
+    manifest({
+      verify: {
+        cmd,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>, atLeastStarts: number) => {
+    for (let i = 0; i < 300; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= atLeastStarts) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error(`the reviewer session (>= ${atLeastStarts} starts) never began`);
+  };
+
+  /** Build → terminal reviewer FAILs with one finding → the builder's contest turn streams
+   *  `contest` (null = stays silent) → the run settles. For the cases where the contest does NOT
+   *  earn a re-review, so `done` resolves without a second reviewer to drive. */
+  const terminalContestFails = async (contest: string | null) => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    if (contest !== null) h.claude.continueTexts = [contest];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs
+    const exit = await done;
+    return { h, exit };
+  };
+  const reviewerStarts = (h: ReturnType<typeof harness>) =>
+    h.claude.starts.filter((s) => s.runId === 'run_1:review').length;
+
+  it('a contested terminal finding a fresh reviewer clears PASSES the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    // The builder points at evidence the finding is wrong — no code change.
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the guard already covers this'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs
+    // The contest turn (a continuation of the live builder) runs, then a FRESH reviewer looks once
+    // more — it is starts[2], not another fix turn.
+    await onReviewTurn(h, 3);
+    expect(h.claude.continuations.some((c) => /contest/i.test(c))).toBe(true);
+    // The fresh reviewer got the builder's pointer as ledger evidence to verify for itself.
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toMatch(/PRIOR ADJUDICATIONS/);
+    expect(readjudged).toContain('CONTESTED (src/a.ts:9)');
+    h.claude.emitText('The pointer holds — out of scope.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // the contest cleared the finding
+    expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(2); // one extra look
+  });
+
+  it('a terminal finding that survives the contest still fails the run, and never checkpoints', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    h.claude.emitText('The pointer does not hold.\nVERDICT: FAIL'); // the finding stands
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.comments.at(-1)?.body).toMatch(/does not satisfy the intent/);
+    // The "may NOT change code" rule: the contest turn adds NO checkpoint (a FIX round folds one in
+    // as "reviewer fix round N" so the fresh reviewer sees the change), so the re-adjudication read
+    // the same diff the terminal round judged — only the one pre-review checkpoint was taken.
+    expect(h.worktrees.commits.some((c) => /fix round/i.test(c.message))).toBe(false);
+    expect(h.worktrees.commits.filter((c) => /pre-review checkpoint/i.test(c.message))).toHaveLength(1);
+    expect(h.worktrees.removed).toEqual([]); // the diff is kept for a human
+  });
+
+  // RUN-175: the contest's fresh adjudicator is a reviewer round like any other, so an honoured
+  // escalation it raises must ride out — not be replaced by the pre-contest verdict, which would
+  // report the one run a reviewer proved unconvergeable as a plain rejection, diagnosis unread.
+  it('an honoured escalation from the contest’s fresh reviewer fail-fasts with the diagnosis (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the guard already covers this'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs, token-free — the contest turn runs
+    await onReviewTurn(h, 3);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/a.ts:1: the guard floor is re-derived per site — also src/b.ts:2 and src/c.ts:3',
+        'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the guard floor — src/a.ts:1, src/b.ts:2, src/c.ts:3',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // the fresh adjudicator escalates instead of merely re-raising
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // not the plain 'review' rejection
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the guard floor'); // the diagnosis surfaced
+  });
+
+  // The leak the RUN-174 gate closes: a fresh re-review is not a free reroll of the verdict. Unless
+  // the builder actually CONTESTED a finding with a checkable pointer, the finding stands and NO
+  // reviewer is spawned to possibly-PASS over it (criterion 4).
+  it('a terminal finding nobody contests stands — no fresh reviewer re-rolls the verdict', async () => {
+    const { h, exit } = await terminalContestFails(null); // the builder streams no rebuttal
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toHaveLength(1); // the contest turn DID happen…
+    expect(reviewerStarts(h)).toBe(1); // …but no re-review followed a non-contest
+  });
+
+  it('a FIXED response cannot clear a terminal finding — nothing was changed to fix', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 1: FIXED src/a.ts:9 — added the guard');
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // a FIXED is not a contest → no re-review
+  });
+
+  it('a CONTESTED with no checkable pointer cannot clear a terminal finding', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 1: CONTESTED'); // no pointer given
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // self-assertion with no pointer → no re-review
+  });
+
+  // RUN-179: a contest that CONTESTS with a checkable pointer but names a finding id NO terminal
+  // finding carries (`FINDING 99` against a single `FINDING 1`) clears the eligibility filter's
+  // pointer bar yet leaves the real finding uncontested — so it must NOT buy a fresh adjudicator
+  // whose stochastic PASS could clear the run over unchanged code. Same re-roll the pointer/FIXED
+  // cases deny, one level up.
+  it('a CONTESTED naming an unknown finding id cannot buy a re-adjudication', async () => {
+    const { h, exit } = await terminalContestFails('FINDING 99: CONTESTED src/a.ts:9 — not a real finding');
+    expect(exit.outcome).toBe('failed'); // FINDING 1 was never answerably contested → it stands
+    expect(reviewerStarts(h)).toBe(1); // an unknown id contested → no fresh adjudicator spawned
+  });
+
+  it('a contest that answers only SOME terminal findings still fails the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    // Two findings, one contested with a pointer, the other left unanswered.
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/a.ts:1: guard A missing\nFINDING 2 [High] src/b.ts:1: guard B missing\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // finding 2 was never contested → it stands
+    expect(reviewerStarts(h)).toBe(1); // not every finding contested → no re-review
+  });
+
+  // Criterion 7: a rebuttal the builder streams before the turn dies must survive into the ledger,
+  // so a continuation's fresh reviewer sees it as a prior adjudication rather than relitigating it.
+  it('folds a streamed contest response into the ledger even when the contest turn then fails', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — pre-existing'];
+    h.claude.continueOutcomes = ['failed']; // streams the rebuttal, then dies
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the terminal FAIL stands after a dead contest turn
+    expect(reviewerStarts(h)).toBe(1); // …and no re-review followed it
+    // The rebuttal survived into the persisted continuable ledger.
+    const record = h.continuable.puts.at(-1);
+    const entry = record?.ledger.find((e) => e.id === 1);
+    expect(entry?.status).toBe('contested');
+    expect(entry?.pointer).toContain('src/a.ts:9');
+  });
+
+  // RUN-179: the single matched-response join runs BEFORE the ledger fold, so a POINTERLESS contest
+  // streamed before the turn dies is persuasion with nothing to check — it is discarded, not
+  // persisted as a contested rebuttal a continuation's fresh reviewer would then have to relitigate.
+  it('does NOT persist a pointerless contest as a rebuttal, even from a crashed contest turn', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED']; // a self-assertion with no pointer
+    h.claude.continueOutcomes = ['failed']; // streams it, then dies
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    const record = h.continuable.puts.at(-1);
+    const entry = record?.ledger.find((e) => e.id === 1);
+    expect(entry).toBeDefined(); // the finding is still in the ledger…
+    expect(entry?.status).toBe('unanswered'); // …but the pointerless contest was not folded as evidence
+    expect(entry?.pointer).toBeNull();
+  });
+
+  // The PASS is the daemon's to accept, not the reviewer's to assert: a malformed report that lists
+  // a terminal finding and then signs PASS has cleared nothing (criterion 3/4). This also covers the
+  // pointer a fresh reviewer rejects — it re-raises the finding, and the daemon takes the FAIL.
+  it('a fresh PASS that still re-raises a terminal finding does NOT clear the run', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED x — trust me'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    // The fresh reviewer rejects the pointer — it re-raises the finding — yet signs PASS anyway.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is STILL missing\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the daemon overrode the PASS — the finding was re-raised
+    expect(exit.reason).toBe('review');
+  });
+
+  it('declines the contest when the run has nothing left to spend, and reports the FAIL as-is', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      defaultBudget: { maxTokens: 1000, maxUsd: null, maxDurationSeconds: null, maxRounds: null },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done', { outputTokens: 0 }); // the builder spent nothing…
+    await onReviewTurn(h, 2);
+    // …and the terminal reviewer spends exactly the ceiling filing its finding — within its OWN
+    // session allowance (the whole 1000), but leaving the run with nothing for a contest turn.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done', { outputTokens: 1000 });
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review');
+    expect(h.claude.continuations).toEqual([]); // no contest turn was handed back
+    expect(h.claude.starts).toHaveLength(2); // build + the one reviewer — nothing re-adjudicated
+  });
+
+  it('never contests an UNKNOWN terminal verdict — a non-report has nothing to answer', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    // A numbered finding but no VERDICT line → 'unknown'. The finding is parseable, but an unknown
+    // is a non-report (killed / crashed / no verdict), so there is nothing to contest.
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:no-verdict');
+    expect(h.claude.continuations).toEqual([]); // no contest turn
+    expect(h.claude.starts).toHaveLength(2); // build + the one reviewer
   });
 });
 

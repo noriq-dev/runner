@@ -217,7 +217,11 @@ export const RUN_STAGES: readonly RunStage[] = [
     actor: 'verify',
     budget: 'run',
     retry: { kind: 'feedback', boundedBy: '[verify.agent].maxRounds' },
-    terminal: ['review', 'review:no-verdict'],
+    // 'review:structural' is the RUN-175 fail-fast: the reviewer evidenced an invariant with no
+    // single enforcement point, so the daemon stopped the fix rounds with the cause named instead
+    // of spending them rediscovering it. Distinct from 'review' because the human's move differs —
+    // re-dispatch around a chokepoint, not "read the findings and try again".
+    terminal: ['review', 'review:no-verdict', 'review:structural'],
     // Only a producing workflow has a diff to review. A verify run IS the reviewer.
     optional: true,
     appliesTo: (wf) => wf.produces,

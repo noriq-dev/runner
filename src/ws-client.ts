@@ -177,7 +177,12 @@ export class WsClient {
   }
 
   /** Report live spend + a log tail for a Run (RUN-22). Non-transitional: this is a
-   *  best-effort telemetry tick, never re-asserted on reconnect (not in liveRuns). */
+   *  best-effort telemetry tick, never re-asserted on reconnect (not in liveRuns).
+   *
+   *  @returns whether the frame actually reached the socket — the same signal `sendRunStatus`
+   *  leans on. Telemetry is fire-and-forget, but the executed-spec record it can carry is owed
+   *  exactly once (RUN-172), so the daemon uses this to hold that record until a frame carrying it
+   *  leaves, rather than counting a down socket as a delivery (RUN-173). */
   sendTelemetry(
     runId: string,
     t: {
@@ -189,8 +194,8 @@ export class WsClient {
       /** The spec this run was briefed with (RUN-166) — once, then null. */
       executedSpec?: ExecutionSpec | null;
     },
-  ): void {
-    this.sendRaw({
+  ): boolean {
+    return this.sendRaw({
       type: 'run.telemetry',
       runId,
       tokensUsed: t.tokensUsed ?? null,

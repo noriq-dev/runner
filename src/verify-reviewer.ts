@@ -15,6 +15,7 @@ import { type AcceptanceItem, renderAcceptanceChecklist } from './acceptance';
 import { type LedgerEntry, renderLedger } from './adjudication';
 import { renderPrompt } from './prompts';
 import { type RepairSpec, renderRepairSpec } from './repair';
+import type { ReviewEscalation } from './verify-agent';
 
 export interface ReviewerPromptContext {
   /** What the diff is supposed to achieve — the anchor task's text, or the run brief. */
@@ -154,10 +155,51 @@ export function reviewerFeedbackPrompt(
   });
 }
 
+/**
+ * What the live builder is told after a TERMINAL-round reviewer FAIL (RUN-174): one turn to
+ * CONTEST a finding with a checkable pointer, and no more. Distinct from `reviewerFeedbackPrompt`
+ * on purpose — a fix round is budget for NEW work, and the terminal round is where the run ends, so
+ * a finding raised there for the first time (the RUN-66/RUN-88 dogfood deaths) was never fixable
+ * OR contestable. This buys the one answer it could still get: the builder points at evidence a
+ * fresh reviewer verifies for itself, no code changes.
+ *
+ * The scope rule it leans on — would-a-revert-fix-it — stays SOLELY in `reviewer.md`, which the
+ * judging reviewer reads (RUN-89's other half). Restating it here is a second place it could drift;
+ * the builder contests with a pointer, the mechanical test stays with the judge. The findings cap
+ * mirrors `reviewerFeedbackPrompt`'s (a report longer than this has stopped being actionable).
+ */
+export function reviewerContestPrompt(findings: string): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
+}
+
 /** Format a final reviewer rejection for a task comment (the gate surface). */
 export function reviewerRejectionComment(findings: string, rounds: number): string {
   const tried = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : '';
   return `🔍 The inline reviewer found the work does not satisfy the intent${tried} — this run did not pass the gate and cannot reach done.\n\n${findings.slice(-6000)}`;
+}
+
+/**
+ * Format an HONOURED structural escalation for a task comment (RUN-175) — the fail-fast surface.
+ *
+ * Distinct from `reviewerRejectionComment` because the human's next move is different: a rejection
+ * says "the work was found wanting, read the findings"; this says "the reviewer showed the work
+ * CANNOT converge under per-finding fixing, and the daemon stopped paying for rounds that would
+ * only rediscover that". The diagnosis leads — it is the one sentence a re-dispatch is written
+ * around — and the cited instances follow, because an escalation is only ever honoured evidenced
+ * and the comment should show the evidence rather than ask to be trusted.
+ */
+export function reviewerEscalationComment(
+  escalation: ReviewEscalation,
+  findings: string,
+  rounds: number,
+): string {
+  const spent = rounds > 0 ? ` after ${rounds} fix round${rounds === 1 ? '' : 's'}` : ' on its first look';
+  return [
+    `🔍 The inline reviewer diagnosed this run as STRUCTURALLY unconvergeable${spent} — finding ${escalation.findingId}: ${escalation.diagnosis}`,
+    `Instances cited: ${escalation.instances.join(', ')}`,
+    'The daemon stopped the remaining fix rounds rather than spending them rediscovering this: per-site patches cannot close an invariant that has no single enforcement point. The diff is kept on its branch — the path forward is a chokepoint that enforces the promise in one place, so re-dispatch the task around one rather than re-running this gate.',
+    findings.slice(-6000),
+  ].join('\n\n');
 }
 
 /** The gate never rendered a judgment (reviewer killed, crashed, budget breach, missing

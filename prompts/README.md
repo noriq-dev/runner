@@ -17,6 +17,7 @@ call site — these files are the literal text an agent reads, so they cannot ca
 | `verify-agent.md` | `verify-agent.ts` `assembleVerifyPrompt` | a dispatched verify run (RUN-20) |
 | `reviewer.md` | `verify-reviewer.ts` `assembleReviewerPrompt` | the inline reviewer (RUN-61) |
 | `reviewer-feedback.md` | `verify-reviewer.ts` `reviewerFeedbackPrompt` | the builder, after a reviewer FAIL |
+| `reviewer-contest.md` | `verify-reviewer.ts` `reviewerContestPrompt` | the builder, after a TERMINAL reviewer FAIL — one contest turn, no code change (RUN-174) |
 | `verify-feedback.md` | `verify.ts` `verifyFeedbackPrompt` | the builder, after the verify cmd failed |
 | `conflict.md` | `land.ts` `assembleConflictPrompt` | the builder, mid-rebase conflict |
 | `resume.md` | `parked.ts` `resumePrompt` | a parked agent being resumed (RUN-30) |
