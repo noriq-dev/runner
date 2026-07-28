@@ -1170,6 +1170,29 @@ describe('RUN-67 round-trip matrix — everything the wizard can write, discover
     expect(walked).toBe(renderProjectManifest(base));
   });
 
+  // The same invariant driven through the REAL rewrite path, not the renderer: a marker already
+  // on disk, the wizard re-run over it (overwrite confirmed), the advanced tier on, and Enter
+  // for every question — the file must come out byte-identical. This is as close to "edit-mode
+  // no-op rewrite" as exists: there is no re-read-into-choices edit mode yet (overwrite starts
+  // blank, so the same answers must be given), and when one lands its cells belong beside it.
+  // The land-section-only variant lives in the runInitProject describe; this walks all four.
+  it('rewriting an existing marker through an all-defaults advanced session leaves it byte-identical', async () => {
+    // Quick pass: key, tool, cmd, shell, timeout, reviewer(N), land; the trailing fork falls
+    // back to N.
+    const quickAnswers = ['ACME', 'claude', 'npm run check', '', '', '', 'noriq/integration'];
+    await run(quickAnswers);
+    const before = await readFile(path.join(dir, '.noriq', 'project.toml'), 'utf8');
+
+    // Rewrite pass over the EXISTING file: overwrite(y), the same quick answers, then every
+    // advanced question blank — [defaults] ×6, land envelope ×4 (autoPush stays N, so no
+    // mergeTarget question), permissions ×4 (allow loop + three deny loops), defaultBranch.
+    await run(['y', ...quickAnswers, ...Array(6).fill(''), ...Array(4).fill(''), ...Array(4).fill(''), ''], {
+      advanced: true,
+    });
+    const after = await readFile(path.join(dir, '.noriq', 'project.toml'), 'utf8');
+    expect(after).toBe(before);
+  });
+
   // The glue over phase 2, driven end to end: ONE wizard session curating every section, its
   // file read back through the daemon's own path. Slot order: key, tool, verify cmd, shell,
   // timeout, reviewer? (y), model, effort, rounds, land branch; then [defaults] ×6 (model +
