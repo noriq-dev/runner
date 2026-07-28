@@ -1977,24 +1977,25 @@ export class RunSupervisor {
       })
       .finally(() => ctx.tally.chargeTime((monotonicMs() - startedAt) / 1000));
 
-    // Fold the builder's responses into the ledger FIRST — before any outcome branch — so a
-    // rebuttal it managed to stream survives even a turn that then ended badly, and a continuation's
-    // fresh reviewer sees it as a prior adjudication (RUN-174 criterion 7). Whatever `buildLedger`
-    // does with each response (fold a CONTESTED onto its entry, keep an existing answer, ignore an
-    // unmatched id) is the ledger the run reports either way. NO checkpoint above, so the diff a
-    // fresh reviewer would read is still the one the terminal round judged.
+    // The response↔terminal-finding join, computed ONCE here — before the ledger fold, the exit
+    // branch, and the eligibility gate below all read it (RUN-179 criterion 4). A response is
+    // EVIDENCE only when it points at something AND names an id THIS terminal round raised: a
+    // pointerless self-assertion is persuasion the next reviewer cannot check, and a `FINDING 99`
+    // naming no terminal finding is context from nowhere. Folding this ONE `matched` set — not the
+    // raw responses — is what keeps the ledger the verifiable-pointer record RUN-79 designed, and
+    // stops the join being re-derived, divergently, at each site.
     const contestText = ctx.getSessionText?.().slice(textBefore) ?? '';
     const responses = parseFindingResponses(contestText);
-    const answered = buildLedger(args.ledger, args.findings, responses, args.terminalRound);
-
-    // The ids THIS terminal round raised — the response↔terminal-id join, computed ONCE before the
-    // exit branch and the eligibility gate diverge (RUN-179). `buildLedger` already folds a response
-    // solely onto the finding sharing its id, so a `FINDING 99` naming no terminal finding never
-    // enters `answered`; restricting the contested set to the same ids keeps the eligibility side
-    // just as faithful. Without it an unknown id sits in `contested` unqueried — harmless only
-    // because the `every` gate reads per terminal finding — and would buy a fresh adjudicator over
-    // unchanged code the moment that gate were ever weakened to 'at least one survives'.
     const terminalIds = new Set(args.findings.map((f) => f.id));
+    const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
+
+    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
+    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
+    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
+    // one the terminal round judged.
+    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
 
     // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
     // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
@@ -2007,17 +2008,13 @@ export class RunSupervisor {
 
     // ── the canonical reconciliation (RUN-174) ────────────────────────────────────────────────
     // ONE place decides whether the contest cleared the run, so no exit can clear a finding another
-    // would have kept. A terminal finding is a CANDIDATE to clear only when the builder CONTESTED it
-    // with a non-empty pointer AND that contest is VISIBLE to the adjudicator — its entry survived
-    // into the ledger the fresh reviewer is handed. Silence, a `FIXED` (nothing was changed here to
-    // fix), an empty pointer, a response for another id, or a finding a ledger cap dropped from the
-    // adjudicator's view is not a candidate, so it still stands. What "checkable" means beyond
-    // non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
-    const contested = new Set(
-      responses
-        .filter((r) => r.status === 'contested' && r.pointer.trim().length > 0 && terminalIds.has(r.id))
-        .map((r) => r.id),
-    );
+    // would have kept. Of the `matched` evidence above, a terminal finding is a CANDIDATE to clear
+    // only when the builder CONTESTED it (a `FIXED` changed nothing here) AND that contest is VISIBLE
+    // to the adjudicator — its entry survived the ledger cap into what the fresh reviewer is handed.
+    // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
+    // pointer or a response for another id never reached `matched` at all. What "checkable" means
+    // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
+    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
     const loc = (s: string) => s.trim().toLowerCase();
     const visibleToAdjudicator = (f: Finding) =>
       answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));

@@ -3683,6 +3683,28 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(entry?.pointer).toContain('src/a.ts:9');
   });
 
+  // RUN-179: the single matched-response join runs BEFORE the ledger fold, so a POINTERLESS contest
+  // streamed before the turn dies is persuasion with nothing to check — it is discarded, not
+  // persisted as a contested rebuttal a continuation's fresh reviewer would then have to relitigate.
+  it('does NOT persist a pointerless contest as a rebuttal, even from a crashed contest turn', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED']; // a self-assertion with no pointer
+    h.claude.continueOutcomes = ['failed']; // streams it, then dies
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    const record = h.continuable.puts.at(-1);
+    const entry = record?.ledger.find((e) => e.id === 1);
+    expect(entry).toBeDefined(); // the finding is still in the ledger…
+    expect(entry?.status).toBe('unanswered'); // …but the pointerless contest was not folded as evidence
+    expect(entry?.pointer).toBeNull();
+  });
+
   // The PASS is the daemon's to accept, not the reviewer's to assert: a malformed report that lists
   // a terminal finding and then signs PASS has cleared nothing (criterion 3/4). This also covers the
   // pointer a fresh reviewer rejects — it re-raises the finding, and the daemon takes the FAIL.
