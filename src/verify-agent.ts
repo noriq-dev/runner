@@ -126,9 +126,16 @@ const DIAGNOSIS_CAP = 300;
 
 /** "Several", made mechanical. RUN-90's prose bar is "several instances + unlike mechanisms + one
  *  named broken promise, cited"; a machine can count the cited instances and read the diagnosis,
- *  but cannot judge "unlike mechanisms" — that half stays in the prompt, and this floor is the
- *  checkable part that cannot be met by one word. */
+ *  but cannot judge "unlike mechanisms" — the checkable proxy is that the instances span more
+ *  than one FILE (below), and the qualitative half stays in the prompt. */
 export const ESCALATION_INSTANCE_FLOOR = 3;
+
+/** The named-broken-promise half, as a floor a shrug cannot meet. `pointsAtSomething`'s three
+ *  alphanumerics was the wrong precedent to reuse here: it guards a claim's EVIDENCE, where `bad`
+ *  next to three citations would have been honoured — but the diagnosis IS the deliverable (it is
+ *  the sentence a human re-dispatches around), and a promise has a subject and a verb where a
+ *  word has neither. Four words is low enough that no genuinely named invariant ever trips it. */
+const ESCALATION_PROSE_FLOOR = 4;
 
 const capLine = (s: string, n: number): string => {
   const t = s.trim();
@@ -180,7 +187,11 @@ export interface EscalationReading {
  *   the ledger can see.
  * - At least ESCALATION_INSTANCE_FLOOR distinct `file:line` instances are cited, on the named
  *   finding or the token line itself — "several instances, cited", counted.
- * - The diagnosis names the promise in words: a line that is only citations has evidenced
+ * - The cited instances span more than one file — the checkable proxy for "unlike mechanisms".
+ *   RUN-90's structural evidence is "a trim in one path, a split in another"; three sites one
+ *   file-local fix could close are the BOUNDED case wearing the token.
+ * - The diagnosis names the promise in a sentence (ESCALATION_PROSE_FLOOR words beyond the
+ *   citations): a line that is only citations, or a one-word shrug beside them, has evidenced
  *   something but named nothing to re-dispatch around.
  *
  * A report with no token returns `{ null, null }` and the caller's behaviour is byte-identical to
@@ -213,11 +224,20 @@ export function readEscalation(output: string): EscalationReading {
       );
       continue;
     }
-    // The named-broken-promise half: strip the citations and require words to remain. Three
-    // alphanumerics is `pointsAtSomething`'s bar — the smallest that rejects punctuation-and-shrug.
-    if ((diagnosis.replace(INSTANCE_RE, ' ').match(/[a-z0-9]/gi)?.length ?? 0) < 3) {
+    const files = new Set(instances.map((i) => i.slice(0, i.lastIndexOf(':')).toLowerCase()));
+    if (files.size < 2) {
       demotions.push(
-        'cites instances but names no broken promise — the diagnosis is what a human re-dispatches around',
+        'every cited instance sits in one file — structural means unlike mechanisms, and one file is one place to fix',
+      );
+      continue;
+    }
+    // Words with at least two letters, citations stripped first so a pile of paths cannot count
+    // as the promise they fail to name.
+    if (
+      (diagnosis.replace(INSTANCE_RE, ' ').match(/[a-z]{2,}[\w-]*/gi)?.length ?? 0) < ESCALATION_PROSE_FLOOR
+    ) {
+      demotions.push(
+        'cites instances but names no broken promise — a diagnosis is a sentence naming the invariant, not a word beside citations',
       );
       continue;
     }

@@ -2070,6 +2070,25 @@ export class RunSupervisor {
     transcript.milestone(reviewVerdictMilestone(readjudged, args.rounds + 2));
     const settled = buildLedger(answered, parseFindings(readjudged.findings), [], args.rounds + 2);
 
+    // RUN-175: the contest's fresh look is a reviewer round like any other, and the token is a
+    // per-round judgement honoured when raised — so an HONOURED escalation from this adjudicator
+    // must ride out rather than be replaced by the pre-contest verdict below, which would report
+    // the one run a reviewer proved unconvergeable as a plain rejection with the diagnosis written
+    // and unread. Its OWN report is what survives (not the terminal round's): the escalation's
+    // finding number points into that report, and the terminal findings it did not clear are in
+    // the ledger it carries. An escalation only ever rides a FAIL, so this cannot shadow the
+    // contest-cleared PASS branch beneath it.
+    if (readjudged.escalation) {
+      this.log.info(
+        'the contest’s fresh reviewer escalated STRUCTURAL — the run fails with the cause named',
+        {
+          runId: ctx.run.id,
+        },
+      );
+      transcript.milestone('the contest’s fresh look escalated STRUCTURAL — the run fails');
+      return { ...readjudged, rounds: args.rounds, ledger: settled };
+    }
+
     // The PASS is DAEMON-decided, not taken on the reviewer's word: it clears the run only if the
     // fresh reviewer PASSed AND re-raised none of the terminal findings. A pointer it rejected it
     // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not

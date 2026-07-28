@@ -3674,6 +3674,35 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(h.worktrees.removed).toEqual([]); // the diff is kept for a human
   });
 
+  // RUN-175: the contest's fresh adjudicator is a reviewer round like any other, so an honoured
+  // escalation it raises must ride out — not be replaced by the pre-contest verdict, which would
+  // report the one run a reviewer proved unconvergeable as a plain rejection, diagnosis unread.
+  it('an honoured escalation from the contest’s fresh reviewer fail-fasts with the diagnosis (RUN-175)', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the guard already covers this'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs, token-free — the contest turn runs
+    await onReviewTurn(h, 3);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/a.ts:1: the guard floor is re-derived per site — also src/b.ts:2 and src/c.ts:3',
+        'ESCALATE STRUCTURAL FINDING 1: no single chokepoint enforces the guard floor — src/a.ts:1, src/b.ts:2, src/c.ts:3',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // the fresh adjudicator escalates instead of merely re-raising
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('review:structural'); // not the plain 'review' rejection
+    const body = h.comments.at(-1)?.body ?? '';
+    expect(body).toMatch(/STRUCTURALLY unconvergeable/);
+    expect(body).toContain('no single chokepoint enforces the guard floor'); // the diagnosis surfaced
+  });
+
   // The leak the RUN-174 gate closes: a fresh re-review is not a free reroll of the verdict. Unless
   // the builder actually CONTESTED a finding with a checkable pointer, the finding stands and NO
   // reviewer is spawned to possibly-PASS over it (criterion 4).

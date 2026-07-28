@@ -184,6 +184,34 @@ describe('readEscalation (RUN-175)', () => {
     expect(r.demoted).toMatch(/names no broken promise/);
   });
 
+  it('demotes a one-word shrug beside three real citations — a diagnosis is a sentence, not a word', () => {
+    // The reviewer round-1 catch: `bad` plus three file references cleared the old alphanumeric
+    // bar. The diagnosis is the deliverable — it is the sentence a human re-dispatches around —
+    // so a token whose prose could not name an invariant is demoted, however well it cites.
+    const r = readEscalation(
+      [
+        'FINDING 1 [High] src/a.ts:1: bad',
+        'ESCALATE STRUCTURAL FINDING 1: bad — src/a.ts:1, src/b.ts:2, src/c.ts:3',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    expect(r.escalation).toBeNull();
+    expect(r.demoted).toMatch(/a sentence naming the invariant/);
+  });
+
+  it('demotes instances that all sit in ONE file — unlike mechanisms cannot live in one place', () => {
+    // Three sites a single file-local fix could close are the BOUNDED case wearing the token.
+    const r = readEscalation(
+      [
+        'FINDING 1 [High] src/a.ts:1: the floor drops at src/a.ts:22 and src/a.ts:47 as well',
+        'ESCALATE STRUCTURAL FINDING 1: no single check enforces the floor — src/a.ts:1, src/a.ts:22, src/a.ts:47',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    expect(r.escalation).toBeNull();
+    expect(r.demoted).toMatch(/one file/);
+  });
+
   it('never converts a PASS — a token on a passing report is ignored, with the reason surfaced', () => {
     const r = readEscalation(STRUCTURAL.replace('VERDICT: FAIL', 'VERDICT: PASS'));
     expect(r.escalation).toBeNull();
