@@ -13,7 +13,6 @@ import {
 
 const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
-  network: 'restricted',
   allow: [],
   deny: [],
   auto: false,
@@ -120,8 +119,8 @@ describe('clampPermissionToWorkflow — the workflow-independent write floor (RU
     expect(clampPermissionToWorkflow(p, workflowFor('verify'))).toBe(p);
   });
 
-  it('clamps ONLY write — deny/allow/network/auto pass through', () => {
-    const p = profile({ write: true, deny: ['Bash'], network: 'full', auto: true });
+  it('clamps ONLY write — deny/allow/auto pass through', () => {
+    const p = profile({ write: true, deny: ['Bash'], auto: true });
     const clamped = clampPermissionToWorkflow(p, workflowFor('scope'));
     expect(clamped).toEqual({ ...p, write: false });
   });

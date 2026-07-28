@@ -21,6 +21,22 @@ export const TaskStatus = z.enum([
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
 
+/**
+ * Is this task finished with — nothing further will happen to it? `done` and `cancelled`
+ * are both terminal: one succeeded, one was abandoned, and NEITHER is still owed work.
+ *
+ * This exists because "finished" was re-derived at every call site and the copies drifted
+ * (PLNR-229): the server's phase-order gate and the dispatch pump correctly read
+ * `NOT IN ('done','cancelled')`, while the Plans view asked `!== 'done'` — so one cancelled
+ * task pinned a plan to that phase forever, showing as unfinished work that could never be
+ * finished. A gate and a progress bar disagreeing about what "settled" means is exactly the
+ * bug, so the predicate lives once, beside the status it reads.
+ *
+ * NB `failed` is deliberately NOT settled: a gate-failed task is re-armable and still owed.
+ */
+export const isSettledTaskStatus = (status: string | null | undefined): boolean =>
+  status === 'done' || status === 'cancelled';
+
 export const AgentRole = z.enum(['orchestrator', 'worker']);
 export type AgentRole = z.infer<typeof AgentRole>;
 

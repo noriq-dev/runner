@@ -15,7 +15,6 @@ import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 
 const perm = (write: boolean): PermissionProfile => ({
   write,
-  network: 'restricted',
   allow: [],
   deny: [],
   auto: false,

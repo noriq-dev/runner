@@ -250,7 +250,7 @@ describe('what the stage refuses to persist', () => {
 describe('the planner’s posture, as it actually reaches the driver', () => {
   it('drops `auto`, which the write clamp deliberately preserves', async () => {
     const { plannerPermission } = await import('../src/supervisor');
-    const build = { write: true, network: 'restricted' as const, allow: [], deny: [], auto: true };
+    const build = { write: true, allow: [], deny: [], auto: true };
     const p = plannerPermission(build);
     expect(p.write).toBe(false);
     // `auto` survives clampPermissionToWorkflow by design (RUN-68) — and on Claude it means
@@ -262,7 +262,6 @@ describe('the planner’s posture, as it actually reaches the driver', () => {
     const { plannerPermission } = await import('../src/supervisor');
     const p = plannerPermission({
       write: true,
-      network: 'restricted',
       allow: ['Bash(npm test)'],
       deny: ['Read(.env)'],
       auto: false,
