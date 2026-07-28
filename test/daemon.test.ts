@@ -1,9 +1,23 @@
-import { ExecutionSpec } from '@noriq-dev/shared';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { ExecutionSpec, RunnerConfig } from '@noriq-dev/shared';
 import type { Run } from '@noriq-dev/shared';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
-import { continuationLockScope, orphanSweep, shouldForwardRunStatus, telemetryFrame } from '../src/daemon';
+import {
+  Daemon,
+  continuationLockScope,
+  orphanSweep,
+  shouldForwardRunStatus,
+  telemetryFrame,
+} from '../src/daemon';
+import type { DaemonHandle } from '../src/daemon';
 import { zeroTelemetry } from '../src/drivers/types';
+import { ParkedStore } from '../src/parked';
+import type { RunReport } from '../src/supervisor';
+import type { WsFactory, WsSocket } from '../src/ws-client';
 
 // The daemon's report→frame gate. Untested until now, which is how the same bug shipped
 // twice: a frame carrying new facts under an UNCHANGED status gets silently dropped, and
@@ -296,5 +310,201 @@ describe('orphanSweep', () => {
     expect(warned).toHaveLength(1);
     await sweep(true);
     expect(warned).toHaveLength(1); // still kept, still reported by the return — just not re-warned
+  });
+});
+
+// RUN-173. RUN-172 made the executed-spec record an append-only history and fixed its delivery, but
+// its RETENTION half — that the daemon holds the record until a frame carrying it actually leaves
+// the socket — lived in the `report` closure inside `daemon.start()` with no way to reach it. The
+// property is delicate: a down socket still sets `held.ws`, so keying the clear on its presence
+// (the pre-RUN-173 code) counted a dropped frame as a delivery and lost the record with nothing to
+// correct it. These drive a real `start()` with a fake WsFactory and a fake fetch — no socket, no
+// HTTP, no ~/.noriq — capture the wired-up `report`, and exercise the retention directly.
+describe('daemon.start() executed-spec retention (RUN-173)', () => {
+  // A socket that records what it is handed — or throws, modelling a down link, which is exactly how
+  // `sendRaw` observes a frame that never left. `deliver` flips between frames to bring it up/down.
+  class FakeDaemonSocket implements WsSocket {
+    sent: string[] = [];
+    deliver = true;
+    private readonly listeners = new Map<string, Array<(...a: unknown[]) => void>>();
+    constructor(
+      readonly url: string,
+      readonly headers: Record<string, string>,
+    ) {}
+    on(event: string, listener: (...a: unknown[]) => void): void {
+      const arr = this.listeners.get(event) ?? [];
+      arr.push(listener);
+      this.listeners.set(event, arr);
+    }
+    send(data: string): void {
+      if (!this.deliver) throw new Error('socket down'); // ws throws when it cannot queue — sendRaw catches → false
+      this.sent.push(data);
+    }
+    close(): void {
+      for (const cb of this.listeners.get('close') ?? []) cb();
+    }
+    telemetry(): Array<Record<string, unknown>> {
+      return this.sent
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((m) => m.type === 'run.telemetry');
+    }
+  }
+
+  const quiet = { info() {}, warn() {}, error() {}, debug() {} } as never;
+  const spec = ExecutionSpec.parse({ anticipatedFiles: [{ path: 'src/a.ts', action: 'modify' }] });
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  let tmp: string;
+  const handles: DaemonHandle[] = [];
+  beforeEach(async () => {
+    tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-daemon-'));
+  });
+  afterEach(async () => {
+    for (const h of handles.splice(0)) await h.stop().catch(() => {});
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  // A config with NO scan roots: discovery is a no-op and the orphan sweep trivial, so start() never
+  // touches a real repo. Built through the contract so budget/update carry their real defaults, then
+  // the roots are emptied (the schema demands ≥1, which parse would reject).
+  const config = (): RunnerConfig => ({
+    ...RunnerConfig.parse({
+      label: 'test',
+      server: 'https://noriq.example',
+      scanRoots: ['/unused'],
+      tools: ['claude'],
+      update: { check: false }, // no version-check fetch or timer
+    }),
+    scanRoots: [],
+  });
+
+  // A fetch that answers registration and owed-merges off-line — never a real host. Records the
+  // paths it saw so a test can assert start() issued no request it did not fake.
+  function fakeFetch(calls: string[]): typeof fetch {
+    return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = String(input);
+      calls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
+      let body: unknown = {};
+      if (new URL(url).pathname === '/api/runners' && (init?.method ?? 'GET') === 'POST') {
+        body = {
+          runner: {
+            id: 'rnr_test',
+            projectId: null,
+            label: 'test',
+            status: 'online',
+            capabilities: { tools: ['claude'], kinds: ['build'], maxConcurrency: 1 },
+            repos: [],
+            freeSlots: 1,
+            lastHeartbeatAt: null,
+            createdAt: '2026-07-28T00:00:00.000Z',
+          },
+        };
+      } else if (url.includes('/owed-merges')) {
+        body = { owed: [] };
+      }
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+  }
+
+  // Drive start() with every seam faked, capturing the `report` callback the daemon wires into the
+  // supervisor — the closure under test. The supervisor itself is a stub: no run is dispatched, so
+  // supervise/resume never fire, but expireStaleParks runs at startup and must answer.
+  async function harness() {
+    const sockets: FakeDaemonSocket[] = [];
+    const connect: WsFactory = (url, headers) => {
+      const s = new FakeDaemonSocket(url, headers);
+      sockets.push(s);
+      return s;
+    };
+    const calls: string[] = [];
+    let report!: (runId: string, rep: RunReport) => void;
+    const daemon = new Daemon(config(), 'tok', {
+      logger: quiet,
+      connect,
+      fetchImpl: fakeFetch(calls),
+      parked: new ParkedStore(path.join(tmp, 'parked.json')),
+      continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
+      stateFile: path.join(tmp, 'state.json'),
+      createSupervisor: (deps) => {
+        report = deps.report;
+        return { supervise: async () => ({}), resume: async () => null, expireStaleParks: async () => 0 };
+      },
+    });
+    const handle = await daemon.start();
+    handles.push(handle);
+    await tick(); // let WsClient.open() resolve the token and set its socket
+    return { handle, sockets, calls, report };
+  }
+
+  it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
+    const { handle, sockets, calls } = await harness();
+    expect(handle.runnerId).toBe('rnr_test');
+    // One fake socket, constructed by the injected factory — never a real ws dial.
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.url).toBe('wss://noriq.example/ws/runner/rnr_test');
+    // Registration went through the fake fetch; nothing hit a real endpoint.
+    expect(calls).toContain('POST /api/runners');
+    expect(
+      calls.every(
+        (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
+      ),
+    ).toBe(true);
+  });
+
+  it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {
+    const { sockets, report } = await harness();
+    const s = sockets[0]!;
+
+    // Socket down: the spec resolves, the report is made, but the telemetry frame throws on send.
+    s.deliver = false;
+    report('run_1', { status: 'running', executedSpec: spec });
+    expect(s.telemetry()).toHaveLength(0); // nothing left the socket
+
+    // Socket up: a later tick that itself carries NO spec must still deliver the HELD one.
+    s.deliver = true;
+    report('run_1', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 10 } });
+    const delivered = s.telemetry();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.executedSpec).toMatchObject({ anticipatedFiles: [{ path: 'src/a.ts' }] });
+
+    // Cleared: the next successful tick carries null, proving the daemon no longer holds it.
+    report('run_1', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 20 } });
+    expect(s.telemetry()).toHaveLength(2);
+    expect(s.telemetry()[1]!.executedSpec).toBeNull();
+  });
+
+  it('drops the pending record on a terminal status even when it never delivered', async () => {
+    const { sockets, report } = await harness();
+    const s = sockets[0]!;
+
+    // Retained (send fails), then the run fails while the socket is still down — never delivered.
+    s.deliver = false;
+    report('run_2', { status: 'running', executedSpec: spec });
+    report('run_2', { status: 'failed' });
+    expect(s.telemetry()).toHaveLength(0);
+
+    // Socket restored: a subsequent live tick carries null — the terminal status dropped the record.
+    s.deliver = true;
+    report('run_2', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 5 } });
+    const delivered = s.telemetry();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.executedSpec).toBeNull();
+  });
+
+  it('a delivered record is also gone once the run reaches a terminal status', async () => {
+    const { sockets, report } = await harness();
+    const s = sockets[0]!;
+
+    // Delivered live (frame carries the spec, cleared on success), then the run completes.
+    report('run_3', { status: 'running', executedSpec: spec });
+    expect(s.telemetry()[0]!.executedSpec).toMatchObject({ anticipatedFiles: [{ path: 'src/a.ts' }] });
+    report('run_3', { status: 'done', exit: { outcome: 'done' } });
+
+    // A stray later tick for the same run carries null — nothing lingers past terminal.
+    report('run_3', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 7 } });
+    expect(s.telemetry().at(-1)!.executedSpec).toBeNull();
   });
 });

@@ -15,7 +15,7 @@ import { buildRegistration } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
-import { type RunReport, RunSupervisor } from './supervisor';
+import { type RunReport, RunSupervisor, type RunSupervisorDeps } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
 import { detectVcs } from './vcs/detect';
@@ -24,7 +24,7 @@ import { GitBackend } from './vcs/git';
 import { PerforceBackend } from './vcs/perforce';
 import type { VcsBackend } from './vcs/types';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
-import { WsClient } from './ws-client';
+import { WsClient, type WsFactory } from './ws-client';
 
 /** How long shutdown waits for stopped runs to report a terminal status. */
 const SHUTDOWN_DRAIN_MS = 5_000;
@@ -95,6 +95,19 @@ export interface DaemonHandle {
   runnerId: string;
   /** Stop live agents, let them report, then close the socket. Await it before exiting. */
   stop(): Promise<void>;
+}
+
+/**
+ * The slice of the supervisor the daemon actually drives (RUN-173). Injected so a test can capture
+ * the wired-up `report` callback — the closure that owes the executed-spec record and must hold it
+ * until a frame carrying it actually leaves the socket — and exercise delivery/retention without a
+ * real run and its whole pipeline. `RunSupervisor` satisfies it; the return types widen to
+ * `Promise<unknown>` because the daemon fires these and never reads their result.
+ */
+export interface SupervisorLike {
+  supervise(run: Run): Promise<unknown>;
+  resume(runId: string, answer: string): Promise<unknown>;
+  expireStaleParks(): Promise<number>;
 }
 
 /**
@@ -217,16 +230,45 @@ export class Daemon {
   private readonly log: typeof defaultLogger;
   private readonly getToken: () => Promise<string>;
   private readonly refreshToken?: () => Promise<string>;
+  /** Injected seams (RUN-173) — real defaults in production, fakes in a `daemon.start()` harness.
+   *  Every one of these is how start() is driven end to end without a socket, HTTP, or ~/.noriq. */
+  private readonly connect?: WsFactory;
+  private readonly fetchImpl?: typeof fetch;
+  private readonly createSupervisor: (deps: RunSupervisorDeps) => SupervisorLike;
+  private readonly parkedStore?: ParkedStore;
+  private readonly continuableStore?: ContinuableStore;
+  private readonly stateFile?: string;
 
   constructor(
     private readonly config: RunnerConfig,
     /** A literal token, or a TokenSource-shaped provider that keeps itself fresh. */
     token: string | { get(): Promise<string>; refresh(): Promise<string> },
-    deps: { logger?: typeof defaultLogger } = {},
+    deps: {
+      logger?: typeof defaultLogger;
+      /** WS socket factory — the real `ws` by default, a fake that never dials in tests. */
+      connect?: WsFactory;
+      /** fetch for the REST client — global `fetch` by default, a fake in tests so start()
+       *  registers and reconciles without a real HTTP request. */
+      fetchImpl?: typeof fetch;
+      /** How the supervisor is built — `new RunSupervisor` by default. A test supplies a factory
+       *  that captures the wired-up `report` callback (the executed-spec retention closure). */
+      createSupervisor?: (deps: RunSupervisorDeps) => SupervisorLike;
+      /** On-disk stores and state file — default to ~/.noriq; a test points them at a temp dir so
+       *  a fully-driven start() writes nothing to the operator's home. */
+      parked?: ParkedStore;
+      continuable?: ContinuableStore;
+      stateFile?: string;
+    } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
     this.getToken = typeof token === 'string' ? async () => token : () => token.get();
     this.refreshToken = typeof token === 'string' ? undefined : () => token.refresh();
+    this.connect = deps.connect;
+    this.fetchImpl = deps.fetchImpl;
+    this.createSupervisor = deps.createSupervisor ?? ((d) => new RunSupervisor(d));
+    this.parkedStore = deps.parked;
+    this.continuableStore = deps.continuable;
+    this.stateFile = deps.stateFile;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -234,6 +276,7 @@ export class Daemon {
       server: this.config.server,
       token: () => this.getToken(),
       onUnauthorized: this.refreshToken,
+      fetchImpl: this.fetchImpl,
     });
     const repos = await discoverRepos(this.config.scanRoots);
     this.log.info(`discovered ${repos.length} repo(s)`, {
@@ -270,11 +313,11 @@ export class Daemon {
     // Runs parked on a human (RUN-30). On disk, because that is the point: the answer may come
     // tomorrow, and a daemon that forgot across a restart would strand both the run and the
     // worktree holding its work.
-    const parked = new ParkedStore();
+    const parked = this.parkedStore ?? new ParkedStore();
     // Continuation state for a "continue a failed run" (RUN-91/92): a failed build's spend and
     // adjudication ledger, kept on disk beside the worktree it belongs to so a re-dispatch of the
     // same run id re-seeds instead of resetting. Same rationale as `parked` — survive a restart.
-    const continuable = new ContinuableStore();
+    const continuable = this.continuableStore ?? new ContinuableStore();
 
     // Both stores are constructed HERE, before the first sweep, and not down beside the rest of
     // the supervisor's deps where they used to live: the sweep must know what they are holding
@@ -291,14 +334,14 @@ export class Daemon {
     });
     await sweepOrphans(false);
 
-    const state = await loadState();
+    const state = await loadState(this.stateFile);
     const tools = this.config.tools ?? detectTools();
     const registration = buildRegistration(
       { label: this.config.label, concurrency: this.config.concurrency, tools, runnerId: state.runnerId },
       repos,
     );
     const runner = await client.registerRunner(registration);
-    await saveState({ runnerId: runner.id });
+    await saveState({ runnerId: runner.id }, this.stateFile);
     this.log.info('registered with Noriq', {
       runnerId: runner.id,
       status: runner.status,
@@ -324,7 +367,7 @@ export class Daemon {
      *  whole life. */
     const pendingSpec = new Map<string, ExecutionSpec>();
     const steering = new SteeringBridge({ logger: this.log });
-    const supervisor = new RunSupervisor({
+    const supervisor = this.createSupervisor({
       drivers: {
         claude: new ClaudeDriver({ logger: this.log }),
         codex: new CodexDriver({ logger: this.log }),
@@ -361,7 +404,7 @@ export class Daemon {
           // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
           // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
           if (held.ws) {
-            held.ws.sendTelemetry(runId, {
+            const left = held.ws.sendTelemetry(runId, {
               ...telemetryFrame(rep),
               logTail: rep.logTail ?? null,
               phase: rep.phase ?? null,
@@ -370,9 +413,11 @@ export class Daemon {
               // there and silently dropped.
               executedSpec: spec,
             });
-            // Only once it has actually left. `held.ws?.` would have counted a down socket as a
-            // delivery, which is the exact case this exists for.
-            if (spec) pendingSpec.delete(runId);
+            // Clear the pending record ONLY once the frame actually LEFT the socket — that is what
+            // sendTelemetry's boolean reports. A down socket still sets `held.ws`, so keying the
+            // clear on its presence counted a dropped frame as a delivery and lost the record with
+            // nothing to correct it; retaining it lets the next live frame re-send (RUN-172/173).
+            if (spec && left) pendingSpec.delete(runId);
           }
         }
         if (rep.status === 'done' || rep.status === 'failed') pendingSpec.delete(runId);
@@ -441,6 +486,7 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
+      connect: this.connect,
       freeSlots: () => Math.max(0, this.config.concurrency - this.active.size),
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
