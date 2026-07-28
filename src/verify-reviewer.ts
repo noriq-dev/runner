@@ -22,9 +22,17 @@ export interface ReviewerPromptContext {
   /** How to inspect the accumulated diff. Absent on a non-git backend — the prompt then
    *  points at the working tree instead of a command it can't run. */
   diffCmd?: string;
-  /** The deterministic floor's command, when one is configured — the reviewer is told it
-   *  already passed so it spends its turns on what the command CANNOT check. */
-  verifyCmd?: string | null;
+  /**
+   * The deterministic floor's command, split by whether it has actually RUN yet (RUN-177).
+   *
+   * At most one is ever set. `verifyPassed` is the original sentence — spend your turns on what a
+   * green suite cannot prove. `verifyPending` is the landing path, where the command runs after
+   * this review against the rebased result: the reviewer is still told not to re-run it (the real
+   * gate is coming), but it is no longer told a suite passed when nothing has run. A gate that
+   * cannot re-run the command has no way to discover the premise was false.
+   */
+  verifyPassed?: string | null;
+  verifyPending?: string | null;
   /** Findings already raised and answered in earlier rounds (RUN-79). Empty/absent on the
    *  first look — a fresh reviewer with no history yet. Rendered into the PRIOR ADJUDICATIONS
    *  section so a settled finding is verified, not relitigated. */
@@ -114,7 +122,8 @@ export interface ReviewerPromptContext {
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
-    verifyCmd: ctx.verifyCmd ?? null,
+    verifyPassed: ctx.verifyPassed ?? null,
+    verifyPending: ctx.verifyPending ?? null,
     intent: ctx.intent,
     context: ctx.repoContext ?? '',
     priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,

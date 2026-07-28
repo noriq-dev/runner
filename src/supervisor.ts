@@ -1488,6 +1488,8 @@ export class RunSupervisor {
     acceptanceOverflow?: number;
     /** The requirement ids a finding may name (RUN-147). */
     requirements?: string[];
+    /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
+    verifyRan?: boolean;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
@@ -1693,6 +1695,8 @@ export class RunSupervisor {
     acceptanceOverflow?: number;
     /** The requirement ids a finding may name (RUN-147). */
     requirements?: string[];
+    /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
+    verifyRan?: boolean;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -1770,7 +1774,12 @@ export class RunSupervisor {
       prompt: assembleReviewerPrompt({
         intent: ctx.intent,
         diffCmd,
-        verifyCmd: cmdVerify(manifest.verify)?.cmd ?? null,
+        // Split in two (RUN-177) because the two states are different facts and only one of them
+        // was ever told. A landing run's deterministic command runs AFTER this review, against the
+        // rebased result — telling the reviewer it "already passed" is false there, and it is
+        // instructed not to re-run it, so it cannot find out.
+        verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
+        verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
         ledger: ctx.ledger,
         repoContext: reviewerContext,
         ...(ctx.acceptance?.length

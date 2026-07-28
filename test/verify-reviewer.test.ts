@@ -48,11 +48,34 @@ describe('the [verify] choice (RUN-61) — schema', () => {
 });
 
 describe('assembleReviewerPrompt', () => {
+  // On a landing repo the deterministic command runs AFTER the review, against the rebased result
+  // (`stages/verify.ts` skips it when `[land]` is configured). The reviewer used to be told it
+  // "already passed" regardless — a false premise handed to a gate that is also told not to re-run
+  // it, so it had no way to find out (RUN-177).
+  it('does not claim the deterministic check passed when it has not run yet', () => {
+    const p = assembleReviewerPrompt({
+      intent: 'RUN-9 — make the thing work',
+      diffCmd: 'git diff abc...HEAD',
+      verifyPending: 'npm run check',
+    });
+    expect(p).toContain('npm run check');
+    expect(p).not.toMatch(/already passed/);
+    expect(p).toMatch(/has NOT run yet/);
+    // Still told not to burn turns on it — the point was never to invite a re-run.
+    expect(p).toMatch(/do not re-run it here/i);
+  });
+
+  it('says nothing about a deterministic check when the repo configures none', () => {
+    const p = assembleReviewerPrompt({ intent: 'x', diffCmd: 'git diff a...HEAD' });
+    expect(p).not.toMatch(/already passed/);
+    expect(p).not.toMatch(/has NOT run yet/);
+  });
+
   it('is adversarial, read-only, and carries the intent and the diff command', () => {
     const p = assembleReviewerPrompt({
       intent: 'RUN-9 — make the thing work',
       diffCmd: 'git diff abc...HEAD',
-      verifyCmd: 'npm test',
+      verifyPassed: 'npm test',
     });
     expect(p).toMatch(/INDEPENDENT, adversarial/);
     expect(p).toMatch(/Do NOT modify any files/);

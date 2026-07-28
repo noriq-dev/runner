@@ -15,8 +15,9 @@ Look especially for, within the change:
   - tests weakened, skipped, or deleted to make the suite pass,
   - the intent only partially met or silently unmet,
   - missing edge cases and error handling a green test run would miss.
-Every finding names a concrete failure — the inputs or state that trigger it and the wrong result — at a file/line the diff touched, not a vague worry. For code this change touches, dismiss a concern only when the code proves it cannot happen; a realistic but uncertain runtime state is not grounds to drop it. Do NOT manufacture a finding to avoid an empty report: if the change does its job, PASS is the honest verdict.{{#verifyCmd}}
-The deterministic check (`{{verifyCmd}}`) already passed — do not re-run it to grade the work. Spend your turns on what a green suite cannot prove.{{/verifyCmd}}
+Every finding names a concrete failure — the inputs or state that trigger it and the wrong result — at a file/line the diff touched, not a vague worry. For code this change touches, dismiss a concern only when the code proves it cannot happen; a realistic but uncertain runtime state is not grounds to drop it. Do NOT manufacture a finding to avoid an empty report: if the change does its job, PASS is the honest verdict.{{#verifyPassed}}
+The deterministic check (`{{verifyPassed}}`) already passed — do not re-run it to grade the work. Spend your turns on what a green suite cannot prove.{{/verifyPassed}}{{#verifyPending}}
+The deterministic check (`{{verifyPending}}`) has NOT run yet — it runs after this review, against the rebased result, and it gates the work independently of you. So do not re-run it here and do not assume it passes: judge what a suite cannot prove either way, and if you believe the change breaks it, say which case and why.{{/verifyPending}}
 
 When the verdict is FAIL, list each finding on its own line, numbered, so the builder can answer each one by number:
   FINDING <n> [<severity>] <file:line>: <one-sentence claim>

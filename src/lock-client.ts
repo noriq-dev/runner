@@ -138,31 +138,59 @@ export class LockClient {
     projectId: string,
     sel: { lockIds?: string[]; paths?: string[] },
   ): Promise<{ released: string[] }> {
-    const reply = await this.callTool(token, 'release_lock', {
+    const reply = await this.callReleaseTool(token, 'release_lock', {
       projectId,
       ...(sel.lockIds?.length ? { lockIds: sel.lockIds } : {}),
       ...(sel.paths?.length ? { paths: sel.paths } : {}),
     });
-    if (reply.isError) {
-      if (NOT_ENABLED.test(reply.text) || toolMissing('release_lock', reply.text)) return { released: [] };
-      throw new Error(`release_lock: ${reply.text.slice(0, 300)}`);
-    }
+    if (!reply) return { released: [] };
+    if (reply.isError) throw new Error(`release_lock: ${reply.text.slice(0, 300)}`);
     const body = reply.body as { released?: string[] };
     return { released: body?.released ?? [] };
+  }
+
+  /**
+   * A release-path tool call, tolerant of an identity that was never granted the tool. Null means
+   * "nothing to do"; anything else is the reply to interpret.
+   *
+   * The missing-tool answer arrives in one of TWO shapes, and which one depends on how the server
+   * surfaces an unknown tool: a tool result carrying `isError`, or a JSON-RPC error that
+   * `parseToolReply` throws before any caller sees a reply. The live server produced the first;
+   * the MCP SDK's own default is the second. Both mean the same thing on this path, and betting on
+   * either would put a spurious `lock release on terminal failed` on every run — the kind of
+   * standing warning that teaches people to stop reading the log.
+   *
+   * A locking-disabled project is folded in here for the same reason: also nothing to do.
+   */
+  private async callReleaseTool(
+    token: string,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolReply | null> {
+    let reply: ToolReply;
+    try {
+      reply = await this.callTool(token, name, args);
+    } catch (err) {
+      // Only the specific tool this call named — never any "not found" prose, which can carry a
+      // path the caller chose.
+      if (toolMissing(name, String(err))) return null;
+      throw err;
+    }
+    if (reply.isError && (NOT_ENABLED.test(reply.text) || toolMissing(name, reply.text))) return null;
+    return reply;
   }
 
   /**
    * Release EVERY lock this token holds (RUN-104): list its own, then release those ids. The
    * prompt terminal cleanup — for a task-anchored run the server also auto-releases on task
    * settle, and TTL covers a crash, so this is promptness, not correctness. No-op when the
-   * project has locking off or the run held nothing.
+   * project has locking off, the run held nothing, or — the usual case since RUN-177 — no kind's
+   * floor grants the release tools at all.
    */
   async releaseAllMine(token: string, projectId: string): Promise<{ released: string[] }> {
-    const reply = await this.callTool(token, 'list_locks', { projectId, mine: true });
-    if (reply.isError) {
-      if (NOT_ENABLED.test(reply.text) || toolMissing('list_locks', reply.text)) return { released: [] };
-      throw new Error(`list_locks: ${reply.text.slice(0, 300)}`);
-    }
+    const reply = await this.callReleaseTool(token, 'list_locks', { projectId, mine: true });
+    if (!reply) return { released: [] };
+    if (reply.isError) throw new Error(`list_locks: ${reply.text.slice(0, 300)}`);
     const body = reply.body as { enabled?: boolean; locks?: Array<{ id: string }> };
     const ids = (body?.locks ?? []).map((l) => l.id).filter(Boolean);
     if (!ids.length) return { released: [] };

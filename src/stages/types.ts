@@ -82,6 +82,9 @@ export interface StageHost {
     acceptanceOverflow?: number;
     /** The requirement ids a finding may name (RUN-147). */
     requirements?: string[];
+    /** Whether the deterministic command has ALREADY run when this reviewer is asked (RUN-177).
+     *  False on the landing path, where it runs after the review, against the rebased result. */
+    verifyRan?: boolean;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {

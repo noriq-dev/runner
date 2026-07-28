@@ -289,6 +289,40 @@ describe('LockClient under a bound run-agent token (RUN-177)', () => {
     await expect(client(fetchImpl).releaseAllMine('run-token', 'prj_x')).resolves.toEqual({ released: [] });
   });
 
+  it('recognises the missing tool when the server raises it as a JSON-RPC ERROR, not a tool result', async () => {
+    // The two shapes are the whole reason this is a helper. The live server answered with a tool
+    // result carrying isError; the MCP SDK's own default is a JSON-RPC error, which
+    // `parseToolReply` throws before any caller sees a reply. Betting on one would put a standing
+    // `lock release on terminal failed` on every run.
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      if (body.method === 'initialize') return new Response(JSON.stringify({ result: {} }), { status: 200 });
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          error: { message: 'MCP error -32602: Tool list_locks not found' },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    await expect(client(fetchImpl).releaseAllMine('run-token', 'prj_x')).resolves.toEqual({ released: [] });
+  });
+
+  it('a THROWN error that is not about this tool still propagates', async () => {
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      if (body.method === 'initialize') return new Response(JSON.stringify({ result: {} }), { status: 200 });
+      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, error: { message: 'internal error: the room is on fire' } }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    await expect(client(fetchImpl).releaseAllMine('run-token', 'prj_x')).rejects.toThrow(/room is on fire/);
+  });
+
   it('the same holds for a direct release by id', async () => {
     const fetchImpl = fakeMcp(
       () => ({ isError: true, text: 'MCP error -32602: Tool release_lock not found' }),
