@@ -45,7 +45,10 @@ export interface StageHost {
   postComment(projectId: string, taskId: string, body: string): void;
   transcript(runId: string): RunTranscript;
   /** Close and forget a run's transcript — the stream a human reads has to END (RUN-74). */
-  endTranscript(runId: string, outcome: string): void;
+  /** Close the run's transcript and return the seq a NEXT sitting must number from (RUN-183).
+   *  Returned rather than counted by the caller: closing flushes whatever was buffered AND appends
+   *  a terminal milestone, so "one more than before" is not reliably true. */
+  endTranscript(runId: string, outcome: string): number;
   vcsFor(repo: ResolvedRepo): SupervisorVcs;
   /** The branch a run's locks are scoped to. */
   lockScopeBranch(repo: ResolvedRepo, run: Run): string | null;

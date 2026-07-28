@@ -982,10 +982,16 @@ export class RunSupervisor {
       // (RUN-74), and a map that only ever grows is a leak with a nicer name.
       endTranscript: (runId, outcome) => {
         const t = this.transcripts.get(runId);
-        if (!t) return;
+        if (!t) return 0;
         t.milestone(`run finished: ${outcome}`);
         t.end();
+        // Read AFTER closing and before forgetting it: closing flushes whatever was buffered and
+        // then appends the milestone, so the number of seqs it consumes is not fixed. Returning
+        // the real value is what stops a continuation numbering into rows that already exist
+        // (RUN-183) — the caller must never try to derive this by counting.
+        const next = t.nextSeq();
         this.transcripts.delete(runId);
+        return next;
       },
       vcsFor: (repo) => this.vcsFor(repo),
       lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),

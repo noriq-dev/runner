@@ -36,6 +36,34 @@ export class RunTranscript {
 
   constructor(private readonly sink: (segments: RunLogSegment[]) => void) {}
 
+  /**
+   * The next seq this transcript will hand out — what a continuation has to resume FROM (RUN-183).
+   *
+   * The server stores segments under `PRIMARY KEY (run_id, seq)` and writes them with `INSERT OR
+   * IGNORE`, which is what makes redelivery after a reconnect a no-op. A second sitting of the
+   * same run that restarts its numbering at 0 therefore collides with every row the first sitting
+   * wrote, and its transcript is discarded in silence — measured live at 49 minutes of work and
+   * zero recorded segments.
+   */
+  nextSeq(): number {
+    return this.seq;
+  }
+
+  /**
+   * Continue the numbering from a previous sitting (RUN-183).
+   *
+   * Refuses once anything has been emitted: a transcript that has already spoken has a stream a
+   * reader is following, and moving its numbering underneath them would reorder what they see.
+   * Idempotent and safe to call before the first segment, which is the only moment it applies.
+   */
+  seedFrom(seq: number): void {
+    // Only before anything has been EMITTED. Buffered text has not been sent yet, so it is no
+    // obstacle — it will simply go out under the resumed numbering, which is what we want.
+    // Refusing after the fact matters: a transcript that has already spoken has a reader following
+    // it, and moving its numbering underneath them would reorder what they see.
+    if (this.seq === 0 && seq > 0) this.seq = seq;
+  }
+
   /** Streamed output from a session. Buffered; consecutive same-voice text coalesces. */
   /**
    * Streamed output from a session. Buffered; consecutive same-voice text coalesces.

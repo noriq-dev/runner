@@ -139,6 +139,24 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   }
 
   ctx.exit = { ...ctx.exit, telemetry: ctx.tally.total() };
+
+  // Close the transcript and persist the continuation BEFORE the terminal status goes out, and
+  // before the workspace is disposed. The ordering carries three separate constraints:
+  //
+  //  - the record must EXIST by the time the server learns this run failed, because that is what
+  //    makes it re-dispatchable; a continuation that arrives first would find no record and start
+  //    over with none of this sitting's spend, ledger, lock scope or transcript position;
+  //  - `changedPaths` has to be read from a workspace that still exists, and `dispose` below is
+  //    permitted to reap it (a backend that both implements changedPaths and disposes would
+  //    otherwise read a workspace that was just released);
+  //  - the transcript's own numbering is only final once it is CLOSED, since closing flushes what
+  //    was buffered and then appends the terminal milestone (RUN-183).
+  const nextLogSeq = host.endTranscript(
+    run.id,
+    `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`,
+  );
+  await recordContinuation(host, ctx, nextLogSeq);
+
   host.report(run.id, {
     status: ctx.exit.outcome,
     agentId: ctx.runAgent.agentId,
@@ -146,8 +164,6 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     logTail: ctx.tail,
     exit: { outcome: ctx.exit.outcome, reason: ctx.exit.reason },
   });
-
-  await recordContinuation(host, ctx);
 
   // Keep only what a human still has to act on: a build whose diff did NOT land. Once it is on the
   // integration branch the worktree and its throwaway branch are dead weight — reaping them here is
@@ -166,7 +182,6 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // without this a long-lived daemon keeps one entry per cancelled run for its whole life.
   host.forgetCancellation?.(run.id);
   host.log.info('run finished', { runId: run.id, outcome: ctx.exit.outcome, reason: ctx.exit.reason });
-  host.endTranscript(run.id, `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`);
 };
 
 /**
@@ -178,7 +193,13 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
  * OTHER terminal — done, landed, a driver failure, a non-build — leaves nothing to continue, so a
  * record a prior failed sitting left is dropped: this continuation resolved it.
  */
-async function recordContinuation(host: StageHost, ctx: RunPipeline): Promise<void> {
+async function recordContinuation(
+  host: StageHost,
+  ctx: RunPipeline,
+  /** The seq the NEXT sitting must number from (RUN-183) — one past everything this one wrote,
+   *  terminal milestone included. */
+  lastLogSeq: number,
+): Promise<void> {
   const store = host.continuable;
   if (!store) return;
   const { run, repo, worktree, workflow: wf } = ctx;
@@ -206,6 +227,9 @@ async function recordContinuation(host: StageHost, ctx: RunPipeline): Promise<vo
       // ceiling it just spent — the same loophole tokens had.
       activeSeconds: ctx.tally.activeSeconds(),
       ...(changedPaths.length ? { changedPaths } : {}),
+      // Where the transcript got to, so the next sitting numbers ABOVE it rather than colliding
+      // with what this one wrote and vanishing into the server's (runId, seq) dedupe (RUN-183).
+      lastLogSeq,
       failedAt: new Date().toISOString(),
     })
     .catch((err) =>

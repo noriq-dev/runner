@@ -3265,6 +3265,16 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(record?.ledger.length).toBeGreaterThan(0); // the reviewer's finding is carried forward
     expect(failed.continuable.entries.has('run_1')).toBe(true);
 
+    // The next sitting's transcript must number ABOVE everything this one wrote (RUN-183). The
+    // server keys segments on (runId, seq) with INSERT OR IGNORE, so an overlap is not a clash —
+    // it is silence, and a continued run showed a human nothing at all for 49 minutes.
+    const highest = Math.max(...failed.transcript.map((s) => s.seq));
+    expect(record?.lastLogSeq).toBeGreaterThan(highest);
+    // Derived from the closed transcript rather than counted by the caller: closing FLUSHES what
+    // was buffered and then appends a terminal milestone, so "one more than before" is not
+    // reliably true and a caller that assumed it would hand out a number already used.
+    expect(record?.lastLogSeq).toBe(highest + 1);
+
     // Pass: a build that satisfies the gate clears any record a prior failed sitting left.
     const seed: ContinuableRun = {
       runId: 'run_1',

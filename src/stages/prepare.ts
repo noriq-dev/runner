@@ -211,10 +211,18 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const tally = new RunTally(host.runBudget(run), continued?.activeSeconds ?? 0);
   if (continued) {
     tally.seed('__prior__', telemetryFromSpent(continued.spent));
+    // Resume the transcript's NUMBERING as well as its spend (RUN-183). The server keys segments
+    // on (runId, seq) and writes them with INSERT OR IGNORE, so a sitting that numbers from zero
+    // collides with everything the last one wrote and is discarded in silence — measured live at
+    // 49 minutes of work and not one recorded segment, which is the difference between a human
+    // seeing a run work and seeing nothing at all. Absent on an older record: starts at 0, exactly
+    // as before.
+    if (continued.lastLogSeq) host.transcript(run.id).seedFrom(continued.lastLogSeq);
     host.log.info('continuing a failed run — re-seeded prior spend and ledger', {
       runId: run.id,
       priorTokens: continued.spent.tokens,
       ledgerEntries: continued.ledger.length,
+      fromLogSeq: continued.lastLogSeq ?? 0,
     });
   }
 

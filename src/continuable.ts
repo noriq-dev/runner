@@ -70,6 +70,19 @@ export interface ContinuableRun {
    * anticipated files, which covers the first sitting too; this covers the case available today.
    */
   changedPaths?: string[];
+  /**
+   * Where this sitting's transcript numbering finished, so the NEXT one resumes from it (RUN-183).
+   *
+   * The server keys segments on `(runId, seq)` and writes with `INSERT OR IGNORE` — the dedupe
+   * that makes redelivery after a reconnect harmless. A second sitting numbering from 0 therefore
+   * collides with every row the first wrote and is discarded without a word: measured live at
+   * 49 minutes of work and zero recorded segments, which left "running" indistinguishable from
+   * "stalled" for the one case a human is most likely to be watching.
+   *
+   * Optional so a record written before this field still loads; absent reads as "start from 0",
+   * which is exactly the old behaviour rather than a new failure.
+   */
+  lastLogSeq?: number;
   failedAt: string;
 }
 
