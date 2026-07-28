@@ -15,7 +15,7 @@ function fakeMcp(
     name: string,
     args: Record<string, unknown>,
   ) => { body?: unknown; isError?: boolean; text?: string },
-  opts: { calls?: Call[]; sessionId?: string; expireOnce?: boolean } = {},
+  opts: { calls?: Call[]; sessionId?: string; expireOnce?: boolean; bound?: boolean } = {},
 ): typeof fetch {
   let expired = opts.expireOnce ?? false;
   const sid = opts.sessionId ?? 'sess_1';
@@ -29,9 +29,11 @@ function fakeMcp(
       body,
     });
     if (body.method === 'initialize') {
+      // `bound` answers the way the real server answers a run-agent token: a 200 with a valid
+      // result and deliberately NO session header, because the identity is the token itself.
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
         status: 200,
-        headers: { 'mcp-session-id': sid },
+        ...(opts.bound ? {} : { headers: { 'mcp-session-id': sid } }),
       });
     }
     if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
@@ -215,5 +217,77 @@ describe('LockClient', () => {
     await c.acquire('t', { projectId: 'prj_x', paths: ['a'] });
     await c.acquire('t', { projectId: 'prj_x', paths: ['b'] });
     expect(calls.filter((x) => x.method === 'initialize')).toHaveLength(1); // handshake once
+  });
+});
+
+// The lock floor authenticates as the RUN's agent, whose token is BOUND server-side — and the
+// server issues no session id for one, on purpose: the identity is the token, and "no session id
+// can move it". Requiring the header made every lock call from a run agent throw, which failed two
+// finished builds on their first live dispatch (RUN-177).
+describe('LockClient under a bound run-agent token (RUN-177)', () => {
+  it('proceeds when initialize returns 200 with no session id, instead of treating it as a failure', async () => {
+    const fetchImpl = fakeMcp(() => ({ body: { ok: true, locks: [{ id: 'lk_1', path: 'a' }] } }), {
+      bound: true,
+    });
+    const res = await client(fetchImpl).acquire('run-token', { projectId: 'prj_x', paths: ['a'] });
+    expect(res.ok).toBe(true);
+  });
+
+  it('does NOT re-handshake on a 404 — with no session, that is the server’s real answer', async () => {
+    // The stale-session retry exists because a worker isolate can recycle a session out from under
+    // us. A bound token has none, so retrying cannot help, and a failing second handshake would
+    // replace the tool's own error with a misleading one.
+    const calls: Call[] = [];
+    const fetchImpl = fakeMcp(() => ({ body: { ok: true, locks: [] } }), {
+      calls,
+      bound: true,
+      expireOnce: true,
+    });
+    await expect(
+      client(fetchImpl).acquire('run-token', { projectId: 'prj_x', paths: ['a'] }),
+    ).rejects.toThrow(/acquire_lock → 404/);
+    expect(calls.filter((c) => c.method === 'initialize')).toHaveLength(1);
+  });
+
+  it('omits the mcp-session-id header on the tool call — there is no session to name', async () => {
+    const calls: Call[] = [];
+    const fetchImpl = fakeMcp(() => ({ body: { ok: true, locks: [] } }), { calls, bound: true });
+    await client(fetchImpl).acquire('run-token', { projectId: 'prj_x', paths: ['a'] });
+    const call = calls.find((c) => c.body.params?.name === 'acquire_lock');
+    expect(call?.session).toBeNull();
+    expect(call?.auth).toBe('Bearer run-token');
+  });
+
+  it('handshakes ONCE — a null session is an answer, not a missing value to retry for', async () => {
+    // The regression this guards: caching `null` under a `??` lookup reads as "not initialized",
+    // so every call re-handshakes. Cheap to miss, and only visible as call volume.
+    const calls: Call[] = [];
+    const fetchImpl = fakeMcp(() => ({ body: { ok: true, locks: [] } }), { calls, bound: true });
+    const c = client(fetchImpl);
+    await c.acquire('run-token', { projectId: 'prj_x', paths: ['a'] });
+    await c.acquire('run-token', { projectId: 'prj_x', paths: ['b'] });
+    expect(calls.filter((x) => x.method === 'initialize')).toHaveLength(1);
+  });
+
+  it('still treats a non-2xx initialize as fatal — only the MISSING HEADER stopped being an error', async () => {
+    const fetchImpl = (async () =>
+      new Response('{"error":"invalid, expired, or revoked token"}', { status: 401 })) as typeof fetch;
+    await expect(
+      client(fetchImpl).acquire('dead-token', { projectId: 'prj_x', paths: ['a'] }),
+    ).rejects.toThrow(/lock mcp initialize → 401/);
+  });
+
+  it('lets a locking-disabled project answer for itself: enabled=false, no conflicts, no gate', async () => {
+    // The end-to-end shape of the live failure. prj_run has file locking OFF, so the floor had
+    // nothing to check — but initialize threw before the project could say so, and two finished
+    // builds were gated on the silence.
+    const fetchImpl = fakeMcp(
+      () => ({ isError: true, text: 'file locking is not enabled for this project' }),
+      {
+        bound: true,
+      },
+    );
+    const res = await client(fetchImpl).acquire('run-token', { projectId: 'prj_run', paths: ['a'] });
+    expect(res).toEqual({ ok: true, enabled: false, locks: [] });
   });
 });

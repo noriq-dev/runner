@@ -72,9 +72,15 @@ const NOT_ENABLED = /not enabled|locking (is )?off|locking disabled/i;
 export class LockClient {
   private readonly base: string;
   private readonly fetchImpl: typeof fetch;
-  /** One server-assigned MCP session per token (the run's agent). Re-initialized on a stale
-   *  session, exactly like NoriqClient.mcpCall — worker isolates recycle sessions at will. */
-  private readonly sessions = new Map<string, string>();
+  /**
+   * The MCP session per token — or `null` for a token that needs none (RUN-177).
+   *
+   * A runner's per-run token is BOUND to one agent server-side, and the server deliberately
+   * issues no session id for one: the identity comes from the token and "no session id can move
+   * it". So `null` is a real, successful outcome here, not a missing value — which is why this
+   * map is probed with `has()` rather than `??`, or every call would re-handshake.
+   */
+  private readonly sessions = new Map<string, string | null>();
 
   constructor(opts: LockClientOptions) {
     this.base = opts.server.replace(/\/+$/, '');
@@ -176,10 +182,10 @@ export class LockClient {
    * session for `token` lazily and re-initializes ONCE on a session the server has forgotten.
    */
   private async callTool(token: string, name: string, args: Record<string, unknown>): Promise<ToolReply> {
-    const attempt = async (sid: string) => {
+    const attempt = async (sid: string | null) => {
       const res = await this.fetchImpl(`${this.base}/mcp`, {
         method: 'POST',
-        headers: { ...this.headers(token), 'mcp-session-id': sid },
+        headers: { ...this.headers(token), ...(sid ? { 'mcp-session-id': sid } : {}) },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 1,
@@ -189,9 +195,12 @@ export class LockClient {
       });
       return { res, raw: await res.text() };
     };
-    let sid = this.sessions.get(token) ?? (await this.initialize(token));
+    let sid = this.sessions.has(token) ? (this.sessions.get(token) ?? null) : await this.initialize(token);
     let { res, raw } = await attempt(sid);
-    if (res.status === 400 || res.status === 404) {
+    // Only a SESSION can go stale. Under a bound token there is none, so a 400/404 is the server's
+    // real answer about this call — re-handshaking would neither help nor change it, and would
+    // replace the tool's own error with a handshake error if the second initialize failed.
+    if (sid !== null && (res.status === 400 || res.status === 404)) {
       this.sessions.delete(token);
       sid = await this.initialize(token);
       ({ res, raw } = await attempt(sid));
@@ -208,9 +217,19 @@ export class LockClient {
     };
   }
 
-  /** Handshake for a server-assigned session (the server rejects sessionless tool calls as
-   *  unattributable — see NoriqClient.mcpInitialize). Cached per token. */
-  private async initialize(token: string): Promise<string> {
+  /**
+   * Handshake. Cached per token, and `null` is a valid result.
+   *
+   * The server rejects sessionless tool calls as unattributable ONLY when it cannot otherwise tell
+   * who is calling. A bound run-agent token already answers that, so the server returns a 200 with
+   * no `mcp-session-id` header and resolves the agent from the token on every later call.
+   * Requiring the header here is what failed the first two live dispatches (RUN-177): the floor
+   * never got to ask, so a project with locking OFF — which would have answered `enabled:false`
+   * and cost nothing — gated two finished builds instead.
+   *
+   * Only `!res.ok` is fatal. A missing session id is an answer, not a failure.
+   */
+  private async initialize(token: string): Promise<string | null> {
     const headers = this.headers(token);
     const res = await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
@@ -228,14 +247,12 @@ export class LockClient {
     });
     const sid = res.headers.get('mcp-session-id');
     const raw = await res.text();
-    if (!res.ok || !sid) {
-      throw new Error(
-        `lock mcp initialize → ${res.status}${sid ? '' : ' (no mcp-session-id header)'}: ${raw.slice(0, 200)}`,
-      );
+    if (!res.ok) {
+      throw new Error(`lock mcp initialize → ${res.status}: ${raw.slice(0, 200)}`);
     }
     await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
-      headers: { ...headers, 'mcp-session-id': sid },
+      headers: { ...headers, ...(sid ? { 'mcp-session-id': sid } : {}) },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
     }).catch(() => {
       /* best-effort — the tool call is the real probe */

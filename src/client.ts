@@ -246,8 +246,16 @@ export class NoriqClient {
     });
   }
 
-  /** The daemon's live MCP session id (RUN-73). Null until the first call initializes. */
+  /**
+   * The daemon's live MCP session id (RUN-73), and whether the handshake has happened at all.
+   *
+   * Two fields because they answer different questions (RUN-177): a BOUND token is issued no
+   * session id, so `null` is a legitimate post-handshake state and cannot also mean "not yet
+   * initialized" — collapsing them re-handshakes on every call. The daemon's own token is
+   * unbound today and always gets an id; this holds the invariant for whoever passes a bound one.
+   */
   private mcpSessionId: string | null = null;
+  private mcpInitialized = false;
 
   private async mcpHeaders(): Promise<Record<string, string>> {
     return {
@@ -264,7 +272,7 @@ export class NoriqClient {
    * every gate comment (verify failure, reviewer rejection, land failure) silently never
    * posted. The session id rides the `mcp-session-id` response header.
    */
-  private async mcpInitialize(): Promise<string> {
+  private async mcpInitialize(): Promise<string | null> {
     const headers = await this.mcpHeaders();
     const res = await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
@@ -282,20 +290,21 @@ export class NoriqClient {
     });
     const sid = res.headers.get('mcp-session-id');
     const raw = await res.text();
-    if (!res.ok || !sid) {
-      throw new Error(
-        `mcp initialize → ${res.status}${sid ? '' : ' (no mcp-session-id header)'}: ${raw.slice(0, 200)}`,
-      );
+    // A missing session id is an ANSWER — the token is bound and needs none — so only a non-2xx
+    // is fatal (RUN-177).
+    if (!res.ok) {
+      throw new Error(`mcp initialize → ${res.status}: ${raw.slice(0, 200)}`);
     }
     // The spec's follow-up; some transports won't serve requests until it arrives.
     await this.fetchImpl(`${this.base}/mcp`, {
       method: 'POST',
-      headers: { ...headers, 'mcp-session-id': sid },
+      headers: { ...headers, ...(sid ? { 'mcp-session-id': sid } : {}) },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
     }).catch(() => {
       /* best-effort — the tool call below is the real probe */
     });
     this.mcpSessionId = sid;
+    this.mcpInitialized = true;
     return sid;
   }
 
@@ -304,10 +313,10 @@ export class NoriqClient {
    *  lazily and re-initializes ONCE on a session the server no longer knows — worker
    *  isolates recycle sessions at will, so the retry is load-bearing, not polish. */
   private async mcpCall(name: string, args: Record<string, unknown>): Promise<unknown> {
-    const attempt = async (sid: string): Promise<{ res: Response; raw: string }> => {
+    const attempt = async (sid: string | null): Promise<{ res: Response; raw: string }> => {
       const res = await this.fetchImpl(`${this.base}/mcp`, {
         method: 'POST',
-        headers: { ...(await this.mcpHeaders()), 'mcp-session-id': sid },
+        headers: { ...(await this.mcpHeaders()), ...(sid ? { 'mcp-session-id': sid } : {}) },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 1,
@@ -317,10 +326,14 @@ export class NoriqClient {
       });
       return { res, raw: await res.text() };
     };
-    let { res, raw } = await attempt(this.mcpSessionId ?? (await this.mcpInitialize()));
-    if (res.status === 400 || res.status === 404) {
+    const sid = this.mcpInitialized ? this.mcpSessionId : await this.mcpInitialize();
+    let { res, raw } = await attempt(sid);
+    // Only a SESSION can go stale, so a bound token (no session id) skips the retry — a 400/404
+    // there is the server's real answer, not a recycled isolate.
+    if (sid !== null && (res.status === 400 || res.status === 404)) {
       // The session died with its isolate (or expired). One fresh handshake, one retry.
       this.mcpSessionId = null;
+      this.mcpInitialized = false;
       ({ res, raw } = await attempt(await this.mcpInitialize()));
     }
     if (!res.ok) throw new Error(`${name} → ${res.status}: ${raw.slice(0, 300)}`);

@@ -1,6 +1,6 @@
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
 import { totalTokens } from '../src/drivers/budget';
@@ -19,6 +19,7 @@ import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
 import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
+import { LOCK_RELEASE_TIMEOUT_MS } from '../src/stages/settle';
 import {
   type AnchorTask,
   type RunReport,
@@ -247,10 +248,19 @@ class FakeWorktrees {
   };
   /** Every terminal release-all (RUN-104), by the run's holder token. */
   releasedAll: string[] = [];
-  /** Ordered log of landing vs lock-release, to prove locks are HELD THROUGH the merge and
-   *  released AFTER it (RUN-105). */
-  timeline: Array<'land' | 'release'> = [];
+  /** Ordered log of landing, lock-release and the terminal report. The release is bounded on both
+   *  sides: AFTER landing so locks are held through the merge (RUN-105), and BEFORE the terminal
+   *  report, which is what retires the agent the release authenticates as (RUN-177). */
+  timeline: Array<'land' | 'release' | 'report'> = [];
+  /** A lock service that accepts the request and never answers — the hang the settle path must
+   *  survive, which no `.catch()` can rescue (RUN-177). */
+  hangRelease = false;
   releaseRunLocks = async (_ws: Workspace, ctx: LockContext): Promise<void> => {
+    if (this.hangRelease) return new Promise<void>(() => {});
+    // Record on a LATER tick, deliberately. Recording synchronously would make the timeline read
+    // `['release', 'report']` even if settle stopped awaiting the release at all — the ordering
+    // assertions would pass against the very regression they exist to catch.
+    await Promise.resolve();
     this.releasedAll.push(ctx.token);
     this.timeline.push('release');
   };
@@ -422,6 +432,7 @@ function harness(
     changedFiles?: string[];
     /** Conflicts the lock layer returns when the floor acquires; empty = granted. */
     lockConflicts?: LockConflict[];
+    hangRelease?: boolean;
     /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
     lockScope?: string[] | null;
     /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
@@ -442,6 +453,7 @@ function harness(
   if (over.landRaces) worktrees.landRaces = true;
   if (over.changedFiles) worktrees.changedFiles = over.changedFiles;
   if (over.lockConflicts) worktrees.lockConflicts = over.lockConflicts;
+  if (over.hangRelease) worktrees.hangRelease = true;
   const reports: Array<{ runId: string } & RunReport> = [];
   const transcript: Array<{
     seq: number;
@@ -475,7 +487,11 @@ function harness(
             manifest: over.manifest ?? manifest(),
             ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
           },
-    report: (runId, r) => reports.push({ runId, ...r }),
+    report: (runId, r) => {
+      reports.push({ runId, ...r });
+      // Only the TERMINAL report carries `exit` — and only that one retires the run agent.
+      if (r.exit) worktrees.timeline.push('report');
+    },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
     // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
@@ -1778,7 +1794,64 @@ describe('lock release on terminal (RUN-104)', () => {
     await flush();
     h.claude.complete('done');
     await done;
-    expect(h.worktrees.timeline).toEqual(['land', 'release']); // land first, THEN release
+    expect(h.worktrees.timeline).toEqual(['land', 'release', 'report']); // land first, THEN release
+  });
+
+  it('releases BEFORE the terminal report, which is what revokes the token it releases with (RUN-177)', async () => {
+    // Reporting a terminal status makes the server retire the run's agent. The release
+    // authenticates AS that agent, so below the report it is a 401 by construction — which is
+    // exactly what the first live dispatch logged. Harmless only while the floor was failing
+    // before it acquired anything; a real leak the moment that was fixed.
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    const release = h.worktrees.timeline.indexOf('release');
+    const report = h.worktrees.timeline.indexOf('report');
+    expect(release).toBeGreaterThanOrEqual(0);
+    expect(report).toBeGreaterThan(release);
+  });
+
+  it('settles anyway when the lock service accepts the release and never answers (RUN-177)', async () => {
+    // The regression the isolated `withTimeout` tests cannot catch: settle awaiting the release
+    // DIRECTLY. A hung lock service would then leave this run non-terminal server-side, its agent
+    // un-retired, its continuation unrecorded and its runner slot held for the daemon's whole life.
+    vi.useFakeTimers();
+    try {
+      const h = harness({ hangRelease: true });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+      );
+      await vi.advanceTimersByTimeAsync(0); // stands in for flush() under fake timers
+      h.claude.complete('done');
+      // Reach settle, then walk past the bound. Without it this await never returns.
+      await vi.advanceTimersByTimeAsync(LOCK_RELEASE_TIMEOUT_MS + 1);
+      await done;
+
+      // The terminal report went out despite the release never answering — only the TERMINAL one
+      // carries `exit`, so this is not satisfied by the earlier `running` reports.
+      expect(h.reports.at(-1)?.exit).toBeDefined();
+      expect(h.worktrees.timeline).toContain('report');
+      expect(h.worktrees.timeline).not.toContain('release'); // it never answered, so it never recorded
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases before the terminal report on a GATED build too, not just a landed one', async () => {
+    // The kept-work path reports `failed` and skips dispose — the release still has to beat the
+    // report there, and that is the path the live runs actually took.
+    const h = harness({ verifyPasses: false });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.timeline).toEqual(['release', 'report']);
   });
 
   it('a run in one worktree is gated by a lock a run in ANOTHER worktree holds (RUN-105)', async () => {

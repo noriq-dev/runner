@@ -20,6 +20,40 @@ import { totalTokens } from '../drivers/budget';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
 
+/**
+ * How long settling will wait for the lock release before going on without it.
+ *
+ * The release has to be ATTEMPTED before the terminal report (RUN-177), which puts a call to the
+ * lock service on the path to settling a run — and settling must never be blockable by it. The
+ * asymmetry decides the length: a release that never answers costs PROMPTNESS (the server also
+ * auto-releases on task settle, and TTL covers the rest), while a settle that never completes
+ * costs CORRECTNESS — the run stays non-terminal server-side, its agent is never retired, its
+ * continuation is never recorded, and the runner slot is held for the life of the daemon.
+ *
+ * Generous enough that a slow-but-working service still releases promptly; short enough that a
+ * dead one cannot wedge a run.
+ */
+export const LOCK_RELEASE_TIMEOUT_MS = 10_000;
+
+/**
+ * Race `p` against a timer, and carry on either way.
+ *
+ * The loser is ABANDONED rather than cancelled, deliberately: threading an AbortSignal through
+ * `VcsBackend.releaseRunLocks` into the MCP client would widen the seam for a request whose whole
+ * posture is best-effort, and an in-flight release that outlives this call harms nothing — it
+ * either succeeds late (which is the desired outcome anyway) or fails into a caught rejection.
+ */
+export async function withTimeout(p: Promise<unknown>, ms: number, onTimeout: () => void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), ms);
+    timer.unref?.();
+  });
+  const winner = await Promise.race([p.then(() => 'done' as const), timeout]);
+  if (timer) clearTimeout(timer);
+  if (winner === 'timeout') onTimeout();
+}
+
 export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
   const { run, repo, worktree, workflow: wf } = ctx;
 
@@ -67,6 +101,43 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // its fix turns), every reviewer round, the conflict resolver, and any prior park. This supersedes
   // the primary session's own first-result snapshot, which missed both the sub-sessions and the fix
   // turns.
+  const vcs = host.vcsFor(repo);
+  // Release the run's locks on terminal (RUN-104), UNCONDITIONALLY — a kept-work build skips
+  // dispose (below), but its locks must still free so a peer waiting on those files unblocks.
+  //
+  // Bounded on BOTH sides, and the window is narrow. It must come AFTER landing (RUN-105): the
+  // locks are HELD THROUGH the rebase→verify→fast-forward, so a second run in another worktree on
+  // this repo cannot grab a file mid-merge and race it — locks live server-side, so runs across
+  // worktrees see each other's holds — and they release only once the work is actually on the
+  // integration branch. It must come BEFORE `report` (RUN-177): reporting a terminal status is what
+  // makes the server retire this run's agent, and the release authenticates as that agent. Below
+  // the report it was a 401 by construction — masked only because the floor was failing before it
+  // acquired anything, and a real lock leak the moment that was fixed.
+  //
+  // Best-effort either way: the server also auto-releases on task settle and via TTL, so a miss
+  // here (a crash before this line, a transient error) costs promptness, never correctness — the
+  // same reason a daemon RESTART needs no lock reconcile of its own.
+  if (vcs.releaseRunLocks) {
+    await withTimeout(
+      vcs
+        .releaseRunLocks(worktree, {
+          projectId: run.projectId,
+          token: ctx.runAgent.token,
+          branch: host.lockScopeBranch(repo, run),
+          taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+        })
+        .catch((err) =>
+          host.log.warn('lock release on terminal failed', { runId: run.id, err: String(err) }),
+        ),
+      LOCK_RELEASE_TIMEOUT_MS,
+      () =>
+        host.log.warn('lock release on terminal did not answer — settling anyway', {
+          runId: run.id,
+          waitedMs: LOCK_RELEASE_TIMEOUT_MS,
+        }),
+    );
+  }
+
   ctx.exit = { ...ctx.exit, telemetry: ctx.tally.total() };
   host.report(run.id, {
     status: ctx.exit.outcome,
@@ -77,27 +148,6 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   });
 
   await recordContinuation(host, ctx);
-
-  const vcs = host.vcsFor(repo);
-  // Release the run's locks on terminal (RUN-104), UNCONDITIONALLY — a kept-work build skips
-  // dispose (below), but its locks must still free so a peer waiting on those files unblocks.
-  // Placed AFTER landing on purpose (RUN-105): the locks are HELD THROUGH the rebase→verify→
-  // fast-forward, so a second run in another worktree on this repo cannot grab a file mid-merge and
-  // race it — locks live server-side, so runs across worktrees see each other's holds — and they
-  // release only once the work is actually on the integration branch.
-  // Best-effort: the server also auto-releases on task settle and via TTL, so a miss here (a crash
-  // before this line, a transient error) costs promptness, never correctness — the same reason a
-  // daemon RESTART needs no lock reconcile of its own.
-  if (vcs.releaseRunLocks) {
-    await vcs
-      .releaseRunLocks(worktree, {
-        projectId: run.projectId,
-        token: ctx.runAgent.token,
-        branch: host.lockScopeBranch(repo, run),
-        taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
-      })
-      .catch((err) => host.log.warn('lock release on terminal failed', { runId: run.id, err: String(err) }));
-  }
 
   // Keep only what a human still has to act on: a build whose diff did NOT land. Once it is on the
   // integration branch the worktree and its throwaway branch are dead weight — reaping them here is
