@@ -473,18 +473,22 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // The detector reads lettered INTENT — any junk between the number and the letters — rather
-  // than an allowlist of separators, which would leak per punctuation mark: each shape below is a
-  // label the strict form rejects, and every one must void rather than leave the valid sibling
-  // standing as the complete enumeration.
-  it('punctuated labels void the enumeration the same way, whatever the junk between', () => {
+  // There is no malformed-label detector to slip past: every `FINDING <n>`-prefixed line that is
+  // neither the numbered FINDING line nor the strict sub-claim shape voids the enumeration. Each
+  // shape below is an edition of the escape a detector allowlist leaked (spaced, parenthesized,
+  // trailing word-character, …) — and the point of classifying instead of detecting is that the
+  // list below is examples, not the rule.
+  it('any malformed label voids the enumeration — a valid sibling never survives as the whole', () => {
     for (const bad of [
       'FINDING 1-b: hyphenated letter',
       'FINDING 1.b: dotted letter',
       'FINDING 1(b): parenthesized letter',
       'FINDING 1_b: underscored letter',
+      'FINDING 1b_: letter with a trailing underscore',
+      'FINDING 1b2: letter with a trailing digit',
       'FINDING 1 (b): spaced and parenthesized letter',
       'FINDING 1 -- b: arbitrary junk before the letter',
+      'FINDING 1', // a bare number line letters nothing and answers nothing
     ]) {
       const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
       expect(out).toHaveLength(1);

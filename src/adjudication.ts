@@ -132,34 +132,33 @@ const FINDING_RE =
 // RESPONSE_RE as it stood (a letter where the colon must be), so every report and every response
 // written before this parses byte-identically.
 //
-// Two regexes because normalisation is ALL-OR-NOTHING per finding. The candidacy gate asks "was
-// every sub-claim contested?", and it can only ask that of the sub-claims that were RECORDED — so
-// keeping the well-formed half of a bad enumeration would let a finding clear on the letters that
-// parsed while a malformed or over-cap sibling was never even entered, the exact escape this
-// format exists to close. The LINE matcher recognises the intent to letter, and it matches ONE OR
-// MORE letters on purpose: a shape the detector cannot see is a shape it cannot void, and a
-// single-letter detector let a malformed `FINDING 1aa` line coexist invisibly with a valid
-// `FINDING 1a` — the kept-subset escape through the detector itself. The strict shape (exactly one
-// letter, colon, claim) then has to hold for EVERY detected line, or the finding keeps no letters
-// and stays the single answerable claim it always was — which is current behaviour, and always a
-// correct way to record it (the RUN-148 steps rule: a decomposition that cannot be run soundly is
-// dropped, never half-run).
+// Normalisation is ALL-OR-NOTHING per finding. The candidacy gate asks "was every sub-claim
+// contested?", and it can only ask that of the sub-claims that were RECORDED — so keeping the
+// well-formed half of a bad enumeration would let a finding clear on the letters that parsed
+// while a malformed sibling was never even entered, the exact escape this format exists to close.
 //
-// The detector does NOT enumerate the separators a malformed label might use — an allowlist of
-// them leaks per punctuation mark (a spaced `FINDING 1 b:` seen, a parenthesized `FINDING 1(b):`
-// invisible beside a valid `FINDING 1a:`, whose kept sibling then reads as the complete
-// enumeration: the kept-subset escape through the detector, one separator at a time). Instead it
-// reads lettered INTENT: any line whose first significant character after the number is a LETTER,
-// with arbitrary non-letter junk allowed between. The STRICT shape below is the only allowlist;
-// everything the detector sees and the shape rejects voids the whole enumeration. Legacy lines are
-// safe not by separator but by their own next character — a finding line's `[` and a response
-// line's `:` are in the junk class's terminator set, so the scan ends before any letter. What the
-// wide net deliberately catches is a prose line that happens to start `FINDING 1 rests…` — which
-// voids that finding's enumeration, degrading it to the single-claim finding it always was. That
-// trade is the right way round: a lost enumeration is current behaviour; a kept subset is the
-// escape.
-const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[^a-z[\n:]*([a-z]+)\b[^\n]*$/gim;
-const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+[a-z][ \t]*:[ \t]+(.+?)[ \t]*$/i;
+// Which is why there is no malformed-label DETECTOR here. Detection is enumerating the shapes a
+// model might malform a letter into, and every edition of that list leaked at its next edge:
+// single-letter matching missed `1aa`, letters-hard-against-the-number missed the spaced `1 b:`, a
+// separator allowlist missed the parenthesized `1(b):`, a junk class with a `\b` missed `1b_:` and
+// `1b2:` — each time the unseen sibling left the valid letters standing as the "complete"
+// enumeration. So nothing is enumerated. Every line beginning `FINDING <n>` for a finding this
+// report numbered is CLASSIFIED exactly once (see parseFindings): the numbered FINDING line
+// itself, a strict sub-claim line, or — everything else — a voider of that finding's whole
+// enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken for it
+// simply does not exist.
+//
+// The deliberate cost is prose: a line that happens to start `FINDING 1 rests…` voids finding 1's
+// enumeration, degrading it to the single-claim finding it always was — which is current
+// behaviour, and always a correct way to record it (the RUN-148 steps rule: a decomposition that
+// cannot be run soundly is dropped, never half-run). A lost enumeration is a duller report; a kept
+// subset is the escape. Legacy reports are untouched by construction: their only
+// `FINDING`-prefixed lines are the numbered finding lines themselves (classified as such and
+// skipped) and prose, which voids an enumeration no legacy finding has.
+const ANY_NUMBERED_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[^\n]*$/gim;
+/** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
+const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
+const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -233,33 +232,32 @@ export function parseFindings(text: string): Finding[] {
     });
   }
   // Second pass (RUN-180): attach sub-claim lines to the finding their number names. Keyed by
-  // number rather than by position, so prose between the lines cannot orphan one. A lettered line
-  // naming a finding nobody numbered is ignored — there is no finding to degrade.
+  // number rather than by position, so prose between the lines cannot orphan one. A line naming a
+  // finding nobody numbered is ignored — there is no finding to degrade.
   //
-  // Per finding, all-or-nothing (see SUBCLAIM_LINE_RE): a line that letters but breaks the shape,
-  // a duplicated letter (the RESPONSE side could not say which claim it answered), or a fifth
-  // letter (the cap) each void the WHOLE enumeration — `null` below — and the finding stays
-  // single-claim. Never an error, and never a kept subset a partial contest could clear.
+  // Per finding, all-or-nothing, by classifying EVERY `FINDING <n>`-prefixed line once (see
+  // ANY_NUMBERED_LINE_RE): the numbered FINDING line itself is pass 1's subject; a strict
+  // sub-claim line records its letter; and ANY other line — a spaced or punctuated letter, a
+  // doubled letter, a trailing `_` or digit, a duplicated letter (the RESPONSE side could not say
+  // which claim it answered), a fifth letter (the cap), prose — voids the WHOLE enumeration
+  // (`null` below) and the finding stays single-claim. Never an error, and never a kept subset a
+  // partial contest could clear.
   const byId = new Map(out.map((f) => [f.id, f]));
   const pending = new Map<number, SubClaim[] | null>();
-  for (const m of text.matchAll(SUBCLAIM_LINE_RE)) {
+  for (const m of text.matchAll(ANY_NUMBERED_LINE_RE)) {
     const id = Number(m[1]);
     if (!byId.has(id)) continue;
+    if (FINDING_LINE_RE.test(m[0]!)) continue; // the numbered FINDING line — pass 1's subject
     const list = pending.get(id);
     if (list === null) continue; // already voided — one bad line spoils the set, not just itself
     const shaped = SUBCLAIM_SHAPE_RE.exec(m[0]!);
-    const letter = m[2]!.toLowerCase();
+    const letter = shaped?.[1]?.toLowerCase();
     const held = list ?? [];
-    if (
-      letter.length !== 1 || // a multi-letter tail (`1aa`) is a lettered line with no valid letter
-      !shaped ||
-      held.some((s) => s.letter === letter) ||
-      held.length >= MAX_SUBCLAIMS
-    ) {
+    if (!shaped || !letter || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
       pending.set(id, null);
       continue;
     }
-    held.push({ letter, claim: cap(shaped[1]!, CLAIM_CAP) });
+    held.push({ letter, claim: cap(shaped[2]!, CLAIM_CAP) });
     pending.set(id, held);
   }
   for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;

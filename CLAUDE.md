@@ -132,10 +132,11 @@ never become letters — they stay evidence inside one claim, or the letters are
 instance-enumeration the collapse rule bought out. The format is optional and positionally additive
 like the requirement bracket, so everything written before it parses byte-identically, and a
 persisted ledger predating sub-claims loads as single-claim entries; malformed lettering voids the
-WHOLE enumeration, and the detector reads lettered INTENT — any junk between the number and the
-letters, never an allowlist of separators, which would leak per punctuation mark — so a spaced
-`FINDING 1 b:`, a parenthesized `FINDING 1(b):`, and even a prose line starting `FINDING 1 rests…`
-all void it, because a lost enumeration is a single-claim finding — current behaviour — where a
+WHOLE enumeration, and there is no malformed-label detector to slip past — detectors enumerate
+shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an edition of the same escape) — so
+every `FINDING <n>`-prefixed line is instead classified once: the numbered FINDING line, the strict
+sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`), because a lost
+enumeration is a single-claim finding — current behaviour — where a
 kept subset lets a partial contest clear letters that were never recorded. Carried answers match a
 re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
 claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
