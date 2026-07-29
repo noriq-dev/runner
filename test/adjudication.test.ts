@@ -581,20 +581,62 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
+        '\n' +
         'The escape described in FINDING 1 is the subject of this report.',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  // The BLOCK BOUNDARY: an enumeration must be CLOSED — by a blank line, the next numbered
+  // FINDING line, a structural line, or the end of the report. A mangled sibling is written into
+  // its own list, so it sits in the block's tail; a stale certificate excludes it by fiat, but
+  // position still sees it — ANY non-boundary line hard against the block voids, even innocent
+  // prose, because the two are indistinguishable by construction. A lost enumeration is the safe
+  // degradation; a kept subset is the escape.
+  it('a non-boundary line hard against the block voids — even innocent prose', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'The escape described in FINDING 1 is the subject of this report.',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  // The stale-certificate escape, closed by position (this round's live probe): the certificate
+  // counts only the strict line, so it certifies the subset as complete — but the mangled sibling
+  // sits in the block's tail, where the boundary rule voids the whole enumeration whatever the
+  // line mangled into (`FINDING 1 b` is invisible to every net that spares prose).
+  it('a stale certificate over a net-invisible mangled sibling voids — position proves the boundary', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
+        'FINDING 1a: recorded claim\n' +
+        '(b) FINDING 1 b — hidden claim',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('an ACCEPTANCE line closes the block — reports answer criteria right after their findings', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'ACCEPTANCE 1: VERIFIED a.ts:1 covers it',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
   // No in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, so a
   // lettered token off the finding's own lines always voids — narration names letters as `(a)`,
-  // the form every render uses, or by claim text. A lost enumeration is the safe degradation; the
-  // spared mention was a kept-subset escape.
-  it('a lettered mention off the finding’s own lines voids — even an in-range one', () => {
+  // the form every render uses, or by claim text. The blank line isolates the net: this mention
+  // is past a closed boundary, and it still voids.
+  it('a lettered mention off the finding’s own lines voids — even in-range, even past the boundary', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
+        '\n' +
         'Here FINDING 1a is contested while (b) stands on the same evidence.',
     );
     expect(out[0]!.subclaims).toEqual([]);
@@ -652,6 +694,7 @@ describe('parsing sub-claims (RUN-180)', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: half one\n' +
+        '\n' +
         'see FINDING 12 in the previous report for background',
     );
     expect(out[0]!.subclaims).toEqual(['half one']);
@@ -664,6 +707,7 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
+        '\n' +
         'See FINDING 1 for the full chain of evidence: it holds either way.',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);

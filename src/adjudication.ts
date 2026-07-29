@@ -157,19 +157,32 @@ const FINDING_RE =
 // well-formed half of a bad enumeration would let a finding clear on the letters that parsed
 // while a malformed sibling was never even entered, the exact escape this format exists to close.
 //
-// The rule that actually closes that escape is the COMPLETENESS DECLARATION, not any shape rule: a
-// FINDING line that enumerates must end its claim with `[sub-claims: <n>]`, and the enumeration is
-// kept only when EXACTLY n strict lettered lines arrive. Shape nets (below) can only void what
-// they can SEE, and a mangled line can compose decoration, spacing, and separator loss into a
-// shape indistinguishable from English — `(b) FINDING 1 b — claim B` is invisible to every net
-// that spares prose, and each review round of this run's own gestation found another such
-// composition. The declaration voids by ABSENCE instead: a line that mangles into ANY shape
-// whatsoever — visible or not — subtracts from the strict count, mismatches the certificate, and
-// the whole enumeration degrades to the single-claim finding. No declaration → no enumeration
-// (letters without a certificate are never kept); a mangled declaration fails to parse as one and
-// lands in the same place. The residue is no longer a parser hole but authorial incoherence: a
-// kept subset now requires the reviewer to certify the subset as complete — to declare a count
-// that excludes a line it wrote — which no shape can produce on its own.
+// Two rules close that escape together, and neither is a shape rule.
+//
+// The COMPLETENESS DECLARATION: a FINDING line that enumerates must end its claim with
+// `[sub-claims: <n>]`, and the enumeration is kept only when EXACTLY n strict lettered lines
+// arrive. Shape nets (below) can only void what they can SEE, and a mangled line can compose
+// decoration, spacing, and separator loss into a shape indistinguishable from English — `(b)
+// FINDING 1 b — claim B` is invisible to every net that spares prose, and each review round of
+// this run's own gestation found another such composition. The declaration voids by ABSENCE
+// instead: a line that mangles into ANY shape whatsoever — visible or not — subtracts from the
+// strict count, mismatches the certificate, and the whole enumeration degrades to the
+// single-claim finding. No declaration → no enumeration (letters without a certificate are never
+// kept); a mangled declaration fails to parse as one and lands in the same place.
+//
+// The BLOCK BOUNDARY: the declaration alone cannot see a STALE count — `[sub-claims: 1]` over a
+// strict (a) and a mangled (b) certifies the subset as complete, because the count excludes the
+// mangled line by fiat rather than by absence, and a stale count is a mundane authorial slip, not
+// incoherence. What the count cannot prove, POSITION can: a sibling is written into its list, so
+// it sits in the enumeration's own tail. The enumeration is therefore a BLOCK — the contiguous
+// run of strict lettered lines starting DIRECTLY under the FINDING line (the format's own words)
+// — and it must be CLOSED: the line after it must be blank, the next numbered FINDING line, a
+// structural line (ESCALATE / ACCEPTANCE / VERDICT), or the end of the report. ANY other line
+// hard against the block voids the whole enumeration, whatever it mangled into — it is either a
+// sibling the block did not admit or prose indistinguishable from one. The residue is a sibling
+// DETACHED from its own list by an author-inserted blank line AND excluded from the author's own
+// count — a double incoherence neither position nor arithmetic can see through, where either
+// alone was one ordinary slip.
 //
 // The shape nets below remain as hygiene AROUND that rule — they void visible label mutations
 // early and keep narration harmless — but validity never rests on them. Detection by shape is
@@ -247,6 +260,13 @@ const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \
  *  not kept — the same safe degradation as every other malformation. Stripped from the stored
  *  claim, so the ledger, the prose key, and every render carry the claim alone. */
 const SUBCLAIM_DECL_RE = /[ \t]*\[[ \t]*sub-claims:[ \t]*(\d{1,2})[ \t]*\]$/i;
+/** The report's structural lines, as block boundaries: what may legally close an enumeration
+ *  besides a blank line, the next numbered FINDING line, or the end of the report. An allowlist
+ *  that can only be too SMALL — an unrecognised boundary voids the enumeration, the safe side —
+ *  and a mangled sibling cannot wear these shapes without its lettered token tripping the nets
+ *  that still scan every line. */
+const ACCEPTANCE_LINE_RE = /^[ \t]*ACCEPTANCE[ \t]+\d+[ \t]*:/i;
+const VERDICT_LINE_RE = /^[ \t]*VERDICT[ \t]*:/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -324,90 +344,94 @@ export function parseFindings(text: string): Finding[] {
       subclaims: [],
     });
   }
-  // Second pass (RUN-180): attach sub-claim lines to the finding their number names. Keyed by
-  // number rather than by position, so prose between the lines cannot orphan one. A line naming a
-  // finding nobody numbered is ignored — there is no finding to degrade.
-  //
-  // This is the ONE enforcement point of the enumeration invariant (the structural settlement):
-  // every line either structural net sees — the HEAD net (first letters are `FINDING <n>`, so
-  // letterless markdown decoration is included) and the NEAR-COLON TOKEN net (`FINDING <n>…:`
-  // anywhere in the line, so decoration wearing letters is included) — is classified exactly once,
-  // per finding, all-or-nothing: the numbered FINDING line itself is pass 1's subject; the strict
-  // sub-claim shape whose letter is the NEXT letter in sequence and whose claim no sibling already
-  // names records a claim; and ANY other classified line — a decorated label, a spaced or
-  // punctuated letter, a doubled letter, a trailing `_` or digit, an out-of-sequence or repeated
-  // letter, a repeated claim text, a fifth letter (the cap), line-start prose — voids the WHOLE
-  // enumeration (`null` below) and the finding stays single-claim. Never an error, and never a
-  // kept subset a partial contest could clear. Fold, render, and candidacy consume the canonical
-  // set this pass emits and carry no shape judgment of their own — the class dies where the data
-  // is born. The strict-shape checks compare the NUMBER too: a sub-claim line of finding 2 that
-  // mentions `FINDING 1:` in its claim is strict for 2 and a voider for 1 — never a recorder of
-  // either's claims onto the other.
+  // Second pass (RUN-180): read each certified finding's enumeration as a BLOCK — the contiguous
+  // run of strict lettered lines DIRECTLY under its FINDING line, closed by a boundary. This is
+  // the ONE enforcement point of the enumeration invariant (the structural settlement), and it is
+  // all-or-nothing per finding: the letters must run a, b, c… (a letter is pure position), name no
+  // claim twice, fit the cap, match the certificate EXACTLY, and the line after the block must be
+  // a boundary — blank, the next numbered FINDING line, a structural line, or the end of the
+  // report. One violation voids the WHOLE enumeration (`null` below) and the finding stays the
+  // single answerable claim it always was. Never an error, and never a kept subset a partial
+  // contest could clear: position proves what the certificate cannot (a stale count excludes a
+  // sibling by fiat, but the sibling still sits in the block's tail, where any non-boundary line
+  // voids), and the certificate proves what position cannot (a line mangled clean away is simply
+  // not counted). Fold, render, and candidacy consume the canonical set this pass emits and carry
+  // no shape judgment of their own — the class dies where the data is born.
   const byId = new Map(out.map((f) => [f.id, f]));
-  const pending = new Map<number, string[] | null>();
   const lines = text.split('\n');
-  // A finding's OWN lines — its numbered FINDING line and its accepted strict sub-claim lines —
-  // are the only places a lettered token of that finding is format rather than mutation, so they
-  // are the only lines net three spares. Keyed per (line, id): finding 2's strict line quoting a
-  // `FINDING 1a` token is still narration ABOUT 1, and voids 1's enumeration like any other.
+  const headAt = new Map<number, number>();
+  lines.forEach((line, li) => {
+    const m = FINDING_LINE_RE.exec(line);
+    if (m) {
+      const id = Number(m[1]);
+      if (byId.has(id) && !headAt.has(id)) headAt.set(id, li);
+    }
+  });
+  const isBoundary = (line: string | undefined): boolean =>
+    line === undefined ||
+    /^[ \t]*$/.test(line) ||
+    FINDING_LINE_RE.test(line) ||
+    ESCALATE_LINE_RE.test(line) ||
+    ACCEPTANCE_LINE_RE.test(line) ||
+    VERDICT_LINE_RE.test(line);
+  const pending = new Map<number, string[] | null>();
+  // A finding's block lines are the only place a lettered token of that finding is format rather
+  // than mutation, so they are the only lines the nets below spare. Keyed per (line, id): finding
+  // 2's strict line quoting a `FINDING 1a` token is still narration ABOUT 1, and voids 1's
+  // enumeration like any other line.
   const ownLines = new Set<string>();
+  for (const [id, count] of declared) {
+    const head = headAt.get(id);
+    if (head === undefined) continue; // unreachable in practice: the certificate came off a parsed line
+    const held: string[] = [];
+    let valid = true;
+    let li = head + 1;
+    for (; li < lines.length; li++) {
+      const shaped = SUBCLAIM_SHAPE_RE.exec(lines[li]!);
+      if (!shaped || Number(shaped[1]) !== id) break; // the block ends at the first non-strict line
+      const letter = shaped[2]!.toLowerCase();
+      const claim = cap(shaped[3]!, CLAIM_CAP);
+      if (
+        letter !== subclaimLetter(held.length) || // letters are position: a, b, c…, no gaps, no repeats
+        held.length >= MAX_SUBCLAIMS ||
+        held.some((c) => subKey(c) === subKey(claim)) // one claim, one identity — even ellipsis-capped
+      ) {
+        valid = false;
+        break;
+      }
+      ownLines.add(`${li}:${id}`);
+      held.push(claim);
+    }
+    valid = valid && held.length === count && isBoundary(lines[li]);
+    pending.set(id, valid && held.length ? held : null);
+  }
+  // The hygiene nets, per line, after the blocks are read (which lines are a finding's own is only
+  // known then): the HEAD net (first letters are `FINDING <n>` — letterless markdown decoration
+  // included), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration wearing letters
+  // included), and the LABELLED TOKEN net (word-material glued to the number, colon or not). A hit
+  // off the finding's own lines voids its enumeration: an intended sub-claim the block did not
+  // admit, a mutation of one, or narration wearing the same shape — indistinguishable by
+  // construction, so all void, with no in-range sparing (a recorded letter can be WORN by a
+  // distinct unrecorded claim). These catch what the block cannot see: a lettered-intent line
+  // ABOVE the head line, a stray letter after the block's own boundary, a mangled next-finding
+  // head. The numbered FINDING line is exempt for its OWN id wherever it appears — a claim ABOUT
+  // the format quotes its own letters — and a line naming a finding nobody numbered is ignored,
+  // there being no finding to degrade. Nothing recorded → nothing a subset could clear → nothing
+  // to void.
   lines.forEach((line, li) => {
     if (ESCALATE_LINE_RE.test(line)) return; // the format's own escalation line; letters nothing, voids nothing
     const ids = new Set<number>();
     const head = HEAD_LINE_RE.exec(line);
     if (head) ids.add(Number(head[1]));
     for (const t of line.matchAll(NEAR_COLON_TOKEN_RE)) ids.add(Number(t[1]));
+    for (const t of line.matchAll(LABELLED_TOKEN_RE)) ids.add(Number(t[1]));
     for (const id of ids) {
-      if (!byId.has(id)) continue;
-      const asFinding = FINDING_LINE_RE.exec(line);
-      if (asFinding && Number(asFinding[1]) === id) {
-        ownLines.add(`${li}:${id}`); // the numbered FINDING line — pass 1's subject
-        continue;
-      }
-      const list = pending.get(id);
-      if (list === null) continue; // already voided — one bad line spoils the set, not just itself
-      const shaped = SUBCLAIM_SHAPE_RE.exec(line);
-      const letter = shaped && Number(shaped[1]) === id ? shaped[2]?.toLowerCase() : undefined;
-      const held = list ?? [];
-      const claim = shaped ? cap(shaped[3]!, CLAIM_CAP) : '';
-      if (
-        !letter ||
-        letter !== subclaimLetter(held.length) || // letters are position: a, b, c…, no gaps, no repeats
-        held.length >= MAX_SUBCLAIMS ||
-        held.some((c) => subKey(c) === subKey(claim)) // one claim, one identity — even ellipsis-capped
-      ) {
-        pending.set(id, null);
-        continue;
-      }
-      ownLines.add(`${li}:${id}`);
-      held.push(claim);
-      pending.set(id, held);
-    }
-  });
-  // Net three runs after the line pass — a narration may precede the lines it narrates, and which
-  // lines are a finding's own is only known once the pass classified them. ANY labelled token off
-  // the finding's own lines is an intended sub-claim the nets above could not classify, a mutation
-  // of one, or narration wearing the same shape — indistinguishable by construction, so all void
-  // (no in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, and the
-  // certificate then blesses the kept subset). Nothing recorded → nothing a subset could clear →
-  // nothing to void.
-  lines.forEach((line, li) => {
-    if (ESCALATE_LINE_RE.test(line)) return;
-    for (const m of line.matchAll(LABELLED_TOKEN_RE)) {
-      const id = Number(m[1]);
       if (ownLines.has(`${li}:${id}`)) continue;
+      const asFinding = FINDING_LINE_RE.exec(line);
+      if (asFinding && Number(asFinding[1]) === id) continue; // a numbered FINDING line — pass 1's subject
       if (pending.get(id)?.length) pending.set(id, null);
     }
   });
-  // The completeness check, last, because it is a fact about the finished set: the enumeration is
-  // kept only when the FINDING line certified EXACTLY this many sub-claims. This is what the shape
-  // nets above cannot do — they void what they can see, and a line can mangle into English — where
-  // a mangled line of ANY shape is simply not counted, so the mismatch voids the whole. Letters
-  // with no certificate are never kept: keeping them would put validity back on the nets alone,
-  // and the safe degradation for a missing or mutated certificate is the single-claim finding.
-  for (const [id, subs] of pending) {
-    if (subs && declared.get(id) !== subs.length) pending.set(id, null);
-  }
   for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
   return out;
 }

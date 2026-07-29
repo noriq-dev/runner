@@ -166,13 +166,21 @@ mangled line can compose decoration, spacing and separator loss into plain Engli
 1 b — claim B` is invisible to any rule that spares prose — the composition class every rewrite
 of the nets leaked at); the certificate voids by ABSENCE instead, since a line that mangles into
 ANYTHING is simply not counted, and no certificate — or a mutated one, which fails to parse as
-one — keeps no letters at all, the same safe degradation. What remains around it is hygiene, not
+one — keeps no letters at all, the same safe degradation. What the certificate cannot see is a
+STALE count — one that excludes a mangled sibling by fiat rather than by absence, a mundane slip
+rather than incoherence — and POSITION closes that: the enumeration is a contiguous BLOCK
+directly under the FINDING line, and it must be CLOSED by a boundary (a blank line, the next
+numbered FINDING line, a structural line, or the end of the report), so a sibling — written into
+its own list, whatever it mangled into — sits in the block's tail where ANY non-boundary line
+voids the whole. The residue is a sibling detached from its own list by an author-inserted blank
+line AND excluded from the author's own count: a double incoherence where either alone was one
+slip. What remains around those two rules is hygiene, not
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
 letters, and a colon hard by the number is label-intent where a colon further on is sentence
 structure), and the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
-voids everywhere but the finding's OWN lines — its numbered line and its accepted strict lines,
-the only places a lettered token is format rather than mutation). There is deliberately no
+voids everywhere but the finding's OWN block lines, the only places a lettered token is format
+rather than mutation). There is deliberately no
 in-range sparing left: a recorded letter can be WORN by a distinct unrecorded claim, and a stale
 certificate that counts only the strict line then blesses the kept subset — so reports narrate a
 sub-claim as `(a)`, the form every render uses, never as a bare `FINDING 1a` token. A
