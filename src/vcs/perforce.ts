@@ -9,6 +9,8 @@ import type {
   LockContext,
   LockOutcome,
   PublishResult,
+  ReviewRequest,
+  ReviewResult,
   VcsBackend,
   Workspace,
 } from './types';
@@ -502,6 +504,25 @@ export class PerforceBackend implements VcsBackend {
   /** Submit already published; there is no further step — exactly like Diversion. */
   async share(_repoRoot: string, _target: string): Promise<{ ok: true }> {
     return { ok: true };
+  }
+
+  /**
+   * The daemon cannot open a Perforce review (RUN-85): `gh` is not the review surface, and no
+   * Swarm (or review-daemon) API has been measured — this file's rule is measured shape or
+   * nothing. The work is not stranded: submit already put it on the line the client views,
+   * numbered and attributed (`noriq@<client>`). What is missing is only the review ARTIFACT,
+   * so the honest answer is a refusal naming where a human reviews — the caller warns and
+   * records it instead of the silent nothing a hand-written `[land].mergeTarget` used to buy.
+   * No p4 call: this method states a fact about Perforce, it does not act.
+   */
+  async openReview(_repoRoot: string, _review: ReviewRequest): Promise<ReviewResult> {
+    return {
+      ok: false,
+      detail:
+        'review happens in Perforce: the plan is submitted as numbered changelists on the line ' +
+        'the client views — review them in your Perforce tooling (Swarm, or p4 describe); the ' +
+        'daemon opens no Swarm review',
+    };
   }
 
   /**

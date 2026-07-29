@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ExecutionSpec, RunnerConfig } from '@noriq-dev/shared';
+import { ExecutionSpec, ProjectManifest, RunnerConfig } from '@noriq-dev/shared';
 import type { Run } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
@@ -10,6 +10,7 @@ import {
   Daemon,
   continuationLockScope,
   orphanSweep,
+  owedMergeReconciler,
   shouldForwardRunStatus,
   telemetryFrame,
 } from '../src/daemon';
@@ -310,6 +311,144 @@ describe('orphanSweep', () => {
     expect(warned).toHaveLength(1);
     await sweep(true);
     expect(warned).toHaveLength(1); // still kept, still reported by the return — just not re-warned
+  });
+});
+
+// RUN-85. reconcileOwedMerges was untested wiring that reached `gh` directly — git-only, so a
+// hand-written [land].mergeTarget on a Diversion/Perforce repo did NOTHING at plan completion,
+// silently. Extracted (the orphanSweep treatment) and routed through the detected backend's
+// openReview: the same fake-backend-plus-quiet-logger register as the sweep tests above.
+describe('owedMergeReconciler (RUN-28/85)', () => {
+  const quiet = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+  const plan = {
+    planId: 'plan_1',
+    planKey: 'alpha',
+    planTitle: 'Runner v2',
+    projectId: 'prj_run',
+    repoRef: 'repo_1',
+  };
+  const manifest = ProjectManifest.parse({
+    key: 'RUN',
+    land: { branch: 'noriq/plan-<planKey>', mergeTarget: 'main', autoPush: true },
+  });
+
+  function fakeBackend(
+    kind: string,
+    over: {
+      share?: { ok: true } | { ok: false; detail: string };
+      review?: { ok: boolean; url?: string; detail?: string; command?: string };
+    } = {},
+  ) {
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+    return {
+      calls,
+      vcs: {
+        kind,
+        share: async (...args: unknown[]) => {
+          calls.push({ method: 'share', args });
+          return over.share ?? ({ ok: true } as const);
+        },
+        openReview: async (...args: unknown[]) => {
+          calls.push({ method: 'openReview', args });
+          return over.review ?? { ok: true, url: 'https://github.com/x/y/pull/7' };
+        },
+      },
+    };
+  }
+
+  function harness(b: ReturnType<typeof fakeBackend>, over: { logger?: unknown } = {}) {
+    const reports: unknown[] = [];
+    const reconcile = owedMergeReconciler({
+      owed: async () => [plan],
+      repoFor: (ref) => (ref === 'repo_1' ? { root: '/repo' } : undefined),
+      manifestFor: async () => manifest,
+      vcsFor: () => b.vcs,
+      report: async (r) => {
+        reports.push(r);
+      },
+      logger: (over.logger ?? quiet) as never,
+    });
+    return { reconcile, reports };
+  }
+
+  it('git path: shares the resolved plan branch, opens review through the backend, reports the URL', async () => {
+    const b = fakeBackend('git');
+    const { reconcile, reports } = harness(b);
+    await reconcile();
+    expect(b.calls).toEqual([
+      { method: 'share', args: ['/repo', 'noriq/plan-alpha'] },
+      {
+        method: 'openReview',
+        args: ['/repo', { head: 'noriq/plan-alpha', base: 'main', planTitle: 'Runner v2', planKey: 'alpha' }],
+      },
+    ]);
+    expect(reports).toEqual([{ planId: 'plan_1', url: 'https://github.com/x/y/pull/7', failed: null }]);
+  });
+
+  // The RUN-85 pin: the silent-nothing path no longer exists. A server-backed backend's honest
+  // refusal is WARNED (naming the backend and, via its detail, where review happens) and
+  // REPORTED as the failure detail — the plan does not stay owed invisibly.
+  it('a non-git mergeTarget gets an explicit warn + reportMerge failure, never silence', async () => {
+    const detail =
+      'review happens in Diversion: merge branch noriq/plan-alpha into main in the ' +
+      'Diversion app (repo dv.repo.test) — the daemon cannot open a Diversion merge request';
+    const b = fakeBackend('diversion', { review: { ok: false, detail } });
+    const warned: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+    const { reconcile, reports } = harness(b, {
+      logger: {
+        ...quiet,
+        warn: (msg: string, fields: Record<string, unknown>) => warned.push({ msg, fields }),
+      },
+    });
+    await reconcile();
+    // share still runs, unbranched — a server-backed share is a documented no-op {ok:true}.
+    expect(b.calls.map((c) => c.method)).toEqual(['share', 'openReview']);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.fields.backend).toBe('diversion');
+    expect(warned[0]?.fields.detail).toBe(detail);
+    expect(reports).toEqual([{ planId: 'plan_1', url: null, failed: detail }]);
+  });
+
+  it('a failed share reports and never reaches openReview — a PR against a stale remote is worse than none', async () => {
+    const b = fakeBackend('git', { share: { ok: false, detail: 'offline' } });
+    const { reconcile, reports } = harness(b);
+    await reconcile();
+    expect(b.calls.map((c) => c.method)).toEqual(['share']);
+    expect(reports).toEqual([{ planId: 'plan_1', failed: 'push failed: offline' }]);
+  });
+
+  it('a repo that never asked for merge requests is skipped without touching the backend', async () => {
+    const b = fakeBackend('git');
+    const reports: unknown[] = [];
+    const reconcile = owedMergeReconciler({
+      owed: async () => [plan],
+      repoFor: () => ({ root: '/repo' }),
+      manifestFor: async () => ProjectManifest.parse({ key: 'RUN' }), // no [land] at all
+      vcsFor: () => b.vcs,
+      report: async (r) => {
+        reports.push(r);
+      },
+      logger: quiet as never,
+    });
+    await reconcile();
+    expect(b.calls).toEqual([]);
+    expect(reports).toEqual([]);
+  });
+
+  it('an unreachable server yields an empty round, not a throw — the next reconnect asks again', async () => {
+    const b = fakeBackend('git');
+    const reconcile = owedMergeReconciler({
+      owed: async () => {
+        throw new Error('ECONNREFUSED');
+      },
+      repoFor: () => ({ root: '/repo' }),
+      manifestFor: async () => manifest,
+      vcsFor: () => b.vcs,
+      report: async () => {},
+      logger: quiet as never,
+    });
+    await expect(reconcile()).resolves.toBeUndefined();
+    expect(b.calls).toEqual([]);
   });
 });
 

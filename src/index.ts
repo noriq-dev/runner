@@ -313,6 +313,8 @@ export type {
   LockContext,
   LockOutcome,
   PublishResult,
+  ReviewRequest,
+  ReviewResult,
   ShareResult,
   VcsBackend,
   Workspace,

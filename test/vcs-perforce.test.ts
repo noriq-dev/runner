@@ -307,6 +307,27 @@ describe('PerforceBackend — publish (submit IS the CAS, measured)', () => {
     expect(await backend.share('/ws1', 'x')).toEqual({ ok: true });
     expect(calls).toEqual([]);
   });
+
+  it('openReview refuses honestly: review happens in Perforce, and no p4 verb is invented (RUN-85)', async () => {
+    // No Swarm/review API was measured (§10 covers submit/resolve/shelve, nothing else), so the
+    // contract is a refusal naming where a human reviews — with ZERO p4 calls.
+    const { backend, calls } = fakes({});
+    calls.length = 0;
+    const res = await backend.openReview('/ws1', {
+      head: 'noriq/plan-alpha',
+      base: 'main',
+      planTitle: 'Runner v2',
+      planKey: 'alpha',
+    });
+    expect(res).toEqual({
+      ok: false,
+      detail:
+        'review happens in Perforce: the plan is submitted as numbered changelists on the line ' +
+        'the client views — review them in your Perforce tooling (Swarm, or p4 describe); the ' +
+        'daemon opens no Swarm review',
+    });
+    expect(calls).toEqual([]);
+  });
 });
 
 describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)', () => {

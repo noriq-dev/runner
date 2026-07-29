@@ -130,6 +130,27 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(calls[0]).toEqual({ method: 'pushBranch', args: ['/repo', 'b', 'upstream'] });
   });
 
+  it('openReview delegates to gh via merge-request.ts — args through, result verbatim (RUN-85)', async () => {
+    // The one verb that maps outside GitOps: onward review is `gh pr create` (RUN-28), so the
+    // exec is injected the same way GitOps is and merge-request.test.ts keeps owning gh's
+    // behaviour (already-exists, hand-runnable command). This pins only the delegation.
+    const gh: Array<{ args: string[]; cwd: string }> = [];
+    const { ops } = recorder();
+    const vcs = new GitBackend(ops, undefined, async (args, cwd) => {
+      gh.push({ args, cwd });
+      return { stdout: 'https://github.com/noriq-dev/runner/pull/7\n' };
+    });
+    const res = await vcs.openReview('/repo', {
+      head: 'noriq/plan-alpha',
+      base: 'main',
+      planTitle: 'Runner v2',
+      planKey: 'alpha',
+    });
+    expect(res).toEqual({ ok: true, url: 'https://github.com/noriq-dev/runner/pull/7' });
+    expect(gh[0]?.cwd).toBe('/repo');
+    expect(gh[0]?.args.slice(0, 6)).toEqual(['pr', 'create', '--base', 'main', '--head', 'noriq/plan-alpha']);
+  });
+
   it('refuses a workspace whose location it did not mint — by name, not with a git error', async () => {
     // The guard exists for the park file: a Workspace round-trips through JSON on disk
     // (RUN-30), where another backend's location or an old daemon's schema can produce

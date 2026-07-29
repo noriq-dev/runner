@@ -143,7 +143,7 @@ system exists to remove. The trade, stated plainly:
 | | |
 |---|---|
 | **What changed** | A build that passes the gate is rebased onto `[land].branch`, **re-verified there**, and fast-forwarded in. No human per run. |
-| **What did NOT change** | The daemon **never merges into the protected branch** — a human still decides what reaches `main`. Without `[land].autoPush` (RUN-27) it also never pushes at all; with it, it publishes only the branch `[land].branch` names and opens a merge request (RUN-28). The boundary moved from `git push` to *approving the merge*, deliberately. |
+| **What did NOT change** | The daemon **never merges into the protected branch** — a human still decides what reaches `main`. Without `[land].autoPush` (RUN-27) it also never pushes at all; with it, it publishes only the branch `[land].branch` names and opens a merge request (RUN-28; on a server-backed VCS it opens nothing and records where review happens instead — RUN-85). The boundary moved from `git push` to *approving the merge*, deliberately. |
 | **What is now load-bearing** | The verify gate is the only thing between an agent and that branch. Its quality *is* the security boundary. |
 | **The sharp edge** | Point `[land].branch` at anything push-triggered, auto-deploying, or watched by CI and you have handed agents production. `branch` has **no default** and is never inferred — auto-landing is opt-in per repo, and pointing it at `main` is a choice you make explicitly. |
 | **Why rebase-then-verify** | Two runs can each be green at their own fork point and broken together. A gate that never sees the combination cannot catch it, so the gate runs on the rebased result — the exact thing that will land. |
@@ -189,11 +189,12 @@ detail of the one above.
 | | |
 |---|---|
 | **When** | Every task in a plan is done (or cancelled). Completion is a SERVER fact — the daemon only sees Runs, never the plan's task graph. |
-| **Whose credentials** | The operator's `gh`, already on the box and already authed — same choice as `autoPush` reusing their git credentials. The alternative was a GitHub token in `runner.toml`: a genuinely new secret on the machine, a new thing to leak, and a second auth path to keep alive. The agent gets none of it; this runs in the daemon, after the gate. |
+| **Whose credentials** | The operator's `gh`, already on the box and already authed — same choice as `autoPush` reusing their git credentials. The alternative was a GitHub token in `runner.toml`: a genuinely new secret on the machine, a new thing to leak, and a second auth path to keep alive. The agent gets none of it; this runs in the daemon, after the gate. Since RUN-85 `gh` is GIT'S implementation of the backend-neutral `openReview` seam (`VcsBackend`, routed by detection like everything else) — the boundary is unchanged: daemon, operator's `gh`, after the gate. |
 | **Requires** | `autoPush`. A merge request cannot exist without the branch reaching the remote. |
 | **Who names the target** | The REPO, via `[land].mergeTarget`. Never inferred, never chosen by whoever dispatched — the protected branch is the repo owner's decision. Omit it and no merge request is ever opened. |
 | **What it never does** | Rebase the working branch to make the PR openable. That branch is already pushed, so rebasing means rewriting published history and force-pushing — which `pushBranch` refuses. If main moved, the forge shows the conflict in the PR, where a human resolves it with full context. |
-| **If it fails** | Nothing is lost: the work is landed AND pushed. The daemon records why and hands over the exact `gh pr create` command. |
+| **If it fails** | Nothing is lost: the work is landed AND pushed. The daemon records why and, on git, hands over the exact `gh pr create` command. |
+| **Server-backed VCS (Diversion/Perforce)** | The daemon opens nothing: `gh` is not the review surface there, and no Diversion pending-merge or Perforce/Swarm review API has been measured, so none is called (RUN-85). A hand-written `[land].mergeTarget` on such a repo gets an explicit warning and a recorded failure naming the backend and where review actually happens (the Diversion app; Perforce's own tooling) — never the silent nothing it used to get. No new credential appears: refusing to act needs none. |
 | **Durability** | Completion is recorded server-side, not just pushed down a socket. A plan can finish while the box is off, the runner is offboarded, or the socket is reconnecting — a fire-and-forget notification would drop the merge request silently, forever. The daemon asks on startup and on every reconnect; the record makes it idempotent, so re-asking cannot open a second PR. |
 
 ## Updating the daemon (`[update]`) — why it only checks

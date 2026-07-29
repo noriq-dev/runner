@@ -289,6 +289,25 @@ describe('DiversionBackend — the rest of the surface', () => {
     expect(calls).toEqual([]); // not even a network call
   });
 
+  it('openReview refuses honestly: review happens in Diversion, and nothing is invented (RUN-85)', async () => {
+    // No pending-merge endpoint is measured, so the contract is a refusal that names where a
+    // human reviews — and ZERO calls: stating that fact must not act on the server.
+    const { backend, calls } = fakes({});
+    const res = await backend.openReview('/repo', {
+      head: 'noriq/plan-alpha',
+      base: 'main',
+      planTitle: 'Runner v2',
+      planKey: 'alpha',
+    });
+    expect(res).toEqual({
+      ok: false,
+      detail:
+        'review happens in Diversion: merge branch noriq/plan-alpha into main in the ' +
+        'Diversion app (repo dv.repo.test) — the daemon cannot open a Diversion merge request',
+    });
+    expect(calls).toEqual([]); // no network call is part of the contract, not an accident
+  });
+
   it('hasWork: uncommitted changes count, and so do commits past the lease base', async () => {
     const dirty = fakes({ status: 'Total modified paths: 1\nNew:\n\t a.txt\nModified:\n\t b.txt\n' });
     const ws1 = await dirty.backend.lease('/repo', 'run_1');

@@ -10,6 +10,8 @@ import type {
   LockContext,
   LockOutcome,
   PublishResult,
+  ReviewRequest,
+  ReviewResult,
   VcsBackend,
   Workspace,
 } from './types';
@@ -460,6 +462,24 @@ export class DiversionBackend implements VcsBackend {
    *  has no push at all). A no-op success, exactly as the interface allows for. */
   async share(_repoRoot: string, _target: string): Promise<{ ok: true }> {
     return { ok: true };
+  }
+
+  /**
+   * The daemon cannot open a Diversion review (RUN-85): `gh` is not the review surface here,
+   * and no pending-merge creation endpoint has been measured — inventing that POST is exactly
+   * what this file's discipline forbids (dvMergeUrl needs a merge id this flow does not have).
+   * So the honest answer is a refusal that says where review actually happens, built from
+   * plain prose: the caller warns and records it, which is the whole point — a hand-written
+   * `[land].mergeTarget` on this backend used to do NOTHING, silently. No server call: this
+   * method states a fact about Diversion, it does not act.
+   */
+  async openReview(_repoRoot: string, review: ReviewRequest): Promise<ReviewResult> {
+    return {
+      ok: false,
+      detail:
+        `review happens in Diversion: merge branch ${review.head} into ${review.base} in the ` +
+        `Diversion app (repo ${this.repoId}) — the daemon cannot open a Diversion merge request`,
+    };
   }
 
   /**

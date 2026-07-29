@@ -1,6 +1,15 @@
 import type { LockClient } from '../lock-client';
+import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
-import type { LeaseOptions, LockContext, LockOutcome, VcsBackend, Workspace } from './types';
+import type {
+  LeaseOptions,
+  LockContext,
+  LockOutcome,
+  ReviewRequest,
+  ReviewResult,
+  VcsBackend,
+  Workspace,
+} from './types';
 
 /** The slice of LockClient the git backend delegates its lock ops to — injectable, and OPTIONAL:
  *  a daemon with no Noriq lock layer wired (or a test) constructs GitBackend without it, and the
@@ -70,15 +79,20 @@ function gitLocation(ws: Workspace): GitLocation {
  *   targetExists → refExists · createTarget → createBranch · integrate → rebaseOnto
  *   resumeIntegrate → continueRebase · abandonIntegrate → abortRebase
  *   publish → landFastForward · share → pushBranch · reapOrphans → reapOrphans
+ *   openReview → openMergeRequest (merge-request.ts — gh, not WorktreeManager)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
   private readonly git: GitOps;
   private readonly locks?: LockDelegate;
+  private readonly gh?: GhExec;
 
-  constructor(git: GitOps, locks?: LockDelegate) {
+  constructor(git: GitOps, locks?: LockDelegate, gh?: GhExec) {
     this.git = git;
     this.locks = locks;
+    // Injectable like GitOps, for the same reason (tests never shell); undefined falls through
+    // to merge-request.ts's own real-`gh` default, so production wiring names nothing new.
+    this.gh = gh;
   }
 
   async lease(repoRoot: string, runId: string, opts?: LeaseOptions): Promise<Workspace> {
@@ -149,6 +163,15 @@ export class GitBackend implements VcsBackend {
     return remote === undefined
       ? this.git.pushBranch(repoRoot, target)
       : this.git.pushBranch(repoRoot, target, remote);
+  }
+
+  /**
+   * The one outcome git delegates OUTSIDE WorktreeManager (RUN-85): onward review is the
+   * operator's `gh`, not a git verb — merge-request.ts holds the whole credential/boundary
+   * rationale (RUN-28) and its result shape is ReviewResult's, field for field.
+   */
+  openReview(repoRoot: string, review: ReviewRequest): Promise<ReviewResult> {
+    return openMergeRequest({ repoRoot, ...review }, this.gh);
   }
 
   reapOrphans(

@@ -5,6 +5,8 @@ import type { LockConflict, LockGrant } from '../lock-client';
  * outcomes rather than git verbs. This is VCS-SPIKE.md §2 made real — the operation set was
  * *discovered, not designed*: RunSupervisor's `Pick<WorktreeManager>` already declared exactly
  * this list, so extracting it is a rename of a seam every test already injects through.
+ * (`openReview` joined later — RUN-85, the RUN-28 merge-request flow asked backend-neutrally —
+ * by the same discovery route: daemon.ts was already doing it, git-only, outside the seam.)
  *
  * Two shapes here were arrived at by being burned, and must survive any future backend verbatim:
  *
@@ -105,6 +107,34 @@ export type PublishResult =
   | { ok: false; reason: 'race' | 'error'; detail: string };
 
 export type ShareResult = { ok: true } | { ok: false; detail: string };
+
+/**
+ * What `openReview` (RUN-85) needs, said backend-neutrally. `head` and `base` are
+ * backend-interpreted strings in exactly the register `targetExists`/`createTarget` use for
+ * `target` — git reads branches, a server-backed VCS reads whatever names its lines.
+ */
+export interface ReviewRequest {
+  /** The plan's working target holding the landed work — already shared, where sharing exists. */
+  head: string;
+  /** The protected target, named by the repo's manifest (`[land].mergeTarget`). Never by a dispatch. */
+  base: string;
+  planTitle: string;
+  planKey: string;
+}
+
+/**
+ * The outcome of asking for an onward review (RUN-85). Field contracts are MergeRequestResult's,
+ * kept verbatim — the daemon's reconcile path branches on them.
+ */
+export interface ReviewResult {
+  ok: boolean;
+  /** Where the review lives, when one was opened (git: the PR URL). */
+  url?: string;
+  /** Why it could not be opened. Never throws — a plan's work is landed and pushed either way. */
+  detail?: string;
+  /** The command a human can run, when we could not. */
+  command?: string;
+}
 
 /**
  * What a lock op needs beyond the workspace (RUN-98): which project, whose identity holds the
@@ -236,6 +266,22 @@ export interface VcsBackend {
    * not a failure.
    */
   share(repoRoot: string, target: string, remote?: string): Promise<ShareResult>;
+
+  /**
+   * Open the plan's onward review from `head` into `base` — RUN-28's merge request, named as an
+   * outcome (RUN-85). Git shells the operator's `gh`, in the DAEMON, after the gate
+   * (merge-request.ts holds the credential rationale). A server-backed VCS, where `gh` is not
+   * the review surface and no review API has been measured, answers honestly that review
+   * happens in its own tool: `{ok:false}` with a `detail` naming the backend and where a human
+   * acts — so the caller warns and records instead of silently doing nothing, which is the
+   * exact defect RUN-85 closes.
+   *
+   * REQUIRED, not optional — share()'s pattern, not `lock?`'s, deliberately: the daemon asks
+   * this of every backend at plan completion, and an omitted method would BE the silence this
+   * verb exists to remove. Required forces each future backend to say where review happens.
+   * Returns rather than throws: the work is landed (and shared, where sharing exists) either way.
+   */
+  openReview(repoRoot: string, review: ReviewRequest): Promise<ReviewResult>;
 
   /**
    * Crash recovery: find workspaces whose Run died with a previous daemon and clean them up —

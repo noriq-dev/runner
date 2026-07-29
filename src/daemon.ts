@@ -1,5 +1,13 @@
-import type { AgentTool, ExecutionSpec, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
-import { NoriqClient } from './client';
+import type {
+  AgentTool,
+  ExecutionSpec,
+  ProjectManifest,
+  Run,
+  RunKind,
+  RunModelUsage,
+  RunnerConfig,
+} from '@noriq-dev/shared';
+import { NoriqClient, type OwedMerge } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
@@ -9,7 +17,6 @@ import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
-import { openMergeRequest } from './merge-request';
 import { ParkedStore } from './parked';
 import { buildRegistration } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
@@ -216,6 +223,89 @@ export function orphanSweep(deps: {
       });
     }
     return { reaped, kept };
+  };
+}
+
+/**
+ * The owed-merge reconcile (RUN-28), extracted for the same reason its neighbours are: it lived
+ * as an untested closure in start()'s wiring, which is where whole layers have shipped silently
+ * dead — and its failure mode is exactly that shape (a plan quietly never gets its review).
+ *
+ * Since RUN-85 it reaches review-opening only through the repo's DETECTED backend — the same
+ * `vcsFor` routing `share` already took, never a manifest field (a committed lie would travel,
+ * RUN-60). Git shells the operator's `gh` behind the seam; a server-backed VCS answers that it
+ * cannot open one and where review actually happens, and that answer is WARNED and REPORTED —
+ * a hand-written `[land].mergeTarget` on a Diversion/Perforce repo used to reach `gh` or
+ * nothing, silently, at the one moment the plan claimed to be done.
+ */
+export function owedMergeReconciler(deps: {
+  owed: () => Promise<OwedMerge[]>;
+  /** Repos this runner still has; an owed plan whose repo is gone is skipped, not failed. */
+  repoFor: (repoRef: string) => { root: string } | undefined;
+  /** Re-read per plan (ManifestStore.current): editing the marker takes effect without a restart. */
+  manifestFor: (root: string) => Promise<ProjectManifest | null>;
+  vcsFor: (root: string) => Pick<VcsBackend, 'kind' | 'share' | 'openReview'>;
+  report: (outcome: { planId: string; url?: string | null; failed?: string | null }) => Promise<void>;
+  logger?: typeof defaultLogger;
+}): () => Promise<void> {
+  const log = deps.logger ?? defaultLogger;
+  return async () => {
+    const owed = await deps.owed().catch((err) => {
+      log.debug('could not ask for owed merge requests', { err: String(err) });
+      return [];
+    });
+    for (const plan of owed) {
+      const repo = plan.repoRef ? deps.repoFor(plan.repoRef) : undefined;
+      if (!repo) continue; // a plan whose repo this runner no longer has
+      const manifest = await deps.manifestFor(repo.root);
+      const target = manifest?.land?.mergeTarget ?? null;
+      if (!manifest?.land || !target) continue; // the repo never asked for merge requests
+
+      const backend = deps.vcsFor(repo.root);
+      const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
+      // Push again before opening: landing pushed each run as it went, but this is the moment
+      // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
+      // Unbranched on purpose: a server-backed share is a documented no-op {ok:true}.
+      const push = await backend.share(repo.root, branch);
+      if (!push.ok) {
+        await deps.report({ planId: plan.planId, failed: `push failed: ${push.detail}` }).catch(() => {});
+        continue;
+      }
+      const mr = await backend.openReview(repo.root, {
+        head: branch,
+        base: target,
+        planTitle: plan.planTitle,
+        planKey: plan.planKey ?? plan.planId,
+      });
+      if (mr.ok) {
+        log.info('opened a merge request for a completed plan', {
+          planId: plan.planId,
+          plan: plan.planTitle,
+          branch,
+          target,
+          url: mr.url,
+        });
+      } else {
+        // The one log a hand-written mergeTarget on a server-backed repo gets — it names the
+        // backend and (via the backend's detail) where review actually happens. `command` is
+        // git's hand-runnable `gh pr create`; a backend with none carries the answer in detail.
+        log.warn('could not open the merge request — a human takes it from here', {
+          planId: plan.planId,
+          backend: backend.kind,
+          detail: mr.detail,
+          command: mr.command,
+        });
+      }
+      // Reported either way. Recording only successes leaves a failure invisible and the plan
+      // owed forever, so every reconnect retries the same broken thing and nobody learns why.
+      await deps
+        .report({
+          planId: plan.planId,
+          url: mr.url ?? null,
+          failed: mr.ok ? null : (mr.detail ?? 'failed'),
+        })
+        .catch((err) => log.warn('could not report the merge result', { err: String(err) }));
+    }
   };
 }
 
@@ -642,61 +732,18 @@ export class Daemon {
       }
     };
 
-    const reconcileOwedMerges = async (): Promise<void> => {
-      const owed = await client.owedMerges(runner.id).catch((err) => {
-        this.log.debug('could not ask for owed merge requests', { err: String(err) });
-        return [];
-      });
-      for (const plan of owed) {
-        const repo = plan.repoRef ? reposById.get(plan.repoRef) : undefined;
-        if (!repo) continue; // a plan whose repo this runner no longer has
-        const manifest = await manifests.current(repo.root);
-        const target = manifest?.land?.mergeTarget ?? null;
-        if (!manifest?.land || !target) continue; // the repo never asked for merge requests
-
-        const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
-        // Push again before opening: landing pushed each run as it went, but this is the moment
-        // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
-        const push = await (backendFor.get(repo.root) ?? vcs).share(repo.root, branch);
-        if (!push.ok) {
-          await client
-            .reportMerge(runner.id, { planId: plan.planId, failed: `push failed: ${push.detail}` })
-            .catch(() => {});
-          continue;
-        }
-        const mr = await openMergeRequest({
-          repoRoot: repo.root,
-          head: branch,
-          base: target,
-          planTitle: plan.planTitle,
-          planKey: plan.planKey ?? plan.planId,
-        });
-        if (mr.ok) {
-          this.log.info('opened a merge request for a completed plan', {
-            planId: plan.planId,
-            plan: plan.planTitle,
-            branch,
-            target,
-            url: mr.url,
-          });
-        } else {
-          this.log.warn('could not open the merge request — run it by hand', {
-            planId: plan.planId,
-            detail: mr.detail,
-            command: mr.command,
-          });
-        }
-        // Reported either way. Recording only successes leaves a failure invisible and the plan
-        // owed forever, so every reconnect retries the same broken thing and nobody learns why.
-        await client
-          .reportMerge(runner.id, {
-            planId: plan.planId,
-            url: mr.url ?? null,
-            failed: mr.ok ? null : (mr.detail ?? 'failed'),
-          })
-          .catch((err) => this.log.warn('could not report the merge result', { err: String(err) }));
-      }
-    };
+    // Owed merge requests (RUN-28), routed through the detected backend since RUN-85 —
+    // `vcsFor` is the same `backendFor.get(root) ?? vcs` the share step always took, now
+    // carrying openReview too, so gh is git's business and a server-backed repo's
+    // mergeTarget yields an honest warn+report instead of a gh call that means nothing there.
+    const reconcileOwedMerges = owedMergeReconciler({
+      owed: () => client.owedMerges(runner.id),
+      repoFor: (repoRef) => reposById.get(repoRef),
+      manifestFor: (root) => manifests.current(root),
+      vcsFor: (root) => backendFor.get(root) ?? vcs,
+      report: (outcome) => client.reportMerge(runner.id, outcome),
+      logger: this.log,
+    });
 
     // Ask once at startup, not only on reconnect (RUN-28): the likeliest way to miss a
     // plan.completed frame is for the box to have been OFF when it fired — and a daemon that
