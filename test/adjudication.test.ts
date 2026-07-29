@@ -5,6 +5,8 @@ import {
   buildLedger,
   parseFindingResponses,
   parseFindings,
+  reconciledEntry,
+  renderContestRecord,
   renderLedger,
   renderRequirementOutcomes,
   requirementOutcomes,
@@ -410,6 +412,8 @@ describe('parsing sub-claims (RUN-180)', () => {
     'FINDING 1b: the entry cap can drop a terminal finding before a PASS\n' +
     'VERDICT: FAIL';
 
+  // The canonical set is claim TEXT in report order (the structural settlement): a letter is the
+  // line's position, enforced a, b, c… by the parse, so nothing downstream ever stores one.
   it('attaches lettered sub-claim lines to the finding their number names', () => {
     expect(parseFindings(REPORT)).toEqual([
       {
@@ -419,8 +423,8 @@ describe('parsing sub-claims (RUN-180)', () => {
         location: 'src/gate.ts:12',
         claim: 'the contest gate bundles two separately-answerable defects',
         subclaims: [
-          { letter: 'a', claim: 'the eligibility check accepts a response naming a nonexistent finding' },
-          { letter: 'b', claim: 'the entry cap can drop a terminal finding before a PASS' },
+          'the eligibility check accepts a response naming a nonexistent finding',
+          'the entry cap can drop a terminal finding before a PASS',
         ],
       },
     ]);
@@ -524,7 +528,7 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 1b: half two\n' +
         'The escape described in FINDING 1 is the subject of this report.',
     );
-    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
   // The token net keys on a colon NEAR the number — label-intent — so a colon that is ordinary
@@ -536,7 +540,7 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 1b: half two\n' +
         'See FINDING 1 for the full chain of evidence: it holds either way.',
     );
-    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
   // The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is format-legal and asserts the
@@ -548,7 +552,7 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 1b: half two\n' +
         'ESCALATE STRUCTURAL FINDING 1: the promise leaks with no chokepoint — a.ts:1, b.ts:2, c.ts:3',
     );
-    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
   // The strict shapes are checked WITH their number: finding 2's sub-claim line whose claim text
@@ -562,7 +566,7 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 2a: overlaps FINDING 1: the same gate',
     );
     expect(out[0]!.subclaims).toEqual([]); // voided by the quoted near-colon token
-    expect(out[1]!.subclaims.map((s) => s.letter)).toEqual(['a']); // recorded for its own number
+    expect(out[1]!.subclaims).toEqual(['overlaps FINDING 1: the same gate']); // recorded for its own number
   });
 
   // The deliberate cost of the wider net: a PROSE line that happens to start `FINDING 1 rests…`
@@ -585,6 +589,29 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
+  // Letters are position (the settlement): a, b, c… in report order, no gaps, no reordering. A
+  // label that breaks the sequence is an intended-but-invalid enumeration like a decorated one —
+  // honouring it would make the letter carry information position does not, i.e. state.
+  it('an out-of-sequence letter voids the enumeration', () => {
+    for (const bad of [
+      'FINDING 1b: starts at b\nFINDING 1a: then a', // reordered
+      'FINDING 1a: first\nFINDING 1c: skips b', // a gap
+      'FINDING 1b: only line, no a', // starts past a
+    ]) {
+      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${bad}`);
+      expect(out[0]!.subclaims).toEqual([]);
+    }
+  });
+
+  // Identity is claim text, so one claim under two letters is not separately answerable — the
+  // whole enumeration degrades rather than leaving an ambiguous pair a response could split.
+  it('the same claim under two letters voids the enumeration', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\nFINDING 1a: the same words\nFINDING 1b: the same words',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
   // More separately-answerable claims than the cap is several findings — and the cap DROPS the
   // enumeration rather than slicing it: a kept (a)–(d) beside a silently cut (e) would let the
   // contest clear four letters while the fifth claim went unrecorded.
@@ -597,7 +624,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   it('an enumeration at the cap is kept whole', () => {
     const letters = ['a', 'b', 'c', 'd'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
     const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
-    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b', 'c', 'd']);
+    expect(out[0]!.subclaims).toEqual(['claim a', 'claim b', 'claim c', 'claim d']);
   });
 
   // A sub-claim line never leaks into the finding list, and a report with none parses as it
@@ -634,7 +661,7 @@ describe('parsing sub-claims (RUN-180)', () => {
 });
 
 describe('folding partial answers into the ledger (RUN-180)', () => {
-  const SF = (id: number, subclaims: { letter: string; claim: string }[], location = `f${id}.ts:1`) => ({
+  const SF = (id: number, subclaims: string[], location = `f${id}.ts:1`) => ({
     id,
     severity: 'High',
     requirements: [],
@@ -649,16 +676,16 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     pointer: string,
     reason = 'because',
   ) => ({ id, subclaim, status, pointer, reason });
-  const AB = [
-    { letter: 'a', claim: 'claim a' },
-    { letter: 'b', claim: 'claim b' },
-  ];
+  const AB = ['claim a', 'claim b'];
 
+  // A RESPONSE letter is resolved at the fold boundary into the claim at that POSITION — the
+  // report's own lettering, which the parse made positional — and dies there: the entry stores
+  // claim text and adjudication only (the structural settlement).
   it('answers fold per sub-claim; the unaddressed one stays unanswered', () => {
     const led = buildLedger([], [SF(1, AB)], [SR(1, 'b', 'contested', 'x.ts:1')], 1);
-    expect(led[0]!.subclaims.map((s) => [s.letter, s.status, s.pointer])).toEqual([
-      ['a', 'unanswered', null],
-      ['b', 'contested', 'x.ts:1'],
+    expect(led[0]!.subclaims.map((s) => [s.claim, s.status, s.pointer])).toEqual([
+      ['claim a', 'unanswered', null],
+      ['claim b', 'contested', 'x.ts:1'],
     ]);
     expect(led[0]!.status).toBe('unanswered'); // no whole-finding response was given
   });
@@ -675,9 +702,21 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9', 'covered')], 1);
     const round2 = buildLedger(round1, [SF(1, AB)], [], 2);
     expect(round2).toHaveLength(1);
-    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status])).toEqual([
-      ['a', 'contested'],
-      ['b', 'unanswered'],
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['claim a', 'contested'],
+      ['claim b', 'unanswered'],
+    ]);
+  });
+
+  // The settlement's own acceptance case: a fresh reviewer that re-letters or re-orders the same
+  // claims changes NOTHING — identity is the claim's wording, letters are re-derived from the new
+  // order, and every carried adjudication lands on the claim it answered.
+  it('a re-ordered re-raise keeps every adjudication with its claim, not its letter', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'b', 'contested', 'b.ts:9', 'refuted')], 1);
+    const round2 = buildLedger(round1, [SF(1, ['claim b', 'claim a'])], [], 2);
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['claim b', 'contested'], // now first — and still the rebutted one
+      ['claim a', 'unanswered'],
     ]);
   });
 
@@ -686,63 +725,46 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
   // The cost of the miss is a visibly unanswered sub-claim, which a builder can answer again.
   it('a re-raise whose lettered claims are different claims does not inherit the old answers', () => {
     const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
-    const round2 = buildLedger(
-      round1,
-      [SF(1, [{ letter: 'a', claim: 'an entirely different assertion' }])],
-      [],
-      2,
-    );
-    // The new claim owns letter (a) with NO inherited answer; held (a) — contested, and no longer
-    // asserted by the new enumeration — is dropped as settled by both sides, while held (b), still
-    // unanswered, is carried rather than lost (it kept its letter, which the new set left free).
+    const round2 = buildLedger(round1, [SF(1, ['an entirely different assertion'])], [], 2);
+    // The new claim takes the first position with NO inherited answer; held 'claim a' — contested,
+    // and no longer asserted by the new enumeration — is dropped as settled by both sides, while
+    // held 'claim b', still unanswered, is carried rather than lost.
     expect(round2[0]!.subclaims).toEqual([
-      {
-        letter: 'a',
-        claim: 'an entirely different assertion',
-        status: 'unanswered',
-        pointer: null,
-        reason: null,
-      },
-      { letter: 'b', claim: 'claim b', status: 'unanswered', pointer: null, reason: null },
+      { claim: 'an entirely different assertion', status: 'unanswered', pointer: null, reason: null },
+      { claim: 'claim b', status: 'unanswered', pointer: null, reason: null },
     ]);
   });
 
-  // The :394 escape, closed: a re-raise that repeats only SOME held letters used to replace the
-  // set wholesale, so `(a) unanswered, (b) contested` became `(b) contested` when the terminal
-  // round listed just (b) — and the candidacy gate, which can only keep standing what was
-  // RECORDED, would have cleared the finding on (b) alone. The uncovered unanswered claim now
-  // carries, re-lettered when its old letter is taken, still visibly standing.
+  // The fold-level RUN-174 escape, closed: a re-raise that repeats only SOME held claims used to
+  // replace the set wholesale, so an unanswered claim vanished exactly when the terminal round
+  // enumerated the claims it cared about — and the candidacy gate can only keep standing what was
+  // RECORDED. The uncovered unanswered claim now carries, still visibly standing, behind the new
+  // enumeration in the record's order.
   it('a partial re-enumeration carries the held unanswered claim instead of dropping it', () => {
     const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'b', 'contested', 'b.ts:9', 'refuted')], 1);
-    // The terminal re-raise letters its ONE claim (a) — wording matching held (b), whose rebuttal
-    // carries — and says nothing about held (a).
-    const round2 = buildLedger(round1, [SF(1, [{ letter: 'a', claim: 'claim b' }])], [], 2);
+    // The terminal re-raise enumerates ONE claim — wording matching held 'claim b', whose rebuttal
+    // carries — and says nothing about held 'claim a'.
+    const round2 = buildLedger(round1, [SF(1, ['claim b'])], [], 2);
     expect(round2[0]!.subclaims).toEqual([
-      { letter: 'a', claim: 'claim b', status: 'contested', pointer: 'b.ts:9', reason: 'refuted' },
-      // Held (a) carried under the next free letter: its old letter now names the new claim.
-      { letter: 'b', claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
+      { claim: 'claim b', status: 'contested', pointer: 'b.ts:9', reason: 'refuted' },
+      { claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
     ]);
   });
 
-  // A carried letter the new set left FREE keeps its letter — and stays answerable by it: the
-  // builder saw that letter in the rendered ledger, so a response naming it this round credits it.
-  it('a carried sub-claim keeping its letter can be answered by that letter', () => {
+  // A held claim past this report's own lines stays answerable at the position the record shows
+  // for it: the report re-lists only the first claim, and the builder's (b) — the second position,
+  // which the report's single line does not shadow — lands on the held second claim.
+  it('a carried sub-claim past the report’s lines is answerable at its record position', () => {
     const round1 = buildLedger([], [SF(1, AB)], [], 1);
     const round2 = buildLedger(
       round1,
-      [SF(1, [{ letter: 'a', claim: 'claim a' }])], // re-raise repeats only (a)…
+      [SF(1, ['claim a'])], // re-raise repeats only the first claim…
       [SR(1, 'b', 'contested', 'late.ts:3', 'finally answered')], // …and the builder answers (b)
       2,
     );
     expect(round2[0]!.subclaims).toEqual([
-      { letter: 'a', claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
-      {
-        letter: 'b',
-        claim: 'claim b',
-        status: 'contested',
-        pointer: 'late.ts:3',
-        reason: 'finally answered',
-      },
+      { claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
+      { claim: 'claim b', status: 'contested', pointer: 'late.ts:3', reason: 'finally answered' },
     ]);
   });
 
@@ -750,8 +772,7 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
   // whole and drops the new enumeration — all-or-nothing (the parse-side rule, one fold up),
   // because a sliced union is a kept subset the contest could clear around.
   it('a union past the ledger cap keeps the held set whole rather than slicing', () => {
-    const claims = (tag: string) =>
-      ['a', 'b', 'c', 'd'].map((l) => ({ letter: l, claim: `${tag} claim ${l}` }));
+    const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
     const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
     const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // union = 8, at the cap
     expect(round2[0]!.subclaims).toHaveLength(8);
@@ -759,34 +780,36 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     expect(round3[0]!.subclaims.map((s) => s.claim)).toEqual(round2[0]!.subclaims.map((s) => s.claim));
   });
 
-  // …and standing whole must not cost this turn's answers: the builder — told a standing letter
-  // stays answerable by its letter — may be contesting a held letter in the very fold that
-  // overflows. Only a letter this round's enumeration re-used is excluded (the response then
-  // names the report in front of the builder — crediting the held claim too would be inventing).
-  it('the overflow fallback still credits this turn’s answer to a free held letter', () => {
-    const claims = (tag: string) =>
-      ['a', 'b', 'c', 'd'].map((l) => ({ letter: l, claim: `${tag} claim ${l}` }));
+  // …and standing whole must not cost this turn's answers: the builder — shown the record's
+  // letters for standing claims — may be contesting one in the very fold that overflows. A letter
+  // this round's enumeration shadows names the report in front of the builder instead (crediting
+  // the held claim too would be inventing).
+  it('the overflow fallback still credits this turn’s answer at the held claim’s position', () => {
+    const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
     const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
-    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // held is now (a)–(h)
+    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // the record now holds (a)–(h)
     const round3 = buildLedger(
       round2,
       [SF(1, claims('three'))], // overflow: the new enumeration is dropped, held set stands…
-      [SR(1, 'e', 'contested', 'e.ts:9', 'answered under its held letter')],
+      [SR(1, 'e', 'contested', 'e.ts:9', 'answered at its record position')],
       3,
     );
-    const byLetter = new Map(round3[0]!.subclaims.map((s) => [s.letter, s]));
-    expect(byLetter.get('e')).toMatchObject({ status: 'contested', pointer: 'e.ts:9' }); // …credited
-    expect(byLetter.get('a')!.status).toBe('unanswered'); // (a) collides with this round's (a) — never credited
+    const byClaim = new Map(round3[0]!.subclaims.map((s) => [s.claim, s]));
+    // (e) is the fifth record position — the first past the report's four lines: held[4].
+    expect(byClaim.get('one claim a')).toMatchObject({ status: 'contested', pointer: 'e.ts:9' });
+    // (a) is shadowed by this round's report — it names 'three claim a', never the held claim.
+    expect(byClaim.get('two claim a')!.status).toBe('unanswered');
   });
 
   // The same crediting on the letterless-re-raise path: the held set is preserved AND the
-  // builder's per-letter answer this turn lands on it, as the prompts promise.
-  it('a letterless re-raise still folds a per-letter answer onto the held letters', () => {
+  // builder's per-letter answer this turn lands on it — nothing shadows, so the letters ARE the
+  // record's positions, which is what the contest record shows the builder.
+  it('a letterless re-raise still folds a per-letter answer onto the held claims', () => {
     const round1 = buildLedger([], [SF(1, AB)], [], 1);
     const round2 = buildLedger(round1, [SF(1, [])], [SR(1, 'a', 'contested', 'a.ts:9', 'covered')], 2);
-    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status, s.pointer])).toEqual([
-      ['a', 'contested', 'a.ts:9'],
-      ['b', 'unanswered', null],
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status, s.pointer])).toEqual([
+      ['claim a', 'contested', 'a.ts:9'],
+      ['claim b', 'unanswered', null],
     ]);
   });
 
@@ -798,7 +821,7 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
       `FINDING 1 [High] a.ts:1: the class\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
     const [one] = parseFindings(longReport('ONE'));
     const [two] = parseFindings(longReport('TWO'));
-    expect(one!.subclaims[0]!.claim).toEqual(two!.subclaims[0]!.claim); // capped to the same text…
+    expect(one!.subclaims[0]).toEqual(two!.subclaims[0]); // capped to the same text…
     const round1 = buildLedger([], [one!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
     const round2 = buildLedger(round1, [two!], [], 2);
     expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']); // …but never carried
@@ -808,10 +831,13 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
   // only past the prefix must not both inherit one rebuttal — an answer nobody gave to one of them.
   it('two distinct claims sharing a long prefix do not share a carried answer', () => {
     const prefix = 'the eligibility filter in contestTerminalFindings accepts a response naming ';
-    const one = { letter: 'a', claim: `${prefix}a finding that does not exist` };
-    const other = { letter: 'a', claim: `${prefix}an id from another round` };
-    const round1 = buildLedger([], [SF(1, [one])], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
-    const round2 = buildLedger(round1, [SF(1, [other])], [], 2);
+    const round1 = buildLedger(
+      [],
+      [SF(1, [`${prefix}a finding that does not exist`])],
+      [SR(1, 'a', 'contested', 'a.ts:9')],
+      1,
+    );
+    const round2 = buildLedger(round1, [SF(1, [`${prefix}an id from another round`])], [], 2);
     expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']);
   });
 
@@ -844,9 +870,9 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
   it('a re-raise that drops the enumeration keeps the held sub-claims and their answers', () => {
     const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
     const round2 = buildLedger(round1, [SF(1, [])], [], 2);
-    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status])).toEqual([
-      ['a', 'contested'],
-      ['b', 'unanswered'],
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['claim a', 'contested'],
+      ['claim b', 'unanswered'],
     ]);
   });
 
@@ -886,12 +912,27 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
 
   it('normalises a malformed persisted sub-claim list field by field instead of crashing', () => {
     const mangled = {
-      subclaims: ['not-an-object', { letter: 'a', claim: 'ok', status: 'bogus' }, { letter: 1 }],
+      subclaims: ['not-an-object', { claim: 'ok', status: 'bogus' }, { letter: 'b' }],
     };
     expect(subclaimsOf(mangled)).toEqual([
-      { letter: 'a', claim: 'ok', status: 'unanswered', pointer: null, reason: null },
+      { claim: 'ok', status: 'unanswered', pointer: null, reason: null },
     ]);
     expect(subclaimsOf({})).toEqual([]);
+  });
+
+  // A ledger persisted by the letter-era shape (this run's own prior sittings) loads too: the
+  // claim is the identity, the stray letter field is ignored, and renders re-derive the labels.
+  it('a letter-era persisted entry loads claim-keyed, its stored letters ignored', () => {
+    const persisted = {
+      subclaims: [
+        { letter: 'c', claim: 'first by position', status: 'contested', pointer: 'x.ts:1', reason: 'r' },
+        { letter: 'a', claim: 'second by position', status: 'unanswered', pointer: null, reason: null },
+      ],
+    };
+    expect(subclaimsOf(persisted)).toEqual([
+      { claim: 'first by position', status: 'contested', pointer: 'x.ts:1', reason: 'r' },
+      { claim: 'second by position', status: 'unanswered', pointer: null, reason: null },
+    ]);
   });
 
   it('renderLedger names the sub-claim that STANDS instead of reading the finding as answered', () => {
@@ -918,5 +959,57 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     const out = renderRequirementOutcomes(requirementOutcomes(['R-7'], led));
     expect(out).toContain('(a) unanswered');
     expect(out).toContain('(b) contested');
+  });
+});
+
+// The contest turn's view of the record (RUN-180): letters are not state anywhere, so a standing
+// sub-claim a letterless or narrowed terminal re-raise does not repeat has no letter the builder
+// could otherwise know — the rendered record is what makes it answerable, and its positional
+// letters are exactly the coordinates the fold resolves a response against.
+describe('renderContestRecord (RUN-180)', () => {
+  const SF = (id: number, subclaims: string[], location = `f${id}.ts:1`) => ({
+    id,
+    severity: 'High',
+    requirements: [],
+    location,
+    claim: 'the class',
+    subclaims,
+  });
+
+  it('renders each terminal finding’s sub-claims with position-derived letters and answers', () => {
+    const terminal = SF(1, ['half one', 'half two']);
+    const ledger = buildLedger(
+      [],
+      [terminal],
+      [{ id: 1, subclaim: 'b', status: 'contested' as const, pointer: 'y.ts:3', reason: 'covered' }],
+      3,
+    );
+    const out = renderContestRecord([terminal], ledger, 3);
+    expect(out).toContain('FINDING 1:');
+    expect(out).toContain('(a) half one — no answer recorded');
+    expect(out).toContain('(b) half two — CONTESTED (y.ts:3)');
+  });
+
+  it('shows the carried claims of a letterless terminal re-raise — the letters the report lacks', () => {
+    const round1 = buildLedger([], [SF(1, ['half one', 'half two'])], [], 1);
+    const terminal = SF(1, []); // the terminal reviewer re-raises without the letters
+    const ledger = buildLedger(round1, [terminal], [], 2);
+    const out = renderContestRecord([terminal], ledger, 2);
+    expect(out).toContain('(a) half one — no answer recorded');
+    expect(out).toContain('(b) half two — no answer recorded');
+  });
+
+  it('is null when no terminal finding carries sub-claims — every pre-RUN-180 report', () => {
+    const terminal = SF(1, []);
+    const ledger = buildLedger([], [terminal], [], 1);
+    expect(renderContestRecord([terminal], ledger, 1)).toBeNull();
+  });
+
+  it('reconciledEntry matches only the entry the fold wrote for this finding and round', () => {
+    const terminal = SF(1, ['half one']);
+    const ledger = buildLedger([], [terminal], [], 2);
+    expect(reconciledEntry(ledger, terminal, 2)?.claim).toBe('the class');
+    expect(reconciledEntry(ledger, terminal, 1)).toBeUndefined(); // another round's entry is not this one
+    expect(reconciledEntry(ledger, { ...terminal, claim: 'reworded' }, 2)).toBeUndefined();
   });
 });

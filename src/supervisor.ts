@@ -18,6 +18,9 @@ import {
   buildLedger,
   parseFindingResponses,
   parseFindings,
+  reconciledEntry,
+  renderContestRecord,
+  subclaimLetter,
   subclaimsOf,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
@@ -2006,8 +2009,18 @@ export class RunSupervisor {
     // block is parsed (RUN-79) — snapshotted before the turn as the fix loop does.
     const textBefore = ctx.getSessionText?.().length ?? 0;
     const startedAt = monotonicMs();
+    // The contest prompt carries the RECORD — each terminal finding's sub-claims as the reconciled
+    // ledger holds them, lettered by position (RUN-180). Letters are not state anywhere (the
+    // structural settlement), so a standing sub-claim this terminal report does not re-list has no
+    // letter the builder could otherwise know: the record is what makes it answerable, and its
+    // positional letters are exactly the coordinates the fold resolves a response against.
     const exit = await ctx.session
-      .continueWith(reviewerContestPrompt(args.verdict.findings))
+      .continueWith(
+        reviewerContestPrompt(
+          args.verdict.findings,
+          renderContestRecord(args.findings, args.ledger, args.terminalRound),
+        ),
+      )
       .catch((err): DriverExit | null => {
         this.log.warn('could not hand the terminal findings back for a contest', {
           runId: ctx.run.id,
@@ -2067,44 +2080,36 @@ export class RunSupervisor {
     const contestedSubs = new Set(
       matched.filter((r) => r.status === 'contested' && r.subclaim).map((r) => `${r.id}${r.subclaim}`),
     );
-    const loc = (s: string) => s.trim().toLowerCase();
     // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
     // parse alone. The fold deliberately PRESERVES held sub-claims when a re-raise drops the
     // letters — or repeats only SOME of them, unioning in the claims its wording does not cover —
     // a fresh terminal reviewer paraphrases by construction, so a letterless or narrowed re-raise
-    // of a half-answered finding still carries its unanswered letter — and reading `f.subclaims`
+    // of a half-answered finding still carries its unanswered claim — and reading `f.subclaims`
     // (empty or a subset on those paths) let a bare or partial contest clear exactly the claim
-    // this format exists to keep standing: the RUN-174 escape reborn one round later. The entry is also the VISIBILITY check:
-    // the adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
-    // fold (the cap) is not evidence and stands. Matched on the values the fold itself wrote (id,
-    // round, location, claim), so it cannot alias a prior attempt's persisted entry.
-    const reconciledOf = (f: Finding) =>
-      answered.find(
-        (e) =>
-          e.round === args.terminalRound &&
-          e.id === f.id &&
-          loc(e.location) === loc(f.location) &&
-          e.claim === f.claim,
-      );
+    // this format exists to keep standing: the RUN-174 escape reborn one round later. The entry is
+    // also the VISIBILITY check: the adjudicator judges what the ledger shows it, so a finding
+    // whose entry did not survive the fold (the cap) is not evidence and stands.
     const answerablyContested = (f: Finding) => {
-      const e = reconciledOf(f);
+      const e = reconciledEntry(answered, f, args.terminalRound);
       if (!e) return false;
-      // Every reconciled letter must read CONTESTED. A carried rebuttal counts — carrying an
+      // Every reconciled sub-claim must read CONTESTED. A carried rebuttal counts — carrying an
       // answer whose claim wording matched is the fold's whole point — while an unanswered or
-      // FIXED letter stands, whichever round enumerated it. FIXED blocking candidacy is not an
-      // oversight but the whole-finding rule ("a `FIXED` changed nothing here") at letter grain:
-      // the terminal reviewer judged the diff WITH any earlier fix in it and still failed, so "it
-      // is fixed" was already adjudicated and never buys the re-roll. A builder who believes a
-      // FIXED letter's claim no longer holds has this turn's move: CONTEST that letter with the
-      // pointer at the landed change — the fold credits a held letter's response on every path —
-      // and the fresh look then verifies it like any other contest.
+      // FIXED claim stands, whichever round enumerated it. FIXED blocking candidacy is not an
+      // oversight but the whole-finding rule ("a `FIXED` changed nothing here") at sub-claim
+      // grain: the terminal reviewer judged the diff WITH any earlier fix in it and still failed,
+      // so "it is fixed" was already adjudicated and never buys the re-roll. A builder who
+      // believes a FIXED sub-claim no longer holds has this turn's move: CONTEST it, at the letter
+      // the contest record shows for it, with the pointer at the landed change — the fold resolves
+      // that letter back to the claim on every path that keeps it — and the fresh look then
+      // verifies it like any other contest.
       if (subclaimsOf(e).some((s) => s.status !== 'contested')) return false;
-      // …and the builder must have engaged THIS turn: letter by letter where this round
-      // enumerated, the whole-finding form where it did not — which is also the letterless
-      // re-raise path, where the carried letters were checked above and the bare contest is the
-      // turn's own answer.
+      // …and the builder must have engaged THIS turn: claim by claim where this round enumerated
+      // (the letters below are pure position — the parse enforced a, b, c… in order, so index IS
+      // the report's letter), the whole-finding form where it did not — which is also the
+      // letterless re-raise path, where the carried claims were checked above and the bare contest
+      // is the turn's own answer.
       return f.subclaims.length
-        ? f.subclaims.every((sc) => contestedSubs.has(`${f.id}${sc.letter}`))
+        ? f.subclaims.every((_, i) => contestedSubs.has(`${f.id}${subclaimLetter(i)}`))
         : contestedWhole.has(f.id);
     };
     if (!args.findings.every((f) => answerablyContested(f))) {
@@ -2151,6 +2156,7 @@ export class RunSupervisor {
     // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not
     // cleared it — either way the finding stands, the same posture judgeWithAcceptance takes for a
     // FAILED criterion under a PASS.
+    const loc = (s: string) => s.trim().toLowerCase();
     const reraised = new Set(
       parseFindings(readjudged.findings)
         .map((f) => loc(f.location))

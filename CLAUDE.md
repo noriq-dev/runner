@@ -122,40 +122,51 @@ there: the builder rebutted the half it could refute and the other half rode the
 RUN-180 prices that: a collapsed finding enumerates separately-answerable claims as lettered
 sub-claim lines (`FINDING 1a: …`), a RESPONSE is credited only for the letters it names, and an
 unaddressed sub-claim STANDS — visibly in the ledger and the per-requirement report, and decisively
-in the terminal contest, where a finding whose letters are only partly contested is no candidate to
-clear and the run fails without spawning the re-adjudicating reviewer. That candidacy is judged on
-the RECONCILED ledger entry, never on the terminal round's own parse: the fold preserves held
-letters when a re-raise drops them (a fresh reviewer paraphrases by construction) — and when it
-repeats only SOME of them, unioning in the claims its wording does not cover, because a narrowed
-re-raise replacing the set wholesale was the same escape one fold up: the terminal round letters
-the claim it cares about and the held unanswered one vanishes from the only record candidacy can
-read. Only a claim the re-raise abandoned AND the builder had rebutted is dropped — settled by
-both sides — and the union never slices: past the entry's cap (twice one round's enumeration cap)
-the held set stands whole and the new enumeration is the thing dropped, all-or-nothing again. So
-a letterless or narrowed terminal re-raise of a half-answered finding still carries its unanswered
-letter — re-lettered if its old letter was taken, answerable BY its letter when not — and a bare
-or partial contest cannot clear it. Instances of one root cause
-never become letters — they stay evidence inside one claim, or the letters are the
-instance-enumeration the collapse rule bought out. The format is optional and positionally additive
-like the requirement bracket, so everything written before it parses byte-identically, and a
-persisted ledger predating sub-claims loads as single-claim entries; malformed lettering voids the
-WHOLE enumeration, and there is no malformed-label detector to slip past — detectors enumerate
-shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an edition of the same escape) — so
-every line two structural nets see is instead classified once: the numbered FINDING line, the
-strict sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`), because a
-lost enumeration is a single-claim finding — current behaviour — where a kept subset lets a
-partial contest clear letters that were never recorded. The HEAD net takes any line whose FIRST
-LETTERS are `FINDING <n>` — markdown decoration is a letterless prefix, so a bulleted
-`- FINDING 1b:`, invisible to a whitespace-only anchor (the kept-subset escape through the anchor
-itself), is a voider too — and the NEAR-COLON TOKEN net takes `FINDING <n>…:` anywhere in the
-line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix rule) and a
-colon hard by the number is label-intent where a colon further on is sentence structure. A
-mid-sentence mention with no colon beside it stays harmless prose, since reports narrate their
-findings by number and voiding on mention would kill every enumeration in a report that explains
-itself. Carried answers match a
-re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
-claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
-down.
+in the terminal contest, where a finding whose sub-claims are only partly contested is no candidate
+to clear and the run fails without spawning the re-adjudicating reviewer. A sub-claim's IDENTITY is
+its normalized claim text, never its letter — the structural settlement this run's own gestation
+forced, after eight review rounds each found another leak in letter-set reconciliation (cap-slice,
+prefix aliasing, letterless re-raise, subset re-raise, markdown decoration): positional labels
+assigned per-round by a memoryless reviewer cannot be identities, so the letter-repair machinery
+(collision remapping, next-free-letter, kept letters) was deleted rather than extended. A letter
+is pure position — the parse enforces `a, b, c…` in report order — read once at the fold boundary
+to resolve a RESPONSE against the lines its writer was shown (this report's own, and past them the
+record's positions), then discarded; every render re-derives letters from position, and the
+contest turn is handed THE RECORD — each standing sub-claim with the letter that answers it here —
+because without it a claim the terminal report does not re-list would be standing and unanswerable
+at once. Candidacy is judged on the RECONCILED ledger entry, never on the terminal round's own
+parse: the fold preserves held claims when a re-raise drops the letters (a fresh reviewer
+paraphrases by construction) — and when it repeats only SOME of them, unioning in the claims its
+wording does not cover, because a narrowed re-raise replacing the set wholesale was the same
+escape one fold up. Only a claim the re-raise abandoned AND the builder had rebutted is dropped —
+settled by both sides — and the union never slices: past the entry's cap (twice one round's
+enumeration cap) the held set stands whole and the new enumeration is the thing dropped,
+all-or-nothing again, with this turn's answers still landed on it by wording. Carried answers
+match a re-raised sub-claim by its WORDING, and a truncated (ellipsis-capped) claim never matches
+— two distinct over-cap claims share it — the may-miss-never-invent order of harms, one level
+down. Instances of one root cause never become letters — they stay evidence inside one claim, or
+the letters are the instance-enumeration the collapse rule bought out. The format is optional and
+positionally additive like the requirement bracket, so everything written before it parses
+byte-identically; a persisted ledger predating sub-claims loads as single-claim entries, and one
+persisted by the letter-era shape loads claim-keyed with its stored letters ignored. The
+enumeration invariant — no separately-answerable claim escapes its own answer — has exactly ONE
+enforcement point, the parse-time classifier (RUN-90's chokepoint rule applied to the format
+itself): every line either structural net sees is classified once as the numbered FINDING line,
+the strict in-sequence sub-claim shape naming a claim no sibling names, or a voider of that
+finding's WHOLE enumeration (even a prose line starting `FINDING 1 rests…`), because a lost
+enumeration is a single-claim finding — current behaviour — where a kept subset lets a partial
+contest clear claims that were never recorded, and there is no malformed-label detector to slip
+past — detectors enumerate shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an
+edition of the same escape). The HEAD net takes any line whose FIRST LETTERS are `FINDING <n>` —
+markdown decoration is a letterless prefix, so a bulleted `- FINDING 1b:`, invisible to a
+whitespace-only anchor, is a voider too — and the NEAR-COLON TOKEN net takes `FINDING <n>…:`
+anywhere in the line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix
+rule) and a colon hard by the number is label-intent where a colon further on is sentence
+structure. A mid-sentence mention with no colon beside it stays harmless prose, since reports
+narrate their findings by number and voiding on mention would kill every enumeration in a report
+that explains itself. Fold, render, and candidacy consume the canonical set and carry no shape
+detection or degradation rules of their own — the class dies where the data is born, or it does
+not die.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud

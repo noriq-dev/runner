@@ -86,14 +86,16 @@ export {
   parseFindings,
   parseFindingResponses,
   buildLedger,
+  reconciledEntry,
+  renderContestRecord,
   renderLedger,
+  subclaimLetter,
   subclaimsOf,
   type AdjudicatedSubClaim,
   type Finding,
   type FindingResponse,
   type FindingStatus,
   type LedgerEntry,
-  type SubClaim,
 } from './adjudication';
 export {
   DEFAULT_PARKED_PATH,

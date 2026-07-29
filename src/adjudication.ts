@@ -12,16 +12,6 @@
 // has to be talked out of. So the reviewer emits NUMBERED findings, the builder answers each in
 // a capped structured block, and only those two designated regions are parsed — never the stream.
 
-/** One separately-answerable claim inside a collapsed finding (RUN-180), from a
- *  `FINDING <n><letter>: <claim>` line under the numbered FINDING line. NOT an instance list:
- *  instances of one root cause stay evidence inside a single claim — a sub-claim is a claim that
- *  could be true while its siblings are false, which is what makes it answerable on its own. */
-export interface SubClaim {
-  /** The single letter the RESPONSE side names it by — `FINDING 1a: CONTESTED …`. */
-  letter: string;
-  claim: string;
-}
-
 /** One numbered finding, as the reviewer emits it:
  *  `FINDING <n> [<severity>] [<requirements>] <file:line>: <claim>` — the requirement bracket
  *  optional, because most tasks name no requirements and every finding raised before RUN-147 has
@@ -35,11 +25,22 @@ export interface Finding {
   requirements: string[];
   location: string;
   claim: string;
-  /** The finding's enumerated separately-answerable claims (RUN-180). Empty for every finding that
-   *  enumerates none — the whole of the pre-RUN-180 world — which keeps the finding one answerable
-   *  unit, exactly as before. */
-  subclaims: SubClaim[];
+  /** The finding's enumerated separately-answerable claims (RUN-180), from the strict
+   *  `FINDING <n><letter>: <claim>` lines under the numbered FINDING line, in report order. NOT an
+   *  instance list: instances of one root cause stay evidence inside a single claim — a sub-claim
+   *  is a claim that could be true while its siblings are false, which is what makes it answerable
+   *  on its own. A sub-claim's identity is its claim TEXT (this run's structural settlement): the
+   *  letters are positional labels of the report they appeared in — the parse enforces a, b, c… in
+   *  order, so a claim's letter IS its index here — and they die at the parse boundary; nothing
+   *  downstream stores or reconciles one. Empty for every finding that enumerates none — the whole
+   *  of the pre-RUN-180 world — which keeps the finding one answerable unit, exactly as before. */
+  subclaims: string[];
 }
+
+/** The letter that labels sub-claim `i` wherever one is rendered or read — the ONE derivation
+ *  (RUN-180): report lines carry it by parse rule, renders derive it from position, and a RESPONSE
+ *  letter resolves back through it to the claim text that is the sub-claim's actual identity. */
+export const subclaimLetter = (i: number): string => String.fromCharCode(97 + i);
 
 export type FindingStatus = 'fixed' | 'contested';
 
@@ -56,8 +57,12 @@ export interface FindingResponse {
 }
 
 /** A sub-claim as the ledger carries it: the claim plus the builder's answer TO THAT CLAIM, so a
- *  half-rebutted finding reads as half-rebutted instead of as answered-as-a-whole (RUN-180). */
-export interface AdjudicatedSubClaim extends SubClaim {
+ *  half-rebutted finding reads as half-rebutted instead of as answered-as-a-whole (RUN-180).
+ *  Deliberately NO letter field: a letter is one report's positional label, not the claim's
+ *  identity, and persisting one is what let eight generations of letter-set reconciliation leak
+ *  (this run's structural settlement). Renders re-derive letters from position. */
+export interface AdjudicatedSubClaim {
+  claim: string;
   status: FindingStatus | 'unanswered';
   pointer: string | null;
   reason: string | null;
@@ -119,6 +124,15 @@ const cap = (s: string, n: number) => {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 };
 
+/** A sub-claim's identity: its normalized claim TEXT (the structural settlement). Everything that
+ *  matches, carries, or credits a sub-claim across rounds keys on this — never on a letter. */
+const subKey = (c: string) => c.toLowerCase().trim();
+/** A TRUNCATED claim is a prefix wearing an identity: cap() marks truncation with a trailing
+ *  ellipsis, and two distinct over-cap claims cap to the same text — so a capped key may never
+ *  match across sets. The cost is a visibly unanswered sub-claim on an over-long claim — a miss,
+ *  never an invention, which is the order of harms the whole ledger obeys. */
+const carryable = (k: string) => !k.endsWith('…');
+
 // `FINDING 1 [High] [R-7] src/init-project.ts:357: detectVcs runs on every init`. The separator
 // before the claim is a colon FOLLOWED BY a space, so the colon inside a `file:line` location
 // never splits it; the location is non-greedy so it stops at the first such colon-space. Location
@@ -150,9 +164,14 @@ const FINDING_RE =
 // `1b2:` — each time the unseen sibling left the valid letters standing as the "complete"
 // enumeration. So nothing is enumerated. A line is CLASSIFIED exactly once (see parseFindings)
 // when either of two structural nets sees it, and then it is one of three things: the numbered
-// FINDING line itself, a strict sub-claim line, or — everything else — a voider of that finding's
-// whole enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken
-// for it simply does not exist.
+// FINDING line itself, the strict sub-claim shape — lettered a, b, c… in report order, naming a
+// claim no sibling already names — or, everything else, a voider of that finding's whole
+// enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken for it
+// simply does not exist. The in-order rule is what makes a letter pure position (the settlement:
+// identity is claim text; a letter is a positional label of the report it appeared in, never
+// state), and the no-duplicate-claim rule keeps that identity unambiguous inside one enumeration —
+// two letters naming one claim is not separately answerable, so it is an intended-but-invalid
+// enumeration like any other.
 //
 // Net one — the HEAD: any line whose FIRST LETTERS are `FINDING <n>`. The prefix may be ANY run
 // of non-letter characters, because markdown decoration is exactly that — `- FINDING 1b:`,
@@ -221,21 +240,19 @@ const reqsOf = (e: { requirements?: unknown }): string[] =>
 
 /** Same contract for sub-claims (RUN-180): a ledger persisted before they existed — every park and
  *  continuation seed until now — reads as single-claim entries, and a hand-edited record degrades
- *  field by field rather than crashing. Exported because the terminal-contest candidacy check in
- *  the supervisor reads entries the same way — never trusted from the object. */
+ *  field by field rather than crashing. An entry persisted by the letter-era shape loads too: the
+ *  claim is the identity, so a stray `letter` field is simply ignored. Exported because the
+ *  terminal-contest candidacy check in the supervisor reads entries the same way — never trusted
+ *  from the object. */
 export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =>
   Array.isArray(e.subclaims)
     ? e.subclaims
         .filter(
-          (s): s is Record<string, unknown> & { letter: string; claim: string } =>
-            typeof s === 'object' &&
-            s !== null &&
-            typeof (s as { letter?: unknown }).letter === 'string' &&
-            typeof (s as { claim?: unknown }).claim === 'string',
+          (s): s is Record<string, unknown> & { claim: string } =>
+            typeof s === 'object' && s !== null && typeof (s as { claim?: unknown }).claim === 'string',
         )
         .slice(0, MAX_LEDGER_SUBCLAIMS)
         .map((s) => ({
-          letter: s.letter,
           claim: s.claim,
           status: s.status === 'fixed' || s.status === 'contested' ? s.status : 'unanswered',
           pointer: typeof s.pointer === 'string' ? s.pointer : null,
@@ -266,19 +283,23 @@ export function parseFindings(text: string): Finding[] {
   // number rather than by position, so prose between the lines cannot orphan one. A line naming a
   // finding nobody numbered is ignored — there is no finding to degrade.
   //
-  // Per finding, all-or-nothing, by classifying once every line either structural net sees — the
-  // HEAD net (first letters are `FINDING <n>`, so letterless markdown decoration is included) and
-  // the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere in the line, so decoration wearing letters
-  // is included): the numbered FINDING line itself is pass 1's subject; a strict sub-claim line
-  // records its letter; and ANY other classified line — a decorated label, a spaced or punctuated
-  // letter, a doubled letter, a trailing `_` or digit, a duplicated letter (the RESPONSE side
-  // could not say which claim it answered), a fifth letter (the cap), line-start prose — voids
-  // the WHOLE enumeration (`null` below) and the finding stays single-claim. Never an error, and
-  // never a kept subset a partial contest could clear. The strict-shape checks compare the NUMBER
-  // too: a sub-claim line of finding 2 that mentions `FINDING 1:` in its claim is strict for 2
-  // and a voider for 1 — never a recorder of either's letters onto the other.
+  // This is the ONE enforcement point of the enumeration invariant (the structural settlement):
+  // every line either structural net sees — the HEAD net (first letters are `FINDING <n>`, so
+  // letterless markdown decoration is included) and the NEAR-COLON TOKEN net (`FINDING <n>…:`
+  // anywhere in the line, so decoration wearing letters is included) — is classified exactly once,
+  // per finding, all-or-nothing: the numbered FINDING line itself is pass 1's subject; the strict
+  // sub-claim shape whose letter is the NEXT letter in sequence and whose claim no sibling already
+  // names records a claim; and ANY other classified line — a decorated label, a spaced or
+  // punctuated letter, a doubled letter, a trailing `_` or digit, an out-of-sequence or repeated
+  // letter, a repeated claim text, a fifth letter (the cap), line-start prose — voids the WHOLE
+  // enumeration (`null` below) and the finding stays single-claim. Never an error, and never a
+  // kept subset a partial contest could clear. Fold, render, and candidacy consume the canonical
+  // set this pass emits and carry no shape judgment of their own — the class dies where the data
+  // is born. The strict-shape checks compare the NUMBER too: a sub-claim line of finding 2 that
+  // mentions `FINDING 1:` in its claim is strict for 2 and a voider for 1 — never a recorder of
+  // either's claims onto the other.
   const byId = new Map(out.map((f) => [f.id, f]));
-  const pending = new Map<number, SubClaim[] | null>();
+  const pending = new Map<number, string[] | null>();
   for (const line of text.split('\n')) {
     if (ESCALATE_LINE_RE.test(line)) continue; // the format's own escalation line; letters nothing, voids nothing
     const ids = new Set<number>();
@@ -294,11 +315,17 @@ export function parseFindings(text: string): Finding[] {
       const shaped = SUBCLAIM_SHAPE_RE.exec(line);
       const letter = shaped && Number(shaped[1]) === id ? shaped[2]?.toLowerCase() : undefined;
       const held = list ?? [];
-      if (!letter || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
+      const claim = shaped ? cap(shaped[3]!, CLAIM_CAP) : '';
+      if (
+        !letter ||
+        letter !== subclaimLetter(held.length) || // letters are position: a, b, c…, no gaps, no repeats
+        held.length >= MAX_SUBCLAIMS ||
+        held.some((c) => subKey(c) === subKey(claim)) // one claim, one identity — even ellipsis-capped
+      ) {
         pending.set(id, null);
         continue;
       }
-      held.push({ letter, claim: cap(shaped![3]!, CLAIM_CAP) });
+      held.push(claim);
       pending.set(id, held);
     }
   }
@@ -407,103 +434,89 @@ export function buildLedger(
   const byId = new Map(responses.filter((r) => !r.subclaim).map((r) => [r.id, r]));
   const bySub = new Map(responses.filter((r) => r.subclaim).map((r) => [`${r.id}${r.subclaim}`, r]));
   // A carried sub-claim answer matches on the claim's FULL wording, not the entry key's 60-char
-  // prefix and not the letter. A prefix aliases two long claims that diverge past it — both would
-  // inherit one rebuttal, answering a claim nobody answered — and a letter is one reviewer's
-  // ordering, not the claim's identity. Full wording may MISS a paraphrase (the sub-claim reads as
-  // unanswered, visibly, and the builder can answer again); it cannot INVENT a match, which is the
-  // failure the whole ledger refuses.
-  //
-  // …which is also why a TRUNCATED claim never carries: cap() marks truncation with a trailing
-  // ellipsis, and two distinct over-cap claims cap to the same text — so a key ending in one is a
-  // prefix wearing an identity, the aliasing above through the cap instead of the slice. Skipping
-  // it costs a visibly unanswered sub-claim on a claim longer than CLAIM_CAP; matching it answers
-  // a claim nobody answered.
-  const subKey = (c: string) => c.toLowerCase().trim();
+  // prefix and not a letter. A prefix aliases two long claims that diverge past it — both would
+  // inherit one rebuttal, answering a claim nobody answered — and a letter is one report's
+  // ordering, not the claim's identity (the structural settlement). Full wording may MISS a
+  // paraphrase (the sub-claim reads as unanswered, visibly, and the builder can answer again); it
+  // cannot INVENT a match, which is the failure the whole ledger refuses. A truncated
+  // (ellipsis-capped) claim never carries, for the same aliasing reason — see `carryable`.
   const carriedFrom = (held: AdjudicatedSubClaim[], claim: string): AdjudicatedSubClaim | undefined => {
     const key = subKey(claim);
-    if (key.endsWith('…')) return undefined;
+    if (!carryable(key)) return undefined;
     return held.find((h) => subKey(h.claim) === key);
-  };
-  const nextFreeLetter = (used: Set<string>): string | undefined => {
-    for (let c = 97; c <= 122; c++) {
-      const l = String.fromCharCode(c);
-      if (!used.has(l)) return l;
-    }
-    return undefined;
   };
   // This round's enumeration wins its own framing (the latest wording, like the claim itself) —
   // but it must not LOSE what the entry already holds. A re-raise that repeats only SOME of the
-  // held letters used to replace the set wholesale, so a held unanswered claim vanished exactly
-  // when the terminal round enumerated the letters it cared about — and the candidacy gate can
+  // held claims used to replace the set wholesale, so a held unanswered claim vanished exactly
+  // when the terminal round enumerated the claims it cared about — and the candidacy gate can
   // only keep standing what was RECORDED: the RUN-174 escape through the fold itself. So held
   // claims the new wording does not cover are UNIONED in beside the new set, keeping their
   // adjudication. Two deliberate asymmetries:
   //   - a held CONTESTED claim the re-raise abandoned is dropped: the reviewer no longer asserts
   //     it and the builder had rebutted it, so keeping it bloats the record and dropping it can
-  //     clear nothing (a contested letter only ever counted toward clearing). Unanswered and
-  //     FIXED letters — the ones whose loss would flip a finding clearable — always carry.
+  //     clear nothing (a contested claim only ever counted toward clearing). Unanswered and
+  //     FIXED claims — the ones whose loss would flip a finding clearable — always carry.
   //   - coverage is the claim's full wording (the carry key), so a reworded survivor rides as a
   //     duplicate row rather than being merged away — may MISS, never INVENT — and a truncated
-  //     (ellipsis-capped) key never counts as covering, for the same aliasing reason carriedFrom
-  //     refuses it.
-  // A carried claim keeps its letter when this round's set left it free — the builder saw that
-  // letter in the ledger and an answer naming it now still credits it — and is re-lettered when
-  // taken, in which case no response is credited (the old letter now names this round's claim;
-  // crediting either way would be inventing). A union past MAX_LEDGER_SUBCLAIMS keeps the HELD
-  // set whole and drops the new enumeration — all-or-nothing, never a sliced subset.
+  //     key never counts as covering, for the same aliasing reason carriedFrom refuses it.
+  // A union past MAX_LEDGER_SUBCLAIMS keeps the HELD set whole and drops the new enumeration —
+  // all-or-nothing, never a sliced subset — with this turn's answers still landed on it by
+  // wording, because the builder may be answering in the very fold that overflows.
   //
-  // Crediting a held letter holds on EVERY path that preserves held sub-claims, not just the
-  // union: a letterless re-raise and the union-overflow fallback keep the held set, and the
-  // builder — told a standing letter stays answerable BY its letter — may be answering it this
-  // very turn. Losing that response would discard a valid current adjudication, the thing the
-  // ledger exists to carry. The one exclusion is a letter this round's enumeration re-used: the
-  // response then names the report in front of the builder, and crediting the held claim too
-  // would be inventing.
+  // RESPONSE letters are resolved HERE, at the fold boundary, into claim text — the only identity
+  // the ledger stores. A letter names a line the builder was SHOWN: this report's lettered lines
+  // first (the parse made those positional), and past them the record's own positions — which is
+  // exactly what any render of the entry labels them (renderLedger, the contest record), since an
+  // entry is written as [this round's claims…, carried extras…]. A letter that names neither
+  // resolves to nothing: a visible miss the builder can repeat, never an invented credit.
   const mergedSubclaims = (f: Finding, heldSubs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] => {
-    const claimed = new Set(f.subclaims.map((sc) => sc.letter));
-    const creditHeld = (subs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] =>
-      subs.map((h) => {
-        const rs = claimed.has(h.letter) ? undefined : bySub.get(`${f.id}${h.letter}`);
-        return rs
-          ? { letter: h.letter, claim: h.claim, status: rs.status, pointer: rs.pointer, reason: rs.reason }
-          : h;
-      });
+    const responseAt = (i: number) => bySub.get(`${f.id}${subclaimLetter(i)}`);
+    const adjudicated = (
+      claim: string,
+      rs: FindingResponse | undefined,
+      held?: AdjudicatedSubClaim,
+    ): AdjudicatedSubClaim => ({
+      claim,
+      status: rs?.status ?? held?.status ?? ('unanswered' as const),
+      pointer: rs?.pointer ?? held?.pointer ?? null,
+      reason: rs?.reason ?? held?.reason ?? null,
+    });
+    // Held claims stay answerable at the positions this report's own lines do not shadow — the
+    // letters the record's rendering shows for them.
+    const creditedHeld = heldSubs.map((h, i) =>
+      i >= f.subclaims.length ? adjudicated(h.claim, responseAt(i), h) : h,
+    );
     // A re-raise that dropped the letters entirely keeps the held sub-claims AND their answers,
     // the same preservation the whole-finding status gets below.
-    if (!f.subclaims.length) return creditHeld(heldSubs);
-    const mapped = f.subclaims.map((sc) => {
-      const rs = bySub.get(`${f.id}${sc.letter}`);
-      const carried = carriedFrom(heldSubs, sc.claim);
-      return {
-        letter: sc.letter,
-        claim: sc.claim,
-        status: rs?.status ?? carried?.status ?? ('unanswered' as const),
-        pointer: rs?.pointer ?? carried?.pointer ?? null,
-        reason: rs?.reason ?? carried?.reason ?? null,
-      };
-    });
-    const used = new Set(mapped.map((s) => s.letter));
-    const covered = new Set(mapped.map((s) => subKey(s.claim)).filter((k) => !k.endsWith('…')));
+    if (!f.subclaims.length) return creditedHeld;
+    const mapped = f.subclaims.map((claim, i) =>
+      adjudicated(claim, responseAt(i), carriedFrom(heldSubs, claim)),
+    );
+    const covered = new Set(mapped.map((s) => subKey(s.claim)).filter(carryable));
     const extras: AdjudicatedSubClaim[] = [];
-    for (const h of heldSubs) {
-      if (h.status === 'contested' || covered.has(subKey(h.claim))) continue;
-      covered.add(subKey(h.claim));
-      const keepLetter = !used.has(h.letter);
-      const rs = keepLetter ? bySub.get(`${f.id}${h.letter}`) : undefined;
-      const letter = keepLetter ? h.letter : nextFreeLetter(used);
-      // No letter left to carry it losslessly — the held set stands, with this turn's answers.
-      if (!letter) return creditHeld(heldSubs);
-      used.add(letter);
-      extras.push({
-        letter,
-        claim: h.claim,
-        status: rs?.status ?? h.status,
-        pointer: rs?.pointer ?? h.pointer,
-        reason: rs?.reason ?? h.reason,
-      });
-    }
+    heldSubs.forEach((h, i) => {
+      const k = subKey(h.claim);
+      // The skip reads the PRIOR status: a claim contested this very turn is not "abandoned by
+      // both sides", and dropping it would hide the fresh rebuttal from the adjudicator's render.
+      if (h.status === 'contested' || covered.has(k)) return;
+      if (carryable(k)) covered.add(k);
+      extras.push(i >= f.subclaims.length ? adjudicated(h.claim, responseAt(i), h) : h);
+    });
     const union = [...mapped, ...extras];
-    return union.length > MAX_LEDGER_SUBCLAIMS ? creditHeld(heldSubs) : union;
+    if (union.length <= MAX_LEDGER_SUBCLAIMS) return union;
+    // Overflow: the held set stands whole — and this turn's answers to re-listed claims land on it
+    // by wording, so standing whole does not cost a valid current adjudication.
+    const landed = new Map<string, FindingResponse>();
+    f.subclaims.forEach((claim, i) => {
+      const rs = responseAt(i);
+      const k = subKey(claim);
+      if (rs && carryable(k)) landed.set(k, rs);
+    });
+    return creditedHeld.map((h) => {
+      const k = subKey(h.claim);
+      const rs = carryable(k) ? landed.get(k) : undefined;
+      return rs ? adjudicated(h.claim, rs) : h;
+    });
   };
   const result = [...prior];
   for (const f of findings) {
@@ -631,7 +644,7 @@ export function renderRequirementOutcomes(report: RequirementReport): string {
       const state = (e: LedgerEntry) => {
         const subs = subclaimsOf(e);
         if (!subs.length) return `[${e.status}]`;
-        return `[sub-claims: ${subs.map((s) => `(${s.letter}) ${s.status}`).join(', ')}]`;
+        return `[sub-claims: ${subs.map((s, i) => `(${subclaimLetter(i)}) ${s.status}`).join(', ')}]`;
       };
       const detail = o.standing
         .map((e) => `\n      ${e.location || '(no location)'} — ${e.claim} ${state(e)}`)
@@ -667,14 +680,17 @@ export function renderLedger(entries: LedgerEntry[]): string {
       // too when one was recorded — it is evidence — but it speaks for no lettered claim.
       const subs = subclaimsOf(e);
       if (!subs.length) return `${head}\n${answer}`;
-      const subLines = subs.map((s) => {
+      // Letters are derived from position here, never read from the entry (the settlement): the
+      // fold resolves a response letter through exactly this derivation, so what a reader answers
+      // by is what the record credits.
+      const subLines = subs.map((s, i) => {
         const sPtr = s.pointer ? ` (${s.pointer})` : '';
         const sWhy = s.reason ? ` — ${s.reason}` : '';
         const sAnswer =
           s.status === 'unanswered'
             ? 'no response recorded — this sub-claim STANDS; judge it fresh'
             : `${s.status.toUpperCase()}${sPtr}${sWhy}`;
-        return `      (${s.letter}) ${s.claim}\n          → builder: ${sAnswer}`;
+        return `      (${subclaimLetter(i)}) ${s.claim}\n          → builder: ${sAnswer}`;
       });
       const whole =
         e.status === 'unanswered'
@@ -683,4 +699,48 @@ export function renderLedger(entries: LedgerEntry[]): string {
       return [head, ...whole, ...subLines].join('\n');
     })
     .join('\n');
+}
+
+/**
+ * The entry the fold wrote for THIS finding in THIS round — the reconciled record the
+ * terminal-contest candidacy judges and the contest record renders. Matched on the values the fold
+ * itself wrote (id, round, location, claim), so it cannot alias a prior attempt's persisted entry.
+ * `undefined` means the entry did not survive the fold (the MAX_ENTRIES cap): what the adjudicator
+ * cannot be shown is not evidence, so the caller treats the finding as standing.
+ */
+export function reconciledEntry(entries: LedgerEntry[], f: Finding, round: number): LedgerEntry | undefined {
+  const loc = (s: string) => s.trim().toLowerCase();
+  return entries.find(
+    (e) => e.round === round && e.id === f.id && loc(e.location) === loc(f.location) && e.claim === f.claim,
+  );
+}
+
+/**
+ * The sub-claims each terminal finding carries on the record, rendered for the CONTEST turn
+ * (RUN-180). Letters are derived from position — the same derivation the fold resolves a response
+ * letter through — so this block is what makes a carried claim answerable at all: a letterless or
+ * narrowed terminal re-raise does not repeat a standing sub-claim, the builder's session may
+ * remember it under a label a later round re-used, and letters are not state anywhere (the
+ * settlement), so the record in front of the builder is the one authoritative labelling. Data
+ * only; the framing — that an unanswered or FIXED sub-claim blocks clearing, and how to contest
+ * one — lives in prompts/reviewer-contest.md. Null when no terminal finding carries sub-claims,
+ * which is every pre-RUN-180 report and renders the prompt without the section.
+ */
+export function renderContestRecord(
+  findings: Finding[],
+  entries: LedgerEntry[],
+  round: number,
+): string | null {
+  const blocks = findings.flatMap((f) => {
+    const e = reconciledEntry(entries, f, round);
+    const subs = e ? subclaimsOf(e) : [];
+    if (!subs.length) return [];
+    const lines = subs.map((s, i) => {
+      const ptr = s.pointer ? ` (${s.pointer})` : '';
+      const answer = s.status === 'unanswered' ? 'no answer recorded' : `${s.status.toUpperCase()}${ptr}`;
+      return `  (${subclaimLetter(i)}) ${s.claim} — ${answer}`;
+    });
+    return [`FINDING ${f.id}:\n${lines.join('\n')}`];
+  });
+  return blocks.length ? blocks.join('\n') : null;
 }

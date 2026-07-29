@@ -3853,12 +3853,17 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('failed'); // sub-claim (a) was never contested → the finding stands
     expect(reviewerStarts(h)).toBe(1); // …and no fresh adjudicator was spawned to possibly-PASS over it
-    // The ledger records WHICH sub-claim went unanswered, not a finding answered-as-a-whole.
+    // The ledger records WHICH sub-claim went unanswered — by its claim text, the identity the
+    // record keys on (letters are render-derived) — not a finding answered-as-a-whole.
     const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
-    expect(entry?.subclaims?.map((s) => [s.letter, s.status])).toEqual([
-      ['a', 'unanswered'],
-      ['b', 'contested'],
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['the eligibility check accepts a response naming a nonexistent finding', 'unanswered'],
+      ['the entry cap can drop a terminal finding before a PASS', 'contested'],
     ]);
+    // The contest prompt carried the record: the letters the RESPONSE block answers by.
+    expect(h.claude.continuations.at(-1)).toContain(
+      '(a) the eligibility check accepts a response naming a nonexistent finding — no answer recorded',
+    );
   });
 
   // …and the bare-number answer is the escape verbatim: a whole-finding CONTESTED must not speak
@@ -3884,7 +3889,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
   // Candidacy reads the RECONCILED ledger entry, not the terminal round's own parse: the fold
   // preserves held sub-claims when a re-raise drops the letters (a fresh reviewer paraphrases by
   // construction), so a letterless terminal re-raise of a half-answered finding still carries its
-  // unanswered letter — and a bare contest must not clear it. Checking `f.subclaims` (empty on
+  // unanswered claim — and a bare contest must not clear it. Checking `f.subclaims` (empty on
   // this path) was the RUN-174 escape reborn one round later.
   it('a letterless re-raise of a half-answered finding is no candidate — the carried letter stands', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
@@ -3912,21 +3917,21 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL');
     h.claude.complete('done');
     const exit = await done;
-    expect(exit.outcome).toBe('failed'); // carried sub-claim (a) was never contested → it stands
+    expect(exit.outcome).toBe('failed'); // carried sub-claim 'half one' was never contested → it stands
     expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
     // The ledger records the half-answered state the candidacy check read.
     const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
-    expect(entry?.subclaims?.map((s) => [s.letter, s.status])).toEqual([
-      ['a', 'unanswered'],
-      ['b', 'contested'],
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half one', 'unanswered'],
+      ['half two', 'contested'],
     ]);
   });
 
   // The fold-level edition of the same escape: a terminal re-raise that repeats only SOME of the
-  // held letters used to REPLACE the held set, so the unanswered letter vanished from the
-  // reconciled entry and a contest of the repeated letter alone could clear the finding. The fold
-  // now unions the uncovered claim in, and candidacy — reading the reconciled entry — keeps the
-  // finding standing on it.
+  // held claims used to REPLACE the held set, so the unanswered claim vanished from the
+  // reconciled entry and a contest of the repeated claim alone could clear the finding. The fold
+  // now unions the uncovered claim in — matched by wording, the sub-claim's identity — and
+  // candidacy, reading the reconciled entry, keeps the finding standing on it.
   it('a terminal re-raise repeating only some letters is no candidate — the uncovered claim stands', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
     h.claude.continueTexts = [
@@ -3959,18 +3964,19 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('failed'); // the uncovered claim was never contested → it stands
     expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
-    // The reconciled entry carries the uncovered claim — re-lettered, visibly unanswered.
+    // The reconciled entry carries the uncovered claim — behind the re-raise's own enumeration in
+    // the record's order, visibly unanswered.
     const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
-    expect(entry?.subclaims?.map((s) => [s.letter, s.claim, s.status])).toEqual([
-      ['a', 'half two', 'contested'],
-      ['b', 'half one', 'unanswered'],
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half two', 'contested'],
+      ['half one', 'unanswered'],
     ]);
   });
 
-  // A carried FIXED letter blocks candidacy — the whole-finding rule ("a FIXED changed nothing
-  // here") at letter grain: the terminal reviewer judged the diff WITH the fix in it and still
+  // A carried FIXED sub-claim blocks candidacy — the whole-finding rule ("a FIXED changed nothing
+  // here") at sub-claim grain: the terminal reviewer judged the diff WITH the fix in it and still
   // failed, so "it is fixed" was already adjudicated and never buys the re-roll.
-  it('a carried FIXED letter stands — a bare contest cannot clear over it', async () => {
+  it('a carried FIXED sub-claim stands — a bare contest cannot clear over it', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
     h.claude.continueTexts = [
       'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
@@ -3993,9 +3999,10 @@ describe('the terminal-round contest turn (RUN-174)', () => {
   });
 
   // …but it is not a dead end: the builder who believes the fixed claim no longer holds CONTESTS
-  // that letter in the contest turn — the fold credits a held letter's response on every path —
-  // and the finding earns the fresh look like any other full contest.
-  it('contesting the carried FIXED letter this turn restores candidacy', async () => {
+  // it in the contest turn, at the letter the contest record shows for its position — the fold
+  // resolves a letter past the report's own lines against exactly those positions — and the
+  // finding earns the fresh look like any other full contest.
+  it('contesting the carried FIXED sub-claim this turn restores candidacy', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
     h.claude.continueTexts = [
       'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
@@ -4021,10 +4028,10 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
   });
 
-  // …and the same path CLEARS when every carried letter already holds a rebuttal: the reconciled
-  // entry shows each letter contested, the bare contest is this turn's own answer to the
+  // …and the same path CLEARS when every carried claim already holds a rebuttal: the reconciled
+  // entry shows each sub-claim contested, the bare contest is this turn's own answer to the
   // letterless re-raise, and the fresh look adjudicates the carried pointers.
-  it('a letterless re-raise whose carried letters are all contested can still earn the fresh look', async () => {
+  it('a letterless re-raise whose carried claims are all contested can still earn the fresh look', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
     h.claude.continueTexts = [
       'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',

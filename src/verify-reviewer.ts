@@ -181,10 +181,16 @@ export function reviewerFeedbackPrompt(
  * The per-sub-claim answer form (RUN-180) IS restated here, unlike the scope rule, because it is
  * format rather than judgment — the builder cannot answer in halves in a shape it was never shown,
  * and this turn is the exact surface where the bundled-finding escape happened: a whole-finding
- * CONTESTED credits no lettered claim, and a letter left unanswered keeps the finding standing.
+ * CONTESTED credits no lettered claim, and a sub-claim left unanswered keeps the finding standing.
+ *
+ * `record` is the reconciled sub-claim record for the terminal findings (renderContestRecord),
+ * rendered because letters are positional labels rather than state (the structural settlement): a
+ * standing sub-claim this report does not re-list has no letter the builder could otherwise know,
+ * so without the record it would be standing AND unanswerable — a trap, not a gate. Null renders
+ * the prompt without the section, which is every finding that never enumerated.
  */
-export function reviewerContestPrompt(findings: string): string {
-  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
+export function reviewerContestPrompt(findings: string, record?: string | null): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000), record: record ?? null });
 }
 
 /** Format a final reviewer rejection for a task comment (the gate surface). */
