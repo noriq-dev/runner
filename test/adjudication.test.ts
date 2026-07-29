@@ -68,6 +68,15 @@ describe('parseFindings', () => {
     expect(out).toHaveLength(1);
     expect(out[0]!.claim).toBe('first');
   });
+
+  // The regression a terminal round of this task's own gestation caught: a fingerprint suffix on
+  // the display changed every legacy claim over CLAIM_CAP. The display is the legacy cap, byte
+  // for byte — identity rides the separate claimKey field instead (RUN-180).
+  it('an over-cap claim parses to the exact pre-RUN-180 display — bare ellipsis, no suffix', () => {
+    const [f] = parseFindings(`FINDING 1 [High] a.ts:1: ${'x'.repeat(300)}`);
+    expect(f!.claim).toBe(`${'x'.repeat(239)}…`);
+    expect(f!.claimKey).toBe('x'.repeat(300)); // the full normalized text, in a field of its own
+  });
 });
 
 describe('parseFindingResponses', () => {
@@ -1007,18 +1016,22 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     ]);
   });
 
-  // Truncation must not erase IDENTITY: an over-cap claim is capped for display with a
-  // fingerprint of its WHOLE normalized text, so two distinct long claims fingerprint apart and
-  // never share a carried answer — and (below) a verbatim re-raise still recognises its own
-  // record. The bare-ellipsis cap aliased both onto one text, and the blanket refusal that
-  // patched the aliasing turned every exact long re-raise into a duplicate row.
+  // Truncation must not erase IDENTITY — and must not invent one either. The display is capped
+  // with the LEGACY bare ellipsis, byte-identical (a suffix the reader did not write broke every
+  // pre-RUN-180 over-cap claim's render), and the FULL normalized text rides a field of its own
+  // (`key`), so two distinct long claims never alias (the bare-ellipsis cap aliased them onto one
+  // text; sitting 5's 32-bit fingerprint collided — both INVENT) and (below) a verbatim re-raise
+  // still recognises its own record instead of duplicating it.
   it('two distinct over-cap claims keep distinct identities — neither inherits the other’s answer', () => {
     const longReport = (tail: string) =>
       `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
     const [one] = parseFindings(longReport('ONE'));
     const [two] = parseFindings(longReport('TWO'));
-    expect(one!.subclaims[0]).not.toEqual(two!.subclaims[0]); // capped, but the identities stay apart
+    expect(one!.subclaims[0]).not.toEqual(two!.subclaims[0]); // raw in hand — identities exact
     const round1 = buildLedger([], [one!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    // The record's display is the legacy cap and nothing else; the identity sits beside it whole.
+    expect(round1[0]!.subclaims[0]!.claim).toBe(`${'x'.repeat(239)}…`);
+    expect(round1[0]!.subclaims[0]!.key).toBe(`${'x'.repeat(250)}one`);
     const round2 = buildLedger(round1, [two!], [], 2);
     expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']); // TWO never inherits ONE's answer
   });
@@ -1031,6 +1044,32 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     const round2 = buildLedger(round1, [f2!], [], 2);
     expect(round2[0]!.subclaims).toHaveLength(1); // one claim, one durable record — no duplicate row
     expect(round2[0]!.subclaims[0]).toMatchObject({ status: 'contested', pointer: 'a.ts:9' });
+  });
+
+  // Identity is stored whole or not at all: past IDENTITY_CAP there is no identity — never a
+  // shortened one two claims could share — so even an exact re-raise MISSES into a visible
+  // duplicate row. May miss, never invent, at the bound itself.
+  it('a claim past the identity bound never matches — an exact re-raise costs a duplicate row', () => {
+    const huge = `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'y'.repeat(1200)}`;
+    const [f1] = parseFindings(huge);
+    const round1 = buildLedger([], [f1!], [], 1);
+    expect(round1[0]!.subclaims[0]!.key).toBeUndefined(); // no identity, not a truncated one
+    const [f2] = parseFindings(huge);
+    const round2 = buildLedger(round1, [f2!], [], 2);
+    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered', 'unanswered']);
+  });
+
+  // The PARENT claim's identity crosses the cap the same way (Finding.claimKey → entry.claimKey):
+  // a verbatim over-cap re-raise is a wording match trustedCarry can trust, so the held sub-claim
+  // record rides — where the display alone, capped to the shared ellipsis, could never say so.
+  it('a verbatim re-raise of an over-cap parent claim keeps its held sub-claim record', () => {
+    const report = `FINDING 1 [High] a.ts:1: ${'the gate '.repeat(40)}leaks [sub-claims: 1]\nFINDING 1a: half one`;
+    const [f1] = parseFindings(report);
+    expect(f1!.claim.endsWith('…')).toBe(true); // the display really was cut
+    const round1 = buildLedger([], [f1!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const [f2] = parseFindings(report);
+    const round2 = buildLedger(round1, [f2!], [], 2);
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([['half one', 'contested']]);
   });
 
   it('a legacy bare-ellipsis persisted claim still never carries — two old long claims may alias', () => {
@@ -1193,6 +1232,19 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
       { claim: 'ok', status: 'unanswered', pointer: null, reason: null },
     ]);
     expect(subclaimsOf({})).toEqual([]);
+  });
+
+  // The identity field is read the way every persisted field is — never trusted from the object:
+  // a non-string or over-bound key reads as NO identity (the record then never matches — a miss),
+  // not as a value the fold would compare.
+  it('a persisted identity that is not a string or is over-bound reads as no identity', () => {
+    const subs = subclaimsOf({
+      subclaims: [
+        { claim: 'a', key: 42, status: 'unanswered', pointer: null, reason: null },
+        { claim: 'b…', key: 'z'.repeat(2000), status: 'unanswered', pointer: null, reason: null },
+      ],
+    });
+    expect(subs.map((s) => s.key)).toEqual([undefined, undefined]);
   });
 
   // A ledger persisted by the letter-era shape (this run's own prior sittings) loads too: the

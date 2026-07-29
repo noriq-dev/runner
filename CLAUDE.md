@@ -176,10 +176,15 @@ territory voids the whole whatever it mangled into, and a blank line cannot deta
 finding's territory every content line is recorded, structural, or a voider — there is nowhere
 left for an unrecorded claim to sit — so narration lives above the findings or below the
 structural lines, and prose that strays into a zone costs the enumeration (dull), never keeps a
-subset. Claim identity also survives its own display cap: an over-cap claim is truncated WITH a
-fingerprint of its whole normalized text (capKeyed), so a verbatim re-raise of a long claim
-recognises its held record instead of duplicating it and two distinct long claims can never
-alias — the bare-ellipsis refusal now guards only records the ellipsis era persisted. What
+subset. Claim identity also survives its own display cap: the display keeps the legacy
+bare-ellipsis cap, byte-identical, and an over-cap claim stores its FULL normalized text in a
+separate identity field beside it — whole or not at all, never hashed and never truncated (a
+truncated identity aliases every claim sharing its prefix and a 32-bit fingerprint is trivially
+collided into merging two claims, both INVENTS — this run's own terminal round mined the collision
+that killed the fingerprint edition) — so a verbatim re-raise of a long claim recognises its held
+record, two distinct long claims can never alias, and a claim past the identity bound simply never
+matches: the visible duplicate row, the same miss a record the ellipsis era persisted has always
+been. What
 remains around those rules is hygiene, not
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
