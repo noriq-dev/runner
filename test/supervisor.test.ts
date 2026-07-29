@@ -3922,6 +3922,51 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     ]);
   });
 
+  // The fold-level edition of the same escape: a terminal re-raise that repeats only SOME of the
+  // held letters used to REPLACE the held set, so the unanswered letter vanished from the
+  // reconciled entry and a contest of the repeated letter alone could clear the finding. The fold
+  // now unions the uncovered claim in, and candidacy — reading the reconciled entry — keeps the
+  // finding standing on it.
+  it('a terminal re-raise repeating only some letters is no candidate — the uncovered claim stands', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the ONE letter the terminal round chose to repeat.
+      'FINDING 1a: CONTESTED src/y.ts:3 — slice keeps the most recent',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects',
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    // The TERMINAL reviewer re-raises the finding but letters ONLY the already-rebutted claim.
+    h.claude.emitText(
+      ['FINDING 1 [High] src/gate.ts:1: two bundled defects', 'FINDING 1a: half two', 'VERDICT: FAIL'].join(
+        '\n',
+      ),
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the uncovered claim was never contested → it stands
+    expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
+    // The reconciled entry carries the uncovered claim — re-lettered, visibly unanswered.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.letter, s.claim, s.status])).toEqual([
+      ['a', 'half two', 'contested'],
+      ['b', 'half one', 'unanswered'],
+    ]);
+  });
+
   // …and the same path CLEARS when every carried letter already holds a rebuttal: the reconciled
   // entry shows each letter contested, the bare contest is this turn's own answer to the
   // letterless re-raise, and the fresh look adjudicates the carried pointers.

@@ -473,11 +473,11 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // There is no malformed-label detector to slip past: every `FINDING <n>`-prefixed line that is
-  // neither the numbered FINDING line nor the strict sub-claim shape voids the enumeration. Each
-  // shape below is an edition of the escape a detector allowlist leaked (spaced, parenthesized,
-  // trailing word-character, …) — and the point of classifying instead of detecting is that the
-  // list below is examples, not the rule.
+  // There is no malformed-label detector to slip past: every line whose first LETTERS are
+  // `FINDING <n>` that is neither the numbered FINDING line nor the strict sub-claim shape voids
+  // the enumeration. Each shape below is an edition of the escape a detector allowlist leaked
+  // (spaced, parenthesized, trailing word-character, decorated, …) — and the point of classifying
+  // instead of detecting is that the list below is examples, not the rule.
   it('any malformed label voids the enumeration — a valid sibling never survives as the whole', () => {
     for (const bad of [
       'FINDING 1-b: hyphenated letter',
@@ -489,11 +489,34 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 (b): spaced and parenthesized letter',
       'FINDING 1 -- b: arbitrary junk before the letter',
       'FINDING 1', // a bare number line letters nothing and answers nothing
+      // Markdown decoration is a letterless prefix, so the classifier sees these too — an anchor
+      // that required line-start whitespace left `- FINDING 1b:` invisible, and the kept sibling
+      // read as the complete enumeration (the kept-subset escape through the anchor itself).
+      '- FINDING 1b: bulleted letter',
+      '* FINDING 1b: starred letter',
+      '> FINDING 1b: quoted letter',
+      '**FINDING 1b:** bolded letter',
+      '2. FINDING 1b: numbered-list letter',
+      '  — FINDING 1b: em-dashed letter',
     ]) {
       const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
       expect(out).toHaveLength(1);
       expect(out[0]!.subclaims).toEqual([]);
     }
+  });
+
+  // The boundary's other side, equally deliberate: a MID-SENTENCE mention has words before the
+  // token and never voids. Reports narrate their findings by number — voiding on mention would
+  // kill every enumeration in any report that explains itself, and a mention records nothing a
+  // partial contest could clear, so leaving it harmless is the safe direction too.
+  it('a prose mention of FINDING <n> mid-sentence does not void its enumeration', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'The escape described in FINDING 1 is the subject of this report.',
+    );
+    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
   });
 
   // The deliberate cost of the wider net: a PROSE line that happens to start `FINDING 1 rests…`
@@ -623,6 +646,9 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
       [],
       2,
     );
+    // The new claim owns letter (a) with NO inherited answer; held (a) — contested, and no longer
+    // asserted by the new enumeration — is dropped as settled by both sides, while held (b), still
+    // unanswered, is carried rather than lost (it kept its letter, which the new set left free).
     expect(round2[0]!.subclaims).toEqual([
       {
         letter: 'a',
@@ -631,7 +657,60 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
         pointer: null,
         reason: null,
       },
+      { letter: 'b', claim: 'claim b', status: 'unanswered', pointer: null, reason: null },
     ]);
+  });
+
+  // The :394 escape, closed: a re-raise that repeats only SOME held letters used to replace the
+  // set wholesale, so `(a) unanswered, (b) contested` became `(b) contested` when the terminal
+  // round listed just (b) — and the candidacy gate, which can only keep standing what was
+  // RECORDED, would have cleared the finding on (b) alone. The uncovered unanswered claim now
+  // carries, re-lettered when its old letter is taken, still visibly standing.
+  it('a partial re-enumeration carries the held unanswered claim instead of dropping it', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'b', 'contested', 'b.ts:9', 'refuted')], 1);
+    // The terminal re-raise letters its ONE claim (a) — wording matching held (b), whose rebuttal
+    // carries — and says nothing about held (a).
+    const round2 = buildLedger(round1, [SF(1, [{ letter: 'a', claim: 'claim b' }])], [], 2);
+    expect(round2[0]!.subclaims).toEqual([
+      { letter: 'a', claim: 'claim b', status: 'contested', pointer: 'b.ts:9', reason: 'refuted' },
+      // Held (a) carried under the next free letter: its old letter now names the new claim.
+      { letter: 'b', claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
+    ]);
+  });
+
+  // A carried letter the new set left FREE keeps its letter — and stays answerable by it: the
+  // builder saw that letter in the rendered ledger, so a response naming it this round credits it.
+  it('a carried sub-claim keeping its letter can be answered by that letter', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [], 1);
+    const round2 = buildLedger(
+      round1,
+      [SF(1, [{ letter: 'a', claim: 'claim a' }])], // re-raise repeats only (a)…
+      [SR(1, 'b', 'contested', 'late.ts:3', 'finally answered')], // …and the builder answers (b)
+      2,
+    );
+    expect(round2[0]!.subclaims).toEqual([
+      { letter: 'a', claim: 'claim a', status: 'unanswered', pointer: null, reason: null },
+      {
+        letter: 'b',
+        claim: 'claim b',
+        status: 'contested',
+        pointer: 'late.ts:3',
+        reason: 'finally answered',
+      },
+    ]);
+  });
+
+  // The union is capped, and the cap never slices: a union it cannot hold keeps the HELD set
+  // whole and drops the new enumeration — all-or-nothing (the parse-side rule, one fold up),
+  // because a sliced union is a kept subset the contest could clear around.
+  it('a union past the ledger cap keeps the held set whole rather than slicing', () => {
+    const claims = (tag: string) =>
+      ['a', 'b', 'c', 'd'].map((l) => ({ letter: l, claim: `${tag} claim ${l}` }));
+    const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
+    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // union = 8, at the cap
+    expect(round2[0]!.subclaims).toHaveLength(8);
+    const round3 = buildLedger(round2, [SF(1, claims('three'))], [], 3); // union would be 12
+    expect(round3[0]!.subclaims.map((s) => s.claim)).toEqual(round2[0]!.subclaims.map((s) => s.claim));
   });
 
   // A TRUNCATED claim is a prefix wearing an identity: two distinct over-cap claims cap to the
@@ -713,6 +792,19 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     const merged = buildLedger([legacy], [SF(1, AB)], [], 2);
     expect(merged).toHaveLength(1);
     expect(merged[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered', 'unanswered']);
+  });
+
+  // Byte-identity is a statement about the TEXT surfaces — what reviewers and humans are handed —
+  // not about in-memory objects, which gained `subclaims` exactly as they gained `requirements`
+  // at RUN-147 (the sanctioned additive-field precedent). This pins the rendered text for a
+  // legacy entry to the exact pre-RUN-180 output, character for character.
+  it('renders a legacy entry byte-identically to the pre-sub-claim output', () => {
+    const [f] = parseFindings('FINDING 1 [High] src/a.ts:1: the guard is missing');
+    const led = buildLedger([], [f!], parseFindingResponses('FINDING 1: CONTESTED src/a.ts:9 — covered'), 1);
+    expect(renderLedger(led)).toBe(
+      '  [round 1, High] src/a.ts:1 — the guard is missing\n' +
+        '      → builder: CONTESTED (src/a.ts:9) — covered',
+    );
   });
 
   it('normalises a malformed persisted sub-claim list field by field instead of crashing', () => {

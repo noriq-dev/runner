@@ -125,19 +125,31 @@ unaddressed sub-claim STANDS — visibly in the ledger and the per-requirement r
 in the terminal contest, where a finding whose letters are only partly contested is no candidate to
 clear and the run fails without spawning the re-adjudicating reviewer. That candidacy is judged on
 the RECONCILED ledger entry, never on the terminal round's own parse: the fold preserves held
-letters when a re-raise drops them (a fresh reviewer paraphrases by construction), so a letterless
-terminal re-raise of a half-answered finding still carries its unanswered letter and a bare contest
-cannot clear it. Instances of one root cause
+letters when a re-raise drops them (a fresh reviewer paraphrases by construction) — and when it
+repeats only SOME of them, unioning in the claims its wording does not cover, because a narrowed
+re-raise replacing the set wholesale was the same escape one fold up: the terminal round letters
+the claim it cares about and the held unanswered one vanishes from the only record candidacy can
+read. Only a claim the re-raise abandoned AND the builder had rebutted is dropped — settled by
+both sides — and the union never slices: past the entry's cap (twice one round's enumeration cap)
+the held set stands whole and the new enumeration is the thing dropped, all-or-nothing again. So
+a letterless or narrowed terminal re-raise of a half-answered finding still carries its unanswered
+letter — re-lettered if its old letter was taken, answerable BY its letter when not — and a bare
+or partial contest cannot clear it. Instances of one root cause
 never become letters — they stay evidence inside one claim, or the letters are the
 instance-enumeration the collapse rule bought out. The format is optional and positionally additive
 like the requirement bracket, so everything written before it parses byte-identically, and a
 persisted ledger predating sub-claims loads as single-claim entries; malformed lettering voids the
 WHOLE enumeration, and there is no malformed-label detector to slip past — detectors enumerate
 shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an edition of the same escape) — so
-every `FINDING <n>`-prefixed line is instead classified once: the numbered FINDING line, the strict
-sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`), because a lost
-enumeration is a single-claim finding — current behaviour — where a
-kept subset lets a partial contest clear letters that were never recorded. Carried answers match a
+every line whose FIRST LETTERS are `FINDING <n>` is instead classified once: the numbered FINDING
+line, the strict sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`),
+because a lost enumeration is a single-claim finding — current behaviour — where a kept subset
+lets a partial contest clear letters that were never recorded. "First letters", not "line start":
+markdown decoration is a letterless prefix, so a bulleted `- FINDING 1b:` — invisible to a
+whitespace-only anchor, which was the kept-subset escape through the anchor itself — is a voider
+too, while a mid-sentence mention has words before the token and stays harmless prose, since
+reports narrate their findings by number and voiding on mention would kill every enumeration in a
+report that explains itself. Carried answers match a
 re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
 claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
 down.

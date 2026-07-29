@@ -2070,10 +2070,11 @@ export class RunSupervisor {
     const loc = (s: string) => s.trim().toLowerCase();
     // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
     // parse alone. The fold deliberately PRESERVES held sub-claims when a re-raise drops the
-    // letters — a fresh terminal reviewer paraphrases by construction, so a letterless re-raise of
-    // a half-answered finding still carries its unanswered letter — and reading `f.subclaims`
-    // (empty on that path) let a bare contest clear exactly the claim this format exists to keep
-    // standing: the RUN-174 escape reborn one round later. The entry is also the VISIBILITY check:
+    // letters — or repeats only SOME of them, unioning in the claims its wording does not cover —
+    // a fresh terminal reviewer paraphrases by construction, so a letterless or narrowed re-raise
+    // of a half-answered finding still carries its unanswered letter — and reading `f.subclaims`
+    // (empty or a subset on those paths) let a bare or partial contest clear exactly the claim
+    // this format exists to keep standing: the RUN-174 escape reborn one round later. The entry is also the VISIBILITY check:
     // the adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
     // fold (the cap) is not evidence and stands. Matched on the values the fold itself wrote (id,
     // round, location, claim), so it cannot alias a prior attempt's persisted entry.

@@ -105,6 +105,12 @@ const MAX_REQUIREMENTS = 6;
  *  contests while the fifth claim was never even recorded — the RUN-174 escape reborn one level
  *  down. See parseFindings: enumeration is all-or-nothing, the RUN-148 steps precedent. */
 const MAX_SUBCLAIMS = 4;
+/** What one round may ENUMERATE is MAX_SUBCLAIMS; what an entry may ACCUMULATE is this — a
+ *  re-raise that repeats only some held letters must not DROP the rest (see buildLedger), so the
+ *  reconciled set can outgrow one round's cap. Still a hard cap ("never a transcript by another
+ *  name"), and like MAX_SUBCLAIMS it never slices: a union it cannot hold keeps the HELD set
+ *  whole and drops the new enumeration, because a kept subset is the escape (RUN-148 shape). */
+const MAX_LEDGER_SUBCLAIMS = 8;
 /** More entries than this and the run is not converging — carry the most recent and move on. */
 const MAX_ENTRIES = 24;
 
@@ -142,20 +148,31 @@ const FINDING_RE =
 // single-letter matching missed `1aa`, letters-hard-against-the-number missed the spaced `1 b:`, a
 // separator allowlist missed the parenthesized `1(b):`, a junk class with a `\b` missed `1b_:` and
 // `1b2:` — each time the unseen sibling left the valid letters standing as the "complete"
-// enumeration. So nothing is enumerated. Every line beginning `FINDING <n>` for a finding this
-// report numbered is CLASSIFIED exactly once (see parseFindings): the numbered FINDING line
-// itself, a strict sub-claim line, or — everything else — a voider of that finding's whole
-// enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken for it
-// simply does not exist.
+// enumeration. So nothing is enumerated. Every line whose FIRST LETTERS are `FINDING <n>` for a
+// finding this report numbered is CLASSIFIED exactly once (see parseFindings): the numbered
+// FINDING line itself, a strict sub-claim line, or — everything else — a voider of that finding's
+// whole enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken
+// for it simply does not exist.
 //
-// The deliberate cost is prose: a line that happens to start `FINDING 1 rests…` voids finding 1's
-// enumeration, degrading it to the single-claim finding it always was — which is current
-// behaviour, and always a correct way to record it (the RUN-148 steps rule: a decomposition that
-// cannot be run soundly is dropped, never half-run). A lost enumeration is a duller report; a kept
-// subset is the escape. Legacy reports are untouched by construction: their only
-// `FINDING`-prefixed lines are the numbered finding lines themselves (classified as such and
-// skipped) and prose, which voids an enumeration no legacy finding has.
-const ANY_NUMBERED_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[^\n]*$/gim;
+// "First letters", not "line start": the prefix may be ANY run of non-letter characters, because
+// markdown decoration is exactly that — `- FINDING 1b:`, `> FINDING 1b:`, `**FINDING 1b:**`,
+// `2. FINDING 1b:` are each a lettered-INTENT line a whitespace-only anchor could not see, and an
+// unseen sibling leaves the valid letters standing as the "complete" enumeration (the kept-subset
+// escape through the anchor itself). Decoration never contains a letter, so the boundary is a
+// class, not a list of bullets. The boundary's other side is equally deliberate: a MID-SENTENCE
+// mention (`…described in FINDING 1.`) has words before the token and never voids — reports
+// narrate their findings by number, so voiding on mention would kill every enumeration in any
+// report that explains itself. A word-prefixed structural line is prose by this rule, and prose
+// that merely names a finding is the one shape that stays harmless.
+//
+// The deliberate cost is prose at line start: a line that happens to open `FINDING 1 rests…` (or
+// `— FINDING 1 stands…`) voids finding 1's enumeration, degrading it to the single-claim finding
+// it always was — which is current behaviour, and always a correct way to record it (the RUN-148
+// steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A lost
+// enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched by
+// construction: their only such lines are the numbered finding lines themselves (classified as
+// such and skipped) and prose, which voids an enumeration no legacy finding has.
+const ANY_NUMBERED_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)[^\n]*$/gim;
 /** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
 const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
@@ -202,7 +219,7 @@ export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =
             typeof (s as { letter?: unknown }).letter === 'string' &&
             typeof (s as { claim?: unknown }).claim === 'string',
         )
-        .slice(0, MAX_SUBCLAIMS)
+        .slice(0, MAX_LEDGER_SUBCLAIMS)
         .map((s) => ({
           letter: s.letter,
           claim: s.claim,
@@ -235,13 +252,14 @@ export function parseFindings(text: string): Finding[] {
   // number rather than by position, so prose between the lines cannot orphan one. A line naming a
   // finding nobody numbered is ignored — there is no finding to degrade.
   //
-  // Per finding, all-or-nothing, by classifying EVERY `FINDING <n>`-prefixed line once (see
-  // ANY_NUMBERED_LINE_RE): the numbered FINDING line itself is pass 1's subject; a strict
-  // sub-claim line records its letter; and ANY other line — a spaced or punctuated letter, a
-  // doubled letter, a trailing `_` or digit, a duplicated letter (the RESPONSE side could not say
-  // which claim it answered), a fifth letter (the cap), prose — voids the WHOLE enumeration
-  // (`null` below) and the finding stays single-claim. Never an error, and never a kept subset a
-  // partial contest could clear.
+  // Per finding, all-or-nothing, by classifying once EVERY line whose first letters are
+  // `FINDING <n>` — decoration before the token is letterless, so a bulleted/bolded/quoted line
+  // is classified too (see ANY_NUMBERED_LINE_RE): the numbered FINDING line itself is pass 1's
+  // subject; a strict sub-claim line records its letter; and ANY other line — a decorated label,
+  // a spaced or punctuated letter, a doubled letter, a trailing `_` or digit, a duplicated letter
+  // (the RESPONSE side could not say which claim it answered), a fifth letter (the cap), prose —
+  // voids the WHOLE enumeration (`null` below) and the finding stays single-claim. Never an
+  // error, and never a kept subset a partial contest could clear.
   const byId = new Map(out.map((f) => [f.id, f]));
   const pending = new Map<number, SubClaim[] | null>();
   for (const m of text.matchAll(ANY_NUMBERED_LINE_RE)) {
@@ -382,28 +400,77 @@ export function buildLedger(
     if (key.endsWith('…')) return undefined;
     return held.find((h) => subKey(h.claim) === key);
   };
+  const nextFreeLetter = (used: Set<string>): string | undefined => {
+    for (let c = 97; c <= 122; c++) {
+      const l = String.fromCharCode(c);
+      if (!used.has(l)) return l;
+    }
+    return undefined;
+  };
+  // This round's enumeration wins its own framing (the latest wording, like the claim itself) —
+  // but it must not LOSE what the entry already holds. A re-raise that repeats only SOME of the
+  // held letters used to replace the set wholesale, so a held unanswered claim vanished exactly
+  // when the terminal round enumerated the letters it cared about — and the candidacy gate can
+  // only keep standing what was RECORDED: the RUN-174 escape through the fold itself. So held
+  // claims the new wording does not cover are UNIONED in beside the new set, keeping their
+  // adjudication. Two deliberate asymmetries:
+  //   - a held CONTESTED claim the re-raise abandoned is dropped: the reviewer no longer asserts
+  //     it and the builder had rebutted it, so keeping it bloats the record and dropping it can
+  //     clear nothing (a contested letter only ever counted toward clearing). Unanswered and
+  //     FIXED letters — the ones whose loss would flip a finding clearable — always carry.
+  //   - coverage is the claim's full wording (the carry key), so a reworded survivor rides as a
+  //     duplicate row rather than being merged away — may MISS, never INVENT — and a truncated
+  //     (ellipsis-capped) key never counts as covering, for the same aliasing reason carriedFrom
+  //     refuses it.
+  // A carried claim keeps its letter when this round's set left it free — the builder saw that
+  // letter in the ledger and an answer naming it now still credits it — and is re-lettered when
+  // taken, in which case no response is credited (the old letter now names this round's claim;
+  // crediting either way would be inventing). A union past MAX_LEDGER_SUBCLAIMS keeps the HELD
+  // set whole and drops the new enumeration — all-or-nothing, never a sliced subset.
+  const mergedSubclaims = (f: Finding, heldSubs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] => {
+    const mapped = f.subclaims.map((sc) => {
+      const rs = bySub.get(`${f.id}${sc.letter}`);
+      const carried = carriedFrom(heldSubs, sc.claim);
+      return {
+        letter: sc.letter,
+        claim: sc.claim,
+        status: rs?.status ?? carried?.status ?? ('unanswered' as const),
+        pointer: rs?.pointer ?? carried?.pointer ?? null,
+        reason: rs?.reason ?? carried?.reason ?? null,
+      };
+    });
+    const used = new Set(mapped.map((s) => s.letter));
+    const covered = new Set(mapped.map((s) => subKey(s.claim)).filter((k) => !k.endsWith('…')));
+    const extras: AdjudicatedSubClaim[] = [];
+    for (const h of heldSubs) {
+      if (h.status === 'contested' || covered.has(subKey(h.claim))) continue;
+      covered.add(subKey(h.claim));
+      const keepLetter = !used.has(h.letter);
+      const rs = keepLetter ? bySub.get(`${f.id}${h.letter}`) : undefined;
+      const letter = keepLetter ? h.letter : nextFreeLetter(used);
+      if (!letter) return heldSubs; // no letter left to carry it losslessly — the held set stands
+      used.add(letter);
+      extras.push({
+        letter,
+        claim: h.claim,
+        status: rs?.status ?? h.status,
+        pointer: rs?.pointer ?? h.pointer,
+        reason: rs?.reason ?? h.reason,
+      });
+    }
+    const union = [...mapped, ...extras];
+    return union.length > MAX_LEDGER_SUBCLAIMS ? heldSubs : union;
+  };
   const result = [...prior];
   for (const f of findings) {
     const r = byId.get(f.id);
     const at = matchIndex(result, f);
     const held = at >= 0 ? result[at] : undefined;
     const heldSubs = held ? subclaimsOf(held) : [];
-    // This round's enumeration wins where it exists (the latest framing, like the claim itself);
-    // a re-raise that dropped the letters keeps the held sub-claims AND their answers, the same
-    // preservation the whole-finding status gets below.
-    const subclaims: AdjudicatedSubClaim[] = f.subclaims.length
-      ? f.subclaims.map((sc) => {
-          const rs = bySub.get(`${f.id}${sc.letter}`);
-          const carried = carriedFrom(heldSubs, sc.claim);
-          return {
-            letter: sc.letter,
-            claim: sc.claim,
-            status: rs?.status ?? carried?.status ?? 'unanswered',
-            pointer: rs?.pointer ?? carried?.pointer ?? null,
-            reason: rs?.reason ?? carried?.reason ?? null,
-          };
-        })
-      : heldSubs;
+    // A re-raise that dropped the letters entirely keeps the held sub-claims AND their answers,
+    // the same preservation the whole-finding status gets below; one that enumerated merges — see
+    // mergedSubclaims.
+    const subclaims: AdjudicatedSubClaim[] = f.subclaims.length ? mergedSubclaims(f, heldSubs) : heldSubs;
     const entry: LedgerEntry = {
       id: f.id,
       round,
