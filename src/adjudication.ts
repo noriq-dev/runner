@@ -12,6 +12,16 @@
 // has to be talked out of. So the reviewer emits NUMBERED findings, the builder answers each in
 // a capped structured block, and only those two designated regions are parsed — never the stream.
 
+/** One separately-answerable claim inside a collapsed finding (RUN-180), from a
+ *  `FINDING <n><letter>: <claim>` line under the numbered FINDING line. NOT an instance list:
+ *  instances of one root cause stay evidence inside a single claim — a sub-claim is a claim that
+ *  could be true while its siblings are false, which is what makes it answerable on its own. */
+export interface SubClaim {
+  /** The single letter the RESPONSE side names it by — `FINDING 1a: CONTESTED …`. */
+  letter: string;
+  claim: string;
+}
+
 /** One numbered finding, as the reviewer emits it:
  *  `FINDING <n> [<severity>] [<requirements>] <file:line>: <claim>` — the requirement bracket
  *  optional, because most tasks name no requirements and every finding raised before RUN-147 has
@@ -25,6 +35,10 @@ export interface Finding {
   requirements: string[];
   location: string;
   claim: string;
+  /** The finding's enumerated separately-answerable claims (RUN-180). Empty for every finding that
+   *  enumerates none — the whole of the pre-RUN-180 world — which keeps the finding one answerable
+   *  unit, exactly as before. */
+  subclaims: SubClaim[];
 }
 
 export type FindingStatus = 'fixed' | 'contested';
@@ -32,10 +46,21 @@ export type FindingStatus = 'fixed' | 'contested';
 /** The builder's answer to one finding, from its `FINDING <n>: <STATUS> <pointer> — <reason>` block. */
 export interface FindingResponse {
   id: number;
+  /** The sub-claim letter this response answers (RUN-180) — `FINDING 1a: …` — or null for the
+   *  whole-finding form, which is every response written before sub-claims existed. */
+  subclaim: string | null;
   status: FindingStatus;
   /** file:line / commit / test — a location a reviewer can open, not an argument. */
   pointer: string;
   reason: string;
+}
+
+/** A sub-claim as the ledger carries it: the claim plus the builder's answer TO THAT CLAIM, so a
+ *  half-rebutted finding reads as half-rebutted instead of as answered-as-a-whole (RUN-180). */
+export interface AdjudicatedSubClaim extends SubClaim {
+  status: FindingStatus | 'unanswered';
+  pointer: string | null;
+  reason: string | null;
 }
 
 /** One accumulated entry handed to the next reviewer: the finding + the builder's adjudication. */
@@ -49,10 +74,17 @@ export interface LedgerEntry {
   requirements: string[];
   location: string;
   claim: string;
-  /** 'unanswered' when the builder's block named no response for this finding's id. */
+  /** 'unanswered' when the builder's block named no response for this finding's id. On an entry
+   *  with sub-claims this is only the WHOLE-FINDING answer — per-sub-claim adjudication lives in
+   *  `subclaims`, and a bare `FINDING <n>` response is recorded here without crediting any of them
+   *  (RUN-180): answering the half you can refute must not read as answering the whole. */
   status: FindingStatus | 'unanswered';
   pointer: string | null;
   reason: string | null;
+  /** The enumerated sub-claims with their own answers (RUN-180). Empty on every entry whose
+   *  finding enumerated none — the pre-RUN-180 world, which folds, matches, and renders exactly
+   *  as it always did. */
+  subclaims: AdjudicatedSubClaim[];
 }
 
 // Caps: the ledger is a distilled record, never a transcript by another name. A field longer
@@ -66,6 +98,9 @@ const REASON_CAP = 200;
 const REQUIREMENT_CAP = 64;
 /** A finding threatening a dozen requirements has named a theme, not a requirement. */
 const MAX_REQUIREMENTS = 6;
+/** A finding needing more than a handful of separately-answerable claims is several findings — or
+ *  an instance list wearing letters, which is the enumeration RUN-89/90 bought out (RUN-180). */
+const MAX_SUBCLAIMS = 4;
 /** More entries than this and the run is not converging — carry the most recent and move on. */
 const MAX_ENTRIES = 24;
 
@@ -85,6 +120,16 @@ const cap = (s: string, n: number) => {
 // than to an unparsed line, which is the only acceptable failure mode for a format a model writes.
 const FINDING_RE =
   /^[ \t]*FINDING[ \t]+(\d+)[ \t]*\[([^\]\n]{1,40})\][ \t]*(?:\[([^\]\n]{1,120})\][ \t]*)?([^\n]*?):[ \t]+(.+?)[ \t]*$/gim;
+
+// `FINDING 1a: the eligibility gate accepts a response naming a nonexistent finding` — a
+// sub-claim line under its numbered FINDING line (RUN-180). Its OWN line rather than an inline
+// list on the FINDING line, so a sub-claim never fights the claim for room under CLAIM_CAP and
+// prose parentheses cannot fake one. Invisible to FINDING_RE (no severity bracket) and to
+// RESPONSE_RE as it stood (a letter where the colon must be), so every report and every response
+// written before this parses byte-identically. A sub-claim line whose number matches no FINDING
+// line is simply ignored — malformed enumeration degrades to the single-claim finding it decorates,
+// never to an unparsed report.
+const SUBCLAIM_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/gim;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -114,6 +159,30 @@ const parseRequirements = (raw: string | undefined): string[] => {
 const reqsOf = (e: { requirements?: unknown }): string[] =>
   Array.isArray(e.requirements) ? e.requirements.filter((r): r is string => typeof r === 'string') : [];
 
+/** Same contract for sub-claims (RUN-180): a ledger persisted before they existed — every park and
+ *  continuation seed until now — reads as single-claim entries, and a hand-edited record degrades
+ *  field by field rather than crashing. Exported because the terminal-contest candidacy check in
+ *  the supervisor reads entries the same way — never trusted from the object. */
+export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =>
+  Array.isArray(e.subclaims)
+    ? e.subclaims
+        .filter(
+          (s): s is Record<string, unknown> & { letter: string; claim: string } =>
+            typeof s === 'object' &&
+            s !== null &&
+            typeof (s as { letter?: unknown }).letter === 'string' &&
+            typeof (s as { claim?: unknown }).claim === 'string',
+        )
+        .slice(0, MAX_SUBCLAIMS)
+        .map((s) => ({
+          letter: s.letter,
+          claim: s.claim,
+          status: s.status === 'fixed' || s.status === 'contested' ? s.status : 'unanswered',
+          pointer: typeof s.pointer === 'string' ? s.pointer : null,
+          reason: typeof s.reason === 'string' ? s.reason : null,
+        }))
+    : [];
+
 /** Extract the reviewer's numbered findings. Anything that does not match the shape is simply
  *  not in the ledger — a reviewer that ignores the format degrades to today's behavior, never
  *  an error. */
@@ -130,7 +199,19 @@ export function parseFindings(text: string): Finding[] {
       requirements: parseRequirements(m[3]),
       location: cap(m[4]!, LOCATION_CAP),
       claim: cap(m[5]!, CLAIM_CAP),
+      subclaims: [],
     });
+  }
+  // Second pass (RUN-180): attach sub-claim lines to the finding their number names. Keyed by
+  // number rather than by position, so prose between the lines cannot orphan one; a letter already
+  // taken is the reviewer's slip and the first wins, mirroring the duplicate-number rule above.
+  const byId = new Map(out.map((f) => [f.id, f]));
+  for (const m of text.matchAll(SUBCLAIM_RE)) {
+    const f = byId.get(Number(m[1]));
+    if (!f || f.subclaims.length >= MAX_SUBCLAIMS) continue;
+    const letter = m[2]!.toLowerCase();
+    if (f.subclaims.some((s) => s.letter === letter)) continue;
+    f.subclaims.push({ letter, claim: cap(m[3]!, CLAIM_CAP) });
   }
   return out;
 }
@@ -138,24 +219,38 @@ export function parseFindings(text: string): Finding[] {
 // `FINDING 1: CONTESTED src/init.ts:164, commit a672b25 — pre-existing, explicit consent`.
 // The separator between pointer and reason is ` — ` (em dash) or ` - ` (spaced hyphen), so a
 // hyphen inside a path or a range never splits it.
-const RESPONSE_RE = /^[ \t]*FINDING[ \t]+(\d+):[ \t]*(FIXED|CONTESTED)\b[ \t]*(.*)$/gim;
+//
+// The sub-claim letter (RUN-180) is OPTIONAL and sits between the number and the colon —
+// `FINDING 1a: CONTESTED …` answers sub-claim (a) alone. Positionally additive, so every response
+// written without one parses byte-identically as the whole-finding form it always was.
+const RESPONSE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])?:[ \t]*(FIXED|CONTESTED)\b[ \t]*(.*)$/gim;
 
 /** Extract the builder's per-finding responses from its structured block. Unmatched lines are
  *  ignored; a builder that writes no block yields no responses (the findings then carry into the
  *  ledger as 'unanswered'). */
 export function parseFindingResponses(text: string): FindingResponse[] {
   const out: FindingResponse[] = [];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   for (const m of text.matchAll(RESPONSE_RE)) {
     const id = Number(m[1]);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const status: FindingStatus = m[2]!.toUpperCase() === 'FIXED' ? 'fixed' : 'contested';
-    const rest = m[3]!.trim();
+    const subclaim = m[2]?.toLowerCase() ?? null;
+    // Keyed by number AND letter (RUN-180): `FINDING 1a` and `FINDING 1b` are two answers, and a
+    // bare `FINDING 1` beside them is a third — the whole-finding form, deduped as it always was.
+    const key = `${id}${subclaim ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const status: FindingStatus = m[3]!.toUpperCase() === 'FIXED' ? 'fixed' : 'contested';
+    const rest = m[4]!.trim();
     const sep = rest.search(/\s[—-]\s/);
     const pointer = sep >= 0 ? rest.slice(0, sep) : rest;
     const reason = sep >= 0 ? rest.slice(sep).replace(/^\s*[—-]\s*/, '') : '';
-    out.push({ id, status, pointer: cap(pointer, POINTER_CAP), reason: cap(reason, REASON_CAP) });
+    out.push({
+      id,
+      subclaim,
+      status,
+      pointer: cap(pointer, POINTER_CAP),
+      reason: cap(reason, REASON_CAP),
+    });
   }
   return out;
 }
@@ -216,12 +311,38 @@ export function buildLedger(
   responses: FindingResponse[],
   round: number,
 ): LedgerEntry[] {
-  const byId = new Map(responses.map((r) => [r.id, r]));
+  // The whole-finding form and the per-sub-claim form are two different answers (RUN-180): a bare
+  // `FINDING 1` folds onto the entry, a `FINDING 1a` onto sub-claim (a) alone — crediting one to
+  // the other is exactly the answered-as-a-whole read this split exists to stop.
+  const byId = new Map(responses.filter((r) => !r.subclaim).map((r) => [r.id, r]));
+  const bySub = new Map(responses.filter((r) => r.subclaim).map((r) => [`${r.id}${r.subclaim}`, r]));
+  // Same 60-char prose key the entry match uses — a carried sub-claim answer may MISS a reworded
+  // sub-claim (it reads as unanswered, visibly), but matching by LETTER could credit an old
+  // rebuttal to a genuinely different claim a fresh reviewer happened to letter the same, which is
+  // the invent-a-match failure the whole ledger refuses.
+  const subKey = (c: string) => c.toLowerCase().trim().slice(0, 60);
   const result = [...prior];
   for (const f of findings) {
     const r = byId.get(f.id);
     const at = matchIndex(result, f);
     const held = at >= 0 ? result[at] : undefined;
+    const heldSubs = held ? subclaimsOf(held) : [];
+    // This round's enumeration wins where it exists (the latest framing, like the claim itself);
+    // a re-raise that dropped the letters keeps the held sub-claims AND their answers, the same
+    // preservation the whole-finding status gets below.
+    const subclaims: AdjudicatedSubClaim[] = f.subclaims.length
+      ? f.subclaims.map((sc) => {
+          const rs = bySub.get(`${f.id}${sc.letter}`);
+          const carried = heldSubs.find((h) => subKey(h.claim) === subKey(sc.claim));
+          return {
+            letter: sc.letter,
+            claim: sc.claim,
+            status: rs?.status ?? carried?.status ?? 'unanswered',
+            pointer: rs?.pointer ?? carried?.pointer ?? null,
+            reason: rs?.reason ?? carried?.reason ?? null,
+          };
+        })
+      : heldSubs;
     const entry: LedgerEntry = {
       id: f.id,
       round,
@@ -241,6 +362,7 @@ export function buildLedger(
       status: r?.status ?? held?.status ?? 'unanswered',
       pointer: r?.pointer ?? held?.pointer ?? null,
       reason: r?.reason ?? held?.reason ?? null,
+      subclaims,
     };
     if (at >= 0) result[at] = entry;
     else result.push(entry);
@@ -321,8 +443,15 @@ export function renderRequirementOutcomes(report: RequirementReport): string {
   if (!report.outcomes.length) return '';
   const lines = report.outcomes.map((o) => {
     if (o.standing.length) {
+      // A sub-claimed entry says WHICH claims stand (RUN-180) — `[unanswered]` on the whole row is
+      // the wording that hid the RUN-174 escape, where the answered half spoke for the silent one.
+      const state = (e: LedgerEntry) => {
+        const subs = subclaimsOf(e);
+        if (!subs.length) return `[${e.status}]`;
+        return `[sub-claims: ${subs.map((s) => `(${s.letter}) ${s.status}`).join(', ')}]`;
+      };
       const detail = o.standing
-        .map((e) => `\n      ${e.location || '(no location)'} — ${e.claim} [${e.status}]`)
+        .map((e) => `\n      ${e.location || '(no location)'} — ${e.claim} ${state(e)}`)
         .join('');
       return `- ❌ **${o.requirement}** — ${o.standing.length} finding(s) still standing${detail}`;
     }
@@ -350,7 +479,25 @@ export function renderLedger(entries: LedgerEntry[]): string {
         e.status === 'unanswered'
           ? '      → builder: no response recorded — judge it fresh'
           : `      → builder: ${status}${ptr}${why}`;
-      return `${head}\n${answer}`;
+      // A partially answered finding renders sub-claim by sub-claim (RUN-180): the one that STANDS
+      // is named rather than absorbed into its siblings' answer. A whole-finding response is shown
+      // too when one was recorded — it is evidence — but it speaks for no lettered claim.
+      const subs = subclaimsOf(e);
+      if (!subs.length) return `${head}\n${answer}`;
+      const subLines = subs.map((s) => {
+        const sPtr = s.pointer ? ` (${s.pointer})` : '';
+        const sWhy = s.reason ? ` — ${s.reason}` : '';
+        const sAnswer =
+          s.status === 'unanswered'
+            ? 'no response recorded — this sub-claim STANDS; judge it fresh'
+            : `${s.status.toUpperCase()}${sPtr}${sWhy}`;
+        return `      (${s.letter}) ${s.claim}\n          → builder: ${sAnswer}`;
+      });
+      const whole =
+        e.status === 'unanswered'
+          ? []
+          : [`      → builder, on the finding as a whole (credits no sub-claim): ${status}${ptr}${why}`];
+      return [head, ...whole, ...subLines].join('\n');
     })
     .join('\n');
 }

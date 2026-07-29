@@ -8,6 +8,7 @@ import {
   renderLedger,
   renderRequirementOutcomes,
   requirementOutcomes,
+  subclaimsOf,
 } from '../src/adjudication';
 
 describe('parseFindings', () => {
@@ -18,8 +19,9 @@ describe('parseFindings', () => {
         'FINDING 2 [Medium] src/foo.ts:92: npm assumed for every project\n' +
         'VERDICT: FAIL',
     );
-    // No requirement bracket → `requirements: []`. Every finding written before RUN-147 and every
-    // task that names no requirements lands here, and must parse exactly as it always did.
+    // No requirement bracket → `requirements: []`, no sub-claim lines → `subclaims: []`. Every
+    // finding written before RUN-147/RUN-180 and every task that names no requirements lands here,
+    // and must parse exactly as it always did.
     expect(out).toEqual([
       {
         id: 1,
@@ -27,6 +29,7 @@ describe('parseFindings', () => {
         requirements: [],
         location: 'src/init-project.ts:357',
         claim: 'detectVcs runs on every init',
+        subclaims: [],
       },
       {
         id: 2,
@@ -34,6 +37,7 @@ describe('parseFindings', () => {
         requirements: [],
         location: 'src/foo.ts:92',
         claim: 'npm assumed for every project',
+        subclaims: [],
       },
     ]);
   });
@@ -41,7 +45,14 @@ describe('parseFindings', () => {
   it('tolerates a missing location and odd severity tags', () => {
     const out = parseFindings('FINDING 1 [P1] : the whole approach is wrong');
     expect(out).toEqual([
-      { id: 1, severity: 'P1', requirements: [], location: '', claim: 'the whole approach is wrong' },
+      {
+        id: 1,
+        severity: 'P1',
+        requirements: [],
+        location: '',
+        claim: 'the whole approach is wrong',
+        subclaims: [],
+      },
     ]);
   });
 
@@ -63,10 +74,18 @@ describe('parseFindingResponses', () => {
         'FINDING 1: FIXED src/foo.ts:92 — made detection package-manager-aware\n' +
         'FINDING 2: CONTESTED src/init.ts:164, commit a672b25 — pre-existing, explicit consent\n',
     );
+    // `subclaim: null` is the whole-finding form — every response written before RUN-180.
     expect(out).toEqual([
-      { id: 1, status: 'fixed', pointer: 'src/foo.ts:92', reason: 'made detection package-manager-aware' },
+      {
+        id: 1,
+        subclaim: null,
+        status: 'fixed',
+        pointer: 'src/foo.ts:92',
+        reason: 'made detection package-manager-aware',
+      },
       {
         id: 2,
+        subclaim: null,
         status: 'contested',
         pointer: 'src/init.ts:164, commit a672b25',
         reason: 'pre-existing, explicit consent',
@@ -76,12 +95,19 @@ describe('parseFindingResponses', () => {
 
   it('a hyphen inside a path does not split pointer from reason', () => {
     const out = parseFindingResponses('FINDING 1: FIXED src/multi-turn.ts:10 — fixed it');
-    expect(out[0]).toEqual({ id: 1, status: 'fixed', pointer: 'src/multi-turn.ts:10', reason: 'fixed it' });
+    expect(out[0]).toEqual({
+      id: 1,
+      subclaim: null,
+      status: 'fixed',
+      pointer: 'src/multi-turn.ts:10',
+      reason: 'fixed it',
+    });
   });
 
   it('a response with no separator keeps the whole tail as the pointer', () => {
     expect(parseFindingResponses('FINDING 3: CONTESTED test/x.test.ts:194')[0]).toEqual({
       id: 3,
+      subclaim: null,
       status: 'contested',
       pointer: 'test/x.test.ts:194',
       reason: '',
@@ -100,15 +126,19 @@ describe('buildLedger', () => {
     requirements,
     location,
     claim,
+    subclaims: [],
+  });
+  /** The whole-finding response form (`subclaim: null`) — every response written before RUN-180. */
+  const R = (id: number, status: 'fixed' | 'contested', pointer: string, reason: string) => ({
+    id,
+    subclaim: null,
+    status,
+    pointer,
+    reason,
   });
 
   it('pairs findings to responses by id; a missing response is unanswered', () => {
-    const led = buildLedger(
-      [],
-      [F(1, 'a'), F(2, 'b')],
-      [{ id: 1, status: 'contested', pointer: 'x.ts:1', reason: 'nope' }],
-      1,
-    );
+    const led = buildLedger([], [F(1, 'a'), F(2, 'b')], [R(1, 'contested', 'x.ts:1', 'nope')], 1);
     expect(led.map((e) => [e.id, e.status, e.pointer])).toEqual([
       [1, 'contested', 'x.ts:1'],
       [2, 'unanswered', null],
@@ -119,14 +149,14 @@ describe('buildLedger', () => {
     const round1 = buildLedger(
       [],
       [F(1, 'detectVcs runs on every init')],
-      [{ id: 1, status: 'contested', pointer: 'commit 11f19c8', reason: 'pre-existing' }],
+      [R(1, 'contested', 'commit 11f19c8', 'pre-existing')],
       1,
     );
     // Round 2 re-raises the same finding (same location + claim), builder answers again.
     const round2 = buildLedger(
       round1,
       [F(1, 'detectVcs runs on every init')],
-      [{ id: 1, status: 'contested', pointer: 'commit 11f19c8, brief', reason: 'still pre-existing' }],
+      [R(1, 'contested', 'commit 11f19c8, brief', 'still pre-existing')],
       2,
     );
     expect(round2).toHaveLength(1); // not duplicated
@@ -141,7 +171,7 @@ describe('buildLedger', () => {
     const round1 = buildLedger(
       [],
       [F(1, 'detectVcs runs on every init', 'src/init.ts:357', ['R-7'])],
-      [{ id: 1, status: 'contested', pointer: 'commit 11f19c8', reason: 'pre-existing' }],
+      [R(1, 'contested', 'commit 11f19c8', 'pre-existing')],
       1,
     );
     const round2 = buildLedger(
@@ -201,7 +231,7 @@ describe('buildLedger', () => {
     const round1 = buildLedger(
       [],
       [F(1, 'x', 'a.ts:1', ['R-7'])],
-      [{ id: 1, status: 'contested', pointer: 'commit abc', reason: 'pre-existing' }],
+      [R(1, 'contested', 'commit abc', 'pre-existing')],
       1,
     );
     const round2 = buildLedger(round1, [F(1, 'x reworded', 'a.ts:1', ['R-7'])], [], 2);
@@ -230,6 +260,7 @@ describe('parsing the requirement bracket (RUN-147)', () => {
       requirements: ['R-7', 'R-9'],
       location: 'src/a.ts:12',
       claim: 'the claim',
+      subclaims: [],
     });
   });
 
@@ -272,6 +303,7 @@ describe('what the run can say per requirement (RUN-147)', () => {
     status,
     pointer: null,
     reason: null,
+    subclaims: [],
   });
 
   it('separates still-standing from raised-and-settled', () => {
@@ -340,6 +372,7 @@ describe('renderLedger', () => {
         status: 'contested',
         pointer: 'commit 11f19c8',
         reason: 'pre-existing, added by RUN-60',
+        subclaims: [],
       },
     ];
     const out = renderLedger(entries);
@@ -359,8 +392,229 @@ describe('renderLedger', () => {
         status: 'unanswered',
         pointer: null,
         reason: null,
+        subclaims: [],
       },
     ]);
     expect(out).toMatch(/no response recorded — judge it fresh/);
+  });
+});
+
+// RUN-180. The collapse rule (RUN-89/90) made a finding the unit the builder answers — and a
+// bundled finding answerable in halves while recorded as answered as a whole. Sub-claims give the
+// halves their own lines: `FINDING 1a: <claim>` under the FINDING line, `FINDING 1a: CONTESTED …`
+// in the RESPONSE block, and an unaddressed letter STANDS instead of riding its siblings' answer.
+describe('parsing sub-claims (RUN-180)', () => {
+  const REPORT =
+    'FINDING 1 [High] src/gate.ts:12: the contest gate bundles two separately-answerable defects\n' +
+    'FINDING 1a: the eligibility check accepts a response naming a nonexistent finding\n' +
+    'FINDING 1b: the entry cap can drop a terminal finding before a PASS\n' +
+    'VERDICT: FAIL';
+
+  it('attaches lettered sub-claim lines to the finding their number names', () => {
+    expect(parseFindings(REPORT)).toEqual([
+      {
+        id: 1,
+        severity: 'High',
+        requirements: [],
+        location: 'src/gate.ts:12',
+        claim: 'the contest gate bundles two separately-answerable defects',
+        subclaims: [
+          { letter: 'a', claim: 'the eligibility check accepts a response naming a nonexistent finding' },
+          { letter: 'b', claim: 'the entry cap can drop a terminal finding before a PASS' },
+        ],
+      },
+    ]);
+  });
+
+  // Malformed enumeration degrades to the single-claim finding, never to an unparsed line — the
+  // only acceptable failure mode for a format a model writes (the RUN-147 bracket's rule).
+  it('ignores a sub-claim line whose number matches no finding', () => {
+    const out = parseFindings('FINDING 1 [High] a.ts:1: the claim\nFINDING 2a: an orphaned letter');
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('a duplicated letter keeps the first — the reviewer’s slip, same as a duplicated number', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: c\nFINDING 1a: first version\nFINDING 1a: second version',
+    );
+    expect(out[0]!.subclaims).toEqual([{ letter: 'a', claim: 'first version' }]);
+  });
+
+  // More separately-answerable claims than this is several findings — or an instance list wearing
+  // letters, which is the enumeration the collapse rule bought out.
+  it('caps how many sub-claims one finding may enumerate', () => {
+    const letters = ['a', 'b', 'c', 'd', 'e', 'f'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
+    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
+    expect(out[0]!.subclaims).toHaveLength(4);
+  });
+
+  // A sub-claim line never leaks into the finding list, and a report with none parses as it
+  // always did — byte-identical legacy behaviour on both sides of the extension.
+  it('sub-claim lines are not findings and do not disturb finding numbering', () => {
+    expect(parseFindings(REPORT).map((f) => f.id)).toEqual([1]);
+  });
+
+  it('parses a per-sub-claim RESPONSE line, letter lowercased', () => {
+    const out = parseFindingResponses('FINDING 1A: CONTESTED src/x.ts:9 — the id filter covers this');
+    expect(out).toEqual([
+      {
+        id: 1,
+        subclaim: 'a',
+        status: 'contested',
+        pointer: 'src/x.ts:9',
+        reason: 'the id filter covers this',
+      },
+    ]);
+  });
+
+  it('a bare response and lettered responses to the same finding are distinct answers', () => {
+    const out = parseFindingResponses(
+      'FINDING 1: CONTESTED whole.ts:1 — as a whole\n' +
+        'FINDING 1a: CONTESTED a.ts:1 — half one\n' +
+        'FINDING 1b: FIXED b.ts:1 — half two',
+    );
+    expect(out.map((r) => [r.subclaim, r.status])).toEqual([
+      [null, 'contested'],
+      ['a', 'contested'],
+      ['b', 'fixed'],
+    ]);
+  });
+});
+
+describe('folding partial answers into the ledger (RUN-180)', () => {
+  const SF = (id: number, subclaims: { letter: string; claim: string }[], location = `f${id}.ts:1`) => ({
+    id,
+    severity: 'High',
+    requirements: [],
+    location,
+    claim: 'the class',
+    subclaims,
+  });
+  const SR = (
+    id: number,
+    subclaim: string | null,
+    status: 'fixed' | 'contested',
+    pointer: string,
+    reason = 'because',
+  ) => ({ id, subclaim, status, pointer, reason });
+  const AB = [
+    { letter: 'a', claim: 'claim a' },
+    { letter: 'b', claim: 'claim b' },
+  ];
+
+  it('answers fold per sub-claim; the unaddressed one stays unanswered', () => {
+    const led = buildLedger([], [SF(1, AB)], [SR(1, 'b', 'contested', 'x.ts:1')], 1);
+    expect(led[0]!.subclaims.map((s) => [s.letter, s.status, s.pointer])).toEqual([
+      ['a', 'unanswered', null],
+      ['b', 'contested', 'x.ts:1'],
+    ]);
+    expect(led[0]!.status).toBe('unanswered'); // no whole-finding response was given
+  });
+
+  // The RUN-174 escape in miniature: a whole-finding answer must not read as answering the
+  // letters. It is recorded — it is evidence — but each sub-claim keeps its own state.
+  it('a bare response is recorded on the entry and credits NO sub-claim', () => {
+    const led = buildLedger([], [SF(1, AB)], [SR(1, null, 'contested', 'whole.ts:1')], 1);
+    expect(led[0]!.status).toBe('contested');
+    expect(led[0]!.subclaims.every((s) => s.status === 'unanswered')).toBe(true);
+  });
+
+  it('a re-raise with the same sub-claim wording carries the earlier answers forward', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9', 'covered')], 1);
+    const round2 = buildLedger(round1, [SF(1, AB)], [], 2);
+    expect(round2).toHaveLength(1);
+    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status])).toEqual([
+      ['a', 'contested'],
+      ['b', 'unanswered'],
+    ]);
+  });
+
+  // May MISS, never INVENT: answers carry by the sub-claim's WORDING, not its letter — a fresh
+  // reviewer that letters a genuinely different claim (a) must not inherit old (a)'s rebuttal.
+  // The cost of the miss is a visibly unanswered sub-claim, which a builder can answer again.
+  it('a re-raise whose lettered claims are different claims does not inherit the old answers', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const round2 = buildLedger(
+      round1,
+      [SF(1, [{ letter: 'a', claim: 'an entirely different assertion' }])],
+      [],
+      2,
+    );
+    expect(round2[0]!.subclaims).toEqual([
+      {
+        letter: 'a',
+        claim: 'an entirely different assertion',
+        status: 'unanswered',
+        pointer: null,
+        reason: null,
+      },
+    ]);
+  });
+
+  it('a re-raise that drops the enumeration keeps the held sub-claims and their answers', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const round2 = buildLedger(round1, [SF(1, [])], [], 2);
+    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status])).toEqual([
+      ['a', 'contested'],
+      ['b', 'unanswered'],
+    ]);
+  });
+
+  // A persisted ledger predates sub-claims (parks, continuation seeds), and a hand-edited one can
+  // hold anything — normalise on read, never crash a continuation (the reqsOf pattern).
+  it('a persisted entry without sub-claim fields loads and behaves as a single-claim entry', () => {
+    const legacy = {
+      id: 1,
+      round: 1,
+      severity: 'High',
+      requirements: [],
+      location: 'f1.ts:1',
+      claim: 'the class',
+      status: 'contested',
+      pointer: 'x.ts:1',
+      reason: 'held',
+    } as unknown as LedgerEntry; // as JSON.parse would hand it over: no `subclaims` at runtime
+    expect(subclaimsOf(legacy)).toEqual([]);
+    expect(renderLedger([legacy])).toContain('builder: CONTESTED (x.ts:1)');
+    const merged = buildLedger([legacy], [SF(1, AB)], [], 2);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered', 'unanswered']);
+  });
+
+  it('normalises a malformed persisted sub-claim list field by field instead of crashing', () => {
+    const mangled = {
+      subclaims: ['not-an-object', { letter: 'a', claim: 'ok', status: 'bogus' }, { letter: 1 }],
+    };
+    expect(subclaimsOf(mangled)).toEqual([
+      { letter: 'a', claim: 'ok', status: 'unanswered', pointer: null, reason: null },
+    ]);
+    expect(subclaimsOf({})).toEqual([]);
+  });
+
+  it('renderLedger names the sub-claim that STANDS instead of reading the finding as answered', () => {
+    const led = buildLedger(
+      [],
+      [SF(1, AB)],
+      [SR(1, 'b', 'contested', 'x.ts:1', 'the slice keeps the most recent')],
+      1,
+    );
+    const out = renderLedger(led);
+    expect(out).toContain('(a) claim a');
+    expect(out).toMatch(/\(a\) claim a\n\s+→ builder: no response recorded — this sub-claim STANDS/);
+    expect(out).toContain('(b) claim b');
+    expect(out).toContain('CONTESTED (x.ts:1) — the slice keeps the most recent');
+  });
+
+  it('the per-requirement report says which sub-claims stand, not a whole-row [unanswered]', () => {
+    const led = buildLedger(
+      [],
+      [{ ...SF(1, AB), requirements: ['R-7'] }],
+      [SR(1, 'b', 'contested', 'x.ts:1')],
+      1,
+    );
+    const out = renderRequirementOutcomes(requirementOutcomes(['R-7'], led));
+    expect(out).toContain('(a) unanswered');
+    expect(out).toContain('(b) contested');
   });
 });

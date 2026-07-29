@@ -101,6 +101,17 @@ shape: each round is a fresh reviewer that never saw the last one's wording, so 
 comes back reworded and the ledger's prose key misses it. It also says not to stretch a finding to
 fit a requirement, because a wrong association is worse than none.
 
+A collapsed finding may enumerate its separately-answerable claims as lettered sub-claim lines —
+`FINDING <n><letter>: <claim>` — and the RESPONSE side answers per letter (RUN-180).
+`reviewer-feedback.md` and `reviewer-contest.md` both carry the answer shape, because a response is
+credited only for the sub-claims it names: an unaddressed sub-claim stands rather than riding its
+siblings' answer, which is how a bundled finding once left a valid half "answered" by the rebuttal
+of the other. Both sides are optional and positionally additive, like the requirement bracket — a
+report or response written without letters parses byte-identically, and malformed lettering degrades
+to the single-claim finding. The prompt draws the line the parser cannot: instances of one root
+cause stay evidence inside one claim, so the letters never become the instance-enumeration the
+collapse rule (RUN-89/90) bought out.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

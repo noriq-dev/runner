@@ -114,6 +114,23 @@ weak: "no finding was **recorded** against it", not "met" (nobody objecting is n
 anyone checking) and not "raised" (the ledger is bounded, so it can only speak for what survived).
 On a PASS nothing is reported as standing: the gate read each finding and its rebuttal and cleared
 the work anyway, so a summary still calling one open would contradict its own run.
+A finding is also the unit the builder ANSWERS, and the reviewer's collapse rule (one numbered
+finding per root cause, or a run is unconvergeable inside its round budget) made that unit
+bundleable — so a finding carrying two separately-answerable claims was answerable in halves while
+recorded as answered as a whole, and the first live terminal review lost a valid claim exactly
+there: the builder rebutted the half it could refute and the other half rode the answer out.
+RUN-180 prices that: a collapsed finding enumerates separately-answerable claims as lettered
+sub-claim lines (`FINDING 1a: …`), a RESPONSE is credited only for the letters it names, and an
+unaddressed sub-claim STANDS — visibly in the ledger and the per-requirement report, and decisively
+in the terminal contest, where a finding whose letters are only partly contested is no candidate to
+clear and the run fails without spawning the re-adjudicating reviewer. Instances of one root cause
+never become letters — they stay evidence inside one claim, or the letters are the
+instance-enumeration the collapse rule bought out. The format is optional and positionally additive
+like the requirement bracket, so everything written before it parses byte-identically, and a
+persisted ledger predating sub-claims loads as single-claim entries. Carried answers match a
+re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
+claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
+down.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud

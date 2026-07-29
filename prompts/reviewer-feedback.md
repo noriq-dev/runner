@@ -17,4 +17,7 @@ When you stop, end your reply with a RESPONSE block — one line per numbered fi
   FINDING <n>: FIXED <file:line> — <what you changed>
   FINDING <n>: CONTESTED <file:line | commit | test> — <why the finding is wrong>
 The next reviewer reads this block, so the pointer must be something it can open and check: FIXED points at the change you made, CONTESTED at the evidence that disproves the finding. A CONTESTED with no checkable pointer will simply be re-raised.
+When a finding enumerates lettered sub-claims (FINDING 1a, FINDING 1b, …), answer each letter as its own line, in the same two forms:
+  FINDING <n><letter>: FIXED|CONTESTED <pointer> — <reason>
+Each sub-claim is answered alone: a response to the bare number speaks for none of the letters, and a sub-claim you do not address STANDS rather than riding its siblings' answer.
 {{#last}}This is the last attempt: a fresh reviewer looks once more after this, and if it still fails the run stops and a human picks it up.{{/last}}{{^last}}When you stop, a fresh reviewer will look again.{{/last}}

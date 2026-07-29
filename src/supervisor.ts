@@ -18,6 +18,7 @@ import {
   buildLedger,
   parseFindingResponses,
   parseFindings,
+  subclaimsOf,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
@@ -1928,9 +1929,9 @@ export class RunSupervisor {
    *
    * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
    * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
-   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, or a
-   * finding a ledger cap dropped cannot clear it — the run then fails without even spawning the
-   * reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, a
+   * finding a ledger cap dropped, or a sub-claim left unanswered while its siblings drew the
+   * rebuttal (RUN-180) cannot clear it — the run then fails without even spawning the reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
    * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
    * enough.
    *
@@ -2053,17 +2054,43 @@ export class RunSupervisor {
     // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
     // pointer or a response for another id never reached `matched` at all. What "checkable" means
     // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
-    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
+    //
+    // A finding that enumerated sub-claims is a candidate only when EVERY sub-claim drew its own
+    // contest (RUN-180). This is the exact surface the run_ms4t62384u0z6c6p4f5d escape used: a
+    // bundled finding was "contested" by rebutting the refutable half, and the other half rode the
+    // answer out. A bare `FINDING <n>` response is recorded as evidence but credits no lettered
+    // claim, so answering in halves leaves the unanswered half STANDING — and the finding off the
+    // candidate set.
+    const contestedWhole = new Set(
+      matched.filter((r) => r.status === 'contested' && !r.subclaim).map((r) => r.id),
+    );
+    const contestedSubs = new Set(
+      matched.filter((r) => r.status === 'contested' && r.subclaim).map((r) => `${r.id}${r.subclaim}`),
+    );
+    const answerablyContested = (f: Finding) =>
+      f.subclaims.length
+        ? f.subclaims.every((sc) => contestedSubs.has(`${f.id}${sc.letter}`))
+        : contestedWhole.has(f.id);
     const loc = (s: string) => s.trim().toLowerCase();
     const visibleToAdjudicator = (f: Finding) =>
-      answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));
-    if (!args.findings.every((f) => contested.has(f.id) && visibleToAdjudicator(f))) {
+      answered.some(
+        (e) =>
+          e.id === f.id &&
+          loc(e.location) === loc(f.location) &&
+          // …and the per-sub-claim contests survived INTO that entry (RUN-180) — the adjudicator
+          // judges what the ledger shows it, so a rebuttal the fold could not carry is not evidence.
+          f.subclaims.every((sc) =>
+            subclaimsOf(e).some((h) => h.letter === sc.letter && h.status === 'contested'),
+          ),
+      );
+    if (!args.findings.every((f) => answerablyContested(f) && visibleToAdjudicator(f))) {
       // At least one terminal finding was not answerably contested, so it stands and the run fails as
       // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
       // Nothing is spawned to be killed; the contest turn already happened above.
       this.log.info('a terminal finding was not answerably contested — the findings stand', {
         runId: ctx.run.id,
-        contested: contested.size,
+        contested: contestedWhole.size,
+        subclaimsContested: contestedSubs.size,
         findings: args.findings.length,
       });
       transcript.milestone('the terminal findings were not all contested — the run fails');

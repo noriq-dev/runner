@@ -9,4 +9,6 @@ Its report:
 
 End your reply with a RESPONSE block — one line per finding you contest, nothing else on the line:
   FINDING <n>: CONTESTED <file:line | commit | test> — <why the finding is wrong, or not this change's to answer for>
-The pointer must be something the reviewer can open and verify: a CONTESTED with no checkable pointer is not a contest and will not clear the finding. Contest only what you can point at; a finding you leave unanswered is taken as accepted. A fresh reviewer reads this block, checks each pointer against the same diff, and passes the run only if the findings no longer stand.
+The pointer must be something the reviewer can open and verify: a CONTESTED with no checkable pointer is not a contest and will not clear the finding. Contest only what you can point at; a finding you leave unanswered is taken as accepted. A finding that enumerates lettered sub-claims (FINDING 1a, FINDING 1b, …) is contested letter by letter, one line each:
+  FINDING <n><letter>: CONTESTED <file:line | commit | test> — <why that sub-claim is wrong>
+A response to the bare number speaks for none of the letters, and a sub-claim you leave unanswered is taken as accepted — the finding then stands on it, however thoroughly you rebutted its siblings. A fresh reviewer reads this block, checks each pointer against the same diff, and passes the run only if the findings no longer stand.
