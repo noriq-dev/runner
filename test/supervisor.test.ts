@@ -4028,9 +4028,41 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
   });
 
-  // …and the same path CLEARS when every carried claim already holds a rebuttal: the reconciled
-  // entry shows each sub-claim contested, the bare contest is this turn's own answer to the
-  // letterless re-raise, and the fresh look adjudicates the carried pointers.
+  // The candidacy contract is the RECONCILED entry alone (criterion: every sub-claim contested and
+  // visible, or the finding stands) — the terminal report's own shape is never a second gate. The
+  // contest prompt tells the builder an already-contested record claim needs no fresh answer, so a
+  // letterless re-raise answered through the record's letters THIS turn must clear without a bare
+  // response beside it: demanding one would fail the exact builder that followed the prompt.
+  it('a letterless re-raise contested through the record’s letters alone earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the standing half by its record letter — no bare response.
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // every reconciled sub-claim contested → candidate, no bare needed
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // …and the same clearing holds when every carried claim already holds a rebuttal: the reconciled
+  // entry shows each sub-claim contested, the bare contest folds in as whole-finding evidence, and
+  // the fresh look adjudicates the carried pointers.
   it('a letterless re-raise whose carried claims are all contested can still earn the fresh look', async () => {
     const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
     h.claude.continueTexts = [

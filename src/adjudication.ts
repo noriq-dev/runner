@@ -187,14 +187,25 @@ const FINDING_RE =
 // a mutated label under the decoration (`(b) FINDING 1 b:`, `(b) FINDING 1(b):`), so the two
 // escapes do not compose within it.
 //
+// Net three — the OUT-OF-RANGE LABEL: word-material glued to the number (`FINDING 1b`, `1aa`,
+// `1b2`, `1b_`) is a label whether or not a colon survived the decoration — `(b) FINDING 1b —
+// second claim` slips the head net (lettered prefix) AND net two (the dash swallowed the colon),
+// and was the escape the first two nets left standing. So after the lines are classified, any
+// labelled token ANYWHERE in the text voids its finding's enumeration unless the label is exactly
+// ONE letter the recorded enumeration contains. In-range single letters are spared because
+// reports narrate their sub-claims by letter (`FINDING 1a is contested; FINDING 1b stands`), and
+// sparing them is safe where sparing shapes was not: an in-range letter names a claim that IS
+// recorded, so the "mention" can hide no unrecorded sibling — at worst it hides a line that would
+// have VOIDED (a duplicate of a recorded letter), which keeps a complete sequential enumeration
+// standing, never a subset. That is the whole residue left, and it is prose-indistinguishable by
+// construction.
+//
 // The boundary's other side is equally deliberate: a MID-SENTENCE mention (`…described in
-// FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token and no colon
-// beside it, and never voids — reports narrate their findings by number, so voiding on mention
-// would kill every enumeration in any report that explains itself. The residue this leaves —
-// word-prefixed decoration whose label ALSO pushed the colon out of the window, or replaced it —
-// is indistinguishable from prose by any rule that spares prose, and reads as prose: it records
-// nothing, which on its own can clear nothing. The report's own `ESCALATE STRUCTURAL FINDING <n>:`
-// line is the one format-legal shape net two would see, and is exempted by its exact prefix.
+// FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token, no colon
+// beside it and no label glued to the number, and never voids — reports narrate their findings by
+// number, so voiding on mention would kill every enumeration in any report that explains itself.
+// The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is the one format-legal shape net two
+// would see, and is exempted by its exact prefix.
 //
 // The deliberate cost is prose at line start or with a colon by the number: `FINDING 1 rests…`
 // or `as FINDING 1: the gate…` voids finding 1's enumeration, degrading it to the single-claim
@@ -202,9 +213,14 @@ const FINDING_RE =
 // RUN-148 steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A
 // lost enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched
 // by construction: their only classified lines are the numbered finding lines themselves
-// (skipped as such) and prose, which voids an enumeration no legacy finding has.
+// (skipped as such) and prose, which voids an enumeration no legacy finding has — and net three
+// only ever voids, so a report that enumerated nothing has nothing it can touch.
 const HEAD_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)/i;
 const NEAR_COLON_TOKEN_RE = /\bFINDING[ \t]+(\d+)[^:\n]{0,8}:/gi;
+/** The label must START with a non-digit word character: `\d+` backtracking must not be able to
+ *  split a longer NUMBER (`FINDING 12`) into `1` + label `2` and void finding 1 on a mention of
+ *  finding 12. */
+const LABELLED_TOKEN_RE = /\bFINDING[ \t]+(\d+)([a-z_]\w*)/gi;
 const ESCALATE_LINE_RE = /^[ \t]*ESCALATE[ \t]+STRUCTURAL[ \t]+FINDING\b/i;
 /** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
 const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
@@ -328,6 +344,19 @@ export function parseFindings(text: string): Finding[] {
       held.push(claim);
       pending.set(id, held);
     }
+  }
+  // Net three runs over the WHOLE text after the line pass, because "in range" is a fact about the
+  // finished enumeration — a narration may precede the lines it narrates. A labelled token that is
+  // not exactly one recorded letter is an intended sub-claim the nets above could not classify (or
+  // a mutation of one), so the enumeration voids — never a kept subset. Nothing recorded → nothing
+  // a subset could clear → nothing to void.
+  for (const m of text.matchAll(LABELLED_TOKEN_RE)) {
+    const id = Number(m[1]);
+    const list = pending.get(id);
+    if (!list?.length) continue;
+    const label = m[2]!.toLowerCase();
+    const i = label.charCodeAt(0) - 97;
+    if (label.length !== 1 || i < 0 || i >= list.length) pending.set(id, null);
   }
   for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
   return out;

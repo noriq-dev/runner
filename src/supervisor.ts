@@ -20,7 +20,6 @@ import {
   parseFindings,
   reconciledEntry,
   renderContestRecord,
-  subclaimLetter,
   subclaimsOf,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
@@ -2068,8 +2067,8 @@ export class RunSupervisor {
     // pointer or a response for another id never reached `matched` at all. What "checkable" means
     // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
     //
-    // A finding that enumerated sub-claims is a candidate only when EVERY sub-claim drew its own
-    // contest (RUN-180). This is the exact surface the run_ms4t62384u0z6c6p4f5d escape used: a
+    // A finding that carries sub-claims is a candidate only when EVERY reconciled sub-claim reads
+    // CONTESTED (RUN-180). This is the exact surface the run_ms4t62384u0z6c6p4f5d escape used: a
     // bundled finding was "contested" by rebutting the refutable half, and the other half rode the
     // answer out. A bare `FINDING <n>` response is recorded as evidence but credits no lettered
     // claim, so answering in halves leaves the unanswered half STANDING — and the finding off the
@@ -2077,21 +2076,25 @@ export class RunSupervisor {
     const contestedWhole = new Set(
       matched.filter((r) => r.status === 'contested' && !r.subclaim).map((r) => r.id),
     );
-    const contestedSubs = new Set(
-      matched.filter((r) => r.status === 'contested' && r.subclaim).map((r) => `${r.id}${r.subclaim}`),
-    );
     // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
-    // parse alone. The fold deliberately PRESERVES held sub-claims when a re-raise drops the
-    // letters — or repeats only SOME of them, unioning in the claims its wording does not cover —
-    // a fresh terminal reviewer paraphrases by construction, so a letterless or narrowed re-raise
-    // of a half-answered finding still carries its unanswered claim — and reading `f.subclaims`
-    // (empty or a subset on those paths) let a bare or partial contest clear exactly the claim
-    // this format exists to keep standing: the RUN-174 escape reborn one round later. The entry is
-    // also the VISIBILITY check: the adjudicator judges what the ledger shows it, so a finding
-    // whose entry did not survive the fold (the cap) is not evidence and stands.
+    // parse alone — in EITHER direction. The fold deliberately PRESERVES held sub-claims when a
+    // re-raise drops the letters — or repeats only SOME of them, unioning in the claims its
+    // wording does not cover — a fresh terminal reviewer paraphrases by construction, so a
+    // letterless or narrowed re-raise of a half-answered finding still carries its unanswered
+    // claim, and reading `f.subclaims` (empty or a subset on those paths) let a bare or partial
+    // contest clear exactly the claim this format exists to keep standing: the RUN-174 escape
+    // reborn one round later. And symmetrically: the terminal report's own SHAPE must not be a
+    // second gate over a record already fully contested — the contest prompt tells the builder an
+    // already-contested record claim needs no fresh answer, so demanding one per-letter (or a bare
+    // response beside fully contested letters) would fail the exact builder that followed the
+    // prompt. The per-letter responses reach this check through the fold, which resolved them onto
+    // the claims they name. The entry is also the VISIBILITY check: the adjudicator judges what
+    // the ledger shows it, so a finding whose entry did not survive the fold (the cap) is not
+    // evidence and stands.
     const answerablyContested = (f: Finding) => {
       const e = reconciledEntry(answered, f, args.terminalRound);
       if (!e) return false;
+      const subs = subclaimsOf(e);
       // Every reconciled sub-claim must read CONTESTED. A carried rebuttal counts — carrying an
       // answer whose claim wording matched is the fold's whole point — while an unanswered or
       // FIXED claim stands, whichever round enumerated it. FIXED blocking candidacy is not an
@@ -2100,17 +2103,12 @@ export class RunSupervisor {
       // so "it is fixed" was already adjudicated and never buys the re-roll. A builder who
       // believes a FIXED sub-claim no longer holds has this turn's move: CONTEST it, at the letter
       // the contest record shows for it, with the pointer at the landed change — the fold resolves
-      // that letter back to the claim on every path that keeps it — and the fresh look then
-      // verifies it like any other contest.
-      if (subclaimsOf(e).some((s) => s.status !== 'contested')) return false;
-      // …and the builder must have engaged THIS turn: claim by claim where this round enumerated
-      // (the letters below are pure position — the parse enforced a, b, c… in order, so index IS
-      // the report's letter), the whole-finding form where it did not — which is also the
-      // letterless re-raise path, where the carried claims were checked above and the bare contest
-      // is the turn's own answer.
-      return f.subclaims.length
-        ? f.subclaims.every((_, i) => contestedSubs.has(`${f.id}${subclaimLetter(i)}`))
-        : contestedWhole.has(f.id);
+      // that letter back to the claim — and the fresh look then verifies it like any other contest.
+      if (subs.length) return subs.every((s) => s.status === 'contested');
+      // A single-claim finding keeps the pre-RUN-180 rule unchanged: the builder must have
+      // contested it THIS turn — silence over a terminal finding is not a contest, however the
+      // entry's carried status reads, because the terminal reviewer raised it over that record.
+      return contestedWhole.has(f.id);
     };
     if (!args.findings.every((f) => answerablyContested(f))) {
       // At least one terminal finding was not answerably contested, so it stands and the run fails as
@@ -2119,7 +2117,7 @@ export class RunSupervisor {
       this.log.info('a terminal finding was not answerably contested — the findings stand', {
         runId: ctx.run.id,
         contested: contestedWhole.size,
-        subclaimsContested: contestedSubs.size,
+        subclaimResponses: matched.filter((r) => r.subclaim).length,
         findings: args.findings.length,
       });
       transcript.milestone('the terminal findings were not all contested — the run fails');

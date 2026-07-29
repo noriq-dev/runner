@@ -510,6 +510,13 @@ describe('parsing sub-claims (RUN-180)', () => {
       '(b) FINDING 1(b): decorated AND parenthesized letter',
       'Note: FINDING 1b: a word before the token',
       'see FINDING 1b: quoting a sub-claim line mid-prose',
+      // Decoration can also SWALLOW the colon — lettered prefix defeats the head net, no colon
+      // defeats the token net — which is why the out-of-range label net exists: a label glued to
+      // the number that names no recorded letter voids, colon or no colon.
+      '(b) FINDING 1b — decorated letter with the colon swallowed',
+      'see FINDING 1b — a letter no line recorded',
+      'Note: FINDING 1b2 — mutated label, colon replaced',
+      '(b) FINDING 1b_ — trailing junk, colon replaced',
     ]) {
       const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
       expect(out).toHaveLength(1);
@@ -529,6 +536,38 @@ describe('parsing sub-claims (RUN-180)', () => {
         'The escape described in FINDING 1 is the subject of this report.',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  // The out-of-range net's spared side: reports narrate their sub-claims by letter, and a letter
+  // the enumeration RECORDS can hide no unrecorded sibling — so an in-range mention stays prose.
+  it('an in-range lettered mention does not void — reports narrate recorded letters', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'Here FINDING 1a is contested while FINDING 1b stands on the same evidence.',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  it('an out-of-range lettered mention voids — it is an intended sibling the nets could not read', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'as FINDING 1c argues, the same gate leaks elsewhere too',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  // The label must start with a non-digit, so `FINDING 12` is a mention of finding 12 — never
+  // finding 1 wearing label `2` — and a longer number cannot void a shorter one's enumeration.
+  it('a mention of a longer finding number is not a label on the shorter one', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'see FINDING 12 in the previous report for background',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one']);
   });
 
   // The token net keys on a colon NEAR the number — label-intent — so a colon that is ordinary

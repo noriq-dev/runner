@@ -159,14 +159,22 @@ contest clear claims that were never recorded, and there is no malformed-label d
 past — detectors enumerate shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an
 edition of the same escape). The HEAD net takes any line whose FIRST LETTERS are `FINDING <n>` —
 markdown decoration is a letterless prefix, so a bulleted `- FINDING 1b:`, invisible to a
-whitespace-only anchor, is a voider too — and the NEAR-COLON TOKEN net takes `FINDING <n>…:`
-anywhere in the line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix
-rule) and a colon hard by the number is label-intent where a colon further on is sentence
-structure. A mid-sentence mention with no colon beside it stays harmless prose, since reports
+whitespace-only anchor, is a voider too; the NEAR-COLON TOKEN net takes `FINDING <n>…:` anywhere
+in the line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix rule)
+and a colon hard by the number is label-intent where a colon further on is sentence structure; and
+the OUT-OF-RANGE LABEL net takes word-material glued to the number anywhere in the text, colon or
+no colon (`(b) FINDING 1b — …` slips both nets above by wearing a letter AND swallowing the
+colon), voiding unless the label is exactly one letter the recorded enumeration contains —
+in-range letters are spared because reports narrate their sub-claims by letter, and an in-range
+letter names a claim that IS recorded, so it can hide no unrecorded sibling. A mid-sentence
+mention with no colon beside it and no label on the number stays harmless prose, since reports
 narrate their findings by number and voiding on mention would kill every enumeration in a report
 that explains itself. Fold, render, and candidacy consume the canonical set and carry no shape
 detection or degradation rules of their own — the class dies where the data is born, or it does
-not die.
+not die. The terminal report's own shape is not a second gate either: candidacy asks the
+reconciled entry — every sub-claim contested and visible, or the finding stands — and the
+per-letter contests reach it through the fold, so a letterless re-raise answered through the
+record's letters clears without a bare response beside it.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud
