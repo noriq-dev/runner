@@ -134,7 +134,11 @@ to resolve a RESPONSE against the lines its writer was shown (this report's own,
 record's positions), then discarded; every render re-derives letters from position, and the
 contest turn is handed THE RECORD — each standing sub-claim with the letter that answers it here —
 because without it a claim the terminal report does not re-list would be standing and unanswerable
-at once. Candidacy is judged on the RECONCILED ledger entry, never on the terminal round's own
+at once, and its answers land on the record's positions ALONE (`applyContestResponses`): the one
+turn that may add no claims never re-runs the union, because report-first resolution on the
+overflow path — where the record is the held set and the report's enumeration is the thing that
+was dropped — discarded answers to the very claims the record displayed as answerable.
+Candidacy is judged on the RECONCILED ledger entry, never on the terminal round's own
 parse: the fold preserves held claims when a re-raise drops the letters (a fresh reviewer
 paraphrases by construction) — and when it repeats only SOME of them, unioning in the claims its
 wording does not cover, because a narrowed re-raise replacing the set wholesale was the same
@@ -144,7 +148,11 @@ enumeration cap) the held set stands whole and the new enumeration is the thing 
 all-or-nothing again, with this turn's answers still landed on it by wording. Carried answers
 match a re-raised sub-claim by its WORDING, and a truncated (ellipsis-capped) claim never matches
 — two distinct over-cap claims share it — the may-miss-never-invent order of harms, one level
-down. Instances of one root cause never become letters — they stay evidence inside one claim, or
+down. The held record itself transfers across a re-raise only on a match that cannot be an
+invention — the parent claim's full wording, or a shared requirement at a specific location: the
+60-char prose prefix still names the ENTRY (legacy identity, unchanged) but cannot hand contested
+letters to a claim that diverges past it, which is prefix aliasing at parent grain buying a fresh
+look on contests nobody made. Instances of one root cause never become letters — they stay evidence inside one claim, or
 the letters are the instance-enumeration the collapse rule bought out. The format is optional and
 positionally additive like the requirement bracket, so everything written before it parses
 byte-identically; a persisted ledger predating sub-claims loads as single-claim entries, and one
@@ -162,17 +170,20 @@ one — keeps no letters at all, the same safe degradation. What remains around 
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
 letters, and a colon hard by the number is label-intent where a colon further on is sentence
-structure), and the OUT-OF-RANGE LABEL net (word-material glued to the number, colon or no colon,
-voids unless it is exactly one recorded letter — in-range letters are spared because reports
-narrate their sub-claims by letter, and an in-range letter names a claim that IS recorded). A
+structure), and the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
+voids everywhere but the finding's OWN lines — its numbered line and its accepted strict lines,
+the only places a lettered token is format rather than mutation). There is deliberately no
+in-range sparing left: a recorded letter can be WORN by a distinct unrecorded claim, and a stale
+certificate that counts only the strict line then blesses the kept subset — so reports narrate a
+sub-claim as `(a)`, the form every render uses, never as a bare `FINDING 1a` token. A
 mid-sentence mention with no colon beside it and no label on the number stays harmless prose,
 since reports narrate their findings by number and voiding on mention would kill every
 enumeration in a report that explains itself. Fold, render, and candidacy consume the canonical
 set and carry no shape detection or degradation rules of their own — the class dies where the
 data is born, or it does not die. The terminal report's own shape is not a second gate either: candidacy asks the
 reconciled entry — every sub-claim contested and visible, or the finding stands — and the
-per-letter contests reach it through the fold, so a letterless re-raise answered through the
-record's letters clears without a bare response beside it.
+per-letter contests reach it through the contest application, so a letterless re-raise answered
+through the record's letters clears without a bare response beside it.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud

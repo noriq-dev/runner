@@ -4094,6 +4094,98 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
   });
 
+  // Held sub-claim state rides only a match that cannot be an invention. The prose rule matches
+  // entries on a 60-char claim prefix — legacy identity, unchanged — but two long claims that
+  // diverge past it can be two REAL findings, and inheriting one's contested letters let the
+  // other reach the fresh look on contests nobody made about its claim. The record drops with the
+  // replaced claim instead (a visible miss, never an invented credit), the entry is single-claim,
+  // and the pre-RUN-180 rule demands a contest THIS turn.
+  it('a prefix-aliased terminal re-raise does not inherit contested letters — no free fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    const prefix = 'the candidacy gate accepts inherited contests as if this claim had been examined ';
+    h.claude.continueTexts = [
+      // The fix turn contests BOTH letters of round 1's finding…
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn says nothing at all.
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        `FINDING 1 [High] src/gate.ts:1: ${prefix}in round one [sub-claims: 2]`,
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests both
+    await onReviewTurn(h, 3);
+    // The TERMINAL claim shares the 60-char prefix but diverges past it — a different claim that
+    // the prose key nonetheless matches to the same entry. Letterless, and no requirement bracket.
+    h.claude.emitText(`FINDING 1 [High] src/gate.ts:1: ${prefix}never at all\nVERDICT: FAIL`);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // no current contest → the aliased finding stands
+    expect(reviewerStarts(h)).toBe(2); // …and no fresh adjudicator was spawned on inherited letters
+    // The entry merged (prefix identity, as it always did) but the contested record did not ride.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.claim).toContain('never at all');
+    expect(entry?.subclaims).toEqual([]);
+  });
+
+  // The record's letters are what the contest resolves against — even where the terminal report's
+  // own lettering diverges, which is exactly the overflow path: the fold keeps the held set whole
+  // and drops the report's enumeration, so the record shows letters for claims the report never
+  // lettered. Answering those letters must credit the displayed claims, not be discarded against
+  // the dropped enumeration (the prompt calls the record authoritative; the code must agree).
+  it('contesting an overflowed record by its displayed letters earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(2), verifyResults: [true, true, true] });
+    const finding = (tag: string) =>
+      [
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles many claims [sub-claims: 4]',
+        ...['a', 'b', 'c', 'd'].map((l, i) => `FINDING 1${l}: ${tag} claim ${i + 1}`),
+        'VERDICT: FAIL',
+      ].join('\n');
+    h.claude.continueTexts = [
+      '', // fix turn 1: no structured response — every letter stays unanswered
+      '', // fix turn 2: same
+      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight HELD claims
+      // (rounds one and two), the terminal enumeration having been dropped by the overflow.
+      ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        .map((l) => `FINDING 1${l}: CONTESTED src/${l}.ts:1 — the record claim does not hold`)
+        .join('\n'),
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(finding('one'));
+    h.claude.complete('done'); // round 1: four letters
+    await onReviewTurn(h, 3);
+    h.claude.emitText(finding('two'));
+    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight
+    await onReviewTurn(h, 4);
+    h.claude.emitText(finding('three')); // terminal: four claims the union cannot hold → dropped
+    h.claude.complete('done');
+    await onReviewTurn(h, 5); // every displayed letter contested → the fresh look IS spawned
+    // The answers landed on the record's claims — none discarded against the dropped enumeration:
+    // the adjudicator's PRIOR ADJUDICATIONS shows each held claim with the letter's own pointer,
+    // including the positions past the terminal report's four lines.
+    const readjudged = h.claude.starts[4]!.prompt;
+    expect(readjudged).toMatch(/\(a\) two claim 1/); // the record's order: round 2's union
+    expect(readjudged).toContain('CONTESTED (src/a.ts:1)');
+    expect(readjudged).toMatch(/\(e\) one claim 1/); // …and the held tail the report never lettered
+    expect(readjudged).toContain('CONTESTED (src/e.ts:1)');
+    expect(readjudged).not.toContain('three claim'); // the dropped enumeration is not the record
+    h.claude.emitText('Every pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(4); // rounds 1–2, terminal, and the contest's fresh look
+  });
+
   // Enumeration normalisation is all-or-nothing, so a bad enumeration (here: over the cap) leaves
   // NO recorded subset a partial contest could clear — the finding is single-claim again, and the
   // pre-RUN-180 rules apply whole: a bare CONTESTED is a full contest and earns the fresh look.

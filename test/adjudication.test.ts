@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   type LedgerEntry,
+  applyContestResponses,
   buildLedger,
   parseFindingResponses,
   parseFindings,
@@ -585,16 +586,30 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The out-of-range net's spared side: reports narrate their sub-claims by letter, and a letter
-  // the enumeration RECORDS can hide no unrecorded sibling — so an in-range mention stays prose.
-  it('an in-range lettered mention does not void — reports narrate recorded letters', () => {
+  // No in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, so a
+  // lettered token off the finding's own lines always voids — narration names letters as `(a)`,
+  // the form every render uses, or by claim text. A lost enumeration is the safe degradation; the
+  // spared mention was a kept-subset escape.
+  it('a lettered mention off the finding’s own lines voids — even an in-range one', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
-        'Here FINDING 1a is contested while FINDING 1b stands on the same evidence.',
+        'Here FINDING 1a is contested while (b) stands on the same evidence.',
     );
-    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  // The refutation of the spared-mention theory: a mangled sibling can wear a letter the
+  // enumeration DOES record, and a certificate that counts only the strict line then blesses the
+  // kept subset — the distinct second claim escaping unrecorded. The worn letter voids the whole.
+  it('a distinct claim wearing a recorded letter voids — a stale certificate cannot keep the subset', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
+        'FINDING 1a: first\n' +
+        '(b) FINDING 1a — distinct second',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
   });
 
   it('an out-of-range lettered mention voids — it is an intended sibling the nets could not read', () => {
@@ -604,6 +619,31 @@ describe('parsing sub-claims (RUN-180)', () => {
         'as FINDING 1c argues, the same gate leaks elsewhere too',
     );
     expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  // The finding's OWN lines are the one place a lettered token is format rather than mutation: the
+  // numbered FINDING line quoting its own letters (a claim ABOUT the format does exactly this) and
+  // the strict lines themselves must not void the enumeration they are part of.
+  it('a finding’s own head line quoting its letters does not void its enumeration', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the parse must keep FINDING 1a distinct [sub-claims: 2]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  // …but another finding's line is not this finding's own: a lettered token there is narration
+  // about it, prose-indistinguishable from a mangled sibling, and voids it like any other.
+  it('a lettered token on ANOTHER finding’s strict line voids the finding it names', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: one [sub-claims: 1]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 2 [High] b.ts:1: two [sub-claims: 1]\n' +
+        'FINDING 2a: overlaps the claim of FINDING 1a above',
+    );
+    expect(out[0]!.subclaims).toEqual([]); // voided by the token on 2's line
+    expect(out[1]!.subclaims).toEqual(['overlaps the claim of FINDING 1a above']); // 2's own line records
   });
 
   // The label must start with a non-digit, so `FINDING 12` is a mention of finding 12 — never
@@ -929,6 +969,54 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']);
   });
 
+  // The same prefix-aliasing refusal one level UP: matchIndex's prose rule keys ENTRIES on a
+  // 60-char prefix (legacy identity, unchanged), but two long PARENT claims diverging past it can
+  // be two real findings — so the held sub-claim record must not ride that match. Carrying it let
+  // a distinct terminal finding inherit contested letters and reach the fresh look on contests
+  // nobody made about it. The entry still merges (may-miss-never-invent governs the RECORD, and a
+  // dropped record is a visible miss); the letters do not.
+  it('a prefix-aliased parent claim does not hand its sub-claim record to a different claim', () => {
+    const prefix = 'the candidacy gate in contestTerminalFindings clears a finding whose letters ';
+    const round1 = buildLedger(
+      [],
+      [{ ...SF(1, AB), claim: `${prefix}were contested in an earlier round` }],
+      [SR(1, 'a', 'contested', 'a.ts:9'), SR(1, 'b', 'contested', 'b.ts:9')],
+      1,
+    );
+    const round2 = buildLedger(
+      round1,
+      [{ ...SF(1, []), claim: `${prefix}nobody ever raised against this claim` }],
+      [],
+      2,
+    );
+    expect(round2).toHaveLength(1); // entry identity: the prose prefix still matches, as it always did
+    expect(round2[0]!.claim).toContain('nobody ever raised'); // the latest wording wins the entry…
+    expect(round2[0]!.subclaims).toEqual([]); // …but the contested record does not transfer
+  });
+
+  // …while the trustworthy matches keep carrying: identical full wording, or the RUN-147
+  // requirement key — a shared id at a specific location — which is how a paraphrased letterless
+  // re-raise keeps its half-answered record (the RUN-174 protection this gate must not undo).
+  it('a paraphrased re-raise sharing a requirement still carries the sub-claim record', () => {
+    const round1 = buildLedger(
+      [],
+      [{ ...SF(1, AB), requirements: ['R-7'] }],
+      [SR(1, 'a', 'contested', 'a.ts:9')],
+      1,
+    );
+    const round2 = buildLedger(
+      round1,
+      [{ ...SF(1, []), claim: 'entirely new words for the same defect', requirements: ['R-7'] }],
+      [],
+      2,
+    );
+    expect(round2).toHaveLength(1);
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['claim a', 'contested'],
+      ['claim b', 'unanswered'],
+    ]);
+  });
+
   // The settlement read (requirementOutcomes) uses the RECONCILED sub-claim state: every letter
   // FIXED is a resolved finding even though no bare response ever set the entry-level status —
   // and a bare FIXED over unanswered letters settles nothing, which is the escape.
@@ -1099,5 +1187,91 @@ describe('renderContestRecord (RUN-180)', () => {
     expect(reconciledEntry(ledger, terminal, 2)?.claim).toBe('the class');
     expect(reconciledEntry(ledger, terminal, 1)).toBeUndefined(); // another round's entry is not this one
     expect(reconciledEntry(ledger, { ...terminal, claim: 'reworded' }, 2)).toBeUndefined();
+  });
+});
+
+// The contest turn lands on the RECORD (RUN-180): the builder was shown the reconciled entry's
+// claims lettered by position, and the prompt calls that lettering authoritative — so the
+// application resolves letters against the entry, never re-runs the union, and never reads the
+// terminal report's own enumeration as the coordinate system.
+describe('applyContestResponses', () => {
+  const SF = (id: number, subclaims: string[]) => ({
+    id,
+    severity: 'High',
+    requirements: [],
+    location: `f${id}.ts:1`,
+    claim: 'the class',
+    subclaims,
+  });
+  const SR = (id: number, subclaim: string | null, pointer: string) => ({
+    id,
+    subclaim,
+    status: 'contested' as const,
+    pointer,
+    reason: 'because',
+  });
+
+  it('resolves letters against the record even where the report’s own lettering diverges — overflow', () => {
+    const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
+    const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
+    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // the record holds (a)–(h)
+    const terminal = SF(1, claims('three'));
+    const raised = buildLedger(round2, [terminal], [], 3); // overflow: held set stands, report's claims dropped
+    const held = [...claims('two'), ...claims('one')]; // round 2's union order: its own claims first
+    expect(raised[0]!.subclaims.map((s) => s.claim)).toEqual(held);
+    // The record showed (a)–(h) for the HELD claims; the builder contests every displayed letter.
+    const letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const answered = applyContestResponses(
+      raised,
+      [terminal],
+      letters.map((l) => SR(1, l, `${l}.ts:1`)),
+      3,
+    );
+    // Every answer lands on the claim the record displayed at that letter — none discarded against
+    // the dropped report enumeration ('three claim …'), which is not in the record at all.
+    expect(answered[0]!.subclaims.map((s) => [s.claim, s.status, s.pointer])).toEqual(
+      held.map((c, i) => [c, 'contested', `${letters[i]}.ts:1`]),
+    );
+  });
+
+  it('a bare response lands on the entry as whole-finding evidence and credits no letter', () => {
+    const terminal = SF(1, ['half one', 'half two']);
+    const raised = buildLedger([], [terminal], [], 3);
+    const answered = applyContestResponses(raised, [terminal], [SR(1, null, 'whole.ts:1')], 3);
+    expect(answered[0]!.status).toBe('contested');
+    expect(answered[0]!.subclaims.every((s) => s.status === 'unanswered')).toBe(true);
+  });
+
+  it('a letter past the record resolves to nothing — a visible miss, never an invented credit', () => {
+    const terminal = SF(1, ['half one']);
+    const raised = buildLedger([], [terminal], [], 3);
+    const answered = applyContestResponses(raised, [terminal], [SR(1, 'c', 'c.ts:1')], 3);
+    expect(answered[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']);
+  });
+
+  it('the claim set is fixed at the terminal fold — a contest adds answers, never claims', () => {
+    const terminal = SF(1, ['half one', 'half two']);
+    const raised = buildLedger([], [terminal], [], 3);
+    const answered = applyContestResponses(raised, [terminal], [SR(1, 'a', 'a.ts:1')], 3);
+    expect(answered[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['half one', 'contested'],
+      ['half two', 'unanswered'],
+    ]);
+  });
+
+  it('a finding whose entry did not survive the fold has nothing to land on — it stands', () => {
+    const terminal = SF(1, ['half one']);
+    // No raise-time entry for this finding/round: the application must not invent one.
+    const answered = applyContestResponses([], [terminal], [SR(1, 'a', 'a.ts:1')], 3);
+    expect(answered).toEqual([]);
+  });
+
+  it('a single-claim entry takes the bare answer exactly as the fold always recorded it', () => {
+    const terminal = SF(1, []);
+    const raised = buildLedger([], [terminal], [], 3);
+    const answered = applyContestResponses(raised, [terminal], [SR(1, null, 'a.ts:9')], 3);
+    expect(answered[0]!.status).toBe('contested');
+    expect(answered[0]!.pointer).toBe('a.ts:9');
+    expect(answered[0]!.subclaims).toEqual([]);
   });
 });

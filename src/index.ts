@@ -85,6 +85,7 @@ export {
 export {
   parseFindings,
   parseFindingResponses,
+  applyContestResponses,
   buildLedger,
   reconciledEntry,
   renderContestRecord,

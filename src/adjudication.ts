@@ -202,18 +202,19 @@ const FINDING_RE =
 // a mutated label under the decoration (`(b) FINDING 1 b:`, `(b) FINDING 1(b):`), so the two
 // escapes do not compose within it.
 //
-// Net three — the OUT-OF-RANGE LABEL: word-material glued to the number (`FINDING 1b`, `1aa`,
+// Net three — the LABELLED TOKEN: word-material glued to the number (`FINDING 1b`, `1aa`,
 // `1b2`, `1b_`) is a label whether or not a colon survived the decoration — `(b) FINDING 1b —
 // second claim` slips the head net (lettered prefix) AND net two (the dash swallowed the colon),
 // and was the escape the first two nets left standing. So after the lines are classified, any
-// labelled token ANYWHERE in the text voids its finding's enumeration unless the label is exactly
-// ONE letter the recorded enumeration contains. In-range single letters are spared because
-// reports narrate their sub-claims by letter (`FINDING 1a is contested; FINDING 1b stands`), and
-// sparing them is safe where sparing shapes was not: an in-range letter names a claim that IS
-// recorded, so the "mention" can hide no unrecorded sibling — at worst it hides a line that would
-// have VOIDED (a duplicate of a recorded letter), which keeps a complete sequential enumeration
-// standing, never a subset. That is the whole residue left, and it is prose-indistinguishable by
-// construction.
+// labelled token voids its finding's enumeration unless it sits on one of that finding's OWN
+// lines — its numbered FINDING line or an accepted strict sub-claim line, the only places a
+// lettered token is the format rather than a mutation of it. There is deliberately NO in-range
+// sparing: an earlier edition spared a single letter the enumeration records, on the theory that
+// it could hide only a duplicate of a recorded claim — refuted, because a DISTINCT claim can wear
+// a recorded letter (`FINDING 1a: first` + `(b) FINDING 1a — distinct second`), and a certificate
+// that counts only the strict line then blesses the kept subset. A worn letter and a narrated one
+// are prose-indistinguishable, so both void; reports narrate a sub-claim as `(a)` (the form every
+// render uses) or by its claim text, never as a bare `FINDING 1a` token.
 //
 // The boundary's other side is equally deliberate: a MID-SENTENCE mention (`…described in
 // FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token, no colon
@@ -222,14 +223,15 @@ const FINDING_RE =
 // The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is the one format-legal shape net two
 // would see, and is exempted by its exact prefix.
 //
-// The deliberate cost is prose at line start or with a colon by the number: `FINDING 1 rests…`
-// or `as FINDING 1: the gate…` voids finding 1's enumeration, degrading it to the single-claim
-// finding it always was — which is current behaviour, and always a correct way to record it (the
-// RUN-148 steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A
-// lost enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched
-// by construction: their only classified lines are the numbered finding lines themselves
-// (skipped as such) and prose, which voids an enumeration no legacy finding has — and net three
-// only ever voids, so a report that enumerated nothing has nothing it can touch.
+// The deliberate cost is prose at line start or with a colon by the number — `FINDING 1 rests…`,
+// `as FINDING 1: the gate…` — and lettered narration anywhere: each voids finding 1's
+// enumeration, degrading it to the single-claim finding it always was — which is current
+// behaviour, and always a correct way to record it (the RUN-148 steps rule: a decomposition that
+// cannot be run soundly is dropped, never half-run). A lost enumeration is a duller report; a
+// kept subset is the escape. Legacy reports are untouched by construction: their only classified
+// lines are the numbered finding lines themselves (skipped as such) and prose, which voids an
+// enumeration no legacy finding has — and net three only ever voids, so a report that enumerated
+// nothing has nothing it can touch.
 const HEAD_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)/i;
 const NEAR_COLON_TOKEN_RE = /\bFINDING[ \t]+(\d+)[^:\n]{0,8}:/gi;
 /** The label must START with a non-digit word character: `\d+` backtracking must not be able to
@@ -343,8 +345,14 @@ export function parseFindings(text: string): Finding[] {
   // either's claims onto the other.
   const byId = new Map(out.map((f) => [f.id, f]));
   const pending = new Map<number, string[] | null>();
-  for (const line of text.split('\n')) {
-    if (ESCALATE_LINE_RE.test(line)) continue; // the format's own escalation line; letters nothing, voids nothing
+  const lines = text.split('\n');
+  // A finding's OWN lines — its numbered FINDING line and its accepted strict sub-claim lines —
+  // are the only places a lettered token of that finding is format rather than mutation, so they
+  // are the only lines net three spares. Keyed per (line, id): finding 2's strict line quoting a
+  // `FINDING 1a` token is still narration ABOUT 1, and voids 1's enumeration like any other.
+  const ownLines = new Set<string>();
+  lines.forEach((line, li) => {
+    if (ESCALATE_LINE_RE.test(line)) return; // the format's own escalation line; letters nothing, voids nothing
     const ids = new Set<number>();
     const head = HEAD_LINE_RE.exec(line);
     if (head) ids.add(Number(head[1]));
@@ -352,7 +360,10 @@ export function parseFindings(text: string): Finding[] {
     for (const id of ids) {
       if (!byId.has(id)) continue;
       const asFinding = FINDING_LINE_RE.exec(line);
-      if (asFinding && Number(asFinding[1]) === id) continue; // the numbered FINDING line — pass 1's subject
+      if (asFinding && Number(asFinding[1]) === id) {
+        ownLines.add(`${li}:${id}`); // the numbered FINDING line — pass 1's subject
+        continue;
+      }
       const list = pending.get(id);
       if (list === null) continue; // already voided — one bad line spoils the set, not just itself
       const shaped = SUBCLAIM_SHAPE_RE.exec(line);
@@ -368,23 +379,26 @@ export function parseFindings(text: string): Finding[] {
         pending.set(id, null);
         continue;
       }
+      ownLines.add(`${li}:${id}`);
       held.push(claim);
       pending.set(id, held);
     }
-  }
-  // Net three runs over the WHOLE text after the line pass, because "in range" is a fact about the
-  // finished enumeration — a narration may precede the lines it narrates. A labelled token that is
-  // not exactly one recorded letter is an intended sub-claim the nets above could not classify (or
-  // a mutation of one), so the enumeration voids — never a kept subset. Nothing recorded → nothing
-  // a subset could clear → nothing to void.
-  for (const m of text.matchAll(LABELLED_TOKEN_RE)) {
-    const id = Number(m[1]);
-    const list = pending.get(id);
-    if (!list?.length) continue;
-    const label = m[2]!.toLowerCase();
-    const i = label.charCodeAt(0) - 97;
-    if (label.length !== 1 || i < 0 || i >= list.length) pending.set(id, null);
-  }
+  });
+  // Net three runs after the line pass — a narration may precede the lines it narrates, and which
+  // lines are a finding's own is only known once the pass classified them. ANY labelled token off
+  // the finding's own lines is an intended sub-claim the nets above could not classify, a mutation
+  // of one, or narration wearing the same shape — indistinguishable by construction, so all void
+  // (no in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, and the
+  // certificate then blesses the kept subset). Nothing recorded → nothing a subset could clear →
+  // nothing to void.
+  lines.forEach((line, li) => {
+    if (ESCALATE_LINE_RE.test(line)) return;
+    for (const m of line.matchAll(LABELLED_TOKEN_RE)) {
+      const id = Number(m[1]);
+      if (ownLines.has(`${li}:${id}`)) continue;
+      if (pending.get(id)?.length) pending.set(id, null);
+    }
+  });
   // The completeness check, last, because it is a fact about the finished set: the enumeration is
   // kept only when the FINDING line certified EXACTLY this many sub-claims. This is what the shape
   // nets above cannot do — they void what they can see, and a line can mangle into English — where
@@ -583,12 +597,27 @@ export function buildLedger(
       return rs ? adjudicated(h.claim, rs) : h;
     });
   };
+  // Held sub-claim state transfers only across a match that cannot be an INVENTION (RUN-180).
+  // matchIndex's prose rule keys on a 60-char prefix — kept byte-identical for ENTRY identity,
+  // the pre-RUN-147 world — but two long claims that diverge past the prefix can be two REAL
+  // findings, and carrying one's contested letters onto the other let a terminal finding reach
+  // the fresh look on contests nobody made about it: the prefix-aliasing escape at parent grain,
+  // the same one `carriedFrom` refuses one level down. So the sub-claim record rides only the
+  // claim's FULL wording (a truncated claim never matches — see `carryable`) or the rule-2 bar,
+  // a shared requirement id at a specific location, because an id is not wording. The cost of
+  // refusing is the held record dropping with the replaced claim — a MISS, visible as the entry's
+  // own claim change and answerable again; carrying would INVENT, the forbidden order of harms.
+  const trustedCarry = (e: LedgerEntry, f: Finding): boolean => {
+    const k = subKey(f.claim);
+    if (carryable(k) && subKey(e.claim) === k) return true;
+    return f.location.trim().length > 0 && shareRequirement(reqsOf(e), f.requirements);
+  };
   const result = [...prior];
   for (const f of findings) {
     const r = byId.get(f.id);
     const at = matchIndex(result, f);
     const held = at >= 0 ? result[at] : undefined;
-    const heldSubs = held ? subclaimsOf(held) : [];
+    const heldSubs = held && trustedCarry(held, f) ? subclaimsOf(held) : [];
     const subclaims: AdjudicatedSubClaim[] = mergedSubclaims(f, heldSubs);
     const entry: LedgerEntry = {
       id: f.id,
@@ -778,6 +807,52 @@ export function reconciledEntry(entries: LedgerEntry[], f: Finding, round: numbe
   return entries.find(
     (e) => e.round === round && e.id === f.id && loc(e.location) === loc(f.location) && e.claim === f.claim,
   );
+}
+
+/**
+ * Land the contest turn's responses on the reconciled terminal entries (RUN-180). The contest
+ * prompt hands the builder THE RECORD — each terminal finding's sub-claims as the reconciled
+ * entry holds them, lettered by position — and declares that lettering authoritative. So a
+ * contest letter resolves against the ENTRY's positions, never against the terminal report's own
+ * enumeration. The two agree wherever the fold kept the report's claims in front (the union
+ * writes [this round's claims…, carried extras…]); where they diverge — the overflow path, which
+ * keeps the held set whole and drops the report's enumeration — the record in front of the
+ * builder is the only labelling it could answer by, and resolving report-first there discarded
+ * answers to the very claims the record displayed.
+ *
+ * The claim set is FIXED at the terminal fold: a contest adds answers, never claims — re-running
+ * the union here would let the one no-new-code turn reshape the record it is answering. A letter
+ * past the entry's claims resolves to nothing (a visible miss, never an invented credit), a bare
+ * response lands on the entry as whole-finding evidence crediting no letter (the RUN-174 rule),
+ * and a finding whose entry did not survive the fold has nothing to land on and stands — what
+ * the adjudicator cannot be shown is not evidence.
+ */
+export function applyContestResponses(
+  entries: LedgerEntry[],
+  findings: Finding[],
+  responses: FindingResponse[],
+  round: number,
+): LedgerEntry[] {
+  const byId = new Map(responses.filter((r) => !r.subclaim).map((r) => [r.id, r]));
+  const bySub = new Map(responses.filter((r) => r.subclaim).map((r) => [`${r.id}${r.subclaim}`, r]));
+  const out = [...entries];
+  for (const f of findings) {
+    const e = reconciledEntry(out, f, round);
+    if (!e) continue;
+    const r = byId.get(f.id);
+    const subclaims = subclaimsOf(e).map((s, i) => {
+      const rs = bySub.get(`${f.id}${subclaimLetter(i)}`);
+      return rs ? { claim: s.claim, status: rs.status, pointer: rs.pointer, reason: rs.reason } : s;
+    });
+    out[out.indexOf(e)] = {
+      ...e,
+      status: r?.status ?? e.status,
+      pointer: r?.pointer ?? e.pointer,
+      reason: r?.reason ?? e.reason,
+      subclaims,
+    };
+  }
+  return out;
 }
 
 /**

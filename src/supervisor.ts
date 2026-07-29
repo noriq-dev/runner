@@ -15,6 +15,7 @@ import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './
 import {
   type Finding,
   type LedgerEntry,
+  applyContestResponses,
   buildLedger,
   parseFindingResponses,
   parseFindings,
@@ -2012,7 +2013,8 @@ export class RunSupervisor {
     // ledger holds them, lettered by position (RUN-180). Letters are not state anywhere (the
     // structural settlement), so a standing sub-claim this terminal report does not re-list has no
     // letter the builder could otherwise know: the record is what makes it answerable, and its
-    // positional letters are exactly the coordinates the fold resolves a response against.
+    // positional letters are exactly the coordinates `applyContestResponses` resolves a response
+    // against below — one labelling, shown and folded alike.
     const exit = await ctx.session
       .continueWith(
         reviewerContestPrompt(
@@ -2041,13 +2043,18 @@ export class RunSupervisor {
     const terminalIds = new Set(args.findings.map((f) => f.id));
     const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
 
-    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // Land that matched evidence on the ledger FIRST — before any outcome branch — so a rebuttal
     // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
-    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
-    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
-    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
-    // one the terminal round judged.
-    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). Every terminal finding's
+    // entry was already written when the finding was RAISED (`record`), so this turn only ADDS
+    // answers — `applyContestResponses` resolves each letter against the reconciled entry's
+    // positions, exactly the labelling the contest record above showed the builder (RUN-180): the
+    // report's own lettering and the record's agree except on the overflow path, where the
+    // record — the only letters the builder could answer standing claims by — must win, and
+    // re-running the fold's union here resolved report-first and discarded those answers. A
+    // finding with no matched response keeps its raise-time entry, 'unanswered'. NO checkpoint
+    // above, so the diff a fresh reviewer would read is still the one the terminal round judged.
+    const answered = applyContestResponses(args.ledger, args.findings, matched, args.terminalRound);
 
     // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
     // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
@@ -2087,10 +2094,11 @@ export class RunSupervisor {
     // second gate over a record already fully contested — the contest prompt tells the builder an
     // already-contested record claim needs no fresh answer, so demanding one per-letter (or a bare
     // response beside fully contested letters) would fail the exact builder that followed the
-    // prompt. The per-letter responses reach this check through the fold, which resolved them onto
-    // the claims they name. The entry is also the VISIBILITY check: the adjudicator judges what
-    // the ledger shows it, so a finding whose entry did not survive the fold (the cap) is not
-    // evidence and stands.
+    // prompt. The per-letter responses reach this check through `applyContestResponses`, which
+    // resolved each letter against the reconciled entry's own positions — the record's labelling,
+    // the one the builder was answering by. The entry is also the VISIBILITY check: the
+    // adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
+    // fold (the cap) is not evidence and stands.
     const answerablyContested = (f: Finding) => {
       const e = reconciledEntry(answered, f, args.terminalRound);
       if (!e) return false;
