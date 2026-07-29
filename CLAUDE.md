@@ -123,11 +123,19 @@ RUN-180 prices that: a collapsed finding enumerates separately-answerable claims
 sub-claim lines (`FINDING 1a: …`), a RESPONSE is credited only for the letters it names, and an
 unaddressed sub-claim STANDS — visibly in the ledger and the per-requirement report, and decisively
 in the terminal contest, where a finding whose letters are only partly contested is no candidate to
-clear and the run fails without spawning the re-adjudicating reviewer. Instances of one root cause
+clear and the run fails without spawning the re-adjudicating reviewer. That candidacy is judged on
+the RECONCILED ledger entry, never on the terminal round's own parse: the fold preserves held
+letters when a re-raise drops them (a fresh reviewer paraphrases by construction), so a letterless
+terminal re-raise of a half-answered finding still carries its unanswered letter and a bare contest
+cannot clear it. Instances of one root cause
 never become letters — they stay evidence inside one claim, or the letters are the
 instance-enumeration the collapse rule bought out. The format is optional and positionally additive
 like the requirement bracket, so everything written before it parses byte-identically, and a
-persisted ledger predating sub-claims loads as single-claim entries. Carried answers match a
+persisted ledger predating sub-claims loads as single-claim entries; malformed lettering voids the
+WHOLE enumeration, and the detector deliberately over-reaches (a spaced `FINDING 1 b:` and even a
+prose line starting `FINDING 1 rests…` void it) because a lost enumeration is a single-claim
+finding — current behaviour — where a kept subset lets a partial contest clear letters that were
+never recorded. Carried answers match a
 re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
 claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
 down.

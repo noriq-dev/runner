@@ -143,9 +143,19 @@ const FINDING_RE =
 // letter, colon, claim) then has to hold for EVERY detected line, or the finding keeps no letters
 // and stays the single answerable claim it always was — which is current behaviour, and always a
 // correct way to record it (the RUN-148 steps rule: a decomposition that cannot be run soundly is
-// dropped, never half-run). Letters must sit hard against the number, so `FINDING 1 [High] …` and
-// `FINDING 1: FIXED …` — every legacy line — never reach the detector at all.
-const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z]+)\b[^\n]*$/gim;
+// dropped, never half-run).
+//
+// The detector also tolerates a separator — space, hyphen, dot — between the number and the
+// letters, for the same reason it tolerates extra letters: only the STRICT shape keeps the letter
+// hard against the number, so a spaced label like `FINDING 1 b:` must be SEEN in order to void, or
+// it coexists invisibly with a valid `FINDING 1a:` and the kept sibling reads as the complete
+// enumeration — the kept-subset escape through the detector, second edition. Legacy lines still
+// never reach it: after the number a finding line has `[` and a response line has `:`, neither a
+// letter. What the wider net newly catches is a prose line that happens to start `FINDING 1 rests…`
+// — which voids that finding's enumeration, degrading it to the single-claim finding it always
+// was. That trade is deliberate: a lost enumeration is current behaviour; a kept subset is the
+// escape.
+const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[ \t]*[-.]?[ \t]*([a-z]+)\b[^\n]*$/gim;
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+[a-z][ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**

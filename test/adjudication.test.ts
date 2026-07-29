@@ -460,6 +460,40 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
+  // A spaced label is a lettered-INTENT shape the strict form rejects, so the detector must see
+  // it: invisible, it would coexist with a valid `FINDING 1a:` and the kept sibling would read as
+  // the complete enumeration — the kept-subset escape through the detector, second edition.
+  it('a spaced label (FINDING 1 b:) voids the WHOLE enumeration — a valid sibling must not survive it', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: a well-formed sub-claim\n' +
+        'FINDING 1 b: the letter drifted off the number',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('punctuated labels (FINDING 1-b:, FINDING 1.b:) void the enumeration the same way', () => {
+    for (const bad of ['FINDING 1-b: hyphenated letter', 'FINDING 1.b: dotted letter']) {
+      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
+      expect(out).toHaveLength(1);
+      expect(out[0]!.subclaims).toEqual([]);
+    }
+  });
+
+  // The deliberate cost of the wider net: a PROSE line that happens to start `FINDING 1 rests…`
+  // voids that finding's enumeration. Degrading to the single-claim finding is current behaviour
+  // and always a correct way to record it; a kept subset is the escape. Never an error.
+  it('a prose line starting FINDING <n> degrades the finding to single-claim, never to an error', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: a well-formed sub-claim\n' +
+        'FINDING 1 rests on the same evidence either way',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
   it('a duplicated letter voids the enumeration — a response naming it would be ambiguous', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: c\nFINDING 1a: first version\nFINDING 1a: second version',

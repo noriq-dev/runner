@@ -2067,23 +2067,40 @@ export class RunSupervisor {
     const contestedSubs = new Set(
       matched.filter((r) => r.status === 'contested' && r.subclaim).map((r) => `${r.id}${r.subclaim}`),
     );
-    const answerablyContested = (f: Finding) =>
-      f.subclaims.length
-        ? f.subclaims.every((sc) => contestedSubs.has(`${f.id}${sc.letter}`))
-        : contestedWhole.has(f.id);
     const loc = (s: string) => s.trim().toLowerCase();
-    const visibleToAdjudicator = (f: Finding) =>
-      answered.some(
+    // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
+    // parse alone. The fold deliberately PRESERVES held sub-claims when a re-raise drops the
+    // letters — a fresh terminal reviewer paraphrases by construction, so a letterless re-raise of
+    // a half-answered finding still carries its unanswered letter — and reading `f.subclaims`
+    // (empty on that path) let a bare contest clear exactly the claim this format exists to keep
+    // standing: the RUN-174 escape reborn one round later. The entry is also the VISIBILITY check:
+    // the adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
+    // fold (the cap) is not evidence and stands. Matched on the values the fold itself wrote (id,
+    // round, location, claim), so it cannot alias a prior attempt's persisted entry.
+    const reconciledOf = (f: Finding) =>
+      answered.find(
         (e) =>
+          e.round === args.terminalRound &&
           e.id === f.id &&
           loc(e.location) === loc(f.location) &&
-          // …and the per-sub-claim contests survived INTO that entry (RUN-180) — the adjudicator
-          // judges what the ledger shows it, so a rebuttal the fold could not carry is not evidence.
-          f.subclaims.every((sc) =>
-            subclaimsOf(e).some((h) => h.letter === sc.letter && h.status === 'contested'),
-          ),
+          e.claim === f.claim,
       );
-    if (!args.findings.every((f) => answerablyContested(f) && visibleToAdjudicator(f))) {
+    const answerablyContested = (f: Finding) => {
+      const e = reconciledOf(f);
+      if (!e) return false;
+      // Every reconciled letter must read CONTESTED. A carried rebuttal counts — carrying an
+      // answer whose claim wording matched is the fold's whole point — while an unanswered or
+      // merely-FIXED letter stands, whichever round enumerated it.
+      if (subclaimsOf(e).some((s) => s.status !== 'contested')) return false;
+      // …and the builder must have engaged THIS turn: letter by letter where this round
+      // enumerated, the whole-finding form where it did not — which is also the letterless
+      // re-raise path, where the carried letters were checked above and the bare contest is the
+      // turn's own answer.
+      return f.subclaims.length
+        ? f.subclaims.every((sc) => contestedSubs.has(`${f.id}${sc.letter}`))
+        : contestedWhole.has(f.id);
+    };
+    if (!args.findings.every((f) => answerablyContested(f))) {
       // At least one terminal finding was not answerably contested, so it stands and the run fails as
       // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
       // Nothing is spawned to be killed; the contest turn already happened above.
