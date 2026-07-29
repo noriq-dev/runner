@@ -230,9 +230,12 @@ const FINDING_RE =
 // below the structural lines — where the nets still police lettered tokens — never inside a
 // finding's zone; the prompt says so, and the degradation for prose that strays in is the lost
 // (single-claim) enumeration, never a kept subset. What no rule can attribute is a sibling
-// written OUTSIDE its own finding's zone bearing no recognisable trace of the format — but a
-// line that names no finding, wears no letter, and sits in another finding's territory is not a
-// mangling of this format; it is unattributable text the author also excluded from the count.
+// written outside every zone bearing no LABEL — a letter is attributed by ADJACENCY to the
+// number, glued or across pure punctuation (nets three and four), because a letter that only
+// decorates the line (`(b) FINDING 1 — …`) is byte-for-byte how narration quotes the record —
+// `(b)` is the form every render uses — and voiding it would void every report that quotes its
+// own record beside a finding number. Such a line inside any finding's TERRITORY still voids by
+// position; outside one it is unattributable text the author also excluded from the count.
 //
 // The shape nets below remain as hygiene AROUND that rule — they void visible label mutations
 // early and keep narration harmless — but validity never rests on them. Detection by shape is
@@ -279,28 +282,45 @@ const FINDING_RE =
 // are prose-indistinguishable, so both void; reports narrate a sub-claim as `(a)` (the form every
 // render uses) or by its claim text, never as a bare `FINDING 1a` token.
 //
+// Net four — the SPACED LABEL: a LONE letter adrift of its number across pure punctuation and
+// space (`FINDING 1 b —`, `(b) FINDING 1 b — hidden claim`, `FINDING 1 (b) —`) is the same
+// label-intent with one more mutation composed in, and slips all three nets at once — decoration
+// letters defeat the head net, a swallowed colon defeats net two, the space defeats the glued
+// token — while a placement past a structural line puts it outside every zone: exactly the
+// composition this task's own gate mined. A lone letter is the tell, because `a, b, c…` is what
+// the format is made of; a FOLLOWING letter makes it an ordinary word and the line a mention, so
+// narration survives. The window admits no alphanumerics, so a longer finding number can never
+// be split into number + label, and letters can never bridge out of a real word.
+//
 // The boundary's other side is equally deliberate: a MID-SENTENCE mention (`…described in
 // FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token, no colon
-// beside it and no label glued to the number, and never voids — reports narrate their findings by
+// beside it and no lone letter by the number, and never voids — reports narrate their findings by
 // number, so voiding on mention would kill every enumeration in any report that explains itself.
 // The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is the one format-legal shape net two
 // would see, and is exempted by its exact prefix.
 //
 // The deliberate cost is prose at line start or with a colon by the number — `FINDING 1 rests…`,
-// `as FINDING 1: the gate…` — and lettered narration anywhere: each voids finding 1's
-// enumeration, degrading it to the single-claim finding it always was — which is current
-// behaviour, and always a correct way to record it (the RUN-148 steps rule: a decomposition that
-// cannot be run soundly is dropped, never half-run). A lost enumeration is a duller report; a
-// kept subset is the escape. Legacy reports are untouched by construction: their only classified
-// lines are the numbered finding lines themselves (skipped as such) and prose, which voids an
-// enumeration no legacy finding has — and net three only ever voids, so a report that enumerated
-// nothing has nothing it can touch.
+// `as FINDING 1: the gate…` — lettered narration anywhere, and one edge wider since net four:
+// a lone single-letter WORD right after the number (`…FINDING 1 a subtle leak…`) reads as a
+// label and voids. Each costs finding 1's enumeration, degrading it to the single-claim finding
+// it always was — which is current behaviour, and always a correct way to record it (the RUN-148
+// steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A lost
+// enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched by
+// construction: their only classified lines are the numbered finding lines themselves (skipped
+// as such) and prose, which voids an enumeration no legacy finding has — and nets three and four
+// only ever void, so a report that enumerated nothing has nothing they can touch.
 const HEAD_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)/i;
 const NEAR_COLON_TOKEN_RE = /\bFINDING[ \t]+(\d+)[^:\n]{0,8}:/gi;
 /** The label must START with a non-digit word character: `\d+` backtracking must not be able to
  *  split a longer NUMBER (`FINDING 12`) into `1` + label `2` and void finding 1 on a mention of
  *  finding 12. */
 const LABELLED_TOKEN_RE = /\bFINDING[ \t]+(\d+)([a-z_]\w*)/gi;
+/** Net four's shape: the gap admits ONLY non-alphanumerics (so a longer number cannot be split
+ *  into number + label, and a letter cannot bridge out of a word) and is deliberately unbounded —
+ *  a length window would just be the next minable edge, and a pure punctuation run of any length
+ *  carries no words. The letter must be LONE — a following letter is an ordinary word, i.e.
+ *  mention. */
+const SPACED_LABEL_RE = /\bFINDING[ \t]+(\d+)[^a-zA-Z0-9\n]+([a-z])(?![a-zA-Z])/gi;
 const ESCALATE_LINE_RE = /^[ \t]*ESCALATE[ \t]+STRUCTURAL[ \t]+FINDING\b/i;
 /** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
 const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
@@ -493,10 +513,12 @@ export function parseFindings(input: string): Finding[] {
     valid = valid && held.length === count && zoneClosed(li);
     pending.set(id, valid && held.length ? held : null);
   }
-  // The hygiene nets, per line, after the blocks are read (which lines are a finding's own is only
+  // The label nets, per line, after the blocks are read (which lines are a finding's own is only
   // known then): the HEAD net (first letters are `FINDING <n>` — letterless markdown decoration
   // included), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration wearing letters
-  // included), and the LABELLED TOKEN net (word-material glued to the number, colon or not). A hit
+  // included), the LABELLED TOKEN net (word-material glued to the number, colon or not), and the
+  // SPACED LABEL net (a lone letter adrift of its number across pure punctuation — the composed
+  // shape that slips the other three and, past a structural line, every zone). A hit
   // off the finding's own lines voids its enumeration: an intended sub-claim the block did not
   // admit, a mutation of one, or narration wearing the same shape — indistinguishable by
   // construction, so all void, with no in-range sparing (a recorded letter can be WORN by a
@@ -513,6 +535,7 @@ export function parseFindings(input: string): Finding[] {
     if (head) ids.add(Number(head[1]));
     for (const t of line.matchAll(NEAR_COLON_TOKEN_RE)) ids.add(Number(t[1]));
     for (const t of line.matchAll(LABELLED_TOKEN_RE)) ids.add(Number(t[1]));
+    for (const t of line.matchAll(SPACED_LABEL_RE)) ids.add(Number(t[1]));
     for (const id of ids) {
       if (ownLines.has(`${li}:${id}`)) continue;
       const asFinding = FINDING_LINE_RE.exec(line);

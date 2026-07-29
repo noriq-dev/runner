@@ -486,15 +486,16 @@ describe('parsing sub-claims (RUN-180)', () => {
     }
   });
 
-  // The two composed shapes that slipped every net — decorated + spaced + colon swallowed, and an
-  // in-range duplicate letter carrying a DISTINCT claim. Both are invisible as lines (they read as
-  // prose), so the certificate is the only thing that can see them: intended but unparsed → not
-  // counted → the whole enumeration voids, never a kept subset.
+  // The composed shapes only ABSENCE can see: a sibling whose letter survives solely as line
+  // decoration (`(b) FINDING 1 — …`) wears no label a net can attribute — it reads as prose
+  // quoting the record — so the certificate is what voids it: intended but unparsed → not
+  // counted → the whole enumeration voids, never a kept subset. (Its spaced-label sibling,
+  // `(b) FINDING 1 b — …`, is since caught by net four wherever it sits — see below.)
   it('a mangled sibling invisible to every net still voids — the certificate counts its absence', () => {
     const spaced = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: claim A\n' +
-        '(b) FINDING 1 b — claim B',
+        '(b) FINDING 1 — claim B',
     );
     expect(spaced[0]!.subclaims).toEqual([]);
     const dupLabel = parseFindings(
@@ -654,7 +655,7 @@ describe('parsing sub-claims (RUN-180)', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: recorded claim\n' +
-        '(b) FINDING 1 b — hidden claim',
+        '(b) FINDING 1 — hidden claim, its letter surviving only as decoration',
     );
     expect(out).toHaveLength(1);
     expect(out[0]!.subclaims).toEqual([]);
@@ -667,7 +668,7 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: recorded claim\n' +
         '\n' +
-        '(b) FINDING 1 b — hidden claim',
+        '(b) FINDING 1 — hidden claim, its letter surviving only as decoration',
     );
     expect(out).toHaveLength(1);
     expect(out[0]!.subclaims).toEqual([]);
@@ -679,6 +680,51 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'ACCEPTANCE 1: VERIFIED a.ts:1 covers it',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  // The SPACED LABEL net, on the exact composition a gate of this task's own gestation mined:
+  // decoration wearing a letter (slips the head net), the colon swallowed by a dash (slips the
+  // near-colon net), the letter adrift of its number by a space (slips the glued-token net) —
+  // and the whole line placed BELOW a structural line, outside every zone. A lone letter hard by
+  // the number is a label wherever it sits; the stale certificate cannot bless the kept subset.
+  it('a spaced lettered token past a structural line still voids — the composed probe', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
+        'FINDING 1a: visible claim\n' +
+        'ACCEPTANCE 1: VERIFIED a.ts:1 covers it\n' +
+        '(b) FINDING 1 b — hidden claim',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('spaced-label variants void outside the zone too — junk letters, brackets, any separator', () => {
+    for (const bad of [
+      'see FINDING 1 b — a letter adrift of its number',
+      'FINDING 1 (b) — spaced and parenthesized, colon swallowed',
+      '(b) FINDING 1 b2 — spaced junk label',
+      '…as (b) FINDING 1 B — uppercase adrift',
+      'see FINDING 1 ---------- b — the gap is unbounded, a length window is the next minable edge',
+    ]) {
+      const out = parseFindings(
+        `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: half one\nVERDICT: FAIL\n${bad}`,
+      );
+      expect(out[0]!.subclaims).toEqual([]);
+    }
+  });
+
+  // …while a mention whose next word is a real WORD stays harmless — a lone letter is the tell
+  // (`a, b, c…` is what the format is made of); a following letter makes it prose. The lone
+  // single-letter word ('…FINDING 1 a subtle leak…') is the deliberate cost, priced like every
+  // other net cost: a dull single-claim degradation, never a kept subset.
+  it('a mention followed by a real word does not trip the spaced-label net', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'VERDICT: FAIL\n' +
+        'see FINDING 1 before merging; FINDING 1 holds either way — FINDING 1, in short, stands.',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });

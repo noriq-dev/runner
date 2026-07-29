@@ -198,9 +198,16 @@ remains around those rules is hygiene, not
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
 letters, and a colon hard by the number is label-intent where a colon further on is sentence
-structure), and the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
+structure), the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
 voids everywhere but the finding's OWN block lines, the only places a lettered token is format
-rather than mutation). There is deliberately no
+rather than mutation), and the SPACED LABEL net (a LONE letter adrift of its number across pure
+punctuation — the composition that wears decoration, drops the colon and un-glues the letter all
+at once, which is how a sibling written below a structural line sat outside every zone; a
+following letter makes it an ordinary word, so mention survives, and the lone single-letter word
+is the priced cost). A letter that survives only as line decoration (`(b) FINDING 1 — …`) is
+attributable by nothing but position — it is byte-for-byte how narration quotes the record — so
+inside a finding's territory it voids by zone and outside one it is the unattributable residual
+the certificate also excluded from its count. There is deliberately no
 in-range sparing left: a recorded letter can be WORN by a distinct unrecorded claim, and a stale
 certificate that counts only the strict line then blesses the kept subset — so reports narrate a
 sub-claim as `(a)`, the form every render uses, never as a bare `FINDING 1a` token. A
