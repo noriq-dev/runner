@@ -3881,6 +3881,29 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(1); // a bare answer credits no sub-claim → no re-review
   });
 
+  // Enumeration normalisation is all-or-nothing, so a bad enumeration (here: over the cap) leaves
+  // NO recorded subset a partial contest could clear — the finding is single-claim again, and the
+  // pre-RUN-180 rules apply whole: a bare CONTESTED is a full contest and earns the fresh look.
+  it('a voided enumeration degrades the finding to single-claim contest rules', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the whole class is pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    const five = ['a', 'b', 'c', 'd', 'e'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
+    h.claude.emitText(
+      `FINDING 1 [High] src/gate.ts:1: five letters is several findings\n${five}\nVERDICT: FAIL`,
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the bare contest DOES earn the re-review — no letters survived to demand more
+    h.claude.emitText('The pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2);
+  });
+
   it('a contest naming EVERY sub-claim earns the fresh look, which sees the per-letter rebuttals', async () => {
     const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
     h.claude.continueTexts = [

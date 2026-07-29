@@ -434,19 +434,41 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  it('a duplicated letter keeps the first — the reviewer’s slip, same as a duplicated number', () => {
+  // ALL-OR-NOTHING, not keep-the-good-half: the candidacy gate asks "was every sub-claim
+  // contested?" of the sub-claims that were RECORDED, so a kept (a) beside a dropped malformed (b)
+  // could clear the finding on (a) alone while (b) was never entered — the RUN-174 escape reborn.
+  // One bad line voids the enumeration and the finding stays the single answerable claim it
+  // always was.
+  it('a valid letter beside a malformed one degrades the WHOLE finding to single-claim', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: a well-formed sub-claim\n' +
+        'FINDING 1b — malformed, a dash where the colon must be',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('a duplicated letter voids the enumeration — a response naming it would be ambiguous', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: c\nFINDING 1a: first version\nFINDING 1a: second version',
     );
-    expect(out[0]!.subclaims).toEqual([{ letter: 'a', claim: 'first version' }]);
+    expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // More separately-answerable claims than this is several findings — or an instance list wearing
-  // letters, which is the enumeration the collapse rule bought out.
-  it('caps how many sub-claims one finding may enumerate', () => {
+  // More separately-answerable claims than the cap is several findings — and the cap DROPS the
+  // enumeration rather than slicing it: a kept (a)–(d) beside a silently cut (e) would let the
+  // contest clear four letters while the fifth claim went unrecorded.
+  it('more sub-claims than the cap drops the enumeration, not the tail', () => {
     const letters = ['a', 'b', 'c', 'd', 'e', 'f'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
     const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
-    expect(out[0]!.subclaims).toHaveLength(4);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('an enumeration at the cap is kept whole', () => {
+    const letters = ['a', 'b', 'c', 'd'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
+    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
+    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b', 'c', 'd']);
   });
 
   // A sub-claim line never leaks into the finding list, and a report with none parses as it
@@ -550,6 +572,43 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
         reason: null,
       },
     ]);
+  });
+
+  // The carry key is the claim's FULL wording, not a 60-char prefix: two long claims that diverge
+  // only past the prefix must not both inherit one rebuttal — an answer nobody gave to one of them.
+  it('two distinct claims sharing a long prefix do not share a carried answer', () => {
+    const prefix = 'the eligibility filter in contestTerminalFindings accepts a response naming ';
+    const one = { letter: 'a', claim: `${prefix}a finding that does not exist` };
+    const other = { letter: 'a', claim: `${prefix}an id from another round` };
+    const round1 = buildLedger([], [SF(1, [one])], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const round2 = buildLedger(round1, [SF(1, [other])], [], 2);
+    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']);
+  });
+
+  // The settlement read (requirementOutcomes) uses the RECONCILED sub-claim state: every letter
+  // FIXED is a resolved finding even though no bare response ever set the entry-level status —
+  // and a bare FIXED over unanswered letters settles nothing, which is the escape.
+  it('a finding whose every sub-claim is FIXED reports as resolved, not standing', () => {
+    const led = buildLedger(
+      [],
+      [{ ...SF(1, AB), requirements: ['R-7'] }],
+      [SR(1, 'a', 'fixed', 'a.ts:9'), SR(1, 'b', 'fixed', 'b.ts:9')],
+      1,
+    );
+    const { outcomes } = requirementOutcomes(['R-7'], led);
+    expect(outcomes[0]!.standing).toHaveLength(0);
+    expect(outcomes[0]!.resolved).toHaveLength(1);
+  });
+
+  it('a bare FIXED over unanswered sub-claims does NOT settle the finding', () => {
+    const led = buildLedger(
+      [],
+      [{ ...SF(1, AB), requirements: ['R-7'] }],
+      [SR(1, null, 'fixed', 'whole.ts:1')],
+      1,
+    );
+    const { outcomes } = requirementOutcomes(['R-7'], led);
+    expect(outcomes[0]!.standing).toHaveLength(1);
   });
 
   it('a re-raise that drops the enumeration keeps the held sub-claims and their answers', () => {

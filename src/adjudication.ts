@@ -99,7 +99,11 @@ const REQUIREMENT_CAP = 64;
 /** A finding threatening a dozen requirements has named a theme, not a requirement. */
 const MAX_REQUIREMENTS = 6;
 /** A finding needing more than a handful of separately-answerable claims is several findings — or
- *  an instance list wearing letters, which is the enumeration RUN-89/90 bought out (RUN-180). */
+ *  an instance list wearing letters, which is the enumeration RUN-89/90 bought out (RUN-180).
+ *  Unlike MAX_REQUIREMENTS this cap DROPS the whole enumeration rather than slicing it: a kept
+ *  (a)–(d) beside a silently cut (e) would let the terminal contest clear the finding on four
+ *  contests while the fifth claim was never even recorded — the RUN-174 escape reborn one level
+ *  down. See parseFindings: enumeration is all-or-nothing, the RUN-148 steps precedent. */
 const MAX_SUBCLAIMS = 4;
 /** More entries than this and the run is not converging — carry the most recent and move on. */
 const MAX_ENTRIES = 24;
@@ -126,10 +130,19 @@ const FINDING_RE =
 // list on the FINDING line, so a sub-claim never fights the claim for room under CLAIM_CAP and
 // prose parentheses cannot fake one. Invisible to FINDING_RE (no severity bracket) and to
 // RESPONSE_RE as it stood (a letter where the colon must be), so every report and every response
-// written before this parses byte-identically. A sub-claim line whose number matches no FINDING
-// line is simply ignored — malformed enumeration degrades to the single-claim finding it decorates,
-// never to an unparsed report.
-const SUBCLAIM_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/gim;
+// written before this parses byte-identically.
+//
+// Two regexes because normalisation is ALL-OR-NOTHING per finding. The candidacy gate asks "was
+// every sub-claim contested?", and it can only ask that of the sub-claims that were RECORDED — so
+// keeping the well-formed half of a bad enumeration would let a finding clear on the letters that
+// parsed while a malformed or over-cap sibling was never even entered, the exact escape this
+// format exists to close. The LINE matcher recognises the intent to letter (anything shaped
+// `FINDING <n><letter>…` at line start); the strict shape then has to hold for EVERY such line, or
+// the finding keeps no letters and stays the single answerable claim it always was — which is
+// current behaviour, and always a correct way to record it (the RUN-148 steps rule: a
+// decomposition that cannot be run soundly is dropped, never half-run).
+const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])\b[^\n]*$/gim;
+const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+[a-z][ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -203,16 +216,31 @@ export function parseFindings(text: string): Finding[] {
     });
   }
   // Second pass (RUN-180): attach sub-claim lines to the finding their number names. Keyed by
-  // number rather than by position, so prose between the lines cannot orphan one; a letter already
-  // taken is the reviewer's slip and the first wins, mirroring the duplicate-number rule above.
+  // number rather than by position, so prose between the lines cannot orphan one. A lettered line
+  // naming a finding nobody numbered is ignored — there is no finding to degrade.
+  //
+  // Per finding, all-or-nothing (see SUBCLAIM_LINE_RE): a line that letters but breaks the shape,
+  // a duplicated letter (the RESPONSE side could not say which claim it answered), or a fifth
+  // letter (the cap) each void the WHOLE enumeration — `null` below — and the finding stays
+  // single-claim. Never an error, and never a kept subset a partial contest could clear.
   const byId = new Map(out.map((f) => [f.id, f]));
-  for (const m of text.matchAll(SUBCLAIM_RE)) {
-    const f = byId.get(Number(m[1]));
-    if (!f || f.subclaims.length >= MAX_SUBCLAIMS) continue;
+  const pending = new Map<number, SubClaim[] | null>();
+  for (const m of text.matchAll(SUBCLAIM_LINE_RE)) {
+    const id = Number(m[1]);
+    if (!byId.has(id)) continue;
+    const list = pending.get(id);
+    if (list === null) continue; // already voided — one bad line spoils the set, not just itself
+    const shaped = SUBCLAIM_SHAPE_RE.exec(m[0]!);
     const letter = m[2]!.toLowerCase();
-    if (f.subclaims.some((s) => s.letter === letter)) continue;
-    f.subclaims.push({ letter, claim: cap(m[3]!, CLAIM_CAP) });
+    const held = list ?? [];
+    if (!shaped || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
+      pending.set(id, null);
+      continue;
+    }
+    held.push({ letter, claim: cap(shaped[1]!, CLAIM_CAP) });
+    pending.set(id, held);
   }
+  for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
   return out;
 }
 
@@ -316,11 +344,13 @@ export function buildLedger(
   // the other is exactly the answered-as-a-whole read this split exists to stop.
   const byId = new Map(responses.filter((r) => !r.subclaim).map((r) => [r.id, r]));
   const bySub = new Map(responses.filter((r) => r.subclaim).map((r) => [`${r.id}${r.subclaim}`, r]));
-  // Same 60-char prose key the entry match uses — a carried sub-claim answer may MISS a reworded
-  // sub-claim (it reads as unanswered, visibly), but matching by LETTER could credit an old
-  // rebuttal to a genuinely different claim a fresh reviewer happened to letter the same, which is
-  // the invent-a-match failure the whole ledger refuses.
-  const subKey = (c: string) => c.toLowerCase().trim().slice(0, 60);
+  // A carried sub-claim answer matches on the claim's FULL wording, not the entry key's 60-char
+  // prefix and not the letter. A prefix aliases two long claims that diverge past it — both would
+  // inherit one rebuttal, answering a claim nobody answered — and a letter is one reviewer's
+  // ordering, not the claim's identity. Full wording may MISS a paraphrase (the sub-claim reads as
+  // unanswered, visibly, and the builder can answer again); it cannot INVENT a match, which is the
+  // failure the whole ledger refuses. Claims are already capped, so the key is bounded.
+  const subKey = (c: string) => c.toLowerCase().trim();
   const result = [...prior];
   for (const f of findings) {
     const r = byId.get(f.id);
@@ -409,6 +439,18 @@ export interface RequirementReport {
  * of the run that produced it, and it would do so on exactly the runs a human is least likely to
  * read carefully.
  */
+/** What a sub-claimed entry's answers amount to as ONE adjudication (RUN-180): every letter fixed
+ *  is fixed; every letter answered but any contested is contested; any letter unanswered leaves
+ *  the whole unanswered — an answer in halves must not settle the finding, and a bare
+ *  whole-finding response never overrides the letters (crediting it to them is the escape).
+ *  An entry without sub-claims keeps its recorded status: the whole pre-RUN-180 world. */
+const effectiveStatus = (e: LedgerEntry): FindingStatus | 'unanswered' => {
+  const subs = subclaimsOf(e);
+  if (!subs.length) return e.status;
+  if (subs.some((s) => s.status === 'unanswered')) return 'unanswered';
+  return subs.every((s) => s.status === 'fixed') ? 'fixed' : 'contested';
+};
+
 export function requirementOutcomes(
   requirements: string[],
   ledger: LedgerEntry[],
@@ -417,7 +459,9 @@ export function requirementOutcomes(
   const declared = new Set(requirements.map((r) => r.toLowerCase()));
   const outcomes = requirements.map((requirement) => {
     const mine = ledger.filter((e) => reqsOf(e).some((r) => r.toLowerCase() === requirement.toLowerCase()));
-    const settled = (e: LedgerEntry) => opts.passed || e.status === 'fixed';
+    // Settlement reads the RECONCILED state, not the raw field (RUN-180): a finding whose every
+    // sub-claim came back FIXED is resolved even though no bare response ever set `status`.
+    const settled = (e: LedgerEntry) => opts.passed || effectiveStatus(e) === 'fixed';
     return {
       requirement,
       standing: mine.filter((e) => !settled(e)),
