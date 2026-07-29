@@ -473,8 +473,19 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  it('punctuated labels (FINDING 1-b:, FINDING 1.b:) void the enumeration the same way', () => {
-    for (const bad of ['FINDING 1-b: hyphenated letter', 'FINDING 1.b: dotted letter']) {
+  // The detector reads lettered INTENT — any junk between the number and the letters — rather
+  // than an allowlist of separators, which would leak per punctuation mark: each shape below is a
+  // label the strict form rejects, and every one must void rather than leave the valid sibling
+  // standing as the complete enumeration.
+  it('punctuated labels void the enumeration the same way, whatever the junk between', () => {
+    for (const bad of [
+      'FINDING 1-b: hyphenated letter',
+      'FINDING 1.b: dotted letter',
+      'FINDING 1(b): parenthesized letter',
+      'FINDING 1_b: underscored letter',
+      'FINDING 1 (b): spaced and parenthesized letter',
+      'FINDING 1 -- b: arbitrary junk before the letter',
+    ]) {
       const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
       expect(out).toHaveLength(1);
       expect(out[0]!.subclaims).toEqual([]);

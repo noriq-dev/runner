@@ -145,17 +145,20 @@ const FINDING_RE =
 // correct way to record it (the RUN-148 steps rule: a decomposition that cannot be run soundly is
 // dropped, never half-run).
 //
-// The detector also tolerates a separator — space, hyphen, dot — between the number and the
-// letters, for the same reason it tolerates extra letters: only the STRICT shape keeps the letter
-// hard against the number, so a spaced label like `FINDING 1 b:` must be SEEN in order to void, or
-// it coexists invisibly with a valid `FINDING 1a:` and the kept sibling reads as the complete
-// enumeration — the kept-subset escape through the detector, second edition. Legacy lines still
-// never reach it: after the number a finding line has `[` and a response line has `:`, neither a
-// letter. What the wider net newly catches is a prose line that happens to start `FINDING 1 rests…`
-// — which voids that finding's enumeration, degrading it to the single-claim finding it always
-// was. That trade is deliberate: a lost enumeration is current behaviour; a kept subset is the
+// The detector does NOT enumerate the separators a malformed label might use — an allowlist of
+// them leaks per punctuation mark (a spaced `FINDING 1 b:` seen, a parenthesized `FINDING 1(b):`
+// invisible beside a valid `FINDING 1a:`, whose kept sibling then reads as the complete
+// enumeration: the kept-subset escape through the detector, one separator at a time). Instead it
+// reads lettered INTENT: any line whose first significant character after the number is a LETTER,
+// with arbitrary non-letter junk allowed between. The STRICT shape below is the only allowlist;
+// everything the detector sees and the shape rejects voids the whole enumeration. Legacy lines are
+// safe not by separator but by their own next character — a finding line's `[` and a response
+// line's `:` are in the junk class's terminator set, so the scan ends before any letter. What the
+// wide net deliberately catches is a prose line that happens to start `FINDING 1 rests…` — which
+// voids that finding's enumeration, degrading it to the single-claim finding it always was. That
+// trade is the right way round: a lost enumeration is current behaviour; a kept subset is the
 // escape.
-const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[ \t]*[-.]?[ \t]*([a-z]+)\b[^\n]*$/gim;
+const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)[^a-z[\n:]*([a-z]+)\b[^\n]*$/gim;
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+[a-z][ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**
