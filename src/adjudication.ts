@@ -148,34 +148,48 @@ const FINDING_RE =
 // single-letter matching missed `1aa`, letters-hard-against-the-number missed the spaced `1 b:`, a
 // separator allowlist missed the parenthesized `1(b):`, a junk class with a `\b` missed `1b_:` and
 // `1b2:` — each time the unseen sibling left the valid letters standing as the "complete"
-// enumeration. So nothing is enumerated. Every line whose FIRST LETTERS are `FINDING <n>` for a
-// finding this report numbered is CLASSIFIED exactly once (see parseFindings): the numbered
+// enumeration. So nothing is enumerated. A line is CLASSIFIED exactly once (see parseFindings)
+// when either of two structural nets sees it, and then it is one of three things: the numbered
 // FINDING line itself, a strict sub-claim line, or — everything else — a voider of that finding's
 // whole enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken
 // for it simply does not exist.
 //
-// "First letters", not "line start": the prefix may be ANY run of non-letter characters, because
-// markdown decoration is exactly that — `- FINDING 1b:`, `> FINDING 1b:`, `**FINDING 1b:**`,
-// `2. FINDING 1b:` are each a lettered-INTENT line a whitespace-only anchor could not see, and an
-// unseen sibling leaves the valid letters standing as the "complete" enumeration (the kept-subset
-// escape through the anchor itself). Decoration never contains a letter, so the boundary is a
-// class, not a list of bullets. The boundary's other side is equally deliberate: a MID-SENTENCE
-// mention (`…described in FINDING 1.`) has words before the token and never voids — reports
-// narrate their findings by number, so voiding on mention would kill every enumeration in any
-// report that explains itself. A word-prefixed structural line is prose by this rule, and prose
-// that merely names a finding is the one shape that stays harmless.
+// Net one — the HEAD: any line whose FIRST LETTERS are `FINDING <n>`. The prefix may be ANY run
+// of non-letter characters, because markdown decoration is exactly that — `- FINDING 1b:`,
+// `> FINDING 1b:`, `**FINDING 1b:**`, `2. FINDING 1b:` are each a lettered-INTENT line a
+// whitespace-only anchor could not see, and an unseen sibling leaves the valid letters standing
+// as the "complete" enumeration (the kept-subset escape through the anchor itself).
 //
-// The deliberate cost is prose at line start: a line that happens to open `FINDING 1 rests…` (or
-// `— FINDING 1 stands…`) voids finding 1's enumeration, degrading it to the single-claim finding
-// it always was — which is current behaviour, and always a correct way to record it (the RUN-148
-// steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A lost
-// enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched by
-// construction: their only such lines are the numbered finding lines themselves (classified as
-// such and skipped) and prose, which voids an enumeration no legacy finding has.
-const ANY_NUMBERED_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)[^\n]*$/gim;
+// Net two — the NEAR-COLON TOKEN: `FINDING <n>` followed by a colon within a few characters,
+// ANYWHERE in the line. This is what catches decoration that wears letters — `(b) FINDING 1b:`
+// slips the head net because its prefix contains a letter, and any list-marker vocabulary
+// (`(b)`, `ii.`, `Note:`) is an enumerable set that would leak at its next member. A colon hard
+// by the token is label-intent; a colon further on is sentence structure. The window also covers
+// a mutated label under the decoration (`(b) FINDING 1 b:`, `(b) FINDING 1(b):`), so the two
+// escapes do not compose within it.
+//
+// The boundary's other side is equally deliberate: a MID-SENTENCE mention (`…described in
+// FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token and no colon
+// beside it, and never voids — reports narrate their findings by number, so voiding on mention
+// would kill every enumeration in any report that explains itself. The residue this leaves —
+// word-prefixed decoration whose label ALSO pushed the colon out of the window, or replaced it —
+// is indistinguishable from prose by any rule that spares prose, and reads as prose: it records
+// nothing, which on its own can clear nothing. The report's own `ESCALATE STRUCTURAL FINDING <n>:`
+// line is the one format-legal shape net two would see, and is exempted by its exact prefix.
+//
+// The deliberate cost is prose at line start or with a colon by the number: `FINDING 1 rests…`
+// or `as FINDING 1: the gate…` voids finding 1's enumeration, degrading it to the single-claim
+// finding it always was — which is current behaviour, and always a correct way to record it (the
+// RUN-148 steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A
+// lost enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched
+// by construction: their only classified lines are the numbered finding lines themselves
+// (skipped as such) and prose, which voids an enumeration no legacy finding has.
+const HEAD_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)/i;
+const NEAR_COLON_TOKEN_RE = /\bFINDING[ \t]+(\d+)[^:\n]{0,8}:/gi;
+const ESCALATE_LINE_RE = /^[ \t]*ESCALATE[ \t]+STRUCTURAL[ \t]+FINDING\b/i;
 /** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
 const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
-const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
+const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -252,31 +266,41 @@ export function parseFindings(text: string): Finding[] {
   // number rather than by position, so prose between the lines cannot orphan one. A line naming a
   // finding nobody numbered is ignored — there is no finding to degrade.
   //
-  // Per finding, all-or-nothing, by classifying once EVERY line whose first letters are
-  // `FINDING <n>` — decoration before the token is letterless, so a bulleted/bolded/quoted line
-  // is classified too (see ANY_NUMBERED_LINE_RE): the numbered FINDING line itself is pass 1's
-  // subject; a strict sub-claim line records its letter; and ANY other line — a decorated label,
-  // a spaced or punctuated letter, a doubled letter, a trailing `_` or digit, a duplicated letter
-  // (the RESPONSE side could not say which claim it answered), a fifth letter (the cap), prose —
-  // voids the WHOLE enumeration (`null` below) and the finding stays single-claim. Never an
-  // error, and never a kept subset a partial contest could clear.
+  // Per finding, all-or-nothing, by classifying once every line either structural net sees — the
+  // HEAD net (first letters are `FINDING <n>`, so letterless markdown decoration is included) and
+  // the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere in the line, so decoration wearing letters
+  // is included): the numbered FINDING line itself is pass 1's subject; a strict sub-claim line
+  // records its letter; and ANY other classified line — a decorated label, a spaced or punctuated
+  // letter, a doubled letter, a trailing `_` or digit, a duplicated letter (the RESPONSE side
+  // could not say which claim it answered), a fifth letter (the cap), line-start prose — voids
+  // the WHOLE enumeration (`null` below) and the finding stays single-claim. Never an error, and
+  // never a kept subset a partial contest could clear. The strict-shape checks compare the NUMBER
+  // too: a sub-claim line of finding 2 that mentions `FINDING 1:` in its claim is strict for 2
+  // and a voider for 1 — never a recorder of either's letters onto the other.
   const byId = new Map(out.map((f) => [f.id, f]));
   const pending = new Map<number, SubClaim[] | null>();
-  for (const m of text.matchAll(ANY_NUMBERED_LINE_RE)) {
-    const id = Number(m[1]);
-    if (!byId.has(id)) continue;
-    if (FINDING_LINE_RE.test(m[0]!)) continue; // the numbered FINDING line — pass 1's subject
-    const list = pending.get(id);
-    if (list === null) continue; // already voided — one bad line spoils the set, not just itself
-    const shaped = SUBCLAIM_SHAPE_RE.exec(m[0]!);
-    const letter = shaped?.[1]?.toLowerCase();
-    const held = list ?? [];
-    if (!shaped || !letter || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
-      pending.set(id, null);
-      continue;
+  for (const line of text.split('\n')) {
+    if (ESCALATE_LINE_RE.test(line)) continue; // the format's own escalation line; letters nothing, voids nothing
+    const ids = new Set<number>();
+    const head = HEAD_LINE_RE.exec(line);
+    if (head) ids.add(Number(head[1]));
+    for (const t of line.matchAll(NEAR_COLON_TOKEN_RE)) ids.add(Number(t[1]));
+    for (const id of ids) {
+      if (!byId.has(id)) continue;
+      const asFinding = FINDING_LINE_RE.exec(line);
+      if (asFinding && Number(asFinding[1]) === id) continue; // the numbered FINDING line — pass 1's subject
+      const list = pending.get(id);
+      if (list === null) continue; // already voided — one bad line spoils the set, not just itself
+      const shaped = SUBCLAIM_SHAPE_RE.exec(line);
+      const letter = shaped && Number(shaped[1]) === id ? shaped[2]?.toLowerCase() : undefined;
+      const held = list ?? [];
+      if (!letter || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
+        pending.set(id, null);
+        continue;
+      }
+      held.push({ letter, claim: cap(shaped![3]!, CLAIM_CAP) });
+      pending.set(id, held);
     }
-    held.push({ letter, claim: cap(shaped[2]!, CLAIM_CAP) });
-    pending.set(id, held);
   }
   for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
   return out;
@@ -427,7 +451,26 @@ export function buildLedger(
   // taken, in which case no response is credited (the old letter now names this round's claim;
   // crediting either way would be inventing). A union past MAX_LEDGER_SUBCLAIMS keeps the HELD
   // set whole and drops the new enumeration — all-or-nothing, never a sliced subset.
+  //
+  // Crediting a held letter holds on EVERY path that preserves held sub-claims, not just the
+  // union: a letterless re-raise and the union-overflow fallback keep the held set, and the
+  // builder — told a standing letter stays answerable BY its letter — may be answering it this
+  // very turn. Losing that response would discard a valid current adjudication, the thing the
+  // ledger exists to carry. The one exclusion is a letter this round's enumeration re-used: the
+  // response then names the report in front of the builder, and crediting the held claim too
+  // would be inventing.
   const mergedSubclaims = (f: Finding, heldSubs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] => {
+    const claimed = new Set(f.subclaims.map((sc) => sc.letter));
+    const creditHeld = (subs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] =>
+      subs.map((h) => {
+        const rs = claimed.has(h.letter) ? undefined : bySub.get(`${f.id}${h.letter}`);
+        return rs
+          ? { letter: h.letter, claim: h.claim, status: rs.status, pointer: rs.pointer, reason: rs.reason }
+          : h;
+      });
+    // A re-raise that dropped the letters entirely keeps the held sub-claims AND their answers,
+    // the same preservation the whole-finding status gets below.
+    if (!f.subclaims.length) return creditHeld(heldSubs);
     const mapped = f.subclaims.map((sc) => {
       const rs = bySub.get(`${f.id}${sc.letter}`);
       const carried = carriedFrom(heldSubs, sc.claim);
@@ -448,7 +491,8 @@ export function buildLedger(
       const keepLetter = !used.has(h.letter);
       const rs = keepLetter ? bySub.get(`${f.id}${h.letter}`) : undefined;
       const letter = keepLetter ? h.letter : nextFreeLetter(used);
-      if (!letter) return heldSubs; // no letter left to carry it losslessly — the held set stands
+      // No letter left to carry it losslessly — the held set stands, with this turn's answers.
+      if (!letter) return creditHeld(heldSubs);
       used.add(letter);
       extras.push({
         letter,
@@ -459,7 +503,7 @@ export function buildLedger(
       });
     }
     const union = [...mapped, ...extras];
-    return union.length > MAX_LEDGER_SUBCLAIMS ? heldSubs : union;
+    return union.length > MAX_LEDGER_SUBCLAIMS ? creditHeld(heldSubs) : union;
   };
   const result = [...prior];
   for (const f of findings) {
@@ -467,10 +511,7 @@ export function buildLedger(
     const at = matchIndex(result, f);
     const held = at >= 0 ? result[at] : undefined;
     const heldSubs = held ? subclaimsOf(held) : [];
-    // A re-raise that dropped the letters entirely keeps the held sub-claims AND their answers,
-    // the same preservation the whole-finding status gets below; one that enumerated merges — see
-    // mergedSubclaims.
-    const subclaims: AdjudicatedSubClaim[] = f.subclaims.length ? mergedSubclaims(f, heldSubs) : heldSubs;
+    const subclaims: AdjudicatedSubClaim[] = mergedSubclaims(f, heldSubs);
     const entry: LedgerEntry = {
       id: f.id,
       round,

@@ -2091,7 +2091,13 @@ export class RunSupervisor {
       if (!e) return false;
       // Every reconciled letter must read CONTESTED. A carried rebuttal counts — carrying an
       // answer whose claim wording matched is the fold's whole point — while an unanswered or
-      // merely-FIXED letter stands, whichever round enumerated it.
+      // FIXED letter stands, whichever round enumerated it. FIXED blocking candidacy is not an
+      // oversight but the whole-finding rule ("a `FIXED` changed nothing here") at letter grain:
+      // the terminal reviewer judged the diff WITH any earlier fix in it and still failed, so "it
+      // is fixed" was already adjudicated and never buys the re-roll. A builder who believes a
+      // FIXED letter's claim no longer holds has this turn's move: CONTEST that letter with the
+      // pointer at the landed change — the fold credits a held letter's response on every path —
+      // and the fresh look then verifies it like any other contest.
       if (subclaimsOf(e).some((s) => s.status !== 'contested')) return false;
       // …and the builder must have engaged THIS turn: letter by letter where this round
       // enumerated, the whole-finding form where it did not — which is also the letterless

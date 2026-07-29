@@ -141,15 +141,18 @@ like the requirement bracket, so everything written before it parses byte-identi
 persisted ledger predating sub-claims loads as single-claim entries; malformed lettering voids the
 WHOLE enumeration, and there is no malformed-label detector to slip past — detectors enumerate
 shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an edition of the same escape) — so
-every line whose FIRST LETTERS are `FINDING <n>` is instead classified once: the numbered FINDING
-line, the strict sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`),
-because a lost enumeration is a single-claim finding — current behaviour — where a kept subset
-lets a partial contest clear letters that were never recorded. "First letters", not "line start":
-markdown decoration is a letterless prefix, so a bulleted `- FINDING 1b:` — invisible to a
-whitespace-only anchor, which was the kept-subset escape through the anchor itself — is a voider
-too, while a mid-sentence mention has words before the token and stays harmless prose, since
-reports narrate their findings by number and voiding on mention would kill every enumeration in a
-report that explains itself. Carried answers match a
+every line two structural nets see is instead classified once: the numbered FINDING line, the
+strict sub-claim shape, or a voider (even a prose line starting `FINDING 1 rests…`), because a
+lost enumeration is a single-claim finding — current behaviour — where a kept subset lets a
+partial contest clear letters that were never recorded. The HEAD net takes any line whose FIRST
+LETTERS are `FINDING <n>` — markdown decoration is a letterless prefix, so a bulleted
+`- FINDING 1b:`, invisible to a whitespace-only anchor (the kept-subset escape through the anchor
+itself), is a voider too — and the NEAR-COLON TOKEN net takes `FINDING <n>…:` anywhere in the
+line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix rule) and a
+colon hard by the number is label-intent where a colon further on is sentence structure. A
+mid-sentence mention with no colon beside it stays harmless prose, since reports narrate their
+findings by number and voiding on mention would kill every enumeration in a report that explains
+itself. Carried answers match a
 re-raised sub-claim by its WORDING, never its letter: a fresh reviewer that letters a different
 claim (a) must not inherit old (a)'s rebuttal — the may-miss-never-invent order of harms, one level
 down.

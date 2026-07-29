@@ -489,15 +489,23 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 (b): spaced and parenthesized letter',
       'FINDING 1 -- b: arbitrary junk before the letter',
       'FINDING 1', // a bare number line letters nothing and answers nothing
-      // Markdown decoration is a letterless prefix, so the classifier sees these too — an anchor
-      // that required line-start whitespace left `- FINDING 1b:` invisible, and the kept sibling
-      // read as the complete enumeration (the kept-subset escape through the anchor itself).
+      // Markdown decoration is a letterless prefix, so the head net sees these — an anchor that
+      // required line-start whitespace left `- FINDING 1b:` invisible, and the kept sibling read
+      // as the complete enumeration (the kept-subset escape through the anchor itself).
       '- FINDING 1b: bulleted letter',
       '* FINDING 1b: starred letter',
       '> FINDING 1b: quoted letter',
       '**FINDING 1b:** bolded letter',
       '2. FINDING 1b: numbered-list letter',
       '  — FINDING 1b: em-dashed letter',
+      // Decoration WEARING letters slips the head net (its prefix contains a letter), which was
+      // the next edition of the same escape — so the near-colon token net catches the label
+      // itself, anywhere in the line, and the two escapes do not compose inside its window.
+      '(b) FINDING 1b: alphabetically decorated letter',
+      '(b) FINDING 1 b: decorated AND spaced letter',
+      '(b) FINDING 1(b): decorated AND parenthesized letter',
+      'Note: FINDING 1b: a word before the token',
+      'see FINDING 1b: quoting a sub-claim line mid-prose',
     ]) {
       const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
       expect(out).toHaveLength(1);
@@ -517,6 +525,44 @@ describe('parsing sub-claims (RUN-180)', () => {
         'The escape described in FINDING 1 is the subject of this report.',
     );
     expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+  });
+
+  // The token net keys on a colon NEAR the number — label-intent — so a colon that is ordinary
+  // sentence structure, further along the line, stays prose and spares the enumeration.
+  it('a prose mention with a far-away colon does not void either', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'See FINDING 1 for the full chain of evidence: it holds either way.',
+    );
+    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+  });
+
+  // The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is format-legal and asserts the
+  // finding — it letters nothing and must not void the letters it escalates over.
+  it('an ESCALATE STRUCTURAL line does not void the finding it escalates', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'ESCALATE STRUCTURAL FINDING 1: the promise leaks with no chokepoint — a.ts:1, b.ts:2, c.ts:3',
+    );
+    expect(out[0]!.subclaims.map((s) => s.letter)).toEqual(['a', 'b']);
+  });
+
+  // The strict shapes are checked WITH their number: finding 2's sub-claim line whose claim text
+  // quotes `FINDING 1:` is a recorder for 2 and a voider for 1 — never a recorder for 1.
+  it('a sub-claim line mentioning another finding near-colon voids that finding, not itself', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: one\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two\n' +
+        'FINDING 2 [High] b.ts:1: two\n' +
+        'FINDING 2a: overlaps FINDING 1: the same gate',
+    );
+    expect(out[0]!.subclaims).toEqual([]); // voided by the quoted near-colon token
+    expect(out[1]!.subclaims.map((s) => s.letter)).toEqual(['a']); // recorded for its own number
   });
 
   // The deliberate cost of the wider net: a PROSE line that happens to start `FINDING 1 rests…`
@@ -711,6 +757,37 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     expect(round2[0]!.subclaims).toHaveLength(8);
     const round3 = buildLedger(round2, [SF(1, claims('three'))], [], 3); // union would be 12
     expect(round3[0]!.subclaims.map((s) => s.claim)).toEqual(round2[0]!.subclaims.map((s) => s.claim));
+  });
+
+  // …and standing whole must not cost this turn's answers: the builder — told a standing letter
+  // stays answerable by its letter — may be contesting a held letter in the very fold that
+  // overflows. Only a letter this round's enumeration re-used is excluded (the response then
+  // names the report in front of the builder — crediting the held claim too would be inventing).
+  it('the overflow fallback still credits this turn’s answer to a free held letter', () => {
+    const claims = (tag: string) =>
+      ['a', 'b', 'c', 'd'].map((l) => ({ letter: l, claim: `${tag} claim ${l}` }));
+    const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
+    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // held is now (a)–(h)
+    const round3 = buildLedger(
+      round2,
+      [SF(1, claims('three'))], // overflow: the new enumeration is dropped, held set stands…
+      [SR(1, 'e', 'contested', 'e.ts:9', 'answered under its held letter')],
+      3,
+    );
+    const byLetter = new Map(round3[0]!.subclaims.map((s) => [s.letter, s]));
+    expect(byLetter.get('e')).toMatchObject({ status: 'contested', pointer: 'e.ts:9' }); // …credited
+    expect(byLetter.get('a')!.status).toBe('unanswered'); // (a) collides with this round's (a) — never credited
+  });
+
+  // The same crediting on the letterless-re-raise path: the held set is preserved AND the
+  // builder's per-letter answer this turn lands on it, as the prompts promise.
+  it('a letterless re-raise still folds a per-letter answer onto the held letters', () => {
+    const round1 = buildLedger([], [SF(1, AB)], [], 1);
+    const round2 = buildLedger(round1, [SF(1, [])], [SR(1, 'a', 'contested', 'a.ts:9', 'covered')], 2);
+    expect(round2[0]!.subclaims.map((s) => [s.letter, s.status, s.pointer])).toEqual([
+      ['a', 'contested', 'a.ts:9'],
+      ['b', 'unanswered', null],
+    ]);
   });
 
   // A TRUNCATED claim is a prefix wearing an identity: two distinct over-cap claims cap to the

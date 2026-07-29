@@ -3967,6 +3967,60 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     ]);
   });
 
+  // A carried FIXED letter blocks candidacy — the whole-finding rule ("a FIXED changed nothing
+  // here") at letter grain: the terminal reviewer judged the diff WITH the fix in it and still
+  // failed, so "it is fixed" was already adjudicated and never buys the re-roll.
+  it('a carried FIXED letter stands — a bare contest cannot clear over it', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1: CONTESTED src/a.ts:9 — the whole finding is wrong',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the FIXED letter is not a contest → the finding stands
+    expect(reviewerStarts(h)).toBe(2); // no fresh adjudicator spawned
+  });
+
+  // …but it is not a dead end: the builder who believes the fixed claim no longer holds CONTESTS
+  // that letter in the contest turn — the fold credits a held letter's response on every path —
+  // and the finding earns the fresh look like any other full contest.
+  it('contesting the carried FIXED letter this turn restores candidacy', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1a: CONTESTED src/f.ts:1 — the guard landed; the claim no longer holds\n' +
+        'FINDING 1: CONTESTED src/a.ts:9 — nothing in this finding survives the diff',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
   // …and the same path CLEARS when every carried letter already holds a rebuttal: the reconciled
   // entry shows each letter contested, the bare contest is this turn's own answer to the
   // letterless re-raise, and the fresh look adjudicates the carried pointers.
