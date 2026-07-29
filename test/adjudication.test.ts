@@ -576,24 +576,35 @@ describe('parsing sub-claims (RUN-180)', () => {
   // token and never voids. Reports narrate their findings by number — voiding on mention would
   // kill every enumeration in any report that explains itself, and a mention records nothing a
   // partial contest could clear, so leaving it harmless is the safe direction too.
-  it('a prose mention of FINDING <n> mid-sentence does not void its enumeration', () => {
+  // Narration lives ABOVE the findings (the prompt's own instruction) or below the structural
+  // lines — a mention by number there is harmless prose, exactly as before.
+  it('a prose mention of FINDING <n> outside its zone does not void its enumeration', () => {
+    const out = parseFindings(
+      'The escape described in FINDING 1 is the subject of this report.\n' +
+        'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: half one\n' +
+        'FINDING 1b: half two',
+    );
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+  });
+
+  it('narration below the next structural line is harmless — the zone ended there', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
-        '\n' +
+        'VERDICT: FAIL\n' +
         'The escape described in FINDING 1 is the subject of this report.',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The BLOCK BOUNDARY: an enumeration must be CLOSED — by a blank line, the next numbered
-  // FINDING line, a structural line, or the end of the report. A mangled sibling is written into
-  // its own list, so it sits in the block's tail; a stale certificate excludes it by fiat, but
-  // position still sees it — ANY non-boundary line hard against the block voids, even innocent
-  // prose, because the two are indistinguishable by construction. A lost enumeration is the safe
-  // degradation; a kept subset is the escape.
-  it('a non-boundary line hard against the block voids — even innocent prose', () => {
+  // The EMPTY ZONE: from the block's end to the next structural line, only blank lines may
+  // appear. A mangled sibling is written into its own finding's territory; a stale certificate
+  // excludes it by fiat, but position still sees it — ANY content line in the zone voids, even
+  // innocent prose, because the two are indistinguishable by construction. A lost enumeration is
+  // the safe degradation; a kept subset is the escape.
+  it('a content line in the finding’s zone voids — even innocent prose', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
@@ -603,11 +614,11 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // The stale-certificate escape, closed by position (this round's live probe): the certificate
-  // counts only the strict line, so it certifies the subset as complete — but the mangled sibling
-  // sits in the block's tail, where the boundary rule voids the whole enumeration whatever the
-  // line mangled into (`FINDING 1 b` is invisible to every net that spares prose).
-  it('a stale certificate over a net-invisible mangled sibling voids — position proves the boundary', () => {
+  // The stale-certificate escape, closed by position: the certificate counts only the strict
+  // line, so it certifies the subset as complete — but the mangled sibling sits in the finding's
+  // own territory, where the zone rule voids the whole enumeration whatever the line mangled into
+  // (`FINDING 1 b` is invisible to every net that spares prose).
+  it('a stale certificate over a net-invisible mangled sibling voids — position proves the zone', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: recorded claim\n' +
@@ -617,7 +628,20 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  it('an ACCEPTANCE line closes the block — reports answer criteria right after their findings', () => {
+  // …and a blank line cannot detach the sibling from its list (this round's live probe): the
+  // zone runs to the next STRUCTURAL line, so blank-then-content is still content in the zone.
+  it('a blank line cannot detach a mangled sibling — the whole zone must be empty', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
+        'FINDING 1a: recorded claim\n' +
+        '\n' +
+        '(b) FINDING 1 b — hidden claim',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
+  it('an ACCEPTANCE line closes the zone — reports answer criteria right after their findings', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
@@ -629,14 +653,14 @@ describe('parsing sub-claims (RUN-180)', () => {
 
   // No in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, so a
   // lettered token off the finding's own lines always voids — narration names letters as `(a)`,
-  // the form every render uses, or by claim text. The blank line isolates the net: this mention
-  // is past a closed boundary, and it still voids.
-  it('a lettered mention off the finding’s own lines voids — even in-range, even past the boundary', () => {
+  // the form every render uses, or by claim text. Placed below VERDICT, outside the zone, so this
+  // pins the NET alone: the lettered token itself is what voids.
+  it('a lettered mention off the finding’s own lines voids — even in-range, even outside the zone', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
-        '\n' +
+        'VERDICT: FAIL\n' +
         'Here FINDING 1a is contested while (b) stands on the same evidence.',
     );
     expect(out[0]!.subclaims).toEqual([]);
@@ -692,10 +716,9 @@ describe('parsing sub-claims (RUN-180)', () => {
   // finding 1 wearing label `2` — and a longer number cannot void a shorter one's enumeration.
   it('a mention of a longer finding number is not a label on the shorter one', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: half one\n' +
-        '\n' +
-        'see FINDING 12 in the previous report for background',
+      'see FINDING 12 in the previous report for background\n' +
+        'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
+        'FINDING 1a: half one',
     );
     expect(out[0]!.subclaims).toEqual(['half one']);
   });
@@ -704,11 +727,10 @@ describe('parsing sub-claims (RUN-180)', () => {
   // sentence structure, further along the line, stays prose and spares the enumeration.
   it('a prose mention with a far-away colon does not void either', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+      'See FINDING 1 for the full chain of evidence: it holds either way.\n' +
+        'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
-        'FINDING 1b: half two\n' +
-        '\n' +
-        'See FINDING 1 for the full chain of evidence: it holds either way.',
+        'FINDING 1b: half two',
     );
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
@@ -985,18 +1007,51 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     ]);
   });
 
-  // A TRUNCATED claim is a prefix wearing an identity: two distinct over-cap claims cap to the
-  // same text, so carrying across that match would answer a claim nobody answered. The cost of
-  // refusing is a visibly unanswered sub-claim on an over-long claim — a miss, never an invention.
-  it('a truncated claim never carries an answer — two long claims must not share one', () => {
+  // Truncation must not erase IDENTITY: an over-cap claim is capped for display with a
+  // fingerprint of its WHOLE normalized text, so two distinct long claims fingerprint apart and
+  // never share a carried answer — and (below) a verbatim re-raise still recognises its own
+  // record. The bare-ellipsis cap aliased both onto one text, and the blanket refusal that
+  // patched the aliasing turned every exact long re-raise into a duplicate row.
+  it('two distinct over-cap claims keep distinct identities — neither inherits the other’s answer', () => {
     const longReport = (tail: string) =>
       `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
     const [one] = parseFindings(longReport('ONE'));
     const [two] = parseFindings(longReport('TWO'));
-    expect(one!.subclaims[0]).toEqual(two!.subclaims[0]); // capped to the same text…
+    expect(one!.subclaims[0]).not.toEqual(two!.subclaims[0]); // capped, but the identities stay apart
     const round1 = buildLedger([], [one!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
     const round2 = buildLedger(round1, [two!], [], 2);
-    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']); // …but never carried
+    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']); // TWO never inherits ONE's answer
+  });
+
+  it('an exact re-raise of an over-cap claim recognises its held record — one row, answer carried', () => {
+    const report = `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'x'.repeat(250)}SAME`;
+    const [f1] = parseFindings(report);
+    const round1 = buildLedger([], [f1!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const [f2] = parseFindings(report); // the same wording, re-raised verbatim
+    const round2 = buildLedger(round1, [f2!], [], 2);
+    expect(round2[0]!.subclaims).toHaveLength(1); // one claim, one durable record — no duplicate row
+    expect(round2[0]!.subclaims[0]).toMatchObject({ status: 'contested', pointer: 'a.ts:9' });
+  });
+
+  it('a legacy bare-ellipsis persisted claim still never carries — two old long claims may alias', () => {
+    const held: LedgerEntry = {
+      id: 1,
+      round: 1,
+      severity: 'High',
+      requirements: [],
+      location: 'f1.ts:1',
+      claim: 'the class',
+      status: 'unanswered',
+      pointer: null,
+      reason: null,
+      // As the ellipsis era persisted it: the tail — the identity — is gone.
+      subclaims: [{ claim: `${'x'.repeat(239)}…`, status: 'unanswered', pointer: null, reason: null }],
+    };
+    const round2 = buildLedger([held], [SF(1, [`${'x'.repeat(250)}SAME`])], [], 2);
+    // The re-raise takes its own row and the held row rides beside it, both visibly unanswered —
+    // a duplicate is the documented cost of the lossy legacy cap; an invented carry never is.
+    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered', 'unanswered']);
+    expect(round2[0]!.subclaims).toHaveLength(2);
   });
 
   // The carry key is the claim's FULL wording, not a 60-char prefix: two long claims that diverge

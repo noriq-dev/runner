@@ -169,12 +169,18 @@ ANYTHING is simply not counted, and no certificate — or a mutated one, which f
 one — keeps no letters at all, the same safe degradation. What the certificate cannot see is a
 STALE count — one that excludes a mangled sibling by fiat rather than by absence, a mundane slip
 rather than incoherence — and POSITION closes that: the enumeration is a contiguous BLOCK
-directly under the FINDING line, and it must be CLOSED by a boundary (a blank line, the next
-numbered FINDING line, a structural line, or the end of the report), so a sibling — written into
-its own list, whatever it mangled into — sits in the block's tail where ANY non-boundary line
-voids the whole. The residue is a sibling detached from its own list by an author-inserted blank
-line AND excluded from the author's own count: a double incoherence where either alone was one
-slip. What remains around those two rules is hygiene, not
+directly under the FINDING line, and the finding's ZONE — from the block's end to the next
+structural line (the next numbered FINDING, ESCALATE/ACCEPTANCE/VERDICT, or the end of the
+report) — must hold nothing but blank lines, so a sibling written into its own finding's
+territory voids the whole whatever it mangled into, and a blank line cannot detach it. Within a
+finding's territory every content line is recorded, structural, or a voider — there is nowhere
+left for an unrecorded claim to sit — so narration lives above the findings or below the
+structural lines, and prose that strays into a zone costs the enumeration (dull), never keeps a
+subset. Claim identity also survives its own display cap: an over-cap claim is truncated WITH a
+fingerprint of its whole normalized text (capKeyed), so a verbatim re-raise of a long claim
+recognises its held record instead of duplicating it and two distinct long claims can never
+alias — the bare-ellipsis refusal now guards only records the ellipsis era persisted. What
+remains around those rules is hygiene, not
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
 letters, and a colon hard by the number is label-intent where a colon further on is sentence
