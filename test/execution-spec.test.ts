@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import {
@@ -19,15 +20,23 @@ const spec = (over: ExecutionSpecInput = {}) => ExecutionSpec.parse(over);
 /** A probe over a fixed set of repo-relative paths, faithful to `probePathKind`'s contract:
  *  file/dir/missing/outside-repo/unchecked. Containment is checked on a path BOUNDARY, not a
  *  string prefix — `/wt2/x` is not inside `/wt`, and a fake that says otherwise would let a
- *  containment bug pass. Anything named with a trailing `/` is a directory. */
+ *  containment bug pass. Anything named with a trailing `/` is a directory.
+ *
+ *  The arithmetic is `path`'s and not the string's, because the checker hands this fake whatever
+ *  `path.resolve` produced: on Windows that is `D:\wt\src\a.ts` against a `/wt` root, which a
+ *  slash-spelled prefix test reads as escaping the repo — every path in the suite came back
+ *  `outside-repo` and the findings under test never ran. The keys stay POSIX on both platforms,
+ *  which is what a spec declares. */
 const probeOver = (present: string[]): SpecPathProbe => {
   const files = new Set(present.filter((p) => !p.endsWith('/')));
   const dirs = new Set(present.filter((p) => p.endsWith('/')).map((p) => p.slice(0, -1)));
   return async (abs, root) => {
-    if (abs !== root && !abs.startsWith(`${root}/`)) return 'outside-repo';
-    const rel = abs.slice(root.length + 1);
-    if (dirs.has(rel)) return 'dir';
-    return files.has(rel) ? 'file' : 'missing';
+    const rel = path.relative(root, abs);
+    // A whole `..` SEGMENT, never a `..` prefix — `..foo` is an ordinary filename.
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return 'outside-repo';
+    const key = rel.split(path.sep).join('/');
+    if (dirs.has(key)) return 'dir';
+    return files.has(key) ? 'file' : 'missing';
   };
 };
 const ROOT = '/wt';

@@ -186,8 +186,9 @@ export function scanRootWarning(repo: string, roots: string[] | null): string | 
   const r = path.resolve(repo);
   const covered = roots.some((root) => {
     const rel = path.relative(path.resolve(root), r);
-    // Not covered if we had to climb OUT of the root (..) or cross to another drive (absolute).
-    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    // Not covered if we had to climb OUT of the root (a whole `..` segment — `..foo` is an
+    // ordinary directory name, not an escape) or cross to another drive (absolute).
+    return rel === '' || !(rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
   });
   return covered ? null : 'this repo is not under any scanRoot — the runner will not find it';
 }

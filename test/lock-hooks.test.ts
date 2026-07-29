@@ -45,6 +45,23 @@ describe('path extraction (RUN-101, ported from the PLNR hook)', () => {
     expect(toRepoRelative('/repo', '/repo')).toBeNull(); // the root itself
   });
 
+  // Every error in this function is fail-OPEN — a path it rejects or misspells is a path the
+  // reactive layer never reserves, and the edit goes ahead unlocked.
+  it('toRepoRelative reads an escape as a whole `..` segment — `..foo` is a filename, and it locks', () => {
+    expect(toRepoRelative('..generated/a.ts', '/repo')).toBe('..generated/a.ts');
+    expect(toRepoRelative('/repo/..generated/a.ts', '/repo')).toBe('..generated/a.ts');
+    expect(toRepoRelative('../a.ts', '/repo')).toBeNull(); // a real climb-out still refused
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'toRepoRelative does not rename a POSIX file whose name contains a backslash',
+    () => {
+      // `\` is a legal filename character here, and splitting on it would reserve `a/b.ts` — a
+      // path that is not the one being edited — while the real `a\b.ts` stays free for a peer.
+      expect(toRepoRelative('src/a\\b.ts', '/repo')).toBe('src/a\\b.ts');
+    },
+  );
+
   it('lockPathsForTool repo-scopes, dedupes, and drops out-of-tree paths', () => {
     expect(
       lockPathsForTool('Bash', { command: 'touch a.txt && touch a.txt && touch /etc/x' }, '/repo'),

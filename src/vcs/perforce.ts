@@ -394,8 +394,22 @@ export class PerforceBackend implements VcsBackend {
     return { ok: false, conflicts: conflicts.map((p) => this.relative(ws, p)) };
   }
 
+  /**
+   * A conflict path in the shape the rest of the system speaks: workspace-relative and `/`-spelled.
+   *
+   * These are contract values, not host ones — they are rendered into the agent's conflict prompt
+   * and into the comment posted when landing fails, so a Windows daemon reporting `src\a.ts` would
+   * describe the same conflict differently depending on who picked up the run.
+   *
+   * Containment is `path`'s arithmetic rather than a string prefix, because `startsWith` reads a
+   * SIBLING as a child: a `/wt2/a.ts` under a `/wt` workspace was silently reported as the relative
+   * path `2/a.ts`. Anything genuinely outside is handed back untouched — an absolute path is a poor
+   * conflict label, but inventing a relative one for a file that is not in the workspace is worse.
+   */
   private relative(ws: Workspace, p: string): string {
-    return p.startsWith(ws.localPath) ? path.relative(ws.localPath, p) : p;
+    const rel = path.relative(ws.localPath, p);
+    if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return p;
+    return rel.split(path.sep).join('/');
   }
 
   private async unresolvedPaths(ws: Workspace): Promise<string[]> {

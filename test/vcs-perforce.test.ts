@@ -241,6 +241,29 @@ describe('PerforceBackend — integrate/resume (the measured headless loop)', ()
     expect(markerWrite?.content).toContain('CONFLICT'); // merge3's marker shape, measured
   });
 
+  // Conflict paths are CONTRACT values: they are rendered into the agent's conflict prompt and into
+  // the comment posted when landing fails, so they must read the same wherever the daemon runs. A
+  // nested path is the case that catches a host separator — the single-component path above cannot.
+  it('reports a nested conflict workspace-relative and `/`-spelled, on any host', async () => {
+    const { backend } = fakes({ unresolved: ['/ws1/src/deep/shared.txt'] });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(await backend.integrate(ws, 'ignored')).toEqual({
+      ok: false,
+      conflicts: ['src/deep/shared.txt'],
+    });
+  });
+
+  // `startsWith` reads a SIBLING as a child: `/ws11/x` under `/ws1` was reported as the relative
+  // path `1/x` — a file that does not exist, named as though it were in the workspace.
+  it('hands back a path outside the workspace rather than inventing a relative one', async () => {
+    const { backend } = fakes({ unresolved: ['/ws11/elsewhere.txt'] });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(await backend.integrate(ws, 'ignored')).toEqual({
+      ok: false,
+      conflicts: ['/ws11/elsewhere.txt'],
+    });
+  });
+
   it('resume after the agent edited: resolve -ay accepts the edited result', async () => {
     const { backend, calls } = fakes({ unresolved: ['/ws1/shared.txt'] });
     const ws = await backend.lease('/ws1', 'run_1');

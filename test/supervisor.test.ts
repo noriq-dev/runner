@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
@@ -837,8 +838,10 @@ describe('[context] reaches the spawned agent (RUN-128/129)', () => {
     h.claude.complete('done');
     await done;
     expect(seen.length).toBeGreaterThan(0);
-    expect(seen.every((p) => p.startsWith('/wt/run_1'))).toBe(true);
-    expect(seen.some((p) => p.startsWith('/repos/'))).toBe(false);
+    // Resolved, not spelled: these are `path.resolve` outputs, so on Windows they arrive as
+    // `D:\wt\run_1\…` and a literal `/wt/run_1` prefix would fail a passing daemon.
+    expect(seen.every((p) => p.startsWith(path.resolve('/wt/run_1')))).toBe(true);
+    expect(seen.some((p) => p.startsWith(path.resolve('/repos')))).toBe(false);
   });
 
   it('inlines the declared reading and the orientation into the build brief', async () => {
@@ -2940,7 +2943,7 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(review.prompt).not.toContain('# house rules');
     // Exactly ONE read in the whole run — the builder's. The reviewer's loader added none: it
     // resolves paths and never opens them, which is what "names only" has to mean to be worth it.
-    expect(reads).toEqual(['/wt/run_1/CLAUDE.md']);
+    expect(reads).toEqual([path.resolve('/wt/run_1', 'CLAUDE.md')]);
     // The daemon's verdict rules come AFTER repo-controlled text — last word to the side that is
     // not written by the repository being judged.
     expect(review.prompt.indexOf('QUOTED FROM THE REPOSITORY')).toBeLessThan(

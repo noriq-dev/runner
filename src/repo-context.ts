@@ -45,10 +45,40 @@ export interface ResolvedRepoContext {
  *  symlinks are followed. */
 export type PathProbe = (absPath: string, root: string) => Promise<boolean | ContextRejection>;
 
+// Escaping is a whole SEGMENT of `..`, not a `..` prefix: `..foo` is an ordinary filename that
+// `path.relative` spells `..foo`, and testing the prefix refuses it as though it climbed out of the
+// repo. That direction is a false refusal rather than a hole — the confinement still holds — but a
+// repo carrying such a name would be told its own file is outside itself, and the message would
+// name the one explanation that is not true.
+const escapes = (rel: string): boolean =>
+  rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+
 const contains = (root: string, abs: string): boolean => {
   const rel = path.relative(root, abs);
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel !== '' && !escapes(rel);
 };
+
+/**
+ * A repo-relative path is a CONTRACT shape, not a host one — so it is spelled with `/` on every
+ * platform.
+ *
+ * `.noriq/project.toml` is committed and travels, so the spelling has to be the manifest's and not
+ * the host's. `path.relative` answers in the HOST's separator, so a Windows daemon rendered
+ * `Start here: docs\ARCH.md` into the brief for a manifest that plainly says otherwise — the same
+ * repo describing itself differently depending on who happened to pick up the run. The rest of the
+ * system agrees with the manifest and not with the host: an execution spec declares POSIX paths,
+ * and file locks reserve them.
+ *
+ * What this guarantees is a canonical repo-relative spelling, NOT the manifest's text verbatim:
+ * `path.resolve` has already folded `./docs/ARCH.md` and `docs/../docs/ARCH.md` into one form
+ * before this sees them. The separator is the part that was varying per platform.
+ *
+ * `path.sep` rather than a `\\` regex, because a backslash is a legal character in a POSIX
+ * filename and rewriting one there would corrupt a real path. On Windows it cannot appear in a
+ * name at all, so the split is unambiguous exactly where it does something.
+ */
+const repoRelative = (root: string, abs: string): string =>
+  path.relative(root, abs).split(path.sep).join('/');
 
 /**
  * The real probe. `stat` (not `lstat`) follows symlinks on purpose — then the RESOLVED target is
@@ -182,7 +212,7 @@ async function resolveList(
       continue;
     }
     const ok = await probe(abs, root);
-    if (ok === true) kept.push(path.relative(root, abs));
+    if (ok === true) kept.push(repoRelative(root, abs));
     else unresolved.push({ declared: d, reason: ok === false ? 'missing' : ok });
   }
   return kept;

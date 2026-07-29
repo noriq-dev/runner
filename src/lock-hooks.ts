@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { LockConflict } from './lock-client';
 
 /** The all-or-nothing outcome of acquiring locks over a set of paths — the shape both the
@@ -94,12 +94,27 @@ function tokenize(s: string): string[] {
   return out;
 }
 
-/** Make a tool-supplied path repo-relative POSIX, or null if it escapes the repo (don't lock it). */
+/**
+ * Make a tool-supplied path repo-relative POSIX, or null if it escapes the repo (don't lock it).
+ *
+ * Both tests below are narrower than they look, and in this direction the errors are fail-OPEN:
+ * a path this function rejects or misspells is simply not reserved, and `guard` allows the edit.
+ *
+ *   - An escape is a whole `..` SEGMENT, never a `..` prefix. `..generated/a.ts` is an ordinary
+ *     filename that `relative` spells `..generated/a.ts`, and reading that as an escape drops the
+ *     lock on a file the agent is about to write.
+ *   - The split is on the HOST's separator alone. `relative` produced this string, so `\` in it is
+ *     a separator on Windows and a legal filename character on POSIX — splitting on both renames a
+ *     real POSIX file `a\b.ts` into `a/b.ts`, reserving a path that is not the one being edited
+ *     while the real one stays free. The lock service's contract is repo-relative POSIX
+ *     (`lock-client.ts`), so the conversion still has to happen; it just must not invent.
+ */
 export function toRepoRelative(p: string, root: string): string | null {
   const abs = isAbsolute(p) ? p : resolve(root, p);
   const rel = relative(root, abs);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null; // outside the worktree
-  return rel.split(/[\\/]/).join('/');
+  // outside the worktree
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  return rel.split(sep).join('/');
 }
 
 /** The repo-relative write set for a tool call, deduped and repo-scoped. */

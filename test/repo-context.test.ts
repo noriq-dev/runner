@@ -207,18 +207,39 @@ describe('openConfined', () => {
     expect(await readAll(path.join(linkedRoot, 'in.md'), linkedRoot)).toBe('inside');
   });
 
-  // The property that separates this from check-then-open, and the one the symlink tests above do
-  // NOT prove: they would pass an implementation that validated the path and opened it afterwards.
-  // Here the name is repointed at a different inode AFTER the handle is returned, and the handle
-  // still yields the validated bytes. The race window itself cannot be driven from a test — nothing
-  // can run between the `open` and the check — so this pins the consequence instead.
+  // The name is repointed at a different inode AFTER the handle is returned, and the handle still
+  // yields the validated bytes: whatever the caller reads later comes from the object that was
+  // checked, not from a name that has since moved.
+  //
+  // Be precise about what that does and does not catch, because the stronger claim is tempting and
+  // wrong. This test CANNOT distinguish `openConfined` from an implementation that validated and
+  // then re-opened the path before returning — both opens complete before the swap can be staged,
+  // so the reopened descriptor still points at the original inode and the assertion passes either
+  // way. Driving the window itself would need a barrier inside the function, and a test seam
+  // through the middle of a confinement check costs more than it proves. So this pins the
+  // CONSEQUENCE the design exists to deliver, and the inode identity check in `openConfined` is
+  // what actually closes the window — reviewed there, not asserted here.
+  //
+  // The swap goes through a SYMLINK so that it can be staged on every platform. Repointing a
+  // regular file (unlink, then recreate the name) is `EPERM` on Windows while a handle is open, so
+  // written that way this test asserted the property on Linux and skipped the platform the CI
+  // matrix exists to cover. Moving the swap to the link keeps the open handle on the target — which
+  // Windows has no reason to refuse — and repoints the NAME exactly as the race would. Note this
+  // means Windows is not immune to the underlying attack, so the coverage is load-bearing rather
+  // than a formality.
   it('reads the descriptor it validated, not the name it was handed', async () => {
-    const p = path.join(root, 'swap.md');
-    await writeFile(p, 'original');
-    const fh = await openConfined(p, root);
+    const [before, after, link] = [
+      path.join(root, 'swap-before.md'),
+      path.join(root, 'swap-after.md'),
+      path.join(root, 'swap.md'),
+    ];
+    await writeFile(before, 'original');
+    await writeFile(after, 'replaced');
+    await symlink(before, link);
+    const fh = await openConfined(link, root);
     try {
-      await rm(p);
-      await writeFile(p, 'replaced'); // same name, new inode
+      await rm(link);
+      await symlink(after, link); // same name, different inode
       expect((await fh.readFile()).toString('utf8')).toBe('original');
     } finally {
       await fh.close();
