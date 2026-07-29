@@ -21,6 +21,7 @@ const finding = (id: number, location: string, claim = 'something'): Finding => 
   requirements: [],
   location,
   claim,
+  subclaims: [],
 });
 
 describe('what is still outstanding', () => {

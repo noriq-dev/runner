@@ -119,7 +119,17 @@ export interface ReviewerPromptContext {
  *  RUN-66 round-1 defects as raw notes now returns one finding naming the cause and citing the
  *  other three as evidence, where the pre-rule wording returned four. That converges the fix in one
  *  round, or proves the work is bigger than the rounds left — either beats learning it last round,
- *  which is the RUN-66 outcome this exists to stop. */
+ *  which is the RUN-66 outcome this exists to stop.
+ *
+ *  RUN-180 amends the collapse rule with the cost it turned out to carry. A finding is the unit the
+ *  builder answers, so a collapsed finding bundling two separately-answerable claims was answerable
+ *  in halves while recorded as answered as a whole — the first live terminal review (RUN-174's run)
+ *  lost a valid claim exactly there, the builder rebutting the refutable half while the other rode
+ *  out unanswered with no format to say "the first half stands". The prompt now asks for lettered
+ *  sub-claim lines when the one finding carries separately-answerable claims, and states the test
+ *  (refutability, not countability) against the instance list, because a reviewer told only
+ *  "enumerate sub-claims" would letter its instances and re-open the RUN-66 convergence failure the
+ *  collapse rule closed. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
@@ -167,9 +177,20 @@ export function reviewerFeedbackPrompt(
  * judging reviewer reads (RUN-89's other half). Restating it here is a second place it could drift;
  * the builder contests with a pointer, the mechanical test stays with the judge. The findings cap
  * mirrors `reviewerFeedbackPrompt`'s (a report longer than this has stopped being actionable).
+ *
+ * The per-sub-claim answer form (RUN-180) IS restated here, unlike the scope rule, because it is
+ * format rather than judgment — the builder cannot answer in halves in a shape it was never shown,
+ * and this turn is the exact surface where the bundled-finding escape happened: a whole-finding
+ * CONTESTED credits no lettered claim, and a sub-claim left unanswered keeps the finding standing.
+ *
+ * `record` is the reconciled sub-claim record for the terminal findings (renderContestRecord),
+ * rendered because letters are positional labels rather than state (the structural settlement): a
+ * standing sub-claim this report does not re-list has no letter the builder could otherwise know,
+ * so without the record it would be standing AND unanswerable — a trap, not a gate. Null renders
+ * the prompt without the section, which is every finding that never enumerated.
  */
-export function reviewerContestPrompt(findings: string): string {
-  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
+export function reviewerContestPrompt(findings: string, record?: string | null): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000), record: record ?? null });
 }
 
 /** Format a final reviewer rejection for a task comment (the gate surface). */

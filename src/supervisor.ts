@@ -15,9 +15,13 @@ import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './
 import {
   type Finding,
   type LedgerEntry,
+  applyContestResponses,
   buildLedger,
   parseFindingResponses,
   parseFindings,
+  reconciledEntry,
+  renderContestRecord,
+  subclaimsOf,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
 import type { ParkState, RunAgent } from './client';
@@ -1928,9 +1932,9 @@ export class RunSupervisor {
    *
    * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
    * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
-   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, or a
-   * finding a ledger cap dropped cannot clear it — the run then fails without even spawning the
-   * reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, a
+   * finding a ledger cap dropped, or a sub-claim left unanswered while its siblings drew the
+   * rebuttal (RUN-180) cannot clear it — the run then fails without even spawning the reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
    * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
    * enough.
    *
@@ -2005,8 +2009,19 @@ export class RunSupervisor {
     // block is parsed (RUN-79) — snapshotted before the turn as the fix loop does.
     const textBefore = ctx.getSessionText?.().length ?? 0;
     const startedAt = monotonicMs();
+    // The contest prompt carries the RECORD — each terminal finding's sub-claims as the reconciled
+    // ledger holds them, lettered by position (RUN-180). Letters are not state anywhere (the
+    // structural settlement), so a standing sub-claim this terminal report does not re-list has no
+    // letter the builder could otherwise know: the record is what makes it answerable, and its
+    // positional letters are exactly the coordinates `applyContestResponses` resolves a response
+    // against below — one labelling, shown and folded alike.
     const exit = await ctx.session
-      .continueWith(reviewerContestPrompt(args.verdict.findings))
+      .continueWith(
+        reviewerContestPrompt(
+          args.verdict.findings,
+          renderContestRecord(args.findings, args.ledger, args.terminalRound),
+        ),
+      )
       .catch((err): DriverExit | null => {
         this.log.warn('could not hand the terminal findings back for a contest', {
           runId: ctx.run.id,
@@ -2028,13 +2043,18 @@ export class RunSupervisor {
     const terminalIds = new Set(args.findings.map((f) => f.id));
     const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
 
-    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // Land that matched evidence on the ledger FIRST — before any outcome branch — so a rebuttal
     // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
-    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
-    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
-    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
-    // one the terminal round judged.
-    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). Every terminal finding's
+    // entry was already written when the finding was RAISED (`record`), so this turn only ADDS
+    // answers — `applyContestResponses` resolves each letter against the reconciled entry's
+    // positions, exactly the labelling the contest record above showed the builder (RUN-180): the
+    // report's own lettering and the record's agree except on the overflow path, where the
+    // record — the only letters the builder could answer standing claims by — must win, and
+    // re-running the fold's union here resolved report-first and discarded those answers. A
+    // finding with no matched response keeps its raise-time entry, 'unanswered'. NO checkpoint
+    // above, so the diff a fresh reviewer would read is still the one the terminal round judged.
+    const answered = applyContestResponses(args.ledger, args.findings, matched, args.terminalRound);
 
     // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
     // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
@@ -2053,17 +2073,59 @@ export class RunSupervisor {
     // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
     // pointer or a response for another id never reached `matched` at all. What "checkable" means
     // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
-    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
-    const loc = (s: string) => s.trim().toLowerCase();
-    const visibleToAdjudicator = (f: Finding) =>
-      answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));
-    if (!args.findings.every((f) => contested.has(f.id) && visibleToAdjudicator(f))) {
+    //
+    // A finding that carries sub-claims is a candidate only when EVERY reconciled sub-claim reads
+    // CONTESTED (RUN-180). This is the exact surface the run_ms4t62384u0z6c6p4f5d escape used: a
+    // bundled finding was "contested" by rebutting the refutable half, and the other half rode the
+    // answer out. A bare `FINDING <n>` response is recorded as evidence but credits no lettered
+    // claim, so answering in halves leaves the unanswered half STANDING — and the finding off the
+    // candidate set.
+    const contestedWhole = new Set(
+      matched.filter((r) => r.status === 'contested' && !r.subclaim).map((r) => r.id),
+    );
+    // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
+    // parse alone — in EITHER direction. The fold deliberately PRESERVES held sub-claims when a
+    // re-raise drops the letters — or repeats only SOME of them, unioning in the claims its
+    // wording does not cover — a fresh terminal reviewer paraphrases by construction, so a
+    // letterless or narrowed re-raise of a half-answered finding still carries its unanswered
+    // claim, and reading `f.subclaims` (empty or a subset on those paths) let a bare or partial
+    // contest clear exactly the claim this format exists to keep standing: the RUN-174 escape
+    // reborn one round later. And symmetrically: the terminal report's own SHAPE must not be a
+    // second gate over a record already fully contested — the contest prompt tells the builder an
+    // already-contested record claim needs no fresh answer, so demanding one per-letter (or a bare
+    // response beside fully contested letters) would fail the exact builder that followed the
+    // prompt. The per-letter responses reach this check through `applyContestResponses`, which
+    // resolved each letter against the reconciled entry's own positions — the record's labelling,
+    // the one the builder was answering by. The entry is also the VISIBILITY check: the
+    // adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
+    // fold (the cap) is not evidence and stands.
+    const answerablyContested = (f: Finding) => {
+      const e = reconciledEntry(answered, f, args.terminalRound);
+      if (!e) return false;
+      const subs = subclaimsOf(e);
+      // Every reconciled sub-claim must read CONTESTED. A carried rebuttal counts — carrying an
+      // answer whose claim wording matched is the fold's whole point — while an unanswered or
+      // FIXED claim stands, whichever round enumerated it. FIXED blocking candidacy is not an
+      // oversight but the whole-finding rule ("a `FIXED` changed nothing here") at sub-claim
+      // grain: the terminal reviewer judged the diff WITH any earlier fix in it and still failed,
+      // so "it is fixed" was already adjudicated and never buys the re-roll. A builder who
+      // believes a FIXED sub-claim no longer holds has this turn's move: CONTEST it, at the letter
+      // the contest record shows for it, with the pointer at the landed change — the fold resolves
+      // that letter back to the claim — and the fresh look then verifies it like any other contest.
+      if (subs.length) return subs.every((s) => s.status === 'contested');
+      // A single-claim finding keeps the pre-RUN-180 rule unchanged: the builder must have
+      // contested it THIS turn — silence over a terminal finding is not a contest, however the
+      // entry's carried status reads, because the terminal reviewer raised it over that record.
+      return contestedWhole.has(f.id);
+    };
+    if (!args.findings.every((f) => answerablyContested(f))) {
       // At least one terminal finding was not answerably contested, so it stands and the run fails as
       // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
       // Nothing is spawned to be killed; the contest turn already happened above.
       this.log.info('a terminal finding was not answerably contested — the findings stand', {
         runId: ctx.run.id,
-        contested: contested.size,
+        contested: contestedWhole.size,
+        subclaimResponses: matched.filter((r) => r.subclaim).length,
         findings: args.findings.length,
       });
       transcript.milestone('the terminal findings were not all contested — the run fails');
@@ -2100,6 +2162,7 @@ export class RunSupervisor {
     // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not
     // cleared it — either way the finding stands, the same posture judgeWithAcceptance takes for a
     // FAILED criterion under a PASS.
+    const loc = (s: string) => s.trim().toLowerCase();
     const reraised = new Set(
       parseFindings(readjudged.findings)
         .map((f) => loc(f.location))

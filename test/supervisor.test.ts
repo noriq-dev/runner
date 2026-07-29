@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
+import type { LedgerEntry } from '../src/adjudication';
 import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
 import { totalTokens } from '../src/drivers/budget';
@@ -3267,6 +3268,9 @@ describe('the inline reviewer (RUN-61)', () => {
 
   // Continuation continuity (RUN-92): a re-dispatched failed run re-seeds from the record the prior
   // sitting left, so spend stays cumulative and the ledger is not relitigated.
+  // Deliberately NO `subclaims` field (RUN-180): a prior sitting's persisted record can predate
+  // sub-claims, and a continuation must load it as a single-claim entry (normalised on read)
+  // rather than crash — so these seeds keep the pre-RUN-180 shape a real record on disk has.
   const priorLedgerEntry = {
     id: 1,
     round: 2,
@@ -3277,7 +3281,7 @@ describe('the inline reviewer (RUN-61)', () => {
     status: 'fixed' as const,
     pointer: 'src/auth.ts:50',
     reason: 'guarded now',
-  };
+  } as unknown as LedgerEntry;
 
   it('re-seeds the prior sitting spend so a continuation reports CUMULATIVE totals (RUN-92)', async () => {
     const seed: ContinuableRun = {
@@ -3824,6 +3828,411 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('failed'); // finding 2 was never contested → it stands
     expect(reviewerStarts(h)).toBe(1); // not every finding contested → no re-review
+  });
+
+  // RUN-180: the same partial answer WITHIN one finding's sub-claims — the run_ms4t62384u0z6c6p4f5d
+  // escape. A bundled finding was "contested" by rebutting the refutable half; the other half rode
+  // the answer out. With the halves enumerated, a contest that names only one letter leaves the
+  // other STANDING, and the finding is not a candidate to clear — no fresh adjudicator to re-roll.
+  it('a contest answering only SOME of one finding’s sub-claims fails the run without a re-review', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1b: CONTESTED src/adjudication.ts:248 — slice keeps the most recent'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles two separately-answerable defects [sub-claims: 2]',
+        'FINDING 1a: the eligibility check accepts a response naming a nonexistent finding',
+        'FINDING 1b: the entry cap can drop a terminal finding before a PASS',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // sub-claim (a) was never contested → the finding stands
+    expect(reviewerStarts(h)).toBe(1); // …and no fresh adjudicator was spawned to possibly-PASS over it
+    // The ledger records WHICH sub-claim went unanswered — by its claim text, the identity the
+    // record keys on (letters are render-derived) — not a finding answered-as-a-whole.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['the eligibility check accepts a response naming a nonexistent finding', 'unanswered'],
+      ['the entry cap can drop a terminal finding before a PASS', 'contested'],
+    ]);
+    // The contest prompt carried the record: the letters the RESPONSE block answers by.
+    expect(h.claude.continuations.at(-1)).toContain(
+      '(a) the eligibility check accepts a response naming a nonexistent finding — no answer recorded',
+    );
+  });
+
+  // …and the bare-number answer is the escape verbatim: a whole-finding CONTESTED must not speak
+  // for letters it never named.
+  it('a bare CONTESTED cannot clear a finding that enumerated sub-claims', async () => {
+    const { h, exit } = await (async () => {
+      const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+      h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the whole thing is wrong'];
+      const done = h.supervisor.supervise(buildRun());
+      await flush();
+      h.claude.complete('done');
+      await onReviewTurn(h, 2);
+      h.claude.emitText(
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      );
+      h.claude.complete('done');
+      return { h, exit: await done };
+    })();
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // a bare answer credits no sub-claim → no re-review
+  });
+
+  // Candidacy reads the RECONCILED ledger entry, not the terminal round's own parse: the fold
+  // preserves held sub-claims when a re-raise drops the letters (a fresh reviewer paraphrases by
+  // construction), so a letterless terminal re-raise of a half-answered finding still carries its
+  // unanswered claim — and a bare contest must not clear it. Checking `f.subclaims` (empty on
+  // this path) was the RUN-174 escape reborn one round later.
+  it('a letterless re-raise of a half-answered finding is no candidate — the carried letter stands', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn answers the letterless re-raise with a bare whole-finding contest.
+      'FINDING 1: CONTESTED src/a.ts:9 — the whole finding is wrong',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding
+    await onReviewTurn(h, 3); // fix turn ran (answering only 1b), floor re-ran, round 2 starts
+    // The TERMINAL reviewer re-raises the same finding WITHOUT the letters.
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // carried sub-claim 'half one' was never contested → it stands
+    expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
+    // The ledger records the half-answered state the candidacy check read.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half one', 'unanswered'],
+      ['half two', 'contested'],
+    ]);
+  });
+
+  // The fold-level edition of the same escape: a terminal re-raise that repeats only SOME of the
+  // held claims used to REPLACE the held set, so the unanswered claim vanished from the
+  // reconciled entry and a contest of the repeated claim alone could clear the finding. The fold
+  // now unions the uncovered claim in — matched by wording, the sub-claim's identity — and
+  // candidacy, reading the reconciled entry, keeps the finding standing on it.
+  it('a terminal re-raise repeating only some letters is no candidate — the uncovered claim stands', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the ONE letter the terminal round chose to repeat.
+      'FINDING 1a: CONTESTED src/y.ts:3 — slice keeps the most recent',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    // The TERMINAL reviewer re-raises the finding but letters ONLY the already-rebutted claim.
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 1]',
+        'FINDING 1a: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the uncovered claim was never contested → it stands
+    expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
+    // The reconciled entry carries the uncovered claim — behind the re-raise's own enumeration in
+    // the record's order, visibly unanswered.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half two', 'contested'],
+      ['half one', 'unanswered'],
+    ]);
+  });
+
+  // A carried FIXED sub-claim blocks candidacy — the whole-finding rule ("a FIXED changed nothing
+  // here") at sub-claim grain: the terminal reviewer judged the diff WITH the fix in it and still
+  // failed, so "it is fixed" was already adjudicated and never buys the re-roll.
+  it('a carried FIXED sub-claim stands — a bare contest cannot clear over it', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1: CONTESTED src/a.ts:9 — the whole finding is wrong',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the FIXED letter is not a contest → the finding stands
+    expect(reviewerStarts(h)).toBe(2); // no fresh adjudicator spawned
+  });
+
+  // …but it is not a dead end: the builder who believes the fixed claim no longer holds CONTESTS
+  // it in the contest turn, at the letter the contest record shows for its position — the fold
+  // resolves a letter past the report's own lines against exactly those positions — and the
+  // finding earns the fresh look like any other full contest.
+  it('contesting the carried FIXED sub-claim this turn restores candidacy', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1a: CONTESTED src/f.ts:1 — the guard landed; the claim no longer holds\n' +
+        'FINDING 1: CONTESTED src/a.ts:9 — nothing in this finding survives the diff',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // The candidacy contract is the RECONCILED entry alone (criterion: every sub-claim contested and
+  // visible, or the finding stands) — the terminal report's own shape is never a second gate. The
+  // contest prompt tells the builder an already-contested record claim needs no fresh answer, so a
+  // letterless re-raise answered through the record's letters THIS turn must clear without a bare
+  // response beside it: demanding one would fail the exact builder that followed the prompt.
+  it('a letterless re-raise contested through the record’s letters alone earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the standing half by its record letter — no bare response.
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // every reconciled sub-claim contested → candidate, no bare needed
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // …and the same clearing holds when every carried claim already holds a rebuttal: the reconciled
+  // entry shows each sub-claim contested, the bare contest folds in as whole-finding evidence, and
+  // the fresh look adjudicates the carried pointers.
+  it('a letterless re-raise whose carried claims are all contested can still earn the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      'FINDING 1: CONTESTED src/a.ts:9 — both halves already rebutted',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests BOTH letters
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn → candidacy holds → fresh look
+    await onReviewTurn(h, 4);
+    // The adjudicator sees the carried per-letter rebuttals, not an answered-as-a-whole row.
+    const readjudged = h.claude.starts[3]!.prompt;
+    expect(readjudged).toContain('CONTESTED (src/x.ts:9)');
+    expect(readjudged).toContain('CONTESTED (src/y.ts:3)');
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // Held sub-claim state rides only a match that cannot be an invention. The prose rule matches
+  // entries on a 60-char claim prefix — legacy identity, unchanged — but two long claims that
+  // diverge past it can be two REAL findings, and inheriting one's contested letters let the
+  // other reach the fresh look on contests nobody made about its claim. The record drops with the
+  // replaced claim instead (a visible miss, never an invented credit), the entry is single-claim,
+  // and the pre-RUN-180 rule demands a contest THIS turn.
+  it('a prefix-aliased terminal re-raise does not inherit contested letters — no free fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    const prefix = 'the candidacy gate accepts inherited contests as if this claim had been examined ';
+    h.claude.continueTexts = [
+      // The fix turn contests BOTH letters of round 1's finding…
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn says nothing at all.
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        `FINDING 1 [High] src/gate.ts:1: ${prefix}in round one [sub-claims: 2]`,
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests both
+    await onReviewTurn(h, 3);
+    // The TERMINAL claim shares the 60-char prefix but diverges past it — a different claim that
+    // the prose key nonetheless matches to the same entry. Letterless, and no requirement bracket.
+    h.claude.emitText(`FINDING 1 [High] src/gate.ts:1: ${prefix}never at all\nVERDICT: FAIL`);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // no current contest → the aliased finding stands
+    expect(reviewerStarts(h)).toBe(2); // …and no fresh adjudicator was spawned on inherited letters
+    // The entry merged (prefix identity, as it always did) but the contested record did not ride.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.claim).toContain('never at all');
+    expect(entry?.subclaims).toEqual([]);
+  });
+
+  // The record's letters are what the contest resolves against — even where the terminal report's
+  // own lettering diverges, which is exactly the overflow path: the fold keeps the held set whole
+  // and drops the report's enumeration, so the record shows letters for claims the report never
+  // lettered. Answering those letters must credit the displayed claims, not be discarded against
+  // the dropped enumeration (the prompt calls the record authoritative; the code must agree).
+  it('contesting an overflowed record by its displayed letters earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(2), verifyResults: [true, true, true] });
+    const finding = (tag: string) =>
+      [
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles many claims [sub-claims: 4]',
+        ...['a', 'b', 'c', 'd'].map((l, i) => `FINDING 1${l}: ${tag} claim ${i + 1}`),
+        'VERDICT: FAIL',
+      ].join('\n');
+    h.claude.continueTexts = [
+      '', // fix turn 1: no structured response — every letter stays unanswered
+      '', // fix turn 2: same
+      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight HELD claims
+      // (rounds one and two), the terminal enumeration having been dropped by the overflow.
+      ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        .map((l) => `FINDING 1${l}: CONTESTED src/${l}.ts:1 — the record claim does not hold`)
+        .join('\n'),
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(finding('one'));
+    h.claude.complete('done'); // round 1: four letters
+    await onReviewTurn(h, 3);
+    h.claude.emitText(finding('two'));
+    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight
+    await onReviewTurn(h, 4);
+    h.claude.emitText(finding('three')); // terminal: four claims the union cannot hold → dropped
+    h.claude.complete('done');
+    await onReviewTurn(h, 5); // every displayed letter contested → the fresh look IS spawned
+    // The answers landed on the record's claims — none discarded against the dropped enumeration:
+    // the adjudicator's PRIOR ADJUDICATIONS shows each held claim with the letter's own pointer,
+    // including the positions past the terminal report's four lines.
+    const readjudged = h.claude.starts[4]!.prompt;
+    expect(readjudged).toMatch(/\(a\) two claim 1/); // the record's order: round 2's union
+    expect(readjudged).toContain('CONTESTED (src/a.ts:1)');
+    expect(readjudged).toMatch(/\(e\) one claim 1/); // …and the held tail the report never lettered
+    expect(readjudged).toContain('CONTESTED (src/e.ts:1)');
+    expect(readjudged).not.toContain('three claim'); // the dropped enumeration is not the record
+    h.claude.emitText('Every pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(4); // rounds 1–2, terminal, and the contest's fresh look
+  });
+
+  // Enumeration normalisation is all-or-nothing, so a bad enumeration (here: over the cap) leaves
+  // NO recorded subset a partial contest could clear — the finding is single-claim again, and the
+  // pre-RUN-180 rules apply whole: a bare CONTESTED is a full contest and earns the fresh look.
+  it('a voided enumeration degrades the finding to single-claim contest rules', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the whole class is pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    const five = ['a', 'b', 'c', 'd', 'e'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
+    h.claude.emitText(
+      `FINDING 1 [High] src/gate.ts:1: five letters is several findings\n${five}\nVERDICT: FAIL`,
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the bare contest DOES earn the re-review — no letters survived to demand more
+    h.claude.emitText('The pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2);
+  });
+
+  it('a contest naming EVERY sub-claim earns the fresh look, which sees the per-letter rebuttals', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    // The fresh adjudicator's PRIOR ADJUDICATIONS carries each sub-claim with its own rebuttal.
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toMatch(/\(a\) half one/);
+    expect(readjudged).toContain('CONTESTED (src/x.ts:9)');
+    expect(readjudged).toContain('CONTESTED (src/y.ts:3)');
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // every letter contested → the contest could clear the run
+    expect(reviewerStarts(h)).toBe(2);
   });
 
   // Criterion 7: a rebuttal the builder streams before the turn dies must survive into the ledger,
