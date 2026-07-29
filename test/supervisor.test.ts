@@ -3843,7 +3843,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     await onReviewTurn(h, 2);
     h.claude.emitText(
       [
-        'FINDING 1 [High] src/gate.ts:1: the gate bundles two separately-answerable defects',
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles two separately-answerable defects [sub-claims: 2]',
         'FINDING 1a: the eligibility check accepts a response naming a nonexistent finding',
         'FINDING 1b: the entry cap can drop a terminal finding before a PASS',
         'VERDICT: FAIL',
@@ -3877,7 +3877,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
       h.claude.complete('done');
       await onReviewTurn(h, 2);
       h.claude.emitText(
-        'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
       );
       h.claude.complete('done');
       return { h, exit: await done };
@@ -3905,7 +3905,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     await onReviewTurn(h, 2);
     h.claude.emitText(
       [
-        'FINDING 1 [High] src/gate.ts:1: two bundled defects',
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
         'FINDING 1a: half one',
         'FINDING 1b: half two',
         'VERDICT: FAIL',
@@ -3946,7 +3946,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     await onReviewTurn(h, 2);
     h.claude.emitText(
       [
-        'FINDING 1 [High] src/gate.ts:1: two bundled defects',
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
         'FINDING 1a: half one',
         'FINDING 1b: half two',
         'VERDICT: FAIL',
@@ -3956,9 +3956,11 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     await onReviewTurn(h, 3);
     // The TERMINAL reviewer re-raises the finding but letters ONLY the already-rebutted claim.
     h.claude.emitText(
-      ['FINDING 1 [High] src/gate.ts:1: two bundled defects', 'FINDING 1a: half two', 'VERDICT: FAIL'].join(
-        '\n',
-      ),
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 1]',
+        'FINDING 1a: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
     );
     h.claude.complete('done');
     const exit = await done;
@@ -3987,7 +3989,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // build turn
     await onReviewTurn(h, 2);
     h.claude.emitText(
-      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
     );
     h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
     await onReviewTurn(h, 3);
@@ -4014,7 +4016,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // build turn
     await onReviewTurn(h, 2);
     h.claude.emitText(
-      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
     );
     h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
     await onReviewTurn(h, 3);
@@ -4046,7 +4048,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // build turn
     await onReviewTurn(h, 2);
     h.claude.emitText(
-      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
     );
     h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
     await onReviewTurn(h, 3);
@@ -4074,7 +4076,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // build turn
     await onReviewTurn(h, 2);
     h.claude.emitText(
-      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
     );
     h.claude.complete('done'); // round 1 letters the finding; the fix turn contests BOTH letters
     await onReviewTurn(h, 3);
@@ -4125,7 +4127,7 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done');
     await onReviewTurn(h, 2);
     h.claude.emitText(
-      'FINDING 1 [High] src/gate.ts:1: two bundled defects\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
     );
     h.claude.complete('done');
     await onReviewTurn(h, 3);

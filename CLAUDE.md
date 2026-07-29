@@ -151,27 +151,25 @@ byte-identically; a persisted ledger predating sub-claims loads as single-claim 
 persisted by the letter-era shape loads claim-keyed with its stored letters ignored. The
 enumeration invariant — no separately-answerable claim escapes its own answer — has exactly ONE
 enforcement point, the parse-time classifier (RUN-90's chokepoint rule applied to the format
-itself): every line either structural net sees is classified once as the numbered FINDING line,
-the strict in-sequence sub-claim shape naming a claim no sibling names, or a voider of that
-finding's WHOLE enumeration (even a prose line starting `FINDING 1 rests…`), because a lost
-enumeration is a single-claim finding — current behaviour — where a kept subset lets a partial
-contest clear claims that were never recorded, and there is no malformed-label detector to slip
-past — detectors enumerate shapes and leak at the next one (`1 b:`, `1(b):`, `1b_:`, each an
-edition of the same escape). The HEAD net takes any line whose FIRST LETTERS are `FINDING <n>` —
-markdown decoration is a letterless prefix, so a bulleted `- FINDING 1b:`, invisible to a
-whitespace-only anchor, is a voider too; the NEAR-COLON TOKEN net takes `FINDING <n>…:` anywhere
-in the line, because decoration can also WEAR letters (`(b) FINDING 1b:` slips any prefix rule)
-and a colon hard by the number is label-intent where a colon further on is sentence structure; and
-the OUT-OF-RANGE LABEL net takes word-material glued to the number anywhere in the text, colon or
-no colon (`(b) FINDING 1b — …` slips both nets above by wearing a letter AND swallowing the
-colon), voiding unless the label is exactly one letter the recorded enumeration contains —
-in-range letters are spared because reports narrate their sub-claims by letter, and an in-range
-letter names a claim that IS recorded, so it can hide no unrecorded sibling. A mid-sentence
-mention with no colon beside it and no label on the number stays harmless prose, since reports
-narrate their findings by number and voiding on mention would kill every enumeration in a report
-that explains itself. Fold, render, and candidacy consume the canonical set and carry no shape
-detection or degradation rules of their own — the class dies where the data is born, or it does
-not die. The terminal report's own shape is not a second gate either: candidacy asks the
+itself), and the rule validity RESTS on is the COMPLETENESS CERTIFICATE, not any shape: an
+enumerating FINDING line ends its claim with `[sub-claims: <n>]`, and the letters are kept only
+when exactly n strict in-sequence lines parse. Shape nets can only void what they can SEE, and a
+mangled line can compose decoration, spacing and separator loss into plain English (`(b) FINDING
+1 b — claim B` is invisible to any rule that spares prose — the composition class every rewrite
+of the nets leaked at); the certificate voids by ABSENCE instead, since a line that mangles into
+ANYTHING is simply not counted, and no certificate — or a mutated one, which fails to parse as
+one — keeps no letters at all, the same safe degradation. What remains around it is hygiene, not
+the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
+is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
+letters, and a colon hard by the number is label-intent where a colon further on is sentence
+structure), and the OUT-OF-RANGE LABEL net (word-material glued to the number, colon or no colon,
+voids unless it is exactly one recorded letter — in-range letters are spared because reports
+narrate their sub-claims by letter, and an in-range letter names a claim that IS recorded). A
+mid-sentence mention with no colon beside it and no label on the number stays harmless prose,
+since reports narrate their findings by number and voiding on mention would kill every
+enumeration in a report that explains itself. Fold, render, and candidacy consume the canonical
+set and carry no shape detection or degradation rules of their own — the class dies where the
+data is born, or it does not die. The terminal report's own shape is not a second gate either: candidacy asks the
 reconciled entry — every sub-claim contested and visible, or the finding stands — and the
 per-letter contests reach it through the fold, so a letterless re-raise answered through the
 record's letters clears without a bare response beside it.

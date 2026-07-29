@@ -407,13 +407,14 @@ describe('renderLedger', () => {
 // in the RESPONSE block, and an unaddressed letter STANDS instead of riding its siblings' answer.
 describe('parsing sub-claims (RUN-180)', () => {
   const REPORT =
-    'FINDING 1 [High] src/gate.ts:12: the contest gate bundles two separately-answerable defects\n' +
+    'FINDING 1 [High] src/gate.ts:12: the contest gate bundles two separately-answerable defects [sub-claims: 2]\n' +
     'FINDING 1a: the eligibility check accepts a response naming a nonexistent finding\n' +
     'FINDING 1b: the entry cap can drop a terminal finding before a PASS\n' +
     'VERDICT: FAIL';
 
   // The canonical set is claim TEXT in report order (the structural settlement): a letter is the
-  // line's position, enforced a, b, c… by the parse, so nothing downstream ever stores one.
+  // line's position, enforced a, b, c… by the parse, so nothing downstream ever stores one. The
+  // `[sub-claims: 2]` certificate is consumed and STRIPPED — ledger identity carries prose alone.
   it('attaches lettered sub-claim lines to the finding their number names', () => {
     expect(parseFindings(REPORT)).toEqual([
       {
@@ -428,6 +429,48 @@ describe('parsing sub-claims (RUN-180)', () => {
         ],
       },
     ]);
+  });
+
+  // The completeness certificate is what closes the composed-malformation class the shape nets
+  // cannot: a mangled line — whatever it mangles into, including shapes indistinguishable from
+  // prose — is simply not counted, and the mismatch voids the whole enumeration.
+  it('letters without a [sub-claims: n] certificate are never kept', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\nFINDING 1a: half one\nFINDING 1b: half two',
+    );
+    expect(out[0]!.subclaims).toEqual([]);
+    expect(out[0]!.claim).toBe('the class');
+  });
+
+  it('a certificate that does not match the parsed count voids — over and under', () => {
+    for (const [decl, lines] of [
+      ['3', 'FINDING 1a: half one\nFINDING 1b: half two'], // declared 3, one line mangled away
+      ['1', 'FINDING 1a: half one\nFINDING 1b: half two'], // declared fewer than written
+    ] as const) {
+      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class [sub-claims: ${decl}]\n${lines}`);
+      expect(out[0]!.subclaims).toEqual([]);
+      expect(out[0]!.claim).toBe('the class'); // the certificate is stripped even when it voids
+    }
+  });
+
+  // The two composed shapes that slipped every net — decorated + spaced + colon swallowed, and an
+  // in-range duplicate letter carrying a DISTINCT claim. Both are invisible as lines (they read as
+  // prose), so the certificate is the only thing that can see them: intended but unparsed → not
+  // counted → the whole enumeration voids, never a kept subset.
+  it('a mangled sibling invisible to every net still voids — the certificate counts its absence', () => {
+    const spaced = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: claim A\n' +
+        '(b) FINDING 1 b — claim B',
+    );
+    expect(spaced[0]!.subclaims).toEqual([]);
+    const dupLabel = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 3]\n' +
+        'FINDING 1a: claim A\n' +
+        'FINDING 1b: claim B\n' +
+        '(b) FINDING 1b — distinct claim C',
+    );
+    expect(dupLabel[0]!.subclaims).toEqual([]);
   });
 
   // Malformed enumeration degrades to the single-claim finding, never to an unparsed line — the
@@ -445,7 +488,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // always was.
   it('a valid letter beside a malformed one degrades the WHOLE finding to single-claim', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: a well-formed sub-claim\n' +
         'FINDING 1b — malformed, a dash where the colon must be',
     );
@@ -458,7 +501,9 @@ describe('parsing sub-claims (RUN-180)', () => {
   // otherwise keep the well-formed subset — the kept-subset escape through the detector itself.
   it('a malformed multi-letter line (FINDING 1aa) voids the enumeration like any other bad line', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\nFINDING 1a: a well-formed sub-claim\nFINDING 1aa: two letters',
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: a well-formed sub-claim\n' +
+        'FINDING 1aa: two letters',
     );
     expect(out).toHaveLength(1);
     expect(out[0]!.subclaims).toEqual([]);
@@ -469,7 +514,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // the complete enumeration — the kept-subset escape through the detector, second edition.
   it('a spaced label (FINDING 1 b:) voids the WHOLE enumeration — a valid sibling must not survive it', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: a well-formed sub-claim\n' +
         'FINDING 1 b: the letter drifted off the number',
     );
@@ -518,7 +563,9 @@ describe('parsing sub-claims (RUN-180)', () => {
       'Note: FINDING 1b2 — mutated label, colon replaced',
       '(b) FINDING 1b_ — trailing junk, colon replaced',
     ]) {
-      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\nFINDING 1a: well-formed\n${bad}`);
+      const out = parseFindings(
+        `FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\nFINDING 1a: well-formed\n${bad}`,
+      );
       expect(out).toHaveLength(1);
       expect(out[0]!.subclaims).toEqual([]);
     }
@@ -530,7 +577,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // partial contest could clear, so leaving it harmless is the safe direction too.
   it('a prose mention of FINDING <n> mid-sentence does not void its enumeration', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'The escape described in FINDING 1 is the subject of this report.',
@@ -542,7 +589,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // the enumeration RECORDS can hide no unrecorded sibling — so an in-range mention stays prose.
   it('an in-range lettered mention does not void — reports narrate recorded letters', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'Here FINDING 1a is contested while FINDING 1b stands on the same evidence.',
@@ -552,7 +599,7 @@ describe('parsing sub-claims (RUN-180)', () => {
 
   it('an out-of-range lettered mention voids — it is an intended sibling the nets could not read', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: half one\n' +
         'as FINDING 1c argues, the same gate leaks elsewhere too',
     );
@@ -563,7 +610,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // finding 1 wearing label `2` — and a longer number cannot void a shorter one's enumeration.
   it('a mention of a longer finding number is not a label on the shorter one', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: half one\n' +
         'see FINDING 12 in the previous report for background',
     );
@@ -574,7 +621,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // sentence structure, further along the line, stays prose and spares the enumeration.
   it('a prose mention with a far-away colon does not void either', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'See FINDING 1 for the full chain of evidence: it holds either way.',
@@ -586,7 +633,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // finding — it letters nothing and must not void the letters it escalates over.
   it('an ESCALATE STRUCTURAL line does not void the finding it escalates', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'ESCALATE STRUCTURAL FINDING 1: the promise leaks with no chokepoint — a.ts:1, b.ts:2, c.ts:3',
@@ -598,10 +645,10 @@ describe('parsing sub-claims (RUN-180)', () => {
   // quotes `FINDING 1:` is a recorder for 2 and a voider for 1 — never a recorder for 1.
   it('a sub-claim line mentioning another finding near-colon voids that finding, not itself', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: one\n' +
+      'FINDING 1 [High] a.ts:1: one [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
-        'FINDING 2 [High] b.ts:1: two\n' +
+        'FINDING 2 [High] b.ts:1: two [sub-claims: 1]\n' +
         'FINDING 2a: overlaps FINDING 1: the same gate',
     );
     expect(out[0]!.subclaims).toEqual([]); // voided by the quoted near-colon token
@@ -613,7 +660,7 @@ describe('parsing sub-claims (RUN-180)', () => {
   // and always a correct way to record it; a kept subset is the escape. Never an error.
   it('a prose line starting FINDING <n> degrades the finding to single-claim, never to an error', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\n' +
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: a well-formed sub-claim\n' +
         'FINDING 1 rests on the same evidence either way',
     );
@@ -623,7 +670,7 @@ describe('parsing sub-claims (RUN-180)', () => {
 
   it('a duplicated letter voids the enumeration — a response naming it would be ambiguous', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: c\nFINDING 1a: first version\nFINDING 1a: second version',
+      'FINDING 1 [High] a.ts:1: c [sub-claims: 2]\nFINDING 1a: first version\nFINDING 1a: second version',
     );
     expect(out[0]!.subclaims).toEqual([]);
   });
@@ -637,7 +684,7 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1a: first\nFINDING 1c: skips b', // a gap
       'FINDING 1b: only line, no a', // starts past a
     ]) {
-      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${bad}`);
+      const out = parseFindings(`FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n${bad}`);
       expect(out[0]!.subclaims).toEqual([]);
     }
   });
@@ -646,7 +693,9 @@ describe('parsing sub-claims (RUN-180)', () => {
   // whole enumeration degrades rather than leaving an ambiguous pair a response could split.
   it('the same claim under two letters voids the enumeration', () => {
     const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class\nFINDING 1a: the same words\nFINDING 1b: the same words',
+      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
+        'FINDING 1a: the same words\n' +
+        'FINDING 1b: the same words',
     );
     expect(out[0]!.subclaims).toEqual([]);
   });
@@ -656,13 +705,13 @@ describe('parsing sub-claims (RUN-180)', () => {
   // contest clear four letters while the fifth claim went unrecorded.
   it('more sub-claims than the cap drops the enumeration, not the tail', () => {
     const letters = ['a', 'b', 'c', 'd', 'e', 'f'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
-    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
+    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class [sub-claims: 6]\n${letters}`);
     expect(out[0]!.subclaims).toEqual([]);
   });
 
   it('an enumeration at the cap is kept whole', () => {
     const letters = ['a', 'b', 'c', 'd'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
-    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class\n${letters}`);
+    const out = parseFindings(`FINDING 1 [High] a.ts:1: the class [sub-claims: 4]\n${letters}`);
     expect(out[0]!.subclaims).toEqual(['claim a', 'claim b', 'claim c', 'claim d']);
   });
 
@@ -857,7 +906,7 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
   // refusing is a visibly unanswered sub-claim on an over-long claim — a miss, never an invention.
   it('a truncated claim never carries an answer — two long claims must not share one', () => {
     const longReport = (tail: string) =>
-      `FINDING 1 [High] a.ts:1: the class\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
+      `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
     const [one] = parseFindings(longReport('ONE'));
     const [two] = parseFindings(longReport('TWO'));
     expect(one!.subclaims[0]).toEqual(two!.subclaims[0]); // capped to the same text…

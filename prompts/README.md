@@ -102,8 +102,13 @@ comes back reworded and the ledger's prose key misses it. It also says not to st
 fit a requirement, because a wrong association is worse than none.
 
 A collapsed finding may enumerate its separately-answerable claims as lettered sub-claim lines —
-`FINDING <n><letter>: <claim>`, lettered `a, b, c…` in order — and the RESPONSE side answers per
-letter (RUN-180). `reviewer-feedback.md` and `reviewer-contest.md` both carry the answer shape,
+`FINDING <n><letter>: <claim>`, lettered `a, b, c…` in order, under a FINDING line whose claim
+ends with the completeness certificate `[sub-claims: <count>]` — and the RESPONSE side answers per
+letter (RUN-180). The certificate is what makes the enumeration all-or-nothing against shapes no
+net can see: the letters are kept only when exactly `<count>` well-formed lines parse, so a line
+that mangles into anything — even plain English — subtracts from the count and voids the whole,
+and a FINDING line without the certificate keeps no letters at all.
+`reviewer-feedback.md` and `reviewer-contest.md` both carry the answer shape,
 because a response is credited only for the sub-claims it names: an unaddressed sub-claim stands
 rather than riding its siblings' answer, which is how a bundled finding once left a valid half
 "answered" by the rebuttal of the other. A sub-claim's identity is its claim WORDING, not its

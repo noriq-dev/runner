@@ -157,21 +157,36 @@ const FINDING_RE =
 // well-formed half of a bad enumeration would let a finding clear on the letters that parsed
 // while a malformed sibling was never even entered, the exact escape this format exists to close.
 //
-// Which is why there is no malformed-label DETECTOR here. Detection is enumerating the shapes a
-// model might malform a letter into, and every edition of that list leaked at its next edge:
-// single-letter matching missed `1aa`, letters-hard-against-the-number missed the spaced `1 b:`, a
-// separator allowlist missed the parenthesized `1(b):`, a junk class with a `\b` missed `1b_:` and
-// `1b2:` — each time the unseen sibling left the valid letters standing as the "complete"
-// enumeration. So nothing is enumerated. A line is CLASSIFIED exactly once (see parseFindings)
-// when either of two structural nets sees it, and then it is one of three things: the numbered
-// FINDING line itself, the strict sub-claim shape — lettered a, b, c… in report order, naming a
-// claim no sibling already names — or, everything else, a voider of that finding's whole
-// enumeration. The strict shape is the only allowlist, and a shape that cannot be mistaken for it
-// simply does not exist. The in-order rule is what makes a letter pure position (the settlement:
-// identity is claim text; a letter is a positional label of the report it appeared in, never
-// state), and the no-duplicate-claim rule keeps that identity unambiguous inside one enumeration —
-// two letters naming one claim is not separately answerable, so it is an intended-but-invalid
-// enumeration like any other.
+// The rule that actually closes that escape is the COMPLETENESS DECLARATION, not any shape rule: a
+// FINDING line that enumerates must end its claim with `[sub-claims: <n>]`, and the enumeration is
+// kept only when EXACTLY n strict lettered lines arrive. Shape nets (below) can only void what
+// they can SEE, and a mangled line can compose decoration, spacing, and separator loss into a
+// shape indistinguishable from English — `(b) FINDING 1 b — claim B` is invisible to every net
+// that spares prose, and each review round of this run's own gestation found another such
+// composition. The declaration voids by ABSENCE instead: a line that mangles into ANY shape
+// whatsoever — visible or not — subtracts from the strict count, mismatches the certificate, and
+// the whole enumeration degrades to the single-claim finding. No declaration → no enumeration
+// (letters without a certificate are never kept); a mangled declaration fails to parse as one and
+// lands in the same place. The residue is no longer a parser hole but authorial incoherence: a
+// kept subset now requires the reviewer to certify the subset as complete — to declare a count
+// that excludes a line it wrote — which no shape can produce on its own.
+//
+// The shape nets below remain as hygiene AROUND that rule — they void visible label mutations
+// early and keep narration harmless — but validity never rests on them. Detection by shape is
+// enumerating the shapes a model might malform a letter into, and every edition of that list
+// leaked at its next edge: single-letter matching missed `1aa`, letters-hard-against-the-number
+// missed the spaced `1 b:`, a separator allowlist missed the parenthesized `1(b):`, a junk class
+// with a `\b` missed `1b_:` and `1b2:`, the colon window missed the swallowed colon — each time
+// the unseen sibling left the valid letters standing as the "complete" enumeration until the
+// declaration made unseen mean uncounted. A line is CLASSIFIED exactly once (see parseFindings)
+// when either structural net sees it, and then it is one of three things: the numbered FINDING
+// line itself, the strict sub-claim shape — lettered a, b, c… in report order, naming a claim no
+// sibling already names — or, everything else, a voider of that finding's whole enumeration. The
+// in-order rule is what makes a letter pure position (the settlement: identity is claim text; a
+// letter is a positional label of the report it appeared in, never state), and the
+// no-duplicate-claim rule keeps that identity unambiguous inside one enumeration — two letters
+// naming one claim is not separately answerable, so it is an intended-but-invalid enumeration
+// like any other.
 //
 // Net one — the HEAD: any line whose FIRST LETTERS are `FINDING <n>`. The prefix may be ANY run
 // of non-letter characters, because markdown decoration is exactly that — `- FINDING 1b:`,
@@ -225,6 +240,11 @@ const ESCALATE_LINE_RE = /^[ \t]*ESCALATE[ \t]+STRUCTURAL[ \t]+FINDING\b/i;
 /** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
 const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
+/** The completeness declaration, at the very end of the FINDING line's claim. Strict on purpose:
+ *  a mutated declaration is claim text, the finding then has no certificate, and its letters are
+ *  not kept — the same safe degradation as every other malformation. Stripped from the stored
+ *  claim, so the ledger, the prose key, and every render carry the claim alone. */
+const SUBCLAIM_DECL_RE = /[ \t]*\[[ \t]*sub-claims:[ \t]*(\d{1,2})[ \t]*\]$/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -282,16 +302,23 @@ export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =
 export function parseFindings(text: string): Finding[] {
   const out: Finding[] = [];
   const seen = new Set<number>();
+  // The completeness certificate per finding (RUN-180): how many sub-claims the FINDING line says
+  // it enumerates. Extracted BEFORE the claim is capped — truncation must not eat the certificate
+  // — and stripped from the stored claim, so ledger identity and every render carry prose alone.
+  const declared = new Map<number, number>();
   for (const m of text.matchAll(FINDING_RE)) {
     const id = Number(m[1]);
     if (seen.has(id)) continue; // a duplicated number is the reviewer's slip; first wins
     seen.add(id);
+    const rawClaim = m[5]!;
+    const decl = SUBCLAIM_DECL_RE.exec(rawClaim);
+    if (decl) declared.set(id, Number(decl[1]));
     out.push({
       id,
       severity: cap(m[2]!, SEVERITY_CAP),
       requirements: parseRequirements(m[3]),
       location: cap(m[4]!, LOCATION_CAP),
-      claim: cap(m[5]!, CLAIM_CAP),
+      claim: cap(decl ? rawClaim.slice(0, decl.index) : rawClaim, CLAIM_CAP),
       subclaims: [],
     });
   }
@@ -357,6 +384,15 @@ export function parseFindings(text: string): Finding[] {
     const label = m[2]!.toLowerCase();
     const i = label.charCodeAt(0) - 97;
     if (label.length !== 1 || i < 0 || i >= list.length) pending.set(id, null);
+  }
+  // The completeness check, last, because it is a fact about the finished set: the enumeration is
+  // kept only when the FINDING line certified EXACTLY this many sub-claims. This is what the shape
+  // nets above cannot do — they void what they can see, and a line can mangle into English — where
+  // a mangled line of ANY shape is simply not counted, so the mismatch voids the whole. Letters
+  // with no certificate are never kept: keeping them would put validity back on the nets alone,
+  // and the safe degradation for a missing or mutated certificate is the single-claim finding.
+  for (const [id, subs] of pending) {
+    if (subs && declared.get(id) !== subs.length) pending.set(id, null);
   }
   for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
   return out;
