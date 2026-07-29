@@ -136,12 +136,16 @@ const FINDING_RE =
 // every sub-claim contested?", and it can only ask that of the sub-claims that were RECORDED — so
 // keeping the well-formed half of a bad enumeration would let a finding clear on the letters that
 // parsed while a malformed or over-cap sibling was never even entered, the exact escape this
-// format exists to close. The LINE matcher recognises the intent to letter (anything shaped
-// `FINDING <n><letter>…` at line start); the strict shape then has to hold for EVERY such line, or
-// the finding keeps no letters and stays the single answerable claim it always was — which is
-// current behaviour, and always a correct way to record it (the RUN-148 steps rule: a
-// decomposition that cannot be run soundly is dropped, never half-run).
-const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])\b[^\n]*$/gim;
+// format exists to close. The LINE matcher recognises the intent to letter, and it matches ONE OR
+// MORE letters on purpose: a shape the detector cannot see is a shape it cannot void, and a
+// single-letter detector let a malformed `FINDING 1aa` line coexist invisibly with a valid
+// `FINDING 1a` — the kept-subset escape through the detector itself. The strict shape (exactly one
+// letter, colon, claim) then has to hold for EVERY detected line, or the finding keeps no letters
+// and stays the single answerable claim it always was — which is current behaviour, and always a
+// correct way to record it (the RUN-148 steps rule: a decomposition that cannot be run soundly is
+// dropped, never half-run). Letters must sit hard against the number, so `FINDING 1 [High] …` and
+// `FINDING 1: FIXED …` — every legacy line — never reach the detector at all.
+const SUBCLAIM_LINE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z]+)\b[^\n]*$/gim;
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+\d+[a-z][ \t]*:[ \t]+(.+?)[ \t]*$/i;
 
 /**
@@ -233,7 +237,12 @@ export function parseFindings(text: string): Finding[] {
     const shaped = SUBCLAIM_SHAPE_RE.exec(m[0]!);
     const letter = m[2]!.toLowerCase();
     const held = list ?? [];
-    if (!shaped || held.some((s) => s.letter === letter) || held.length >= MAX_SUBCLAIMS) {
+    if (
+      letter.length !== 1 || // a multi-letter tail (`1aa`) is a lettered line with no valid letter
+      !shaped ||
+      held.some((s) => s.letter === letter) ||
+      held.length >= MAX_SUBCLAIMS
+    ) {
       pending.set(id, null);
       continue;
     }
@@ -349,8 +358,19 @@ export function buildLedger(
   // inherit one rebuttal, answering a claim nobody answered — and a letter is one reviewer's
   // ordering, not the claim's identity. Full wording may MISS a paraphrase (the sub-claim reads as
   // unanswered, visibly, and the builder can answer again); it cannot INVENT a match, which is the
-  // failure the whole ledger refuses. Claims are already capped, so the key is bounded.
+  // failure the whole ledger refuses.
+  //
+  // …which is also why a TRUNCATED claim never carries: cap() marks truncation with a trailing
+  // ellipsis, and two distinct over-cap claims cap to the same text — so a key ending in one is a
+  // prefix wearing an identity, the aliasing above through the cap instead of the slice. Skipping
+  // it costs a visibly unanswered sub-claim on a claim longer than CLAIM_CAP; matching it answers
+  // a claim nobody answered.
   const subKey = (c: string) => c.toLowerCase().trim();
+  const carriedFrom = (held: AdjudicatedSubClaim[], claim: string): AdjudicatedSubClaim | undefined => {
+    const key = subKey(claim);
+    if (key.endsWith('…')) return undefined;
+    return held.find((h) => subKey(h.claim) === key);
+  };
   const result = [...prior];
   for (const f of findings) {
     const r = byId.get(f.id);
@@ -363,7 +383,7 @@ export function buildLedger(
     const subclaims: AdjudicatedSubClaim[] = f.subclaims.length
       ? f.subclaims.map((sc) => {
           const rs = bySub.get(`${f.id}${sc.letter}`);
-          const carried = heldSubs.find((h) => subKey(h.claim) === subKey(sc.claim));
+          const carried = carriedFrom(heldSubs, sc.claim);
           return {
             letter: sc.letter,
             claim: sc.claim,

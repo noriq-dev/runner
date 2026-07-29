@@ -449,6 +449,17 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
+  // The detector matches one-or-more letters so a malformed multi-letter form cannot slip past it:
+  // a shape the detector cannot see is a shape it cannot void, and `1aa` beside a valid `1a` would
+  // otherwise keep the well-formed subset — the kept-subset escape through the detector itself.
+  it('a malformed multi-letter line (FINDING 1aa) voids the enumeration like any other bad line', () => {
+    const out = parseFindings(
+      'FINDING 1 [High] a.ts:1: the class\nFINDING 1a: a well-formed sub-claim\nFINDING 1aa: two letters',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.subclaims).toEqual([]);
+  });
+
   it('a duplicated letter voids the enumeration — a response naming it would be ambiguous', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: c\nFINDING 1a: first version\nFINDING 1a: second version',
@@ -572,6 +583,20 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
         reason: null,
       },
     ]);
+  });
+
+  // A TRUNCATED claim is a prefix wearing an identity: two distinct over-cap claims cap to the
+  // same text, so carrying across that match would answer a claim nobody answered. The cost of
+  // refusing is a visibly unanswered sub-claim on an over-long claim — a miss, never an invention.
+  it('a truncated claim never carries an answer — two long claims must not share one', () => {
+    const longReport = (tail: string) =>
+      `FINDING 1 [High] a.ts:1: the class\nFINDING 1a: ${'x'.repeat(250)}${tail}`;
+    const [one] = parseFindings(longReport('ONE'));
+    const [two] = parseFindings(longReport('TWO'));
+    expect(one!.subclaims[0]!.claim).toEqual(two!.subclaims[0]!.claim); // capped to the same text…
+    const round1 = buildLedger([], [one!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const round2 = buildLedger(round1, [two!], [], 2);
+    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered']); // …but never carried
   });
 
   // The carry key is the claim's FULL wording, not a 60-char prefix: two long claims that diverge
