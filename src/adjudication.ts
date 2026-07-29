@@ -26,9 +26,9 @@ export interface Finding {
   location: string;
   claim: string;
   /** The claim's FULL normalized identity, present only when the display cap cut the claim (or
-   *  an authored trailing ellipsis makes a cut indistinguishable) and IDENTITY_CAP can hold it
-   *  whole (RUN-180): what sub-claim carry compares when the display can no longer speak for the
-   *  wording. Never a hash and never a truncation — see identityOf. Absent on every finding whose
+   *  an authored trailing ellipsis makes a cut indistinguishable) (RUN-180): what sub-claim
+   *  carry compares when the display can no longer speak for the wording. Whole at any length —
+   *  never a hash, a truncation, or a bound (see storedKey). Absent on every finding whose
    *  display IS its identity, which is every finding the pre-RUN-180 world ever parsed. */
   claimKey?: string;
   /** The finding's enumerated separately-answerable claims (RUN-180), from the strict
@@ -72,10 +72,10 @@ export interface FindingResponse {
  *  (this run's structural settlement). Renders re-derive letters from position. */
 export interface AdjudicatedSubClaim {
   claim: string;
-  /** The claim's FULL normalized identity beside a display the cap cut (RUN-180). Absent when the
-   *  display is the identity — every under-cap claim — and on records that cannot have one: a
-   *  claim that outgrew IDENTITY_CAP, or one the bare-ellipsis era persisted with the tail
-   *  already gone. A record without an identity never matches anything (see identityOf). */
+  /** The claim's FULL normalized identity beside a display the cap cut (RUN-180). Absent when
+   *  the display is the identity — every under-cap claim — and on the records that cannot have
+   *  one: those the bare-ellipsis era persisted with the tail already gone. A record without an
+   *  identity never matches anything (see identityOf). */
   key?: string;
   status: FindingStatus | 'unanswered';
   pointer: string | null;
@@ -145,40 +145,35 @@ const cap = (s: string, n: number) => {
 /** A claim's identity: its normalized claim TEXT (the structural settlement). Everything that
  *  matches, carries, or credits a claim across rounds keys on this — never on a letter. */
 const subKey = (c: string) => c.toLowerCase().trim();
-/** Identity storage's own bound ("never a transcript by another name"). Generous next to
- *  CLAIM_CAP because it is not a display width — any claim a reviewer plausibly writes fits
- *  whole — and a claim that outgrows it is stored with NO identity rather than a shortened one:
- *  a truncated identity aliases every claim sharing the prefix, and a hashed one collides (32
- *  bits are trivially minable — this run's own terminal round mined `8f907ae1` to prove it).
- *  Both are INVENTS; an absent identity only ever MISSES — a visible duplicate row the builder
- *  can answer again — which is the order of harms the whole ledger obeys. */
-const IDENTITY_CAP = 1000;
-/** The identity of a claim still in hand as the report's RAW text (parse and fold time): the
- *  FULL normalized text, whole or not at all. */
-const identityOfRaw = (raw: string): string | null => {
-  const k = subKey(raw);
-  return k.length <= IDENTITY_CAP ? k : null;
-};
 /** The WRITE half of identity-beside-display (this run's terminal settlement): display capping
  *  stays the legacy bare ellipsis, byte-identical — the display field never carries a suffix a
  *  reader did not write — so a display the cap left whole IS the identity and stores nothing
  *  extra, while a display ending in the ellipsis (cut by cap(), or authored so a reader cannot
- *  tell) stores the full normalized text in a field of its own. */
-const storedKey = (raw: string): string | undefined => {
-  if (!subKey(cap(raw, CLAIM_CAP)).endsWith('…')) return undefined;
-  return identityOfRaw(raw) ?? undefined;
-};
+ *  tell) stores the full normalized text in a field of its own.
+ *
+ *  The identity is stored WHOLE, with no bound of its own — it is exactly as long as the claim
+ *  the reviewer wrote on one report line, already bounded by the report the run carries in full.
+ *  Every shortening of it re-opens the escape somewhere: a truncation aliases every claim
+ *  sharing the prefix, a hash collides (32 bits are trivially minable — this run's own terminal
+ *  round mined `8f907ae1` to prove it), and a length bound is a CLIFF — at bound+1 an exact
+ *  letterless re-raise stopped carrying its partly answered record, re-opening the bare-contest
+ *  path (the next round's gate mined exactly that). The first two INVENT; the cliff LOSES a
+ *  record, worse than the duplicate-row miss it was traded for. What keeps the ledger distilled
+ *  is its COUNT caps (MAX_LEDGER_SUBCLAIMS, MAX_ENTRIES) and its display/evidence caps; this is
+ *  the one field whose job is to be lossless. */
+const storedKey = (raw: string): string | undefined =>
+  subKey(cap(raw, CLAIM_CAP)).endsWith('…') ? subKey(raw) : undefined;
 /** The READ half, over a stored record: a display that ends with the ellipsis cannot be its own
  *  identity — two distinct over-cap claims share it — so the identity is the key stored beside
- *  it, and a record with none never matches anything: one persisted by the bare-ellipsis era
- *  (parks, continuation seeds — the tail is simply gone), or a claim too long even for
- *  IDENTITY_CAP. Either way the cost is the visible duplicate row, never an invented match. */
+ *  it, and a record with none — persisted by the bare-ellipsis era (parks, continuation seeds:
+ *  the tail is simply gone) — never matches anything: the visible duplicate-row miss, never an
+ *  invented match. */
 const identityOf = (display: string, key: unknown): string | null => {
   const d = subKey(display);
   if (!d.endsWith('…')) return d;
   if (typeof key !== 'string') return null;
   const k = subKey(key);
-  return k.length > 0 && k.length <= IDENTITY_CAP ? k : null;
+  return k.length > 0 ? k : null;
 };
 
 // `FINDING 1 [High] [R-7] src/init-project.ts:357: detectVcs runs on every init`. The separator
@@ -352,34 +347,52 @@ const reqsOf = (e: { requirements?: unknown }): string[] =>
   Array.isArray(e.requirements) ? e.requirements.filter((r): r is string => typeof r === 'string') : [];
 
 /** Same contract for sub-claims (RUN-180): a ledger persisted before they existed — every park and
- *  continuation seed until now — reads as single-claim entries, and a hand-edited record degrades
- *  field by field rather than crashing. An entry persisted by the letter-era shape loads too: the
- *  claim is the identity, so a stray `letter` field is simply ignored. Exported because the
- *  terminal-contest candidacy check in the supervisor reads entries the same way — never trusted
- *  from the object. */
-export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =>
-  Array.isArray(e.subclaims)
-    ? e.subclaims
-        .filter(
-          (s): s is Record<string, unknown> & { claim: string } =>
-            typeof s === 'object' && s !== null && typeof (s as { claim?: unknown }).claim === 'string',
-        )
-        .slice(0, MAX_LEDGER_SUBCLAIMS)
-        .map((s) => ({
-          claim: s.claim,
-          // The identity field rides only when it is one: a non-string or over-bound value reads
-          // as no identity at all (the record then never matches — a miss, never an alias).
-          ...(typeof s.key === 'string' && s.key.length <= IDENTITY_CAP ? { key: s.key } : {}),
-          status: s.status === 'fixed' || s.status === 'contested' ? s.status : 'unanswered',
-          pointer: typeof s.pointer === 'string' ? s.pointer : null,
-          reason: typeof s.reason === 'string' ? s.reason : null,
-        }))
-    : [];
+ *  continuation seed until now — reads as single-claim entries, never a crash. An entry persisted
+ *  by the letter-era shape loads too: the claim is the identity, so a stray `letter` field is
+ *  simply ignored. Exported because the terminal-contest candidacy check in the supervisor reads
+ *  entries the same way — never trusted from the object.
+ *
+ *  Degradation splits by grain, and the split is the safety direction. A FIELD inside a
+ *  well-formed record degrades field by field toward the STANDING state — an unknown status
+ *  reads 'unanswered', a non-identity key reads unmatchable — because a field's fallback can
+ *  only make the claim harder to clear. The LIST does not: an entry that is not a sub-claim, or
+ *  more entries than the fold can ever write, voids the WHOLE list to the single-claim entry the
+ *  finding would otherwise be — never the well-formed subset, because a kept subset is clearable
+ *  around the claim it dropped (the parse chokepoint's all-or-nothing rule, applied at the other
+ *  boundary where sub-claim state is born into the process: this reader is to persisted records
+ *  what parseFindings is to reports, not a downstream consumer doing shape repair). */
+export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] => {
+  const list = e.subclaims;
+  if (!Array.isArray(list) || list.length > MAX_LEDGER_SUBCLAIMS) return [];
+  const out: AdjudicatedSubClaim[] = [];
+  for (const s of list) {
+    if (typeof s !== 'object' || s === null || typeof (s as { claim?: unknown }).claim !== 'string')
+      return [];
+    const r = s as Record<string, unknown> & { claim: string };
+    out.push({
+      claim: r.claim,
+      ...(typeof r.key === 'string' && r.key.length > 0 ? { key: r.key } : {}),
+      status: r.status === 'fixed' || r.status === 'contested' ? r.status : 'unanswered',
+      pointer: typeof r.pointer === 'string' ? r.pointer : null,
+      reason: typeof r.reason === 'string' ? r.reason : null,
+    });
+  }
+  return out;
+};
 
 /** Extract the reviewer's numbered findings. Anything that does not match the shape is simply
  *  not in the ledger — a reviewer that ignores the format degrades to today's behavior, never
  *  an error. */
-export function parseFindings(text: string): Finding[] {
+export function parseFindings(input: string): Finding[] {
+  // Line endings are normalized BEFORE any anchor runs — the parse chokepoint owns the line
+  // shape it classifies. A CRLF report is the same report, but a stray `\r` sits exactly where
+  // the certificate's `$` and the strict sub-claim shape look (neither is multiline, and `.`,
+  // `[ \t]` and end-of-string `$` all refuse `\r`), so a CRLF reviewer silently lost every
+  // enumeration while its numbered findings — matched by the multiline FINDING_RE, whose `$`
+  // accepts any line terminator — still parsed. A transport formatting fact must not void what
+  // the format rules mean to keep, and normalizing HERE keeps the invariant's one enforcement
+  // point: no downstream consumer ever sees a `\r` the nets and blocks were never taught.
+  const text = input.replace(/\r\n?/g, '\n');
   const out: Finding[] = [];
   const seen = new Set<number>();
   // The completeness certificate per finding (RUN-180): how many sub-claims the FINDING line says
@@ -523,7 +536,11 @@ const RESPONSE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])?:[ \t]*(FIXED|CONTESTED)\b
 /** Extract the builder's per-finding responses from its structured block. Unmatched lines are
  *  ignored; a builder that writes no block yields no responses (the findings then carry into the
  *  ledger as 'unanswered'). */
-export function parseFindingResponses(text: string): FindingResponse[] {
+export function parseFindingResponses(input: string): FindingResponse[] {
+  // The same line-ending normalization as parseFindings, for the same reason: the two parsers
+  // are the two halves of one format, and the RESPONSE side must read every line the FINDING
+  // side taught a builder to answer — CRLF included.
+  const text = input.replace(/\r\n?/g, '\n');
   const out: FindingResponse[] = [];
   const seen = new Set<string>();
   for (const m of text.matchAll(RESPONSE_RE)) {
@@ -617,12 +634,11 @@ export function buildLedger(
   // ordering, not the claim's identity (the structural settlement). Full wording may MISS a
   // paraphrase (the sub-claim reads as unanswered, visibly, and the builder can answer again); it
   // cannot INVENT a match, which is the failure the whole ledger refuses. The fresh side is the
-  // report's raw text; the held side answers with the identity stored beside a cut display
-  // (identityOf) — and a record with none, the bare-ellipsis era's or an over-IDENTITY_CAP
-  // claim's, never carries.
+  // report's raw text, whose identity is always whole in hand; the held side answers with the
+  // identity stored beside a cut display (identityOf) — and a record with none, the
+  // bare-ellipsis era's, never carries.
   const carriedFrom = (held: AdjudicatedSubClaim[], raw: string): AdjudicatedSubClaim | undefined => {
-    const key = identityOfRaw(raw);
-    if (key === null) return undefined;
+    const key = subKey(raw);
     return held.find((h) => identityOf(h.claim, h.key) === key);
   };
   // This round's enumeration wins its own framing (the latest wording, like the claim itself) —
@@ -680,7 +696,7 @@ export function buildLedger(
     // the same preservation the whole-finding status gets below.
     if (!f.subclaims.length) return creditedHeld;
     const mapped = f.subclaims.map((raw, i) => recorded(raw, responseAt(i), carriedFrom(heldSubs, raw)));
-    const covered = new Set(f.subclaims.map(identityOfRaw).filter((k): k is string => k !== null));
+    const covered = new Set(f.subclaims.map(subKey));
     const extras: AdjudicatedSubClaim[] = [];
     heldSubs.forEach((h, i) => {
       const k = identityOf(h.claim, h.key);
@@ -697,8 +713,7 @@ export function buildLedger(
     const landed = new Map<string, FindingResponse>();
     f.subclaims.forEach((raw, i) => {
       const rs = responseAt(i);
-      const k = identityOfRaw(raw);
-      if (rs && k !== null) landed.set(k, rs);
+      if (rs) landed.set(subKey(raw), rs);
     });
     return creditedHeld.map((h) => {
       const k = identityOf(h.claim, h.key);
@@ -713,8 +728,12 @@ export function buildLedger(
   // the fresh look on contests nobody made about it: the prefix-aliasing escape at parent grain,
   // the same one `carriedFrom` refuses one level down. So the sub-claim record rides only the
   // claim's FULL wording (the identity stored beside a cut display — claimKey; a record with
-  // none, ellipsis-era or over-bound, never matches) or the rule-2 bar,
-  // a shared requirement id at a specific location, because an id is not wording. The cost of
+  // none, the ellipsis era's, never matches) or the rule-2 bar,
+  // a shared requirement id at a specific location, because an id is not wording — the SAME two
+  // trustworthy matches the entry-level ledger has always used, deliberately: rule 2 is what
+  // keeps a paraphrased letterless re-raise from losing its half-answered record (the RUN-174
+  // protection — a fresh reviewer paraphrases by construction, and demanding identical wording
+  // here would re-open that escape for every reworded finding). The cost of
   // refusing is the held record dropping with the replaced claim — a MISS, visible as the entry's
   // own claim change and answerable again; carrying would INVENT, the forbidden order of harms.
   const trustedCarry = (e: LedgerEntry, f: Finding): boolean => {

@@ -441,6 +441,29 @@ describe('parsing sub-claims (RUN-180)', () => {
     ]);
   });
 
+  // A CRLF report is the same report: line endings are normalized at the parse chokepoint,
+  // because a stray `\r` sat exactly where the certificate's `$` and the strict shape's anchors
+  // look — the numbered findings still parsed (multiline `$` forgives `\r`) while every
+  // enumeration silently voided, a transport formatting fact defeating the format's own rules.
+  it('a CRLF report keeps its enumeration — line endings are normalized at the chokepoint', () => {
+    const out = parseFindings(REPORT.replaceAll('\n', '\r\n'));
+    expect(out[0]!.claim).toBe('the contest gate bundles two separately-answerable defects');
+    expect(out[0]!.subclaims).toEqual([
+      'the eligibility check accepts a response naming a nonexistent finding',
+      'the entry cap can drop a terminal finding before a PASS',
+    ]);
+  });
+
+  it('a CRLF response block parses like its LF twin', () => {
+    const out = parseFindingResponses(
+      'FINDING 1a: CONTESTED src/x.ts:9 — covered\r\nFINDING 1b: FIXED b.ts:1 — done\r\n',
+    );
+    expect(out.map((r) => [r.subclaim, r.status, r.pointer])).toEqual([
+      ['a', 'contested', 'src/x.ts:9'],
+      ['b', 'fixed', 'b.ts:1'],
+    ]);
+  });
+
   // The completeness certificate is what closes the composed-malformation class the shape nets
   // cannot: a mangled line — whatever it mangles into, including shapes indistinguishable from
   // prose — is simply not counted, and the mismatch voids the whole enumeration.
@@ -1046,17 +1069,35 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     expect(round2[0]!.subclaims[0]).toMatchObject({ status: 'contested', pointer: 'a.ts:9' });
   });
 
-  // Identity is stored whole or not at all: past IDENTITY_CAP there is no identity — never a
-  // shortened one two claims could share — so even an exact re-raise MISSES into a visible
-  // duplicate row. May miss, never invent, at the bound itself.
-  it('a claim past the identity bound never matches — an exact re-raise costs a duplicate row', () => {
+  // Identity has no bound of its own — it is exactly the claim the reviewer wrote on one report
+  // line — because any bound is a cliff: at bound+1 an exact re-raise stopped matching and a
+  // partly answered record stopped carrying. One claim, one durable row, at any length.
+  it('an exact re-raise of an arbitrarily long claim matches — one durable row, at any length', () => {
     const huge = `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: ${'y'.repeat(1200)}`;
     const [f1] = parseFindings(huge);
-    const round1 = buildLedger([], [f1!], [], 1);
-    expect(round1[0]!.subclaims[0]!.key).toBeUndefined(); // no identity, not a truncated one
+    const round1 = buildLedger([], [f1!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    expect(round1[0]!.subclaims[0]!.key).toBe('y'.repeat(1200)); // stored whole, never shortened
     const [f2] = parseFindings(huge);
     const round2 = buildLedger(round1, [f2!], [], 2);
-    expect(round2[0]!.subclaims.map((s) => s.status)).toEqual(['unanswered', 'unanswered']);
+    expect(round2[0]!.subclaims.map((s) => [s.status, s.pointer])).toEqual([['contested', 'a.ts:9']]);
+  });
+
+  // The same losslessness at PARENT grain — the cliff a gate of this task's own gestation mined:
+  // a very long parent claim with no identity lost its partly answered record on an exact
+  // LETTERLESS terminal re-raise, degrading the finding to the bare-contest path right before
+  // candidacy. The claimKey carries whole, so the record survives the re-raise.
+  it('an exact letterless re-raise of a very long parent claim keeps its partly answered record', () => {
+    const parent = 'w'.repeat(1200);
+    const [f1] = parseFindings(
+      `FINDING 1 [High] a.ts:1: ${parent} [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two`,
+    );
+    const round1 = buildLedger([], [f1!], [SR(1, 'a', 'contested', 'a.ts:9')], 1);
+    const [f2] = parseFindings(`FINDING 1 [High] a.ts:1: ${parent}`); // letterless, wording exact
+    const round2 = buildLedger(round1, [f2!], [], 2);
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['half one', 'contested'],
+      ['half two', 'unanswered'],
+    ]);
   });
 
   // The PARENT claim's identity crosses the cap the same way (Finding.claimKey → entry.claimKey):
@@ -1224,27 +1265,27 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     );
   });
 
-  it('normalises a malformed persisted sub-claim list field by field instead of crashing', () => {
-    const mangled = {
-      subclaims: ['not-an-object', { claim: 'ok', status: 'bogus' }, { letter: 'b' }],
-    };
-    expect(subclaimsOf(mangled)).toEqual([
-      { claim: 'ok', status: 'unanswered', pointer: null, reason: null },
-    ]);
+  // Degradation splits by grain, and the split is the safety direction (the parse chokepoint's
+  // all-or-nothing rule at the other boundary where sub-claim state is born): a malformed ENTRY
+  // voids the whole list to the single-claim entry — never the well-formed subset, which is
+  // clearable around the claim it dropped — and a list longer than the fold can ever write voids
+  // rather than slicing, for the same reason the cap never slices anywhere else.
+  it('a malformed persisted entry voids the whole sub-claim list — never a kept subset', () => {
+    expect(subclaimsOf({ subclaims: ['not-an-object', { claim: 'ok' }] })).toEqual([]);
+    expect(subclaimsOf({ subclaims: [{ claim: 'ok' }, { letter: 'b' }] })).toEqual([]);
+    const nine = Array.from({ length: 9 }, (_, i) => ({ claim: `c${i}` }));
+    expect(subclaimsOf({ subclaims: nine })).toEqual([]); // over the cap: voided, never sliced
     expect(subclaimsOf({})).toEqual([]);
   });
 
-  // The identity field is read the way every persisted field is — never trusted from the object:
-  // a non-string or over-bound key reads as NO identity (the record then never matches — a miss),
-  // not as a value the fold would compare.
-  it('a persisted identity that is not a string or is over-bound reads as no identity', () => {
-    const subs = subclaimsOf({
-      subclaims: [
-        { claim: 'a', key: 42, status: 'unanswered', pointer: null, reason: null },
-        { claim: 'b…', key: 'z'.repeat(2000), status: 'unanswered', pointer: null, reason: null },
-      ],
-    });
-    expect(subs.map((s) => s.key)).toEqual([undefined, undefined]);
+  // A FIELD inside a well-formed entry still degrades field by field, and toward STANDING —
+  // an unknown status reads 'unanswered', a non-identity key reads unmatchable — because a
+  // field's fallback can only make the claim harder to clear.
+  it('fields inside a well-formed persisted entry degrade toward the standing state', () => {
+    expect(subclaimsOf({ subclaims: [{ claim: 'ok', status: 'bogus', key: 42 }] })).toEqual([
+      { claim: 'ok', status: 'unanswered', pointer: null, reason: null },
+    ]);
+    expect(subclaimsOf({ subclaims: [{ claim: 'b…', key: '' }] })[0]!.key).toBeUndefined();
   });
 
   // A ledger persisted by the letter-era shape (this run's own prior sittings) loads too: the

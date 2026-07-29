@@ -178,13 +178,22 @@ left for an unrecorded claim to sit — so narration lives above the findings or
 structural lines, and prose that strays into a zone costs the enumeration (dull), never keeps a
 subset. Claim identity also survives its own display cap: the display keeps the legacy
 bare-ellipsis cap, byte-identical, and an over-cap claim stores its FULL normalized text in a
-separate identity field beside it — whole or not at all, never hashed and never truncated (a
-truncated identity aliases every claim sharing its prefix and a 32-bit fingerprint is trivially
-collided into merging two claims, both INVENTS — this run's own terminal round mined the collision
-that killed the fingerprint edition) — so a verbatim re-raise of a long claim recognises its held
-record, two distinct long claims can never alias, and a claim past the identity bound simply never
-matches: the visible duplicate row, the same miss a record the ellipsis era persisted has always
-been. What
+separate identity field beside it — whole at ANY length, never hashed, truncated, or bounded (a
+truncated identity aliases every claim sharing its prefix, a 32-bit fingerprint is trivially
+collided into merging two claims — this run's own terminal round mined the collision that killed
+the fingerprint edition — and a length bound is a cliff where an exact letterless re-raise LOSES
+its partly answered record, which the round after mined at bound+1; the count and display caps
+are what keep the ledger distilled, and identity is the one field whose job is losslessness) —
+so a verbatim re-raise of a long claim recognises its held record, two distinct long claims can
+never alias, and only a record the bare-ellipsis era persisted still refuses to match: the
+visible duplicate row it always was. The parse chokepoint also owns the LINE SHAPE it
+classifies — line endings are normalized before any anchor runs, because a CRLF report's
+findings still parsed while its every enumeration silently voided on the `\r` the anchors
+refuse — and the persisted-record reader applies the same all-or-nothing grain at the other
+boundary where sub-claim state is born: a malformed entry or an over-long list voids whole to
+the single-claim entry, never to the well-formed subset a partial contest could clear around,
+while fields inside a well-formed entry degrade toward STANDING, the direction that cannot
+clear. What
 remains around those rules is hygiene, not
 the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
 is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
