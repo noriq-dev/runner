@@ -443,9 +443,9 @@ function harness(
      *  the acceptance criteria its gate must answer (RUN-145). */
     anchorTask?: AnchorTask | null;
     /** RUN-188 task-pointer lookup. Presence wires resolveSpinOff; the map is ref → task (a
-     *  missing ref answers null, 'fails' → every lookup throws). Absent = the dep is not wired,
-     *  the pre-RUN-188 daemon. */
-    spinOffTasks?: Record<string, SpinOffLookup> | 'fails';
+     *  missing ref answers null, 'fails' → every lookup throws, 'hangs' → every lookup never
+     *  resolves, driving the deadline). Absent = the dep is not wired, the pre-RUN-188 daemon. */
+    spinOffTasks?: Record<string, SpinOffLookup> | 'fails' | 'hangs';
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
@@ -556,10 +556,13 @@ function harness(
     ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
     ...(over.spinOffTasks !== undefined
       ? {
-          resolveSpinOff: async (ref: string) => {
-            if (over.spinOffTasks === 'fails') throw new Error('server unreachable');
-            return over.spinOffTasks?.[ref] ?? null;
+          resolveSpinOff: (ref: string): Promise<SpinOffLookup | null> => {
+            if (over.spinOffTasks === 'hangs') return new Promise(() => {}); // never resolves
+            if (over.spinOffTasks === 'fails') return Promise.reject(new Error('server unreachable'));
+            return Promise.resolve((over.spinOffTasks as Record<string, SpinOffLookup>)[ref] ?? null);
           },
+          // Tests must not wait out the real deadline; the value only needs to be a deadline.
+          spinOffTimeoutMs: 25,
         }
       : {}),
     ...(over.cancelled
@@ -4458,6 +4461,53 @@ describe('spin-off task pointers (RUN-188)', () => {
     const exit = await done;
     expect(exit.outcome).toBe('failed');
     expect(reviewerStarts(h)).toBe(1);
+  });
+
+  // The per-answer cap is PRICED, never taken silently: a fourth ref is not looked up, and the
+  // answer cannot credit a contest even when every named task is real — three verified tasks must
+  // not speak for one nobody checked.
+  it('a fourth task pointer is never silently dropped — the over-cap answer cannot credit', async () => {
+    const four = Object.fromEntries(
+      ['A-1', 'A-2', 'A-3', 'A-4'].map((k) => [k, { key: k, title: `real task ${k}` }]),
+    );
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: four });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:A-1 task:A-2 task:A-3 task:A-4 — spread across four',
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator on a set the daemon did not finish
+    // The saturation fact is in the ledger, out loud — never a silent reduction of the claim set.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    const unchecked = entry?.spinOffs?.find((f) => f.ref === '(unchecked)');
+    expect(unchecked?.verified).toBe(false);
+    expect(unchecked?.detail).toContain('more task pointer(s)');
+  });
+
+  // A task-claim token no reference can be read from is a claim the daemon cannot verify — it
+  // degrades toward unverifiable (an unverified fact), never toward "no task named".
+  it('a task claim the daemon cannot read blocks credit instead of reading as no claim', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task: RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['(unchecked)', false]]);
+    expect(entry?.spinOffs?.[0]?.detail).toContain('no readable reference');
+  });
+
+  // A stalled lookup is a non-answer, on a deadline: the run neither hangs on the await nor
+  // credits the contest — the same degradation a thrown lookup gets.
+  it('a lookup that never resolves times out to unverified — the run neither hangs nor credits', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: 'hangs' });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
   });
 
   // The pre-RUN-188 daemon, byte-identical: no lookup wired → no facts, and a task pointer is the

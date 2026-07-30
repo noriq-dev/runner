@@ -91,21 +91,40 @@ export interface SpinOffCheck {
 }
 
 /** A pointer naming more tasks than this has stopped tracking work and started dodging findings —
- *  the volume concern the RUN-188 brief names. Deduped-then-capped like MAX_REQUIREMENTS. */
-const MAX_TASK_POINTERS = 3;
+ *  the volume concern the RUN-188 brief names. The cap is PRICED by the verifier, never taken
+ *  silently: refs past it are not looked up, and one unverified saturation fact blocks the answer
+ *  from crediting — a silently dropped fourth ref would let three verified tasks speak for a
+ *  bogus one. */
+export const MAX_TASK_POINTERS = 3;
 /** Read-side caps for persisted facts (the ledger is a distilled record, like every other field). */
 const SPINOFF_REF_CAP = 64;
 const SPINOFF_DETAIL_CAP = 240;
 
+/** What taskRefsIn read out of one pointer (RUN-188). */
+export interface TaskPointerScan {
+  /** Every readable reference, deduped, in pointer order — deliberately UNCAPPED: the extraction
+   *  must never reduce the set it hands the verifier, because whatever it drops here is a task
+   *  claim nothing downstream can refuse to credit. */
+  refs: string[];
+  /** Task-claim tokens (`task:` with no readable reference after the colon) — COUNTED, not
+   *  dropped. A claim the daemon cannot read is a claim it cannot verify, and reading it as "no
+   *  task named" would credit the exact answer this check exists to check. */
+  unreadable: number;
+}
+
 /** The task references a CONTESTED pointer names (RUN-188): `task:<ref>` tokens in the free-text
  *  pointer. Deliberately NOT a parse-format change — the pointer was always free text and
  *  `task:RUN-201` parsed byte-identically before this existed; this only reads the vocabulary the
- *  templates teach, so a response written without it is untouched. */
-export const taskRefsIn = (pointer: string): string[] =>
-  [...new Set([...pointer.matchAll(/\btask:([A-Za-z][\w-]*)/gi)].map((m) => m[1]!))].slice(
-    0,
-    MAX_TASK_POINTERS,
-  );
+ *  templates teach, so a response written without it is untouched. Within a pointer, though, any
+ *  `task:` token is task-claim INTENT, readable or not: the mangled form degrades toward
+ *  unverifiable (the parse chokepoint's direction), never toward absence. */
+export const taskRefsIn = (pointer: string): TaskPointerScan => {
+  const claims = [...pointer.matchAll(/\btask:([A-Za-z][\w-]*)?/gi)];
+  return {
+    refs: [...new Set(claims.flatMap((m) => (m[1] ? [m[1]] : [])))],
+    unreadable: claims.filter((m) => !m[1]).length,
+  };
+};
 
 /** Whether an answer's task-pointer facts allow it to CREDIT a contest (RUN-188). Absent facts
  *  change nothing — the pre-RUN-188 world, a daemon with no lookup wired, a pointer naming no
@@ -133,7 +152,9 @@ const UNREADABLE_SPINOFF: SpinOffCheck = {
 export const spinOffsOf = (x: { spinOffs?: unknown }): SpinOffCheck[] | undefined => {
   const raw = x.spinOffs;
   if (raw === undefined) return undefined;
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_TASK_POINTERS)
+  // The writer's true maximum: MAX_TASK_POINTERS checked refs plus the one saturation fact that
+  // prices everything past them. Longer is a shape no writer here produces.
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_TASK_POINTERS + 1)
     return [UNREADABLE_SPINOFF];
   return raw.map((f) => {
     if (typeof f !== 'object' || f === null) return UNREADABLE_SPINOFF;
@@ -1135,20 +1156,25 @@ export function applyContestResponses(
       // and moves the task-pointer facts with the answer (RUN-188).
       landAnswer(s, bySub.get(`${f.id}${subclaimLetter(i)}`)),
     );
-    const next: LedgerEntry = {
-      ...e,
-      status: r?.status ?? e.status,
-      pointer: r?.pointer ?? e.pointer,
-      reason: r?.reason ?? e.reason,
-      subclaims,
-    };
     // The entry-grain half of landAnswer's facts rule (RUN-188): a whole-finding contest this
     // turn replaces the facts with its own — even with none, because a daemon check qualifies
     // the pointer it ran against — while an entry the turn did not answer keeps what it held.
+    // Built field by field (not spread) so a stale fact cannot ride in beside a new answer.
     const spinOffs = r ? r.spinOffs : spinOffsOf(e);
-    if (spinOffs?.length) next.spinOffs = spinOffs;
-    else if (r) delete next.spinOffs;
-    out[out.indexOf(e)] = next;
+    out[out.indexOf(e)] = {
+      id: e.id,
+      round: e.round,
+      severity: e.severity,
+      requirements: e.requirements,
+      location: e.location,
+      claim: e.claim,
+      ...(e.claimKey !== undefined ? { claimKey: e.claimKey } : {}),
+      status: r?.status ?? e.status,
+      pointer: r?.pointer ?? e.pointer,
+      reason: r?.reason ?? e.reason,
+      ...(spinOffs?.length ? { spinOffs } : {}),
+      subclaims,
+    };
   }
   return out;
 }

@@ -83,6 +83,7 @@ export {
   type UnresolvedPath,
 } from './repo-context';
 export {
+  MAX_TASK_POINTERS,
   parseFindings,
   parseFindingResponses,
   applyContestResponses,
@@ -101,6 +102,7 @@ export {
   type FindingStatus,
   type LedgerEntry,
   type SpinOffCheck,
+  type TaskPointerScan,
 } from './adjudication';
 export {
   DEFAULT_PARKED_PATH,

@@ -16,6 +16,7 @@ import {
   type Finding,
   type FindingResponse,
   type LedgerEntry,
+  MAX_TASK_POINTERS,
   type SpinOffCheck,
   applyContestResponses,
   buildLedger,
@@ -252,6 +253,11 @@ export interface RunSupervisorDeps {
    * stays exactly the free text it was before this existed.
    */
   resolveSpinOff?: (ref: string) => Promise<SpinOffLookup | null>;
+  /** Deadline for ONE resolveSpinOff lookup (RUN-188). The await sits on the adjudication path —
+   *  between the builder's turn and the fold — so a stalled MCP call must degrade to the same
+   *  unverified non-answer a failed one does rather than hang the run. Omitted →
+   *  TASK_LOOKUP_TIMEOUT_MS; present for tests, the contextBudget pattern. */
+  spinOffTimeoutMs?: number;
   /**
    * Dispatch-time predictive locking (RUN-103): the DECLARED file scope of a run, if one is
    * known, so the daemon can take its locks before the agent starts and refuse a dispatch that
@@ -681,6 +687,10 @@ export interface SpinOffLookup {
  *  builder spinning off ten tasks to dodge ten findings meets the control instead of outrunning
  *  it, and the ledger says so out loud (the no-silent-caps rule). */
 const MAX_TASK_LOOKUPS_PER_TURN = 8;
+/** Deadline for one task lookup (RUN-188). This await sits between the builder's turn and the
+ *  ledger fold, so a hung MCP call with no deadline would stall the run's adjudication — and the
+ *  probe posture is that a lookup that cannot ANSWER is a non-answer, which a stall is. */
+const TASK_LOOKUP_TIMEOUT_MS = 10_000;
 
 /**
  * The RUNNABLE half of `[verify]` (RUN-61). Since the stage became a choice, `cmd` is
@@ -1971,16 +1981,32 @@ export class RunSupervisor {
    * own, the checkClaimable probe posture. No lookup wired → responses pass through untouched and
    * a task pointer stays the free text it always was, which is every daemon before RUN-188.
    */
-  private async verifyTaskPointers(
-    runId: string,
-    responses: FindingResponse[],
-  ): Promise<FindingResponse[]> {
+  private async verifyTaskPointers(runId: string, responses: FindingResponse[]): Promise<FindingResponse[]> {
     const lookup = this.deps.resolveSpinOff;
     if (!lookup) return responses;
     const clip = (s: string, n: number) => {
       const t = s.trim();
       return t.length > n ? `${t.slice(0, n - 1)}…` : t;
     };
+    // A stall is a non-answer: race each lookup against a deadline, resolving null either way a
+    // real answer never arrives. The timer is unref'd (the budget.ts rule — a forgotten deadline
+    // must never be what holds the daemon open) and guarded, since a fake clock need not have it.
+    const timeoutMs = this.deps.spinOffTimeoutMs ?? TASK_LOOKUP_TIMEOUT_MS;
+    const timedLookup = (ref: string): Promise<SpinOffLookup | null> =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+        lookup(ref).then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          () => {
+            clearTimeout(timer);
+            resolve(null);
+          },
+        );
+      });
     const facts = new Map<string, SpinOffCheck>();
     let looked = 0;
     const check = async (ref: string): Promise<SpinOffCheck> => {
@@ -1995,7 +2021,7 @@ export class RunSupervisor {
         };
       } else {
         looked += 1;
-        const t = await lookup(ref).catch(() => null);
+        const t = await timedLookup(ref);
         if (!t) {
           fact = {
             ref,
@@ -2029,13 +2055,30 @@ export class RunSupervisor {
     for (const r of responses) {
       // Only a CONTESTED pointer is evidence a task can back — a FIXED points at a change, and
       // checking tasks it happens to mention would attach facts to a claim nobody made.
-      const refs = r.status === 'contested' ? taskRefsIn(r.pointer) : [];
-      if (!refs.length) {
+      const scan = r.status === 'contested' ? taskRefsIn(r.pointer) : { refs: [], unreadable: 0 };
+      if (!scan.refs.length && !scan.unreadable) {
         out.push(r);
         continue;
       }
       const spinOffs: SpinOffCheck[] = [];
-      for (const ref of refs) spinOffs.push(await check(ref));
+      for (const ref of scan.refs.slice(0, MAX_TASK_POINTERS)) spinOffs.push(await check(ref));
+      // Every task claim the loop above did NOT check is priced as ONE unverified fact, never
+      // dropped: refs past the per-answer cap (three verified tasks must not speak for a fourth
+      // nobody looked at) and claims no reference could be read from (a mangled claim degrades
+      // toward unverifiable, not toward "no task named"). Unverified is what blocks crediting.
+      const over = Math.max(0, scan.refs.length - MAX_TASK_POINTERS);
+      if (over > 0 || scan.unreadable > 0) {
+        const parts: string[] = [];
+        if (over > 0)
+          parts.push(`${over} more task pointer(s) than the ${MAX_TASK_POINTERS} one answer may name`);
+        if (scan.unreadable > 0)
+          parts.push(`${scan.unreadable} task claim(s) with no readable reference (write task:<key>)`);
+        spinOffs.push({
+          ref: '(unchecked)',
+          verified: false,
+          detail: `not checked — ${parts.join('; ')}`,
+        });
+      }
       out.push({ ...r, spinOffs });
     }
     if (facts.size) {

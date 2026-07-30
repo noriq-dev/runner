@@ -1536,22 +1536,36 @@ describe('spin-off task-pointer facts (RUN-188)', () => {
 
   describe('taskRefsIn', () => {
     it('reads the task:<ref> vocabulary out of a free-text pointer', () => {
-      expect(taskRefsIn('task:RUN-201')).toEqual(['RUN-201']);
-      expect(taskRefsIn('src/a.ts:9, task:RUN-201')).toEqual(['RUN-201']);
-      expect(taskRefsIn('task:task_ms54mz39')).toEqual(['task_ms54mz39']);
+      expect(taskRefsIn('task:RUN-201')).toEqual({ refs: ['RUN-201'], unreadable: 0 });
+      expect(taskRefsIn('src/a.ts:9, task:RUN-201')).toEqual({ refs: ['RUN-201'], unreadable: 0 });
+      expect(taskRefsIn('task:task_ms54mz39')).toEqual({ refs: ['task_ms54mz39'], unreadable: 0 });
     });
 
     // NOT a parse-format change: the pointer was always free text, and one that names no task —
     // every response written before RUN-188 — yields nothing and folds untouched.
     it('finds nothing in a pointer that names no task', () => {
-      expect(taskRefsIn('src/a.ts:9')).toEqual([]);
-      expect(taskRefsIn('commit a672b25')).toEqual([]);
-      expect(taskRefsIn('')).toEqual([]);
+      expect(taskRefsIn('src/a.ts:9')).toEqual({ refs: [], unreadable: 0 });
+      expect(taskRefsIn('commit a672b25')).toEqual({ refs: [], unreadable: 0 });
+      expect(taskRefsIn('')).toEqual({ refs: [], unreadable: 0 });
     });
 
-    it('dedupes and caps — a pointer naming a dozen tasks is dodging, not tracking', () => {
-      expect(taskRefsIn('task:A-1 and task:A-1 and task:B-2')).toEqual(['A-1', 'B-2']);
-      expect(taskRefsIn('task:A-1 task:B-2 task:C-3 task:D-4 task:E-5')).toHaveLength(3);
+    // The extraction NEVER reduces the set it hands the verifier: whatever it dropped would be a
+    // task claim nothing downstream could refuse to credit. Deduping loses nothing (one ref, one
+    // check); the volume cap lives in the verifier, priced as an unverified fact.
+    it('dedupes but never caps — every named ref reaches the verifier', () => {
+      expect(taskRefsIn('task:A-1 and task:A-1 and task:B-2')).toEqual({
+        refs: ['A-1', 'B-2'],
+        unreadable: 0,
+      });
+      expect(taskRefsIn('task:A-1 task:B-2 task:C-3 task:D-4 task:E-5').refs).toHaveLength(5);
+    });
+
+    // A task-claim token no reference can be read from is COUNTED, not dropped: a claim the
+    // daemon cannot read is a claim it cannot verify, and "no task named" would credit it.
+    it('counts unreadable task claims instead of reading them as no claim at all', () => {
+      expect(taskRefsIn('task:')).toEqual({ refs: [], unreadable: 1 });
+      expect(taskRefsIn('task: RUN-201')).toEqual({ refs: [], unreadable: 1 });
+      expect(taskRefsIn('task:RUN-201, task:')).toEqual({ refs: ['RUN-201'], unreadable: 1 });
     });
   });
 
@@ -1698,5 +1712,9 @@ describe('spin-off task-pointer facts (RUN-188)', () => {
     expect(spinOffsOf({ spinOffs: [{ ref: 'R-1', detail: 'd', verified: 'yes' }] })).toEqual([
       FACT('R-1', false, 'd'),
     ]);
+    // The writer's true maximum — MAX_TASK_POINTERS checked facts plus the one saturation fact
+    // that prices everything past them — still loads whole.
+    const atMax = ['a', 'b', 'c'].map((r) => FACT(r, true)).concat(FACT('(unchecked)', false));
+    expect(spinOffsOf({ spinOffs: atMax })).toEqual(atMax);
   });
 });
