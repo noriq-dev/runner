@@ -389,11 +389,15 @@ export class NoriqClient {
       };
     } | null;
     const t = out?.task;
-    if (!t?.key || !t?.title) return null;
+    // TYPE-checked, not truthiness-checked (RUN-188): the cast above is a claim about the wire,
+    // not a fact, and a truthy non-string key/title (`title: 42`) crossing this boundary throws
+    // in whatever string-shaped code touches it next — on the adjudication path, that aborted a
+    // fold a finding was meant to merely stand on. A malformed task is the same answer as none.
+    if (typeof t?.key !== 'string' || !t.key || typeof t.title !== 'string' || !t.title) return null;
     return {
       key: t.key,
       title: t.title,
-      body: t.body ?? null,
+      body: typeof t.body === 'string' ? t.body : null,
       // Parsed through the contract rather than trusted: this arrives from a server the daemon
       // does not control, and the whole point of a vendored schema is that the wire is checked at
       // the boundary. A spec that does not parse is dropped to null and FLAGGED — a server on a

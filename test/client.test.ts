@@ -341,4 +341,16 @@ describe('getTask spin-off provenance (RUN-188)', () => {
     expect(t?.key).toBe('K-1');
     expect(t?.spinOff).toEqual({ sourceTaskId: null, sourceRunId: null, finding: null });
   });
+
+  // The boundary is TYPE-checked, not truthiness-checked: a truthy non-string key/title crossing
+  // it throws in whatever string-shaped code touches it next — on the adjudication path, that
+  // aborted a fold. A malformed task is the same answer as none.
+  it('a truthy non-string key/title reads as no task at all', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ key: 'K-1', title: 42 }),
+    });
+    expect(await client.getTask('K-1')).toBeNull();
+  });
 });

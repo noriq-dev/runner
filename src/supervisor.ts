@@ -2021,7 +2021,13 @@ export class RunSupervisor {
         };
       } else {
         looked += 1;
-        const t = await timedLookup(ref);
+        const raw = await timedLookup(ref);
+        // The seam's answer is DATA, not a contract: resolveSpinOff is injectable and the server
+        // behind it is not this daemon's, so a shape this code did not write — a numeric title, a
+        // missing key — is the same non-answer a failed lookup is. Validated field by field
+        // BEFORE anything touches it, because a throw here would abort the adjudication path a
+        // finding was meant to merely stand on (may-miss-never-invent, and never a crash).
+        const t = raw && typeof raw.key === 'string' && typeof raw.title === 'string' ? raw : null;
         if (!t) {
           fact = {
             ref,
@@ -2032,15 +2038,21 @@ export class RunSupervisor {
           // The provenance line is the mechanical fact the reviewer's substance judgment starts
           // from: filed from THIS run against a finding, filed elsewhere, or carrying none (a task
           // a human filed by hand — still a legitimate target, and the reviewer is told which).
-          const prov = t.spinOff;
+          // Field-typed like the answer itself: provenance only ever SHARPENS the existence fact,
+          // so a malformed field degrades to the unsharpened line, never to a throw.
+          const prov = t.spinOff && typeof t.spinOff === 'object' ? t.spinOff : null;
+          const sourceRun = typeof prov?.sourceRunId === 'string' ? prov.sourceRunId : null;
           const from = !prov
             ? 'carries no spin-off provenance — it may predate this run'
-            : prov.sourceRunId === runId
+            : sourceRun === runId
               ? 'filed from THIS run'
-              : prov.sourceRunId
-                ? `filed from run ${prov.sourceRunId}`
+              : sourceRun
+                ? `filed from run ${sourceRun}`
                 : 'its provenance names no source run';
-          const against = prov?.finding ? `, against: "${clip(prov.finding, 120)}"` : '';
+          const against =
+            typeof prov?.finding === 'string' && prov.finding
+              ? `, against: "${clip(prov.finding, 120)}"`
+              : '';
           fact = {
             ref,
             verified: true,
@@ -2054,8 +2066,14 @@ export class RunSupervisor {
     const out: FindingResponse[] = [];
     for (const r of responses) {
       // Only a CONTESTED pointer is evidence a task can back — a FIXED points at a change, and
-      // checking tasks it happens to mention would attach facts to a claim nobody made.
-      const scan = r.status === 'contested' ? taskRefsIn(r.pointer) : { refs: [], unreadable: 0 };
+      // checking tasks it happens to mention would attach facts to a claim nobody made. The scan
+      // is the parser's, taken off the RAW line (FindingResponse.taskScan): `r.pointer` is the
+      // capped DISPLAY, and scanning it let a claim padded past the cap fall off the check — a
+      // verified first task crediting a never-checked later one. The fallback serves only a
+      // hand-built response that skipped the parser; on parser output an absent scan MEANS the
+      // raw pointer named nothing, and a capped substring of it cannot name more.
+      const scan =
+        r.status === 'contested' ? (r.taskScan ?? taskRefsIn(r.pointer)) : { refs: [], unreadable: 0 };
       if (!scan.refs.length && !scan.unreadable) {
         out.push(r);
         continue;

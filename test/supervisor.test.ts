@@ -4498,6 +4498,45 @@ describe('spin-off task pointers (RUN-188)', () => {
     expect(entry?.spinOffs?.[0]?.detail).toContain('no readable reference');
   });
 
+  // The scan is the parser's, off the RAW line: the ledger stores a capped pointer display, and
+  // scanning THAT let a claim padded past the cap fall off the check — a verified first task
+  // crediting a never-checked later one.
+  it('a task claim the display cap cut from the pointer is still checked — and blocks credit', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      `FINDING 1: CONTESTED task:RUN-201 ${'pad '.repeat(50)}task:RUN-999 — split across the cap`,
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // RUN-999 was never verified → the finding stands
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator on a set the daemon did not finish
+    // Both claims were checked — including the one the stored pointer no longer names.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.pointer?.includes('task:RUN-999')).toBe(false); // the display is capped…
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([
+      ['RUN-201', true],
+      ['RUN-999', false], // …and the check still reached the later claim
+    ]);
+  });
+
+  // The seam's answer is data, not a contract: a shape the daemon did not write (a numeric title)
+  // must degrade to the unverified non-answer — never a throw that aborts the fold a finding was
+  // meant to merely stand on.
+  it('a malformed lookup answer degrades to unverified — never a crash on the adjudication path', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      verifyResults: [true],
+      spinOffTasks: { 'RUN-201': { key: 'RUN-201', title: 42 } as unknown as SpinOffLookup },
+    });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the finding stands; the run settled instead of crashing
+    expect(exit.reason).toBe('review');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
+  });
+
   // A stalled lookup is a non-answer, on a deadline: the run neither hangs on the await nor
   // credits the contest — the same degradation a thrown lookup gets.
   it('a lookup that never resolves times out to unverified — the run neither hangs nor credits', async () => {

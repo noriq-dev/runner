@@ -68,6 +68,13 @@ export interface FindingResponse {
    *  assert its own verification. Absent on every response whose pointer names no task and
    *  whenever no lookup is wired, both of which fold exactly as before. */
   spinOffs?: SpinOffCheck[];
+  /** The task claims scanned out of the RAW pointer at parse time (RUN-188), before the display
+   *  cap — the RUN-180 rule again: identity is exact while the line is still in hand, and the
+   *  fold's capped display cannot speak for it. Scanning the STORED pointer instead let a claim
+   *  padded past POINTER_CAP fall off the check entirely — a verified first task crediting a
+   *  never-checked later one. Absent when the raw pointer names no task, which is every response
+   *  written before the vocabulary existed. */
+  taskScan?: TaskPointerScan;
 }
 
 /**
@@ -156,14 +163,20 @@ export const spinOffsOf = (x: { spinOffs?: unknown }): SpinOffCheck[] | undefine
   // prices everything past them. Longer is a shape no writer here produces.
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_TASK_POINTERS + 1)
     return [UNREADABLE_SPINOFF];
+  // ONE LINE per fact is structural: every render derives a fact's `→ daemon:` line from this
+  // canonical set, so a newline smuggled into a field — a task titled with one, a provenance
+  // finding carrying one, a hand-edited persisted record — would let server- or builder-shaped
+  // text manufacture extra lines inside the reviewer's trusted data. Flattened HERE, the one
+  // normalizer every consumer reads through, rather than at each render.
+  const flat = (s: string) => s.replace(/\s+/g, ' ');
   return raw.map((f) => {
     if (typeof f !== 'object' || f === null) return UNREADABLE_SPINOFF;
     const r = f as Record<string, unknown>;
     if (typeof r.ref !== 'string' || typeof r.detail !== 'string') return UNREADABLE_SPINOFF;
     return {
-      ref: cap(r.ref, SPINOFF_REF_CAP),
+      ref: cap(flat(r.ref), SPINOFF_REF_CAP),
       verified: r.verified === true,
-      detail: cap(r.detail, SPINOFF_DETAIL_CAP),
+      detail: cap(flat(r.detail), SPINOFF_DETAIL_CAP),
     };
   });
 };
@@ -696,12 +709,18 @@ export function parseFindingResponses(input: string): FindingResponse[] {
     const sep = rest.search(/\s[—-]\s/);
     const pointer = sep >= 0 ? rest.slice(0, sep) : rest;
     const reason = sep >= 0 ? rest.slice(sep).replace(/^\s*[—-]\s*/, '') : '';
+    // Task claims are scanned HERE, off the RAW pointer, because the line below caps what the
+    // ledger stores — and a claim the cap cut out of the display must still reach the verifier
+    // (see FindingResponse.taskScan). Attached only when the pointer names one, so a response
+    // without the vocabulary keeps its exact pre-RUN-188 shape.
+    const scan = taskRefsIn(pointer);
     out.push({
       id,
       subclaim,
       status,
       pointer: cap(pointer, POINTER_CAP),
       reason: cap(reason, REASON_CAP),
+      ...(scan.refs.length || scan.unreadable ? { taskScan: scan } : {}),
     });
   }
   return out;
