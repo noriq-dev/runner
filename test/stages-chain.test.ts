@@ -187,6 +187,8 @@ function harness(over: { tally?: RunTally } = {}) {
   /** `id#key` per registration (RUN-170): the composite the SteeringBridge keys sessions by, so a
    *  cancel can stop EVERY live session of the run — two entries here means two reachable ones. */
   const steering = { registered: [] as string[], unregistered: [] as string[] };
+  /** The persisted cancellation fact (RUN-165) the chain probes before every spawn. */
+  const cancel = { cancelled: false };
   /** When set, startAgent THROWS for a matching spawn — the synchronous driver-start failure the
    *  wave must settle like any failed member rather than reject on. */
   let failSpawn: ((opts: DriverStartOptions) => boolean) | null = null;
@@ -208,6 +210,7 @@ function harness(over: { tally?: RunTally } = {}) {
     steering: {
       register: (id, _session, _stop, key) => steering.registered.push(key ? `${id}#${key}` : id),
       unregister: (id, key) => steering.unregistered.push(key ? `${id}#${key}` : id),
+      isCancelled: () => cancel.cancelled,
     },
     // The recorder that pins the no-park rule: a wave child must never reach the REAL park probe.
     parkIfBlocked: async (ctx) => {
@@ -247,6 +250,7 @@ function harness(over: { tally?: RunTally } = {}) {
     transcript,
     parentCheckpoints,
     steering,
+    cancel,
     setFailSpawn: (f: (opts: DriverStartOptions) => boolean) => {
       failSpawn = f;
     },
@@ -497,6 +501,57 @@ describe('a wave child never parks (RUN-170)', () => {
     expect(h.spawns).toHaveLength(2);
     expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'steps:child-asked' });
     expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/cannot park/);
+  });
+});
+
+describe('a cancel is a fact about the RUN, wherever it lands mid-chain (RUN-165/170)', () => {
+  // The race cancelRun alone cannot cover: it stops the sessions REGISTERED at that instant, and
+  // a wave child still awaiting its lease has none — the lease then resolves and a session nothing
+  // ever stops would spawn. The persisted fact is probed after the lease, before any process.
+  it('a cancel landing while children are still leasing spawns no session at all', async () => {
+    const h = harness();
+    let releaseLeases!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseLeases = r;
+    });
+    const w = fakeWave({
+      lease: async (childId) => {
+        await gate; // both leases held in flight — the cancel lands here
+        return {
+          runId: childId,
+          localPath: `/wt/${childId}`,
+          readOnly: false,
+          baseId: 'base',
+          workRef: `noriq/run/${childId}`,
+          location: { branch: `noriq/run/${childId}` },
+        };
+      },
+    });
+    const running = executeChain(h.host, h.plan({ steps: pairThenDependent(), wave: w.wave }));
+    await tick(); // the wave opened; both leases are pending
+    h.cancel.cancelled = true; // the operator cancels — no session exists for cancelRun to stop
+    releaseLeases();
+    const out = await running;
+    expect(h.spawns).toHaveLength(0); // the leases resolved, and still nothing spawned
+    if (!('chainFailed' in out)) throw new Error('expected a chain that never started a session');
+    expect(out.chainFailed).toBe('cancelled');
+  });
+
+  it('a cancel landing between waves stops the chain before its next session', async () => {
+    const h = harness();
+    const w = fakeWave();
+    const running = executeChain(h.host, h.plan({ steps: pairThenDependent(), wave: w.wave }));
+    await until(() => h.spawns.length === 2);
+    h.cancel.cancelled = true; // lands in the gap: the wave is settling, step c has not spawned
+    h.spawns[0]!.end();
+    h.spawns[1]!.end();
+    const out = await running;
+    if ('chainFailed' in out || out.parked) throw new Error('expected an outcome');
+    // The finished children's work still landed (done before the cancel took effect)…
+    expect(w.publishes).toHaveLength(2);
+    // …but no further session spawned, and the run reports the cancellation.
+    expect(h.spawns).toHaveLength(2);
+    expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'cancelled' });
   });
 });
 

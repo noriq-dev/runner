@@ -236,6 +236,60 @@ export function orphanSweep(deps: {
 }
 
 /**
+ * The daemon's session-capacity ledger (RUN-170), extracted for the same reason its neighbours
+ * are: this wiring is where whole layers have shipped silently dead, and a capacity computation
+ * that quietly over-grants fails just as quietly — as four sessions on a three-slot machine.
+ *
+ * `waveLimit` is a RESERVATION, not a sample. The pure subtraction it replaces had a window: two
+ * chains could each ask "what is spare?" before either had spawned a child, each see only the
+ * other's single seat, and together start more sessions than the machine allows. The grant closes
+ * it — the answer is RECORDED synchronously inside the ask, so the second chain's ask (the
+ * process is single-threaded; asks serialize on the event loop) sees the first's claim, whatever
+ * either has actually spawned yet. A run's claim on capacity is the busiest of three honest
+ * measures: its most recent grant (what it may be about to spawn), its live sessions (what it
+ * actually runs — a wave is several processes where the run count reads one), and the one seat
+ * any active run holds. Grants are replaced on each ask (the chain re-asks per wave) and released
+ * when the run settles; a stale grant between a run's last wave and its end over-reserves, which
+ * is the conservative direction — a slower schedule, never a broken bound. What remains out of
+ * scope, per RUN-170's own deferral: fairness/reservation ACROSS daemons — this ledger is one
+ * process's, which is also where the lease pool and the active set live.
+ */
+export function waveCapacity(deps: {
+  concurrency: number;
+  /** Runs supervising right now — live, not a snapshot (Daemon.active). */
+  active: () => Iterable<string>;
+  /** Live sessions of ONE run (SteeringBridge.liveSessionsOf). */
+  sessionsOf: (runId: string) => number;
+  /** Live sessions machine-wide, minus one run's own (SteeringBridge.liveSessionCount) — the
+   *  backstop for a session whose run has already left the active set mid-teardown. */
+  liveSessions: (excludeRunId?: string) => number;
+}): { waveLimit: (runId: string) => number; freeSlots: () => number; release: (runId: string) => void } {
+  const grants = new Map<string, number>();
+  const claimed = (excludeRunId?: string): number => {
+    let n = 0;
+    for (const id of deps.active()) {
+      if (id !== excludeRunId) n += Math.max(1, grants.get(id) ?? 0, deps.sessionsOf(id));
+    }
+    return Math.max(n, deps.liveSessions(excludeRunId));
+  };
+  return {
+    waveLimit: (runId) => {
+      const limit = Math.max(1, deps.concurrency - claimed(runId));
+      // The reservation itself: recorded before returning, so a simultaneous ask from another
+      // chain subtracts this one's claim instead of double-spending the same spare slots.
+      grants.set(runId, limit);
+      return limit;
+    },
+    // The heartbeat's advertisement counts grants too: a wave the daemon just promised breadth to
+    // is capacity even before its children register, or the server dispatches into the gap.
+    freeSlots: () => Math.max(0, deps.concurrency - claimed()),
+    release: (runId) => {
+      grants.delete(runId);
+    },
+  };
+}
+
+/**
  * The owed-merge reconcile (RUN-28), extracted for the same reason its neighbours are: it lived
  * as an untested closure in start()'s wiring, which is where whole layers have shipped silently
  * dead — and its failure mode is exactly that shape (a plan quietly never gets its review).
@@ -466,6 +520,15 @@ export class Daemon {
      *  whole life. */
     const pendingSpec = new Map<string, ExecutionSpec>();
     const steering = new SteeringBridge({ logger: this.log });
+    // The session-capacity ledger (RUN-170): waveLimit RESERVES what it answers, so simultaneous
+    // chains cannot double-spend the same spare slots, and freeSlots sees a granted wave as
+    // occupied capacity. See waveCapacity's doc for the bound it holds and the deferral it keeps.
+    const capacity = waveCapacity({
+      concurrency: this.config.concurrency,
+      active: () => this.active,
+      sessionsOf: (runId) => steering.liveSessionsOf(runId),
+      liveSessions: (excludeRunId) => steering.liveSessionCount(excludeRunId),
+    });
     const supervisor = this.createSupervisor({
       drivers: {
         claude: new ClaudeDriver({ logger: this.log }),
@@ -575,21 +638,13 @@ export class Daemon {
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
       repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
-      // How many of a run's wave steps may overlap (RUN-170): the machine's `concurrency` minus
-      // what the REST of the machine is running. Two measures, and the BUSIER wins, because each
-      // undercounts a case the other sees: live sessions are the actual processes (another run's
-      // wave is several of them where the run count reads one), while the run count covers a run
-      // that is momentarily between sessions and about to spawn its next. Re-asked by the chain
-      // before each wave, so a long chain tracks the machine instead of its dispatch-time
-      // snapshot; the floor of 1 means a saturated machine degrades a wave to sequential rather
-      // than refusing the run. Simultaneous waves can still race one sampling window — cross-run
-      // RESERVATION is deliberately out of scope (the static-subtraction bound, RUN-170).
-      // Bound HERE, not only in tests: a dep only tests supply is a feature that has never run.
-      waveLimit: (runId) => {
-        const otherRuns = Math.max(0, this.active.size - (this.active.has(runId) ? 1 : 0));
-        const others = Math.max(otherRuns, steering.liveSessionCount(runId));
-        return Math.max(1, this.config.concurrency - others);
-      },
+      // How many of a run's wave steps may overlap (RUN-170): a RESERVING ask on the capacity
+      // ledger — the grant is recorded synchronously inside the call, which is what closes the
+      // window where two chains sample the same spare slots before either spawns (see
+      // waveCapacity). Re-asked by the chain before each wave; the floor of 1 means a saturated
+      // machine degrades a wave to sequential rather than refusing the run. Bound HERE, not only
+      // in tests: a dep only tests supply is a feature that has never run.
+      waveLimit: (runId) => capacity.waveLimit(runId),
       steering,
       logger: this.log,
     });
@@ -606,16 +661,22 @@ export class Daemon {
         repos: registration.repos,
       },
       connect: this.connect,
-      // Sessions, not just runs (RUN-170): one run's wave is several live processes, and a
-      // heartbeat that counted runs would advertise free slots on a machine a single decomposed
-      // run has saturated — inviting dispatches its own wave limit exists to make room for.
-      freeSlots: () =>
-        Math.max(0, this.config.concurrency - Math.max(this.active.size, steering.liveSessionCount())),
+      // The capacity ledger's view, not a run count (RUN-170): one run's wave is several live
+      // processes — and a wave the daemon just granted breadth to is occupied capacity even
+      // before its children register. A heartbeat that counted runs would advertise free slots
+      // on a machine a single decomposed run has saturated, inviting dispatches its own wave
+      // limit exists to make room for.
+      freeSlots: () => capacity.freeSlots(),
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
         onAssigned: (run) => {
           this.active.add(run.id);
-          void supervisor.supervise(run).finally(() => this.active.delete(run.id));
+          void supervisor.supervise(run).finally(() => {
+            this.active.delete(run.id);
+            // The run's wave grant dies with it (RUN-170) — a lingering grant would keep
+            // reserving capacity for a run that can never spawn again.
+            capacity.release(run.id);
+          });
         },
         onCancel: (m) => {
           // Hard interrupt + SIGTERM + worktree teardown (the supervisor's finally
@@ -733,6 +794,7 @@ export class Daemon {
         this.log.error('resuming a parked run threw', { runId, err: String(err) });
       } finally {
         this.active.delete(runId);
+        capacity.release(runId); // same rule as onAssigned: a settled run holds no wave grant
       }
     };
 

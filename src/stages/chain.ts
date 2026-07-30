@@ -231,6 +231,23 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     getSessionText: () => allText + outcome.getSessionText().slice(outcome.sessionText.length),
   });
 
+  /** The persisted cancellation fact (RUN-165), asked before EVERY chain spawn — the one helper
+   *  all three spawn entries share (the wave loop, each sequential step, each wave member after
+   *  its lease). The stage machine's `stopBefore` only sees the pipeline's boundaries, and a
+   *  chain is many sessions with gaps between them inside ONE stage: a cancel landing in a gap —
+   *  or while a child's lease is still resolving, past `cancelRun`'s snapshot of live sessions —
+   *  must not be answered by spawning the next session. */
+  const cancelled = () => host.steering?.isCancelled?.(run.id) ?? false;
+  /** The chain's stop for a cancelled run: the work so far rides out (settle still runs on the
+   *  returned session), and nothing after it spawns. */
+  const cancelStop = (): ChainOutcome => {
+    host.log.info('the run was cancelled — the chain stops before its next session', { runId: run.id });
+    host.transcript(run.id).milestone('the run was cancelled — the remaining steps did not run');
+    return last
+      ? { ...last, exit: { ...last.exit, outcome: 'failed', isError: true, reason: 'cancelled' } }
+      : { chainFailed: 'cancelled' };
+  };
+
   /** The budget-exhausted stop, shared by both paths: FAILED, not the previous step's success.
    *  Returning that outcome unchanged would send a run that did half its plan through verify and
    *  landing and report it done — the silently-truncated-plan shape, arriving by the budget. */
@@ -256,6 +273,9 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
    *  session the chain hands onward — which under a wave schedule is not always the last-indexed
    *  one; keying the close/keep decision on the index left the handed-on session already closed. */
   const runStep = async (step: ExecutionStep, i: number, isFinal: boolean): Promise<ChainOutcome | null> => {
+    // A cancel that landed since the last session ended (RUN-165) — the gap between two steps is
+    // inside the execute stage, where no stage boundary asks.
+    if (cancelled()) return cancelStop();
     // The line announcing a step belongs to it (RUN-150). Every other segment is labelled by the
     // SESSION that emits it, which is what keeps attribution right once steps can overlap.
     host.transcript(run.id).milestone(`step ${i + 1}/${steps.length} — ${step.title} [${step.id}]`, step.id);
@@ -539,6 +559,12 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
           });
           return { step, i, failed: `steps:lease-failed: ${err}` };
         }
+        // A cancel that landed WHILE the lease was resolving (RUN-165/170): `cancelRun` stops only
+        // the sessions registered at that instant, so a session spawned after its snapshot would
+        // be one nothing ever stops. The persisted fact is asked here, past the await, before any
+        // process exists — the member settles as failed and its workspace is kept or disposed by
+        // the ordinary rule.
+        if (cancelled()) return { step, i, ws, failed: 'cancelled' };
         // A member must RESOLVE whatever happens to it — this map runs under Promise.all, and one
         // member throwing (a driver whose start() throws is an explicitly supported failure) would
         // reject the whole wave: siblings' finished work never integrated, their workspaces never
@@ -706,6 +732,8 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
   const doneIds = new Set(steps.slice(0, from).map((s) => s.id));
   let remaining = steps.slice(from);
   while (remaining.length) {
+    // Asked per wave as well as per spawn: a cancelled run must not even LEASE for its next wave.
+    if (cancelled()) return cancelStop();
     const overlapCap = plan.wave?.leasesOverlap ? Math.max(1, plan.wave.limit()) : 1;
     const pruned = remaining.map((s) => ({ ...s, dependsOn: s.dependsOn.filter((d) => !doneIds.has(d)) }));
     // Only the FIRST wave of the re-plan is executed; the rest is re-drawn next iteration, against
@@ -719,9 +747,23 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     // sequentially; waves after it may overlap.
     const resumedInWave = Boolean(plan.resumeFromStepId) && pending.some((s) => indexOf.get(s.id)! === from);
     // The last SCHEDULED step always runs sequentially, in the parent workspace, after its
-    // siblings land: the chain's success outcome is a live session the gates hand fix turns to,
-    // and a wave child's cwd is a workspace that is DISPOSED when its work lands — handing that
-    // session onward would run repairs in a removed checkout.
+    // siblings land: the chain's success outcome is a live session the gates hand fix turns to
+    // (RUN-29/146/174 — the contract stated in this function's doc since RUN-168), and a wave
+    // child's cwd is a workspace that is DISPOSED when its work lands — handing that session
+    // onward would run repairs in a removed checkout while the reviewer folds the PARENT tree.
+    //
+    // The cost is priced, not overlooked: a final wave of N overlaps N-1, so the minimum
+    // decomposition (two independent steps) runs sequentially — pure wall-clock, exactly what
+    // every decomposed run was before RUN-170. The two ways to buy that overlap back were both
+    // worse than the hour they save. Running the tail IN the parent workspace concurrently with
+    // its sibling children breaks the settled wave precondition — the parent checkout must be
+    // CLEAN when children publish into it (git's fast-forward refuses a dirty checked-out
+    // target), so a failed tail would strand every landed sibling un-landed, and committing a
+    // failed step's half-written tree to un-strand them puts partial work on the run's line.
+    // Sealing the returned session (no continueWith) instead revokes every gate's repair turn
+    // for exactly the long, decomposed runs that need them most — trading a terminal failure for
+    // a wall-clock win. A plan whose last step DEPENDS on the others (the common shape a planner
+    // writes) loses nothing at all: its tail was already its own wave.
     const isLastWave = pending.length === remaining.length;
     const tail = isLastWave ? pending[pending.length - 1]! : null;
     const overlapped = tail ? pending.slice(0, -1) : pending;

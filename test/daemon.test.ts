@@ -13,6 +13,7 @@ import {
   owedMergeReconciler,
   shouldForwardRunStatus,
   telemetryFrame,
+  waveCapacity,
 } from '../src/daemon';
 import type { DaemonHandle } from '../src/daemon';
 import { zeroTelemetry } from '../src/drivers/types';
@@ -159,6 +160,77 @@ describe('continuationLockScope', () => {
     it('still declares nothing when neither side has anything', async () => {
       expect(await continuationLockScope(store({}))(run('run_1'), spec([]))).toBeNull();
     });
+  });
+});
+
+// RUN-170. The capacity ledger behind waveLimit/freeSlots. Extracted and tested for the reason
+// its neighbours are — and because its failure mode is the quietest kind: a pure "what is spare?"
+// sample let two chains ask in the same window, each see only the other's single seat, and
+// together start more sessions than the machine allows. The grant is the fix: the answer is
+// RECORDED inside the ask, so the second ask subtracts the first's claim whatever either has
+// actually spawned yet.
+describe('waveCapacity', () => {
+  const ledger = (
+    over: { concurrency?: number; active?: string[]; sessions?: Record<string, number> } = {},
+  ) => {
+    const active = new Set(over.active ?? []);
+    const sessions = new Map(Object.entries(over.sessions ?? {}));
+    return {
+      active,
+      sessions,
+      cap: waveCapacity({
+        concurrency: over.concurrency ?? 3,
+        active: () => active,
+        sessionsOf: (id) => sessions.get(id) ?? 0,
+        liveSessions: (exclude) =>
+          [...sessions].filter(([id]) => id !== exclude).reduce((a, [, n]) => a + n, 0),
+      }),
+    };
+  };
+
+  // The reviewer's counterexample, closed: concurrency 3, two active chains, NEITHER has spawned
+  // a child yet. The second ask must see the first's grant, or 2+2 sessions land on 3 slots.
+  it('two chains asking in the same window cannot double-spend the spare slots', () => {
+    const { cap } = ledger({ concurrency: 3, active: ['run_a', 'run_b'] });
+    expect(cap.waveLimit('run_a')).toBe(2); // b holds one seat → a may run 2
+    expect(cap.waveLimit('run_b')).toBe(1); // a's GRANT of 2 is already claimed → b gets the rest
+    // Granted total = 3 = concurrency: the four-session outcome is unreachable.
+  });
+
+  it('a run’s claim is the busiest of grant, live sessions and its seat', () => {
+    const l = ledger({ concurrency: 4, active: ['run_a', 'run_b'] });
+    expect(l.cap.waveLimit('run_b')).toBe(3); // a: one seat
+    l.sessions.set('run_b', 3); // b's wave spawned — sessions now exceed nothing (grant 3)
+    expect(l.cap.waveLimit('run_a')).toBe(1); // b's claim is max(1, grant 3, sessions 3) = 3
+  });
+
+  it('re-asking replaces the grant — a chain that de-overlaps frees what it reserved', () => {
+    const { cap } = ledger({ concurrency: 3, active: ['run_a', 'run_b'] });
+    expect(cap.waveLimit('run_a')).toBe(2);
+    expect(cap.waveLimit('run_a')).toBe(2); // idempotent: its own grant is not held against it
+    expect(cap.waveLimit('run_b')).toBe(1);
+    // …and once a's grant is released (its run settled), b's next ask gets the room back — only
+    // a's still-active seat is counted.
+    cap.release('run_a');
+    expect(cap.waveLimit('run_b')).toBe(2);
+  });
+
+  it('freeSlots counts a granted wave as occupied capacity before its children even register', () => {
+    const { cap } = ledger({ concurrency: 3, active: ['run_a'] });
+    expect(cap.freeSlots()).toBe(2); // one seat held
+    cap.waveLimit('run_a'); // granted 3 — about to spawn a wave of up to 3
+    expect(cap.freeSlots()).toBe(0); // the heartbeat must not invite dispatches into that gap
+  });
+
+  it('still counts a straggler session whose run already left the active set', () => {
+    const { cap, sessions } = ledger({ concurrency: 2, active: ['run_a'] });
+    sessions.set('run_gone', 1); // torn-down run, session not yet unregistered
+    expect(cap.waveLimit('run_a')).toBe(1);
+  });
+
+  it('floors at one — a saturated machine degrades a wave to sequential, never refuses the run', () => {
+    const { cap } = ledger({ concurrency: 1, active: ['run_a', 'run_b'] });
+    expect(cap.waveLimit('run_a')).toBe(1);
   });
 });
 

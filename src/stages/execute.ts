@@ -43,6 +43,12 @@ export interface ExecuteHost {
   steering?: {
     register: (runId: string, session: DriverSession, stop: () => Promise<void>, key?: string) => void;
     unregister: (runId: string, key?: string) => void;
+    /** The persisted cancellation fact (RUN-165). A chain is many sessions with gaps between
+     *  them INSIDE the execute stage, so the stage-boundary check cannot see a cancel that lands
+     *  mid-chain — between two steps, or while a wave child is still leasing its workspace
+     *  (`cancelRun` stops only sessions that exist, and a lease resolving after it would spawn
+     *  one that nothing stops). The chain asks this before every spawn (RUN-170). */
+    isCancelled?: (runId: string) => boolean;
   };
   /** Did this run stop to ask a human (RUN-30)? Returns the exit to report iff it parked. */
   parkIfBlocked(ctx: {

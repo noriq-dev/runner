@@ -119,6 +119,13 @@ export class SteeringBridge {
     return n;
   }
 
+  /** ONE run's live sessions — the per-run half of the same capacity question, for the daemon's
+   *  reservation ledger (RUN-170): a run's claim on the machine is the busiest of its grant, its
+   *  live sessions, and its seat, and this is the middle measure. */
+  liveSessionsOf(runId: string): number {
+    return this.targets.get(runId)?.size ?? 0;
+  }
+
   /**
    * SIGTERM every live session — daemon shutdown. Returns the runIds it stopped.
    *

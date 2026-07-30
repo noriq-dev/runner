@@ -94,6 +94,14 @@ describe('liveSessionCount', () => {
     bridge.unregister('run_a', 'step:s2');
     expect(bridge.liveSessionCount()).toBe(0);
   });
+
+  it('answers one run’s own count — the capacity ledger’s per-run measure', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    expect(bridge.liveSessionsOf('run_a')).toBe(2);
+    expect(bridge.liveSessionsOf('run_b')).toBe(0);
+  });
 });
 
 describe('SteeringBridge', () => {
