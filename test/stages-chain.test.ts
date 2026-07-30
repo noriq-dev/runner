@@ -508,6 +508,29 @@ describe('a wave child never parks (RUN-170)', () => {
     expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'steps:child-asked' });
     expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/cannot park/);
   });
+
+  // The unknown answer must not become the acted-on one (RUN-152's direction): a probe failure
+  // read as "nobody asked" lets the tail's own park check adopt a child's stale question and park
+  // the WRONG session — a corrupted resume, where stopping costs a re-dispatch with every landed
+  // child's work kept.
+  it('an unanswerable park probe stops the chain rather than risking a wrong-session park', async () => {
+    const h = harness();
+    const w = fakeWave({
+      probeBlocked: async () => {
+        throw new Error('server flake');
+      },
+    });
+    const running = executeChain(h.host, h.plan({ steps: pairThenDependent(), wave: w.wave }));
+    await until(() => h.spawns.length === 2);
+    h.spawns[0]!.end();
+    h.spawns[1]!.end();
+    const out = await running;
+    if ('chainFailed' in out || out.parked) throw new Error('expected an outcome');
+    expect(w.publishes).toHaveLength(2); // the children's work still landed and is kept
+    expect(h.spawns).toHaveLength(2); // the tail never spawned — nothing to park wrongly
+    expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'steps:park-probe-failed' });
+    expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/could not confirm/);
+  });
 });
 
 describe('a cancel is a fact about the RUN, wherever it lands mid-chain (RUN-165/170)', () => {

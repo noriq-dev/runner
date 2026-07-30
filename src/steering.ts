@@ -44,6 +44,21 @@ interface SteerTarget {
   stop: () => Promise<void>;
 }
 
+/** How long a cancel or hard steer waits for a session's polite `interrupt()` before moving on.
+ *  The interrupt is a courtesy to the driver (finish the token, flush state); the SIGTERM behind
+ *  a cancel is the enforcement, and a driver that never acknowledges must not stand between the
+ *  run and it — nor, on a decomposed run, between the operator and the run's OTHER sessions
+ *  (RUN-170). */
+const INTERRUPT_GRACE_MS = 5_000;
+
+/** A resolve-only timer that must never be the reason the daemon outlives its work — the budget
+ *  layer's own unref rule, guarded the same way because a fake clock need not implement it. */
+const grace = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === 'function') t.unref();
+  });
+
 export class SteeringBridge {
   /**
    * runId → session key → target. Two levels because a decomposed run's wave holds several live
@@ -72,9 +87,11 @@ export class SteeringBridge {
    */
   private readonly cancelled = new Set<string>();
   private readonly log: typeof defaultLogger;
+  private readonly interruptGraceMs: number;
 
-  constructor(deps: { logger?: typeof defaultLogger } = {}) {
+  constructor(deps: { logger?: typeof defaultLogger; interruptGraceMs?: number } = {}) {
     this.log = deps.logger ?? defaultLogger;
+    this.interruptGraceMs = deps.interruptGraceMs ?? INTERRUPT_GRACE_MS;
   }
 
   /** A run's live session becomes steerable when it starts. `stop` tears that session down (used
@@ -172,21 +189,31 @@ export class SteeringBridge {
       this.log.info('run cancelled with no live session — the pipeline stops at its next stage', { runId });
       return true;
     }
-    for (const target of sessions) {
-      try {
-        await target.session.interrupt();
-      } catch (err) {
-        this.log.warn('cancel interrupt failed', { runId, err: String(err) });
-      }
-      try {
-        await target.stop();
-      } catch (err) {
-        this.log.warn('cancel stop failed — continuing to the run’s other sessions', {
-          runId,
-          err: String(err),
-        });
-      }
-    }
+    // CONCURRENT fan-out with a BOUNDED courtesy. This loop used to await each session's
+    // unbounded interrupt() in turn, so one hung driver stood between the run and its own
+    // SIGTERM — and between the cancel and every later sibling. Each session now races its
+    // interrupt against the grace and takes its stop regardless, and no session waits on
+    // another's: the guarantee is the SIGTERM, not the driver's cooperation.
+    await Promise.all(
+      sessions.map(async (target) => {
+        await Promise.race([
+          Promise.resolve()
+            .then(() => target.session.interrupt())
+            .catch((err) => {
+              this.log.warn('cancel interrupt failed', { runId, err: String(err) });
+            }),
+          grace(this.interruptGraceMs),
+        ]);
+        try {
+          await target.stop();
+        } catch (err) {
+          this.log.warn('cancel stop failed — the run’s other sessions stop regardless', {
+            runId,
+            err: String(err),
+          });
+        }
+      }),
+    );
     this.log.info('run cancelled — SIGTERM + teardown', { runId, sessions: sessions.length });
     return true;
   }
@@ -221,25 +248,35 @@ export class SteeringBridge {
     // context; the one session it was about NOT hearing it loses the steer. Delivery is claimed
     // when ANY session accepted — the notices fallback exists for the reached-nobody case.
     let delivered = 0;
-    let firstErr: Error | null = null;
-    for (const target of sessions) {
-      try {
-        if (steer.mode === 'hard') await target.session.interrupt();
-        // pushInput reports FALSE when the session's input already closed — the agent
-        // finished while this steer was in flight. That push is a silent no-op, so claiming
-        // via:'runtime' for it would suppress the notices fallback (the documented dedup guard)
-        // and the steer would reach nobody while the human watched it get acked as delivered.
-        if (target.session.pushInput(steer.body)) delivered += 1;
-      } catch (err) {
-        firstErr ??= err as Error;
-        this.log.warn('steer delivery failed', { runId: steer.runId, err: String(err) });
-      }
-    }
+    const errs: Error[] = [];
+    // Concurrent per-session, with the hard half's interrupt bounded — cancelRun's rule, for the
+    // same reason: one hung driver must not cost the run's OTHER sessions their steer. On a
+    // timeout the injection is still attempted; the session hears it at its next boundary.
+    await Promise.all(
+      sessions.map(async (target) => {
+        try {
+          if (steer.mode === 'hard') {
+            await Promise.race([
+              Promise.resolve().then(() => target.session.interrupt()),
+              grace(this.interruptGraceMs),
+            ]);
+          }
+          // pushInput reports FALSE when the session's input already closed — the agent
+          // finished while this steer was in flight. That push is a silent no-op, so claiming
+          // via:'runtime' for it would suppress the notices fallback (the documented dedup guard)
+          // and the steer would reach nobody while the human watched it get acked as delivered.
+          if (target.session.pushInput(steer.body)) delivered += 1;
+        } catch (err) {
+          errs.push(err as Error);
+          this.log.warn('steer delivery failed', { runId: steer.runId, err: String(err) });
+        }
+      }),
+    );
     if (delivered > 0) {
       this.log.info('steer delivered', { runId: steer.runId, mode: steer.mode, sessions: delivered });
       return { ...base, delivered: true, via: 'runtime', detail: null };
     }
-    if (firstErr) return { ...base, delivered: false, via: 'fallback', detail: firstErr.message };
+    if (errs.length > 0) return { ...base, delivered: false, via: 'fallback', detail: errs[0]!.message };
     this.log.warn('steer arrived after the session closed — leaving it to the notices fallback', {
       runId: steer.runId,
       mode: steer.mode,

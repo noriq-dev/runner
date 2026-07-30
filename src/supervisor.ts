@@ -1134,11 +1134,11 @@ export class RunSupervisor {
       dispose: (ws) => vcs.dispose(ws),
       // The park-state probe (RUN-30's authority) — how the chain learns a wave child stopped to
       // ask a human, since a child cannot park. Absent with parking off, exactly like parkIfBlocked.
+      // A probe FAILURE propagates rather than reading as "not blocked" (RUN-152's direction —
+      // the unknown answer must not become the one acted on): the chain is the actor that decides
+      // what an unanswerable probe means, and coercing here decided it silently.
       ...(this.deps.getParkState
-        ? {
-            probeBlocked: async () =>
-              Boolean((await this.deps.getParkState!(run.id).catch(() => null))?.blocked),
-          }
+        ? { probeBlocked: async () => Boolean((await this.deps.getParkState!(run.id))?.blocked) }
         : {}),
     };
   }

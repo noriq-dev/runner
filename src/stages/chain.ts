@@ -733,21 +733,34 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     // A child that stopped to ask a human marked the RUN blocked server-side, and a child cannot
     // park (see the header). Left unanswered, the next sequential step's own park check would
     // adopt the stale question and park the WRONG session against it — so the chain stops here,
-    // work landed and kept, and says what happened.
+    // work landed and kept, and says what happened. An UNANSWERABLE probe stops it too (RUN-152's
+    // direction — the unknown answer must not become the one acted on): reading a transient
+    // failure as "nobody asked" is exactly the wrong-session park, where stopping costs a
+    // re-dispatch with every landed child's work kept.
     if (wave.probeBlocked && lastLanded) {
-      const blocked = await wave.probeBlocked().catch(() => false);
-      if (blocked) {
-        host.log.warn('a wave step stopped to ask a human — a concurrent step cannot park', {
-          runId: run.id,
-        });
+      const blocked = await wave.probeBlocked().catch(() => null);
+      if (blocked !== false) {
+        host.log.warn(
+          blocked
+            ? 'a wave step stopped to ask a human — a concurrent step cannot park'
+            : 'the park probe failed after a wave — stopping rather than risking a wrong-session park',
+          { runId: run.id },
+        );
         host
           .transcript(run.id)
           .milestone(
-            'a step in this wave asked a human a question. A concurrent step cannot park (its workspace has no park record), so the chain stops with the work so far landed and kept — answer on the task and re-dispatch.',
+            blocked
+              ? 'a step in this wave asked a human a question. A concurrent step cannot park (its workspace has no park record), so the chain stops with the work so far landed and kept — answer on the task and re-dispatch.'
+              : 'could not confirm whether a step in this wave asked a human (the park probe failed), so the chain stops with the work so far landed and kept rather than let the next step park against a question that may not be its own. Re-dispatch to continue.',
           );
         return {
           ...lastLanded,
-          exit: { ...lastLanded.exit, outcome: 'failed', isError: true, reason: 'steps:child-asked' },
+          exit: {
+            ...lastLanded.exit,
+            outcome: 'failed',
+            isError: true,
+            reason: blocked ? 'steps:child-asked' : 'steps:park-probe-failed',
+          },
         };
       }
     }

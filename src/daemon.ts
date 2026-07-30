@@ -253,6 +253,16 @@ export function orphanSweep(deps: {
  * is the conservative direction — a slower schedule, never a broken bound. What remains out of
  * scope, per RUN-170's own deferral: fairness/reservation ACROSS daemons — this ledger is one
  * process's, which is also where the lease pool and the active set live.
+ *
+ * `admit` is the ADMISSION half of the same bound. The advertisement narrows the window a
+ * dispatch can race into (a grant pushes the shrunken freeSlots at once), but a frame already in
+ * the air cannot be recalled — so an assignment that lands on a saturated machine WAITS for a
+ * seat instead of becoming an extra session. The daemon still never REFUSES an assignment; it
+ * holds it, the same boundary a saturated wave already accepts for its own steps. A queued run
+ * claims no seat (counting it would deadlock two waiters against each other), and waiters are
+ * re-checked in arrival order whenever a claim moves — a grant replaced or released — and on
+ * every freeSlots read, which the heartbeat performs each beat, so a seat freed by a finished
+ * session is noticed within one beat even when no ledger state moved.
  */
 export function waveCapacity(deps: {
   concurrency: number;
@@ -263,14 +273,41 @@ export function waveCapacity(deps: {
   /** Live sessions machine-wide, minus one run's own (SteeringBridge.liveSessionCount) — the
    *  backstop for a session whose run has already left the active set mid-teardown. */
   liveSessions: (excludeRunId?: string) => number;
-}): { waveLimit: (runId: string) => number; freeSlots: () => number; release: (runId: string) => void } {
+}): {
+  waveLimit: (runId: string) => number;
+  freeSlots: () => number;
+  release: (runId: string) => void;
+  admit: (runId: string) => Promise<void>;
+} {
   const grants = new Map<string, number>();
+  /** Assignments waiting for a seat, in arrival order. `waiting` mirrors it for claimed()'s
+   *  benefit: a queued run holds no seat yet — it is exactly what admission is holding OUT of
+   *  the machine, so giving it the one-seat floor would deadlock waiters against each other. */
+  const waiters: Array<{ runId: string; resolve: () => void }> = [];
+  const waiting = new Set<string>();
   const claimed = (excludeRunId?: string): number => {
     let n = 0;
     for (const id of deps.active()) {
-      if (id !== excludeRunId) n += Math.max(1, grants.get(id) ?? 0, deps.sessionsOf(id));
+      if (id === excludeRunId) continue;
+      n += Math.max(waiting.has(id) ? 0 : 1, grants.get(id) ?? 0, deps.sessionsOf(id));
     }
     return Math.max(n, deps.liveSessions(excludeRunId));
+  };
+  /** Room for one more of this run's sessions under the ceiling. */
+  const fits = (runId: string): boolean => claimed(runId) + 1 <= deps.concurrency;
+  /** Re-check waiters in order. Admitting one takes its floor seat back (waiting.delete), so the
+   *  next waiter is judged against it — seats hand over one at a time, FIFO. */
+  const poke = (): void => {
+    for (let i = 0; i < waiters.length; ) {
+      const w = waiters[i]!;
+      if (!fits(w.runId)) {
+        i += 1;
+        continue;
+      }
+      waiters.splice(i, 1);
+      waiting.delete(w.runId);
+      w.resolve();
+    }
   };
   return {
     waveLimit: (runId) => {
@@ -278,13 +315,28 @@ export function waveCapacity(deps: {
       // The reservation itself: recorded before returning, so a simultaneous ask from another
       // chain subtracts this one's claim instead of double-spending the same spare slots.
       grants.set(runId, limit);
+      // A replaced grant can SHRINK (the chain de-overlapped): what it freed may admit a waiter.
+      poke();
       return limit;
     },
     // The heartbeat's advertisement counts grants too: a wave the daemon just promised breadth to
-    // is capacity even before its children register, or the server dispatches into the gap.
-    freeSlots: () => Math.max(0, deps.concurrency - claimed()),
+    // is capacity even before its children register, or the server dispatches into the gap. The
+    // read doubles as the waiters' liveness tick (see the doc): a session ending moves no ledger
+    // state of its own, and the beat rides this every interval.
+    freeSlots: () => {
+      poke();
+      return Math.max(0, deps.concurrency - claimed());
+    },
     release: (runId) => {
       grants.delete(runId);
+      poke();
+    },
+    admit: (runId) => {
+      if (fits(runId)) return Promise.resolve();
+      waiting.add(runId);
+      return new Promise<void>((resolve) => {
+        waiters.push({ runId, resolve });
+      });
     },
   };
 }
@@ -681,13 +733,22 @@ export class Daemon {
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
         onAssigned: (run) => {
+          // The seat is claimed SYNCHRONOUSLY — the ledger and the heartbeat see this run before
+          // anything yields — but supervision waits for ADMISSION (RUN-170): the advertisement
+          // cannot recall a dispatch already in the air, so an assignment that lands on a machine
+          // a wave has saturated is HELD until a seat exists rather than becoming an extra
+          // session. Never refused: a cancel arriving while it waits is still honored — the
+          // cancelled fact persists (RUN-165) and supervision settles at its first stage check.
           this.active.add(run.id);
-          void supervisor.supervise(run).finally(() => {
-            this.active.delete(run.id);
-            // The run's wave grant dies with it (RUN-170) — a lingering grant would keep
-            // reserving capacity for a run that can never spawn again.
-            capacity.release(run.id);
-          });
+          void capacity
+            .admit(run.id)
+            .then(() => supervisor.supervise(run))
+            .finally(() => {
+              this.active.delete(run.id);
+              // The run's wave grant dies with it (RUN-170) — a lingering grant would keep
+              // reserving capacity for a run that can never spawn again.
+              capacity.release(run.id);
+            });
         },
         onCancel: (m) => {
           // Hard interrupt + SIGTERM + worktree teardown (the supervisor's finally

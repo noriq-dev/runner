@@ -232,6 +232,63 @@ describe('waveCapacity', () => {
     const { cap } = ledger({ concurrency: 1, active: ['run_a', 'run_b'] });
     expect(cap.waveLimit('run_a')).toBe(1);
   });
+
+  // The admission half (RUN-170): an advertisement cannot recall a dispatch already in the air,
+  // so an assignment that lands on a saturated machine WAITS for a seat instead of becoming an
+  // extra session — the enforcement the freeSlots figure alone could never be.
+  it('holds an assignment while a grant saturates the machine, and admits it when the claim moves', async () => {
+    const l = ledger({ concurrency: 3, active: ['run_a'] });
+    expect(l.cap.waveLimit('run_a')).toBe(3); // the wave takes the machine
+    l.active.add('run_b'); // assigned mid-wave: the seat is claimed…
+    let admitted = false;
+    const gate = l.cap.admit('run_b').then(() => {
+      admitted = true;
+    });
+    await Promise.resolve();
+    expect(admitted).toBe(false); // …but no fourth session starts on a three-slot machine
+    l.cap.release('run_a'); // the wave's run settled
+    await gate;
+    expect(admitted).toBe(true);
+  });
+
+  it('waiters take seats FIFO — a queued run holds no seat, and two waiters cannot deadlock', async () => {
+    const l = ledger({ concurrency: 1, active: ['run_a'] });
+    expect(l.cap.waveLimit('run_a')).toBe(1);
+    l.active.add('run_b');
+    l.active.add('run_c');
+    const admitted: string[] = [];
+    const b = l.cap.admit('run_b').then(() => admitted.push('run_b'));
+    const c = l.cap.admit('run_c').then(() => admitted.push('run_c'));
+    await Promise.resolve();
+    expect(admitted).toEqual([]); // the one slot is run_a's
+    l.active.delete('run_a'); // settled — active.delete THEN release, onAssigned's own order
+    l.cap.release('run_a');
+    await b;
+    // ONE seat freed admits ONE waiter: run_c is judged against the just-admitted run_b's seat.
+    // (Counting queued runs as seated would instead deadlock them against each other forever.)
+    expect(admitted).toEqual(['run_b']);
+    l.active.delete('run_b');
+    l.cap.release('run_b');
+    await c;
+    expect(admitted).toEqual(['run_b', 'run_c']);
+  });
+
+  it('the freeSlots read re-checks waiters — a seat freed by a finished session admits within a beat', async () => {
+    // Sessions ending move no ledger state of their own; the heartbeat rides freeSlots every
+    // beat, which is where a queued assignment notices the room they freed.
+    const l = ledger({ concurrency: 2, active: ['run_a'], sessions: { run_a: 2 } });
+    l.active.add('run_b');
+    let admitted = false;
+    const gate = l.cap.admit('run_b').then(() => {
+      admitted = true;
+    });
+    await Promise.resolve();
+    expect(admitted).toBe(false);
+    l.sessions.set('run_a', 1); // a wave session finished
+    l.cap.freeSlots(); // the next heartbeat's own read
+    await gate;
+    expect(admitted).toBe(true);
+  });
 });
 
 // RUN-153. `reapOrphans` ran only at daemon START, so a workspace deliberately KEPT mid-flight —
@@ -660,9 +717,10 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   }
 
   // Drive start() with every seam faked, capturing the `report` callback the daemon wires into the
-  // supervisor — the closure under test. The supervisor itself is a stub: no run is dispatched, so
-  // supervise/resume never fire, but expireStaleParks runs at startup and must answer.
-  async function harness(over: { concurrency?: number } = {}) {
+  // supervisor — the closure under test. The supervisor itself is a stub: `supervised` records the
+  // runs that actually reached it (the admission gate's observable, RUN-170), and `superviseGate`
+  // holds each one open so a test can model a run that is still working.
+  async function harness(over: { concurrency?: number; superviseGate?: Promise<void> } = {}) {
     const sockets: FakeDaemonSocket[] = [];
     const connect: WsFactory = (url, headers) => {
       const s = new FakeDaemonSocket(url, headers);
@@ -670,6 +728,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
       return s;
     };
     const calls: string[] = [];
+    const supervised: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
     const daemon = new Daemon(config(over.concurrency), 'tok', {
@@ -682,14 +741,46 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
-        return { supervise: async () => ({}), resume: async () => null, expireStaleParks: async () => 0 };
+        return {
+          supervise: async (run) => {
+            supervised.push(run.id);
+            await (over.superviseGate ?? Promise.resolve());
+            return {};
+          },
+          resume: async () => null,
+          expireStaleParks: async () => 0,
+        };
       },
     });
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, report, deps };
+    return { handle, sockets, calls, report, deps, supervised };
   }
+
+  /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
+   *  the test would silently exercise nothing. */
+  const assignedFrame = (id: string) =>
+    JSON.stringify({
+      type: 'run.assigned',
+      run: {
+        id,
+        projectId: 'prj_a',
+        runnerId: 'rnr_test',
+        agentId: null,
+        kind: 'build',
+        anchor: null,
+        brief: 'go',
+        repoRef: 'repo_a',
+        agentTool: 'claude',
+        budget: {},
+        status: 'dispatched',
+        exit: null,
+        createdBy: 'usr_1',
+        createdAt: '2026-07-14T00:00:00.000Z',
+        updatedAt: '2026-07-14T00:00:00.000Z',
+      },
+    });
 
   it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
     const { handle, sockets, calls } = await harness();
@@ -726,29 +817,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   it('a wave grant pushes the shrunken freeSlots advertisement at once, not at the next beat (RUN-170)', async () => {
     const { deps, sockets } = await harness({ concurrency: 3 });
     const s = sockets[0]!;
-    s.emit(
-      'message',
-      JSON.stringify({
-        type: 'run.assigned',
-        run: {
-          id: 'run_w',
-          projectId: 'prj_a',
-          runnerId: 'rnr_test',
-          agentId: null,
-          kind: 'build',
-          anchor: null,
-          brief: 'go',
-          repoRef: 'repo_a',
-          agentTool: 'claude',
-          budget: {},
-          status: 'dispatched',
-          exit: null,
-          createdBy: 'usr_1',
-          createdAt: '2026-07-14T00:00:00.000Z',
-          updatedAt: '2026-07-14T00:00:00.000Z',
-        },
-      }),
-    );
+    s.emit('message', assignedFrame('run_w'));
     const before = s.sent.length;
     expect(deps.waveLimit?.('run_w')).toBe(3); // nothing else running — the wave may take the machine
     const beats = s.sent
@@ -757,6 +826,29 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
       .filter((f) => f.type === 'heartbeat');
     // The grant is occupied capacity the moment it is made — and the server hears so at once.
     expect(beats).toEqual([{ type: 'heartbeat', freeSlots: 0 }]);
+  });
+
+  // RUN-170, the enforcement behind the advertisement: a dispatch already in the air cannot be
+  // recalled by any heartbeat, so an assignment landing on a machine a wave has saturated is HELD
+  // — never refused, never a fourth session — until the seats exist.
+  it('an assignment into a saturated machine is held, and starts when the wave’s run settles', async () => {
+    let settle!: () => void;
+    const gate = new Promise<void>((r) => {
+      settle = r;
+    });
+    const { deps, sockets, supervised } = await harness({ concurrency: 3, superviseGate: gate });
+    const s = sockets[0]!;
+    s.emit('message', assignedFrame('run_a'));
+    await tick();
+    expect(supervised).toEqual(['run_a']);
+    expect(deps.waveLimit?.('run_a')).toBe(3); // run_a's wave takes the whole machine
+    s.emit('message', assignedFrame('run_b')); // raced past the advertisement
+    await tick();
+    expect(supervised).toEqual(['run_a']); // held: three wave children, and no fourth session
+    settle(); // run_a finishes → its grant is released → the held assignment takes the seat
+    await tick();
+    await tick();
+    expect(supervised).toEqual(['run_a', 'run_b']);
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {

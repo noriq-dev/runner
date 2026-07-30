@@ -7,6 +7,9 @@ class FakeSession implements DriverSession {
   inputs: string[] = [];
   interrupts = 0;
   interruptThrows = false;
+  /** Model a driver whose interrupt() never answers — the hung case RUN-170's bounded grace
+   *  exists for. */
+  interruptHangs = false;
   /** Model a session whose input queue has closed (the agent already finished). */
   inputClosed = false;
   constructor(readonly runId: string) {}
@@ -19,6 +22,7 @@ class FakeSession implements DriverSession {
   async interrupt(): Promise<void> {
     this.order.push('interrupt');
     this.interrupts += 1;
+    if (this.interruptHangs) return new Promise<void>(() => {});
     if (this.interruptThrows) throw new Error('interrupt boom');
   }
   async stop(): Promise<void> {}
@@ -344,6 +348,34 @@ describe('several live sessions of one run (RUN-170)', () => {
     expect(boxA.stops).toBe(1);
     expect(boxB.stops).toBe(1);
     expect(bridge.isCancelled('run_1')).toBe(true);
+  });
+
+  it('a hung interrupt neither blocks its own SIGTERM nor strands its siblings', async () => {
+    // The polite interrupt is a COURTESY and the SIGTERM is the enforcement: a driver that never
+    // answers must not stand between the run and its stop, or between the cancel and the run's
+    // other sessions. The fan-out is concurrent and the courtesy bounded by the grace.
+    const bridge = new SteeringBridge({ interruptGraceMs: 5 });
+    const hung = new FakeSession('run_1');
+    hung.interruptHangs = true;
+    const good = new FakeSession('run_1');
+    const boxHung = register(bridge, hung, 'step:a');
+    const boxGood = register(bridge, good, 'step:b');
+    await bridge.cancelRun('run_1'); // resolves at all — the grace bounds the hung courtesy
+    expect(boxGood.stops).toBe(1); // the sibling never waited on the hung driver
+    expect(boxHung.stops).toBe(1); // and the hung session still took its SIGTERM
+  });
+
+  it('a hard steer still reaches the siblings of a session whose interrupt hangs', async () => {
+    const bridge = new SteeringBridge({ interruptGraceMs: 5 });
+    const hung = new FakeSession('run_1');
+    hung.interruptHangs = true;
+    const good = new FakeSession('run_1');
+    register(bridge, hung, 'step:a');
+    register(bridge, good, 'step:b');
+    const result = await bridge.applySteer(steer({ mode: 'hard' }));
+    expect(good.inputs).toHaveLength(1); // delivered without waiting on the hung sibling
+    expect(hung.inputs).toHaveLength(1); // still injected after the grace — heard at the next boundary
+    expect(result).toMatchObject({ delivered: true, via: 'runtime' });
   });
 
   it('one session refusing to stop does not strand its siblings', async () => {
