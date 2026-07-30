@@ -589,6 +589,9 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
     close(): void {
       for (const cb of this.listeners.get('close') ?? []) cb();
     }
+    emit(event: string, ...args: unknown[]): void {
+      for (const cb of this.listeners.get(event) ?? []) cb(...args);
+    }
     telemetry(): Array<Record<string, unknown>> {
       return this.sent
         .map((s) => JSON.parse(s) as Record<string, unknown>)
@@ -712,6 +715,48 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
     const { deps } = await harness({ concurrency: 3 });
     expect(deps.waveLimit).toBeTypeOf('function');
     expect(deps.waveLimit?.('run_asking')).toBe(3);
+  });
+
+  // RUN-170, the admission half: the server is the admission authority — this daemon has never
+  // refused an assignment — and it dispatches against the last freeSlots it HEARD. A grant that
+  // waited for the next timed beat left a whole interval a dispatch could land in, so the grant
+  // pushes the shrunken advertisement itself. The run is made ACTIVE first because that is
+  // production's shape (waveLimit is only ever asked by a run being supervised) and because the
+  // ledger counts grants through the active set.
+  it('a wave grant pushes the shrunken freeSlots advertisement at once, not at the next beat (RUN-170)', async () => {
+    const { deps, sockets } = await harness({ concurrency: 3 });
+    const s = sockets[0]!;
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'run.assigned',
+        run: {
+          id: 'run_w',
+          projectId: 'prj_a',
+          runnerId: 'rnr_test',
+          agentId: null,
+          kind: 'build',
+          anchor: null,
+          brief: 'go',
+          repoRef: 'repo_a',
+          agentTool: 'claude',
+          budget: {},
+          status: 'dispatched',
+          exit: null,
+          createdBy: 'usr_1',
+          createdAt: '2026-07-14T00:00:00.000Z',
+          updatedAt: '2026-07-14T00:00:00.000Z',
+        },
+      }),
+    );
+    const before = s.sent.length;
+    expect(deps.waveLimit?.('run_w')).toBe(3); // nothing else running — the wave may take the machine
+    const beats = s.sent
+      .slice(before)
+      .map((x) => JSON.parse(x) as Record<string, unknown>)
+      .filter((f) => f.type === 'heartbeat');
+    // The grant is occupied capacity the moment it is made — and the server hears so at once.
+    expect(beats).toEqual([{ type: 'heartbeat', freeSlots: 0 }]);
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {

@@ -399,6 +399,8 @@ describe('a wave actually overlaps (RUN-170)', () => {
     if ('chainFailed' in out || out.parked) throw new Error('expected an outcome');
     expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'steps:child-conflict' });
     expect(w.abandoned).toContain('run_1--a');
+    // The land-failure notice is the failing child's segment (RUN-170's attribution rule).
+    expect(h.transcript.find((t) => t.text.includes('did not land back'))!.step).toBe('a');
     // Never force-delete work that exists nowhere else: the conflicted children are kept —
     // and the tail step never starts, because the chain stops at the failure.
     expect(w.disposed).toEqual([]);
@@ -428,6 +430,10 @@ describe('a failed step lets its wave finish, then the chain stops (RUN-170)', (
     // The run's outcome is the failing step's, over the accumulated text.
     expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'boom' });
     expect(out.sessionText).toContain('B landed anyway');
+    // A child's milestones are ITS segments, not the parent voice's — attribution is what keeps
+    // a transcript readable once two steps' segments interleave (RUN-150/170).
+    expect(h.transcript.find((t) => t.text.includes('did not finish'))!.step).toBe('a');
+    expect(h.transcript.find((t) => t.text.includes('workspace is kept'))!.step).toBe('a');
   });
 
   // A member THROWING — a driver whose start() fails is an explicitly supported failure — must
@@ -590,6 +596,56 @@ describe('degrading to the sequential chain, which is always correct (RUN-170)',
     h.spawns[2]!.end();
     await running;
     expect(w.leases).toEqual([]);
+  });
+
+  // An exhausted run must not OPEN a wave: the first-step exception (spawn once and let the
+  // budget layer decline — the same failure shape as an undecomposed run) is kept at the first
+  // STEP's grain. Overlapping would lease N workspaces and start N processes only to kill them,
+  // which is RUN-133's spawn-to-kill shape multiplied by the wave width.
+  it('an exhausted run leases nothing — one sequential spawn carries the decline, never N', async () => {
+    const tally = new RunTally({ maxTokens: 100, maxUsd: null, maxDurationSeconds: null, maxRounds: null });
+    tally.record('prior-sitting', { ...zeroTelemetry(), outputTokens: 100 }); // ceiling already spent
+    const h = harness({ tally });
+    const w = fakeWave();
+    const running = executeChain(h.host, h.plan({ steps: threeIndependent(), wave: w.wave }));
+    await until(() => h.spawns.length === 1);
+    await tick();
+    expect(h.spawns).toHaveLength(1); // ONE spawn carries the decline
+    expect(w.leases).toEqual([]); // no child workspace was ever taken
+    // The budget layer declines the turn in production; the fake stands in for its terminal exit.
+    h.spawns[0]!.end({ outcome: 'failed', isError: true, reason: 'budget:tokens' });
+    const out = await running;
+    if ('chainFailed' in out || out.parked) throw new Error('expected an outcome');
+    expect(out.exit).toMatchObject({ outcome: 'failed', reason: 'budget:tokens' });
+    expect(h.spawns).toHaveLength(1); // the chain stopped — no sibling, no tail
+  });
+
+  // The other boundary: a remainder too small to hand every member a spendable share. Flooring
+  // shares UP would let their sum outspend the remainder; passing the floored 0 through would
+  // hand a member a dimension the budget wrapper cannot arm (`superviseBudget` relies on the
+  // schema's maxDurationSeconds >= 1 — a 0 disarms the deadline entirely, the opposite of
+  // bounding it at nothing; the same floor guards maxTokens). So the wave declines to overlap
+  // and each sequential step reserves the true remainder in turn.
+  it('a remainder too small to split runs the wave sequentially rather than handing out zero shares', async () => {
+    const tally = new RunTally({ maxTokens: 1, maxUsd: null, maxDurationSeconds: null, maxRounds: null });
+    const h = harness({ tally });
+    const w = fakeWave();
+    const running = executeChain(h.host, h.plan({ steps: threeIndependent(), wave: w.wave }));
+    await until(() => h.spawns.length === 1);
+    await tick();
+    expect(h.spawns).toHaveLength(1); // sequential — never two live
+    expect(w.leases).toEqual([]);
+    // The remainder reaches the step WHOLE and spendable, not floor-divided to 0.
+    expect(h.spawns[0]!.opts.budget?.maxTokens).toBe(1);
+    h.spawns[0]!.end();
+    await until(() => h.spawns.length === 2);
+    expect(h.spawns[0]!.live).toBe(false); // one at a time, genuinely
+    h.spawns[1]!.end();
+    await until(() => h.spawns.length === 3);
+    h.spawns[2]!.end();
+    const out = await running;
+    if ('chainFailed' in out || out.parked) throw new Error('expected a finished chain');
+    expect(out.exit.outcome).toBe('done');
   });
 
   // The limit is re-asked before EACH wave, not sampled once: a machine that got busy after the

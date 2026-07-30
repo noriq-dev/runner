@@ -239,6 +239,18 @@ export class WsClient {
     this.sendRaw({ type: 'run.log', runId, segments });
   }
 
+  /** Push the current freeSlots advertisement NOW rather than at the next timed beat (RUN-170).
+   *  The server is the admission authority — the daemon has never refused an assignment, so the
+   *  only enforcement that reaches dispatch is what this box last advertised. A capacity change
+   *  that waits out the heartbeat interval is therefore a window the server can dispatch into: a
+   *  wave grant claims several slots the last beat still called free. Best-effort like the beat
+   *  itself — a down socket drops the frame and the next beat re-asserts the same figure. No ping
+   *  rides along and no silent-beat accounting moves: this is an advertisement, not a probe. */
+  advertiseCapacity(): void {
+    if (this.stopped) return;
+    this.sendRaw({ type: 'heartbeat', freeSlots: this.opts.freeSlots() });
+  }
+
   private open(): void {
     void this.openAsync();
   }

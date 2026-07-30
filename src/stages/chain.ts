@@ -165,14 +165,27 @@ type SessionOutcome = ExecuteOutcome & { parked?: undefined };
  * told it may spend everything, the RUN-133 per-session-copy bug reborn. Splitting one reservation
  * keeps the invariant by construction: the sum of the shares never exceeds the remainder at wave
  * start. `maxRounds` passes through verbatim — it caps reviewer looks, nothing a step spends.
+ *
+ * Returns null when the remainder cannot hand every member a SPENDABLE share — a non-null integer
+ * dimension whose floor-division comes out 0. Flooring up instead would break the sum invariant,
+ * and passing the 0 through would break the wrapper's: `superviseBudget` relies on the schema's
+ * `maxDurationSeconds >= 1` when it arms the initial deadline, so a 0 there disarms the wall clock
+ * entirely rather than bounding it at nothing. The caller answers null by not overlapping —
+ * sequential is always a correct way to do the work, and its steps reserve the true remainder in
+ * turn under the ordinary exhaustion machinery.
  */
-function splitBudget(budget: RunBudget | undefined, n: number): RunBudget | undefined {
+function splitBudget(budget: RunBudget | undefined, n: number): RunBudget | null | undefined {
   if (!budget || n <= 1) return budget;
   const share = (v: number | null) => (v == null ? null : Math.floor(v / n));
+  const maxTokens = share(budget.maxTokens);
+  const maxDurationSeconds = share(budget.maxDurationSeconds);
+  if ((maxTokens != null && maxTokens < 1) || (maxDurationSeconds != null && maxDurationSeconds < 1)) {
+    return null;
+  }
   return {
-    maxTokens: share(budget.maxTokens),
+    maxTokens,
     maxUsd: budget.maxUsd == null ? null : budget.maxUsd / n,
-    maxDurationSeconds: share(budget.maxDurationSeconds),
+    maxDurationSeconds,
     maxRounds: budget.maxRounds,
   };
 }
@@ -474,7 +487,10 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     });
     host
       .transcript(run.id)
-      .milestone(`step [${step.id}]'s workspace is kept at ${ws.localPath} — its work landed nowhere else`);
+      .milestone(
+        `step [${step.id}]'s workspace is kept at ${ws.localPath} — its work landed nowhere else`,
+        step.id,
+      );
   };
 
   type WaveMember = {
@@ -503,6 +519,35 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       });
       return 'run-sequentially';
     }
+    // ONE reservation divides across the wave — N concurrent `reserve()` calls would each be
+    // handed the whole remainder (see splitBudget). Every way the wave cannot afford its shares
+    // resolves to the SEQUENTIAL path, where each step reserves the true remainder in turn: an
+    // exhausted FIRST wave keeps the first-step exception at the first STEP's grain — one spawn
+    // declined by the budget layer, the same failure shape as an undecomposed run, never N leases
+    // and N processes started to be killed (RUN-133's rule); and a remainder too small to split
+    // must not overlap either, because handing a member a zero dimension does not bound it at
+    // nothing — it disarms the budget wrapper's deadline entirely (see splitBudget).
+    const firstIndex = indexOf.get(waveSteps[0]!.id)!;
+    const reservation = plan.tally.reserve();
+    if (!reservation.ok) {
+      if (last) {
+        host.log.warn('no budget left for the next wave — stopping the chain', {
+          runId: run.id,
+          breach: reservation.breach,
+        });
+        return budgetStop(firstIndex, reservation.breach);
+      }
+      return 'run-sequentially';
+    }
+    const share = splitBudget(reservation.budget, waveSteps.length);
+    if (share === null) {
+      host.log.warn('the remainder cannot give every wave member a spendable share — running sequentially', {
+        runId: run.id,
+        steps: waveSteps.map((s) => s.id),
+      });
+      return 'run-sequentially';
+    }
+
     // The parent is checkpointed before the wave opens (RUN-170's settled decision): a lease from
     // a run forks the BRANCH, so uncommitted parent work would be invisible to every child — and
     // the parent worktree must be clean when children publish into it (git's fast-forward refuses
@@ -516,21 +561,6 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       });
       return 'run-sequentially';
     }
-
-    // ONE reservation divides across the wave. N concurrent `reserve()` calls would each be handed
-    // the whole remainder (see splitBudget) — and the first wave keeps the first-step exception:
-    // an exhausted run spawns and is declined by the budget layer, the same failure shape as an
-    // undecomposed run.
-    const firstIndex = indexOf.get(waveSteps[0]!.id)!;
-    const reservation = plan.tally.reserve();
-    if (!reservation.ok && last) {
-      host.log.warn('no budget left for the next wave — stopping the chain', {
-        runId: run.id,
-        breach: reservation.breach,
-      });
-      return budgetStop(firstIndex, reservation.breach);
-    }
-    const share = reservation.ok ? splitBudget(reservation.budget, waveSteps.length) : undefined;
 
     host
       .transcript(run.id)
@@ -586,7 +616,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
               // child degrades to the Codex posture — the hard floor (RUN-102) still runs over the
               // parent worktree at landing, AFTER the children's commits have landed into it.
               lockEnforcer: undefined,
-              ...(reservation.ok && share ? { budget: share } : {}),
+              ...(share ? { budget: share } : {}),
               spendGuard: plan.tally.guard(`step:${step.id}`),
               clockGuard: plan.tally.clockGuard(),
             },
@@ -632,6 +662,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
           .transcript(run.id)
           .milestone(
             `step ${m.i + 1}/${steps.length} did not finish (${m.outcome.exit.reason ?? 'no reason given'}) — its running siblings finish and land, then the chain stops`,
+            m.step.id,
           );
         failure ??= { member: m, reason: m.outcome.exit.reason ?? 'steps:child-failed' };
         await keepOrDisposeChild(m.step, m.ws!);
@@ -649,6 +680,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
           .transcript(run.id)
           .milestone(
             `step ${m.i + 1}/${steps.length} [${m.step.id}] did not land back (${landed.detail}) — its workspace is kept`,
+            m.step.id,
           );
         failure ??= { member: m, reason: landed.reason };
         continue;

@@ -644,7 +644,18 @@ export class Daemon {
       // waveCapacity). Re-asked by the chain before each wave; the floor of 1 means a saturated
       // machine degrades a wave to sequential rather than refusing the run. Bound HERE, not only
       // in tests: a dep only tests supply is a feature that has never run.
-      waveLimit: (runId) => capacity.waveLimit(runId),
+      waveLimit: (runId) => {
+        const limit = capacity.waveLimit(runId);
+        // The grant just claimed slots the server's last-heard advertisement still calls free,
+        // and the server is the admission authority — this daemon has never refused an
+        // assignment, so the only enforcement that reaches dispatch is the advertisement.
+        // Pushing it NOW shrinks the stale window from a heartbeat interval to one frame's
+        // flight; a dispatch already in the air is the residual the ledger absorbs — the run
+        // lands in `active` synchronously on arrival, and every ask after that subtracts its
+        // seat.
+        held.ws?.advertiseCapacity();
+        return limit;
+      },
       steering,
       logger: this.log,
     });
