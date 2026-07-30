@@ -102,8 +102,9 @@ function harness(over: { parks?: DriverExit | null } = {}) {
       return spawn.budgetRun;
     },
     steering: {
-      register: (id) => registered.push(id),
-      unregister: (id) => unregistered.push(id),
+      // Records `id#key` when a key rides along (RUN-170) — the keyless shape stays the bare id.
+      register: (id, _session, _stop, key) => registered.push(key ? `${id}#${key}` : id),
+      unregister: (id, key) => unregistered.push(key ? `${id}#${key}` : id),
     },
     parkIfBlocked: async (ctx) => {
       parkCalls.push({ activeSeconds: ctx.activeSeconds, tail: ctx.tail, exit: ctx.exit });
@@ -251,5 +252,18 @@ describe('steering', () => {
     spawn.finish({ outcome: 'failed', isError: true, reason: 'budget' });
     await running;
     expect(unregistered).toEqual(['run_1']);
+  });
+
+  // RUN-170: the steering key IS the tally slot — the slot is already unique per concurrent
+  // session, and two names for "which session am I" is two names that can disagree. Without this,
+  // a wave's step sessions register under the bare runId and clobber each other.
+  it('registers and unregisters under the tally slot on a decomposed run', async () => {
+    const { host, spawn, plan, registered, unregistered } = harness();
+    const running = executeRun(host, { ...plan, slot: 'step:s1', stepId: 's1' });
+    await Promise.resolve();
+    expect(registered).toEqual(['run_1#step:s1']);
+    spawn.finish();
+    await running;
+    expect(unregistered).toEqual(['run_1#step:s1']);
   });
 });

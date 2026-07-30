@@ -310,10 +310,12 @@ export interface RunSupervisorDeps {
   continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
   /** How long a park may sit before the daemon fails it (RUN-30). Default: DEFAULT_PARK_TTL_HOURS. */
   parkTtlHours?: number;
-  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
+  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). `key` names which
+   *  of the run's sessions is registering — a wave holds several at once (RUN-170); omitted, the
+   *  bridge treats the run as its single session, which every non-chain call site is. */
   steering?: {
-    register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
-    unregister: (runId: string) => void;
+    register: (runId: string, session: DriverSession, stop: () => Promise<void>, key?: string) => void;
+    unregister: (runId: string, key?: string) => void;
     /** Has an operator cancelled this run (RUN-165)? Asked at every stage boundary, because a
      *  cancel is a fact about the RUN and the pipeline is many sessions with gaps between them. */
     isCancelled?: (runId: string) => boolean;

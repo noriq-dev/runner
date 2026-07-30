@@ -37,10 +37,12 @@ export interface ExecuteHost {
   transcript(runId: string): RunTranscript;
   /** The supervisor's single spawn point — it is what applies the sanitized env (RUN-109). */
   startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
-  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
+  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). `key` names WHICH
+   *  of the run's sessions this is — a wave runs a run's steps concurrently (RUN-170), and two
+   *  sessions registered under the bare runId clobber each other. */
   steering?: {
-    register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
-    unregister: (runId: string) => void;
+    register: (runId: string, session: DriverSession, stop: () => Promise<void>, key?: string) => void;
+    unregister: (runId: string, key?: string) => void;
   };
   /** Did this run stop to ask a human (RUN-30)? Returns the exit to report iff it parked. */
   parkIfBlocked(ctx: {
@@ -140,14 +142,16 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
       },
     },
   });
-  // Steerable + cancellable while it runs (RUN-16/18).
-  host.steering?.register(run.id, budgetRun.session, budgetRun.stop);
+  // Steerable + cancellable while it runs (RUN-16/18). The steering key IS the tally slot — the
+  // slot is already unique per concurrent session (last-writer-wins forces that), so reusing it
+  // keeps one "which session am I" name rather than two that can disagree (RUN-170).
+  host.steering?.register(run.id, budgetRun.session, budgetRun.stop, plan.slot);
 
   let exit: DriverExit;
   try {
     exit = await budgetRun.done;
   } finally {
-    host.steering?.unregister(run.id);
+    host.steering?.unregister(run.id, plan.slot);
   }
   // The terminal result, recorded authoritatively (RUN-59): a driver whose result carries a mix
   // but emits no separate onTelemetry tick (or a fake in tests) is captured here. Fix turns that
