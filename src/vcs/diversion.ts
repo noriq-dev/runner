@@ -458,6 +458,22 @@ export class DiversionBackend implements VcsBackend {
     return { ok: false, reason: 'error', detail: `publish failed: HTTP ${res.status}` };
   }
 
+  /**
+   * The run-addressed pair (RUN-170), expressible here without new API surface: this backend
+   * already names a run's line itself — `noriq/run/<id>`, the convention lease() applies — so
+   * the run id resolves to that branch IN HERE and the existing integrate/publish machinery
+   * (the server-side merge, the backend-carried CAS) does the rest. Implemented even though
+   * `leasesOverlap` is absent (pool-of-1 — waves run sequentially here today), because the
+   * verbs are honestly answerable; the pool, not this method, is what stops overlap.
+   */
+  integrateFromRun(ws: Workspace, runId: string): Promise<IntegrateResult> {
+    return this.integrate(ws, `noriq/run/${runId}`);
+  }
+
+  publishToRun(ws: Workspace, runId: string): Promise<PublishResult> {
+    return this.publish(ws, `noriq/run/${runId}`);
+  }
+
   /** Publishing already reached the server — there is nothing further to share (§9: the CLI
    *  has no push at all). A no-op success, exactly as the interface allows for. */
   async share(_repoRoot: string, _target: string): Promise<{ ok: true }> {

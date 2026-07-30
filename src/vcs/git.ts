@@ -79,10 +79,14 @@ function gitLocation(ws: Workspace): GitLocation {
  *   targetExists → refExists · createTarget → createBranch · integrate → rebaseOnto
  *   resumeIntegrate → continueRebase · abandonIntegrate → abortRebase
  *   publish → landFastForward · share → pushBranch · reapOrphans → reapOrphans
+ *   integrateFromRun → rebaseOnto(runBranch) · publishToRun → landFastForward(runBranch)
  *   openReview → openMergeRequest (merge-request.ts — gh, not WorktreeManager)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
+  /** Git isolates in SPACE — every lease mints its own worktree — so a wave's steps may hold
+   *  one each, concurrently (RUN-170). The live pool-of-1 backends leave this absent. */
+  readonly leasesOverlap = true;
   private readonly git: GitOps;
   private readonly locks?: LockDelegate;
   private readonly gh?: GhExec;
@@ -157,6 +161,18 @@ export class GitBackend implements VcsBackend {
   async publish(ws: Workspace, target: string) {
     const loc = gitLocation(ws);
     return this.git.landFastForward(loc.repoRoot, target, loc.branch);
+  }
+
+  // The run-addressed pair (RUN-170) is `integrate`/`publish` with the other side resolved
+  // through the SAME convention lease({fromRunId}) applies: the run id becomes that run's
+  // throwaway branch, in here, so the supervisor still never learns the convention exists.
+  integrateFromRun(ws: Workspace, runId: string) {
+    return this.git.rebaseOnto({ path: ws.localPath }, runBranch(runId));
+  }
+
+  async publishToRun(ws: Workspace, runId: string) {
+    const loc = gitLocation(ws);
+    return this.git.landFastForward(loc.repoRoot, runBranch(runId), loc.branch);
   }
 
   share(repoRoot: string, target: string, remote?: string) {

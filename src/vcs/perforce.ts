@@ -501,6 +501,27 @@ export class PerforceBackend implements VcsBackend {
     }
   }
 
+  /**
+   * The run-addressed pair (RUN-170) is refused here, honestly, for two reasons that compound:
+   * this backend leases pool-of-1 (`leasesOverlap` absent), so a wave runs sequentially in the
+   * parent's own workspace and these verbs never legitimately fire — and there is no per-run
+   * LINE to name anyway: a run's work is a pending changelist, and submit lands on the line the
+   * client VIEWS, chosen by the operator, not per run (see the model note at the top). A call
+   * reaching this is a scheduling bug, and the loud failure is the diagnostic — quietly
+   * composing something from unshelve would land work on a line no run id ever named.
+   */
+  async integrateFromRun(ws: Workspace, runId: string): Promise<IntegrateResult> {
+    throw new Error(
+      `cannot integrate run ${runId}'s work into run ${ws.runId}'s workspace on Perforce: leases here are pool-of-1, so wave steps run sequentially and share the parent's workspace — the run-addressed verbs have no target line on this backend`,
+    );
+  }
+
+  async publishToRun(ws: Workspace, runId: string): Promise<PublishResult> {
+    throw new Error(
+      `cannot land run ${ws.runId}'s workspace on run ${runId}'s line on Perforce: submit lands on the line the client views, not on a per-run line — and pool-of-1 leases mean no wave step ever needs this verb here`,
+    );
+  }
+
   /** Submit already published; there is no further step — exactly like Diversion. */
   async share(_repoRoot: string, _target: string): Promise<{ ok: true }> {
     return { ok: true };

@@ -53,6 +53,11 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(new GitBackend(ops).kind).toBe('git');
   });
 
+  it('declares leasesOverlap — git isolates in space, so a wave may hold a lease per step (RUN-170)', () => {
+    const { ops } = recorder();
+    expect(new GitBackend(ops).leasesOverlap).toBe(true);
+  });
+
   it('lease wraps WorktreeInfo into a Workspace: localPath is the path, location hides the rest', async () => {
     const { ops, calls } = recorder();
     const ws = await new GitBackend(ops).lease('/repo', 'run_1', { readOnly: true });
@@ -104,6 +109,10 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(await vcs.resumeIntegrate(ws)).toEqual({ ok: true });
     await vcs.abandonIntegrate(ws);
     expect(await vcs.publish(ws, 'noriq/integration')).toEqual({ ok: true, sha: 'sha1' });
+    // The run-addressed pair (RUN-170): same outcomes, the other side named by run id — the
+    // run-id→branch convention stays in here, symmetric with lease({fromRunId}).
+    expect(await vcs.integrateFromRun(ws, 'run_parent')).toEqual({ ok: false, conflicts: ['a.ts'] });
+    expect(await vcs.publishToRun(ws, 'run_parent')).toEqual({ ok: true, sha: 'sha1' });
     expect(await vcs.share('/repo', 'noriq/integration')).toEqual({ ok: false, detail: 'offline' });
     expect(await vcs.reapOrphans('/repo')).toBe(2);
 
@@ -119,6 +128,10 @@ describe('GitBackend — the outcome→verb mapping', () => {
       // publish takes the WORKSPACE; the branch it publishes from comes out of location,
       // never from a caller-supplied ref (RUN-50).
       { method: 'landFastForward', args: ['/repo', 'noriq/integration', 'noriq/run/run_1'] },
+      // integrateFromRun/publishToRun resolve the run id to ITS branch; the publishing branch
+      // still comes out of location, never from a caller-supplied ref (RUN-50, RUN-170).
+      { method: 'rebaseOnto', args: [{ path: '/wt/run_1' }, 'noriq/run/run_parent'] },
+      { method: 'landFastForward', args: ['/repo', 'noriq/run/run_parent', 'noriq/run/run_1'] },
       { method: 'pushBranch', args: ['/repo', 'noriq/integration'] },
       { method: 'reapOrphans', args: ['/repo', undefined] },
     ]);
@@ -167,6 +180,7 @@ describe('GitBackend — the outcome→verb mapping', () => {
       location: { client: 'ws9', change: 42 }, // a Perforce-shaped location
     };
     await expect(vcs.publish(alien, 'main')).rejects.toThrow(/does not carry a git location/);
+    await expect(vcs.publishToRun(alien, 'run_1')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
   });
 });

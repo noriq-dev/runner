@@ -4,6 +4,7 @@ import { zeroTelemetry } from '../src/drivers/types';
 import { RunSupervisor } from '../src/supervisor';
 import { DiversionBackend, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
 import type { LockDelegate } from '../src/vcs/git';
+import type { VcsBackend } from '../src/vcs/types';
 
 /** A fake Noriq lock view (the authoritative coordination layer), recording calls. */
 function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
@@ -279,6 +280,58 @@ describe('DiversionBackend — publish carries the CAS the server does not have 
     const { backend } = fakes({ mergeResponses: [{ status: 200 }, { status: 200 }] });
     const ws = await backend.lease('/repo', 'run_1');
     expect(await backend.publish(ws, 'main')).toEqual({ ok: true, sha: 'dv.commit.10' });
+  });
+});
+
+describe('DiversionBackend — run-addressed verbs (RUN-170): the branch convention stays in here', () => {
+  // Pool-of-1 leases mean waves never overlap here today (leasesOverlap stays unset), but the
+  // verbs are honestly answerable: this backend already names a run's line itself
+  // (noriq/run/<id>), so the run id resolves to that branch IN HERE and the existing merge
+  // machinery — integrate's server-side merge, publish's backend-carried CAS — does the rest.
+  it('leaves leasesOverlap unset — the pool, not the verbs, is what stops overlap', () => {
+    // Read through the seam, as the wave scheduler will — the capability is interface surface.
+    const vcs: VcsBackend = fakes({}).backend;
+    expect(vcs.leasesOverlap).toBeUndefined();
+  });
+
+  it('integrateFromRun merges noriq/run/<runId> INTO the workspace branch', async () => {
+    const { backend, calls } = fakes({
+      branches: { main: 'dv.commit.10', 'noriq/run/run_parent': 'dv.commit.20' },
+      mergeResponses: [{ status: 201, id: 'dv.commit.30' }],
+    });
+    const ws = await backend.lease('/repo', 'run_child');
+    calls.length = 0;
+    expect(await backend.integrateFromRun(ws, 'run_parent')).toEqual({ ok: true });
+    expect(calls.map((c) => c.what)).toEqual([
+      'POST /repos/dv.repo.test/merges?base_id=noriq%2Frun%2Frun_child&other_id=noriq%2Frun%2Frun_parent',
+      'dv update --conflict_resolution accept-incoming',
+    ]);
+  });
+
+  it('publishToRun runs the CAS against noriq/run/<runId> — race and landing shapes verbatim', async () => {
+    const { backend, calls } = fakes({
+      branches: { main: 'dv.commit.10', 'noriq/run/run_parent': 'dv.commit.20' },
+      mergeResponses: [
+        { status: 200 }, // guard: parent line unmoved since the child integrated it
+        { status: 201, id: 'dv.commit.50' }, // the landing merge
+      ],
+    });
+    const ws = await backend.lease('/repo', 'run_child');
+    calls.length = 0;
+    expect(await backend.publishToRun(ws, 'run_parent')).toEqual({ ok: true, sha: 'dv.commit.50' });
+    expect(calls.map((c) => c.what)).toEqual([
+      'POST /repos/dv.repo.test/merges?base_id=noriq%2Frun%2Frun_child&other_id=noriq%2Frun%2Frun_parent',
+      'POST /repos/dv.repo.test/merges?base_id=noriq%2Frun%2Frun_parent&other_id=noriq%2Frun%2Frun_child',
+    ]);
+  });
+
+  it('publishToRun loses the race the same way publish does — the parent line moved', async () => {
+    const { backend } = fakes({
+      branches: { main: 'dv.commit.10', 'noriq/run/run_parent': 'dv.commit.20' },
+      mergeResponses: [{ status: 201, id: 'dv.commit.60' }], // guard merged something → moved
+    });
+    const ws = await backend.lease('/repo', 'run_child');
+    expect(await backend.publishToRun(ws, 'run_parent')).toMatchObject({ ok: false, reason: 'race' });
   });
 });
 
