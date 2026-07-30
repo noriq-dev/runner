@@ -634,11 +634,12 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   // RUN-170. The wave limit is a dep only the daemon can bind — a dep only tests supply is a
   // feature that has never run (the resolveLockScope lesson, again). With nothing else active the
   // run may use the machine's whole concurrency: it holds one slot itself, so the limit is
-  // freeSlots() plus its own seat.
+  // freeSlots() plus its own seat. The chain re-asks per wave; here nothing else is running, so
+  // both measures (active runs, live sessions) answer zero others.
   it('binds the wave limit to the machine’s spare capacity (RUN-170)', async () => {
     const { deps } = await harness({ concurrency: 3 });
     expect(deps.waveLimit).toBeTypeOf('function');
-    expect(deps.waveLimit?.()).toBe(3);
+    expect(deps.waveLimit?.('run_asking')).toBe(3);
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {

@@ -64,6 +64,38 @@ describe('steerModeForKind', () => {
   });
 });
 
+// RUN-170: the bridge is the one place every session already announces itself, so it is where the
+// daemon's capacity questions get an honest answer — a wave's children are several live processes
+// where the active-run count reads one.
+describe('liveSessionCount', () => {
+  it('counts every registered session, across runs', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    register(bridge, new FakeSession('run_b'));
+    expect(bridge.liveSessionCount()).toBe(3);
+  });
+
+  it('excludes the asking run’s own sessions — the wave limit subtracts only the REST', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    register(bridge, new FakeSession('run_b'));
+    expect(bridge.liveSessionCount('run_a')).toBe(1);
+    expect(bridge.liveSessionCount('run_b')).toBe(2);
+  });
+
+  it('drops back as sessions unregister', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    bridge.unregister('run_a', 'step:s1');
+    expect(bridge.liveSessionCount()).toBe(1);
+    bridge.unregister('run_a', 'step:s2');
+    expect(bridge.liveSessionCount()).toBe(0);
+  });
+});
+
 describe('SteeringBridge', () => {
   it('soft steer queues a user turn (runtime delivery)', async () => {
     const bridge = new SteeringBridge();

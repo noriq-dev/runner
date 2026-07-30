@@ -82,11 +82,13 @@ export interface ChainWave {
   leasesOverlap: boolean;
   /**
    * How many of a wave's steps may actually overlap — the daemon's own concurrency minus what
-   * other runs are using, sampled when the chain starts. A run that saturates the machine with
-   * its own steps starves every other run, which is worse than a slow run. Floor 1 upstream;
-   * `planWaves` treats anything ≤1 as one-per-wave.
+   * the REST of the machine is running, asked again before EACH wave rather than sampled once: a
+   * chain runs for a long time, and a limit frozen at its start would keep claiming capacity that
+   * another run's wave has since taken (or ignore capacity that freed up). A run that saturates
+   * the machine with its own steps starves every other run, which is worse than a slow run.
+   * Floor 1 upstream; `planWaves` treats anything ≤1 as one-per-wave.
    */
-  limit: number;
+  limit: () => number;
   /** Lease a child workspace forked from the PARENT RUN's work (`lease(root, childId,
    *  {fromRunId})` — the closure carries root and parent id). */
   lease: (childWorkspaceId: string) => Promise<Workspace>;
@@ -249,9 +251,11 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     };
   };
 
-  /** One step in the parent's workspace — the pre-RUN-170 chain body, verbatim. Returns the
-   *  outcome to STOP the chain with, or null to continue. */
-  const runStep = async (step: ExecutionStep, i: number): Promise<ChainOutcome | null> => {
+  /** One step in the parent's workspace — the pre-RUN-170 chain body. Returns the outcome to STOP
+   *  the chain with, or null to continue. `isFinal` marks the last SCHEDULED step — the one whose
+   *  session the chain hands onward — which under a wave schedule is not always the last-indexed
+   *  one; keying the close/keep decision on the index left the handed-on session already closed. */
+  const runStep = async (step: ExecutionStep, i: number, isFinal: boolean): Promise<ChainOutcome | null> => {
     // The line announcing a step belongs to it (RUN-150). Every other segment is labelled by the
     // SESSION that emits it, which is what keeps attribution right once steps can overlap.
     host.transcript(run.id).milestone(`step ${i + 1}/${steps.length} — ${step.title} [${step.id}]`, step.id);
@@ -323,7 +327,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     // A resume finishes the step that parked and stops there — see `stopAfterResumedStep` for why
     // a fresh step cannot be briefed from a resume. Reported as incomplete, naming what is left,
     // rather than as a run that did its plan.
-    if (plan.stopAfterResumedStep && i < steps.length - 1) {
+    if (plan.stopAfterResumedStep && !isFinal) {
       const remaining = steps.slice(i + 1).map((r) => r.id);
       host.log.warn('a resumed chain finished its parked step; the rest need a fresh dispatch', {
         runId: run.id,
@@ -340,7 +344,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       };
     }
 
-    if (i < steps.length - 1) {
+    if (!isFinal) {
       // Capture before the next step opens, so its fresh session reads this one's work from the
       // tree rather than from a summary. Best-effort: a checkpoint that fails leaves the work in
       // the worktree, where the next step still sees it — it costs the per-step commit boundary,
@@ -535,32 +539,45 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
           });
           return { step, i, failed: `steps:lease-failed: ${err}` };
         }
-        const outcome = await executeRun(childHost, {
-          ...plan,
-          worktree: ws,
-          stepId: step.id,
-          priorSteps: prior,
-          slot: `step:${step.id}`,
-          start: {
-            ...plan.start,
-            cwd: ws.localPath,
-            prompt: plan.stepPrompt(step, i, prior),
-            resumeSessionId: undefined,
-            // The reactive lock hook is bound to the PARENT worktree's root; in a child checkout
-            // it would compute wrong repo-relative paths and lock names that exist nowhere. The
-            // child degrades to the Codex posture — the hard floor (RUN-102) still runs over the
-            // parent worktree at landing, AFTER the children's commits have landed into it.
-            lockEnforcer: undefined,
-            ...(reservation.ok && share ? { budget: share } : {}),
-            spendGuard: plan.tally.guard(`step:${step.id}`),
-            clockGuard: plan.tally.clockGuard(),
-          },
-          priorActiveSeconds: plan.tally.activeSeconds(),
-        });
-        // Unreachable while childHost never parks; the guard keeps a future edit from silently
-        // parking a child workspace nothing can resume into.
-        if (outcome.parked) return { step, i, ws, failed: 'steps:child-parked' };
-        return { step, i, ws, outcome };
+        // A member must RESOLVE whatever happens to it — this map runs under Promise.all, and one
+        // member throwing (a driver whose start() throws is an explicitly supported failure) would
+        // reject the whole wave: siblings' finished work never integrated, their workspaces never
+        // settled, and the run's outcome an exception instead of the failing step's.
+        try {
+          const outcome = await executeRun(childHost, {
+            ...plan,
+            worktree: ws,
+            stepId: step.id,
+            priorSteps: prior,
+            slot: `step:${step.id}`,
+            start: {
+              ...plan.start,
+              cwd: ws.localPath,
+              prompt: plan.stepPrompt(step, i, prior),
+              resumeSessionId: undefined,
+              // The reactive lock hook is bound to the PARENT worktree's root; in a child checkout
+              // it would compute wrong repo-relative paths and lock names that exist nowhere. The
+              // child degrades to the Codex posture — the hard floor (RUN-102) still runs over the
+              // parent worktree at landing, AFTER the children's commits have landed into it.
+              lockEnforcer: undefined,
+              ...(reservation.ok && share ? { budget: share } : {}),
+              spendGuard: plan.tally.guard(`step:${step.id}`),
+              clockGuard: plan.tally.clockGuard(),
+            },
+            priorActiveSeconds: plan.tally.activeSeconds(),
+          });
+          // Unreachable while childHost never parks; the guard keeps a future edit from silently
+          // parking a child workspace nothing can resume into.
+          if (outcome.parked) return { step, i, ws, failed: 'steps:child-parked' };
+          return { step, i, ws, outcome };
+        } catch (err) {
+          host.log.warn('a wave step threw before producing an outcome — its siblings still land', {
+            runId: run.id,
+            stepId: step.id,
+            err: String(err),
+          });
+          return { step, i, ws, failed: `steps:child-failed: ${err}` };
+        }
       }),
     );
 
@@ -573,6 +590,9 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     for (const m of members) {
       if (!m.outcome) {
         failure ??= { member: m, reason: m.failed ?? 'steps:child-failed' };
+        // A member that got a workspace but no outcome (executeRun threw) still settles it by the
+        // same rule as any failed child: keep what holds work, dispose what holds nothing.
+        if (m.ws) await keepOrDisposeChild(m.step, m.ws);
         continue;
       }
       allText += m.outcome.sessionText;
@@ -614,12 +634,12 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       last = lastLanded;
     }
 
-    // Close every wave session except the one the chain hands onward: the failing step's (its
-    // outcome is the run's, and settle stops the returned session), or — on the success path of
-    // the FINAL wave — the last step's, which the gate's fix turns talk to. Compared by SESSION,
-    // since `withAllText` re-wraps the outcome record.
-    const isFinalWave = !failure && waveSteps.some((s) => indexOf.get(s.id) === steps.length - 1);
-    const keep = failure ? (failure.member.outcome ?? null) : isFinalWave ? lastLanded : null;
+    // Close every wave session except a failing step's — its outcome is the run's, and settle
+    // stops the returned session. A child session is NEVER the one the chain hands onward on
+    // success: its cwd is a workspace that is DISPOSED when its work lands, and the gates' fix
+    // turns would then edit a removed checkout — which is why the last SCHEDULED step always runs
+    // sequentially in the parent workspace (the main loop's tail rule) and every child closes here.
+    const keep = failure?.member.outcome ?? null;
     for (const m of members) {
       if (!m.outcome) continue;
       if (keep && m.outcome.session === keep.session) continue;
@@ -676,32 +696,54 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     return null;
   };
 
-  // The schedule (RUN-149's planWaves): with no wave seam, a backend whose leases cannot overlap,
-  // or a limit of 1, this degrades to one step per wave — byte-identical order to the pre-RUN-170
-  // sequential chain, since `checkSteps` already topo-ordered the list.
-  const limit = plan.wave?.leasesOverlap ? Math.max(1, plan.wave.limit) : 1;
-  const waves = planWaves(steps, limit);
-
-  for (const waveSteps of waves) {
-    // A resumed chain re-enters at the parked step; anything scheduled before it is already done.
-    const pending = waveSteps.filter((s) => indexOf.get(s.id)! >= from);
-    if (!pending.length) continue;
+  // The schedule (RUN-149's planWaves), drawn one wave at a time rather than once: the limit is
+  // the machine's SPARE capacity, which moves while a chain runs, so each wave asks again and the
+  // remaining steps are re-grouped under the answer. Satisfied dependencies are pruned first —
+  // the planner only sees live edges — and a resumed chain slices off the steps already done.
+  // With no wave seam, a backend whose leases cannot overlap, or a limit of 1, every wave comes
+  // out a singleton — byte-identical order to the pre-RUN-170 sequential chain, since
+  // `checkSteps` already topo-ordered the list.
+  const doneIds = new Set(steps.slice(0, from).map((s) => s.id));
+  let remaining = steps.slice(from);
+  while (remaining.length) {
+    const overlapCap = plan.wave?.leasesOverlap ? Math.max(1, plan.wave.limit()) : 1;
+    const pruned = remaining.map((s) => ({ ...s, dependsOn: s.dependsOn.filter((d) => !doneIds.has(d)) }));
+    // Only the FIRST wave of the re-plan is executed; the rest is re-drawn next iteration, against
+    // whatever the limit says then. planWaves always schedules at least one step for a non-empty
+    // list, so the loop strictly shrinks `remaining`.
+    const waveIds = new Set((planWaves(pruned, overlapCap)[0] ?? []).map((s) => s.id));
+    const pending = remaining.filter((s) => waveIds.has(s.id));
+    if (!pending.length) throw new Error(`chain for ${run.id} could not schedule its remaining steps`);
     // The resumed step is a RESTORED session in the parent's workspace — overlapping fresh
     // siblings around it would fork a base that session is still moving. Its wave runs
     // sequentially; waves after it may overlap.
     const resumedInWave = Boolean(plan.resumeFromStepId) && pending.some((s) => indexOf.get(s.id)! === from);
-    let sequentially = pending.length === 1 || !plan.wave?.leasesOverlap || limit <= 1 || resumedInWave;
+    // The last SCHEDULED step always runs sequentially, in the parent workspace, after its
+    // siblings land: the chain's success outcome is a live session the gates hand fix turns to,
+    // and a wave child's cwd is a workspace that is DISPOSED when its work lands — handing that
+    // session onward would run repairs in a removed checkout.
+    const isLastWave = pending.length === remaining.length;
+    const tail = isLastWave ? pending[pending.length - 1]! : null;
+    const overlapped = tail ? pending.slice(0, -1) : pending;
+    let sequentially =
+      overlapped.length <= 1 || !plan.wave?.leasesOverlap || overlapCap <= 1 || resumedInWave;
     if (!sequentially) {
-      const flow = await runWave(pending);
+      const flow = await runWave(overlapped);
       if (flow === 'run-sequentially') sequentially = true;
       else if (flow) return flow;
     }
     if (sequentially) {
-      for (const step of pending) {
-        const flow = await runStep(step, indexOf.get(step.id)!);
+      for (const step of overlapped) {
+        const flow = await runStep(step, indexOf.get(step.id)!, false);
         if (flow) return flow;
       }
     }
+    if (tail) {
+      const flow = await runStep(tail, indexOf.get(tail.id)!, true);
+      if (flow) return flow;
+    }
+    for (const s of pending) doneIds.add(s.id);
+    remaining = remaining.filter((s) => !waveIds.has(s.id));
   }
 
   // Unreachable while `checkSteps` guarantees two or more, but a null here would be a crash rather

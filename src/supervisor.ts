@@ -341,15 +341,18 @@ export interface RunSupervisorDeps {
   };
   /**
    * How many of a decomposed run's wave steps may overlap (RUN-170): the daemon's own
-   * `concurrency` minus what OTHER runs are using, asked when a chain starts. A run that
-   * saturates the machine with its own steps starves every other run, which is worse than a
-   * slow run — so the limit is the machine's spare capacity, not a per-run knob.
+   * `concurrency` minus what the REST of the machine is running, asked again before EACH wave —
+   * a chain runs a long time, and a limit sampled once would keep spending capacity the machine
+   * no longer has. Takes the asking RUN's id so the daemon can exclude that run's own sessions
+   * from the count. A run that saturates the machine with its own steps starves every other run,
+   * which is worse than a slow run — so the limit is the machine's spare capacity, not a per-run
+   * knob.
    *
    * Omitted → 1, which is the fully sequential chain every decomposed run was before this
    * existed. Conservative deliberately: a dep only the daemon binds must not default to
    * unbounded concurrency in every harness that never heard of it.
    */
-  waveLimit?: () => number;
+  waveLimit?: (runId: string) => number;
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
@@ -1120,7 +1123,8 @@ export class RunSupervisor {
       // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
       // the safe, sequential reading (vcs/types.ts).
       leasesOverlap: Boolean(vcs.leasesOverlap && vcs.integrateFromRun && vcs.publishToRun),
-      limit: this.deps.waveLimit?.() ?? 1,
+      // Re-asked by the chain before each wave, not sampled here: what is spare NOW is the answer.
+      limit: () => this.deps.waveLimit?.(run.id) ?? 1,
       lease: (childId) => vcs.lease(repo.root, childId, { fromRunId: run.id }),
       checkpoint: (ws, label) => vcs.checkpoint(ws, runCommitMessage(run.id, label)),
       integrateBack: (ws) => vcs.integrateFromRun!(ws, run.id),

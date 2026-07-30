@@ -737,3 +737,60 @@ describe('continue a failed run adopts the kept worktree (RUN-91)', () => {
     await wm.remove(again);
   });
 });
+
+// RUN-170: the wave return trip, against REAL git — the exact composition GitBackend makes of
+// these primitives (lease({fromRunId}) → create(baseRef: runBranch(parent)), integrateFromRun →
+// rebaseOnto(runBranch(parent)), publishToRun → landFastForward(runBranch(parent), childBranch)).
+// The fakes elsewhere pin the chain's sequencing; this pins that git actually delivers the
+// outcome: parent tip carries every landed child, the parent's checked-out worktree reflects
+// them, the gate's diff sees the accumulation, and no merge commit is invented.
+describe('a wave’s return trip (real git)', () => {
+  it('lands both children on the parent tip, reflected in the parent worktree, with no merge commit', async () => {
+    const parent = await wm.create(repo, 'waveP');
+    // The parent's own accumulated work, checkpointed before the wave opens — children fork the
+    // BRANCH, so this is what makes it visible to them.
+    await writeFile(path.join(parent.path, 'parent.ts'), 'export const p = 1;\n');
+    await wm.commitWork(parent, 'parent work');
+
+    // Two children forked FROM THE PARENT RUN's branch — lease({fromRunId}) in git terms.
+    const c1 = await wm.create(repo, 'waveP--s1', { baseRef: runBranch('waveP') });
+    const c2 = await wm.create(repo, 'waveP--s2', { baseRef: runBranch('waveP') });
+    expect(existsSync(path.join(c1.path, 'parent.ts'))).toBe(true); // children see the parent's work
+
+    await writeFile(path.join(c1.path, 'a.ts'), 'export const a = 1;\n');
+    await wm.commitWork(c1, 'step s1');
+    await writeFile(path.join(c2.path, 'b.ts'), 'export const b = 1;\n');
+    await wm.commitWork(c2, 'step s2');
+
+    // The serial return trip: integrate the parent's current line in, then fast-forward the
+    // parent branch — which is CHECKED OUT in the parent worktree the whole time — to the child.
+    expect(await wm.rebaseOnto(c1, runBranch('waveP'))).toEqual({ ok: true });
+    expect((await wm.landFastForward(repo, runBranch('waveP'), runBranch('waveP--s1'))).ok).toBe(true);
+    // The second child finds the line moved (its sibling landed) and re-integrates first — the
+    // same shape the chain's CAS-loser retry takes.
+    expect(await wm.rebaseOnto(c2, runBranch('waveP'))).toEqual({ ok: true });
+    expect((await wm.landFastForward(repo, runBranch('waveP'), runBranch('waveP--s2'))).ok).toBe(true);
+
+    // The parent branch tip contains BOTH children's commits…
+    const { stdout: subjects } = await git(
+      ['log', '--pretty=%s', `${parent.baseSha}..${runBranch('waveP')}`],
+      repo,
+    );
+    expect(subjects).toContain('step s1');
+    expect(subjects).toContain('step s2');
+    // …the parent WORKTREE reflects them (landFastForward fast-forwards inside the checkout)…
+    expect(existsSync(path.join(parent.path, 'a.ts'))).toBe(true);
+    expect(existsSync(path.join(parent.path, 'b.ts'))).toBe(true);
+    // …the parent-level gate sees the ACCUMULATED diff…
+    expect((await wm.changedPaths(parent)).sort()).toEqual(['a.ts', 'b.ts', 'parent.ts']);
+    // …and no merge commit was invented anywhere on the line.
+    const { stdout: merges } = await git(['rev-list', '--merges', '--count', runBranch('waveP')], repo);
+    expect(merges.trim()).toBe('0');
+
+    // Landed children are disposable: their work survives on the parent's line, not in the copy.
+    await wm.remove(c1);
+    await wm.remove(c2);
+    expect(existsSync(path.join(parent.path, 'a.ts'))).toBe(true);
+    await wm.remove(parent);
+  });
+});

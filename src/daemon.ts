@@ -576,11 +576,20 @@ export class Daemon {
       // never run.
       repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
       // How many of a run's wave steps may overlap (RUN-170): the machine's `concurrency` minus
-      // what OTHER runs are using. The run asking already holds one active slot — this is
-      // `freeSlots()` (the heartbeat's computation, below) plus its own seat — and the floor of 1
-      // means a saturated machine degrades a wave to sequential rather than refusing the run.
+      // what the REST of the machine is running. Two measures, and the BUSIER wins, because each
+      // undercounts a case the other sees: live sessions are the actual processes (another run's
+      // wave is several of them where the run count reads one), while the run count covers a run
+      // that is momentarily between sessions and about to spawn its next. Re-asked by the chain
+      // before each wave, so a long chain tracks the machine instead of its dispatch-time
+      // snapshot; the floor of 1 means a saturated machine degrades a wave to sequential rather
+      // than refusing the run. Simultaneous waves can still race one sampling window — cross-run
+      // RESERVATION is deliberately out of scope (the static-subtraction bound, RUN-170).
       // Bound HERE, not only in tests: a dep only tests supply is a feature that has never run.
-      waveLimit: () => Math.max(1, this.config.concurrency - Math.max(0, this.active.size - 1)),
+      waveLimit: (runId) => {
+        const otherRuns = Math.max(0, this.active.size - (this.active.has(runId) ? 1 : 0));
+        const others = Math.max(otherRuns, steering.liveSessionCount(runId));
+        return Math.max(1, this.config.concurrency - others);
+      },
       steering,
       logger: this.log,
     });
@@ -597,7 +606,11 @@ export class Daemon {
         repos: registration.repos,
       },
       connect: this.connect,
-      freeSlots: () => Math.max(0, this.config.concurrency - this.active.size),
+      // Sessions, not just runs (RUN-170): one run's wave is several live processes, and a
+      // heartbeat that counted runs would advertise free slots on a machine a single decomposed
+      // run has saturated — inviting dispatches its own wave limit exists to make room for.
+      freeSlots: () =>
+        Math.max(0, this.config.concurrency - Math.max(this.active.size, steering.liveSessionCount())),
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
         onAssigned: (run) => {

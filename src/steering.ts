@@ -104,6 +104,22 @@ export class SteeringBridge {
   }
 
   /**
+   * Live sessions registered right now, minus `excludeRunId`'s own (RUN-170). The bridge is the
+   * one place every session — primary, reviewer, planner, wave child — already announces itself,
+   * so it is where the daemon's capacity questions get an honest answer: the wave limit subtracts
+   * what the REST of the machine is running, and the heartbeat's free-slot count must see a
+   * wave's children as occupied capacity. Counting active RUNS undercounts both — a run's wave is
+   * several processes the run count reads as one.
+   */
+  liveSessionCount(excludeRunId?: string): number {
+    let n = 0;
+    for (const [runId, sessions] of this.targets) {
+      if (runId !== excludeRunId) n += sessions.size;
+    }
+    return n;
+  }
+
+  /**
    * SIGTERM every live session — daemon shutdown. Returns the runIds it stopped.
    *
    * A spawned `claude`/`codex` is NOT in the daemon's process-teardown path: exiting

@@ -2654,6 +2654,21 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
       ],
     }),
   });
+  // Three, because the last SCHEDULED step always runs sequentially in the parent workspace (the
+  // chain's returned session is the gates' fix-turn target, and a child workspace is disposed when
+  // its work lands) — so genuine overlap needs two steps scheduled BEFORE the tail.
+  const threeParallel = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'three independent pieces',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'one', anticipatedFiles: [{ path: 'src/a.ts' }] },
+        { id: 's2', title: 'two', anticipatedFiles: [{ path: 'src/b.ts' }] },
+        { id: 's3', title: 'three', anticipatedFiles: [{ path: 'src/c.ts' }] },
+      ],
+    }),
+  });
   /** Settle ONE of several live sessions — FakeDriver.complete() only reaches the last start. */
   const settleAt = (h: ReturnType<typeof harness>, i: number, outcome: 'done' | 'failed' = 'done') =>
     h.claude.starts[i]!.handlers?.onExit?.({
@@ -2667,10 +2682,10 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
   };
 
   it('runs a wave concurrently on an overlap-capable backend, and lands children back BY RUN ID', async () => {
-    const h = harness({ anchorTask: parallelSteps(), leasesOverlap: true, waveLimit: 2 });
+    const h = harness({ anchorTask: threeParallel(), leasesOverlap: true, waveLimit: 3 });
     const done = h.supervisor.supervise(buildRun());
     await pump(() => h.claude.starts.length >= 2);
-    // Both step sessions are live AT ONCE — neither has settled yet.
+    // Both overlapping step sessions are live AT ONCE — neither has settled yet.
     expect(h.claude.starts).toHaveLength(2);
     // One workspace per overlapping step, each leased FROM the parent run by id on the seam.
     expect(h.worktrees.created.map((c) => ({ runId: c.runId, fromRunId: c.fromRunId }))).toEqual([
@@ -2678,10 +2693,16 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
       { runId: 'run_1--s1', fromRunId: 'run_1' },
       { runId: 'run_1--s2', fromRunId: 'run_1' },
     ]);
-    // …and each session works in its own checkout, never the parent's.
+    // …and each overlapping session works in its own checkout, never the parent's.
     expect(h.claude.starts.map((s) => s.cwd)).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
     settleAt(h, 0);
     settleAt(h, 1);
+    // The last scheduled step runs SEQUENTIALLY in the parent workspace, after the children
+    // landed — its live session is the one the gates hand fix turns to, and by then the child
+    // checkouts are already disposed.
+    await pump(() => h.claude.starts.length >= 3);
+    expect(h.claude.starts[2]!.cwd).toBe('/wt/run_1');
+    settleAt(h, 2);
     const exit = await done;
     expect(exit.outcome).toBe('done');
     // The child→parent return trip names the parent RUN on the VcsBackend seam — no branch or ref
@@ -2733,20 +2754,21 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
   it('a resumed chain’s later steps still overlap — the closures reach the resume call site too', async () => {
     const task: AnchorTask = {
       key: 'ACME-1',
-      title: 'one, then two at once',
+      title: 'one, then two at once, then the tail',
       body: null,
       executionSpec: ExecutionSpec.parse({
         steps: [
           { id: 's1', title: 'first' },
           { id: 's2', title: 'second', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/a.ts' }] },
           { id: 's3', title: 'third', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/b.ts' }] },
+          { id: 's4', title: 'fourth', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/c.ts' }] },
         ],
       }),
     };
     const h = harness({
       anchorTask: task,
       leasesOverlap: true,
-      waveLimit: 2,
+      waveLimit: 3,
       parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
     });
     const done = h.supervisor.supervise(buildRun());
@@ -2762,7 +2784,7 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
     h.claude.complete('done'); // the resumed s1 finishes
     await pump(() => h.claude.starts.length >= before + 2);
     // s2 and s3 are live at once, in their own child workspaces — proof the wave seam and limit
-    // reached the RESUME call site's ChainPlan, not only supervise's.
+    // reached the RESUME call site's ChainPlan, not only supervise's. s4 is the sequential tail.
     expect(h.claude.starts.length).toBe(before + 2);
     expect(h.worktrees.created.filter((c) => c.fromRunId === 'run_1').map((c) => c.runId)).toEqual([
       'run_1--s2',
@@ -2770,6 +2792,9 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
     ]);
     settleAt(h, before);
     settleAt(h, before + 1);
+    await pump(() => h.claude.starts.length >= before + 3);
+    expect(h.claude.starts.at(-1)!.cwd).toBe('/wt/run_1'); // the tail runs in the parent workspace
+    settleAt(h, before + 2);
     const exit = (await resumed) as DriverExit;
     expect(exit.outcome).toBe('done');
     expect(h.worktrees.publishedToRun.map((p) => p.ws)).toEqual(['run_1--s2', 'run_1--s3']);
