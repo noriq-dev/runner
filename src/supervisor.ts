@@ -95,7 +95,7 @@ import {
   worthMapping,
 } from './stages';
 import { authorSpecBlock, buildRunBrief } from './stages/brief';
-import type { StepSummary } from './stages/chain';
+import type { ChainWave, StepSummary } from './stages/chain';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -149,7 +149,23 @@ export type SupervisorVcs = Pick<
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
   // lock/unlock/queryLocks are optional the same way (RUN-98): a fake or lock-less backend omits
   // them, and the supervisor treats absence as "no lock layer" (RUN-101/103).
-  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths' | 'releaseRunLocks'>>;
+  // The wave trio (RUN-170) is optional with the OPPOSITE default direction: absence reads as
+  // "leases cannot overlap", so a fake that says nothing gets the sequential chain it always had —
+  // the conservative degradation `VcsBackend.leasesOverlap` documents.
+  Partial<
+    Pick<
+      VcsBackend,
+      | 'kind'
+      | 'lock'
+      | 'unlock'
+      | 'queryLocks'
+      | 'changedPaths'
+      | 'releaseRunLocks'
+      | 'leasesOverlap'
+      | 'integrateFromRun'
+      | 'publishToRun'
+    >
+  >;
 
 export interface ResolvedRepo {
   root: string;
@@ -323,6 +339,17 @@ export interface RunSupervisorDeps {
      *  per cancelled run for its whole life. */
     forget?: (runId: string) => void;
   };
+  /**
+   * How many of a decomposed run's wave steps may overlap (RUN-170): the daemon's own
+   * `concurrency` minus what OTHER runs are using, asked when a chain starts. A run that
+   * saturates the machine with its own steps starves every other run, which is worse than a
+   * slow run — so the limit is the machine's spare capacity, not a per-run knob.
+   *
+   * Omitted → 1, which is the fully sequential chain every decomposed run was before this
+   * existed. Conservative deliberately: a dep only the daemon binds must not default to
+   * unbounded concurrency in every harness that never heard of it.
+   */
+  waveLimit?: () => number;
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
@@ -537,8 +564,12 @@ export class RunTally {
     this.slots.set(slot, t);
   }
 
-  /** Charge a finished session's active stretch to the run. Sessions are strictly sequential in
-   *  this daemon — builder, then reviewer, then conflict turn — so these sum rather than overlap. */
+  /** Charge a finished session's active stretch to the run. The post-driver sessions — builder,
+   *  reviewer, conflict turn — are strictly sequential, so their stretches sum without overlap; a
+   *  wave's step sessions DO overlap (RUN-170) and each still charges its own stretch, so under
+   *  concurrency this figure is agent COMPUTE time, not wall-clock. That is the deliberate reading
+   *  of `maxDurationSeconds` for a wave: three sessions running an hour together cost three hours
+   *  of the ceiling, the conservative direction — overlap can only exhaust a run sooner. */
   chargeTime(seconds: number): void {
     this.active += Math.max(0, seconds);
   }
@@ -1073,6 +1104,39 @@ export class RunSupervisor {
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
   private vcsFor(repo: ResolvedRepo): SupervisorVcs {
     return repo.vcs ?? this.deps.vcs;
+  }
+
+  /**
+   * The wave seam a chain reaches source control through (RUN-170) — closures over `vcsFor(repo)`
+   * and the parent RUN ID, the same DI pattern `checkpoint` already uses at both `executeChain`
+   * call sites. Closures rather than the backend itself, deliberately: the chain gets exactly the
+   * verbs a wave needs, with the child→parent return trip already run-addressed, so no branch or
+   * ref string can originate above the seam (RUN-50's rule under concurrency).
+   */
+  private waveFor(repo: ResolvedRepo, run: Run): ChainWave {
+    const vcs = this.vcsFor(repo);
+    return {
+      // All three run-addressed pieces, or none: a backend (or fake) that declares overlap but
+      // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
+      // the safe, sequential reading (vcs/types.ts).
+      leasesOverlap: Boolean(vcs.leasesOverlap && vcs.integrateFromRun && vcs.publishToRun),
+      limit: this.deps.waveLimit?.() ?? 1,
+      lease: (childId) => vcs.lease(repo.root, childId, { fromRunId: run.id }),
+      checkpoint: (ws, label) => vcs.checkpoint(ws, runCommitMessage(run.id, label)),
+      integrateBack: (ws) => vcs.integrateFromRun!(ws, run.id),
+      abandonIntegrate: (ws) => vcs.abandonIntegrate(ws),
+      publishBack: (ws) => vcs.publishToRun!(ws, run.id),
+      hasWork: (ws) => vcs.hasWork(ws),
+      dispose: (ws) => vcs.dispose(ws),
+      // The park-state probe (RUN-30's authority) — how the chain learns a wave child stopped to
+      // ask a human, since a child cannot park. Absent with parking off, exactly like parkIfBlocked.
+      ...(this.deps.getParkState
+        ? {
+            probeBlocked: async () =>
+              Boolean((await this.deps.getParkState!(run.id).catch(() => null))?.blocked),
+          }
+        : {}),
+    };
   }
 
   /**
@@ -2774,6 +2838,9 @@ export class RunSupervisor {
           stepPrompt: (step, i, prior) =>
             `${resumedBrief?.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null) ?? resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
+          // Same wave seam as the supervise path (RUN-170): the resumed step's own wave runs
+          // sequentially (the chain enforces that), but the steps AFTER it may overlap.
+          wave: this.waveFor(repo, run),
         })
       : await executeRun(this.executeHost(), resumeBase);
     // The parked step is gone from the recomputed plan (RUN-168). Reported the way every other
@@ -2895,6 +2962,9 @@ export class RunSupervisor {
             `${start.prompt}${renderStepFocus(step, i, chain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) =>
             this.vcsFor(prepared.repo).checkpoint(prepared.worktree, runCommitMessage(run.id, label)),
+          // The wave seam (RUN-170): overlap capability, limit and the run-addressed return trip,
+          // injected as closures the way checkpoint is.
+          wave: this.waveFor(prepared.repo, run),
         })
       : await executeRun(this.executeHost(), base);
     // A chain that could not start at all (RUN-168) — no session, so nothing to settle around.

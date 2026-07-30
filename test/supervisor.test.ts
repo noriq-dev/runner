@@ -324,6 +324,30 @@ class FakeWorktrees {
     this.pushes.push({ root, branch });
     return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
   };
+
+  // ── waves (RUN-170) ────────────────────────────────────────────────────────
+  /** Opt a test into overlapping leases. False (the default) is the pool-of-1 posture, so every
+   *  existing test keeps the sequential chain it always modelled — the conservative reading the
+   *  seam documents for a backend that says nothing. */
+  leasesOverlap = false;
+  /** Every run-addressed integrate/publish, with the RUN it named — the assertion that no branch
+   *  or ref for the parent's line ever originates in supervisor/chain code. */
+  integratedFromRun: Array<{ ws: string; runId: string }> = [];
+  integrateFromRun = async (
+    ws: Workspace,
+    runId: string,
+  ): Promise<{ ok: true } | { ok: false; conflicts: string[] }> => {
+    this.integratedFromRun.push({ ws: ws.runId, runId });
+    return { ok: true };
+  };
+  publishedToRun: Array<{ ws: string; runId: string }> = [];
+  publishToRun = async (
+    ws: Workspace,
+    runId: string,
+  ): Promise<{ ok: true; sha: string } | { ok: false; reason: 'race' | 'error'; detail: string }> => {
+    this.publishedToRun.push({ ws: ws.runId, runId });
+    return { ok: true, sha: 'wavesha' };
+  };
 }
 
 const perm = (write: boolean): PermissionProfile => ({
@@ -446,12 +470,18 @@ function harness(
      *  missing ref answers null, 'fails' → every lookup throws, 'hangs' → every lookup never
      *  resolves, driving the deadline). Absent = the dep is not wired, the pre-RUN-188 daemon. */
     spinOffTasks?: Record<string, SpinOffLookup> | 'fails' | 'hangs';
+    /** RUN-170: how many wave steps may overlap. Presence wires the waveLimit dep the daemon
+     *  binds; absent = the dep is not wired, and the supervisor's conservative default (1) holds. */
+    waveLimit?: number;
+    /** RUN-170: the fake backend's isolation model. true = git's (leases overlap). */
+    leasesOverlap?: boolean;
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
   // (RUN-164) — a test of a resumed chain has to be able to model that.
   let anchorTask = over.anchorTask ?? null;
   const worktrees = new FakeWorktrees();
+  if (over.leasesOverlap) worktrees.leasesOverlap = true;
   if (over.changed === false) worktrees.changed = false;
   if (over.createFails) worktrees.createFails = true;
   if (over.conflicts) worktrees.conflicts = over.conflicts;
@@ -553,6 +583,7 @@ function harness(
         }
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
+    ...(over.waveLimit !== undefined ? { waveLimit: () => over.waveLimit! } : {}),
     ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
     ...(over.spinOffTasks !== undefined
       ? {
@@ -2603,6 +2634,145 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
     await done;
     expect(h.claude.starts).toHaveLength(1);
     expect(h.claude.starts[0]!.prompt).not.toContain('YOU ARE DOING STEP');
+  });
+});
+
+// RUN-170: the wave WIRING — the lease/integrateFromRun/publishToRun closures and the daemon's
+// limit reach ChainPlan at both call sites (supervise and resume), injected over vcsFor(repo) the
+// way checkpoint already is. The chain's own concurrency mechanics are pinned in
+// test/stages-chain.test.ts; what this describe owns is that the supervisor actually binds them.
+describe('a decomposed run’s wave overlaps (RUN-170)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const parallelSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'two independent pieces',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'one', anticipatedFiles: [{ path: 'src/a.ts' }] },
+        { id: 's2', title: 'two', anticipatedFiles: [{ path: 'src/b.ts' }] },
+      ],
+    }),
+  });
+  /** Settle ONE of several live sessions — FakeDriver.complete() only reaches the last start. */
+  const settleAt = (h: ReturnType<typeof harness>, i: number, outcome: 'done' | 'failed' = 'done') =>
+    h.claude.starts[i]!.handlers?.onExit?.({
+      outcome,
+      isError: outcome === 'failed',
+      reason: outcome === 'failed' ? 'boom' : null,
+      telemetry: zeroTelemetry(),
+    });
+  const pump = async (cond: () => boolean) => {
+    for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  it('runs a wave concurrently on an overlap-capable backend, and lands children back BY RUN ID', async () => {
+    const h = harness({ anchorTask: parallelSteps(), leasesOverlap: true, waveLimit: 2 });
+    const done = h.supervisor.supervise(buildRun());
+    await pump(() => h.claude.starts.length >= 2);
+    // Both step sessions are live AT ONCE — neither has settled yet.
+    expect(h.claude.starts).toHaveLength(2);
+    // One workspace per overlapping step, each leased FROM the parent run by id on the seam.
+    expect(h.worktrees.created.map((c) => ({ runId: c.runId, fromRunId: c.fromRunId }))).toEqual([
+      { runId: 'run_1', fromRunId: undefined },
+      { runId: 'run_1--s1', fromRunId: 'run_1' },
+      { runId: 'run_1--s2', fromRunId: 'run_1' },
+    ]);
+    // …and each session works in its own checkout, never the parent's.
+    expect(h.claude.starts.map((s) => s.cwd)).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
+    settleAt(h, 0);
+    settleAt(h, 1);
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    // The child→parent return trip names the parent RUN on the VcsBackend seam — no branch or ref
+    // string for it originates in supervisor/chain code.
+    expect(h.worktrees.integratedFromRun).toEqual([
+      { ws: 'run_1--s1', runId: 'run_1' },
+      { ws: 'run_1--s2', runId: 'run_1' },
+    ]);
+    expect(h.worktrees.publishedToRun).toEqual([
+      { ws: 'run_1--s1', runId: 'run_1' },
+      { ws: 'run_1--s2', runId: 'run_1' },
+    ]);
+    // Landed children are disposed; the parent workspace survives for the human's review.
+    expect(h.worktrees.removed).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
+  });
+
+  // The perforce/diversion posture: leases take turns, so a wave must not take a second one — a
+  // child lease while the parent holds the pool would deadlock, in-process, with nothing to time
+  // out. The fake defaults to this reading, which is also what keeps every pre-RUN-170 test on the
+  // sequential chain it always modelled.
+  it('keeps the same wave sequential on a pool-of-1 backend — one lease, one session at a time', async () => {
+    const h = harness({ anchorTask: parallelSteps(), waveLimit: 4 });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts).toHaveLength(1); // the second step has not started
+    h.claude.complete('done');
+    await pump(() => h.claude.starts.length >= 2);
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.created).toHaveLength(1); // the parent's lease, and never a second
+    expect(h.worktrees.integratedFromRun).toEqual([]);
+    expect(h.claude.starts.map((s) => s.cwd)).toEqual(['/wt/run_1', '/wt/run_1']);
+  });
+
+  // Without the daemon's waveLimit dep the supervisor defaults to 1 — fully sequential, so a
+  // harness (or daemon) that never heard of waves cannot acquire unbounded concurrency.
+  it('runs fully sequentially when no wave limit is wired, however capable the backend', async () => {
+    const h = harness({ anchorTask: parallelSteps(), leasesOverlap: true });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts).toHaveLength(1);
+    h.claude.complete('done');
+    await pump(() => h.claude.starts.length >= 2);
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.created).toHaveLength(1);
+  });
+
+  it('a resumed chain’s later steps still overlap — the closures reach the resume call site too', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'one, then two at once',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/a.ts' }] },
+          { id: 's3', title: 'third', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/b.ts' }] },
+        ],
+      }),
+    };
+    const h = harness({
+      anchorTask: task,
+      leasesOverlap: true,
+      waveLimit: 2,
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // s1 parks on its question
+    await done;
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed s1 finishes
+    await pump(() => h.claude.starts.length >= before + 2);
+    // s2 and s3 are live at once, in their own child workspaces — proof the wave seam and limit
+    // reached the RESUME call site's ChainPlan, not only supervise's.
+    expect(h.claude.starts.length).toBe(before + 2);
+    expect(h.worktrees.created.filter((c) => c.fromRunId === 'run_1').map((c) => c.runId)).toEqual([
+      'run_1--s2',
+      'run_1--s3',
+    ]);
+    settleAt(h, before);
+    settleAt(h, before + 1);
+    const exit = (await resumed) as DriverExit;
+    expect(exit.outcome).toBe('done');
+    expect(h.worktrees.publishedToRun.map((p) => p.ws)).toEqual(['run_1--s2', 'run_1--s3']);
   });
 });
 

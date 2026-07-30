@@ -17,7 +17,7 @@ import {
 import type { DaemonHandle } from '../src/daemon';
 import { zeroTelemetry } from '../src/drivers/types';
 import { ParkedStore } from '../src/parked';
-import type { RunReport } from '../src/supervisor';
+import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WsFactory, WsSocket } from '../src/ws-client';
 
 // The daemon's report→frame gate. Untested until now, which is how the same bug shipped
@@ -216,6 +216,41 @@ describe('orphanSweep', () => {
     });
     await sweep(true);
     expect(b.reaped).toEqual(['run_leaked']);
+  });
+
+  // RUN-170: a wave child's workspace rides its parent run's identity — its id embeds the
+  // parent's. Mid-wave the child is exactly as live as its parent, but only the PARENT is in the
+  // active set, so without the ownership fold the periodic sweep reads the child as a leak and
+  // deletes the checkout its step is working in.
+  it('never touches a live run’s wave-child workspaces mid-wave', async () => {
+    const b = backend(['run_live--s1', 'run_live--s2', 'run_gone--s1']);
+    const active = new Set(['run_live']);
+    const sweep = orphanSweep({
+      repos: [{ root: '/repo' }],
+      vcsFor: () => b.vcs,
+      isActive: (id) => active.has(id),
+      reserved: none,
+      logger: quiet as never,
+    });
+    await sweep(true);
+    // The dead run's leaked child is still swept — ownership folds to the parent, not to "any
+    // child-shaped id".
+    expect(b.reaped).toEqual(['run_gone--s1']);
+  });
+
+  // …and the held set folds the same way: a parked parent's child workspace (left by a wave that
+  // stopped) is being held for a resume, exactly as the parent's own is.
+  it('honours a HELD parent’s child workspaces too', async () => {
+    const b = backend(['run_parked--s2']);
+    const sweep = orphanSweep({
+      repos: [{ root: '/repo' }],
+      vcsFor: () => b.vcs,
+      isActive: () => false,
+      reserved: async () => ['run_parked'],
+      logger: quiet as never,
+    });
+    await sweep(true);
+    expect(b.reaped).toEqual([]);
   });
 
   // The data loss this sweep would otherwise INTRODUCE. A parked run (RUN-30) and a continuable
@@ -506,12 +541,13 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   // A config with NO scan roots: discovery is a no-op and the orphan sweep trivial, so start() never
   // touches a real repo. Built through the contract so budget/update carry their real defaults, then
   // the roots are emptied (the schema demands ≥1, which parse would reject).
-  const config = (): RunnerConfig => ({
+  const config = (concurrency = 1): RunnerConfig => ({
     ...RunnerConfig.parse({
       label: 'test',
       server: 'https://noriq.example',
       scanRoots: ['/unused'],
       tools: ['claude'],
+      concurrency,
       update: { check: false }, // no version-check fetch or timer
     }),
     scanRoots: [],
@@ -551,7 +587,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   // Drive start() with every seam faked, capturing the `report` callback the daemon wires into the
   // supervisor — the closure under test. The supervisor itself is a stub: no run is dispatched, so
   // supervise/resume never fire, but expireStaleParks runs at startup and must answer.
-  async function harness() {
+  async function harness(over: { concurrency?: number } = {}) {
     const sockets: FakeDaemonSocket[] = [];
     const connect: WsFactory = (url, headers) => {
       const s = new FakeDaemonSocket(url, headers);
@@ -560,22 +596,24 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
     };
     const calls: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
-    const daemon = new Daemon(config(), 'tok', {
+    let deps!: RunSupervisorDeps;
+    const daemon = new Daemon(config(over.concurrency), 'tok', {
       logger: quiet,
       connect,
       fetchImpl: fakeFetch(calls),
       parked: new ParkedStore(path.join(tmp, 'parked.json')),
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
-      createSupervisor: (deps) => {
-        report = deps.report;
+      createSupervisor: (d) => {
+        deps = d;
+        report = d.report;
         return { supervise: async () => ({}), resume: async () => null, expireStaleParks: async () => 0 };
       },
     });
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, report };
+    return { handle, sockets, calls, report, deps };
   }
 
   it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
@@ -591,6 +629,16 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  // RUN-170. The wave limit is a dep only the daemon can bind — a dep only tests supply is a
+  // feature that has never run (the resolveLockScope lesson, again). With nothing else active the
+  // run may use the machine's whole concurrency: it holds one slot itself, so the limit is
+  // freeSlots() plus its own seat.
+  it('binds the wave limit to the machine’s spare capacity (RUN-170)', async () => {
+    const { deps } = await harness({ concurrency: 3 });
+    expect(deps.waveLimit).toBeTypeOf('function');
+    expect(deps.waveLimit?.()).toBe(3);
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {

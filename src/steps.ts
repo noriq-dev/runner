@@ -194,6 +194,38 @@ export function planWaves(steps: ExecutionStep[], limit = Number.POSITIVE_INFINI
 }
 
 /**
+ * Wave children are STEPS of one run, not runs of their own (RUN-170): a child workspace is
+ * leased under this derived id, so the run keeps one identity, one credential and one budget
+ * while the backend gets a distinct name per concurrent lease.
+ *
+ * The separator is what makes ownership recoverable with no external registry — the same rule
+ * that lets `reapOrphans` reconstruct run ids from branch names. A real run id is server-minted
+ * (`run_<alnum>`) and never contains it, so `owningRunId` can always find the parent, and the
+ * order of harms is safe in the failure direction: a stray `--` in some future id shape makes the
+ * sweep KEEP a workspace it might have reaped, never reap one it must keep.
+ */
+export const STEP_WORKSPACE_SEP = '--';
+
+/**
+ * The id a step's concurrent workspace is leased under. The id reaches git refs (`runBranch`)
+ * and worktree directory names, and a step id is free text from a planner — so it is narrowed to
+ * characters safe in both (`.` is excluded because `..` is invalid inside a ref). Two ids that
+ * collide once narrowed are the CALLER's to detect: the chain runs that wave sequentially rather
+ * than let two sessions adopt one checkout, which is the invariant this id exists to protect.
+ */
+export function stepWorkspaceId(runId: string, stepId: string): string {
+  return `${runId}${STEP_WORKSPACE_SEP}${stepId.replace(/[^A-Za-z0-9_-]+/g, '-')}`;
+}
+
+/** The run that OWNS a workspace id: the parent for a wave child's, the id itself otherwise.
+ *  The orphan sweep asks this so a live child is not reaped mid-wave (RUN-170) — a child's
+ *  workspace is exactly as owned as its parent run is. */
+export function owningRunId(workspaceRunId: string): string {
+  const at = workspaceRunId.indexOf(STEP_WORKSPACE_SEP);
+  return at > 0 ? workspaceRunId.slice(0, at) : workspaceRunId;
+}
+
+/**
  * The decomposition as the builder reads it.
  *
  * Until each step is its own session (the remainder of RUN-148), this is what makes a declared

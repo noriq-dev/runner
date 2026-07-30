@@ -22,6 +22,7 @@ import { buildRegistration } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
+import { owningRunId } from './steps';
 import { type RunReport, RunSupervisor, type RunSupervisorDeps } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
@@ -195,7 +196,15 @@ export function orphanSweep(deps: {
       log.warn('skipping the orphan sweep — could not read what is being held', { err: String(err) });
       return { reaped: 0, kept: [] };
     }
-    const isOwned = (runId: string) => deps.isActive(runId) || held.has(runId);
+    // A wave child's workspace rides its parent run's identity (RUN-170): its id embeds the
+    // parent's, and it is exactly as owned as that run is — live mid-wave, or held by a park or
+    // continuation. Without the fold the periodic sweep reads a live child as a leak and deletes
+    // the checkout its step is working in.
+    const isOwned = (runId: string) => {
+      if (deps.isActive(runId) || held.has(runId)) return true;
+      const owner = owningRunId(runId);
+      return owner !== runId && (deps.isActive(owner) || held.has(owner));
+    };
     for (const r of deps.repos) {
       reaped += await deps
         .vcsFor(r.root)
@@ -566,6 +575,12 @@ export class Daemon {
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
       repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
+      // How many of a run's wave steps may overlap (RUN-170): the machine's `concurrency` minus
+      // what OTHER runs are using. The run asking already holds one active slot — this is
+      // `freeSlots()` (the heartbeat's computation, below) plus its own seat — and the floor of 1
+      // means a saturated machine degrades a wave to sequential rather than refusing the run.
+      // Bound HERE, not only in tests: a dep only tests supply is a feature that has never run.
+      waveLimit: () => Math.max(1, this.config.concurrency - Math.max(0, this.active.size - 1)),
       steering,
       logger: this.log,
     });
