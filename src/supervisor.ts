@@ -14,17 +14,21 @@ import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
 import {
   type Finding,
+  type FindingResponse,
   type LedgerEntry,
+  type SpinOffCheck,
   applyContestResponses,
   buildLedger,
   parseFindingResponses,
   parseFindings,
   reconciledEntry,
   renderContestRecord,
+  spinOffsHold,
   subclaimsOf,
+  taskRefsIn,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
-import type { ParkState, RunAgent } from './client';
+import type { ParkState, RunAgent, SpinOffProvenance } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
@@ -238,6 +242,16 @@ export interface RunSupervisorDeps {
    * — the daemon spawns exactly as before. Only an explicit `{ claimable: false }` declines.
    */
   checkClaimable?: (taskId: string) => Promise<{ claimable: boolean; reason: string | null } | null>;
+  /**
+   * Look up a task a CONTESTED response's `task:<ref>` pointer names (RUN-188, →
+   * NoriqClient.getTask; the server resolves keys and ids alike). The DAEMON runs this check
+   * because the judging reviewer holds no Noriq credential and must not gain one (RUN-43) — it is
+   * handed the result as ledger data, never a token. Same probe posture as checkClaimable: a
+   * throw and a null are the same non-answer, recorded UNVERIFIED — which can never CREDIT a
+   * contest and never fails the run by itself. Omitted → no facts are attached and a task pointer
+   * stays exactly the free text it was before this existed.
+   */
+  resolveSpinOff?: (ref: string) => Promise<SpinOffLookup | null>;
   /**
    * Dispatch-time predictive locking (RUN-103): the DECLARED file scope of a run, if one is
    * known, so the daemon can take its locks before the agent starts and refuse a dispatch that
@@ -650,6 +664,23 @@ export interface AnchorTask {
   /** The SERVER holds a spec it could not read (RUN-135) — not the same as having none. */
   executionSpecUnreadable?: boolean;
 }
+
+/** What the RUN-188 task-pointer check needs of a task: enough to say it EXISTS and where it came
+ *  from. Structurally satisfied by client.ts's TaskBrief, the same seam shape as AnchorTask. */
+export interface SpinOffLookup {
+  key: string;
+  title: string;
+  /** Provenance a spun-off task carries. Absent on a task a human filed by hand — still a
+   *  legitimate contest target ("tracked THERE" does not require the builder filed it); the
+   *  reviewer weighs the difference, told which it is. */
+  spinOff?: SpinOffProvenance | null;
+}
+
+/** Distinct task lookups one fold turn may spend (RUN-188). Past it a ref is recorded as
+ *  unchecked — still `verified: false`, so it credits nothing — rather than silently dropped: a
+ *  builder spinning off ten tasks to dodge ten findings meets the control instead of outrunning
+ *  it, and the ledger says so out loud (the no-silent-caps rule). */
+const MAX_TASK_LOOKUPS_PER_TURN = 8;
 
 /**
  * The RUNNABLE half of `[verify]` (RUN-61). Since the stage became a choice, `cmd` is
@@ -1634,8 +1665,12 @@ export class RunSupervisor {
         })
         .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
-      // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
-      ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
+      // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer
+      // sees. A CONTESTED pointer naming a task is checked FIRST (RUN-188, the same path the
+      // terminal contest uses), so the fact — verified or not — rides the fold and reaches the
+      // fresh reviewer as data it could never look up itself.
+      const fixResponses = await this.verifyTaskPointers(ctx.run.id, parseFindingResponses(fixText));
+      ledger = buildLedger(ledger, findings, fixResponses, round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
       // Same as the floor's hand-back: the run keeps the reviewer's reason, so the turn's own
@@ -1923,6 +1958,97 @@ export class RunSupervisor {
   }
 
   /**
+   * The mechanical half of adjudicating a spin-off contest (RUN-188), shared by BOTH fold sites —
+   * the fix rounds and the terminal contest — so the two cannot drift on what "checked" means.
+   *
+   * A CONTESTED pointer may name a task (`task:<ref>`): "real, out of scope, tracked THERE". The
+   * judging reviewer holds no Noriq credential and gets none for this (RUN-43), so the daemon
+   * looks each named task up and attaches what it saw to the response, which the fold then
+   * carries as ledger data — the fresh reviewer judges substance over facts instead of a prose
+   * promise. The order of harms is may-miss-never-invent: a lookup that failed, answered
+   * malformed, found nothing, or was declined (the per-turn bound) yields `verified: false` — a
+   * fact that can only make the contest harder to credit — and never a crash or a gate of its
+   * own, the checkClaimable probe posture. No lookup wired → responses pass through untouched and
+   * a task pointer stays the free text it always was, which is every daemon before RUN-188.
+   */
+  private async verifyTaskPointers(
+    runId: string,
+    responses: FindingResponse[],
+  ): Promise<FindingResponse[]> {
+    const lookup = this.deps.resolveSpinOff;
+    if (!lookup) return responses;
+    const clip = (s: string, n: number) => {
+      const t = s.trim();
+      return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+    };
+    const facts = new Map<string, SpinOffCheck>();
+    let looked = 0;
+    const check = async (ref: string): Promise<SpinOffCheck> => {
+      const held = facts.get(ref);
+      if (held) return held;
+      let fact: SpinOffCheck;
+      if (looked >= MAX_TASK_LOOKUPS_PER_TURN) {
+        fact = {
+          ref,
+          verified: false,
+          detail: 'not checked — this turn named more task pointers than the daemon will look up',
+        };
+      } else {
+        looked += 1;
+        const t = await lookup(ref).catch(() => null);
+        if (!t) {
+          fact = {
+            ref,
+            verified: false,
+            detail: 'no such task reachable from this runner — treat the pointer as pointing at nothing',
+          };
+        } else {
+          // The provenance line is the mechanical fact the reviewer's substance judgment starts
+          // from: filed from THIS run against a finding, filed elsewhere, or carrying none (a task
+          // a human filed by hand — still a legitimate target, and the reviewer is told which).
+          const prov = t.spinOff;
+          const from = !prov
+            ? 'carries no spin-off provenance — it may predate this run'
+            : prov.sourceRunId === runId
+              ? 'filed from THIS run'
+              : prov.sourceRunId
+                ? `filed from run ${prov.sourceRunId}`
+                : 'its provenance names no source run';
+          const against = prov?.finding ? `, against: "${clip(prov.finding, 120)}"` : '';
+          fact = {
+            ref,
+            verified: true,
+            detail: `exists — ${t.key}: ${clip(t.title, 100)} (${from}${against})`,
+          };
+        }
+      }
+      facts.set(ref, fact);
+      return fact;
+    };
+    const out: FindingResponse[] = [];
+    for (const r of responses) {
+      // Only a CONTESTED pointer is evidence a task can back — a FIXED points at a change, and
+      // checking tasks it happens to mention would attach facts to a claim nobody made.
+      const refs = r.status === 'contested' ? taskRefsIn(r.pointer) : [];
+      if (!refs.length) {
+        out.push(r);
+        continue;
+      }
+      const spinOffs: SpinOffCheck[] = [];
+      for (const ref of refs) spinOffs.push(await check(ref));
+      out.push({ ...r, spinOffs });
+    }
+    if (facts.size) {
+      this.log.info('checked the task pointers the builder contested with', {
+        runId,
+        refs: [...facts.keys()],
+        verified: [...facts.values()].filter((f) => f.verified).length,
+      });
+    }
+    return out;
+  }
+
+  /**
    * The RUN-174 contest turn: one adjudication turn after a TERMINAL-round FAIL, before the run
    * reports. Returns the FINAL result iff the contest RAN — a PASS only when every terminal finding
    * drew a checkable CONTESTED response AND a fresh reviewer verified those pointers hold; otherwise
@@ -1933,8 +2059,9 @@ export class RunSupervisor {
    * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
    * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
    * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, a
-   * finding a ledger cap dropped, or a sub-claim left unanswered while its siblings drew the
-   * rebuttal (RUN-180) cannot clear it — the run then fails without even spawning the reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * finding a ledger cap dropped, a sub-claim left unanswered while its siblings drew the
+   * rebuttal (RUN-180), or a task pointer the daemon could not verify (RUN-188) cannot clear it —
+   * the run then fails without even spawning the reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
    * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
    * enough.
    *
@@ -2037,11 +2164,17 @@ export class RunSupervisor {
     // pointerless self-assertion is persuasion the next reviewer cannot check, and a `FINDING 99`
     // naming no terminal finding is context from nowhere. Folding this ONE `matched` set — not the
     // raw responses — is what keeps the ledger the verifiable-pointer record RUN-79 designed, and
-    // stops the join being re-derived, divergently, at each site.
+    // stops the join being re-derived, divergently, at each site. Task pointers in the matched set
+    // are then checked by the daemon (RUN-188, the fix rounds' own path) so what folds below is
+    // the response PLUS the fact — and an unverified pointer folds as exactly that, visible to a
+    // human and a continuation even when the gate underneath declines the contest.
     const contestText = ctx.getSessionText?.().slice(textBefore) ?? '';
     const responses = parseFindingResponses(contestText);
     const terminalIds = new Set(args.findings.map((f) => f.id));
-    const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
+    const matched = await this.verifyTaskPointers(
+      ctx.run.id,
+      responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id)),
+    );
 
     // Land that matched evidence on the ledger FIRST — before any outcome branch — so a rebuttal
     // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
@@ -2080,8 +2213,15 @@ export class RunSupervisor {
     // answer out. A bare `FINDING <n>` response is recorded as evidence but credits no lettered
     // claim, so answering in halves leaves the unanswered half STANDING — and the finding off the
     // candidate set.
+    // A contest standing on task pointers none of which the daemon could verify is a pointer at
+    // nothing (RUN-188): it folds into the ledger above — the evidence and its failure are both
+    // recorded — but it is no candidate to clear, exactly like an empty pointer. spinOffsHold is
+    // deliberately vacuous over absent facts, so a response naming no task, a pre-RUN-188
+    // response, and a daemon with no lookup wired all clear (or stand) exactly as they did before.
     const contestedWhole = new Set(
-      matched.filter((r) => r.status === 'contested' && !r.subclaim).map((r) => r.id),
+      matched
+        .filter((r) => r.status === 'contested' && !r.subclaim && spinOffsHold(r.spinOffs))
+        .map((r) => r.id),
     );
     // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
     // parse alone — in EITHER direction. The fold deliberately PRESERVES held sub-claims when a
@@ -2112,7 +2252,11 @@ export class RunSupervisor {
       // believes a FIXED sub-claim no longer holds has this turn's move: CONTEST it, at the letter
       // the contest record shows for it, with the pointer at the landed change — the fold resolves
       // that letter back to the claim — and the fresh look then verifies it like any other contest.
-      if (subs.length) return subs.every((s) => s.status === 'contested');
+      // A carried contest whose task pointer did not verify blocks candidacy too (RUN-188): the
+      // contest record showed the builder that letter as needing a fresh answer (renderContestRecord
+      // marks it), so demanding one here is the FIXED rule again, not a second gate over a record
+      // the prompt called settled.
+      if (subs.length) return subs.every((s) => s.status === 'contested' && spinOffsHold(s.spinOffs));
       // A single-claim finding keeps the pre-RUN-180 rule unchanged: the builder must have
       // contested it THIS turn — silence over a terminal finding is not a contest, however the
       // entry's carried status reads, because the terminal reviewer raised it over that record.

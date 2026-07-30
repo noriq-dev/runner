@@ -540,6 +540,11 @@ export class Daemon {
       // the one that can register runners and reach every project this human can.
       createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
       resolveTask: (taskId) => client.getTask(taskId),
+      // The mechanical check behind a CONTESTED task pointer (RUN-188): the judging reviewer holds
+      // no credential (RUN-43), so the daemon looks the task up and enters the result as ledger
+      // data. Bound here for the same reason resolveLockScope is: a dep only tests supply is a
+      // feature that has never run.
+      resolveSpinOff: (ref) => client.getTask(ref),
       // Phase-gate backstop (RUN-81): don't spawn an agent on a task the server offered but whose
       // plan phase isn't unlocked. Read-only probe; a null answer fails open (see checkClaimable).
       checkClaimable: (taskId) => client.checkClaimable(taskId),

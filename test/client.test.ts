@@ -91,7 +91,7 @@ describe('MCP session lifecycle (RUN-73)', () => {
   // recycle), which is why the retry-once matters.
   type Frame = { method?: string; sid: string | null; toolName?: string };
 
-  function fakeMcpServer(opts: { forgetAfterMint?: number } = {}) {
+  function fakeMcpServer(opts: { forgetAfterMint?: number; task?: unknown } = {}) {
     const frames: Frame[] = [];
     const sessions = new Set<string>();
     let minted = 0;
@@ -126,7 +126,10 @@ describe('MCP session lifecycle (RUN-73)', () => {
           id: 1,
           result: {
             content: [
-              { type: 'text', text: JSON.stringify({ task: { key: 'K-1', title: 'T', body: null } }) },
+              {
+                type: 'text',
+                text: JSON.stringify({ task: opts.task ?? { key: 'K-1', title: 'T', body: null } }),
+              },
             ],
           },
         }),
@@ -272,5 +275,70 @@ describe('checkClaimable phase-gate probe (RUN-81)', () => {
       fetchImpl: mcp({ gated: 'yes' }),
     });
     expect(await client.checkClaimable('task_1')).toBeNull();
+  });
+});
+
+// RUN-188: the task-pointer check reads a spun-off task's provenance through getTask. The read is
+// LENIENT where the spec read beside it is strict, because the stakes invert: a spec that
+// misparses could be overwritten, while provenance only ever sharpens an existence check — so a
+// malformed field must not fail the lookup that carries the rest.
+describe('getTask spin-off provenance (RUN-188)', () => {
+  const mcp = (task: unknown) =>
+    (async (_url: string | URL, init?: RequestInit) => {
+      const method = (JSON.parse(String(init?.body)) as { method?: string }).method;
+      if (method === 'initialize')
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
+          status: 200,
+          headers: { 'mcp-session-id': 'sess_1' },
+        });
+      if (method === 'notifications/initialized') return new Response(null, { status: 202 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: JSON.stringify({ task }) }] },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+  it('reads provenance when the server sends it', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({
+        key: 'RUN-201',
+        title: 'Harden the guard floor',
+        spinOff: { sourceTaskId: 'task_9', sourceRunId: 'run_1', finding: 'the guard is missing' },
+      }),
+    });
+    const t = await client.getTask('RUN-201');
+    expect(t?.spinOff).toEqual({
+      sourceTaskId: 'task_9',
+      sourceRunId: 'run_1',
+      finding: 'the guard is missing',
+    });
+  });
+
+  it('a task without the field carries NO provenance — every pre-RUN-188 server', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ key: 'K-1', title: 'T' }),
+    });
+    const t = await client.getTask('K-1');
+    expect(t).not.toBeNull();
+    expect(t && 'spinOff' in t).toBe(false);
+  });
+
+  it('malformed provenance degrades field by field — the task itself still resolves', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: mcp({ key: 'K-1', title: 'T', spinOff: { sourceRunId: 42, finding: '' } }),
+    });
+    const t = await client.getTask('K-1');
+    expect(t?.key).toBe('K-1');
+    expect(t?.spinOff).toEqual({ sourceTaskId: null, sourceRunId: null, finding: null });
   });
 });

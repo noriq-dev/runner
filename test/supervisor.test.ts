@@ -27,6 +27,7 @@ import {
   type RunReport,
   RunSupervisor,
   RunTally,
+  type SpinOffLookup,
   assemblePrompt,
   effectiveKind,
   mergeBudget,
@@ -441,6 +442,10 @@ function harness(
     /** The anchor task the server hands back — how a test gives a run an execution spec, and so
      *  the acceptance criteria its gate must answer (RUN-145). */
     anchorTask?: AnchorTask | null;
+    /** RUN-188 task-pointer lookup. Presence wires resolveSpinOff; the map is ref → task (a
+     *  missing ref answers null, 'fails' → every lookup throws). Absent = the dep is not wired,
+     *  the pre-RUN-188 daemon. */
+    spinOffTasks?: Record<string, SpinOffLookup> | 'fails';
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
@@ -549,6 +554,14 @@ function harness(
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
     ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
+    ...(over.spinOffTasks !== undefined
+      ? {
+          resolveSpinOff: async (ref: string) => {
+            if (over.spinOffTasks === 'fails') throw new Error('server unreachable');
+            return over.spinOffTasks?.[ref] ?? null;
+          },
+        }
+      : {}),
     ...(over.cancelled
       ? {
           steering: {
@@ -4335,6 +4348,173 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(exit.reason).toBe('review:no-verdict');
     expect(h.claude.continuations).toEqual([]); // no contest turn
     expect(h.claude.starts).toHaveLength(2); // build + the one reviewer
+  });
+});
+
+// RUN-188: the gate integration for spun-off work. A CONTESTED pointer may name a task —
+// `task:<key>`, "real, out of scope, tracked THERE" — and the DAEMON checks it mechanically at
+// both fold sites through one path, entering the result as ledger data for the credential-less
+// fresh reviewer (RUN-43). The order of harms is may-miss-never-invent: a lookup that fails or
+// finds nothing never CREDITS a contest and never fails the run by itself, and a daemon with no
+// lookup wired behaves exactly as before RUN-188.
+describe('spin-off task pointers (RUN-188)', () => {
+  const REVIEWED = (maxRounds = 0, cmd: string | null = 'npm test') =>
+    manifest({
+      verify: {
+        cmd,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>, atLeastStarts: number) => {
+    for (let i = 0; i < 300; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= atLeastStarts) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error(`the reviewer session (>= ${atLeastStarts} starts) never began`);
+  };
+  const reviewerStarts = (h: ReturnType<typeof harness>) =>
+    h.claude.starts.filter((s) => s.runId === 'run_1:review').length;
+  /** A spun-off task on the server, its provenance naming THIS run (run_1) and the finding. */
+  const SPUN_OFF: Record<string, SpinOffLookup> = {
+    'RUN-201': {
+      key: 'RUN-201',
+      title: 'Harden the guard floor',
+      spinOff: { sourceTaskId: 'task_9', sourceRunId: 'run_1', finding: 'the guard is missing' },
+    },
+  };
+  /** Build → terminal reviewer FAILs → the contest turn streams `contest` → the run settles.
+   *  Boxed, because an async return would ADOPT the run promise and deadlock any test that still
+   *  has reviewer turns to drive. */
+  const terminalContest = async (h: ReturnType<typeof harness>, contest: string) => {
+    h.claude.continueTexts = [contest];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs → the contest turn runs
+    return { done };
+  };
+
+  it('a verified task pointer earns the fresh look, which reads the daemon’s check as ledger data', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:RUN-201 — real, out of scope, tracked there',
+    );
+    await onReviewTurn(h, 3); // the contest cleared candidacy → one fresh adjudicator
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toContain('CONTESTED (task:RUN-201)');
+    // The daemon's line, not the builder's claim: existence AND provenance, as checkable data.
+    expect(readjudged).toContain(
+      '→ daemon: task:RUN-201 verified — exists — RUN-201: Harden the guard floor (filed from THIS run, against: "the guard is missing")',
+    );
+    h.claude.emitText('The task covers the finding and the work is adjacent.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2); // the terminal round + the contest's fresh look
+  });
+
+  it('a task the daemon cannot find never buys the re-adjudication — recorded NOT verified', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: {} });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-999 — tracked there, honest');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // an unverifiable pointer is a pointer at nothing
+    expect(exit.reason).toBe('review');
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator spawned to possibly-PASS over it
+    // The contest and its failed check both survive into the ledger — visible to a human and a
+    // continuation, not just to the gate that refused it.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.status).toBe('contested');
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-999', false]]);
+  });
+
+  // The probe posture (checkClaimable's): a throw is the same non-answer as a null — recorded
+  // unverified, never a crash, never a gate of its own. The run fails on the finding standing,
+  // which is exactly where it stood before the contest.
+  it('a lookup that throws is recorded unverified — never a crash, never a credit', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: 'fails' });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
+  });
+
+  // Every named task must verify: a real task beside a bogus one does not carry the response —
+  // refusing may cost a re-contest, crediting would invent the half that was never checked.
+  it('a contest naming a verified AND an unverifiable task is no candidate', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:RUN-201 task:RUN-999 — split across two',
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+  });
+
+  // The pre-RUN-188 daemon, byte-identical: no lookup wired → no facts, and a task pointer is the
+  // free text it always was — a checkable-looking pointer the fresh reviewer judges from prose.
+  it('with no lookup wired a task pointer behaves exactly as before — free text, no daemon line', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] }); // spinOffTasks absent
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    await onReviewTurn(h, 3); // the non-empty pointer still earns the fresh look, as it did before
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toContain('CONTESTED (task:RUN-201)');
+    // No daemon DATA line rides the entry (the template's own teaching still mentions the form).
+    expect(readjudged).not.toContain('→ daemon: task:RUN-201');
+    h.claude.emitText('The pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  // The OTHER fold site, same path: a fix-round contest naming a task carries the daemon's check
+  // into the ledger the NEXT fresh reviewer reads — the fact reaches it as data it could never
+  // look up itself.
+  it('a fix-round task pointer is checked and the fact reaches the next fresh reviewer', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true], spinOffTasks: SPUN_OFF });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED task:RUN-201 — out of scope, tracked there'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // round 1 FAILs → fix turn answers with the task pointer
+    await onReviewTurn(h, 3); // floor re-ran, round 2's fresh reviewer starts
+    const next = h.claude.starts[2]!.prompt;
+    expect(next).toMatch(/PRIOR ADJUDICATIONS/);
+    expect(next).toContain('CONTESTED (task:RUN-201)');
+    expect(next).toContain('→ daemon: task:RUN-201 verified — exists — RUN-201: Harden the guard floor');
+    h.claude.emitText('Adjacent work, properly tracked.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2); // round 1 + round 2 — the fact rode the ledger, not a new spawn
+  });
+
+  // …and an unverified fix-round pointer rides the ledger too, marked NOT verified, so the next
+  // reviewer is told to treat it as pointing at nothing rather than reading prose.
+  it('an unverifiable fix-round pointer reaches the next reviewer marked NOT verified', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true], spinOffTasks: {} });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED task:RUN-999 — tracked there'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    expect(h.claude.starts[2]!.prompt).toContain('→ daemon: task:RUN-999 NOT verified');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
   });
 });
 

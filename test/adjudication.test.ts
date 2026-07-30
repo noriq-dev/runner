@@ -11,7 +11,10 @@ import {
   renderLedger,
   renderRequirementOutcomes,
   requirementOutcomes,
+  spinOffsHold,
+  spinOffsOf,
   subclaimsOf,
+  taskRefsIn,
 } from '../src/adjudication';
 
 describe('parseFindings', () => {
@@ -1511,5 +1514,189 @@ describe('applyContestResponses', () => {
     expect(answered[0]!.status).toBe('contested');
     expect(answered[0]!.pointer).toBe('a.ts:9');
     expect(answered[0]!.subclaims).toEqual([]);
+  });
+});
+
+// RUN-188. A CONTESTED pointer may name a task — `task:<key>`, "real, out of scope, tracked
+// THERE" — and the DAEMON checks it mechanically, because the judging reviewer holds no Noriq
+// credential and never gets one (RUN-43). The fact rides the fold BESIDE the answer it qualifies,
+// renders as data for the fresh reviewer, and on persisted ledgers degrades toward UNVERIFIED —
+// the one direction that cannot credit a contest (may-miss-never-invent).
+describe('spin-off task-pointer facts (RUN-188)', () => {
+  const FACT = (ref: string, verified: boolean, detail = 'checked') => ({ ref, verified, detail });
+  const F1 = {
+    id: 1,
+    severity: 'High',
+    requirements: [],
+    location: 'a.ts:1',
+    claim: 'adjacent hardening the intent never named',
+    subclaims: [] as string[],
+  };
+  const SF = (id: number, subclaims: string[]) => ({ ...F1, id, subclaims });
+
+  describe('taskRefsIn', () => {
+    it('reads the task:<ref> vocabulary out of a free-text pointer', () => {
+      expect(taskRefsIn('task:RUN-201')).toEqual(['RUN-201']);
+      expect(taskRefsIn('src/a.ts:9, task:RUN-201')).toEqual(['RUN-201']);
+      expect(taskRefsIn('task:task_ms54mz39')).toEqual(['task_ms54mz39']);
+    });
+
+    // NOT a parse-format change: the pointer was always free text, and one that names no task —
+    // every response written before RUN-188 — yields nothing and folds untouched.
+    it('finds nothing in a pointer that names no task', () => {
+      expect(taskRefsIn('src/a.ts:9')).toEqual([]);
+      expect(taskRefsIn('commit a672b25')).toEqual([]);
+      expect(taskRefsIn('')).toEqual([]);
+    });
+
+    it('dedupes and caps — a pointer naming a dozen tasks is dodging, not tracking', () => {
+      expect(taskRefsIn('task:A-1 and task:A-1 and task:B-2')).toEqual(['A-1', 'B-2']);
+      expect(taskRefsIn('task:A-1 task:B-2 task:C-3 task:D-4 task:E-5')).toHaveLength(3);
+    });
+  });
+
+  describe('spinOffsHold', () => {
+    // Vacuous over absence on purpose: the pre-RUN-188 world — a response naming no task, a
+    // persisted ledger without the field, a daemon with no lookup wired — clears (or stands)
+    // exactly as it always did.
+    it('is vacuous over absent facts', () => {
+      expect(spinOffsHold(undefined)).toBe(true);
+      expect(spinOffsHold([])).toBe(true);
+    });
+
+    it('demands every named task verified once facts are present', () => {
+      expect(spinOffsHold([FACT('RUN-201', true)])).toBe(true);
+      expect(spinOffsHold([FACT('RUN-201', true), FACT('BOGUS', false)])).toBe(false);
+    });
+  });
+
+  it('the fold carries a response’s facts beside the answer, and the render shows the daemon line', () => {
+    const rs = {
+      ...parseFindingResponses('FINDING 1: CONTESTED task:RUN-201 — real, out of scope, tracked there')[0]!,
+      spinOffs: [FACT('RUN-201', true, 'exists — RUN-201: Harden the guard floor (filed from THIS run)')],
+    };
+    const led = buildLedger([], [F1], [rs], 1);
+    expect(led[0]!.spinOffs).toEqual(rs.spinOffs);
+    const out = renderLedger(led);
+    expect(out).toContain('→ builder: CONTESTED (task:RUN-201) — real, out of scope, tracked there');
+    expect(out).toContain(
+      '→ daemon: task:RUN-201 verified — exists — RUN-201: Harden the guard floor (filed from THIS run)',
+    );
+  });
+
+  it('an unverified fact renders NOT verified — the pointer is shown pointing at nothing', () => {
+    const rs = {
+      ...parseFindingResponses('FINDING 1: CONTESTED task:BOGUS — tracked there')[0]!,
+      spinOffs: [FACT('BOGUS', false, 'no such task reachable from this runner')],
+    };
+    const out = renderLedger(buildLedger([], [F1], [rs], 1));
+    expect(out).toContain('→ daemon: task:BOGUS NOT verified — no such task reachable from this runner');
+  });
+
+  it('facts land on the sub-claim whose letter the response named, not on its siblings', () => {
+    const rs = {
+      id: 1,
+      subclaim: 'b',
+      status: 'contested' as const,
+      pointer: 'task:RUN-201',
+      reason: 'tracked there',
+      spinOffs: [FACT('RUN-201', false, 'no such task')],
+    };
+    const led = buildLedger([], [SF(1, ['claim a', 'claim b'])], [rs], 1);
+    expect(led[0]!.subclaims[0]!.spinOffs).toBeUndefined();
+    expect(led[0]!.subclaims[1]!.spinOffs).toEqual(rs.spinOffs);
+    expect(renderLedger(led)).toContain('→ daemon: task:RUN-201 NOT verified — no such task');
+  });
+
+  it('a re-raise with no response keeps the held facts beside the held pointer', () => {
+    const rs = {
+      ...parseFindingResponses('FINDING 1: CONTESTED task:RUN-201 — tracked')[0]!,
+      spinOffs: [FACT('RUN-201', true)],
+    };
+    const round2 = buildLedger(buildLedger([], [F1], [rs], 1), [F1], [], 2);
+    expect(round2[0]!.status).toBe('contested');
+    expect(round2[0]!.spinOffs).toEqual(rs.spinOffs);
+  });
+
+  // A daemon check qualifies the pointer it ran against: carrying it onto a NEW pointer would be
+  // a verification nobody ran — the invented match, one field over.
+  it('a fresh answer replaces the facts, even with none to give', () => {
+    const first = {
+      ...parseFindingResponses('FINDING 1: CONTESTED task:RUN-201 — tracked')[0]!,
+      spinOffs: [FACT('RUN-201', true)],
+    };
+    const second = parseFindingResponses('FINDING 1: CONTESTED src/a.ts:9 — covered by the guard')[0]!;
+    const round2 = buildLedger(buildLedger([], [F1], [first], 1), [F1], [second], 2);
+    expect(round2[0]!.pointer).toBe('src/a.ts:9');
+    expect(round2[0]!.spinOffs).toBeUndefined();
+  });
+
+  it('applyContestResponses moves the facts with the contest answers, per letter', () => {
+    const terminal = SF(1, ['half one', 'half two']);
+    const raised = buildLedger([], [terminal], [], 3);
+    const answered = applyContestResponses(
+      raised,
+      [terminal],
+      [
+        {
+          id: 1,
+          subclaim: 'a',
+          status: 'contested' as const,
+          pointer: 'task:RUN-201',
+          reason: 'tracked',
+          spinOffs: [FACT('RUN-201', true)],
+        },
+        { id: 1, subclaim: 'b', status: 'contested' as const, pointer: 'x.ts:1', reason: 'covered' },
+      ],
+      3,
+    );
+    expect(answered[0]!.subclaims[0]!.spinOffs).toEqual([FACT('RUN-201', true)]);
+    expect(answered[0]!.subclaims[1]!.spinOffs).toBeUndefined();
+  });
+
+  // The contest record must say WHICH carried contests the candidacy gate will refuse — a prompt
+  // calling an unverified-pointer contest settled would fail the builder that followed it.
+  it('renderContestRecord marks a carried contest whose task pointer did not verify', () => {
+    const rs = {
+      id: 1,
+      subclaim: 'a',
+      status: 'contested' as const,
+      pointer: 'task:BOGUS',
+      reason: 'tracked',
+      spinOffs: [FACT('BOGUS', false, 'no such task')],
+    };
+    const round1 = buildLedger([], [SF(1, ['half one', 'half two'])], [rs], 1);
+    const terminal = SF(1, []); // a letterless terminal re-raise: the record is the only lettering
+    const raised = buildLedger(round1, [terminal], [], 3);
+    const out = renderContestRecord([terminal], raised, 3);
+    expect(out).toContain('(a) half one — CONTESTED (task:BOGUS) [its task pointer did NOT verify');
+    expect(out).toContain('(b) half two — no answer recorded');
+  });
+
+  // The persisted-degradation twins (the RUN-180 suite's contract, for this field).
+  it('a persisted record without the field loads with no facts — behavior unchanged', () => {
+    expect(spinOffsOf({})).toBeUndefined();
+    const sub = subclaimsOf({ subclaims: [{ claim: 'ok', status: 'contested' }] })[0]!;
+    expect('spinOffs' in sub).toBe(false);
+    expect(spinOffsHold(sub.spinOffs)).toBe(true);
+  });
+
+  it('a persisted fact field that cannot be read degrades toward UNVERIFIED — never absent', () => {
+    for (const mangled of [
+      'nope',
+      [],
+      ['not-an-object'],
+      [{ ref: 'R-1' }], // no detail
+      Array.from({ length: 9 }, (_, i) => FACT(`R-${i}`, true)), // more than a writer here can produce
+    ]) {
+      const facts = spinOffsOf({ spinOffs: mangled });
+      expect(facts).toBeDefined();
+      expect(spinOffsHold(facts)).toBe(false);
+    }
+    // A field inside a well-formed fact degrades the same direction: a non-boolean `verified`
+    // reads false, because the fallback must only ever make the claim harder to clear.
+    expect(spinOffsOf({ spinOffs: [{ ref: 'R-1', detail: 'd', verified: 'yes' }] })).toEqual([
+      FACT('R-1', false, 'd'),
+    ]);
   });
 });

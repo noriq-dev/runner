@@ -2,6 +2,16 @@ import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
+/** Where a spun-off task came from (RUN-188): the run and finding that spawned it. Runner-local,
+ *  like TaskBrief itself — the server owns the wire shape (the planar side lands first), and this
+ *  is only what the daemon's task-pointer check reads out of it, leniently. */
+export interface SpinOffProvenance {
+  sourceTaskId: string | null;
+  sourceRunId: string | null;
+  /** The finding text the task was filed against, when the server recorded one. */
+  finding: string | null;
+}
+
 /** The slice of a task the daemon inlines into an agent's prompt. */
 export interface TaskBrief {
   key: string;
@@ -18,6 +28,11 @@ export interface TaskBrief {
    * the daemon can say so rather than brief an agent as if the task were unplanned.
    */
   executionSpecUnreadable: boolean;
+  /**
+   * Spin-off provenance (RUN-188), when the server records this task as spun off from a run.
+   * Absent on every task that was not — and on any server that predates the field.
+   */
+  spinOff?: SpinOffProvenance;
 }
 
 /** Parse a wire spec at the boundary. Absent → no spec; present but unparseable → flagged, never
@@ -32,6 +47,23 @@ function readSpec(
   return parsed.success
     ? { executionSpec: parsed.data, executionSpecUnreadable: false }
     : { executionSpec: null, executionSpecUnreadable: true };
+}
+
+/** Provenance at the boundary (RUN-188): absent or malformed reads as NONE — the task itself
+ *  still resolves, because existence is the mechanical fact the daemon's check rests on and
+ *  provenance only sharpens it. Field-lenient on purpose: this arrives from a server on its own
+ *  release cadence, and a field this daemon does not recognise must not fail the lookup. */
+function readSpinOff(raw: unknown): { spinOff?: SpinOffProvenance } {
+  if (typeof raw !== 'object' || raw === null) return {};
+  const r = raw as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' && v.trim().length > 0 ? v : null);
+  return {
+    spinOff: {
+      sourceTaskId: str(r.sourceTaskId),
+      sourceRunId: str(r.sourceRunId),
+      finding: str(r.finding),
+    },
+  };
 }
 
 /**
@@ -350,7 +382,11 @@ export class NoriqClient {
    *  handing the agent an opaque id it has to go look up. */
   async getTask(taskId: string): Promise<TaskBrief | null> {
     const out = (await this.mcpCall('get_task', { taskId })) as {
-      task?: Partial<TaskBrief> & { executionSpec?: unknown; executionSpecUnreadable?: unknown };
+      task?: Partial<TaskBrief> & {
+        executionSpec?: unknown;
+        executionSpecUnreadable?: unknown;
+        spinOff?: unknown;
+      };
     } | null;
     const t = out?.task;
     if (!t?.key || !t?.title) return null;
@@ -364,6 +400,10 @@ export class NoriqClient {
       // newer contract than this daemon is exactly the case where silently reporting "no spec"
       // would let a planner overwrite a real one.
       ...readSpec(t.executionSpec, t.executionSpecUnreadable === true),
+      // Spin-off provenance (RUN-188) — the field the daemon's task-pointer check reads. Lenient
+      // where the spec read above is strict, because the stakes invert: a spec that misparses
+      // could be overwritten, while provenance only ever SHARPENS an existence check.
+      ...readSpinOff(t.spinOff),
     };
   }
 

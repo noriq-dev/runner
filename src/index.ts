@@ -90,13 +90,17 @@ export {
   reconciledEntry,
   renderContestRecord,
   renderLedger,
+  spinOffsHold,
+  spinOffsOf,
   subclaimLetter,
   subclaimsOf,
+  taskRefsIn,
   type AdjudicatedSubClaim,
   type Finding,
   type FindingResponse,
   type FindingStatus,
   type LedgerEntry,
+  type SpinOffCheck,
 } from './adjudication';
 export {
   DEFAULT_PARKED_PATH,

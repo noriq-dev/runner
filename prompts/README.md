@@ -123,6 +123,19 @@ prompt draws the line the parser cannot: instances of one root cause stay eviden
 claim, so the letters never become the instance-enumeration the collapse rule (RUN-89/90) bought
 out.
 
+A CONTESTED pointer may also name a TASK — `task:<key>`, "real, out of scope, tracked THERE"
+(RUN-188). Deliberately not a parse change: the pointer was always free text, so the vocabulary is
+taught in `reviewer-feedback.md` and `reviewer-contest.md` and read out by the daemon
+(`taskRefsIn`), which looks each named task up itself — the judging reviewer holds no Noriq
+credential (RUN-43) — and folds the result into the ledger as `→ daemon:` data lines beside the
+answer. The judgment split follows the credential line: existence and provenance are the daemon's
+mechanical facts; substance and the **evasion test** (a criterion the diff was commissioned to
+meet cannot be spun off; newly-found adjacent work can) are the reviewer's, and that rule lives
+solely in `reviewer.md` — the builder-facing templates carry only the pointer form, the RUN-89
+one-place discipline again. A task the daemon could not verify never credits a contest
+(may-miss-never-invent): it renders NOT verified, and at the terminal contest the finding stands
+without a fresh adjudicator being spawned.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

@@ -63,7 +63,89 @@ export interface FindingResponse {
   /** file:line / commit / test — a location a reviewer can open, not an argument. */
   pointer: string;
   reason: string;
+  /** The daemon's check of any `task:<ref>` the pointer names (RUN-188). Attached by the
+   *  SUPERVISOR after the parse and before the fold, never by the parser — a response cannot
+   *  assert its own verification. Absent on every response whose pointer names no task and
+   *  whenever no lookup is wired, both of which fold exactly as before. */
+  spinOffs?: SpinOffCheck[];
 }
+
+/**
+ * What the DAEMON established about one task a CONTESTED pointer names (RUN-188) — the mechanical
+ * half of adjudicating "real, out of scope, tracked THERE". The judging reviewer holds no Noriq
+ * credential and gets none for this (RUN-43), so the daemon looks the task up and this is the
+ * result, entered as ledger DATA; whether the task covers the finding's substance — and whether
+ * spinning it off was evasion — stays the reviewer's judgment, over facts instead of a prose
+ * promise.
+ */
+export interface SpinOffCheck {
+  /** The reference as the builder wrote it, `task:` stripped. */
+  ref: string;
+  /** The daemon SAW the task. False is every other outcome — no such task, a malformed answer, a
+   *  server it could not reach, a lookup it declined to run — because a check that did not
+   *  succeed must never CREDIT a contest (may-miss-never-invent): an unverified pointer is a
+   *  pointer at nothing. */
+  verified: boolean;
+  /** What the daemon saw, for the reviewer: title and provenance on a hit, the failure otherwise. */
+  detail: string;
+}
+
+/** A pointer naming more tasks than this has stopped tracking work and started dodging findings —
+ *  the volume concern the RUN-188 brief names. Deduped-then-capped like MAX_REQUIREMENTS. */
+const MAX_TASK_POINTERS = 3;
+/** Read-side caps for persisted facts (the ledger is a distilled record, like every other field). */
+const SPINOFF_REF_CAP = 64;
+const SPINOFF_DETAIL_CAP = 240;
+
+/** The task references a CONTESTED pointer names (RUN-188): `task:<ref>` tokens in the free-text
+ *  pointer. Deliberately NOT a parse-format change — the pointer was always free text and
+ *  `task:RUN-201` parsed byte-identically before this existed; this only reads the vocabulary the
+ *  templates teach, so a response written without it is untouched. */
+export const taskRefsIn = (pointer: string): string[] =>
+  [...new Set([...pointer.matchAll(/\btask:([A-Za-z][\w-]*)/gi)].map((m) => m[1]!))].slice(
+    0,
+    MAX_TASK_POINTERS,
+  );
+
+/** Whether an answer's task-pointer facts allow it to CREDIT a contest (RUN-188). Absent facts
+ *  change nothing — the pre-RUN-188 world, a daemon with no lookup wired, a pointer naming no
+ *  task — while facts present demand every named task verified. The direction is the order of
+ *  harms: refusing costs the builder a re-contest it can still make; crediting an unverified
+ *  pointer invents the evidence the check exists to demand. */
+export const spinOffsHold = (facts?: SpinOffCheck[]): boolean =>
+  !facts?.length || facts.every((f) => f.verified);
+
+/** A persisted fact this reader could not trust degrades to THIS — present and UNVERIFIED —
+ *  because a field's fallback can only make the claim harder to clear (the subclaimsOf grain):
+ *  degrading to absence would read as "no task was named" and let a contest clear around the
+ *  record it mangled. */
+const UNREADABLE_SPINOFF: SpinOffCheck = {
+  ref: '(unreadable)',
+  verified: false,
+  detail: 'a persisted task-pointer fact could not be read — treat the pointer as unverified',
+};
+
+/** The persisted-record reader for task-pointer facts (RUN-188), the reqsOf/subclaimsOf contract:
+ *  an ABSENT field is every record written before the field existed and reads as exactly that —
+ *  no facts, behavior unchanged — while a field that is present but unreadable (any shape a
+ *  writer here never produces) degrades toward UNVERIFIED, per item and for the list as a whole,
+ *  the direction that cannot credit a contest. */
+export const spinOffsOf = (x: { spinOffs?: unknown }): SpinOffCheck[] | undefined => {
+  const raw = x.spinOffs;
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_TASK_POINTERS)
+    return [UNREADABLE_SPINOFF];
+  return raw.map((f) => {
+    if (typeof f !== 'object' || f === null) return UNREADABLE_SPINOFF;
+    const r = f as Record<string, unknown>;
+    if (typeof r.ref !== 'string' || typeof r.detail !== 'string') return UNREADABLE_SPINOFF;
+    return {
+      ref: cap(r.ref, SPINOFF_REF_CAP),
+      verified: r.verified === true,
+      detail: cap(r.detail, SPINOFF_DETAIL_CAP),
+    };
+  });
+};
 
 /** A sub-claim as the ledger carries it: the claim plus the builder's answer TO THAT CLAIM, so a
  *  half-rebutted finding reads as half-rebutted instead of as answered-as-a-whole (RUN-180).
@@ -80,6 +162,11 @@ export interface AdjudicatedSubClaim {
   status: FindingStatus | 'unanswered';
   pointer: string | null;
   reason: string | null;
+  /** The daemon's check of any task THIS claim's answer points at (RUN-188) — data for the
+   *  credential-less reviewer. Travels with the pointer it qualifies: a fresh answer replaces it
+   *  along with the pointer, and it is absent on every record written before the field existed,
+   *  which reads and clears exactly as it always did. */
+  spinOffs?: SpinOffCheck[];
 }
 
 /** One accumulated entry handed to the next reviewer: the finding + the builder's adjudication. */
@@ -104,6 +191,10 @@ export interface LedgerEntry {
   status: FindingStatus | 'unanswered';
   pointer: string | null;
   reason: string | null;
+  /** The daemon's check of any task the WHOLE-FINDING answer points at (RUN-188) — the
+   *  AdjudicatedSubClaim.spinOffs contract at entry grain. Absent on every entry written before
+   *  the field existed. */
+  spinOffs?: SpinOffCheck[];
   /** The enumerated sub-claims with their own answers (RUN-180). Empty on every entry whose
    *  finding enumerated none — the pre-RUN-180 world, which folds, matches, and renders exactly
    *  as it always did. */
@@ -389,12 +480,17 @@ export const subclaimsOf = (e: { subclaims?: unknown }): AdjudicatedSubClaim[] =
     if (typeof s !== 'object' || s === null || typeof (s as { claim?: unknown }).claim !== 'string')
       return [];
     const r = s as Record<string, unknown> & { claim: string };
+    // Task-pointer facts read through their own field-grain reader (RUN-188): absent stays
+    // absent (the pre-RUN-188 record, unchanged), unreadable degrades toward UNVERIFIED — the
+    // one direction that cannot credit a contest.
+    const spinOffs = spinOffsOf(r as { spinOffs?: unknown });
     out.push({
       claim: r.claim,
       ...(typeof r.key === 'string' && r.key.length > 0 ? { key: r.key } : {}),
       status: r.status === 'fixed' || r.status === 'contested' ? r.status : 'unanswered',
       pointer: typeof r.pointer === 'string' ? r.pointer : null,
       reason: typeof r.reason === 'string' ? r.reason : null,
+      ...(spinOffs !== undefined ? { spinOffs } : {}),
     });
   }
   return out;
@@ -635,6 +731,23 @@ function matchIndex(entries: LedgerEntry[], f: Finding): number {
   );
 }
 
+/** Land one answer on a held sub-claim record: the claim and its identity stay, the adjudication
+ *  moves — and the task-pointer facts move WITH the answer (RUN-188): a daemon check qualifies
+ *  the pointer it ran against, so an answer that brings none STRIPS the stale ones rather than
+ *  inheriting a verification nobody ran on the new pointer. */
+const landAnswer = (h: AdjudicatedSubClaim, rs: FindingResponse | undefined): AdjudicatedSubClaim => {
+  if (!rs) return h;
+  const next: AdjudicatedSubClaim = {
+    claim: h.claim,
+    ...(h.key !== undefined ? { key: h.key } : {}),
+    status: rs.status,
+    pointer: rs.pointer,
+    reason: rs.reason,
+  };
+  if (rs.spinOffs?.length) next.spinOffs = rs.spinOffs;
+  return next;
+};
+
 /**
  * Fold one round's findings (⋈ the builder's responses to them) into the running ledger. A
  * finding matching a prior entry REPLACES it — the latest adjudication wins and the entry does
@@ -691,9 +804,8 @@ export function buildLedger(
   const mergedSubclaims = (f: Finding, heldSubs: AdjudicatedSubClaim[]): AdjudicatedSubClaim[] => {
     const responseAt = (i: number) => bySub.get(`${f.id}${subclaimLetter(i)}`);
     // A held record answered this turn keeps its claim AND its identity field — only the
-    // adjudication moves.
-    const answered = (h: AdjudicatedSubClaim, rs: FindingResponse | undefined): AdjudicatedSubClaim =>
-      rs ? { ...h, status: rs.status, pointer: rs.pointer, reason: rs.reason } : h;
+    // adjudication (with its task-pointer facts, RUN-188) moves.
+    const answered = landAnswer;
     // A claim recorded from this report's RAW line: the ledger stores the legacy-capped display,
     // with the full identity in its own field when the cap cuts (storedKey) — never folded into
     // the display, never hashed (the terminal settlement).
@@ -710,6 +822,11 @@ export function buildLedger(
       };
       const key = storedKey(raw);
       if (key !== undefined) s.key = key;
+      // Facts follow the answer's source (RUN-188): this turn's response brings its own (or
+      // none), and a claim answered only by carry keeps the carried check beside the carried
+      // pointer.
+      const spinOffs = rs ? rs.spinOffs : held?.spinOffs;
+      if (spinOffs?.length) s.spinOffs = spinOffs;
       return s;
     };
     // Held claims stay answerable at the positions this report's own lines do not shadow — the
@@ -740,8 +857,7 @@ export function buildLedger(
     });
     return creditedHeld.map((h) => {
       const k = identityOf(h.claim, h.key);
-      const rs = k !== null ? landed.get(k) : undefined;
-      return rs ? { ...h, status: rs.status, pointer: rs.pointer, reason: rs.reason } : h;
+      return landAnswer(h, k !== null ? landed.get(k) : undefined);
     });
   };
   // Held sub-claim state transfers only across a match that cannot be an INVENTION (RUN-180).
@@ -792,6 +908,11 @@ export function buildLedger(
       reason: r?.reason ?? held?.reason ?? null,
       subclaims,
     };
+    // Facts travel with the answer they qualify (RUN-188), exactly as the pointer does: a
+    // response this round brings its own or strips the stale ones (landAnswer's rule at entry
+    // grain), and a re-raise with no response keeps the held check beside the held pointer.
+    const spinOffs = r ? r.spinOffs : held ? spinOffsOf(held) : undefined;
+    if (spinOffs?.length) entry.spinOffs = spinOffs;
     // The identity travels with the claim it identifies: a re-raise replaces both together, and a
     // claim the cap left whole carries none (the display is the identity — see identityOf).
     if (f.claimKey !== undefined) entry.claimKey = f.claimKey;
@@ -910,6 +1031,16 @@ export function renderRequirementOutcomes(report: RequirementReport): string {
   return `**Requirements** — what the review found, per requirement:\n\n${lines.join('\n')}${stray}`;
 }
 
+/** The daemon's task-pointer checks, as render lines beside the answer they qualify (RUN-188).
+ *  Read through spinOffsOf, so a persisted record degrades here exactly as it does everywhere
+ *  else; an answer with no facts renders nothing, keeping every pre-RUN-188 surface
+ *  byte-identical. The framing — treat NOT-verified as pointing at nothing, judge a verified
+ *  task's substance — lives in prompts/reviewer.md; this is only the data. */
+const renderSpinOffs = (x: { spinOffs?: unknown }, indent: string): string[] =>
+  (spinOffsOf(x) ?? []).map(
+    (t) => `${indent}→ daemon: task:${t.ref} ${t.verified ? 'verified' : 'NOT verified'} — ${t.detail}`,
+  );
+
 /** Render the ledger as the entry lines for the reviewer's PRIOR ADJUDICATIONS section. The
  *  framing (verify-don't-trust) lives in prompts/reviewer.md — this is only the data. */
 export function renderLedger(entries: LedgerEntry[]): string {
@@ -928,7 +1059,7 @@ export function renderLedger(entries: LedgerEntry[]): string {
       // is named rather than absorbed into its siblings' answer. A whole-finding response is shown
       // too when one was recorded — it is evidence — but it speaks for no lettered claim.
       const subs = subclaimsOf(e);
-      if (!subs.length) return `${head}\n${answer}`;
+      if (!subs.length) return [head, answer, ...renderSpinOffs(e, '      ')].join('\n');
       // Letters are derived from position here, never read from the entry (the settlement): the
       // fold resolves a response letter through exactly this derivation, so what a reader answers
       // by is what the record credits.
@@ -939,13 +1070,17 @@ export function renderLedger(entries: LedgerEntry[]): string {
           s.status === 'unanswered'
             ? 'no response recorded — this sub-claim STANDS; judge it fresh'
             : `${s.status.toUpperCase()}${sPtr}${sWhy}`;
-        return `      (${subclaimLetter(i)}) ${s.claim}\n          → builder: ${sAnswer}`;
+        return [
+          `      (${subclaimLetter(i)}) ${s.claim}`,
+          `          → builder: ${sAnswer}`,
+          ...renderSpinOffs(s, '          '),
+        ].join('\n');
       });
       const whole =
         e.status === 'unanswered'
           ? []
           : [`      → builder, on the finding as a whole (credits no sub-claim): ${status}${ptr}${why}`];
-      return [head, ...whole, ...subLines].join('\n');
+      return [head, ...whole, ...renderSpinOffs(e, '      '), ...subLines].join('\n');
     })
     .join('\n');
 }
@@ -995,18 +1130,25 @@ export function applyContestResponses(
     const e = reconciledEntry(out, f, round);
     if (!e) continue;
     const r = byId.get(f.id);
-    const subclaims = subclaimsOf(e).map((s, i) => {
-      const rs = bySub.get(`${f.id}${subclaimLetter(i)}`);
-      // The spread keeps the claim and its identity field — a contest adds answers, never claims.
-      return rs ? { ...s, status: rs.status, pointer: rs.pointer, reason: rs.reason } : s;
-    });
-    out[out.indexOf(e)] = {
+    const subclaims = subclaimsOf(e).map((s, i) =>
+      // landAnswer keeps the claim and its identity field — a contest adds answers, never claims —
+      // and moves the task-pointer facts with the answer (RUN-188).
+      landAnswer(s, bySub.get(`${f.id}${subclaimLetter(i)}`)),
+    );
+    const next: LedgerEntry = {
       ...e,
       status: r?.status ?? e.status,
       pointer: r?.pointer ?? e.pointer,
       reason: r?.reason ?? e.reason,
       subclaims,
     };
+    // The entry-grain half of landAnswer's facts rule (RUN-188): a whole-finding contest this
+    // turn replaces the facts with its own — even with none, because a daemon check qualifies
+    // the pointer it ran against — while an entry the turn did not answer keeps what it held.
+    const spinOffs = r ? r.spinOffs : spinOffsOf(e);
+    if (spinOffs?.length) next.spinOffs = spinOffs;
+    else if (r) delete next.spinOffs;
+    out[out.indexOf(e)] = next;
   }
   return out;
 }
@@ -1034,7 +1176,15 @@ export function renderContestRecord(
     const lines = subs.map((s, i) => {
       const ptr = s.pointer ? ` (${s.pointer})` : '';
       const answer = s.status === 'unanswered' ? 'no answer recorded' : `${s.status.toUpperCase()}${ptr}`;
-      return `  (${subclaimLetter(i)}) ${s.claim} — ${answer}`;
+      // A carried contest standing on a task pointer the daemon could not verify does NOT read as
+      // "already a contest" (RUN-188): the record must say so here, or the candidacy gate would
+      // fail the exact builder the prompt told to skip already-contested claims — the second-gate
+      // trap this render exists to avoid, at the one field where a carried answer can be void.
+      const stale =
+        s.status === 'contested' && !spinOffsHold(s.spinOffs)
+          ? ' [its task pointer did NOT verify — this contest clears nothing; contest this letter again with a pointer that checks out]'
+          : '';
+      return `  (${subclaimLetter(i)}) ${s.claim} — ${answer}${stale}`;
     });
     return [`FINDING ${f.id}:\n${lines.join('\n')}`];
   });
