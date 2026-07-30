@@ -564,6 +564,13 @@ describe('Noriq MCP wiring', () => {
     expect(verify).toContain('mcp__noriq__post_comment');
     expect(verify).not.toContain('mcp__noriq__claim_task');
     expect(verify).not.toContain('mcp__noriq__update_task');
+    // Build and verify may SPIN OFF work they found but may not do (RUN-188) — the product is a
+    // PROPOSED task a human gates, so this is not create_task by another name. Scope's product
+    // IS a proposed plan, so it has no use for the tool.
+    expect(build).toContain('mcp__noriq__spin_off_task');
+    expect(verify).toContain('mcp__noriq__spin_off_task');
+    expect(scope).not.toContain('mcp__noriq__spin_off_task');
+    expect(build).not.toContain('mcp__noriq__create_task');
   });
 
   it('lets EVERY kind reach a human (RUN-32)', () => {

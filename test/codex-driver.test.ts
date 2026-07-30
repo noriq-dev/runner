@@ -566,6 +566,11 @@ describe('the per-kind Noriq tool floor reaches codex (RUN-46)', () => {
     // But it CAN reach a human (RUN-32) — rationing that pushes agents toward guessing.
     expect(tools).toContain('raise_alert');
     expect(tools).toContain('request_input');
+    // And it CAN spin off work the diff surfaces that is not this task's (RUN-188) — inert
+    // until a human accepts it, so the grant still cannot MOVE the work being judged. Not
+    // create_task by another name: that one stays absent.
+    expect(tools).toContain('spin_off_task');
+    expect(tools).not.toContain('create_task');
   });
 
   it('no MCP config → no enabled_tools either (nothing to filter)', () => {

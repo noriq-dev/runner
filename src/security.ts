@@ -123,7 +123,10 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
   // five edges to cut because this floor said no. Safe because the RUN-23 gate still holds:
   // plans arrive PROPOSED and a human approves them after the tidying. Still excluded, on
   // purpose: create_task/decompose_task (mint claimable work outside the proposed-plan gate)
-  // and claim/release (scope plans, never executes).
+  // and claim/release (scope plans, never executes). spin_off_task (RUN-188, granted to
+  // build/verify below) also stays out of scope's floor — not for the gate's reason, but
+  // because scope's product IS a proposed plan: work a scope run surfaces belongs in the plan
+  // it is already minting, not filed beside it.
   scope: [
     'set_agent_identity',
     'get_briefing',
@@ -175,6 +178,23 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     // would block cooperating peers for the run's life. That is unavoidable while daemon and agent
     // share one identity, and it is bounded by run-settle and TTL rather than indefinite.
     'acquire_lock',
+    // Spinning work off instead of absorbing or arguing it (RUN-188). When a run surfaces work
+    // that is real but not THIS task's — a hardening gap, a missing seam, a follow-up — its only
+    // moves were absorb it (scope creep), contest it (prose), or eat the FAIL. RUN-186's landing
+    // run took the honest path — contested with evidence, raised an evidence-backed alert with a
+    // full design sketch — and still failed, because an alert records a concern and creates no
+    // work a gate can point at; a human had to fold it into a task BY HAND. This tool is that
+    // manual step made first-class, and it does NOT reopen the hole the exclusion above guards:
+    // its product is a PROPOSED task — on the board, carrying provenance (source task, source
+    // run, the finding) — but not claimable and not pumpable until a human accepts it, the same
+    // RUN-23 gate that keeps create_task off every floor. Distinct from raise_alert on purpose:
+    // an alert is a concern that is NOT work; a spin-off is work that is not mine.
+    //
+    // What the grant still hands a hostile or lazy agent: volume — ten spin-offs to dodge ten
+    // findings. Each is inert until a human touches it, and a spin-off offered against a finding
+    // clears nothing by itself: the reviewer adjudicates every such pointer, and a criterion the
+    // diff owed cannot be spun off.
+    'spin_off_task',
   ],
   verify: [
     'set_agent_identity',
@@ -183,6 +203,11 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     'get_plans',
     'post_comment',
     'read_open_comments',
+    // Same grant, same gate as build's (RUN-188): the verifier is the actor most likely to
+    // SURFACE work that is real but out of this diff's scope, and raise_alert (concern-not-work)
+    // was its only channel. The product stays a PROPOSED task a human gates, so the grant does
+    // not let the reviewer MOVE the work it is judging — the line this floor exists to hold.
+    'spin_off_task',
   ],
 };
 
