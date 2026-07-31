@@ -69,6 +69,7 @@ import { type StageName, stagesFor, stopBefore } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
+  type ExecuteOutcome,
   type PatternMapHost,
   type PlanCheckHost,
   type PlanHost,
@@ -2847,10 +2848,13 @@ export class RunSupervisor {
           wave: this.waveFor(repo, run),
         })
       : await executeRun(this.executeHost(), resumeBase);
-    // The parked step is gone from the recomputed plan (RUN-168). Reported the way every other
-    // unresumable park is: the workspace is KEPT, because it holds work that exists nowhere else.
-    if ('chainFailed' in executed) return fail(executed.chainFailed);
-    if (executed.parked) return executed.parked;
+    // The parked step is gone from the recomputed plan (RUN-168), or a cancel landed before the
+    // resumed session spawned (RUN-165). Both still SETTLE: the park's workspace holds the earlier
+    // sittings' work, and settle's own probe is what keeps it — plus the terminal report, the lock
+    // release, the refreshed continuation record and the cancellation cleanup that a bare `fail()`
+    // here skipped. The inert outcome walks the same pipeline, which on a failed exit is `settle`.
+    const outcome = 'chainFailed' in executed ? sessionlessChainExit(run, executed.chainFailed) : executed;
+    if (outcome.parked) return outcome.parked;
 
     return this.afterDriver({
       run,
@@ -2861,14 +2865,14 @@ export class RunSupervisor {
       noriqMcp,
       task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
       runAgent,
-      session: executed.session,
-      stopSession: executed.stopSession,
+      session: outcome.session,
+      stopSession: outcome.stopSession,
       executedSpec: resumedSpec,
-      exit: executed.exit,
+      exit: outcome.exit,
       tally,
-      verifyText: executed.sessionText,
-      getSessionText: executed.getSessionText,
-      tail: executed.tail,
+      verifyText: outcome.sessionText,
+      getSessionText: outcome.getSessionText,
+      tail: outcome.tail,
     });
   }
 
@@ -2971,9 +2975,14 @@ export class RunSupervisor {
           wave: this.waveFor(prepared.repo, run),
         })
       : await executeRun(this.executeHost(), base);
-    // A chain that could not start at all (RUN-168) — no session, so nothing to settle around.
-    if ('chainFailed' in executed) return fail(executed.chainFailed);
-    if (executed.parked) return executed.parked;
+    // A chain that never started a session (RUN-168) is still a run that PREPARED: the workspace
+    // is leased, the locks are held, the transcript is open, a cancel has written the record only
+    // `settle` forgets (RUN-165) — so "no session" is not "nothing to settle around". Shaped as an
+    // inert outcome it enters the same post-driver walk as every other exit, which reduces to
+    // `settle` on a failed exit; `fail()`-ing here instead bypassed the terminal report, the lock
+    // release and the workspace's keep-or-dispose decision.
+    const outcome = 'chainFailed' in executed ? sessionlessChainExit(run, executed.chainFailed) : executed;
+    if (outcome.parked) return outcome.parked;
 
     return this.afterDriver({
       run,
@@ -2984,13 +2993,13 @@ export class RunSupervisor {
       ...(prepared.noriqMcp ? { noriqMcp: prepared.noriqMcp } : {}),
       task: prepared.task,
       runAgent: prepared.runAgent,
-      session: executed.session,
-      stopSession: executed.stopSession,
-      exit: executed.exit,
+      session: outcome.session,
+      stopSession: outcome.stopSession,
+      exit: outcome.exit,
       tally: prepared.tally,
-      verifyText: executed.sessionText,
-      getSessionText: executed.getSessionText,
-      tail: executed.tail,
+      verifyText: outcome.sessionText,
+      getSessionText: outcome.getSessionText,
+      tail: outcome.tail,
       continued: prepared.continued,
       executedSpec,
     });
@@ -3525,6 +3534,39 @@ const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
   integrate: integrateStage,
   settle: settleStage,
 };
+
+/**
+ * A chain failure with no session behind it, shaped to enter the post-driver walk (RUN-170).
+ *
+ * `executeChain` can fail before ANY session exists — a cancel that lands ahead of the first spawn
+ * (RUN-165), a wave whose every member failed to lease, a parked step gone from its recomputed
+ * plan (RUN-168). Returning those through `fail()` skipped `settle`, and settle is not optional
+ * there: prepare has already leased the workspace, taken the locks and opened the transcript, a
+ * cancel has written the record only settle forgets, and a failed wave can have landed children's
+ * work onto the parent's branch — work the dispose decision must see, or it is force-deleted work
+ * that exists nowhere else. The inert session is never exercised: every stage that would touch it
+ * gates on `driverSucceeded` / `exit.outcome === 'done'`, which this exit fails by construction,
+ * so the walk reduces to the one stage that runs no matter how the run got here.
+ */
+function sessionlessChainExit(run: Run, reason: string): ExecuteOutcome {
+  const exit: DriverExit = { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
+  return {
+    exit,
+    session: {
+      runId: run.id,
+      // There is no live input to deliver into; `false` is the contract's honest "turn NOT
+      // delivered" (drivers/types.ts), which is what keeps steering's fallback path working.
+      pushInput: () => false,
+      interrupt: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      done: () => Promise.resolve(exit),
+    },
+    stopSession: () => Promise.resolve(),
+    sessionText: '',
+    getSessionText: () => '',
+    tail: '',
+  };
+}
 
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {

@@ -461,8 +461,13 @@ function harness(
     hangRelease?: boolean;
     /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
     lockScope?: string[] | null;
-    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
+    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. The array
+     *  is read LIVE, so a test can push into it mid-run to model a cancel landing in a gap. */
     cancelled?: string[];
+    /** Observe each report as it happens — how a test lands a cancel at an exact point in the
+     *  pipeline rather than before it starts (RUN-170's settle test needs the gap between the
+     *  stage-boundary checks and the chain's first spawn). */
+    onReport?: (runId: string, r: RunReport) => void;
     /** The anchor task the server hands back — how a test gives a run an execution spec, and so
      *  the acceptance criteria its gate must answer (RUN-145). */
     anchorTask?: AnchorTask | null;
@@ -508,6 +513,8 @@ function harness(
   if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
   const claimChecks: string[] = [];
+  /** Cancellation records settle cleaned up (RUN-165) — the steering `forget` calls. */
+  const forgets: string[] = [];
   const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
   // Mutable, because the real thing is: once a human answers, the server marks the signal
   // answered and moves the run back to running, so the NEXT check says "not blocked".
@@ -527,6 +534,7 @@ function harness(
       reports.push({ runId, ...r });
       // Only the TERMINAL report carries `exit` — and only that one retires the run agent.
       if (r.exit) worktrees.timeline.push('report');
+      over.onReport?.(runId, r);
     },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
@@ -602,7 +610,9 @@ function harness(
             register: () => {},
             unregister: () => {},
             isCancelled: (runId: string) => (over.cancelled ?? []).includes(runId),
-            forget: () => {},
+            forget: (runId: string) => {
+              forgets.push(runId);
+            },
           },
         }
       : {}),
@@ -620,6 +630,7 @@ function harness(
     parkChecks,
     claimChecks,
     agentCreates,
+    forgets,
     /** Model the run asking a question on its NEXT session end — a park mid-chain. */
     parkNext: () => {
       park.state = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
@@ -5200,6 +5211,45 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/its plan no longer declares/);
   });
 
+  // RUN-170's settle rule holds on the resume path too: parked-step-gone is a chain failure with
+  // no session behind it, and returning it through `fail()` skipped settle — no lock release, a
+  // bare terminal report, and no continuation refresh for the very workspace the failure promises
+  // to keep.
+  it('parked-step-gone still settles: locks release and the kept workspace stays continuable', async () => {
+    const parkedWith: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: parkedWith });
+    h.setAnchorTask({
+      ...parkedWith,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 'x1', title: 'rethought' },
+          { id: 'x2', title: 'also rethought' },
+        ],
+      }),
+    });
+    h.answerIt();
+    const exit = await h.supervisor.resume('run_1', 'Use B.');
+
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:parked-step-gone' });
+    const terminal = h.reports.filter((r) => r.exit).at(-1);
+    expect(terminal?.agentId).toBeDefined(); // settle's terminal report, not the bare fail() shape
+    expect(h.worktrees.releasedAll.length).toBeGreaterThan(0); // locks released on terminal
+    expect(h.worktrees.removed).toHaveLength(0); // the workspace kept, as the failure promises
+    // The continuation record is refreshed (RUN-92), so the kept work is re-dispatchable rather
+    // than an orphan a human has to rediscover by hand.
+    expect(h.continuable.puts.at(-1)).toMatchObject({ runId: 'run_1' });
+  });
+
   // RUN-145. A resume reaches afterDriver by its OWN path, so it was passing no spec at all: the
   // resumed run's reviewer got an empty checklist while a first-sitting run's got the criteria.
   // Parking, answering a question and carrying on silently disabled the gate's definition of done —
@@ -6098,4 +6148,45 @@ describe('a cancelled run does not go on to build (RUN-165)', () => {
 
   // The control is the rest of this file: every other test here wires no cancellation and reaches
   // its agent, so a guard that stopped everything could not have got this far.
+
+  // RUN-170. The boundary checks see the gaps BETWEEN stages; a chain is many sessions with gaps
+  // INSIDE one stage, and a cancel landing there — after the execute boundary passed, before the
+  // chain's first spawn — is a failure with no session behind it. That used to return through
+  // `fail()`, skipping settle: no lock release, a bare terminal report, a cancellation record kept
+  // for the daemon's life, and a workspace whose fate nothing decided.
+  it('a chain cancelled before its first session still settles', async () => {
+    const cancelled: string[] = [];
+    const h = harness({
+      cancelled,
+      anchorTask: {
+        key: 'ACME-1',
+        title: 'two steps',
+        body: null,
+        executionSpec: ExecutionSpec.parse({
+          steps: [
+            { id: 's1', title: 'first' },
+            { id: 's2', title: 'second' },
+          ],
+        }),
+      },
+      // The cancel lands when the run reports what it was briefed with (RUN-166) — after the
+      // stage-boundary checks have been asked, before the chain spawns anything.
+      onReport: (runId, r) => {
+        if (r.executedSpec) cancelled.push(runId);
+      },
+    });
+    const exit = await h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'cancelled' });
+    expect(h.claude.starts).toHaveLength(0); // the cancel held: no session ever spawned
+    // Settle still ran — the one stage that runs no matter how the run got here (RUN-165):
+    const terminal = h.reports.find((r) => r.exit);
+    expect(terminal?.agentId).toBeDefined(); // settle's terminal report, not the bare fail() shape
+    expect(h.worktrees.releasedAll).toHaveLength(1); // the locks released on terminal (RUN-104)
+    expect(h.worktrees.removed).toHaveLength(0); // the workspace kept — never force-deleted
+    expect(h.forgets).toEqual(['run_1']); // the cancellation record cleaned up
+    expect(h.transcript.at(-1)!.text).toContain('cancelled'); // the transcript closed on the terminal
+  });
 });
