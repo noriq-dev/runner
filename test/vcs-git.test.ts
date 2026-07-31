@@ -53,6 +53,11 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(new GitBackend(ops).kind).toBe('git');
   });
 
+  it('declares leasesOverlap — git isolates in space, so a wave may hold a lease per step (RUN-170)', () => {
+    const { ops } = recorder();
+    expect(new GitBackend(ops).leasesOverlap).toBe(true);
+  });
+
   it('lease wraps WorktreeInfo into a Workspace: localPath is the path, location hides the rest', async () => {
     const { ops, calls } = recorder();
     const ws = await new GitBackend(ops).lease('/repo', 'run_1', { readOnly: true });
@@ -104,6 +109,10 @@ describe('GitBackend — the outcome→verb mapping', () => {
     expect(await vcs.resumeIntegrate(ws)).toEqual({ ok: true });
     await vcs.abandonIntegrate(ws);
     expect(await vcs.publish(ws, 'noriq/integration')).toEqual({ ok: true, sha: 'sha1' });
+    // The run-addressed pair (RUN-170): same outcomes, the other side named by run id — the
+    // run-id→branch convention stays in here, symmetric with lease({fromRunId}).
+    expect(await vcs.integrateFromRun(ws, 'run_parent')).toEqual({ ok: false, conflicts: ['a.ts'] });
+    expect(await vcs.publishToRun(ws, 'run_parent')).toEqual({ ok: true, sha: 'sha1' });
     expect(await vcs.share('/repo', 'noriq/integration')).toEqual({ ok: false, detail: 'offline' });
     expect(await vcs.reapOrphans('/repo')).toBe(2);
 
@@ -119,6 +128,10 @@ describe('GitBackend — the outcome→verb mapping', () => {
       // publish takes the WORKSPACE; the branch it publishes from comes out of location,
       // never from a caller-supplied ref (RUN-50).
       { method: 'landFastForward', args: ['/repo', 'noriq/integration', 'noriq/run/run_1'] },
+      // integrateFromRun/publishToRun resolve the run id to ITS branch; the publishing branch
+      // still comes out of location, never from a caller-supplied ref (RUN-50, RUN-170).
+      { method: 'rebaseOnto', args: [{ path: '/wt/run_1' }, 'noriq/run/run_parent'] },
+      { method: 'landFastForward', args: ['/repo', 'noriq/run/run_parent', 'noriq/run/run_1'] },
       { method: 'pushBranch', args: ['/repo', 'noriq/integration'] },
       { method: 'reapOrphans', args: ['/repo', undefined] },
     ]);
@@ -128,6 +141,27 @@ describe('GitBackend — the outcome→verb mapping', () => {
     const { ops, calls } = recorder();
     await new GitBackend(ops).share('/repo', 'b', 'upstream');
     expect(calls[0]).toEqual({ method: 'pushBranch', args: ['/repo', 'b', 'upstream'] });
+  });
+
+  it('openReview delegates to gh via merge-request.ts — args through, result verbatim (RUN-85)', async () => {
+    // The one verb that maps outside GitOps: onward review is `gh pr create` (RUN-28), so the
+    // exec is injected the same way GitOps is and merge-request.test.ts keeps owning gh's
+    // behaviour (already-exists, hand-runnable command). This pins only the delegation.
+    const gh: Array<{ args: string[]; cwd: string }> = [];
+    const { ops } = recorder();
+    const vcs = new GitBackend(ops, undefined, async (args, cwd) => {
+      gh.push({ args, cwd });
+      return { stdout: 'https://github.com/noriq-dev/runner/pull/7\n' };
+    });
+    const res = await vcs.openReview('/repo', {
+      head: 'noriq/plan-alpha',
+      base: 'main',
+      planTitle: 'Runner v2',
+      planKey: 'alpha',
+    });
+    expect(res).toEqual({ ok: true, url: 'https://github.com/noriq-dev/runner/pull/7' });
+    expect(gh[0]?.cwd).toBe('/repo');
+    expect(gh[0]?.args.slice(0, 6)).toEqual(['pr', 'create', '--base', 'main', '--head', 'noriq/plan-alpha']);
   });
 
   it('refuses a workspace whose location it did not mint — by name, not with a git error', async () => {
@@ -146,6 +180,7 @@ describe('GitBackend — the outcome→verb mapping', () => {
       location: { client: 'ws9', change: 42 }, // a Perforce-shaped location
     };
     await expect(vcs.publish(alien, 'main')).rejects.toThrow(/does not carry a git location/);
+    await expect(vcs.publishToRun(alien, 'run_1')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
   });
 });

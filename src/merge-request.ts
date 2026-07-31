@@ -24,9 +24,11 @@ const exec = promisify(execFile);
  *
  * The API needs a token — the thing we are declining to introduce. `gh` already holds the
  * operator's auth in their keyring, handles enterprise hosts and SSO, and if it is missing we can
- * hand a human the exact command instead of failing. A forge that is not GitHub gets the same
- * treatment via RUN-44's abstraction; hardcoding an API client now would be the thing that has to
- * be undone then.
+ * hand a human the exact command instead of failing. Since RUN-85 this file is GIT'S
+ * implementation detail behind `VcsBackend.openReview` (vcs/types.ts) — the daemon routes by
+ * detected backend and never imports this directly. A git forge that is not GitHub (RUN-44)
+ * would swap inside this file; hardcoding an API client now would be the thing that has to be
+ * undone then.
  */
 
 export interface MergeRequestResult {

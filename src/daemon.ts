@@ -1,5 +1,13 @@
-import type { AgentTool, ExecutionSpec, Run, RunKind, RunModelUsage, RunnerConfig } from '@noriq-dev/shared';
-import { NoriqClient } from './client';
+import type {
+  AgentTool,
+  ExecutionSpec,
+  ProjectManifest,
+  Run,
+  RunKind,
+  RunModelUsage,
+  RunnerConfig,
+} from '@noriq-dev/shared';
+import { NoriqClient, type OwedMerge } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
 import { discoverRepos } from './discovery';
 import { totalTokens } from './drivers/budget';
@@ -9,12 +17,12 @@ import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
-import { openMergeRequest } from './merge-request';
 import { ParkedStore } from './parked';
 import { buildRegistration } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
+import { owningRunId } from './steps';
 import { type RunReport, RunSupervisor, type RunSupervisorDeps } from './supervisor';
 import { detectTools } from './tools';
 import { checkForUpdate, updateAdvice } from './update';
@@ -188,7 +196,15 @@ export function orphanSweep(deps: {
       log.warn('skipping the orphan sweep — could not read what is being held', { err: String(err) });
       return { reaped: 0, kept: [] };
     }
-    const isOwned = (runId: string) => deps.isActive(runId) || held.has(runId);
+    // A wave child's workspace rides its parent run's identity (RUN-170): its id embeds the
+    // parent's, and it is exactly as owned as that run is — live mid-wave, or held by a park or
+    // continuation. Without the fold the periodic sweep reads a live child as a leak and deletes
+    // the checkout its step is working in.
+    const isOwned = (runId: string) => {
+      if (deps.isActive(runId) || held.has(runId)) return true;
+      const owner = owningRunId(runId);
+      return owner !== runId && (deps.isActive(owner) || held.has(owner));
+    };
     for (const r of deps.repos) {
       reaped += await deps
         .vcsFor(r.root)
@@ -216,6 +232,206 @@ export function orphanSweep(deps: {
       });
     }
     return { reaped, kept };
+  };
+}
+
+/**
+ * The daemon's session-capacity ledger (RUN-170), extracted for the same reason its neighbours
+ * are: this wiring is where whole layers have shipped silently dead, and a capacity computation
+ * that quietly over-grants fails just as quietly — as four sessions on a three-slot machine.
+ *
+ * `waveLimit` is a RESERVATION, not a sample. The pure subtraction it replaces had a window: two
+ * chains could each ask "what is spare?" before either had spawned a child, each see only the
+ * other's single seat, and together start more sessions than the machine allows. The grant closes
+ * it — the answer is RECORDED synchronously inside the ask, so the second chain's ask (the
+ * process is single-threaded; asks serialize on the event loop) sees the first's claim, whatever
+ * either has actually spawned yet. A run's claim on capacity is the busiest of three honest
+ * measures: its most recent grant (what it may be about to spawn), its live sessions (what it
+ * actually runs — a wave is several processes where the run count reads one), and the one seat
+ * any active run holds. Grants are replaced on each ask (the chain re-asks per wave) and released
+ * when the run settles; a stale grant between a run's last wave and its end over-reserves, which
+ * is the conservative direction — a slower schedule, never a broken bound. What remains out of
+ * scope, per RUN-170's own deferral: fairness/reservation ACROSS daemons — this ledger is one
+ * process's, which is also where the lease pool and the active set live.
+ *
+ * `admit` is the ADMISSION half of the same bound. The advertisement narrows the window a
+ * dispatch can race into (a grant pushes the shrunken freeSlots at once), but a frame already in
+ * the air cannot be recalled — so an assignment that lands on a saturated machine WAITS for a
+ * seat instead of becoming an extra session. The daemon still never REFUSES an assignment; it
+ * holds it, the same boundary a saturated wave already accepts for its own steps. A queued run
+ * claims no seat (counting it would deadlock two waiters against each other), and waiters are
+ * re-checked in arrival order whenever a claim moves — a grant replaced or released — and on
+ * every freeSlots read, which the heartbeat performs each beat, so a seat freed by a finished
+ * session is noticed within one beat even when no ledger state moved.
+ */
+export function waveCapacity(deps: {
+  concurrency: number;
+  /** Runs supervising right now — live, not a snapshot (Daemon.active). */
+  active: () => Iterable<string>;
+  /** Live sessions of ONE run (SteeringBridge.liveSessionsOf). */
+  sessionsOf: (runId: string) => number;
+  /** Live sessions machine-wide, minus one run's own (SteeringBridge.liveSessionCount) — the
+   *  backstop for a session whose run has already left the active set mid-teardown. */
+  liveSessions: (excludeRunId?: string) => number;
+}): {
+  waveLimit: (runId: string) => number;
+  freeSlots: () => number;
+  release: (runId: string) => void;
+  admit: (runId: string) => Promise<void>;
+} {
+  const grants = new Map<string, number>();
+  /** Assignments waiting for a seat, in arrival order. `waiting` mirrors it for claimed()'s
+   *  benefit: a queued run holds no seat yet — it is exactly what admission is holding OUT of
+   *  the machine, so giving it the one-seat floor would deadlock waiters against each other. */
+  const waiters: Array<{ runId: string; resolve: () => void }> = [];
+  const waiting = new Set<string>();
+  const claimed = (excludeRunId?: string): number => {
+    let n = 0;
+    let ofActive = 0; // live sessions already represented in n, run by run
+    for (const id of deps.active()) {
+      if (id === excludeRunId) continue;
+      const live = deps.sessionsOf(id);
+      n += Math.max(waiting.has(id) ? 0 : 1, grants.get(id) ?? 0, live);
+      ofActive += live;
+    }
+    // Sessions whose run has already LEFT the active set (mid-teardown) hold real seats the walk
+    // above cannot see. They ADD to the active runs' claims — a stray session and a
+    // granted-but-unspawned wave occupy DIFFERENT seats, and folding them with a max let the
+    // stray hide behind the grant: concurrency 3, one run granted two seats it had not spawned
+    // yet, one teardown session elsewhere → claimed read 2 and a fourth session was admitted.
+    // Subtracting `ofActive` keeps every active run's sessions counted exactly once (inside its
+    // own per-run max), so the remainder is precisely the strays; clamped because the two reads
+    // are of the same live registry and must not go negative on a transient disagreement.
+    return n + Math.max(0, deps.liveSessions(excludeRunId) - ofActive);
+  };
+  /** Room for one more of this run's sessions under the ceiling. */
+  const fits = (runId: string): boolean => claimed(runId) + 1 <= deps.concurrency;
+  /** Re-check waiters in order. Admitting one takes its floor seat back (waiting.delete), so the
+   *  next waiter is judged against it — seats hand over one at a time, FIFO. */
+  const poke = (): void => {
+    for (let i = 0; i < waiters.length; ) {
+      const w = waiters[i]!;
+      if (!fits(w.runId)) {
+        i += 1;
+        continue;
+      }
+      waiters.splice(i, 1);
+      waiting.delete(w.runId);
+      w.resolve();
+    }
+  };
+  return {
+    waveLimit: (runId) => {
+      const limit = Math.max(1, deps.concurrency - claimed(runId));
+      // The reservation itself: recorded before returning, so a simultaneous ask from another
+      // chain subtracts this one's claim instead of double-spending the same spare slots.
+      grants.set(runId, limit);
+      // A replaced grant can SHRINK (the chain de-overlapped): what it freed may admit a waiter.
+      poke();
+      return limit;
+    },
+    // The heartbeat's advertisement counts grants too: a wave the daemon just promised breadth to
+    // is capacity even before its children register, or the server dispatches into the gap. The
+    // read doubles as the waiters' liveness tick (see the doc): a session ending moves no ledger
+    // state of its own, and the beat rides this every interval.
+    freeSlots: () => {
+      poke();
+      return Math.max(0, deps.concurrency - claimed());
+    },
+    release: (runId) => {
+      grants.delete(runId);
+      poke();
+    },
+    admit: (runId) => {
+      if (fits(runId)) return Promise.resolve();
+      waiting.add(runId);
+      return new Promise<void>((resolve) => {
+        waiters.push({ runId, resolve });
+      });
+    },
+  };
+}
+
+/**
+ * The owed-merge reconcile (RUN-28), extracted for the same reason its neighbours are: it lived
+ * as an untested closure in start()'s wiring, which is where whole layers have shipped silently
+ * dead — and its failure mode is exactly that shape (a plan quietly never gets its review).
+ *
+ * Since RUN-85 it reaches review-opening only through the repo's DETECTED backend — the same
+ * `vcsFor` routing `share` already took, never a manifest field (a committed lie would travel,
+ * RUN-60). Git shells the operator's `gh` behind the seam; a server-backed VCS answers that it
+ * cannot open one and where review actually happens, and that answer is WARNED and REPORTED —
+ * a hand-written `[land].mergeTarget` on a Diversion/Perforce repo used to reach `gh` or
+ * nothing, silently, at the one moment the plan claimed to be done.
+ */
+export function owedMergeReconciler(deps: {
+  owed: () => Promise<OwedMerge[]>;
+  /** Repos this runner still has; an owed plan whose repo is gone is skipped, not failed. */
+  repoFor: (repoRef: string) => { root: string } | undefined;
+  /** Re-read per plan (ManifestStore.current): editing the marker takes effect without a restart. */
+  manifestFor: (root: string) => Promise<ProjectManifest | null>;
+  vcsFor: (root: string) => Pick<VcsBackend, 'kind' | 'share' | 'openReview'>;
+  report: (outcome: { planId: string; url?: string | null; failed?: string | null }) => Promise<void>;
+  logger?: typeof defaultLogger;
+}): () => Promise<void> {
+  const log = deps.logger ?? defaultLogger;
+  return async () => {
+    const owed = await deps.owed().catch((err) => {
+      log.debug('could not ask for owed merge requests', { err: String(err) });
+      return [];
+    });
+    for (const plan of owed) {
+      const repo = plan.repoRef ? deps.repoFor(plan.repoRef) : undefined;
+      if (!repo) continue; // a plan whose repo this runner no longer has
+      const manifest = await deps.manifestFor(repo.root);
+      const target = manifest?.land?.mergeTarget ?? null;
+      if (!manifest?.land || !target) continue; // the repo never asked for merge requests
+
+      const backend = deps.vcsFor(repo.root);
+      const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
+      // Push again before opening: landing pushed each run as it went, but this is the moment
+      // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
+      // Unbranched on purpose: a server-backed share is a documented no-op {ok:true}.
+      const push = await backend.share(repo.root, branch);
+      if (!push.ok) {
+        await deps.report({ planId: plan.planId, failed: `push failed: ${push.detail}` }).catch(() => {});
+        continue;
+      }
+      const mr = await backend.openReview(repo.root, {
+        head: branch,
+        base: target,
+        planTitle: plan.planTitle,
+        planKey: plan.planKey ?? plan.planId,
+      });
+      if (mr.ok) {
+        log.info('opened a merge request for a completed plan', {
+          planId: plan.planId,
+          plan: plan.planTitle,
+          branch,
+          target,
+          url: mr.url,
+        });
+      } else {
+        // The one log a hand-written mergeTarget on a server-backed repo gets — it names the
+        // backend and (via the backend's detail) where review actually happens. `command` is
+        // git's hand-runnable `gh pr create`; a backend with none carries the answer in detail.
+        log.warn('could not open the merge request — a human takes it from here', {
+          planId: plan.planId,
+          backend: backend.kind,
+          detail: mr.detail,
+          command: mr.command,
+        });
+      }
+      // Reported either way. Recording only successes leaves a failure invisible and the plan
+      // owed forever, so every reconnect retries the same broken thing and nobody learns why.
+      await deps
+        .report({
+          planId: plan.planId,
+          url: mr.url ?? null,
+          failed: mr.ok ? null : (mr.detail ?? 'failed'),
+        })
+        .catch((err) => log.warn('could not report the merge result', { err: String(err) }));
+    }
   };
 }
 
@@ -367,6 +583,15 @@ export class Daemon {
      *  whole life. */
     const pendingSpec = new Map<string, ExecutionSpec>();
     const steering = new SteeringBridge({ logger: this.log });
+    // The session-capacity ledger (RUN-170): waveLimit RESERVES what it answers, so simultaneous
+    // chains cannot double-spend the same spare slots, and freeSlots sees a granted wave as
+    // occupied capacity. See waveCapacity's doc for the bound it holds and the deferral it keeps.
+    const capacity = waveCapacity({
+      concurrency: this.config.concurrency,
+      active: () => this.active,
+      sessionsOf: (runId) => steering.liveSessionsOf(runId),
+      liveSessions: (excludeRunId) => steering.liveSessionCount(excludeRunId),
+    });
     const supervisor = this.createSupervisor({
       drivers: {
         claude: new ClaudeDriver({ logger: this.log }),
@@ -450,6 +675,11 @@ export class Daemon {
       // the one that can register runners and reach every project this human can.
       createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
       resolveTask: (taskId) => client.getTask(taskId),
+      // The mechanical check behind a CONTESTED task pointer (RUN-188): the judging reviewer holds
+      // no credential (RUN-43), so the daemon looks the task up and enters the result as ledger
+      // data. Bound here for the same reason resolveLockScope is: a dep only tests supply is a
+      // feature that has never run.
+      resolveSpinOff: (ref) => client.getTask(ref),
       // Phase-gate backstop (RUN-81): don't spawn an agent on a task the server offered but whose
       // plan phase isn't unlocked. Read-only probe; a null answer fails open (see checkClaimable).
       checkClaimable: (taskId) => client.checkClaimable(taskId),
@@ -471,6 +701,24 @@ export class Daemon {
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
       repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
+      // How many of a run's wave steps may overlap (RUN-170): a RESERVING ask on the capacity
+      // ledger — the grant is recorded synchronously inside the call, which is what closes the
+      // window where two chains sample the same spare slots before either spawns (see
+      // waveCapacity). Re-asked by the chain before each wave; the floor of 1 means a saturated
+      // machine degrades a wave to sequential rather than refusing the run. Bound HERE, not only
+      // in tests: a dep only tests supply is a feature that has never run.
+      waveLimit: (runId) => {
+        const limit = capacity.waveLimit(runId);
+        // The grant just claimed slots the server's last-heard advertisement still calls free,
+        // and the server is the admission authority — this daemon has never refused an
+        // assignment, so the only enforcement that reaches dispatch is the advertisement.
+        // Pushing it NOW shrinks the stale window from a heartbeat interval to one frame's
+        // flight; a dispatch already in the air is the residual the ledger absorbs — the run
+        // lands in `active` synchronously on arrival, and every ask after that subtracts its
+        // seat.
+        held.ws?.advertiseCapacity();
+        return limit;
+      },
       steering,
       logger: this.log,
     });
@@ -487,12 +735,31 @@ export class Daemon {
         repos: registration.repos,
       },
       connect: this.connect,
-      freeSlots: () => Math.max(0, this.config.concurrency - this.active.size),
+      // The capacity ledger's view, not a run count (RUN-170): one run's wave is several live
+      // processes — and a wave the daemon just granted breadth to is occupied capacity even
+      // before its children register. A heartbeat that counted runs would advertise free slots
+      // on a machine a single decomposed run has saturated, inviting dispatches its own wave
+      // limit exists to make room for.
+      freeSlots: () => capacity.freeSlots(),
       handlers: {
         onRegistered: (m) => this.log.debug('ws registered', m),
         onAssigned: (run) => {
+          // The seat is claimed SYNCHRONOUSLY — the ledger and the heartbeat see this run before
+          // anything yields — but supervision waits for ADMISSION (RUN-170): the advertisement
+          // cannot recall a dispatch already in the air, so an assignment that lands on a machine
+          // a wave has saturated is HELD until a seat exists rather than becoming an extra
+          // session. Never refused: a cancel arriving while it waits is still honored — the
+          // cancelled fact persists (RUN-165) and supervision settles at its first stage check.
           this.active.add(run.id);
-          void supervisor.supervise(run).finally(() => this.active.delete(run.id));
+          void capacity
+            .admit(run.id)
+            .then(() => supervisor.supervise(run))
+            .finally(() => {
+              this.active.delete(run.id);
+              // The run's wave grant dies with it (RUN-170) — a lingering grant would keep
+              // reserving capacity for a run that can never spawn again.
+              capacity.release(run.id);
+            });
         },
         onCancel: (m) => {
           // Hard interrupt + SIGTERM + worktree teardown (the supervisor's finally
@@ -610,6 +877,7 @@ export class Daemon {
         this.log.error('resuming a parked run threw', { runId, err: String(err) });
       } finally {
         this.active.delete(runId);
+        capacity.release(runId); // same rule as onAssigned: a settled run holds no wave grant
       }
     };
 
@@ -642,61 +910,18 @@ export class Daemon {
       }
     };
 
-    const reconcileOwedMerges = async (): Promise<void> => {
-      const owed = await client.owedMerges(runner.id).catch((err) => {
-        this.log.debug('could not ask for owed merge requests', { err: String(err) });
-        return [];
-      });
-      for (const plan of owed) {
-        const repo = plan.repoRef ? reposById.get(plan.repoRef) : undefined;
-        if (!repo) continue; // a plan whose repo this runner no longer has
-        const manifest = await manifests.current(repo.root);
-        const target = manifest?.land?.mergeTarget ?? null;
-        if (!manifest?.land || !target) continue; // the repo never asked for merge requests
-
-        const branch = resolveLandBranch(manifest.land.branch, plan.planKey);
-        // Push again before opening: landing pushed each run as it went, but this is the moment
-        // the branch is claimed to be complete, and a PR against a stale remote is worse than none.
-        const push = await (backendFor.get(repo.root) ?? vcs).share(repo.root, branch);
-        if (!push.ok) {
-          await client
-            .reportMerge(runner.id, { planId: plan.planId, failed: `push failed: ${push.detail}` })
-            .catch(() => {});
-          continue;
-        }
-        const mr = await openMergeRequest({
-          repoRoot: repo.root,
-          head: branch,
-          base: target,
-          planTitle: plan.planTitle,
-          planKey: plan.planKey ?? plan.planId,
-        });
-        if (mr.ok) {
-          this.log.info('opened a merge request for a completed plan', {
-            planId: plan.planId,
-            plan: plan.planTitle,
-            branch,
-            target,
-            url: mr.url,
-          });
-        } else {
-          this.log.warn('could not open the merge request — run it by hand', {
-            planId: plan.planId,
-            detail: mr.detail,
-            command: mr.command,
-          });
-        }
-        // Reported either way. Recording only successes leaves a failure invisible and the plan
-        // owed forever, so every reconnect retries the same broken thing and nobody learns why.
-        await client
-          .reportMerge(runner.id, {
-            planId: plan.planId,
-            url: mr.url ?? null,
-            failed: mr.ok ? null : (mr.detail ?? 'failed'),
-          })
-          .catch((err) => this.log.warn('could not report the merge result', { err: String(err) }));
-      }
-    };
+    // Owed merge requests (RUN-28), routed through the detected backend since RUN-85 —
+    // `vcsFor` is the same `backendFor.get(root) ?? vcs` the share step always took, now
+    // carrying openReview too, so gh is git's business and a server-backed repo's
+    // mergeTarget yields an honest warn+report instead of a gh call that means nothing there.
+    const reconcileOwedMerges = owedMergeReconciler({
+      owed: () => client.owedMerges(runner.id),
+      repoFor: (repoRef) => reposById.get(repoRef),
+      manifestFor: (root) => manifests.current(root),
+      vcsFor: (root) => backendFor.get(root) ?? vcs,
+      report: (outcome) => client.reportMerge(runner.id, outcome),
+      logger: this.log,
+    });
 
     // Ask once at startup, not only on reconnect (RUN-28): the likeliest way to miss a
     // plan.completed frame is for the box to have been OFF when it fired — and a daemon that

@@ -7,6 +7,9 @@ class FakeSession implements DriverSession {
   inputs: string[] = [];
   interrupts = 0;
   interruptThrows = false;
+  /** Model a driver whose interrupt() never answers — the hung case RUN-170's bounded grace
+   *  exists for. */
+  interruptHangs = false;
   /** Model a session whose input queue has closed (the agent already finished). */
   inputClosed = false;
   constructor(readonly runId: string) {}
@@ -19,6 +22,7 @@ class FakeSession implements DriverSession {
   async interrupt(): Promise<void> {
     this.order.push('interrupt');
     this.interrupts += 1;
+    if (this.interruptHangs) return new Promise<void>(() => {});
     if (this.interruptThrows) throw new Error('interrupt boom');
   }
   async stop(): Promise<void> {}
@@ -27,12 +31,18 @@ class FakeSession implements DriverSession {
   }
 }
 
-// register(runId, session, stop) — a run's stop hook (budgetRun.stop in prod).
-function register(bridge: SteeringBridge, session: FakeSession): { stops: number } {
+// register(runId, session, stop, key?) — a run's stop hook (budgetRun.stop in prod). `key` is the
+// session's tally slot on a decomposed run (RUN-170); omitted for the single-session shape.
+function register(bridge: SteeringBridge, session: FakeSession, key?: string): { stops: number } {
   const box = { stops: 0 };
-  bridge.register(session.runId, session, async () => {
-    box.stops += 1;
-  });
+  bridge.register(
+    session.runId,
+    session,
+    async () => {
+      box.stops += 1;
+    },
+    key,
+  );
   return box;
 }
 
@@ -55,6 +65,46 @@ describe('steerModeForKind', () => {
     expect(steerModeForKind('instruction')).toBe('soft');
     expect(steerModeForKind('question')).toBe('soft');
     expect(steerModeForKind('message')).toBe('soft');
+  });
+});
+
+// RUN-170: the bridge is the one place every session already announces itself, so it is where the
+// daemon's capacity questions get an honest answer — a wave's children are several live processes
+// where the active-run count reads one.
+describe('liveSessionCount', () => {
+  it('counts every registered session, across runs', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    register(bridge, new FakeSession('run_b'));
+    expect(bridge.liveSessionCount()).toBe(3);
+  });
+
+  it('excludes the asking run’s own sessions — the wave limit subtracts only the REST', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    register(bridge, new FakeSession('run_b'));
+    expect(bridge.liveSessionCount('run_a')).toBe(1);
+    expect(bridge.liveSessionCount('run_b')).toBe(2);
+  });
+
+  it('drops back as sessions unregister', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    bridge.unregister('run_a', 'step:s1');
+    expect(bridge.liveSessionCount()).toBe(1);
+    bridge.unregister('run_a', 'step:s2');
+    expect(bridge.liveSessionCount()).toBe(0);
+  });
+
+  it('answers one run’s own count — the capacity ledger’s per-run measure', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_a'), 'step:s1');
+    register(bridge, new FakeSession('run_a'), 'step:s2');
+    expect(bridge.liveSessionsOf('run_a')).toBe(2);
+    expect(bridge.liveSessionsOf('run_b')).toBe(0);
   });
 });
 
@@ -217,5 +267,156 @@ describe('stopAll (daemon shutdown)', () => {
     });
     await expect(bridge.stopAll()).resolves.toHaveLength(2);
     expect(ok).toEqual(['good']); // one failure must not strand the rest
+  });
+
+  it('stops every session of a multi-session run, reporting the run once', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    const boxA = register(bridge, a, 'step:a');
+    const boxB = register(bridge, b, 'step:b');
+    const ids = await bridge.stopAll();
+    expect(ids).toEqual(['run_1']); // the RUN is what shutdown reports, not its session count
+    expect(boxA.stops).toBe(1);
+    expect(boxB.stops).toBe(1);
+    expect(bridge.hasRun('run_1')).toBe(false);
+  });
+});
+
+// RUN-170: a wave runs a run's steps concurrently, so one run is several live sessions at once.
+// A runId-keyed map made the second registration clobber the first — and its unregister then
+// removed the survivor, leaving a live, spending session no cancel could reach.
+describe('several live sessions of one run (RUN-170)', () => {
+  it('a second registration under its own key does not clobber the first', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    register(bridge, a, 'step:a');
+    register(bridge, b, 'step:b');
+    // A steer names the RUN and carries no session address: it reaches every live session,
+    // because the one it was about missing it loses the steer.
+    const result = await bridge.applySteer(steer({ body: 'stop touching the schema' }));
+    expect(a.inputs).toEqual(['stop touching the schema']);
+    expect(b.inputs).toEqual(['stop touching the schema']);
+    expect(result).toMatchObject({ delivered: true, via: 'runtime' });
+  });
+
+  it('a hard steer interrupts EACH session before injecting into it', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    register(bridge, a, 'step:a');
+    register(bridge, b, 'step:b');
+    await bridge.applySteer(steer({ mode: 'hard' }));
+    expect(a.order).toEqual(['interrupt', 'push']);
+    expect(b.order).toEqual(['interrupt', 'push']);
+  });
+
+  it('delivery to at least one session is runtime delivery, even when a sibling already closed', async () => {
+    const bridge = new SteeringBridge();
+    const closed = new FakeSession('run_1');
+    closed.inputClosed = true; // this step finished while the steer was in flight
+    const live = new FakeSession('run_1');
+    register(bridge, closed, 'step:a');
+    register(bridge, live, 'step:b');
+    const result = await bridge.applySteer(steer());
+    expect(live.inputs).toHaveLength(1);
+    expect(result).toMatchObject({ delivered: true, via: 'runtime' });
+  });
+
+  it('every session closed → dropped, so the notices fallback still runs', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    a.inputClosed = true;
+    b.inputClosed = true;
+    register(bridge, a, 'step:a');
+    register(bridge, b, 'step:b');
+    const result = await bridge.applySteer(steer());
+    expect(result).toMatchObject({ delivered: false, via: 'dropped' });
+  });
+
+  it('cancelRun stops EVERY live session of the run', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    const boxA = register(bridge, a, 'step:a');
+    const boxB = register(bridge, b, 'step:b');
+    expect(await bridge.cancelRun('run_1')).toBe(true);
+    expect(a.interrupts).toBe(1);
+    expect(b.interrupts).toBe(1);
+    expect(boxA.stops).toBe(1);
+    expect(boxB.stops).toBe(1);
+    expect(bridge.isCancelled('run_1')).toBe(true);
+  });
+
+  it('a hung interrupt neither blocks its own SIGTERM nor strands its siblings', async () => {
+    // The polite interrupt is a COURTESY and the SIGTERM is the enforcement: a driver that never
+    // answers must not stand between the run and its stop, or between the cancel and the run's
+    // other sessions. The fan-out is concurrent and the courtesy bounded by the grace.
+    const bridge = new SteeringBridge({ interruptGraceMs: 5 });
+    const hung = new FakeSession('run_1');
+    hung.interruptHangs = true;
+    const good = new FakeSession('run_1');
+    const boxHung = register(bridge, hung, 'step:a');
+    const boxGood = register(bridge, good, 'step:b');
+    await bridge.cancelRun('run_1'); // resolves at all — the grace bounds the hung courtesy
+    expect(boxGood.stops).toBe(1); // the sibling never waited on the hung driver
+    expect(boxHung.stops).toBe(1); // and the hung session still took its SIGTERM
+  });
+
+  it('a hard steer still reaches the siblings of a session whose interrupt hangs', async () => {
+    const bridge = new SteeringBridge({ interruptGraceMs: 5 });
+    const hung = new FakeSession('run_1');
+    hung.interruptHangs = true;
+    const good = new FakeSession('run_1');
+    register(bridge, hung, 'step:a');
+    register(bridge, good, 'step:b');
+    const result = await bridge.applySteer(steer({ mode: 'hard' }));
+    expect(good.inputs).toHaveLength(1); // delivered without waiting on the hung sibling
+    expect(hung.inputs).toHaveLength(1); // still injected after the grace — heard at the next boundary
+    expect(result).toMatchObject({ delivered: true, via: 'runtime' });
+  });
+
+  it('one session refusing to stop does not strand its siblings', async () => {
+    const bridge = new SteeringBridge();
+    const bad = new FakeSession('run_1');
+    const good = new FakeSession('run_1');
+    bridge.register(
+      'run_1',
+      bad,
+      async () => {
+        throw new Error('stop boom');
+      },
+      'step:a',
+    );
+    const box = register(bridge, good, 'step:b');
+    await expect(bridge.cancelRun('run_1')).resolves.toBe(true);
+    expect(box.stops).toBe(1); // the sibling still went down
+  });
+
+  it('unregister removes only its own session', async () => {
+    const bridge = new SteeringBridge();
+    const a = new FakeSession('run_1');
+    const b = new FakeSession('run_1');
+    register(bridge, a, 'step:a');
+    register(bridge, b, 'step:b');
+    bridge.unregister('run_1', 'step:a');
+    expect(bridge.hasRun('run_1')).toBe(true); // b is still live and steerable
+    const result = await bridge.applySteer(steer());
+    expect(a.inputs).toEqual([]);
+    expect(b.inputs).toHaveLength(1);
+    expect(result).toMatchObject({ delivered: true, via: 'runtime' });
+    bridge.unregister('run_1', 'step:b');
+    expect(bridge.hasRun('run_1')).toBe(false);
+  });
+
+  // The single-session shape is every existing call site: default key in, default key out.
+  it('keyless register and unregister keep addressing the same (single) session', () => {
+    const bridge = new SteeringBridge();
+    register(bridge, new FakeSession('run_1'));
+    expect(bridge.hasRun('run_1')).toBe(true);
+    bridge.unregister('run_1');
+    expect(bridge.hasRun('run_1')).toBe(false);
   });
 });

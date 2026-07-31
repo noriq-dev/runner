@@ -9,7 +9,7 @@ export type { PrepareHost, PrepareOutcome, PreparedRun } from './prepare';
 export { executeRun, LOG_TAIL_CAP } from './execute';
 export type { ExecuteHost, ExecuteOutcome, ExecutePlan } from './execute';
 export { executeChain, renderPriorSteps, renderStepFocus } from './chain';
-export type { ChainOutcome, ChainPlan, StepSummary } from './chain';
+export type { ChainOutcome, ChainPlan, ChainWave, StepSummary } from './chain';
 export { verifyStage } from './verify';
 export { reviewStage } from './review';
 export { integrateStage } from './integrate';

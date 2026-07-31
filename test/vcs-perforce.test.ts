@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LockDelegate } from '../src/vcs/git';
 import { type P4Cli, PerforceBackend } from '../src/vcs/perforce';
+import type { VcsBackend } from '../src/vcs/types';
 
 /** A fake Noriq lock view (the authoritative coordination layer) that records calls and returns
  *  a configurable acquire result. */
@@ -305,6 +306,48 @@ describe('PerforceBackend — publish (submit IS the CAS, measured)', () => {
     const { backend, calls } = fakes({});
     calls.length = 0;
     expect(await backend.share('/ws1', 'x')).toEqual({ ok: true });
+    expect(calls).toEqual([]);
+  });
+
+  it('openReview refuses honestly: review happens in Perforce, and no p4 verb is invented (RUN-85)', async () => {
+    // No Swarm/review API was measured (§10 covers submit/resolve/shelve, nothing else), so the
+    // contract is a refusal naming where a human reviews — with ZERO p4 calls.
+    const { backend, calls } = fakes({});
+    calls.length = 0;
+    const res = await backend.openReview('/ws1', {
+      head: 'noriq/plan-alpha',
+      base: 'main',
+      planTitle: 'Runner v2',
+      planKey: 'alpha',
+    });
+    expect(res).toEqual({
+      ok: false,
+      detail:
+        'review happens in Perforce: the plan is submitted as numbered changelists on the line ' +
+        'the client views — review them in your Perforce tooling (Swarm, or p4 describe); the ' +
+        'daemon opens no Swarm review',
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('PerforceBackend — run-addressed verbs decline honestly (RUN-170)', () => {
+  // Pool-of-1: a wave's steps run sequentially in the parent's own workspace, so these verbs
+  // never legitimately fire here — and there is no per-run LINE to land on anyway (submit goes
+  // to the line the client views). A call reaching them is a scheduling bug; the refusal names
+  // the backend, with ZERO p4 calls — stating a fact about Perforce must not act on it.
+  it('leaves leasesOverlap unset — the conservative, sequential-wave reading', () => {
+    // Read through the seam, as the wave scheduler will — the capability is interface surface.
+    const vcs: VcsBackend = fakes({}).backend;
+    expect(vcs.leasesOverlap).toBeUndefined();
+  });
+
+  it('integrateFromRun and publishToRun refuse by name, without touching p4', async () => {
+    const { backend, calls } = fakes({});
+    const ws = await backend.lease('/ws1', 'run_1');
+    calls.length = 0;
+    await expect(backend.integrateFromRun(ws, 'run_parent')).rejects.toThrow(/Perforce.*pool-of-1/);
+    await expect(backend.publishToRun(ws, 'run_parent')).rejects.toThrow(/Perforce/);
     expect(calls).toEqual([]);
   });
 });

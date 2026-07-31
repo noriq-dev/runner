@@ -113,6 +113,28 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
     expect(scope).not.toContain('create_task');
     expect(scope).not.toContain('decompose_task');
   });
+
+  it('build and verify can SPIN OFF work they found but may not do — scope cannot (RUN-188)', () => {
+    // RUN-186's landing run did everything right — contested with evidence, raised an alert with
+    // a full design sketch — and still failed, because an alert records a concern and creates no
+    // work the gate can point at; a human folded it into a task by hand. spin_off_task is that
+    // manual step made first-class. Its product is a PROPOSED task — visible, carrying
+    // provenance, not claimable and not pumpable until a human accepts it (the RUN-23 gate) —
+    // which is what makes it safe to advertise to a prompt-injected builder.
+    expect(noriqToolNamesFor('build')).toContain('spin_off_task');
+    expect(noriqToolNamesFor('verify')).toContain('spin_off_task');
+    // Scope's product IS a proposed plan: work it surfaces belongs in the plan it is minting.
+    expect(noriqToolNamesFor('scope')).not.toContain('spin_off_task');
+  });
+
+  it('the spin-off grant does not reopen RUN-69: create_task stays off EVERY floor', () => {
+    // spin_off_task is a new tool with a gated product, not create_task by another name — the
+    // tools that mint CLAIMABLE work outside the human plan-approval gate stay absent everywhere.
+    for (const kind of KINDS) {
+      expect(noriqToolNamesFor(kind), kind).not.toContain('create_task');
+      expect(noriqToolNamesFor(kind), kind).not.toContain('decompose_task');
+    }
+  });
 });
 
 describe('permission profiles never grant a dangerous mode UNINVITED (RUN-68)', () => {

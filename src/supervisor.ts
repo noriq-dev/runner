@@ -14,13 +14,22 @@ import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
 import {
   type Finding,
+  type FindingResponse,
   type LedgerEntry,
+  MAX_TASK_POINTERS,
+  type SpinOffCheck,
+  applyContestResponses,
   buildLedger,
   parseFindingResponses,
   parseFindings,
+  reconciledEntry,
+  renderContestRecord,
+  spinOffsHold,
+  subclaimsOf,
+  taskRefsIn,
 } from './adjudication';
 import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
-import type { ParkState, RunAgent } from './client';
+import type { ParkState, RunAgent, SpinOffProvenance } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
@@ -60,6 +69,7 @@ import { type StageName, stagesFor, stopBefore } from './run-machine';
 import { sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
+  type ExecuteOutcome,
   type PatternMapHost,
   type PlanCheckHost,
   type PlanHost,
@@ -86,7 +96,7 @@ import {
   worthMapping,
 } from './stages';
 import { authorSpecBlock, buildRunBrief } from './stages/brief';
-import type { StepSummary } from './stages/chain';
+import type { ChainWave, StepSummary } from './stages/chain';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
@@ -140,7 +150,23 @@ export type SupervisorVcs = Pick<
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
   // lock/unlock/queryLocks are optional the same way (RUN-98): a fake or lock-less backend omits
   // them, and the supervisor treats absence as "no lock layer" (RUN-101/103).
-  Partial<Pick<VcsBackend, 'kind' | 'lock' | 'unlock' | 'queryLocks' | 'changedPaths' | 'releaseRunLocks'>>;
+  // The wave trio (RUN-170) is optional with the OPPOSITE default direction: absence reads as
+  // "leases cannot overlap", so a fake that says nothing gets the sequential chain it always had —
+  // the conservative degradation `VcsBackend.leasesOverlap` documents.
+  Partial<
+    Pick<
+      VcsBackend,
+      | 'kind'
+      | 'lock'
+      | 'unlock'
+      | 'queryLocks'
+      | 'changedPaths'
+      | 'releaseRunLocks'
+      | 'leasesOverlap'
+      | 'integrateFromRun'
+      | 'publishToRun'
+    >
+  >;
 
 export interface ResolvedRepo {
   root: string;
@@ -235,6 +261,21 @@ export interface RunSupervisorDeps {
    */
   checkClaimable?: (taskId: string) => Promise<{ claimable: boolean; reason: string | null } | null>;
   /**
+   * Look up a task a CONTESTED response's `task:<ref>` pointer names (RUN-188, →
+   * NoriqClient.getTask; the server resolves keys and ids alike). The DAEMON runs this check
+   * because the judging reviewer holds no Noriq credential and must not gain one (RUN-43) — it is
+   * handed the result as ledger data, never a token. Same probe posture as checkClaimable: a
+   * throw and a null are the same non-answer, recorded UNVERIFIED — which can never CREDIT a
+   * contest and never fails the run by itself. Omitted → no facts are attached and a task pointer
+   * stays exactly the free text it was before this existed.
+   */
+  resolveSpinOff?: (ref: string) => Promise<SpinOffLookup | null>;
+  /** Deadline for ONE resolveSpinOff lookup (RUN-188). The await sits on the adjudication path —
+   *  between the builder's turn and the fold — so a stalled MCP call must degrade to the same
+   *  unverified non-answer a failed one does rather than hang the run. Omitted →
+   *  TASK_LOOKUP_TIMEOUT_MS; present for tests, the contextBudget pattern. */
+  spinOffTimeoutMs?: number;
+  /**
    * Dispatch-time predictive locking (RUN-103): the DECLARED file scope of a run, if one is
    * known, so the daemon can take its locks before the agent starts and refuse a dispatch that
    * would clash — extending the RUN-81 phase-gate backstop from "is the task claimable" to "are
@@ -286,10 +327,12 @@ export interface RunSupervisorDeps {
   continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
   /** How long a park may sit before the daemon fails it (RUN-30). Default: DEFAULT_PARK_TTL_HOURS. */
   parkTtlHours?: number;
-  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). */
+  /** Makes the live session steerable + cancellable while it runs (RUN-16/18). `key` names which
+   *  of the run's sessions is registering — a wave holds several at once (RUN-170); omitted, the
+   *  bridge treats the run as its single session, which every non-chain call site is. */
   steering?: {
-    register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
-    unregister: (runId: string) => void;
+    register: (runId: string, session: DriverSession, stop: () => Promise<void>, key?: string) => void;
+    unregister: (runId: string, key?: string) => void;
     /** Has an operator cancelled this run (RUN-165)? Asked at every stage boundary, because a
      *  cancel is a fact about the RUN and the pipeline is many sessions with gaps between them. */
     isCancelled?: (runId: string) => boolean;
@@ -297,6 +340,20 @@ export interface RunSupervisorDeps {
      *  per cancelled run for its whole life. */
     forget?: (runId: string) => void;
   };
+  /**
+   * How many of a decomposed run's wave steps may overlap (RUN-170): the daemon's own
+   * `concurrency` minus what the REST of the machine is running, asked again before EACH wave —
+   * a chain runs a long time, and a limit sampled once would keep spending capacity the machine
+   * no longer has. Takes the asking RUN's id so the daemon can exclude that run's own sessions
+   * from the count. A run that saturates the machine with its own steps starves every other run,
+   * which is worse than a slow run — so the limit is the machine's spare capacity, not a per-run
+   * knob.
+   *
+   * Omitted → 1, which is the fully sequential chain every decomposed run was before this
+   * existed. Conservative deliberately: a dep only the daemon binds must not default to
+   * unbounded concurrency in every harness that never heard of it.
+   */
+  waveLimit?: (runId: string) => number;
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
@@ -511,8 +568,12 @@ export class RunTally {
     this.slots.set(slot, t);
   }
 
-  /** Charge a finished session's active stretch to the run. Sessions are strictly sequential in
-   *  this daemon — builder, then reviewer, then conflict turn — so these sum rather than overlap. */
+  /** Charge a finished session's active stretch to the run. The post-driver sessions — builder,
+   *  reviewer, conflict turn — are strictly sequential, so their stretches sum without overlap; a
+   *  wave's step sessions DO overlap (RUN-170) and each still charges its own stretch, so under
+   *  concurrency this figure is agent COMPUTE time, not wall-clock. That is the deliberate reading
+   *  of `maxDurationSeconds` for a wave: three sessions running an hour together cost three hours
+   *  of the ceiling, the conservative direction — overlap can only exhaust a run sooner. */
   chargeTime(seconds: number): void {
     this.active += Math.max(0, seconds);
   }
@@ -646,6 +707,27 @@ export interface AnchorTask {
   /** The SERVER holds a spec it could not read (RUN-135) — not the same as having none. */
   executionSpecUnreadable?: boolean;
 }
+
+/** What the RUN-188 task-pointer check needs of a task: enough to say it EXISTS and where it came
+ *  from. Structurally satisfied by client.ts's TaskBrief, the same seam shape as AnchorTask. */
+export interface SpinOffLookup {
+  key: string;
+  title: string;
+  /** Provenance a spun-off task carries. Absent on a task a human filed by hand — still a
+   *  legitimate contest target ("tracked THERE" does not require the builder filed it); the
+   *  reviewer weighs the difference, told which it is. */
+  spinOff?: SpinOffProvenance | null;
+}
+
+/** Distinct task lookups one fold turn may spend (RUN-188). Past it a ref is recorded as
+ *  unchecked — still `verified: false`, so it credits nothing — rather than silently dropped: a
+ *  builder spinning off ten tasks to dodge ten findings meets the control instead of outrunning
+ *  it, and the ledger says so out loud (the no-silent-caps rule). */
+const MAX_TASK_LOOKUPS_PER_TURN = 8;
+/** Deadline for one task lookup (RUN-188). This await sits between the builder's turn and the
+ *  ledger fold, so a hung MCP call with no deadline would stall the run's adjudication — and the
+ *  probe posture is that a lookup that cannot ANSWER is a non-answer, which a stall is. */
+const TASK_LOOKUP_TIMEOUT_MS = 10_000;
 
 /**
  * The RUNNABLE half of `[verify]` (RUN-61). Since the stage became a choice, `cmd` is
@@ -1026,6 +1108,46 @@ export class RunSupervisor {
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
   private vcsFor(repo: ResolvedRepo): SupervisorVcs {
     return repo.vcs ?? this.deps.vcs;
+  }
+
+  /**
+   * The wave seam a chain reaches source control through (RUN-170) — closures over `vcsFor(repo)`
+   * and the parent RUN ID, the same DI pattern `checkpoint` already uses at both `executeChain`
+   * call sites. Closures rather than the backend itself, deliberately: the chain gets exactly the
+   * verbs a wave needs, with the child→parent return trip already run-addressed, so no branch or
+   * ref string can originate above the seam (RUN-50's rule under concurrency).
+   */
+  private waveFor(repo: ResolvedRepo, run: Run): ChainWave {
+    const vcs = this.vcsFor(repo);
+    // The parent workspace's posture, recomputed the way `prepare` computed it: a child checkout
+    // is the SAME run's workspace and must carry the same physical floor — a decomposed
+    // non-producing run (scope, verify) whose steps overlap must not receive writable child trees
+    // when its parent tree is read-only. The permission clamp already denies the edit tools
+    // (RUN-118); this keeps the worktree-level floor symmetric with the sitting that leased first.
+    const readOnly = !runWorkflow(run, repo.manifest).worktreeWritable;
+    return {
+      // All three run-addressed pieces, or none: a backend (or fake) that declares overlap but
+      // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
+      // the safe, sequential reading (vcs/types.ts).
+      leasesOverlap: Boolean(vcs.leasesOverlap && vcs.integrateFromRun && vcs.publishToRun),
+      // Re-asked by the chain before each wave, not sampled here: what is spare NOW is the answer.
+      limit: () => this.deps.waveLimit?.(run.id) ?? 1,
+      lease: (childId) => vcs.lease(repo.root, childId, { fromRunId: run.id, readOnly }),
+      checkpoint: (ws, label) => vcs.checkpoint(ws, runCommitMessage(run.id, label)),
+      integrateBack: (ws) => vcs.integrateFromRun!(ws, run.id),
+      abandonIntegrate: (ws) => vcs.abandonIntegrate(ws),
+      publishBack: (ws) => vcs.publishToRun!(ws, run.id),
+      hasWork: (ws) => vcs.hasWork(ws),
+      dispose: (ws) => vcs.dispose(ws),
+      // The park-state probe (RUN-30's authority) — how the chain learns a wave child stopped to
+      // ask a human, since a child cannot park. Absent with parking off, exactly like parkIfBlocked.
+      // A probe FAILURE propagates rather than reading as "not blocked" (RUN-152's direction —
+      // the unknown answer must not become the one acted on): the chain is the actor that decides
+      // what an unanswerable probe means, and coercing here decided it silently.
+      ...(this.deps.getParkState
+        ? { probeBlocked: async () => Boolean((await this.deps.getParkState!(run.id))?.blocked) }
+        : {}),
+    };
   }
 
   /**
@@ -1630,8 +1752,12 @@ export class RunSupervisor {
         })
         .finally(() => ctx.tally.chargeTime((monotonicMs() - fixStartedAt) / 1000));
       const fixText = ctx.getSessionText?.().slice(textBefore) ?? '';
-      // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer sees.
-      ledger = buildLedger(ledger, findings, parseFindingResponses(fixText), round);
+      // Fold this round's findings + the builder's rebuttal into the ledger the NEXT reviewer
+      // sees. A CONTESTED pointer naming a task is checked FIRST (RUN-188, the same path the
+      // terminal contest uses), so the fact — verified or not — rides the fold and reaches the
+      // fresh reviewer as data it could never look up itself.
+      const fixResponses = await this.verifyTaskPointers(ctx.run.id, parseFindingResponses(fixText));
+      ledger = buildLedger(ledger, findings, fixResponses, round);
       // The builder died, errored, or breached its budget on the fix. The reviewer's verdict
       // stands; pushing more turns at a session that just failed is how a loop becomes a spend.
       // Same as the floor's hand-back: the run keeps the reviewer's reason, so the turn's own
@@ -1919,6 +2045,148 @@ export class RunSupervisor {
   }
 
   /**
+   * The mechanical half of adjudicating a spin-off contest (RUN-188), shared by BOTH fold sites —
+   * the fix rounds and the terminal contest — so the two cannot drift on what "checked" means.
+   *
+   * A CONTESTED pointer may name a task (`task:<ref>`): "real, out of scope, tracked THERE". The
+   * judging reviewer holds no Noriq credential and gets none for this (RUN-43), so the daemon
+   * looks each named task up and attaches what it saw to the response, which the fold then
+   * carries as ledger data — the fresh reviewer judges substance over facts instead of a prose
+   * promise. The order of harms is may-miss-never-invent: a lookup that failed, answered
+   * malformed, found nothing, or was declined (the per-turn bound) yields `verified: false` — a
+   * fact that can only make the contest harder to credit — and never a crash or a gate of its
+   * own, the checkClaimable probe posture. No lookup wired → responses pass through untouched and
+   * a task pointer stays the free text it always was, which is every daemon before RUN-188.
+   */
+  private async verifyTaskPointers(runId: string, responses: FindingResponse[]): Promise<FindingResponse[]> {
+    const lookup = this.deps.resolveSpinOff;
+    if (!lookup) return responses;
+    const clip = (s: string, n: number) => {
+      const t = s.trim();
+      return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+    };
+    // A stall is a non-answer: race each lookup against a deadline, resolving null either way a
+    // real answer never arrives. The timer is unref'd (the budget.ts rule — a forgotten deadline
+    // must never be what holds the daemon open) and guarded, since a fake clock need not have it.
+    const timeoutMs = this.deps.spinOffTimeoutMs ?? TASK_LOOKUP_TIMEOUT_MS;
+    const timedLookup = (ref: string): Promise<SpinOffLookup | null> =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+        lookup(ref).then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          () => {
+            clearTimeout(timer);
+            resolve(null);
+          },
+        );
+      });
+    const facts = new Map<string, SpinOffCheck>();
+    let looked = 0;
+    const check = async (ref: string): Promise<SpinOffCheck> => {
+      const held = facts.get(ref);
+      if (held) return held;
+      let fact: SpinOffCheck;
+      if (looked >= MAX_TASK_LOOKUPS_PER_TURN) {
+        fact = {
+          ref,
+          verified: false,
+          detail: 'not checked — this turn named more task pointers than the daemon will look up',
+        };
+      } else {
+        looked += 1;
+        const raw = await timedLookup(ref);
+        // The seam's answer is DATA, not a contract: resolveSpinOff is injectable and the server
+        // behind it is not this daemon's, so a shape this code did not write — a numeric title, a
+        // missing key — is the same non-answer a failed lookup is. Validated field by field
+        // BEFORE anything touches it, because a throw here would abort the adjudication path a
+        // finding was meant to merely stand on (may-miss-never-invent, and never a crash).
+        const t = raw && typeof raw.key === 'string' && typeof raw.title === 'string' ? raw : null;
+        if (!t) {
+          fact = {
+            ref,
+            verified: false,
+            detail: 'no such task reachable from this runner — treat the pointer as pointing at nothing',
+          };
+        } else {
+          // The provenance line is the mechanical fact the reviewer's substance judgment starts
+          // from: filed from THIS run against a finding, filed elsewhere, or carrying none (a task
+          // a human filed by hand — still a legitimate target, and the reviewer is told which).
+          // Field-typed like the answer itself: provenance only ever SHARPENS the existence fact,
+          // so a malformed field degrades to the unsharpened line, never to a throw.
+          const prov = t.spinOff && typeof t.spinOff === 'object' ? t.spinOff : null;
+          const sourceRun = typeof prov?.sourceRunId === 'string' ? prov.sourceRunId : null;
+          const from = !prov
+            ? 'carries no spin-off provenance — it may predate this run'
+            : sourceRun === runId
+              ? 'filed from THIS run'
+              : sourceRun
+                ? `filed from run ${sourceRun}`
+                : 'its provenance names no source run';
+          const against =
+            typeof prov?.finding === 'string' && prov.finding
+              ? `, against: "${clip(prov.finding, 120)}"`
+              : '';
+          fact = {
+            ref,
+            verified: true,
+            detail: `exists — ${t.key}: ${clip(t.title, 100)} (${from}${against})`,
+          };
+        }
+      }
+      facts.set(ref, fact);
+      return fact;
+    };
+    const out: FindingResponse[] = [];
+    for (const r of responses) {
+      // Only a CONTESTED pointer is evidence a task can back — a FIXED points at a change, and
+      // checking tasks it happens to mention would attach facts to a claim nobody made. The scan
+      // is the parser's, taken off the RAW line (FindingResponse.taskScan): `r.pointer` is the
+      // capped DISPLAY, and scanning it let a claim padded past the cap fall off the check — a
+      // verified first task crediting a never-checked later one. The fallback serves only a
+      // hand-built response that skipped the parser; on parser output an absent scan MEANS the
+      // raw pointer named nothing, and a capped substring of it cannot name more.
+      const scan =
+        r.status === 'contested' ? (r.taskScan ?? taskRefsIn(r.pointer)) : { refs: [], unreadable: 0 };
+      if (!scan.refs.length && !scan.unreadable) {
+        out.push(r);
+        continue;
+      }
+      const spinOffs: SpinOffCheck[] = [];
+      for (const ref of scan.refs.slice(0, MAX_TASK_POINTERS)) spinOffs.push(await check(ref));
+      // Every task claim the loop above did NOT check is priced as ONE unverified fact, never
+      // dropped: refs past the per-answer cap (three verified tasks must not speak for a fourth
+      // nobody looked at) and claims no reference could be read from (a mangled claim degrades
+      // toward unverifiable, not toward "no task named"). Unverified is what blocks crediting.
+      const over = Math.max(0, scan.refs.length - MAX_TASK_POINTERS);
+      if (over > 0 || scan.unreadable > 0) {
+        const parts: string[] = [];
+        if (over > 0)
+          parts.push(`${over} more task pointer(s) than the ${MAX_TASK_POINTERS} one answer may name`);
+        if (scan.unreadable > 0)
+          parts.push(`${scan.unreadable} task claim(s) with no readable reference (write task:<key>)`);
+        spinOffs.push({
+          ref: '(unchecked)',
+          verified: false,
+          detail: `not checked — ${parts.join('; ')}`,
+        });
+      }
+      out.push({ ...r, spinOffs });
+    }
+    if (facts.size) {
+      this.log.info('checked the task pointers the builder contested with', {
+        runId,
+        refs: [...facts.keys()],
+        verified: [...facts.values()].filter((f) => f.verified).length,
+      });
+    }
+    return out;
+  }
+
+  /**
    * The RUN-174 contest turn: one adjudication turn after a TERMINAL-round FAIL, before the run
    * reports. Returns the FINAL result iff the contest RAN — a PASS only when every terminal finding
    * drew a checkable CONTESTED response AND a fresh reviewer verified those pointers hold; otherwise
@@ -1928,9 +2196,10 @@ export class RunSupervisor {
    *
    * The clearing decision is the daemon's, in one place (criterion 3/4): a fresh re-review is not a
    * free reroll of the verdict. A finding stands unless the builder CONTESTED it with a pointer the
-   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, or a
-   * finding a ledger cap dropped cannot clear it — the run then fails without even spawning the
-   * reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
+   * adjudicator can SEE, so silence, a `FIXED`, an empty pointer, a response for another id, a
+   * finding a ledger cap dropped, a sub-claim left unanswered while its siblings drew the
+   * rebuttal (RUN-180), or a task pointer the daemon could not verify (RUN-188) cannot clear it —
+   * the run then fails without even spawning the reviewer. Only a full set of visible, checkable contests earns the look; and even then a PASS
    * clears the run only if the reviewer re-raised none of the findings, so its word alone is never
    * enough.
    *
@@ -2005,8 +2274,19 @@ export class RunSupervisor {
     // block is parsed (RUN-79) — snapshotted before the turn as the fix loop does.
     const textBefore = ctx.getSessionText?.().length ?? 0;
     const startedAt = monotonicMs();
+    // The contest prompt carries the RECORD — each terminal finding's sub-claims as the reconciled
+    // ledger holds them, lettered by position (RUN-180). Letters are not state anywhere (the
+    // structural settlement), so a standing sub-claim this terminal report does not re-list has no
+    // letter the builder could otherwise know: the record is what makes it answerable, and its
+    // positional letters are exactly the coordinates `applyContestResponses` resolves a response
+    // against below — one labelling, shown and folded alike.
     const exit = await ctx.session
-      .continueWith(reviewerContestPrompt(args.verdict.findings))
+      .continueWith(
+        reviewerContestPrompt(
+          args.verdict.findings,
+          renderContestRecord(args.findings, args.ledger, args.terminalRound),
+        ),
+      )
       .catch((err): DriverExit | null => {
         this.log.warn('could not hand the terminal findings back for a contest', {
           runId: ctx.run.id,
@@ -2022,19 +2302,30 @@ export class RunSupervisor {
     // pointerless self-assertion is persuasion the next reviewer cannot check, and a `FINDING 99`
     // naming no terminal finding is context from nowhere. Folding this ONE `matched` set — not the
     // raw responses — is what keeps the ledger the verifiable-pointer record RUN-79 designed, and
-    // stops the join being re-derived, divergently, at each site.
+    // stops the join being re-derived, divergently, at each site. Task pointers in the matched set
+    // are then checked by the daemon (RUN-188, the fix rounds' own path) so what folds below is
+    // the response PLUS the fact — and an unverified pointer folds as exactly that, visible to a
+    // human and a continuation even when the gate underneath declines the contest.
     const contestText = ctx.getSessionText?.().slice(textBefore) ?? '';
     const responses = parseFindingResponses(contestText);
     const terminalIds = new Set(args.findings.map((f) => f.id));
-    const matched = responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id));
+    const matched = await this.verifyTaskPointers(
+      ctx.run.id,
+      responses.filter((r) => r.pointer.trim().length > 0 && terminalIds.has(r.id)),
+    );
 
-    // Fold that matched evidence into the ledger FIRST — before any outcome branch — so a rebuttal
+    // Land that matched evidence on the ledger FIRST — before any outcome branch — so a rebuttal
     // the builder streamed survives even a turn that then ended badly, and a continuation's fresh
-    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). `buildLedger` still writes an
-    // entry for EVERY terminal finding, so one with no matched response stays 'unanswered' rather
-    // than being dropped. NO checkpoint above, so the diff a fresh reviewer would read is still the
-    // one the terminal round judged.
-    const answered = buildLedger(args.ledger, args.findings, matched, args.terminalRound);
+    // reviewer sees it as a prior adjudication (RUN-174 criterion 7). Every terminal finding's
+    // entry was already written when the finding was RAISED (`record`), so this turn only ADDS
+    // answers — `applyContestResponses` resolves each letter against the reconciled entry's
+    // positions, exactly the labelling the contest record above showed the builder (RUN-180): the
+    // report's own lettering and the record's agree except on the overflow path, where the
+    // record — the only letters the builder could answer standing claims by — must win, and
+    // re-running the fold's union here resolved report-first and discarded those answers. A
+    // finding with no matched response keeps its raise-time entry, 'unanswered'. NO checkpoint
+    // above, so the diff a fresh reviewer would read is still the one the terminal round judged.
+    const answered = applyContestResponses(args.ledger, args.findings, matched, args.terminalRound);
 
     // The builder died, errored, or breached its ceiling on the contest turn. The terminal verdict
     // stands — pushing a re-review at a session that just failed is the loop-becomes-spend mistake
@@ -2053,17 +2344,70 @@ export class RunSupervisor {
     // Silence, a `FIXED`, or a finding a cap dropped is not a candidate, so it still stands; an empty
     // pointer or a response for another id never reached `matched` at all. What "checkable" means
     // beyond non-empty — does the pointer actually HOLD — is the fresh reviewer's to judge, below.
-    const contested = new Set(matched.filter((r) => r.status === 'contested').map((r) => r.id));
-    const loc = (s: string) => s.trim().toLowerCase();
-    const visibleToAdjudicator = (f: Finding) =>
-      answered.some((e) => e.id === f.id && loc(e.location) === loc(f.location));
-    if (!args.findings.every((f) => contested.has(f.id) && visibleToAdjudicator(f))) {
+    //
+    // A finding that carries sub-claims is a candidate only when EVERY reconciled sub-claim reads
+    // CONTESTED (RUN-180). This is the exact surface the run_ms4t62384u0z6c6p4f5d escape used: a
+    // bundled finding was "contested" by rebutting the refutable half, and the other half rode the
+    // answer out. A bare `FINDING <n>` response is recorded as evidence but credits no lettered
+    // claim, so answering in halves leaves the unanswered half STANDING — and the finding off the
+    // candidate set.
+    // A contest standing on task pointers none of which the daemon could verify is a pointer at
+    // nothing (RUN-188): it folds into the ledger above — the evidence and its failure are both
+    // recorded — but it is no candidate to clear, exactly like an empty pointer. spinOffsHold is
+    // deliberately vacuous over absent facts, so a response naming no task, a pre-RUN-188
+    // response, and a daemon with no lookup wired all clear (or stand) exactly as they did before.
+    const contestedWhole = new Set(
+      matched
+        .filter((r) => r.status === 'contested' && !r.subclaim && spinOffsHold(r.spinOffs))
+        .map((r) => r.id),
+    );
+    // Candidacy is judged on the RECONCILED entry the fold above just wrote, never on this round's
+    // parse alone — in EITHER direction. The fold deliberately PRESERVES held sub-claims when a
+    // re-raise drops the letters — or repeats only SOME of them, unioning in the claims its
+    // wording does not cover — a fresh terminal reviewer paraphrases by construction, so a
+    // letterless or narrowed re-raise of a half-answered finding still carries its unanswered
+    // claim, and reading `f.subclaims` (empty or a subset on those paths) let a bare or partial
+    // contest clear exactly the claim this format exists to keep standing: the RUN-174 escape
+    // reborn one round later. And symmetrically: the terminal report's own SHAPE must not be a
+    // second gate over a record already fully contested — the contest prompt tells the builder an
+    // already-contested record claim needs no fresh answer, so demanding one per-letter (or a bare
+    // response beside fully contested letters) would fail the exact builder that followed the
+    // prompt. The per-letter responses reach this check through `applyContestResponses`, which
+    // resolved each letter against the reconciled entry's own positions — the record's labelling,
+    // the one the builder was answering by. The entry is also the VISIBILITY check: the
+    // adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
+    // fold (the cap) is not evidence and stands.
+    const answerablyContested = (f: Finding) => {
+      const e = reconciledEntry(answered, f, args.terminalRound);
+      if (!e) return false;
+      const subs = subclaimsOf(e);
+      // Every reconciled sub-claim must read CONTESTED. A carried rebuttal counts — carrying an
+      // answer whose claim wording matched is the fold's whole point — while an unanswered or
+      // FIXED claim stands, whichever round enumerated it. FIXED blocking candidacy is not an
+      // oversight but the whole-finding rule ("a `FIXED` changed nothing here") at sub-claim
+      // grain: the terminal reviewer judged the diff WITH any earlier fix in it and still failed,
+      // so "it is fixed" was already adjudicated and never buys the re-roll. A builder who
+      // believes a FIXED sub-claim no longer holds has this turn's move: CONTEST it, at the letter
+      // the contest record shows for it, with the pointer at the landed change — the fold resolves
+      // that letter back to the claim — and the fresh look then verifies it like any other contest.
+      // A carried contest whose task pointer did not verify blocks candidacy too (RUN-188): the
+      // contest record showed the builder that letter as needing a fresh answer (renderContestRecord
+      // marks it), so demanding one here is the FIXED rule again, not a second gate over a record
+      // the prompt called settled.
+      if (subs.length) return subs.every((s) => s.status === 'contested' && spinOffsHold(s.spinOffs));
+      // A single-claim finding keeps the pre-RUN-180 rule unchanged: the builder must have
+      // contested it THIS turn — silence over a terminal finding is not a contest, however the
+      // entry's carried status reads, because the terminal reviewer raised it over that record.
+      return contestedWhole.has(f.id);
+    };
+    if (!args.findings.every((f) => answerablyContested(f))) {
       // At least one terminal finding was not answerably contested, so it stands and the run fails as
       // it does today — WITHOUT spawning a reviewer whose fresh PASS could clear it (criterion 4).
       // Nothing is spawned to be killed; the contest turn already happened above.
       this.log.info('a terminal finding was not answerably contested — the findings stand', {
         runId: ctx.run.id,
-        contested: contested.size,
+        contested: contestedWhole.size,
+        subclaimResponses: matched.filter((r) => r.subclaim).length,
         findings: args.findings.length,
       });
       transcript.milestone('the terminal findings were not all contested — the run fails');
@@ -2100,6 +2444,7 @@ export class RunSupervisor {
     // re-raises (criterion 4), and a malformed report that lists a finding then signs PASS has not
     // cleared it — either way the finding stands, the same posture judgeWithAcceptance takes for a
     // FAILED criterion under a PASS.
+    const loc = (s: string) => s.trim().toLowerCase();
     const reraised = new Set(
       parseFindings(readjudged.findings)
         .map((f) => loc(f.location))
@@ -2504,12 +2849,18 @@ export class RunSupervisor {
           stepPrompt: (step, i, prior) =>
             `${resumedBrief?.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null) ?? resumeStart.prompt}${renderStepFocus(step, i, resumedChain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) => this.vcsFor(repo).checkpoint(worktree, runCommitMessage(run.id, label)),
+          // Same wave seam as the supervise path (RUN-170): the resumed step's own wave runs
+          // sequentially (the chain enforces that), but the steps AFTER it may overlap.
+          wave: this.waveFor(repo, run),
         })
       : await executeRun(this.executeHost(), resumeBase);
-    // The parked step is gone from the recomputed plan (RUN-168). Reported the way every other
-    // unresumable park is: the workspace is KEPT, because it holds work that exists nowhere else.
-    if ('chainFailed' in executed) return fail(executed.chainFailed);
-    if (executed.parked) return executed.parked;
+    // The parked step is gone from the recomputed plan (RUN-168), or a cancel landed before the
+    // resumed session spawned (RUN-165). Both still SETTLE: the park's workspace holds the earlier
+    // sittings' work, and settle's own probe is what keeps it — plus the terminal report, the lock
+    // release, the refreshed continuation record and the cancellation cleanup that a bare `fail()`
+    // here skipped. The inert outcome walks the same pipeline, which on a failed exit is `settle`.
+    const outcome = 'chainFailed' in executed ? sessionlessChainExit(run, executed.chainFailed) : executed;
+    if (outcome.parked) return outcome.parked;
 
     return this.afterDriver({
       run,
@@ -2520,14 +2871,14 @@ export class RunSupervisor {
       noriqMcp,
       task: run.anchor?.type === 'task' ? await this.resolveAnchorTask(run.anchor.taskId) : null,
       runAgent,
-      session: executed.session,
-      stopSession: executed.stopSession,
+      session: outcome.session,
+      stopSession: outcome.stopSession,
       executedSpec: resumedSpec,
-      exit: executed.exit,
+      exit: outcome.exit,
       tally,
-      verifyText: executed.sessionText,
-      getSessionText: executed.getSessionText,
-      tail: executed.tail,
+      verifyText: outcome.sessionText,
+      getSessionText: outcome.getSessionText,
+      tail: outcome.tail,
     });
   }
 
@@ -2625,11 +2976,19 @@ export class RunSupervisor {
             `${start.prompt}${renderStepFocus(step, i, chain.steps.length)}${renderPriorSteps(prior)}`,
           checkpoint: (label) =>
             this.vcsFor(prepared.repo).checkpoint(prepared.worktree, runCommitMessage(run.id, label)),
+          // The wave seam (RUN-170): overlap capability, limit and the run-addressed return trip,
+          // injected as closures the way checkpoint is.
+          wave: this.waveFor(prepared.repo, run),
         })
       : await executeRun(this.executeHost(), base);
-    // A chain that could not start at all (RUN-168) — no session, so nothing to settle around.
-    if ('chainFailed' in executed) return fail(executed.chainFailed);
-    if (executed.parked) return executed.parked;
+    // A chain that never started a session (RUN-168) is still a run that PREPARED: the workspace
+    // is leased, the locks are held, the transcript is open, a cancel has written the record only
+    // `settle` forgets (RUN-165) — so "no session" is not "nothing to settle around". Shaped as an
+    // inert outcome it enters the same post-driver walk as every other exit, which reduces to
+    // `settle` on a failed exit; `fail()`-ing here instead bypassed the terminal report, the lock
+    // release and the workspace's keep-or-dispose decision.
+    const outcome = 'chainFailed' in executed ? sessionlessChainExit(run, executed.chainFailed) : executed;
+    if (outcome.parked) return outcome.parked;
 
     return this.afterDriver({
       run,
@@ -2640,13 +2999,13 @@ export class RunSupervisor {
       ...(prepared.noriqMcp ? { noriqMcp: prepared.noriqMcp } : {}),
       task: prepared.task,
       runAgent: prepared.runAgent,
-      session: executed.session,
-      stopSession: executed.stopSession,
-      exit: executed.exit,
+      session: outcome.session,
+      stopSession: outcome.stopSession,
+      exit: outcome.exit,
       tally: prepared.tally,
-      verifyText: executed.sessionText,
-      getSessionText: executed.getSessionText,
-      tail: executed.tail,
+      verifyText: outcome.sessionText,
+      getSessionText: outcome.getSessionText,
+      tail: outcome.tail,
       continued: prepared.continued,
       executedSpec,
     });
@@ -3181,6 +3540,39 @@ const POST_DRIVER_STAGES: Partial<Record<StageName, StageImpl>> = {
   integrate: integrateStage,
   settle: settleStage,
 };
+
+/**
+ * A chain failure with no session behind it, shaped to enter the post-driver walk (RUN-170).
+ *
+ * `executeChain` can fail before ANY session exists — a cancel that lands ahead of the first spawn
+ * (RUN-165), a wave whose every member failed to lease, a parked step gone from its recomputed
+ * plan (RUN-168). Returning those through `fail()` skipped `settle`, and settle is not optional
+ * there: prepare has already leased the workspace, taken the locks and opened the transcript, a
+ * cancel has written the record only settle forgets, and a failed wave can have landed children's
+ * work onto the parent's branch — work the dispose decision must see, or it is force-deleted work
+ * that exists nowhere else. The inert session is never exercised: every stage that would touch it
+ * gates on `driverSucceeded` / `exit.outcome === 'done'`, which this exit fails by construction,
+ * so the walk reduces to the one stage that runs no matter how the run got here.
+ */
+function sessionlessChainExit(run: Run, reason: string): ExecuteOutcome {
+  const exit: DriverExit = { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
+  return {
+    exit,
+    session: {
+      runId: run.id,
+      // There is no live input to deliver into; `false` is the contract's honest "turn NOT
+      // delivered" (drivers/types.ts), which is what keeps steering's fallback path working.
+      pushInput: () => false,
+      interrupt: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      done: () => Promise.resolve(exit),
+    },
+    stopSession: () => Promise.resolve(),
+    sessionText: '',
+    getSessionText: () => '',
+    tail: '',
+  };
+}
 
 /** One line per reviewer look, in the transcript's system voice (RUN-74). */
 function reviewVerdictMilestone(v: VerifyVerdict, round: number): string {

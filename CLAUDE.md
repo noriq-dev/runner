@@ -114,11 +114,133 @@ weak: "no finding was **recorded** against it", not "met" (nobody objecting is n
 anyone checking) and not "raised" (the ledger is bounded, so it can only speak for what survived).
 On a PASS nothing is reported as standing: the gate read each finding and its rebuttal and cleared
 the work anyway, so a summary still calling one open would contradict its own run.
+A finding is also the unit the builder ANSWERS, and the reviewer's collapse rule (one numbered
+finding per root cause, or a run is unconvergeable inside its round budget) made that unit
+bundleable — so a finding carrying two separately-answerable claims was answerable in halves while
+recorded as answered as a whole, and the first live terminal review lost a valid claim exactly
+there: the builder rebutted the half it could refute and the other half rode the answer out.
+RUN-180 prices that: a collapsed finding enumerates separately-answerable claims as lettered
+sub-claim lines (`FINDING 1a: …`), a RESPONSE is credited only for the letters it names, and an
+unaddressed sub-claim STANDS — visibly in the ledger and the per-requirement report, and decisively
+in the terminal contest, where a finding whose sub-claims are only partly contested is no candidate
+to clear and the run fails without spawning the re-adjudicating reviewer. A sub-claim's IDENTITY is
+its normalized claim text, never its letter — the structural settlement this run's own gestation
+forced, after eight review rounds each found another leak in letter-set reconciliation (cap-slice,
+prefix aliasing, letterless re-raise, subset re-raise, markdown decoration): positional labels
+assigned per-round by a memoryless reviewer cannot be identities, so the letter-repair machinery
+(collision remapping, next-free-letter, kept letters) was deleted rather than extended. A letter
+is pure position — the parse enforces `a, b, c…` in report order — read once at the fold boundary
+to resolve a RESPONSE against the lines its writer was shown (this report's own, and past them the
+record's positions), then discarded; every render re-derives letters from position, and the
+contest turn is handed THE RECORD — each standing sub-claim with the letter that answers it here —
+because without it a claim the terminal report does not re-list would be standing and unanswerable
+at once, and its answers land on the record's positions ALONE (`applyContestResponses`): the one
+turn that may add no claims never re-runs the union, because report-first resolution on the
+overflow path — where the record is the held set and the report's enumeration is the thing that
+was dropped — discarded answers to the very claims the record displayed as answerable.
+Candidacy is judged on the RECONCILED ledger entry, never on the terminal round's own
+parse: the fold preserves held claims when a re-raise drops the letters (a fresh reviewer
+paraphrases by construction) — and when it repeats only SOME of them, unioning in the claims its
+wording does not cover, because a narrowed re-raise replacing the set wholesale was the same
+escape one fold up. Only a claim the re-raise abandoned AND the builder had rebutted is dropped —
+settled by both sides — and the union never slices: past the entry's cap (twice one round's
+enumeration cap) the held set stands whole and the new enumeration is the thing dropped,
+all-or-nothing again, with this turn's answers still landed on it by wording. Carried answers
+match a re-raised sub-claim by its WORDING, and a truncated (ellipsis-capped) claim never matches
+— two distinct over-cap claims share it — the may-miss-never-invent order of harms, one level
+down. The held record itself transfers across a re-raise only on a match that cannot be an
+invention — the parent claim's full wording, or a shared requirement at a specific location: the
+60-char prose prefix still names the ENTRY (legacy identity, unchanged) but cannot hand contested
+letters to a claim that diverges past it, which is prefix aliasing at parent grain buying a fresh
+look on contests nobody made. Instances of one root cause never become letters — they stay evidence inside one claim, or
+the letters are the instance-enumeration the collapse rule bought out. The format is optional and
+positionally additive like the requirement bracket, so everything written before it parses
+byte-identically; a persisted ledger predating sub-claims loads as single-claim entries, and one
+persisted by the letter-era shape loads claim-keyed with its stored letters ignored. The
+enumeration invariant — no separately-answerable claim escapes its own answer — has exactly ONE
+enforcement point, the parse-time classifier (RUN-90's chokepoint rule applied to the format
+itself), and the rule validity RESTS on is the COMPLETENESS CERTIFICATE, not any shape: an
+enumerating FINDING line ends its claim with `[sub-claims: <n>]`, and the letters are kept only
+when exactly n strict in-sequence lines parse. Shape nets can only void what they can SEE, and a
+mangled line can compose decoration, spacing and separator loss into plain English (`(b) FINDING
+1 b — claim B` is invisible to any rule that spares prose — the composition class every rewrite
+of the nets leaked at); the certificate voids by ABSENCE instead, since a line that mangles into
+ANYTHING is simply not counted, and no certificate — or a mutated one, which fails to parse as
+one — keeps no letters at all, the same safe degradation. What the certificate cannot see is a
+STALE count — one that excludes a mangled sibling by fiat rather than by absence, a mundane slip
+rather than incoherence — and POSITION closes that: the enumeration is a contiguous BLOCK
+directly under the FINDING line, and the finding's ZONE — from the block's end to the next
+structural line (the next numbered FINDING, ESCALATE/ACCEPTANCE/VERDICT, or the end of the
+report) — must hold nothing but blank lines, so a sibling written into its own finding's
+territory voids the whole whatever it mangled into, and a blank line cannot detach it. Within a
+finding's territory every content line is recorded, structural, or a voider — there is nowhere
+left for an unrecorded claim to sit — so narration lives above the findings or below the
+structural lines, and prose that strays into a zone costs the enumeration (dull), never keeps a
+subset. Claim identity also survives its own display cap: the display keeps the legacy
+bare-ellipsis cap, byte-identical, and an over-cap claim stores its FULL normalized text in a
+separate identity field beside it — whole at ANY length, never hashed, truncated, or bounded (a
+truncated identity aliases every claim sharing its prefix, a 32-bit fingerprint is trivially
+collided into merging two claims — this run's own terminal round mined the collision that killed
+the fingerprint edition — and a length bound is a cliff where an exact letterless re-raise LOSES
+its partly answered record, which the round after mined at bound+1; the count and display caps
+are what keep the ledger distilled, and identity is the one field whose job is losslessness) —
+so a verbatim re-raise of a long claim recognises its held record, two distinct long claims can
+never alias, and only a record the bare-ellipsis era persisted still refuses to match: the
+visible duplicate row it always was. The parse chokepoint also owns the LINE SHAPE it
+classifies — line endings are normalized before any anchor runs, because a CRLF report's
+findings still parsed while its every enumeration silently voided on the `\r` the anchors
+refuse — and the persisted-record reader applies the same all-or-nothing grain at the other
+boundary where sub-claim state is born: a malformed entry or an over-long list voids whole to
+the single-claim entry, never to the well-formed subset a partial contest could clear around,
+while fields inside a well-formed entry degrade toward STANDING, the direction that cannot
+clear. What
+remains around those rules is hygiene, not
+the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
+is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
+letters, and a colon hard by the number is label-intent where a colon further on is sentence
+structure), the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
+voids everywhere but the finding's OWN block lines, the only places a lettered token is format
+rather than mutation), and the SPACED LABEL net (a LONE letter adrift of its number across pure
+punctuation — the composition that wears decoration, drops the colon and un-glues the letter all
+at once, which is how a sibling written below a structural line sat outside every zone; a
+following letter makes it an ordinary word, so mention survives, and the lone single-letter word
+is the priced cost). A letter that survives only as line decoration (`(b) FINDING 1 — …`) is
+attributable by nothing but position — it is byte-for-byte how narration quotes the record — so
+inside a finding's territory it voids by zone and outside one it is the unattributable residual
+the certificate also excluded from its count. There is deliberately no
+in-range sparing left: a recorded letter can be WORN by a distinct unrecorded claim, and a stale
+certificate that counts only the strict line then blesses the kept subset — so reports narrate a
+sub-claim as `(a)`, the form every render uses, never as a bare `FINDING 1a` token. A
+mid-sentence mention with no colon beside it and no label on the number stays harmless prose,
+since reports narrate their findings by number and voiding on mention would kill every
+enumeration in a report that explains itself. Fold, render, and candidacy consume the canonical
+set and carry no shape detection or degradation rules of their own — the class dies where the
+data is born, or it does not die. The terminal report's own shape is not a second gate either: candidacy asks the
+reconciled entry — every sub-claim contested and visible, or the finding stands — and the
+per-letter contests reach it through the contest application, so a letterless re-raise answered
+through the record's letters clears without a bare response beside it.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud
 that a spec cannot change an agent's mode, permissions, or what it may publish, because every field
 in it is free text from the server.
+
+A finding that is real but not THIS task's also has somewhere to go besides a fix round
+(RUN-188): `spin_off_task`, on the build and verify floors, files it as its own task. The
+distinction is drawn against `raise_alert` and the two must not merge: an alert is a concern that
+is NOT work ("this smells wrong"); a spin-off is work that is not mine — RUN-186's landing run
+contested with evidence and raised an alert carrying a full design sketch, and still FAILED,
+because an alert is prose: it records the concern but creates no work a gate can point at, and a
+human had to fold it into a task by hand. It does not reopen RUN-69: `create_task` stays off every
+floor, and the spin-off's product is a PROPOSED task — visible, carrying provenance (source task,
+source run, the finding) — not claimable and not pumpable until a human accepts it, the RUN-23
+gate again. What makes it more than bookkeeping is the gate integration: a spun-off task is an
+adjudicable object — a `CONTESTED` may point at it as checkable evidence ("real, out of scope,
+tracked THERE"), the DAEMON verifies the pointer mechanically and hands the result to the
+credential-less reviewer as data (RUN-43: the judge cannot move work, so it gets facts, not a
+token), a failed or unavailable lookup never CREDITS the contest (may-miss-never-invent, again) —
+and the reviewer can still REJECT a spin-off as evasion: a criterion the diff owed cannot be spun
+off; newly-found adjacent work can.
 
 A task that arrives WITHOUT one gets the **`plan` stage** (RUN-140): a fresh read-only agent
 (`src/stages/plan.ts`, `prompts/planner.md`) reads the repo, emits a spec, and the daemon writes it

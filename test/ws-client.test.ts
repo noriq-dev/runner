@@ -126,6 +126,24 @@ describe('WsClient', () => {
     client.stop();
   });
 
+  // RUN-170. The server is the admission authority and dispatches against the last freeSlots it
+  // HEARD — so a capacity change that waits out the beat interval is a window it can dispatch
+  // into (a wave grant claims several slots the previous beat still called free). The grant's
+  // owner pushes the advertisement itself instead of waiting.
+  it('advertiseCapacity pushes the current freeSlots at once — no beat, no ping (RUN-170)', () => {
+    let slots = 3;
+    const client = makeClient({ freeSlots: () => slots });
+    client.start();
+    const s = sockets[0]!;
+    s.emit('open');
+    const before = s.sent.length;
+    slots = 0; // a wave grant just claimed the machine
+    client.advertiseCapacity();
+    // Exactly one frame, and no ping alongside: an advertisement, not a liveness probe.
+    expect(s.msgs().slice(before)).toEqual([{ type: 'heartbeat', freeSlots: 0 }]);
+    client.stop();
+  });
+
   // RUN-176. The daemon survived suspend/resume as a live process on a dead socket: writes into a
   // half-open socket succeed into the kernel buffer, no FIN ever arrives, `close` never fires, and
   // the reconnect ladder — correct on every real close — was simply never entered. 14 hours

@@ -1,6 +1,6 @@
 import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { MAX_STEPS, checkSteps, planWaves, renderSteps } from '../src/steps';
+import { MAX_STEPS, checkSteps, owningRunId, planWaves, renderSteps, stepWorkspaceId } from '../src/steps';
 
 // RUN-148. A spec may declare an ordered decomposition. The PLANNER owns the judgement (which files
 // are one coherent piece of work); the daemon owns the mechanics (are these ids usable, is this
@@ -156,6 +156,34 @@ describe('grouping steps into waves', () => {
       .flat()
       .map((s) => s.id);
     expect(flat.sort()).toEqual(['a', 'b', 'c', 'd']);
+  });
+});
+
+// RUN-170. Wave children are STEPS of one run, not runs of their own: a child workspace id embeds
+// its parent's run id so ownership is recoverable with no external registry — the same rule that
+// lets reapOrphans reconstruct run ids from branch names.
+describe('a wave child’s workspace identity', () => {
+  it('rides the parent run id, recoverably', () => {
+    const id = stepWorkspaceId('run_1', 's2-steering');
+    expect(id).toBe('run_1--s2-steering');
+    expect(owningRunId(id)).toBe('run_1');
+  });
+
+  // The id reaches git refs and worktree directory names, and a step id is a planner's free text.
+  // `.` is excluded because `..` is invalid inside a ref component.
+  it('narrows a free-text step id to ref-safe characters', () => {
+    expect(stepWorkspaceId('run_1', 'fix auth (v2)…')).toBe('run_1--fix-auth-v2-');
+    expect(stepWorkspaceId('run_1', 'a..b')).toBe('run_1--a-b');
+  });
+
+  it('answers a plain run id with itself — the sweep asks about every workspace', () => {
+    expect(owningRunId('run_ms6w066e')).toBe('run_ms6w066e');
+  });
+
+  // A step id containing the separator still resolves to the parent: the FIRST separator wins,
+  // because a real run id is server-minted and never contains one.
+  it('finds the parent past a separator inside the step id itself', () => {
+    expect(owningRunId(stepWorkspaceId('run_1', 'a--b'))).toBe('run_1');
   });
 });
 

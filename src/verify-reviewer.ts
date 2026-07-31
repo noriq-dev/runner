@@ -36,7 +36,11 @@ export interface ReviewerPromptContext {
   verifyPending?: string | null;
   /** Findings already raised and answered in earlier rounds (RUN-79). Empty/absent on the
    *  first look — a fresh reviewer with no history yet. Rendered into the PRIOR ADJUDICATIONS
-   *  section so a settled finding is verified, not relitigated. */
+   *  section so a settled finding is verified, not relitigated. Since RUN-188 an answer may also
+   *  carry the daemon's task-pointer check (`→ daemon:` lines in the render): this actor holds no
+   *  Noriq credential and can never look a task up (RUN-43), so the verified spin-off facts
+   *  reach it HERE, as data inside the same ledger — deliberately not a separate context field,
+   *  so every entry path that threads a ledger threads the facts with it. */
   ledger?: LedgerEntry[];
   /** The repo's own orientation, NAMES ONLY (RUN-154). This is the actor being asked "does this
    *  look like this repo's code?", and it was the one told nothing about what this repo's code
@@ -119,7 +123,28 @@ export interface ReviewerPromptContext {
  *  RUN-66 round-1 defects as raw notes now returns one finding naming the cause and citing the
  *  other three as evidence, where the pre-rule wording returned four. That converges the fix in one
  *  round, or proves the work is bigger than the rounds left — either beats learning it last round,
- *  which is the RUN-66 outcome this exists to stop. */
+ *  which is the RUN-66 outcome this exists to stop.
+ *
+ *  RUN-188 adds the spin-off adjudication rule: a CONTESTED answer may point at a TASK
+ *  (`task:<key>`) — work that is real but not this change's, now tracked on its own. The template
+ *  splits the judgment along the credential line: the DAEMON has already run the mechanical half
+ *  (the task exists, its provenance) and its result rides the ledger render as `→ daemon:` lines,
+ *  so the reviewer is told to trust that line over the builder's prose and to treat an unverified
+ *  pointer as pointing at nothing; what stays the reviewer's is SUBSTANCE — the evasion test,
+ *  stated like the revert test (mechanical, both directions): a criterion the diff was
+ *  commissioned to meet cannot be spun off, newly-found adjacent work can. The rule lives only in
+ *  reviewer.md (RUN-89's one-place discipline) — the builder-facing templates teach the pointer
+ *  FORM and nothing of the judgment.
+ *
+ *  RUN-180 amends the collapse rule with the cost it turned out to carry. A finding is the unit the
+ *  builder answers, so a collapsed finding bundling two separately-answerable claims was answerable
+ *  in halves while recorded as answered as a whole — the first live terminal review (RUN-174's run)
+ *  lost a valid claim exactly there, the builder rebutting the refutable half while the other rode
+ *  out unanswered with no format to say "the first half stands". The prompt now asks for lettered
+ *  sub-claim lines when the one finding carries separately-answerable claims, and states the test
+ *  (refutability, not countability) against the instance list, because a reviewer told only
+ *  "enumerate sub-claims" would letter its instances and re-open the RUN-66 convergence failure the
+ *  collapse rule closed. */
 export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
   return renderPrompt('reviewer', {
     diffCmd: ctx.diffCmd ?? null,
@@ -167,9 +192,27 @@ export function reviewerFeedbackPrompt(
  * judging reviewer reads (RUN-89's other half). Restating it here is a second place it could drift;
  * the builder contests with a pointer, the mechanical test stays with the judge. The findings cap
  * mirrors `reviewerFeedbackPrompt`'s (a report longer than this has stopped being actionable).
+ *
+ * The per-sub-claim answer form (RUN-180) IS restated here, unlike the scope rule, because it is
+ * format rather than judgment — the builder cannot answer in halves in a shape it was never shown,
+ * and this turn is the exact surface where the bundled-finding escape happened: a whole-finding
+ * CONTESTED credits no lettered claim, and a sub-claim left unanswered keeps the finding standing.
+ *
+ * `record` is the reconciled sub-claim record for the terminal findings (renderContestRecord),
+ * rendered because letters are positional labels rather than state (the structural settlement): a
+ * standing sub-claim this report does not re-list has no letter the builder could otherwise know,
+ * so without the record it would be standing AND unanswerable — a trap, not a gate. Null renders
+ * the prompt without the section, which is every finding that never enumerated.
+ *
+ * The task-pointer form (RUN-188) is taught here for the same reason the sub-claim form is —
+ * format, not judgment: a builder cannot contest "real, out of scope, tracked THERE" in a
+ * vocabulary it was never shown, and this terminal turn is exactly where RUN-186's landing run
+ * had nowhere checkable to point. The record also marks a carried contest whose task pointer did
+ * NOT verify (renderContestRecord), because the candidacy gate refuses it and a prompt calling it
+ * settled would fail the builder that followed the prompt.
  */
-export function reviewerContestPrompt(findings: string): string {
-  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000) });
+export function reviewerContestPrompt(findings: string, record?: string | null): string {
+  return renderPrompt('reviewer-contest', { findings: findings.slice(-6000), record: record ?? null });
 }
 
 /** Format a final reviewer rejection for a task comment (the gate surface). */

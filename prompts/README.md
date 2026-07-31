@@ -101,6 +101,41 @@ shape: each round is a fresh reviewer that never saw the last one's wording, so 
 comes back reworded and the ledger's prose key misses it. It also says not to stretch a finding to
 fit a requirement, because a wrong association is worse than none.
 
+A collapsed finding may enumerate its separately-answerable claims as lettered sub-claim lines —
+`FINDING <n><letter>: <claim>`, lettered `a, b, c…` in order, under a FINDING line whose claim
+ends with the completeness certificate `[sub-claims: <count>]` — and the RESPONSE side answers per
+letter (RUN-180). The certificate is what makes the enumeration all-or-nothing against shapes no
+net can see: the letters are kept only when exactly `<count>` well-formed lines parse, so a line
+that mangles into anything — even plain English — subtracts from the count and voids the whole,
+and a FINDING line without the certificate keeps no letters at all.
+`reviewer-feedback.md` and `reviewer-contest.md` both carry the answer shape,
+because a response is credited only for the sub-claims it names: an unaddressed sub-claim stands
+rather than riding its siblings' answer, which is how a bundled finding once left a valid half
+"answered" by the rebuttal of the other. A sub-claim's identity is its claim WORDING, not its
+letter — letters are positional labels of the report in front of the responder, re-derived at
+every render — which is why `reviewer.md` tells a re-raise to restate a standing sub-claim's
+wording exactly, and why `reviewer-contest.md` takes `{{record}}`: the reconciled sub-claims of
+the terminal findings with the letters that answer them, since a standing claim the terminal
+report does not re-list has no letter the builder could otherwise know. Both sides are optional
+and positionally additive, like the requirement bracket — a report or response written without
+letters parses byte-identically, and malformed lettering degrades to the single-claim finding. The
+prompt draws the line the parser cannot: instances of one root cause stay evidence inside one
+claim, so the letters never become the instance-enumeration the collapse rule (RUN-89/90) bought
+out.
+
+A CONTESTED pointer may also name a TASK — `task:<key>`, "real, out of scope, tracked THERE"
+(RUN-188). Deliberately not a parse change: the pointer was always free text, so the vocabulary is
+taught in `reviewer-feedback.md` and `reviewer-contest.md` and read out by the daemon
+(`taskRefsIn`), which looks each named task up itself — the judging reviewer holds no Noriq
+credential (RUN-43) — and folds the result into the ledger as `→ daemon:` data lines beside the
+answer. The judgment split follows the credential line: existence and provenance are the daemon's
+mechanical facts; substance and the **evasion test** (a criterion the diff was commissioned to
+meet cannot be spun off; newly-found adjacent work can) are the reviewer's, and that rule lives
+solely in `reviewer.md` — the builder-facing templates carry only the pointer form, the RUN-89
+one-place discipline again. A task the daemon could not verify never credits a contest
+(may-miss-never-invent): it renders NOT verified, and at the terminal contest the finding stands
+without a fresh adjudicator being spawned.
+
 `verify-agent.md` and `reviewer.md` carry it too since RUN-154, in a **names-only** rendering: the
 same entry points, conventions, and required-reading NAMES, with no file contents inlined. A
 reviewer judging whether a diff looks like this repo's code is where conventions matter most, and it

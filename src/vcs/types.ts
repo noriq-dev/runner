@@ -5,6 +5,11 @@ import type { LockConflict, LockGrant } from '../lock-client';
  * outcomes rather than git verbs. This is VCS-SPIKE.md §2 made real — the operation set was
  * *discovered, not designed*: RunSupervisor's `Pick<WorktreeManager>` already declared exactly
  * this list, so extracting it is a rename of a seam every test already injects through.
+ * (`openReview` joined later — RUN-85, the RUN-28 merge-request flow asked backend-neutrally —
+ * by the same discovery route: daemon.ts was already doing it, git-only, outside the seam.
+ * `integrateFromRun`/`publishToRun` joined at RUN-170: the same two contracts with the other
+ * side named BY RUN ID, so a wave's child step can return to its parent run's line without a
+ * ref ever crossing the seam.)
  *
  * Two shapes here were arrived at by being burned, and must survive any future backend verbatim:
  *
@@ -107,6 +112,34 @@ export type PublishResult =
 export type ShareResult = { ok: true } | { ok: false; detail: string };
 
 /**
+ * What `openReview` (RUN-85) needs, said backend-neutrally. `head` and `base` are
+ * backend-interpreted strings in exactly the register `targetExists`/`createTarget` use for
+ * `target` — git reads branches, a server-backed VCS reads whatever names its lines.
+ */
+export interface ReviewRequest {
+  /** The plan's working target holding the landed work — already shared, where sharing exists. */
+  head: string;
+  /** The protected target, named by the repo's manifest (`[land].mergeTarget`). Never by a dispatch. */
+  base: string;
+  planTitle: string;
+  planKey: string;
+}
+
+/**
+ * The outcome of asking for an onward review (RUN-85). Field contracts are MergeRequestResult's,
+ * kept verbatim — the daemon's reconcile path branches on them.
+ */
+export interface ReviewResult {
+  ok: boolean;
+  /** Where the review lives, when one was opened (git: the PR URL). */
+  url?: string;
+  /** Why it could not be opened. Never throws — a plan's work is landed and pushed either way. */
+  detail?: string;
+  /** The command a human can run, when we could not. */
+  command?: string;
+}
+
+/**
  * What a lock op needs beyond the workspace (RUN-98): which project, whose identity holds the
  * lock, the scope branch, and the task to auto-release against.
  *
@@ -161,6 +194,19 @@ export interface VcsBackend {
    * backend say which shape it is; absent means git's (skip to keep).
    */
   readonly disposePreservesWork?: boolean;
+
+  /**
+   * True when this backend can hold MANY leases at once — git isolates in SPACE (a worktree
+   * per lease costs nothing), so a wave's overlapping steps may each take one (RUN-170).
+   *
+   * Absent means leases take turns (the live backends' pool-of-1 queue, RUN-48) — and on such
+   * a backend overlap is not merely slow but a DEADLOCK: a child lease taken while the parent
+   * holds the pool blocks forever, in-process, with nothing to time out. The wave scheduler
+   * reads this flag and runs the same wave sequentially instead, which is always a correct way
+   * to do the work. Absent is deliberately the unsafe-to-overlap reading, so a new backend
+   * gets the conservative behaviour without knowing this flag exists.
+   */
+  readonly leasesOverlap?: boolean;
 
   /** Lease an isolated workspace, exclusively, for this Run. Git mints one; a live backend
    *  would wait its turn for one. */
@@ -217,6 +263,22 @@ export interface VcsBackend {
   abandonIntegrate(ws: Workspace): Promise<void>;
 
   /**
+   * `integrate`, with the base named BY RUN ID (RUN-170): make the workspace contain run
+   * `runId`'s current work PLUS this workspace's own — how a wave's child step picks up the
+   * parent run's accumulated line before landing back on it. By run id, NOT by ref, symmetric
+   * with `LeaseOptions.fromRunId`: how a run's work is named (a branch, a shelved change) is
+   * the backend's own business, and a ref parameter here would reopen the exact leak RUN-50
+   * closed — `publish`'s old `fromRef` was the supervisor passing git's branch name back in.
+   *
+   * Same conflict contract as `integrate`: PATHS, left IN PROGRESS for an agent to resolve;
+   * callers that don't resolve must `abandonIntegrate`. A backend whose leases cannot overlap
+   * (`leasesOverlap` absent) never legitimately receives this call — its waves run
+   * sequentially in one workspace — and refuses loudly rather than guess at a line it has no
+   * name for.
+   */
+  integrateFromRun(ws: Workspace, runId: string): Promise<IntegrateResult>;
+
+  /**
    * Land the workspace's state on `target` IFF the target hasn't moved — compare-and-swap,
    * never a merge commit. Losing the race is an expected result, not an error: report it and
    * let the caller re-integrate.
@@ -228,6 +290,17 @@ export interface VcsBackend {
   publish(ws: Workspace, target: string): Promise<PublishResult>;
 
   /**
+   * `publish`, with the target named BY RUN ID (RUN-170): land the workspace's state on run
+   * `runId`'s line IFF that line hasn't moved — compare-and-swap, never a merge commit,
+   * `publish`'s contract verbatim. This is the child→parent return trip of a concurrent wave,
+   * and the CAS is what serializes two children finishing together: the loser gets
+   * `{ok:false, reason:'race'}`, re-runs `integrateFromRun`, and retries — the same race the
+   * landing flow already handles against `[land].branch`. Run-id addressed for
+   * `LeaseOptions.fromRunId`'s reason: no ref crosses the seam.
+   */
+  publishToRun(ws: Workspace, runId: string): Promise<PublishResult>;
+
+  /**
    * Git's extra publishing step (RUN-27 `[land].autoPush`): push the landed target to its
    * remote — one explicit refspec, never force. Meaningless on a server-backed VCS, where
    * `publish` already reached the server; kept on the interface because the daemon's merge-
@@ -236,6 +309,22 @@ export interface VcsBackend {
    * not a failure.
    */
   share(repoRoot: string, target: string, remote?: string): Promise<ShareResult>;
+
+  /**
+   * Open the plan's onward review from `head` into `base` — RUN-28's merge request, named as an
+   * outcome (RUN-85). Git shells the operator's `gh`, in the DAEMON, after the gate
+   * (merge-request.ts holds the credential rationale). A server-backed VCS, where `gh` is not
+   * the review surface and no review API has been measured, answers honestly that review
+   * happens in its own tool: `{ok:false}` with a `detail` naming the backend and where a human
+   * acts — so the caller warns and records instead of silently doing nothing, which is the
+   * exact defect RUN-85 closes.
+   *
+   * REQUIRED, not optional — share()'s pattern, not `lock?`'s, deliberately: the daemon asks
+   * this of every backend at plan completion, and an omitted method would BE the silence this
+   * verb exists to remove. Required forces each future backend to say where review happens.
+   * Returns rather than throws: the work is landed (and shared, where sharing exists) either way.
+   */
+  openReview(repoRoot: string, review: ReviewRequest): Promise<ReviewResult>;
 
   /**
    * Crash recovery: find workspaces whose Run died with a previous daemon and clean them up —

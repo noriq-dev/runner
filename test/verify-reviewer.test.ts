@@ -176,6 +176,7 @@ describe('assembleReviewerPrompt', () => {
           status: 'contested',
           pointer: 'commit 11f19c8',
           reason: 'pre-existing, added by RUN-60',
+          subclaims: [],
         },
       ],
     });

@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
+import type { LedgerEntry } from '../src/adjudication';
 import type { ParkState, RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
 import { totalTokens } from '../src/drivers/budget';
@@ -26,6 +27,7 @@ import {
   type RunReport,
   RunSupervisor,
   RunTally,
+  type SpinOffLookup,
   assemblePrompt,
   effectiveKind,
   mergeBudget,
@@ -322,6 +324,30 @@ class FakeWorktrees {
     this.pushes.push({ root, branch });
     return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
   };
+
+  // ── waves (RUN-170) ────────────────────────────────────────────────────────
+  /** Opt a test into overlapping leases. False (the default) is the pool-of-1 posture, so every
+   *  existing test keeps the sequential chain it always modelled — the conservative reading the
+   *  seam documents for a backend that says nothing. */
+  leasesOverlap = false;
+  /** Every run-addressed integrate/publish, with the RUN it named — the assertion that no branch
+   *  or ref for the parent's line ever originates in supervisor/chain code. */
+  integratedFromRun: Array<{ ws: string; runId: string }> = [];
+  integrateFromRun = async (
+    ws: Workspace,
+    runId: string,
+  ): Promise<{ ok: true } | { ok: false; conflicts: string[] }> => {
+    this.integratedFromRun.push({ ws: ws.runId, runId });
+    return { ok: true };
+  };
+  publishedToRun: Array<{ ws: string; runId: string }> = [];
+  publishToRun = async (
+    ws: Workspace,
+    runId: string,
+  ): Promise<{ ok: true; sha: string } | { ok: false; reason: 'race' | 'error'; detail: string }> => {
+    this.publishedToRun.push({ ws: ws.runId, runId });
+    return { ok: true, sha: 'wavesha' };
+  };
 }
 
 const perm = (write: boolean): PermissionProfile => ({
@@ -435,17 +461,32 @@ function harness(
     hangRelease?: boolean;
     /** The declared scope the predictive resolver returns (RUN-103); presence wires the dep. */
     lockScope?: string[] | null;
-    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. */
+    /** Which runs an operator has cancelled (RUN-165). Presence wires the steering dep. The array
+     *  is read LIVE, so a test can push into it mid-run to model a cancel landing in a gap. */
     cancelled?: string[];
+    /** Observe each report as it happens — how a test lands a cancel at an exact point in the
+     *  pipeline rather than before it starts (RUN-170's settle test needs the gap between the
+     *  stage-boundary checks and the chain's first spawn). */
+    onReport?: (runId: string, r: RunReport) => void;
     /** The anchor task the server hands back — how a test gives a run an execution spec, and so
      *  the acceptance criteria its gate must answer (RUN-145). */
     anchorTask?: AnchorTask | null;
+    /** RUN-188 task-pointer lookup. Presence wires resolveSpinOff; the map is ref → task (a
+     *  missing ref answers null, 'fails' → every lookup throws, 'hangs' → every lookup never
+     *  resolves, driving the deadline). Absent = the dep is not wired, the pre-RUN-188 daemon. */
+    spinOffTasks?: Record<string, SpinOffLookup> | 'fails' | 'hangs';
+    /** RUN-170: how many wave steps may overlap. Presence wires the waveLimit dep the daemon
+     *  binds; absent = the dep is not wired, and the supervisor's conservative default (1) holds. */
+    waveLimit?: number;
+    /** RUN-170: the fake backend's isolation model. true = git's (leases overlap). */
+    leasesOverlap?: boolean;
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
   // (RUN-164) — a test of a resumed chain has to be able to model that.
   let anchorTask = over.anchorTask ?? null;
   const worktrees = new FakeWorktrees();
+  if (over.leasesOverlap) worktrees.leasesOverlap = true;
   if (over.changed === false) worktrees.changed = false;
   if (over.createFails) worktrees.createFails = true;
   if (over.conflicts) worktrees.conflicts = over.conflicts;
@@ -472,6 +513,8 @@ function harness(
   if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
   const claimChecks: string[] = [];
+  /** Cancellation records settle cleaned up (RUN-165) — the steering `forget` calls. */
+  const forgets: string[] = [];
   const agentCreates: Array<{ label?: string; allowedTools?: string[] }> = [];
   // Mutable, because the real thing is: once a human answers, the server marks the signal
   // answered and moves the run back to running, so the NEXT check says "not blocked".
@@ -491,6 +534,7 @@ function harness(
       reports.push({ runId, ...r });
       // Only the TERMINAL report carries `exit` — and only that one retires the run agent.
       if (r.exit) worktrees.timeline.push('report');
+      over.onReport?.(runId, r);
     },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
@@ -547,14 +591,28 @@ function harness(
         }
       : {}),
     ...(over.lockScope !== undefined ? { resolveLockScope: () => over.lockScope ?? null } : {}),
+    ...(over.waveLimit !== undefined ? { waveLimit: () => over.waveLimit! } : {}),
     ...(over.anchorTask !== undefined ? { resolveTask: async () => anchorTask } : {}),
+    ...(over.spinOffTasks !== undefined
+      ? {
+          resolveSpinOff: (ref: string): Promise<SpinOffLookup | null> => {
+            if (over.spinOffTasks === 'hangs') return new Promise(() => {}); // never resolves
+            if (over.spinOffTasks === 'fails') return Promise.reject(new Error('server unreachable'));
+            return Promise.resolve((over.spinOffTasks as Record<string, SpinOffLookup>)[ref] ?? null);
+          },
+          // Tests must not wait out the real deadline; the value only needs to be a deadline.
+          spinOffTimeoutMs: 25,
+        }
+      : {}),
     ...(over.cancelled
       ? {
           steering: {
             register: () => {},
             unregister: () => {},
             isCancelled: (runId: string) => (over.cancelled ?? []).includes(runId),
-            forget: () => {},
+            forget: (runId: string) => {
+              forgets.push(runId);
+            },
           },
         }
       : {}),
@@ -572,6 +630,7 @@ function harness(
     parkChecks,
     claimChecks,
     agentCreates,
+    forgets,
     /** Model the run asking a question on its NEXT session end — a park mid-chain. */
     parkNext: () => {
       park.state = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
@@ -2589,6 +2648,192 @@ describe('a decomposed run is a chain of sessions (RUN-168)', () => {
   });
 });
 
+// RUN-170: the wave WIRING — the lease/integrateFromRun/publishToRun closures and the daemon's
+// limit reach ChainPlan at both call sites (supervise and resume), injected over vcsFor(repo) the
+// way checkpoint already is. The chain's own concurrency mechanics are pinned in
+// test/stages-chain.test.ts; what this describe owns is that the supervisor actually binds them.
+describe('a decomposed run’s wave overlaps (RUN-170)', () => {
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const parallelSteps = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'two independent pieces',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'one', anticipatedFiles: [{ path: 'src/a.ts' }] },
+        { id: 's2', title: 'two', anticipatedFiles: [{ path: 'src/b.ts' }] },
+      ],
+    }),
+  });
+  // Three, because the last SCHEDULED step always runs sequentially in the parent workspace (the
+  // chain's returned session is the gates' fix-turn target, and a child workspace is disposed when
+  // its work lands) — so genuine overlap needs two steps scheduled BEFORE the tail.
+  const threeParallel = (): AnchorTask => ({
+    key: 'ACME-1',
+    title: 'three independent pieces',
+    body: null,
+    executionSpec: ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'one', anticipatedFiles: [{ path: 'src/a.ts' }] },
+        { id: 's2', title: 'two', anticipatedFiles: [{ path: 'src/b.ts' }] },
+        { id: 's3', title: 'three', anticipatedFiles: [{ path: 'src/c.ts' }] },
+      ],
+    }),
+  });
+  /** Settle ONE of several live sessions — FakeDriver.complete() only reaches the last start. */
+  const settleAt = (h: ReturnType<typeof harness>, i: number, outcome: 'done' | 'failed' = 'done') =>
+    h.claude.starts[i]!.handlers?.onExit?.({
+      outcome,
+      isError: outcome === 'failed',
+      reason: outcome === 'failed' ? 'boom' : null,
+      telemetry: zeroTelemetry(),
+    });
+  const pump = async (cond: () => boolean) => {
+    for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  it('runs a wave concurrently on an overlap-capable backend, and lands children back BY RUN ID', async () => {
+    const h = harness({ anchorTask: threeParallel(), leasesOverlap: true, waveLimit: 3 });
+    const done = h.supervisor.supervise(buildRun());
+    await pump(() => h.claude.starts.length >= 2);
+    // Both overlapping step sessions are live AT ONCE — neither has settled yet.
+    expect(h.claude.starts).toHaveLength(2);
+    // One workspace per overlapping step, each leased FROM the parent run by id on the seam.
+    expect(h.worktrees.created.map((c) => ({ runId: c.runId, fromRunId: c.fromRunId }))).toEqual([
+      { runId: 'run_1', fromRunId: undefined },
+      { runId: 'run_1--s1', fromRunId: 'run_1' },
+      { runId: 'run_1--s2', fromRunId: 'run_1' },
+    ]);
+    // …and each overlapping session works in its own checkout, never the parent's.
+    expect(h.claude.starts.map((s) => s.cwd)).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
+    settleAt(h, 0);
+    settleAt(h, 1);
+    // The last scheduled step runs SEQUENTIALLY in the parent workspace, after the children
+    // landed — its live session is the one the gates hand fix turns to, and by then the child
+    // checkouts are already disposed.
+    await pump(() => h.claude.starts.length >= 3);
+    expect(h.claude.starts[2]!.cwd).toBe('/wt/run_1');
+    settleAt(h, 2);
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    // The child→parent return trip names the parent RUN on the VcsBackend seam — no branch or ref
+    // string for it originates in supervisor/chain code.
+    expect(h.worktrees.integratedFromRun).toEqual([
+      { ws: 'run_1--s1', runId: 'run_1' },
+      { ws: 'run_1--s2', runId: 'run_1' },
+    ]);
+    expect(h.worktrees.publishedToRun).toEqual([
+      { ws: 'run_1--s1', runId: 'run_1' },
+      { ws: 'run_1--s2', runId: 'run_1' },
+    ]);
+    // Landed children are disposed; the parent workspace survives for the human's review.
+    expect(h.worktrees.removed).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
+  });
+
+  // A child checkout is the SAME run's workspace, so it carries the parent's physical posture: a
+  // decomposed read-only run (scope) whose steps overlap must not receive writable child trees.
+  // The permission clamp already denies the edit tools (RUN-118); this is the worktree-level floor
+  // staying symmetric with the one prepare leased first.
+  it('wave children of a read-only run lease read-only checkouts', async () => {
+    const h = harness({ anchorTask: threeParallel(), leasesOverlap: true, waveLimit: 3 });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'scope', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await pump(() => h.claude.starts.length >= 2);
+    expect(h.worktrees.created.map((c) => ({ runId: c.runId, readOnly: c.readOnly }))).toEqual([
+      { runId: 'run_1', readOnly: true },
+      { runId: 'run_1--s1', readOnly: true },
+      { runId: 'run_1--s2', readOnly: true },
+    ]);
+    settleAt(h, 0);
+    settleAt(h, 1);
+    await pump(() => h.claude.starts.length >= 3);
+    settleAt(h, 2);
+    await done;
+  });
+
+  // The perforce/diversion posture: leases take turns, so a wave must not take a second one — a
+  // child lease while the parent holds the pool would deadlock, in-process, with nothing to time
+  // out. The fake defaults to this reading, which is also what keeps every pre-RUN-170 test on the
+  // sequential chain it always modelled.
+  it('keeps the same wave sequential on a pool-of-1 backend — one lease, one session at a time', async () => {
+    const h = harness({ anchorTask: parallelSteps(), waveLimit: 4 });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts).toHaveLength(1); // the second step has not started
+    h.claude.complete('done');
+    await pump(() => h.claude.starts.length >= 2);
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.created).toHaveLength(1); // the parent's lease, and never a second
+    expect(h.worktrees.integratedFromRun).toEqual([]);
+    expect(h.claude.starts.map((s) => s.cwd)).toEqual(['/wt/run_1', '/wt/run_1']);
+  });
+
+  // Without the daemon's waveLimit dep the supervisor defaults to 1 — fully sequential, so a
+  // harness (or daemon) that never heard of waves cannot acquire unbounded concurrency.
+  it('runs fully sequentially when no wave limit is wired, however capable the backend', async () => {
+    const h = harness({ anchorTask: parallelSteps(), leasesOverlap: true });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    expect(h.claude.starts).toHaveLength(1);
+    h.claude.complete('done');
+    await pump(() => h.claude.starts.length >= 2);
+    h.claude.complete('done');
+    await done;
+    expect(h.worktrees.created).toHaveLength(1);
+  });
+
+  it('a resumed chain’s later steps still overlap — the closures reach the resume call site too', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'one, then two at once, then the tail',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/a.ts' }] },
+          { id: 's3', title: 'third', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/b.ts' }] },
+          { id: 's4', title: 'fourth', dependsOn: ['s1'], anticipatedFiles: [{ path: 'src/c.ts' }] },
+        ],
+      }),
+    };
+    const h = harness({
+      anchorTask: task,
+      leasesOverlap: true,
+      waveLimit: 3,
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // s1 parks on its question
+    await done;
+    expect(h.parked.entries.get('run_1')!.stepId).toBe('s1');
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const before = h.claude.starts.length;
+    h.claude.complete('done'); // the resumed s1 finishes
+    await pump(() => h.claude.starts.length >= before + 2);
+    // s2 and s3 are live at once, in their own child workspaces — proof the wave seam and limit
+    // reached the RESUME call site's ChainPlan, not only supervise's. s4 is the sequential tail.
+    expect(h.claude.starts.length).toBe(before + 2);
+    expect(h.worktrees.created.filter((c) => c.fromRunId === 'run_1').map((c) => c.runId)).toEqual([
+      'run_1--s2',
+      'run_1--s3',
+    ]);
+    settleAt(h, before);
+    settleAt(h, before + 1);
+    await pump(() => h.claude.starts.length >= before + 3);
+    expect(h.claude.starts.at(-1)!.cwd).toBe('/wt/run_1'); // the tail runs in the parent workspace
+    settleAt(h, before + 2);
+    const exit = (await resumed) as DriverExit;
+    expect(exit.outcome).toBe('done');
+    expect(h.worktrees.publishedToRun.map((p) => p.ws)).toEqual(['run_1--s2', 'run_1--s3']);
+  });
+});
+
 describe('the inline reviewer answers acceptance criteria (RUN-145)', () => {
   const REVIEWED = () =>
     manifest({
@@ -3267,6 +3512,9 @@ describe('the inline reviewer (RUN-61)', () => {
 
   // Continuation continuity (RUN-92): a re-dispatched failed run re-seeds from the record the prior
   // sitting left, so spend stays cumulative and the ledger is not relitigated.
+  // Deliberately NO `subclaims` field (RUN-180): a prior sitting's persisted record can predate
+  // sub-claims, and a continuation must load it as a single-claim entry (normalised on read)
+  // rather than crash — so these seeds keep the pre-RUN-180 shape a real record on disk has.
   const priorLedgerEntry = {
     id: 1,
     round: 2,
@@ -3277,7 +3525,7 @@ describe('the inline reviewer (RUN-61)', () => {
     status: 'fixed' as const,
     pointer: 'src/auth.ts:50',
     reason: 'guarded now',
-  };
+  } as unknown as LedgerEntry;
 
   it('re-seeds the prior sitting spend so a continuation reports CUMULATIVE totals (RUN-92)', async () => {
     const seed: ContinuableRun = {
@@ -3826,6 +4074,411 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(reviewerStarts(h)).toBe(1); // not every finding contested → no re-review
   });
 
+  // RUN-180: the same partial answer WITHIN one finding's sub-claims — the run_ms4t62384u0z6c6p4f5d
+  // escape. A bundled finding was "contested" by rebutting the refutable half; the other half rode
+  // the answer out. With the halves enumerated, a contest that names only one letter leaves the
+  // other STANDING, and the finding is not a candidate to clear — no fresh adjudicator to re-roll.
+  it('a contest answering only SOME of one finding’s sub-claims fails the run without a re-review', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1b: CONTESTED src/adjudication.ts:248 — slice keeps the most recent'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles two separately-answerable defects [sub-claims: 2]',
+        'FINDING 1a: the eligibility check accepts a response naming a nonexistent finding',
+        'FINDING 1b: the entry cap can drop a terminal finding before a PASS',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // sub-claim (a) was never contested → the finding stands
+    expect(reviewerStarts(h)).toBe(1); // …and no fresh adjudicator was spawned to possibly-PASS over it
+    // The ledger records WHICH sub-claim went unanswered — by its claim text, the identity the
+    // record keys on (letters are render-derived) — not a finding answered-as-a-whole.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['the eligibility check accepts a response naming a nonexistent finding', 'unanswered'],
+      ['the entry cap can drop a terminal finding before a PASS', 'contested'],
+    ]);
+    // The contest prompt carried the record: the letters the RESPONSE block answers by.
+    expect(h.claude.continuations.at(-1)).toContain(
+      '(a) the eligibility check accepts a response naming a nonexistent finding — no answer recorded',
+    );
+  });
+
+  // …and the bare-number answer is the escape verbatim: a whole-finding CONTESTED must not speak
+  // for letters it never named.
+  it('a bare CONTESTED cannot clear a finding that enumerated sub-claims', async () => {
+    const { h, exit } = await (async () => {
+      const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+      h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the whole thing is wrong'];
+      const done = h.supervisor.supervise(buildRun());
+      await flush();
+      h.claude.complete('done');
+      await onReviewTurn(h, 2);
+      h.claude.emitText(
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+      );
+      h.claude.complete('done');
+      return { h, exit: await done };
+    })();
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // a bare answer credits no sub-claim → no re-review
+  });
+
+  // Candidacy reads the RECONCILED ledger entry, not the terminal round's own parse: the fold
+  // preserves held sub-claims when a re-raise drops the letters (a fresh reviewer paraphrases by
+  // construction), so a letterless terminal re-raise of a half-answered finding still carries its
+  // unanswered claim — and a bare contest must not clear it. Checking `f.subclaims` (empty on
+  // this path) was the RUN-174 escape reborn one round later.
+  it('a letterless re-raise of a half-answered finding is no candidate — the carried letter stands', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn answers the letterless re-raise with a bare whole-finding contest.
+      'FINDING 1: CONTESTED src/a.ts:9 — the whole finding is wrong',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding
+    await onReviewTurn(h, 3); // fix turn ran (answering only 1b), floor re-ran, round 2 starts
+    // The TERMINAL reviewer re-raises the same finding WITHOUT the letters.
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // carried sub-claim 'half one' was never contested → it stands
+    expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
+    // The ledger records the half-answered state the candidacy check read.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half one', 'unanswered'],
+      ['half two', 'contested'],
+    ]);
+  });
+
+  // The fold-level edition of the same escape: a terminal re-raise that repeats only SOME of the
+  // held claims used to REPLACE the held set, so the unanswered claim vanished from the
+  // reconciled entry and a contest of the repeated claim alone could clear the finding. The fold
+  // now unions the uncovered claim in — matched by wording, the sub-claim's identity — and
+  // candidacy, reading the reconciled entry, keeps the finding standing on it.
+  it('a terminal re-raise repeating only some letters is no candidate — the uncovered claim stands', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the ONE letter the terminal round chose to repeat.
+      'FINDING 1a: CONTESTED src/y.ts:3 — slice keeps the most recent',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]',
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    // The TERMINAL reviewer re-raises the finding but letters ONLY the already-rebutted claim.
+    h.claude.emitText(
+      [
+        'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 1]',
+        'FINDING 1a: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the uncovered claim was never contested → it stands
+    expect(reviewerStarts(h)).toBe(2); // round 1 + terminal — no fresh adjudicator to possibly-PASS
+    // The reconciled entry carries the uncovered claim — behind the re-raise's own enumeration in
+    // the record's order, visibly unanswered.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.subclaims?.map((s) => [s.claim, s.status])).toEqual([
+      ['half two', 'contested'],
+      ['half one', 'unanswered'],
+    ]);
+  });
+
+  // A carried FIXED sub-claim blocks candidacy — the whole-finding rule ("a FIXED changed nothing
+  // here") at sub-claim grain: the terminal reviewer judged the diff WITH the fix in it and still
+  // failed, so "it is fixed" was already adjudicated and never buys the re-roll.
+  it('a carried FIXED sub-claim stands — a bare contest cannot clear over it', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1: CONTESTED src/a.ts:9 — the whole finding is wrong',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the FIXED letter is not a contest → the finding stands
+    expect(reviewerStarts(h)).toBe(2); // no fresh adjudicator spawned
+  });
+
+  // …but it is not a dead end: the builder who believes the fixed claim no longer holds CONTESTS
+  // it in the contest turn, at the letter the contest record shows for its position — the fold
+  // resolves a letter past the report's own lines against exactly those positions — and the
+  // finding earns the fresh look like any other full contest.
+  it('contesting the carried FIXED sub-claim this turn restores candidacy', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: FIXED src/f.ts:1 — added the guard\nFINDING 1b: CONTESTED src/y.ts:3 — covered',
+      'FINDING 1a: CONTESTED src/f.ts:1 — the guard landed; the claim no longer holds\n' +
+        'FINDING 1: CONTESTED src/a.ts:9 — nothing in this finding survives the diff',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1; the fix turn FIXes (a), contests (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // The candidacy contract is the RECONCILED entry alone (criterion: every sub-claim contested and
+  // visible, or the finding stands) — the terminal report's own shape is never a second gate. The
+  // contest prompt tells the builder an already-contested record claim needs no fresh answer, so a
+  // letterless re-raise answered through the record's letters THIS turn must clear without a bare
+  // response beside it: demanding one would fail the exact builder that followed the prompt.
+  it('a letterless re-raise contested through the record’s letters alone earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      // The fix turn answers only the refutable half…
+      'FINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn contests the standing half by its record letter — no bare response.
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests only (b)
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn flips (a) to CONTESTED → fresh look
+    await onReviewTurn(h, 4);
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // every reconciled sub-claim contested → candidate, no bare needed
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // …and the same clearing holds when every carried claim already holds a rebuttal: the reconciled
+  // entry shows each sub-claim contested, the bare contest folds in as whole-finding evidence, and
+  // the fresh look adjudicates the carried pointers.
+  it('a letterless re-raise whose carried claims are all contested can still earn the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      'FINDING 1: CONTESTED src/a.ts:9 — both halves already rebutted',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests BOTH letters
+    await onReviewTurn(h, 3);
+    h.claude.emitText('FINDING 1 [High] src/gate.ts:1: two bundled defects\nVERDICT: FAIL'); // letterless
+    h.claude.complete('done'); // terminal FAIL → contest turn → candidacy holds → fresh look
+    await onReviewTurn(h, 4);
+    // The adjudicator sees the carried per-letter rebuttals, not an answered-as-a-whole row.
+    const readjudged = h.claude.starts[3]!.prompt;
+    expect(readjudged).toContain('CONTESTED (src/x.ts:9)');
+    expect(readjudged).toContain('CONTESTED (src/y.ts:3)');
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(3); // rounds 1, terminal, and the contest's fresh look
+  });
+
+  // Held sub-claim state rides only a match that cannot be an invention. The prose rule matches
+  // entries on a 60-char claim prefix — legacy identity, unchanged — but two long claims that
+  // diverge past it can be two REAL findings, and inheriting one's contested letters let the
+  // other reach the fresh look on contests nobody made about its claim. The record drops with the
+  // replaced claim instead (a visible miss, never an invented credit), the entry is single-claim,
+  // and the pre-RUN-180 rule demands a contest THIS turn.
+  it('a prefix-aliased terminal re-raise does not inherit contested letters — no free fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true] });
+    const prefix = 'the candidacy gate accepts inherited contests as if this claim had been examined ';
+    h.claude.continueTexts = [
+      // The fix turn contests BOTH letters of round 1's finding…
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+      // …and the contest turn says nothing at all.
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      [
+        `FINDING 1 [High] src/gate.ts:1: ${prefix}in round one [sub-claims: 2]`,
+        'FINDING 1a: half one',
+        'FINDING 1b: half two',
+        'VERDICT: FAIL',
+      ].join('\n'),
+    );
+    h.claude.complete('done'); // round 1 letters the finding; the fix turn contests both
+    await onReviewTurn(h, 3);
+    // The TERMINAL claim shares the 60-char prefix but diverges past it — a different claim that
+    // the prose key nonetheless matches to the same entry. Letterless, and no requirement bracket.
+    h.claude.emitText(`FINDING 1 [High] src/gate.ts:1: ${prefix}never at all\nVERDICT: FAIL`);
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // no current contest → the aliased finding stands
+    expect(reviewerStarts(h)).toBe(2); // …and no fresh adjudicator was spawned on inherited letters
+    // The entry merged (prefix identity, as it always did) but the contested record did not ride.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.claim).toContain('never at all');
+    expect(entry?.subclaims).toEqual([]);
+  });
+
+  // The record's letters are what the contest resolves against — even where the terminal report's
+  // own lettering diverges, which is exactly the overflow path: the fold keeps the held set whole
+  // and drops the report's enumeration, so the record shows letters for claims the report never
+  // lettered. Answering those letters must credit the displayed claims, not be discarded against
+  // the dropped enumeration (the prompt calls the record authoritative; the code must agree).
+  it('contesting an overflowed record by its displayed letters earns the fresh look', async () => {
+    const h = harness({ manifest: REVIEWED(2), verifyResults: [true, true, true] });
+    const finding = (tag: string) =>
+      [
+        'FINDING 1 [High] src/gate.ts:1: the gate bundles many claims [sub-claims: 4]',
+        ...['a', 'b', 'c', 'd'].map((l, i) => `FINDING 1${l}: ${tag} claim ${i + 1}`),
+        'VERDICT: FAIL',
+      ].join('\n');
+    h.claude.continueTexts = [
+      '', // fix turn 1: no structured response — every letter stays unanswered
+      '', // fix turn 2: same
+      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight HELD claims
+      // (rounds one and two), the terminal enumeration having been dropped by the overflow.
+      ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        .map((l) => `FINDING 1${l}: CONTESTED src/${l}.ts:1 — the record claim does not hold`)
+        .join('\n'),
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText(finding('one'));
+    h.claude.complete('done'); // round 1: four letters
+    await onReviewTurn(h, 3);
+    h.claude.emitText(finding('two'));
+    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight
+    await onReviewTurn(h, 4);
+    h.claude.emitText(finding('three')); // terminal: four claims the union cannot hold → dropped
+    h.claude.complete('done');
+    await onReviewTurn(h, 5); // every displayed letter contested → the fresh look IS spawned
+    // The answers landed on the record's claims — none discarded against the dropped enumeration:
+    // the adjudicator's PRIOR ADJUDICATIONS shows each held claim with the letter's own pointer,
+    // including the positions past the terminal report's four lines.
+    const readjudged = h.claude.starts[4]!.prompt;
+    expect(readjudged).toMatch(/\(a\) two claim 1/); // the record's order: round 2's union
+    expect(readjudged).toContain('CONTESTED (src/a.ts:1)');
+    expect(readjudged).toMatch(/\(e\) one claim 1/); // …and the held tail the report never lettered
+    expect(readjudged).toContain('CONTESTED (src/e.ts:1)');
+    expect(readjudged).not.toContain('three claim'); // the dropped enumeration is not the record
+    h.claude.emitText('Every pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(4); // rounds 1–2, terminal, and the contest's fresh look
+  });
+
+  // Enumeration normalisation is all-or-nothing, so a bad enumeration (here: over the cap) leaves
+  // NO recorded subset a partial contest could clear — the finding is single-claim again, and the
+  // pre-RUN-180 rules apply whole: a bare CONTESTED is a full contest and earns the fresh look.
+  it('a voided enumeration degrades the finding to single-claim contest rules', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED src/a.ts:9 — the whole class is pre-existing'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    const five = ['a', 'b', 'c', 'd', 'e'].map((l) => `FINDING 1${l}: claim ${l}`).join('\n');
+    h.claude.emitText(
+      `FINDING 1 [High] src/gate.ts:1: five letters is several findings\n${five}\nVERDICT: FAIL`,
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3); // the bare contest DOES earn the re-review — no letters survived to demand more
+    h.claude.emitText('The pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2);
+  });
+
+  it('a contest naming EVERY sub-claim earns the fresh look, which sees the per-letter rebuttals', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] });
+    h.claude.continueTexts = [
+      'FINDING 1a: CONTESTED src/x.ts:9 — the id filter covers it\nFINDING 1b: CONTESTED src/y.ts:3 — slice keeps the most recent',
+    ];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText(
+      'FINDING 1 [High] src/gate.ts:1: two bundled defects [sub-claims: 2]\nFINDING 1a: half one\nFINDING 1b: half two\nVERDICT: FAIL',
+    );
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    // The fresh adjudicator's PRIOR ADJUDICATIONS carries each sub-claim with its own rebuttal.
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toMatch(/\(a\) half one/);
+    expect(readjudged).toContain('CONTESTED (src/x.ts:9)');
+    expect(readjudged).toContain('CONTESTED (src/y.ts:3)');
+    h.claude.emitText('Both pointers hold.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // every letter contested → the contest could clear the run
+    expect(reviewerStarts(h)).toBe(2);
+  });
+
   // Criterion 7: a rebuttal the builder streams before the turn dies must survive into the ledger,
   // so a continuation's fresh reviewer sees it as a prior adjudication rather than relitigating it.
   it('folds a streamed contest response into the ledger even when the contest turn then fails', async () => {
@@ -3926,6 +4579,259 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(exit.reason).toBe('review:no-verdict');
     expect(h.claude.continuations).toEqual([]); // no contest turn
     expect(h.claude.starts).toHaveLength(2); // build + the one reviewer
+  });
+});
+
+// RUN-188: the gate integration for spun-off work. A CONTESTED pointer may name a task —
+// `task:<key>`, "real, out of scope, tracked THERE" — and the DAEMON checks it mechanically at
+// both fold sites through one path, entering the result as ledger data for the credential-less
+// fresh reviewer (RUN-43). The order of harms is may-miss-never-invent: a lookup that fails or
+// finds nothing never CREDITS a contest and never fails the run by itself, and a daemon with no
+// lookup wired behaves exactly as before RUN-188.
+describe('spin-off task pointers (RUN-188)', () => {
+  const REVIEWED = (maxRounds = 0, cmd: string | null = 'npm test') =>
+    manifest({
+      verify: {
+        cmd,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds,
+        agent: { agent: null, tool: null, model: null, effort: null, maxRounds },
+      },
+    });
+  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const onReviewTurn = async (h: ReturnType<typeof harness>, atLeastStarts: number) => {
+    for (let i = 0; i < 300; i++) {
+      if (h.claude.opts?.runId === 'run_1:review' && h.claude.starts.length >= atLeastStarts) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error(`the reviewer session (>= ${atLeastStarts} starts) never began`);
+  };
+  const reviewerStarts = (h: ReturnType<typeof harness>) =>
+    h.claude.starts.filter((s) => s.runId === 'run_1:review').length;
+  /** A spun-off task on the server, its provenance naming THIS run (run_1) and the finding. */
+  const SPUN_OFF: Record<string, SpinOffLookup> = {
+    'RUN-201': {
+      key: 'RUN-201',
+      title: 'Harden the guard floor',
+      spinOff: { sourceTaskId: 'task_9', sourceRunId: 'run_1', finding: 'the guard is missing' },
+    },
+  };
+  /** Build → terminal reviewer FAILs → the contest turn streams `contest` → the run settles.
+   *  Boxed, because an async return would ADOPT the run promise and deadlock any test that still
+   *  has reviewer turns to drive. */
+  const terminalContest = async (h: ReturnType<typeof harness>, contest: string) => {
+    h.claude.continueTexts = [contest];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // terminal reviewer FAILs → the contest turn runs
+    return { done };
+  };
+
+  it('a verified task pointer earns the fresh look, which reads the daemon’s check as ledger data', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:RUN-201 — real, out of scope, tracked there',
+    );
+    await onReviewTurn(h, 3); // the contest cleared candidacy → one fresh adjudicator
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toContain('CONTESTED (task:RUN-201)');
+    // The daemon's line, not the builder's claim: existence AND provenance, as checkable data.
+    expect(readjudged).toContain(
+      '→ daemon: task:RUN-201 verified — exists — RUN-201: Harden the guard floor (filed from THIS run, against: "the guard is missing")',
+    );
+    h.claude.emitText('The task covers the finding and the work is adjacent.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2); // the terminal round + the contest's fresh look
+  });
+
+  it('a task the daemon cannot find never buys the re-adjudication — recorded NOT verified', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: {} });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-999 — tracked there, honest');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // an unverifiable pointer is a pointer at nothing
+    expect(exit.reason).toBe('review');
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator spawned to possibly-PASS over it
+    // The contest and its failed check both survive into the ledger — visible to a human and a
+    // continuation, not just to the gate that refused it.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.status).toBe('contested');
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-999', false]]);
+  });
+
+  // The probe posture (checkClaimable's): a throw is the same non-answer as a null — recorded
+  // unverified, never a crash, never a gate of its own. The run fails on the finding standing,
+  // which is exactly where it stood before the contest.
+  it('a lookup that throws is recorded unverified — never a crash, never a credit', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: 'fails' });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
+  });
+
+  // Every named task must verify: a real task beside a bogus one does not carry the response —
+  // refusing may cost a re-contest, crediting would invent the half that was never checked.
+  it('a contest naming a verified AND an unverifiable task is no candidate', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:RUN-201 task:RUN-999 — split across two',
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+  });
+
+  // The per-answer cap is PRICED, never taken silently: a fourth ref is not looked up, and the
+  // answer cannot credit a contest even when every named task is real — three verified tasks must
+  // not speak for one nobody checked.
+  it('a fourth task pointer is never silently dropped — the over-cap answer cannot credit', async () => {
+    const four = Object.fromEntries(
+      ['A-1', 'A-2', 'A-3', 'A-4'].map((k) => [k, { key: k, title: `real task ${k}` }]),
+    );
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: four });
+    const { done } = await terminalContest(
+      h,
+      'FINDING 1: CONTESTED task:A-1 task:A-2 task:A-3 task:A-4 — spread across four',
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator on a set the daemon did not finish
+    // The saturation fact is in the ledger, out loud — never a silent reduction of the claim set.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    const unchecked = entry?.spinOffs?.find((f) => f.ref === '(unchecked)');
+    expect(unchecked?.verified).toBe(false);
+    expect(unchecked?.detail).toContain('more task pointer(s)');
+  });
+
+  // A task-claim token no reference can be read from is a claim the daemon cannot verify — it
+  // degrades toward unverifiable (an unverified fact), never toward "no task named".
+  it('a task claim the daemon cannot read blocks credit instead of reading as no claim', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task: RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['(unchecked)', false]]);
+    expect(entry?.spinOffs?.[0]?.detail).toContain('no readable reference');
+  });
+
+  // The scan is the parser's, off the RAW line: the ledger stores a capped pointer display, and
+  // scanning THAT let a claim padded past the cap fall off the check — a verified first task
+  // crediting a never-checked later one.
+  it('a task claim the display cap cut from the pointer is still checked — and blocks credit', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: SPUN_OFF });
+    const { done } = await terminalContest(
+      h,
+      `FINDING 1: CONTESTED task:RUN-201 ${'pad '.repeat(50)}task:RUN-999 — split across the cap`,
+    );
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // RUN-999 was never verified → the finding stands
+    expect(reviewerStarts(h)).toBe(1); // no fresh adjudicator on a set the daemon did not finish
+    // Both claims were checked — including the one the stored pointer no longer names.
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.pointer?.includes('task:RUN-999')).toBe(false); // the display is capped…
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([
+      ['RUN-201', true],
+      ['RUN-999', false], // …and the check still reached the later claim
+    ]);
+  });
+
+  // The seam's answer is data, not a contract: a shape the daemon did not write (a numeric title)
+  // must degrade to the unverified non-answer — never a throw that aborts the fold a finding was
+  // meant to merely stand on.
+  it('a malformed lookup answer degrades to unverified — never a crash on the adjudication path', async () => {
+    const h = harness({
+      manifest: REVIEWED(),
+      verifyResults: [true],
+      spinOffTasks: { 'RUN-201': { key: 'RUN-201', title: 42 } as unknown as SpinOffLookup },
+    });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed'); // the finding stands; the run settled instead of crashing
+    expect(exit.reason).toBe('review');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
+  });
+
+  // A stalled lookup is a non-answer, on a deadline: the run neither hangs on the await nor
+  // credits the contest — the same degradation a thrown lookup gets.
+  it('a lookup that never resolves times out to unverified — the run neither hangs nor credits', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true], spinOffTasks: 'hangs' });
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(reviewerStarts(h)).toBe(1);
+    const entry = h.continuable.puts.at(-1)?.ledger.find((e) => e.id === 1);
+    expect(entry?.spinOffs?.map((f) => [f.ref, f.verified])).toEqual([['RUN-201', false]]);
+  });
+
+  // The pre-RUN-188 daemon, byte-identical: no lookup wired → no facts, and a task pointer is the
+  // free text it always was — a checkable-looking pointer the fresh reviewer judges from prose.
+  it('with no lookup wired a task pointer behaves exactly as before — free text, no daemon line', async () => {
+    const h = harness({ manifest: REVIEWED(), verifyResults: [true] }); // spinOffTasks absent
+    const { done } = await terminalContest(h, 'FINDING 1: CONTESTED task:RUN-201 — tracked there');
+    await onReviewTurn(h, 3); // the non-empty pointer still earns the fresh look, as it did before
+    const readjudged = h.claude.starts[2]!.prompt;
+    expect(readjudged).toContain('CONTESTED (task:RUN-201)');
+    // No daemon DATA line rides the entry (the template's own teaching still mentions the form).
+    expect(readjudged).not.toContain('→ daemon: task:RUN-201');
+    h.claude.emitText('The pointer holds.\nVERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  // The OTHER fold site, same path: a fix-round contest naming a task carries the daemon's check
+  // into the ledger the NEXT fresh reviewer reads — the fact reaches it as data it could never
+  // look up itself.
+  it('a fix-round task pointer is checked and the fact reaches the next fresh reviewer', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true], spinOffTasks: SPUN_OFF });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED task:RUN-201 — out of scope, tracked there'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // build turn
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done'); // round 1 FAILs → fix turn answers with the task pointer
+    await onReviewTurn(h, 3); // floor re-ran, round 2's fresh reviewer starts
+    const next = h.claude.starts[2]!.prompt;
+    expect(next).toMatch(/PRIOR ADJUDICATIONS/);
+    expect(next).toContain('CONTESTED (task:RUN-201)');
+    expect(next).toContain('→ daemon: task:RUN-201 verified — exists — RUN-201: Harden the guard floor');
+    h.claude.emitText('Adjacent work, properly tracked.\nVERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done');
+    expect(reviewerStarts(h)).toBe(2); // round 1 + round 2 — the fact rode the ledger, not a new spawn
+  });
+
+  // …and an unverified fix-round pointer rides the ledger too, marked NOT verified, so the next
+  // reviewer is told to treat it as pointing at nothing rather than reading prose.
+  it('an unverifiable fix-round pointer reaches the next reviewer marked NOT verified', async () => {
+    const h = harness({ manifest: REVIEWED(1), verifyResults: [true, true], spinOffTasks: {} });
+    h.claude.continueTexts = ['FINDING 1: CONTESTED task:RUN-999 — tracked there'];
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h, 2);
+    h.claude.emitText('FINDING 1 [High] src/a.ts:1: the guard is missing\nVERDICT: FAIL');
+    h.claude.complete('done');
+    await onReviewTurn(h, 3);
+    expect(h.claude.starts[2]!.prompt).toContain('→ daemon: task:RUN-999 NOT verified');
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    await done;
   });
 });
 
@@ -4325,6 +5231,45 @@ describe('resuming a parked run (RUN-30)', () => {
     const exit = await h.supervisor.resume('run_1', 'Use B.');
     expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:parked-step-gone' });
     expect(h.transcript.map((t) => t.text).join('\n')).toMatch(/its plan no longer declares/);
+  });
+
+  // RUN-170's settle rule holds on the resume path too: parked-step-gone is a chain failure with
+  // no session behind it, and returning it through `fail()` skipped settle — no lock release, a
+  // bare terminal report, and no continuation refresh for the very workspace the failure promises
+  // to keep.
+  it('parked-step-gone still settles: locks release and the kept workspace stays continuable', async () => {
+    const parkedWith: AnchorTask = {
+      key: 'ACME-1',
+      title: 'two steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+        ],
+      }),
+    };
+    const h = await parkFirst({ anchorTask: parkedWith });
+    h.setAnchorTask({
+      ...parkedWith,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 'x1', title: 'rethought' },
+          { id: 'x2', title: 'also rethought' },
+        ],
+      }),
+    });
+    h.answerIt();
+    const exit = await h.supervisor.resume('run_1', 'Use B.');
+
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'steps:parked-step-gone' });
+    const terminal = h.reports.filter((r) => r.exit).at(-1);
+    expect(terminal?.agentId).toBeDefined(); // settle's terminal report, not the bare fail() shape
+    expect(h.worktrees.releasedAll.length).toBeGreaterThan(0); // locks released on terminal
+    expect(h.worktrees.removed).toHaveLength(0); // the workspace kept, as the failure promises
+    // The continuation record is refreshed (RUN-92), so the kept work is re-dispatchable rather
+    // than an orphan a human has to rediscover by hand.
+    expect(h.continuable.puts.at(-1)).toMatchObject({ runId: 'run_1' });
   });
 
   // RUN-145. A resume reaches afterDriver by its OWN path, so it was passing no spec at all: the
@@ -5225,4 +6170,45 @@ describe('a cancelled run does not go on to build (RUN-165)', () => {
 
   // The control is the rest of this file: every other test here wires no cancellation and reaches
   // its agent, so a guard that stopped everything could not have got this far.
+
+  // RUN-170. The boundary checks see the gaps BETWEEN stages; a chain is many sessions with gaps
+  // INSIDE one stage, and a cancel landing there — after the execute boundary passed, before the
+  // chain's first spawn — is a failure with no session behind it. That used to return through
+  // `fail()`, skipping settle: no lock release, a bare terminal report, a cancellation record kept
+  // for the daemon's life, and a workspace whose fate nothing decided.
+  it('a chain cancelled before its first session still settles', async () => {
+    const cancelled: string[] = [];
+    const h = harness({
+      cancelled,
+      anchorTask: {
+        key: 'ACME-1',
+        title: 'two steps',
+        body: null,
+        executionSpec: ExecutionSpec.parse({
+          steps: [
+            { id: 's1', title: 'first' },
+            { id: 's2', title: 'second' },
+          ],
+        }),
+      },
+      // The cancel lands when the run reports what it was briefed with (RUN-166) — after the
+      // stage-boundary checks have been asked, before the chain spawns anything.
+      onReport: (runId, r) => {
+        if (r.executedSpec) cancelled.push(runId);
+      },
+    });
+    const exit = await h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+
+    expect(exit).toMatchObject({ outcome: 'failed', reason: 'cancelled' });
+    expect(h.claude.starts).toHaveLength(0); // the cancel held: no session ever spawned
+    // Settle still ran — the one stage that runs no matter how the run got here (RUN-165):
+    const terminal = h.reports.find((r) => r.exit);
+    expect(terminal?.agentId).toBeDefined(); // settle's terminal report, not the bare fail() shape
+    expect(h.worktrees.releasedAll).toHaveLength(1); // the locks released on terminal (RUN-104)
+    expect(h.worktrees.removed).toHaveLength(0); // the workspace kept — never force-deleted
+    expect(h.forgets).toEqual(['run_1']); // the cancellation record cleaned up
+    expect(h.transcript.at(-1)!.text).toContain('cancelled'); // the transcript closed on the terminal
+  });
 });
