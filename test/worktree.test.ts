@@ -793,4 +793,47 @@ describe('a wave’s return trip (real git)', () => {
     expect(existsSync(path.join(parent.path, 'a.ts'))).toBe(true);
     await wm.remove(parent);
   });
+
+  // The test above lands in the polite order, so nobody ever LOSES. This one drives the race to
+  // the refusal itself: two children finish together — both integrate the SAME parent tip, neither
+  // has seen the other's work — so the second publish arrives non-fast-forward. Exactly one wins;
+  // the loser is answered 'race' (never a merge commit papering over the lost CAS), re-integrates,
+  // and its retry lands — the loop the chain runs under WAVE_PUBLISH_ATTEMPTS.
+  it('a publish that lost the race is refused; the loser re-integrates and lands — no merge commit', async () => {
+    const parent = await wm.create(repo, 'waveR');
+    await writeFile(path.join(parent.path, 'parent.ts'), 'export const p = 1;\n');
+    await wm.commitWork(parent, 'parent work');
+
+    const c1 = await wm.create(repo, 'waveR--s1', { baseRef: runBranch('waveR') });
+    const c2 = await wm.create(repo, 'waveR--s2', { baseRef: runBranch('waveR') });
+    await writeFile(path.join(c1.path, 'a.ts'), 'export const a = 1;\n');
+    await wm.commitWork(c1, 'step s1');
+    await writeFile(path.join(c2.path, 'b.ts'), 'export const b = 1;\n');
+    await wm.commitWork(c2, 'step s2');
+
+    // "Finished together": both integrate the parent line at the same point.
+    expect(await wm.rebaseOnto(c1, runBranch('waveR'))).toEqual({ ok: true });
+    expect(await wm.rebaseOnto(c2, runBranch('waveR'))).toEqual({ ok: true });
+
+    // Exactly one publish wins…
+    expect((await wm.landFastForward(repo, runBranch('waveR'), runBranch('waveR--s1'))).ok).toBe(true);
+    // …and the other is REFUSED as the race it lost, with nothing invented on the line:
+    const lost = await wm.landFastForward(repo, runBranch('waveR'), runBranch('waveR--s2'));
+    expect(lost).toMatchObject({ ok: false, reason: 'race' });
+    expect(existsSync(path.join(parent.path, 'b.ts'))).toBe(false); // the loser landed nothing
+
+    // The loser's retry: re-integrate (now seeing the winner's commit), publish again.
+    expect(await wm.rebaseOnto(c2, runBranch('waveR'))).toEqual({ ok: true });
+    expect((await wm.landFastForward(repo, runBranch('waveR'), runBranch('waveR--s2'))).ok).toBe(true);
+
+    // Both children's work is on the parent line, linear history, zero merge commits.
+    expect(existsSync(path.join(parent.path, 'a.ts'))).toBe(true);
+    expect(existsSync(path.join(parent.path, 'b.ts'))).toBe(true);
+    const { stdout: merges } = await git(['rev-list', '--merges', '--count', runBranch('waveR')], repo);
+    expect(merges.trim()).toBe('0');
+
+    await wm.remove(c1);
+    await wm.remove(c2);
+    await wm.remove(parent);
+  });
 });

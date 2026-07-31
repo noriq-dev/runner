@@ -2730,6 +2730,28 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
     expect(h.worktrees.removed).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
   });
 
+  // A child checkout is the SAME run's workspace, so it carries the parent's physical posture: a
+  // decomposed read-only run (scope) whose steps overlap must not receive writable child trees.
+  // The permission clamp already denies the edit tools (RUN-118); this is the worktree-level floor
+  // staying symmetric with the one prepare leased first.
+  it('wave children of a read-only run lease read-only checkouts', async () => {
+    const h = harness({ anchorTask: threeParallel(), leasesOverlap: true, waveLimit: 3 });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'scope', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await pump(() => h.claude.starts.length >= 2);
+    expect(h.worktrees.created.map((c) => ({ runId: c.runId, readOnly: c.readOnly }))).toEqual([
+      { runId: 'run_1', readOnly: true },
+      { runId: 'run_1--s1', readOnly: true },
+      { runId: 'run_1--s2', readOnly: true },
+    ]);
+    settleAt(h, 0);
+    settleAt(h, 1);
+    await pump(() => h.claude.starts.length >= 3);
+    settleAt(h, 2);
+    await done;
+  });
+
   // The perforce/diversion posture: leases take turns, so a wave must not take a second one — a
   // child lease while the parent holds the pool would deadlock, in-process, with nothing to time
   // out. The fake defaults to this reading, which is also what keeps every pre-RUN-170 test on the

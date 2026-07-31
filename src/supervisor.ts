@@ -1119,6 +1119,12 @@ export class RunSupervisor {
    */
   private waveFor(repo: ResolvedRepo, run: Run): ChainWave {
     const vcs = this.vcsFor(repo);
+    // The parent workspace's posture, recomputed the way `prepare` computed it: a child checkout
+    // is the SAME run's workspace and must carry the same physical floor — a decomposed
+    // non-producing run (scope, verify) whose steps overlap must not receive writable child trees
+    // when its parent tree is read-only. The permission clamp already denies the edit tools
+    // (RUN-118); this keeps the worktree-level floor symmetric with the sitting that leased first.
+    const readOnly = !runWorkflow(run, repo.manifest).worktreeWritable;
     return {
       // All three run-addressed pieces, or none: a backend (or fake) that declares overlap but
       // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
@@ -1126,7 +1132,7 @@ export class RunSupervisor {
       leasesOverlap: Boolean(vcs.leasesOverlap && vcs.integrateFromRun && vcs.publishToRun),
       // Re-asked by the chain before each wave, not sampled here: what is spare NOW is the answer.
       limit: () => this.deps.waveLimit?.(run.id) ?? 1,
-      lease: (childId) => vcs.lease(repo.root, childId, { fromRunId: run.id }),
+      lease: (childId) => vcs.lease(repo.root, childId, { fromRunId: run.id, readOnly }),
       checkpoint: (ws, label) => vcs.checkpoint(ws, runCommitMessage(run.id, label)),
       integrateBack: (ws) => vcs.integrateFromRun!(ws, run.id),
       abandonIntegrate: (ws) => vcs.abandonIntegrate(ws),

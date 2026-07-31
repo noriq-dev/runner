@@ -289,6 +289,26 @@ describe('waveCapacity', () => {
     await gate;
     expect(admitted).toBe(true);
   });
+
+  // The round-2 counterexample, closed: a session whose run has LEFT the active set (mid-teardown)
+  // holds a real seat, and folding it in with a max let it hide behind an active run's grant —
+  // concurrency 3, run_a granted 2 it had not spawned yet, one teardown session elsewhere, and the
+  // machine read 2 claimed: a fourth session was admitted onto three slots. Strays must ADD.
+  it('a teardown session outside the active set cannot hide behind a grant', async () => {
+    const l = ledger({ concurrency: 3, active: ['run_a'], sessions: { run_x: 1 } });
+    expect(l.cap.waveLimit('run_a')).toBe(2); // the stray seat is visible to the grant too
+    l.active.add('run_b'); // assigned while a's grant (2) + x's teardown seat (1) fill the machine
+    let admitted = false;
+    const gate = l.cap.admit('run_b').then(() => {
+      admitted = true;
+    });
+    await Promise.resolve();
+    expect(admitted).toBe(false); // 2 granted + 1 stray = 3 claimed: no fourth session
+    l.sessions.delete('run_x'); // the teardown finished
+    l.cap.freeSlots(); // the next heartbeat's own read
+    await gate;
+    expect(admitted).toBe(true);
+  });
 });
 
 // RUN-153. `reapOrphans` ran only at daemon START, so a workspace deliberately KEPT mid-flight —

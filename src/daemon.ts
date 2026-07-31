@@ -287,11 +287,22 @@ export function waveCapacity(deps: {
   const waiting = new Set<string>();
   const claimed = (excludeRunId?: string): number => {
     let n = 0;
+    let ofActive = 0; // live sessions already represented in n, run by run
     for (const id of deps.active()) {
       if (id === excludeRunId) continue;
-      n += Math.max(waiting.has(id) ? 0 : 1, grants.get(id) ?? 0, deps.sessionsOf(id));
+      const live = deps.sessionsOf(id);
+      n += Math.max(waiting.has(id) ? 0 : 1, grants.get(id) ?? 0, live);
+      ofActive += live;
     }
-    return Math.max(n, deps.liveSessions(excludeRunId));
+    // Sessions whose run has already LEFT the active set (mid-teardown) hold real seats the walk
+    // above cannot see. They ADD to the active runs' claims — a stray session and a
+    // granted-but-unspawned wave occupy DIFFERENT seats, and folding them with a max let the
+    // stray hide behind the grant: concurrency 3, one run granted two seats it had not spawned
+    // yet, one teardown session elsewhere → claimed read 2 and a fourth session was admitted.
+    // Subtracting `ofActive` keeps every active run's sessions counted exactly once (inside its
+    // own per-run max), so the remainder is precisely the strays; clamped because the two reads
+    // are of the same live registry and must not go negative on a transient disagreement.
+    return n + Math.max(0, deps.liveSessions(excludeRunId) - ofActive);
   };
   /** Room for one more of this run's sessions under the ceiling. */
   const fits = (runId: string): boolean => claimed(runId) + 1 <= deps.concurrency;
