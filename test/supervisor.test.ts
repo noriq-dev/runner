@@ -798,6 +798,15 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
     expect(p).not.toContain('This repo says of itself');
   });
 
+  it('an intentionally empty custom prompt does not fall back to the bundled prompt', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: customWf(''),
+    });
+    expect(p).toBe('');
+  });
+
   it('a custom scope prompt receives identity, project, task, context, and spec variables', () => {
     const p = assemblePrompt(
       makeRun({ kind: 'scope', workflow: 'docs', anchor: { type: 'task', taskId: 'task_9' } }),

@@ -915,7 +915,7 @@ export function assemblePrompt(
       ledger: ctx.ledger ?? '',
     });
   }
-  if (wf.promptRef) {
+  if (wf.promptRef !== null && wf.promptRef !== undefined) {
     const template = wf.promptRef;
     const common = {
       identity,
