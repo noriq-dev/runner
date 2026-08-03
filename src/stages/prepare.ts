@@ -189,11 +189,12 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     }
   }
 
-  const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
+  const workflowSource = repo.workflowCatalog ?? repo.manifest;
+  const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
   // The run's workflow (RUN-117): read its flags, don't compare kind. The NAMED one when the repo
   // defines it (RUN-132) — same posture either way, since a custom inherits its base verbatim and
   // `effectiveKind` above decided which base that is; what the named one adds is its stage list.
-  const wf = runWorkflow(run, repo.manifest);
+  const wf = runWorkflow(run, workflowSource);
   const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
   // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
   // suite and exercise the behavior, which needs a writable tree (node_modules, test
@@ -426,7 +427,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // above this line ACQUIRES — a workspace lease, an identity, a predictive lock — and unwinds on
   // failure; everything from here is a pure function of facts already in hand, which is what lets
   // `resume` build one too.
-  const workflow = run.workflow ? resolveWorkflow(run.workflow, repo.manifest) : undefined;
+  const workflow = resolveWorkflow(run.workflow ?? run.kind, workflowSource);
   const { checkedSpec, buildPrompt } = await buildRunBrief(host, {
     run,
     repo,

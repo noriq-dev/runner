@@ -789,6 +789,78 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
     expect(p).not.toContain('This repo says of itself');
   });
 
+  it('a custom scope prompt receives identity, project, task, context, and spec variables', () => {
+    const p = assemblePrompt(
+      makeRun({ kind: 'scope', workflow: 'docs', anchor: { type: 'task', taskId: 'task_9' } }),
+      manifest({ key: 'RUN' }),
+      {
+        agent: testAgent(),
+        server: 'https://s',
+        task: { key: 'RUN-9', title: 'Document auth', body: 'Survey it' },
+        workflow: customWf(
+          '{{agentId}}|{{projectKey}}|{{taskId}}|{{taskKey}}|{{taskTitle}}|{{context}}|{{spec}}',
+        ),
+        repoContext: 'repo-context',
+        executionSpec: 'execution-spec',
+      },
+    );
+    expect(p).toBe('agt_run1|RUN|task_9|RUN-9|Document auth|repo-context|execution-spec');
+  });
+
+  it('a custom build prompt receives its verify/reviewer shape variables', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.build,
+      id: 'hotfix',
+      promptRef: '{{kind}}|{{verifyCmd}}|{{#reviewer}}reviewed{{/reviewer}}|{{brief}}',
+      promptSource: '/repo/.noriq/workflows/hotfix.toml',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'build', brief: 'repair it' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+    });
+    expect(p).toBe('BUILD|npm test||repair it');
+  });
+
+  it('warns once for a missing user variable and names the template source', () => {
+    const warnings: Array<{ message: string; variable: string; source: string }> = [];
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: {
+        ...customWf('{{typo}}/{{typo}}'),
+        promptSource: '/repo/.noriq/workflows/docs.md',
+      },
+      promptWarning: (message, details) => warnings.push({ message, ...details }),
+    });
+    expect(p).toBe('/');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      variable: 'typo',
+      source: '/repo/.noriq/workflows/docs.md',
+    });
+  });
+
+  it('keeps a custom verify prompt quoted inside the daemon-owned verify frame', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.verify,
+      id: 'security',
+      promptRef: 'focus={{brief}} project={{projectKey}} specs={{specs}} verdict=VERDICT: PASS',
+      promptSource: '/repo/.noriq/workflows/security.md',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'verify', brief: 'audit auth' }), manifest({ key: 'RUN' }), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      diffCmd: 'git diff base..HEAD',
+    });
+    expect(p).toContain('QUOTED WORKFLOW GUIDANCE');
+    expect(p).toContain('focus=audit auth project=RUN specs=audit auth verdict=VERDICT: PASS');
+    expect(p.indexOf('QUOTED WORKFLOW GUIDANCE')).toBeLessThan(p.lastIndexOf('End your response'));
+    expect(p).toContain('INDEPENDENT, adversarial reviewer');
+    expect(p.trimEnd()).toMatch(/Task specs \/ intent to verify against:\naudit auth$/);
+  });
+
   // The no-op guarantee: a repo that declares no [context] must get the pre-RUN-128 prompt.
   it('renders byte-identically to before when the repo declared nothing', () => {
     const args = { agent: testAgent(), server: 'https://s' };

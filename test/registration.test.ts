@@ -71,6 +71,36 @@ describe('buildRegistration', () => {
     expect(reg.repos[0]?.workflows).toEqual(['docs', 'hotfix']);
   });
 
+  it('advertises merged file/user workflow names without their definitions', () => {
+    const catalogs = new Map([
+      [
+        '/x/a',
+        {
+          definitions: {
+            local: {
+              base: 'build' as const,
+              prompt: 'secret machine-local text',
+              promptSource: '/home/me/.noriq/workflows/local.toml',
+              source: '/home/me/.noriq/workflows/local.toml',
+              tier: 'user-file' as const,
+            },
+            docs: {
+              base: 'scope' as const,
+              prompt: 'project text',
+              promptSource: '/x/a/.noriq/workflows/docs.toml',
+              source: '/x/a/.noriq/workflows/docs.toml',
+              tier: 'project-file' as const,
+            },
+          },
+        },
+      ],
+    ]);
+    const reg = buildRegistration({ label: 'l', concurrency: 1, tools: [] }, repos, catalogs);
+    expect(reg.repos[0]?.workflows).toEqual(['docs', 'local']);
+    expect(JSON.stringify(reg.repos[0])).not.toContain('secret machine-local text');
+    expect(JSON.stringify(reg.repos[0])).not.toContain('base');
+  });
+
   it('advertises the coordinate catalog per installed tool (RUN-115)', () => {
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude', 'codex'] }, []);
     const claude = reg.agents.find((a) => a.tool === 'claude');

@@ -4,6 +4,7 @@ import { CLAUDE_CATALOG } from './drivers/claude';
 import { CODEX_CATALOG } from './drivers/codex';
 import type { DriverCatalog } from './drivers/types';
 import { VERSION } from './version';
+import type { WorkflowCatalog } from './workflow-store';
 
 /** The static per-tool coordinate menus (RUN-115), keyed by tool so registration can advertise the
  *  menu for each installed driver WITHOUT a live driver instance (registration precedes their
@@ -81,6 +82,7 @@ const DEFAULT_KINDS: RunKind[] = ['scope', 'build', 'verify'];
 export function buildRegistration(
   params: RegistrationParams,
   discovered: DiscoveredRepo[],
+  workflowCatalogs: ReadonlyMap<string, WorkflowCatalog> = new Map(),
 ): RunnerRegistration {
   return {
     ...(params.runnerId ? { runnerId: params.runnerId } : {}),
@@ -101,10 +103,12 @@ export function buildRegistration(
       board: r.manifest.board,
       name: r.name,
       defaultBranch: r.defaultBranch,
-      // The repo's custom workflow names (RUN-121) — the three built-ins are always available and
-      // are not listed. The daemon resolves each to its base posture at dispatch (RUN-126), so the
-      // wire carries just the name (matches shared RunnerRepo.workflows: string[]).
-      workflows: Object.keys(r.manifest.workflows ?? {}),
+      // Merged custom workflow names (RUN-192). A definition may intentionally shadow a bundled
+      // name, so advertise every loaded name; the daemon still resolves its base posture locally.
+      // The wire carries no base or prompt bytes (matches shared RunnerRepo.workflows: string[]).
+      workflows: Object.keys(workflowCatalogs.get(r.root)?.definitions ?? r.manifest.workflows ?? {}).sort(
+        (a, b) => a.localeCompare(b),
+      ),
     })),
   };
 }

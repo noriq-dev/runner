@@ -1,5 +1,6 @@
 import type { PermissionProfile, ProjectManifest, Run, RunKind } from '@noriq-dev/shared';
 import { type StageActor, type StageName, clampStagesToWorkflow } from './run-machine';
+import type { LoadedWorkflowDefinition, WorkflowCatalog } from './workflow-store';
 
 /**
  * One stage as the WORKFLOW declares it (RUN-132).
@@ -77,6 +78,9 @@ export interface Workflow {
   /** A custom prompt (template name or inline text) overriding the base's default brief (RUN-119).
    *  Absent/null on a built-in → the promptShape's own template. Consumed by RUN-121. */
   promptRef?: string | null;
+  /** File that supplied a custom prompt. Present only for user-authored templates, whose missing
+   *  variables warn and degrade rather than throwing like bundled templates. */
+  promptSource?: string | null;
   /**
    * The stages this workflow runs (RUN-132) — the pipeline, declared rather than derived.
    *
@@ -153,8 +157,9 @@ export const BUILTIN_WORKFLOWS: Record<RunKind, Workflow> = {
 };
 
 /**
- * Resolve a run's workflow (RUN-116). A legacy dispatch carries only a `kind`, which maps to its
- * matching built-in; a `workflow` id names a custom one (RUN-121) via `runWorkflow`.
+ * Resolve one bundled workflow posture (RUN-116). `runWorkflow` first gives a loaded definition
+ * with the selected name the chance to inherit one of these postures, including when a legacy
+ * dispatch selects the name through `kind` alone (RUN-192).
  *
  * Falls back to SCOPE for a kind outside the union rather than returning undefined — this is what
  * `startAgent`'s write clamp calls (RUN-158), and `clampPermissionToWorkflow(profile, undefined)`
@@ -173,20 +178,19 @@ export function workflowFor(kind: RunKind): Workflow {
 const isBuiltinId = (id: string): id is RunKind => Object.hasOwn(BUILTIN_WORKFLOWS, id);
 
 /**
- * Resolve a workflow by id (RUN-119): a built-in kind name, or a repo-defined `[workflow.<name>]`.
- * A built-in id ALWAYS wins over a same-named custom one — a repo cannot redefine `build` and
- * quietly widen it. A custom workflow inherits its `base` built-in's posture verbatim (so the
- * write floor and every gate come from a known-safe foundation) and only carries its own id +
- * prompt override. An id that names neither returns `undefined`, so the caller can fall back to the
- * run's kind rather than guessing a posture.
+ * Resolve a workflow by id (RUN-119/192): a built-in kind name, or a loaded custom definition.
+ * Project and user definitions are already merged by WorkflowStore; a matching definition wins
+ * over the bundled name, while its declared `base` remains the sole source of posture. A custom
+ * workflow inherits its `base` built-in's posture verbatim (so the write floor and every gate come
+ * from a known-safe foundation) and only carries its own id + prompt override. An id that names
+ * neither returns `undefined`, so the caller can fall back without guessing a posture.
  */
 export function resolveWorkflow(
   id: string,
-  manifest: Pick<ProjectManifest, 'workflows'>,
+  source: Pick<ProjectManifest, 'workflows'> | WorkflowCatalog,
 ): Workflow | undefined {
-  if (isBuiltinId(id)) return BUILTIN_WORKFLOWS[id];
-  const defined = manifest.workflows;
-  const custom = defined && Object.hasOwn(defined, id) ? defined[id] : undefined;
+  const custom = workflowDefinition(source, id);
+  if (!custom && isBuiltinId(id)) return BUILTIN_WORKFLOWS[id];
   if (!custom || !Object.hasOwn(BUILTIN_WORKFLOWS, custom.base)) return undefined;
   const base = BUILTIN_WORKFLOWS[custom.base];
   // The stage list a custom workflow runs (RUN-132). It inherits the base's verbatim today, which
@@ -196,22 +200,49 @@ export function resolveWorkflow(
   // floor: swap the `base.stages` below for the manifest's declared list and the surface is wired,
   // already clamped, with the tests below already covering what a declaration may and may not do.
   const stages = clampStagesToWorkflow(base.stages, base);
-  return { ...base, id, promptRef: custom.prompt, stages };
+  return {
+    ...base,
+    id,
+    promptRef: custom.prompt,
+    promptSource: custom.promptSource,
+    stages,
+  };
 }
 
+type DefinitionSource = Pick<ProjectManifest, 'workflows'> | WorkflowCatalog;
+
+const workflowDefinition = (
+  source: DefinitionSource,
+  id: string,
+): (LoadedWorkflowDefinition & { promptSource: string | null }) | undefined => {
+  if ('definitions' in source) {
+    return Object.hasOwn(source.definitions, id) ? source.definitions[id] : undefined;
+  }
+  const custom = source.workflows && Object.hasOwn(source.workflows, id) ? source.workflows[id] : undefined;
+  return custom
+    ? {
+        ...custom,
+        promptSource: custom.prompt === null ? null : '.noriq/project.toml',
+        source: '.noriq/project.toml',
+        tier: 'project-manifest',
+      }
+    : undefined;
+};
+
 /**
- * The workflow a run actually executes (RUN-132): its named one when the repo defines it, else its
- * kind's built-in.
+ * The workflow a run actually executes (RUN-132/192): its explicit `workflow`, or otherwise its
+ * `kind`, resolved through the per-dispatch catalog before falling back to the bundled posture.
  *
- * The posture is identical either way — a custom workflow inherits its base's flags verbatim and
- * `effectiveKind` (RUN-126) keeps the daemon authoritative about which base that is — so this can
- * never be an escalation. What a named workflow adds is its prompt (RUN-121) and its stage list.
+ * A custom definition may deliberately select a different bundled base, but it cannot invent a
+ * posture: `effectiveKind` (RUN-126) and every machine-owned clamp derive from that selected base.
+ * Loaded text therefore changes prompt content, never stage ordering or permission mechanics.
  */
 export function runWorkflow(
   run: Pick<Run, 'kind' | 'workflow'>,
-  manifest: Pick<ProjectManifest, 'workflows'>,
+  source: Pick<ProjectManifest, 'workflows'> | WorkflowCatalog,
 ): Workflow {
-  const named = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  const id = run.workflow ?? run.kind;
+  const named = resolveWorkflow(id, source);
   if (named) return named;
   // A `kind` the wire schema should have rejected falls back to SCOPE — the narrowest posture, not
   // the nearest one. Unreachable for a real dispatch, and the direction matters anyway: a fallback

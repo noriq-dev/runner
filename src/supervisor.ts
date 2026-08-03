@@ -11,7 +11,12 @@ import type {
 } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
-import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
+import {
+  type AcceptanceItem,
+  acceptanceOverflow,
+  enumerateAcceptance,
+  renderAcceptanceChecklist,
+} from './acceptance';
 import {
   type Finding,
   type FindingResponse,
@@ -60,7 +65,7 @@ import type { LockConflict } from './lock-client';
 import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
-import { renderPrompt, renderTemplate } from './prompts';
+import { renderPrompt, renderUserTemplate } from './prompts';
 import { buildRepairSpec } from './repair';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
 import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
@@ -117,6 +122,7 @@ import {
   runWorkflow,
   workflowFor,
 } from './workflow';
+import type { WorkflowCatalog } from './workflow-store';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -172,6 +178,8 @@ export type SupervisorVcs = Pick<
 export interface ResolvedRepo {
   root: string;
   manifest: ProjectManifest;
+  /** Freshly loaded at dispatch and pinned with this resolved repo for the run. */
+  workflowCatalog?: WorkflowCatalog;
   /**
    * This repo's backend (RUN-60), when it is not the machine default — the daemon detects per
    * repo (git by `.git`, Diversion by the dv registry) and routes here. Omitted → `deps.vcs`,
@@ -421,7 +429,9 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  * (a `docs` workflow based on `scope` is read-only), so the base wins over whatever `kind` the
  * dispatch carried. This closes the footgun where a UI (or any client) selects a read-only workflow
  * but leaves `kind = build`: the daemon holds the manifest and decides, so a mismatched dispatched
- * kind can never escalate write. No workflow (or an unknown name) → the dispatched `kind` stands.
+ * kind can never escalate write. With no explicit selection, a loaded definition matching the
+ * kind wins by RUN-192's source precedence; with no such definition (or an unknown explicit name),
+ * the dispatched `kind` stands.
  *
  * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
  * inherited from its base — so it doubles as the posture kind.
@@ -435,9 +445,9 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  */
 export function effectiveKind(
   run: Pick<Run, 'kind' | 'workflow'>,
-  manifest: Pick<ProjectManifest, 'workflows'>,
+  source: Pick<ProjectManifest, 'workflows'> | WorkflowCatalog,
 ): RunKind {
-  const wf = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  const wf = resolveWorkflow(run.workflow ?? run.kind, source);
   const kind = (wf?.promptShape ?? run.kind) as RunKind;
   // A kind outside the union degrades to SCOPE rather than being passed through. Everything
   // downstream indexes a fixed-key record with this — `manifest.permissions[kind]`,
@@ -821,9 +831,13 @@ export function assemblePrompt(
     promptShapeOverride?: 'planner' | 'plan-checker' | 'pattern-mapper';
     /** The adjudication ledger, for the plan checker's own prior-rounds section (RUN-141). */
     ledger?: string;
+    /** User-template diagnostics. The default is quiet for pure callers; production binds the
+     *  daemon logger in buildRunBrief. */
+    promptWarning?: (message: string, details: { variable: string; source: string }) => void;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
+  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   // The daemon created this identity before the process existed and handed it a token that
   // can only be this agent, so there is nothing to register (RUN-43). The old prompt asked
   // the model to call set_agent_identity — which made attribution depend on it complying,
@@ -847,7 +861,7 @@ export function assemblePrompt(
           ? 'PLAN CHECK'
           : ctx.promptShapeOverride === 'pattern-mapper'
             ? 'PATTERN MAP'
-            : run.kind.toUpperCase(),
+            : wf.promptShape.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
     // The planner and the checker are spawned with NO `noriqMcp` (RUN-140/141), so the shared
@@ -861,7 +875,6 @@ export function assemblePrompt(
   // families. A custom workflow's own prompt receives it as `{{context}}` but must PLACE that tag
   // to get it — a template we do not control cannot have text injected into it. The verify family
   // gets the NAMES-ONLY rendering instead (RUN-154), for the reason below.
-  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   // Which rendering an actor gets follows what it IS, not which template it uses. `verifyActor` is
   // the flag that means "this one judges" — so a repo-defined workflow based on `verify` (RUN-119)
   // gets the bounded, explicitly-untrusted block through its own `{{context}}` too, instead of 16k
@@ -903,18 +916,66 @@ export function assemblePrompt(
     });
   }
   if (wf.promptRef) {
-    // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
-    // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
-    // workflow's inherited posture (write floor, gates) still governs everything else.
-    return renderTemplate(wf.promptRef, {
+    const template = wf.promptRef;
+    const common = {
       identity,
+      label: ctx.agent.label,
+      agentId: ctx.agent.agentId,
+      kind: wf.promptShape.toUpperCase(),
+      projectKey: manifest.key,
+      projectId: run.projectId,
       server: ctx.server,
+      runId: run.id,
+      repoRef: run.repoRef,
+      workflow: wf.id,
+      planId: run.anchor?.type === 'plan' ? run.anchor.planId : null,
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+      taskKey: ctx.task?.key ?? null,
+      taskTitle: ctx.task?.title ?? null,
+      taskBody: ctx.task?.body ?? null,
       brief: run.brief,
       anchor,
       context: repoContext,
+    };
+    const source = wf.promptSource ?? '.noriq/project.toml';
+    const render = (vars: Parameters<typeof renderUserTemplate>[1]) =>
+      renderUserTemplate(template, vars, { source, warn: ctx.promptWarning });
+
+    if (wf.promptShape === 'verify') {
+      const acceptance = ctx.acceptance?.length
+        ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
+        : null;
+      const workflowPrompt = render({
+        ...common,
+        // Kept for templates written before criteria were structured. A verify actor receives no
+        // author spec; `acceptance` is its execution-definition input.
+        spec: '',
+        specs: `${run.brief}${anchor}`,
+        diffCmd: ctx.diffCmd ?? null,
+        acceptance,
+        acceptanceOverflow: ctx.acceptanceOverflow ?? 0,
+      });
+      return assembleVerifyPrompt(`${run.brief}${anchor}`, {
+        agent: ctx.agent,
+        server: ctx.server,
+        diffCmd: ctx.diffCmd,
+        repoContext,
+        workflowPrompt,
+        ...(ctx.acceptance?.length
+          ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+          : {}),
+      });
+    }
+
+    return render({
+      ...common,
       spec: executionSpec,
-      verifyCmd: manifest.verify?.cmd ?? '',
-      reviewer: manifest.verify?.agent ? 'true' : '',
+      ...(wf.promptShape === 'build'
+        ? {
+            verifyCmd: manifest.verify?.cmd ?? null,
+            reviewer: Boolean(manifest.verify?.agent),
+          }
+        : {}),
     });
   }
   if (wf.promptShape === 'scope') {
@@ -1125,7 +1186,7 @@ export class RunSupervisor {
     // non-producing run (scope, verify) whose steps overlap must not receive writable child trees
     // when its parent tree is read-only. The permission clamp already denies the edit tools
     // (RUN-118); this keeps the worktree-level floor symmetric with the sitting that leased first.
-    const readOnly = !runWorkflow(run, repo.manifest).worktreeWritable;
+    const readOnly = !runWorkflow(run, repo.workflowCatalog ?? repo.manifest).worktreeWritable;
     return {
       // All three run-addressed pieces, or none: a backend (or fake) that declares overlap but
       // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
@@ -2887,10 +2948,11 @@ export class RunSupervisor {
 
     const repo = await this.deps.resolveRepo(run.repoRef);
     if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
+    const workflowSource = repo.workflowCatalog ?? repo.manifest;
+    const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
     // posture either way; what the named one adds is its declared stage list.
-    const wf = runWorkflow(run, repo.manifest);
+    const wf = runWorkflow(run, workflowSource);
     const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
@@ -3026,7 +3088,7 @@ export class RunSupervisor {
           runAgent,
           kind,
           ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
-          ...(run.workflow ? { workflow: wf } : {}),
+          workflow: wf,
         }).catch((err) => {
           this.log.warn('could not rebuild the brief on resume — later steps will not run', {
             runId,
@@ -3754,7 +3816,7 @@ export class RunSupervisor {
     const continued = ctx.continued ?? null;
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
     // posture either way; what the named one adds is its declared stage list.
-    const wf = runWorkflow(run, repo.manifest);
+    const wf = runWorkflow(run, repo.workflowCatalog ?? repo.manifest);
 
     // The pipeline as an explicit SEQUENCE (RUN-131). What used to be ~390 lines of gates in one
     // method is now `stagesFor(wf)` — a declared, ordered list this loop walks, so the two flag

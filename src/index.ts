@@ -60,7 +60,23 @@ export {
   type DeviceCodeResponse,
 } from './auth-device';
 export { DEFAULT_STATE_PATH, loadState, saveState, type RunnerState } from './state';
-export { promptTemplate, renderPrompt, renderTemplate, type PromptVars } from './prompts';
+export {
+  promptTemplate,
+  renderPrompt,
+  renderTemplate,
+  renderUserTemplate,
+  type PromptVars,
+  type UserTemplateOptions,
+} from './prompts';
+export {
+  DEFAULT_USER_WORKFLOWS_DIR,
+  WORKFLOW_TEMPLATE_MAX_CHARS,
+  WorkflowStore,
+  type LoadedWorkflowDefinition,
+  type WorkflowCatalog,
+  type WorkflowSourceTier,
+  type WorkflowStoreDeps,
+} from './workflow-store';
 export {
   AGENT_INSTRUCTION_FILES,
   CONTEXT_BUDGET_CHARS,

@@ -14,11 +14,13 @@ import {
   shouldForwardRunStatus,
   telemetryFrame,
   waveCapacity,
+  workflowRepoResolver,
 } from '../src/daemon';
 import type { DaemonHandle } from '../src/daemon';
 import { zeroTelemetry } from '../src/drivers/types';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
+import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
 import type { WsFactory, WsSocket } from '../src/ws-client';
 
 // The daemon's report→frame gate. Untested until now, which is how the same bug shipped
@@ -693,7 +695,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   // A config with NO scan roots: discovery is a no-op and the orphan sweep trivial, so start() never
   // touches a real repo. Built through the contract so budget/update carry their real defaults, then
   // the roots are emptied (the schema demands ≥1, which parse would reject).
-  const config = (concurrency = 1): RunnerConfig => ({
+  const config = (concurrency = 1, scanRoots: string[] = []): RunnerConfig => ({
     ...RunnerConfig.parse({
       label: 'test',
       server: 'https://noriq.example',
@@ -702,17 +704,18 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
       concurrency,
       update: { check: false }, // no version-check fetch or timer
     }),
-    scanRoots: [],
+    scanRoots,
   });
 
   // A fetch that answers registration and owed-merges off-line — never a real host. Records the
   // paths it saw so a test can assert start() issued no request it did not fake.
-  function fakeFetch(calls: string[]): typeof fetch {
+  function fakeFetch(calls: string[], bodies: unknown[] = []): typeof fetch {
     return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = String(input);
       calls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
       let body: unknown = {};
       if (new URL(url).pathname === '/api/runners' && (init?.method ?? 'GET') === 'POST') {
+        bodies.push(JSON.parse(String(init?.body)));
         body = {
           runner: {
             id: 'rnr_test',
@@ -740,7 +743,14 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
   // supervisor — the closure under test. The supervisor itself is a stub: `supervised` records the
   // runs that actually reached it (the admission gate's observable, RUN-170), and `superviseGate`
   // holds each one open so a test can model a run that is still working.
-  async function harness(over: { concurrency?: number; superviseGate?: Promise<void> } = {}) {
+  async function harness(
+    over: {
+      concurrency?: number;
+      superviseGate?: Promise<void>;
+      scanRoots?: string[];
+      workflows?: WorkflowStore;
+    } = {},
+  ) {
     const sockets: FakeDaemonSocket[] = [];
     const connect: WsFactory = (url, headers) => {
       const s = new FakeDaemonSocket(url, headers);
@@ -748,16 +758,18 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
       return s;
     };
     const calls: string[] = [];
+    const bodies: unknown[] = [];
     const supervised: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
-    const daemon = new Daemon(config(over.concurrency), 'tok', {
+    const daemon = new Daemon(config(over.concurrency, over.scanRoots), 'tok', {
       logger: quiet,
       connect,
-      fetchImpl: fakeFetch(calls),
+      fetchImpl: fakeFetch(calls, bodies),
       parked: new ParkedStore(path.join(tmp, 'parked.json')),
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
+      workflows: over.workflows,
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -777,7 +789,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, report, deps, supervised };
+    return { handle, sockets, calls, bodies, report, deps, supervised };
   }
 
   /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
@@ -817,6 +829,36 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  it('re-reads and pins a workflow catalog beside the manifest for each dispatch', async () => {
+    const manifest = ProjectManifest.parse({ key: 'RUN' });
+    let reads = 0;
+    const resolve = workflowRepoResolver({
+      repos: [{ id: 'repo_a', root: '/repo' }],
+      manifestFor: async () => manifest,
+      workflowsFor: async (): Promise<WorkflowCatalog> => {
+        reads += 1;
+        return {
+          definitions: {
+            docs: {
+              base: 'scope',
+              prompt: `dispatch-${reads}`,
+              promptSource: '/repo/.noriq/workflows/docs.toml',
+              source: '/repo/.noriq/workflows/docs.toml',
+              tier: 'project-file',
+            },
+          },
+        };
+      },
+    });
+
+    const first = await resolve('repo_a');
+    const second = await resolve('repo_a');
+    expect(first?.workflowCatalog?.definitions.docs?.prompt).toBe('dispatch-1');
+    expect(second?.workflowCatalog?.definitions.docs?.prompt).toBe('dispatch-2');
+    expect(first?.workflowCatalog).not.toBe(second?.workflowCatalog);
+    expect(reads).toBe(2);
   });
 
   // RUN-170. The wave limit is a dep only the daemon can bind — a dep only tests supply is a

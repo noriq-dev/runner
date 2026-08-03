@@ -126,15 +126,22 @@ environment.
 
 ## Configure
 
-Two files, and they are split by **who they belong to**:
+Configuration is split by **who it belongs to**:
 
 - `~/.noriq/runner.toml` — **machine-local**: label, server, scan roots, concurrency, budget.
   Never committed; it's about your box, not the project. **`init` writes this for you** — reach
   for [`runner.toml.example`](runner.toml.example) only to hand-edit or to set up headless.
 - `.noriq/project.toml` — **committed** per-repo marker: the project KEY, verify command, tool,
   `[land]`, and per-kind permission profiles. Travels with the repo, so your teammates' runners
-  agree with yours about what's allowed. **`init-project` writes this one** — run it from the
-  repo root:
+  agree with yours about what's allowed. **`init-project` writes this one**.
+- `.noriq/workflows/*.toml` — optional **committed** workflow definitions. The filename is the
+  workflow name; `base` inherits the built-in safety posture, while `prompt` may be inline or
+  `{ file = "prompt.md" }` relative to that TOML.
+- `~/.noriq/workflows/*.toml` — the same workflow shape, machine-local. A project definition wins
+  over a user definition of the same name; both win over the bundled workflow. Files are re-read
+  at dispatch, so edits affect the next run without restarting the daemon.
+
+Create the project marker from the repo root:
 
 ```bash
 cd ~/code/acme

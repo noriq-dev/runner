@@ -39,6 +39,42 @@ export function renderTemplate(template: string, vars: PromptVars): string {
   });
 }
 
+export interface UserTemplateOptions {
+  /** The file an operator edits to fix the typo. */
+  source: string;
+  warn?: (message: string, details: { variable: string; source: string }) => void;
+}
+
+/**
+ * Render repo/operator-authored templates without weakening the bundled-template rail (RUN-192).
+ * Unknown values are falsy/empty and warn once per variable for this render, including when the
+ * same miss appears as both a section and an interpolation. A typo degrades one prompt; it never
+ * aborts the run or teaches built-in call sites to tolerate programming errors.
+ */
+export function renderUserTemplate(template: string, vars: PromptVars, options: UserTemplateOptions): string {
+  const warned = new Set<string>();
+  const value = (name: string): PromptVars[string] => {
+    const v = vars[name];
+    if (v !== undefined) return v;
+    if (!warned.has(name)) {
+      warned.add(name);
+      options.warn?.(`workflow template variable '{{${name}}}' is unknown in ${options.source}`, {
+        variable: name,
+        source: options.source,
+      });
+    }
+    return '';
+  };
+  const sectioned = template.replace(SECTION_RE, (_, mode: string, name: string, body: string) => {
+    const v = value(name);
+    return (mode === '#' ? truthy(v) : !truthy(v)) ? body : '';
+  });
+  return sectioned.replace(VAR_RE, (_, name: string) => {
+    const v = value(name);
+    return v === null ? '' : String(v);
+  });
+}
+
 /**
  * Injected at build time by esbuild's `define` (same pattern as __RUNNER_VERSION__ in
  * version.ts): the bundle carries every template inline, so dist/cli.js stays the one

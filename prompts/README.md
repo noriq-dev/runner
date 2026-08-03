@@ -35,6 +35,64 @@ exactly what the agent reads. Keep section tags inside lines: a conditional sent
 own leading newline (see `build.md`). The file's trailing newline is stripped; everything else is
 verbatim.
 
+Bundled templates use strict rendering: a variable their call site omitted is a programming error
+and throws. Workflow templates are operator/repo-authored, so they use lenient rendering instead:
+an unknown interpolation becomes `''`, an unknown section is falsy, and the daemon logs one warning
+per unknown name for that render. The warning names both the variable and the template file.
+
+## Workflow templates
+
+One workflow definition may live in any of these places, in precedence order:
+
+1. `.noriq/workflows/<name>.toml` in the project;
+2. `[workflow.<name>]` in `.noriq/project.toml`;
+3. `~/.noriq/workflows/<name>.toml` on this machine;
+4. the bundled `scope`, `build`, or `verify` workflow.
+
+Dedicated files use the same `base` + `prompt` shape as the inline table:
+
+```toml
+base = "scope"
+prompt = { file = "docs-plan.md" }
+```
+
+An inline string remains valid (`prompt = "Survey {{brief}}"`). A prompt file is resolved beside
+the TOML that names it. Project prompts are confined to the repository; machine-local prompts are
+confined to `~/.noriq/workflows`, not the wider home directory. Both the definition and prompt are
+re-read for each dispatch and then pinned for that run.
+
+The dictionaries below are exact. `null` interpolates as empty and is falsy in a section; `''` is
+also falsy. Extra supplied values are harmless. A misspelled name is not an alias for anything.
+
+Common to `scope`, `build`, and `verify` custom prompts:
+
+- `identity`: the rendered daemon-owned identity header;
+- `label`, `agentId`, `kind`, `projectKey`, `projectId`, `server`: identity and project facts;
+- `runId`, `repoRef`, `workflow`, `planId`: run/repository/workflow facts (`planId` is otherwise null);
+- `taskId`, `taskKey`, `taskTitle`, `taskBody`: anchor task facts, or `null` without that fact;
+- `brief`, `anchor`: the dispatched brief and rendered task/plan anchor;
+- `context`: author context for scope/build; bounded names-only quoted context for verify.
+
+`scope` adds `spec`, the rendered execution spec or `''`.
+
+`build` adds:
+
+- `spec`: the rendered execution spec or `''`;
+- `verifyCmd`: the deterministic verify command or `null`;
+- `reviewer`: boolean, true only when an inline reviewer is configured.
+
+`verify` adds:
+
+- `spec`: always `''`; judging actors do not receive the author's working spec;
+- `specs`: the dispatched brief plus anchor, which the daemon later repeats as task intent;
+- `diffCmd`: the backend's diff command or `null`;
+- `acceptance`: the numbered acceptance checklist or `null`;
+- `acceptanceOverflow`: how many criteria did not fit, normally `0`.
+
+A verify-based custom template does not become the outer verifier prompt. Its rendered text is
+quoted as repo/operator-controlled workflow guidance inside `verify-agent.md`; acceptance handling,
+independent-review rules, and the daemon's verdict instructions remain after it.
+
 `{{context}}` is the repo's own orientation block (`[context]` in `.noriq/project.toml`, RUN-128),
 resolved by `src/repo-context.ts` from the **run's workspace** — not the discovered checkout, which
 may be on a different branch. It carries its own leading blank line, so inline the tag

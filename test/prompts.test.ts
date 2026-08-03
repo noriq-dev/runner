@@ -4,7 +4,7 @@
 // file covers the rail itself.
 import { readdirSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { promptTemplate, renderPrompt, renderTemplate } from '../src/prompts';
+import { promptTemplate, renderPrompt, renderTemplate, renderUserTemplate } from '../src/prompts';
 
 describe('renderTemplate', () => {
   it('interpolates variables; null renders as nothing', () => {
@@ -29,6 +29,43 @@ describe('renderTemplate', () => {
   it('a missing variable throws — a hole in a prompt is a programming error, not a render', () => {
     expect(() => renderTemplate('hi {{who}}', {})).toThrow(/\{\{who\}\}/);
     expect(() => renderTemplate('{{#who}}x{{/who}}', {})).toThrow(/\{\{#who\}\}/);
+  });
+});
+
+describe('renderUserTemplate', () => {
+  it('renders an unknown interpolation empty and warns once with variable + source', () => {
+    const warnings: Array<{ message: string; variable: string; source: string }> = [];
+    const rendered = renderUserTemplate(
+      '{{typo}}/{{typo}}',
+      {},
+      {
+        source: '/repo/.noriq/workflows/docs.md',
+        warn: (message, details) => warnings.push({ message, ...details }),
+      },
+    );
+    expect(rendered).toBe('/');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      variable: 'typo',
+      source: '/repo/.noriq/workflows/docs.md',
+    });
+    expect(warnings[0]?.message).toContain('{{typo}}');
+    expect(warnings[0]?.message).toContain('/repo/.noriq/workflows/docs.md');
+  });
+
+  it('treats an unknown section as falsy without duplicating its warning', () => {
+    const warnings: string[] = [];
+    const rendered = renderUserTemplate(
+      '{{#missing}}wrong{{/missing}}{{^missing}}fallback {{missing}}{{/missing}}',
+      {},
+      { source: 'workflow.toml', warn: (message) => warnings.push(message) },
+    );
+    expect(rendered).toBe('fallback ');
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('does not make strict built-in rendering lenient', () => {
+    expect(() => renderTemplate('{{missing}}', {})).toThrow(/missing/);
   });
 });
 

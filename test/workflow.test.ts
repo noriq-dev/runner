@@ -83,10 +83,9 @@ describe('resolveWorkflow — repo-defined workflows (RUN-119)', () => {
     });
   });
 
-  it('a built-in id wins over a same-named custom workflow (no redefining build)', () => {
-    // A repo cannot widen `build` by declaring [workflow.build] base = "scope".
+  it('a project definition wins over the bundled name but still inherits its declared base', () => {
     const wf = resolveWorkflow('build', M({ build: { base: 'scope', prompt: null } }));
-    expect(wf).toEqual(BUILTIN_WORKFLOWS.build); // the real build, not the read-only impostor
+    expect(wf).toMatchObject({ id: 'build', promptShape: 'scope', produces: false });
   });
 
   it('returns undefined for an id that names neither a kind nor a defined workflow', () => {
@@ -232,8 +231,24 @@ describe('runWorkflow — the workflow a run actually executes (RUN-132)', () =>
     expect(runWorkflow(run('scope', 'nope'), M({}))).toEqual(BUILTIN_WORKFLOWS.scope);
   });
 
-  it('a name colliding with a built-in resolves to the built-in, not the repo’s version', () => {
+  it('a loaded name colliding with a built-in resolves through its base posture', () => {
     const wf = runWorkflow(run('scope', 'build'), M({ build: { base: 'scope', prompt: null } }));
-    expect(wf).toEqual(BUILTIN_WORKFLOWS.build);
+    expect(wf).toMatchObject({ id: 'build', promptShape: 'scope', produces: false });
+  });
+
+  it('a per-dispatch catalog carries prompt source identity into the resolved workflow', () => {
+    const source = '/repo/.noriq/workflows/docs.md';
+    const wf = resolveWorkflow('docs', {
+      definitions: {
+        docs: {
+          base: 'scope',
+          prompt: 'read {{brief}}',
+          promptSource: source,
+          source: '/repo/.noriq/workflows/docs.toml',
+          tier: 'project-file',
+        },
+      },
+    });
+    expect(wf).toMatchObject({ promptShape: 'scope', promptRef: 'read {{brief}}', promptSource: source });
   });
 });

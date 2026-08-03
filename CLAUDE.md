@@ -334,8 +334,14 @@ with which facts. The build inlines them via esbuild `define` (`__RUNNER_PROMPTS
 but never edits) are the three **built-in workflows** (`src/workflow.ts` `BUILTIN_WORKFLOWS`). Since
 RUN-116/117 they are *data*, not a `switch`: a `Workflow` descriptor carries `promptShape`,
 `worktreeWritable`, `produces`, `verifyActor`, `usesPlanBase`, and `supervisor.ts` reads those flags
-— it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119): a named
-variant of a built-in `base` that inherits the base's posture verbatim and only swaps in a prompt.
+— it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119), or put
+the same `base` + `prompt` shape in `.noriq/workflows/<name>.toml` (RUN-192); machine-local
+definitions live in `~/.noriq/workflows/<name>.toml`. `WorkflowStore` re-reads and pins a merged
+catalog per dispatch: project file > inline project table > user file > bundled name. Every
+definition inherits its base's posture verbatim and only swaps in a prompt. A file prompt resolves
+beside its TOML and reads through `openConfined`, rooted at the repo or user workflow directory.
+User-authored templates render leniently with source-naming warnings, while bundled templates keep
+strict failures; verify-based custom text stays quoted inside the daemon-owned verify frame.
 
 Since RUN-132 a `Workflow` also carries `stages` — its pipeline, declared rather than derived from
 `RunStage.appliesTo`. The division of labour is the design and reversing it would put a manifest
@@ -377,12 +383,14 @@ coordinates by default", and the dashboard sends `agent` only when a model or ef
 the clock has not started (`runCoordinate` /
 `resolveAgentTool` normalize either form, so a legacy dispatch resolves byte-identically).
 
-### Two-file config
+### Configuration sources
 
 - `~/.noriq/runner.toml` — machine-local, never committed (`config.ts`; see `runner.toml.example`).
 - `.noriq/project.toml` — committed per-repo marker: project KEY, verify cmd, tool, `[land]`,
   per-kind permission profiles (`discovery.ts` + `manifest-store.ts`; see `project.toml.example`).
   `ManifestStore` re-reads it per Run, so editing it takes effect on the next dispatch with no restart.
+- `.noriq/workflows/*.toml` / `~/.noriq/workflows/*.toml` — project and machine-local workflow
+  definitions, merged and re-read by `WorkflowStore` for each dispatch.
 
 ## Invariants (do not regress these)
 
