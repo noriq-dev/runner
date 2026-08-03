@@ -354,7 +354,7 @@ describe('rendering a spec into a brief', () => {
     });
     expect(out.length).toBeLessThan(SPEC_BUDGET_CHARS + 400);
     expect(out).toMatch(/cut off here/);
-    expect(out).toMatch(/ask for the rest of it/);
+    expect(out).toMatch(/read the FULL spec with the get_task tool/);
   });
 
   // RUN-145 moved the judge's view of the criteria out of here entirely: a gate is now asked to

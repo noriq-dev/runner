@@ -337,7 +337,11 @@ function capped(block: string, budget: number = SPEC_BUDGET_CHARS): string {
   if (block.length <= budget) return block;
   const cut = block.slice(0, budget);
   const atLine = cut.slice(0, Math.max(cut.lastIndexOf('\n'), 0));
-  return `${atLine}\n\n[this spec was longer than the brief allows and is cut off here — ask for the rest of it rather than assuming what you have seen is all of it]`;
+  // "get_task", by name: a live builder read the old "ask for the rest of it" as an instruction
+  // to ask a HUMAN, called request_input over a document sitting one tool call away, and the run
+  // died no_changes (RUN-198). The tool that has the rest is named; a human is for questions only
+  // a human can answer.
+  return `${atLine}\n\n[this spec was longer than the brief allows and is cut off here — read the FULL spec with the get_task tool before assuming what you have seen is all of it; do not ask a human for it]`;
 }
 
 /** A prompt section for a task whose spec the SERVER could not read (RUN-135). Not the same as a
