@@ -162,7 +162,8 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   host.transcript(run.id).milestone('no execution spec on this task — planning it in a fresh context first');
 
   let text = '';
-  /** Non-null only while the repair turn runs (RUN-197) — its own bounded accumulator. */
+  /** Non-null only while a repair (RUN-197) or revision (RUN-198) turn runs — that turn's own
+   *  bounded accumulator, because a length snapshot into the sliding tail cap cannot isolate one. */
   let repairBuf: string | null = null;
   const startedAt = Date.now();
   const budgetRun = host.startAgent(plan.driver, {
@@ -312,23 +313,26 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
     checked,
     envelope: plan.start.budget ?? null,
     revise: async (feedback: string) => {
-      // Parse only THIS turn's output. `text` accumulates every turn, so parsing the whole buffer
-      // would find the ORIGINAL plan's fence and hand it back as the revision — a revision that
-      // emitted prose, or a bare object, or nothing, would silently look like a successful one.
-      // The reviewer loop takes the same snapshot for the same reason (RUN-79).
-      const before = text.length;
+      // Parse only THIS turn's output — through the turn accumulator, not a length snapshot into
+      // `text`: the tail cap SLIDES once the buffer is full, and a slid snapshot misaligns every
+      // later parse (RUN-198; the exact bug RUN-197 fixed for the repair turn — "could not
+      // revise" on the live run was this). Parsing the whole buffer would be worse still: it
+      // finds the ORIGINAL plan's fence and hands it back as the revision.
       const turn = budgetRun.session.continueWith;
       if (!turn) return null;
+      repairBuf = '';
       const revisedExit = await turn.call(budgetRun.session, feedback).catch((err) => {
         host.log.warn('could not hand the plan findings back', { runId: run.id, err: String(err) });
         return null;
       });
+      const turnText = repairBuf;
+      repairBuf = null;
       if (!revisedExit || revisedExit.outcome !== 'done') return null;
-      const revised = parsePlannedSpec(text.slice(before));
+      const revised = parsePlannedSpec(turnText);
       // The revision REPLACES the plan, so nothing parseable means the previous one stands rather
       // than being lost — a checker round that produced no new plan has cost tokens, not a plan.
       if (!revised) return null;
-      return { checked: await host.checkSpec(revised, plan.worktree.localPath), text: text.slice(before) };
+      return { checked: await host.checkSpec(revised, plan.worktree.localPath), text: turnText };
     },
     close: async (final: CheckedExecutionSpec) => {
       // STOPPING IS UNCONDITIONAL. Saving first and stopping after meant a save that hung or threw
