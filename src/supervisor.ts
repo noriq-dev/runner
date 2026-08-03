@@ -2832,6 +2832,10 @@ export class RunSupervisor {
     const runSpend = ctx.tally.total();
     await this.deps.parked.park({
       run,
+      // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
+      // editing a workflow while the question is open affects the next dispatch only, including
+      // when the daemon restarts before the answer arrives.
+      ...(ctx.repo.workflowCatalog ? { workflowCatalog: ctx.repo.workflowCatalog } : {}),
       sessionId,
       agentId: ctx.runAgent.agentId,
       agentLabel: ctx.runAgent.label,
@@ -2946,8 +2950,16 @@ export class RunSupervisor {
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     };
 
-    const repo = await this.deps.resolveRepo(run.repoRef);
-    if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
+    const currentRepo = await this.deps.resolveRepo(run.repoRef);
+    if (!currentRepo) return fail(`repo not found for repoRef ${run.repoRef}`);
+    // Re-resolve the repository because the task/spec and manifest may legitimately move during a
+    // 72-hour park, but keep the workflow snapshot this dispatch prepared under (RUN-192). Without
+    // this overlay, changing a verify-based definition to build while it waits grants the resumed
+    // session build posture and runs the producing pipeline. A park written before RUN-192 has no
+    // snapshot and retains the old best-effort fallback to the current catalog.
+    const repo = entry.workflowCatalog
+      ? { ...currentRepo, workflowCatalog: entry.workflowCatalog }
+      : currentRepo;
     const workflowSource = repo.workflowCatalog ?? repo.manifest;
     const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same

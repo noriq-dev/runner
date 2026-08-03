@@ -37,6 +37,7 @@ import {
 } from '../src/supervisor';
 import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 import { BUILTIN_WORKFLOWS } from '../src/workflow';
+import type { WorkflowCatalog } from '../src/workflow-store';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -480,11 +481,14 @@ function harness(
     waveLimit?: number;
     /** RUN-170: the fake backend's isolation model. true = git's (leases overlap). */
     leasesOverlap?: boolean;
+    /** Mutable dispatch catalog, so a park test can model workflow files changing while it waits. */
+    workflowCatalog?: WorkflowCatalog;
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
   // (RUN-164) — a test of a resumed chain has to be able to model that.
   let anchorTask = over.anchorTask ?? null;
+  let workflowCatalog = over.workflowCatalog;
   const worktrees = new FakeWorktrees();
   if (over.leasesOverlap) worktrees.leasesOverlap = true;
   if (over.changed === false) worktrees.changed = false;
@@ -528,6 +532,7 @@ function harness(
         : {
             root: `/repos/${repoRef}`,
             manifest: over.manifest ?? manifest(),
+            ...(workflowCatalog ? { workflowCatalog } : {}),
             ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
           },
     report: (runId, r) => {
@@ -638,6 +643,10 @@ function harness(
     /** Model a human rewriting the task's spec while the run is parked. */
     setAnchorTask: (t: AnchorTask | null) => {
       anchorTask = t;
+    },
+    /** Model workflow TOML changing after this run prepared but before its answer arrives. */
+    setWorkflowCatalog: (catalog: WorkflowCatalog) => {
+      workflowCatalog = catalog;
     },
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
@@ -5217,6 +5226,43 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.resumeSessionId).toBe('sess-fake');
     expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
     expect(h.worktrees.created).toHaveLength(1); // only the original
+  });
+
+  it('keeps the dispatch workflow snapshot when definitions change while parked (RUN-192)', async () => {
+    const catalog = (base: 'verify' | 'build', prompt: string): WorkflowCatalog => ({
+      definitions: {
+        audit: {
+          base,
+          prompt,
+          promptSource: '/repo/.noriq/workflows/audit.md',
+          source: '/repo/.noriq/workflows/audit.toml',
+          tier: 'project-file',
+        },
+      },
+    });
+    const h = harness({ parkState: asked, workflowCatalog: catalog('verify', 'Audit {{brief}}') });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'verify', workflow: 'audit', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    expect((await h.parked.get('run_1'))?.workflowCatalog?.definitions.audit?.base).toBe('verify');
+    // This edit belongs to the NEXT dispatch. Before the fix, resume re-resolved it and granted
+    // the waiting run the build posture and producing pipeline.
+    h.setWorkflowCatalog(catalog('build', 'Build {{brief}}'));
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Continue the audit.');
+    await flush();
+    const start = h.claude.starts.at(-1)!;
+    expect(start.kind).toBe('verify');
+    expect(start.permission.write).toBe(false);
+    expect(start.multiTurn).toBe(false);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    expect(await resumed).toMatchObject({ outcome: 'done' });
+    expect(h.worktrees.commits).toEqual([]);
   });
 
   // RUN-168 recorded WHERE a chain parked; RUN-169 is what lets the rest of it run. Before the

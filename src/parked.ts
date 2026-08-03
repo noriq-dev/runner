@@ -7,6 +7,7 @@ import type { ModelUsage } from './drivers/types';
 import { renderPrompt } from './prompts';
 import type { StepSummary } from './stages/chain';
 import type { Workspace } from './vcs/types';
+import type { WorkflowCatalog } from './workflow-store';
 
 /**
  * Runs parked on a human (RUN-30) — the daemon's side of `blocked`.
@@ -24,6 +25,14 @@ export const DEFAULT_PARKED_PATH = path.join(os.homedir(), '.noriq', 'parked-run
 
 export interface ParkedRun {
   run: Run;
+  /**
+   * The workflow definitions pinned when this run was dispatched (RUN-192).
+   *
+   * A park may survive both edits to workflow files and a daemon restart. Resuming against a
+   * freshly loaded catalog would let those edits change the posture, prompt and pipeline of a run
+   * that already started. Older parks omit this field and keep their pre-RUN-192 behaviour.
+   */
+  workflowCatalog?: WorkflowCatalog;
   /** What `resume` takes. Null on a driver with no resumable session — such a run can be
    *  reported blocked but not brought back, so we refuse to park it (see supervisor). */
   sessionId: string | null;
