@@ -78,6 +78,17 @@ export interface ParkedRun {
   /** The question the agent asked, for the log and for the resume turn. */
   question: string | null;
   /**
+   * Which STAGE ACTOR asked (RUN-190), or absent for the primary session's parks.
+   *
+   * A stage park is an IN-PROCESS wait: the planner, checker, mapper and reviewer run inside a
+   * live `supervise` stack, so the daemon parks the run and holds the stage until the answer
+   * arrives over ws, then re-runs the stage with the answer — no session to restore, `sessionId`
+   * null. This record exists for the crash case: a daemon restart loses the waiting stack, and a
+   * resume that finds a stage park with nobody waiting must say so rather than pretend — the
+   * stage's work does not exist yet, so re-dispatching the run loses nothing.
+   */
+  stage?: 'plan' | 'plan-check' | 'pattern-map' | 'review' | null;
+  /**
    * Which STEP of a decomposed run was speaking when it parked (RUN-168), or null/absent for an
    * undecomposed run and every park written before this existed.
    *

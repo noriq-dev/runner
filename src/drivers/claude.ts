@@ -220,6 +220,7 @@ export function lockHooks(enforcer: LockEnforcer): NonNullable<SdkQueryOptions['
 export function mapPermission(
   profile: PermissionProfile,
   kind: RunKind,
+  noriqTools?: readonly string[],
 ): {
   permissionMode: string;
   allowedTools: string[];
@@ -229,13 +230,27 @@ export function mapPermission(
   if (profile.write) allowed.push(...EDIT_TOOLS);
   // The agent reports its own work through Noriq — without these the prompt's
   // "register + claim + report" contract is unsatisfiable and the run is a no-op.
-  allowed.push(...noriqToolsFor(kind));
+  // A stage actor's narrowed set (DriverStartOptions.noriqTools) replaces the kind floor when
+  // present: it shares the run's identity, so the server advertises the run's full catalogue,
+  // and this narrowing is what keeps the extra tools out of the actor's hands.
+  const noriq = noriqTools ? noriqTools.map((t) => `mcp__${NORIQ_MCP_NAME}__${t}`) : noriqToolsFor(kind);
+  allowed.push(...noriq);
   allowed.push(...profile.allow);
 
   const disallowed = [...profile.deny];
   // No edit tools without write — that is what read-only means, and it is the property
   // that stops a VERIFY agent from "fixing" the code it is supposed to be judging.
   if (!profile.write) disallowed.push(...EDIT_TOOLS);
+  // The complement of a narrowed set is DENIED, not merely un-allowed. Deny outranks bypass, so
+  // this is the half that holds under `auto = true` — an allowlist alone gates nothing there.
+  // The universe is EVERY kind's floor, not this session's: a stage actor runs under the RUN's
+  // shared credential, so the server advertises the run's catalogue — an inline reviewer spawned
+  // as `verify` inside a build run can see `claim_task`, and denying only the verify floor would
+  // leave every build-only tool reachable under bypass.
+  if (noriqTools) {
+    const catalogue = new Set((['scope', 'build', 'verify'] as RunKind[]).flatMap((k) => noriqToolsFor(k)));
+    disallowed.push(...[...catalogue].filter((t) => !noriq.includes(t)));
+  }
 
   // AUTO (RUN-68): the repo opted this kind into Claude's own bypass mode — everything is
   // approved except what `disallowedTools` names, and deny outranks bypass, so the write axis
@@ -390,7 +405,7 @@ export class ClaudeDriver implements AgentDriver {
     const input = new AsyncQueue<SdkUserMessage>();
     input.push(userTurn(opts.prompt));
 
-    const perm = mapPermission(opts.permission, opts.kind);
+    const perm = mapPermission(opts.permission, opts.kind, opts.noriqTools);
     const abort = new AbortController();
     const query = this.queryFn({
       prompt: input,

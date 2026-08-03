@@ -3152,6 +3152,41 @@ describe('the inline reviewer (RUN-61)', () => {
     throw new Error('the reviewer session never started');
   };
 
+  // RUN-190: a STAGE actor asking is an in-process wait — the run pauses, the stage's stack holds,
+  // and the answer re-runs the stage fresh with the Q&A appended. No session restore involved.
+  it('a reviewer that asks pauses the run, and the answered round re-runs fresh (RUN-190)', async () => {
+    const pump = async (cond: () => boolean) => {
+      for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), verifyResults: [true] });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // the build turn — not blocked, so it does not park
+    await onReviewTurn(h);
+    h.parkNext(); // the reviewer's question opens mid-round
+    h.claude.emitText('I cannot judge this without knowing whether the legacy surface is live.');
+    h.claude.complete('done'); // round ends → the stage parks and WAITS, in process
+    await pump(() => h.reports.some((r) => r.status === 'blocked'));
+    const entry = await h.parked.get('run_1');
+    expect(entry?.stage).toBe('review');
+    expect(entry?.sessionId).toBeNull(); // nothing to restore — the record is for the crash case
+    expect(h.worktrees.removed).toEqual([]); // the work stays put while the human thinks
+
+    h.answerIt();
+    await h.supervisor.resume('run_1', 'The legacy surface is dead — judge without it.');
+    await pump(() => h.claude.starts.length >= 3);
+    const rerun = h.claude.starts.at(-1)!;
+    expect(rerun.runId).toBe('run_1:review'); // a FRESH round, not a resumed session
+    expect(rerun.prompt).toContain('The legacy surface is dead'); // the answer rides the prompt
+    expect(rerun.prompt).toContain('do not re-ask');
+    expect(await h.parked.get('run_1')).toBeFalsy(); // unparked the moment it was answered
+
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    const exit = await done;
+    expect(exit.outcome).toBe('done'); // the paused round's non-verdict was discarded, as promised
+  });
+
   // RUN-154. The reviewer is the actor asked whether a diff looks like this repo's code, and it was
   // the one told nothing about what this repo's code looks like. Names only — its context already
   // carries the diff — and resolved at the point of use, so a run RESUMED in a later process gets
@@ -3202,7 +3237,7 @@ describe('the inline reviewer (RUN-61)', () => {
     await done;
   });
 
-  it('spawns a fresh read-only session with NO Noriq credential, and a PASS reaches done', async () => {
+  it('spawns a fresh read-only session with ONLY the escalation pair, and a PASS reaches done', async () => {
     const h = harness({ manifest: REVIEWED('npm test', { model: 'claude-opus-4-8', effort: 'high' }) });
     const done = h.supervisor.supervise(buildRun());
     await flush();
@@ -3213,7 +3248,10 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(review.runId).toBe('run_1:review');
     expect(review.kind).toBe('verify'); // executes but never edits — the verify floor
     expect(review.permission.write).toBe(false);
-    expect(review.noriqMcp).toBeUndefined(); // one run, one credential (RUN-43) — the reviewer has none
+    // The run's ONE credential (RUN-43), narrowed to the reach-a-human pair (RUN-190): a reviewer
+    // that cannot ask does not stop, it guesses a verdict. Everything that moves work stays out.
+    expect(review.noriqMcp).toBeDefined();
+    expect(review.noriqTools).toEqual(['raise_alert', 'request_input']);
     expect(review.model).toBe('claude-opus-4-8'); // the SET model — the point of the knob
     expect(review.effort).toBe('high');
     expect(review.prompt).toContain('git diff base0000...HEAD'); // the diff since the fork
@@ -3848,7 +3886,9 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(review?.runId).toBe('run_1:review');
     expect(review?.kind).toBe('verify');
     expect(review?.model).toBe('gpt-5.6-sol');
-    expect(review?.noriqMcp).toBeUndefined(); // no credential on ANY driver
+    // The escalation pair rides on ANY driver (RUN-190) — codex narrows via enabled_tools.
+    expect(review?.noriqMcp).toBeDefined();
+    expect(review?.noriqTools).toEqual(['raise_alert', 'request_input']);
     expect(h.claude.starts.filter((s) => s.runId === 'run_1:review')).toHaveLength(0);
     h.codex.emitText('VERDICT: PASS');
     h.codex.complete('done');

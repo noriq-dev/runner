@@ -76,6 +76,8 @@ export interface CodexSpawnOptions {
   approvalPolicy: 'never';
   /** The agent's Noriq connection. Omitted → it cannot report its own work at all. */
   noriqMcp?: NoriqMcp;
+  /** A stage actor's narrowed Noriq tool set — replaces the kind floor in `enabled_tools`. */
+  noriqTools?: readonly string[];
   /** The run kind, so the per-kind Noriq tool floor applies HERE too (RUN-46) — without it
    *  every codex agent got the server's whole tool surface, and a verify agent could
    *  claim_task the work it was judging. */
@@ -167,6 +169,7 @@ export class CodexDriver implements AgentDriver {
       sandbox: mapSandbox(opts.permission),
       approvalPolicy: 'never',
       noriqMcp: opts.noriqMcp,
+      noriqTools: opts.noriqTools,
       kind: opts.kind,
       env: opts.env,
     });
@@ -359,7 +362,10 @@ export const defaultSpawnCodex = (
         // (the reviewer moving the work it judges). JSON.stringify emits a valid TOML string
         // array, which is how -c values are parsed.
         '-c',
-        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify(noriqToolNamesFor(opts.kind))}`,
+        // A stage actor's narrowed set (DriverStartOptions.noriqTools) replaces the kind floor —
+        // same seam as the Claude driver, enforced here by the server allowlist itself, which is
+        // sandbox-independent: not-enabled is not-advertised, whatever the sandbox mode.
+        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify([...(opts.noriqTools ?? noriqToolNamesFor(opts.kind))])}`,
       ]
     : [];
   // Model + effort (RUN-33), per-spawn for the same reason as the MCP config above: writing

@@ -39,3 +39,5 @@ Emit ONE fenced ```json block and nothing after it:
 ```
 
 Leave out anything you could not establish. An empty list is an honest answer; a plausible one you did not check is not.
+
+You will rarely need a human — your answers come from reading this repo. But if something you find looks genuinely dangerous to build on (a test command that would touch production, credentials committed where the plan says to work), `raise_alert` and keep mapping. Reserve `request_input` for the case where you cannot produce a usable map at all without an answer.

@@ -153,6 +153,17 @@ export interface DriverStartOptions {
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */
   noriqMcp?: NoriqMcp;
   /**
+   * Narrow THIS session's Noriq tool set below its kind's floor (bare names, un-prefixed).
+   *
+   * Absent, the driver derives the set from `kind` (`noriqToolNamesFor`) — the right answer for
+   * every primary session. The stage actors (planner, plan checker, pattern mapper, inline
+   * reviewer) pass `STAGE_NORIQ_TOOLS` here: they share the run's one identity, so the server-side
+   * catalogue is the run's, and this is the seam that keeps a read-only actor from holding
+   * `update_task` while still being able to reach a human. Drivers enforce it both ways — the
+   * complement is DENIED, not merely un-allowed, so a bypass-permissions profile cannot widen it.
+   */
+  noriqTools?: readonly string[];
+  /**
    * Reactive per-edit file locking (RUN-101). When present, a driver that supports in-process
    * tool-use hooks (Claude) wires it as a PreToolUse deny + a Stop release — the runner's
    * GUARANTEED, unskippable variant of the PLNR client hook, run in-process so the run's token

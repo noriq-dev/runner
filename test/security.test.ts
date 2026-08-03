@@ -2,7 +2,7 @@ import type { PermissionProfile, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { mapPermission } from '../src/drivers/claude';
 import { mapSandbox } from '../src/drivers/codex';
-import { noriqToolNamesFor, sanitizedAgentEnv } from '../src/security';
+import { STAGE_NORIQ_TOOLS, noriqToolNamesFor, sanitizedAgentEnv } from '../src/security';
 
 const perm = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -134,6 +134,35 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
       expect(noriqToolNamesFor(kind), kind).not.toContain('create_task');
       expect(noriqToolNamesFor(kind), kind).not.toContain('decompose_task');
     }
+  });
+});
+
+describe('the stage escalation pair (RUN-190)', () => {
+  it('is exactly reach-a-human — the tools whose own rationale says they ration nothing', () => {
+    expect([...STAGE_NORIQ_TOOLS]).toEqual(['raise_alert', 'request_input']);
+  });
+
+  it('Claude: a narrowed session allows the pair and DENIES the rest of the kind floor', () => {
+    const p = mapPermission(perm({ write: true }), 'build', STAGE_NORIQ_TOOLS);
+    expect(p.allowedTools).toContain('mcp__noriq__request_input');
+    expect(p.allowedTools).toContain('mcp__noriq__raise_alert');
+    expect(p.allowedTools).not.toContain('mcp__noriq__claim_task');
+    // DENIED, not merely un-allowed: deny outranks bypass, so this half holds under auto.
+    expect(p.disallowedTools).toContain('mcp__noriq__claim_task');
+    expect(p.disallowedTools).toContain('mcp__noriq__update_task');
+  });
+
+  it('…and the denial survives auto, which is the case that matters (RUN-68)', () => {
+    const p = mapPermission(perm({ write: true, auto: true }), 'build', STAGE_NORIQ_TOOLS);
+    expect(p.permissionMode).toBe('bypassPermissions');
+    expect(p.disallowedTools).toContain('mcp__noriq__claim_task');
+    expect(p.disallowedTools).not.toContain('mcp__noriq__request_input');
+  });
+
+  it('an un-narrowed session keeps its kind floor exactly as before', () => {
+    const p = mapPermission(perm({ write: true }), 'build');
+    expect(p.allowedTools).toContain('mcp__noriq__claim_task');
+    expect(p.disallowedTools).not.toContain('mcp__noriq__claim_task');
   });
 });
 

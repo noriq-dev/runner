@@ -88,6 +88,10 @@ export interface StageHost {
     /** Whether the deterministic command has ALREADY run when this reviewer is asked (RUN-177).
      *  False on the landing path, where it runs after the review, against the rebased result. */
     verifyRan?: boolean;
+    /** The run's Noriq connection — the reviewer gets the escalation pair through it, no more. */
+    noriqMcp?: NoriqMcp;
+    /** The run's agent identity, so a reviewer that pauses the run can be parked under it. */
+    runAgent?: { agentId: string; label: string; token: string };
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {
@@ -126,7 +130,7 @@ export interface RunPipeline {
   readonly permission: PermissionProfile;
   readonly noriqMcp?: NoriqMcp;
   readonly task: AnchorTask | null;
-  readonly runAgent: { agentId: string; token: string };
+  readonly runAgent: { agentId: string; label: string; token: string };
   readonly session: DriverSession;
   readonly stopSession: () => Promise<void>;
   readonly tally: RunTally;

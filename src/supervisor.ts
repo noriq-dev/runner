@@ -66,13 +66,14 @@ import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-con
 import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
 import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
 import { type StageName, stagesFor, stopBefore } from './run-machine';
-import { sanitizedAgentEnv } from './security';
+import { STAGE_NORIQ_TOOLS, sanitizedAgentEnv } from './security';
 import {
   type ExecuteHost,
   type ExecuteOutcome,
   type PatternMapHost,
   type PlanCheckHost,
   type PlanHost,
+  type PlanOutcome,
   type PlannedRun,
   type PrepareHost,
   type PreparedRun,
@@ -1629,6 +1630,10 @@ export class RunSupervisor {
     requirements?: string[];
     /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
     verifyRan?: boolean;
+    /** The run's Noriq connection — each reviewer round gets the escalation pair through it. */
+    noriqMcp?: NoriqMcp;
+    /** The run's agent identity — what a review-stage park is recorded under (RUN-190). */
+    runAgent?: { agentId: string; label: string; token: string };
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
@@ -1874,6 +1879,15 @@ export class RunSupervisor {
     requirements?: string[];
     /** Whether the deterministic command has already run (RUN-177) — false on the landing path. */
     verifyRan?: boolean;
+    /** The run's Noriq connection, for the escalation pair alone (see the spawn below). */
+    noriqMcp?: NoriqMcp;
+    /** The run's agent identity — what a review-stage park is recorded under (RUN-190). */
+    runAgent?: { agentId: string; label: string; token: string };
+    /** A prior ask's Q&A block, appended to this round's prompt (RUN-190). */
+    stageAnswer?: string;
+    /** How many times this round has already paused the run — the cap that stops a reviewer
+     *  answering every answer with another question from holding the run forever. */
+    asks?: number;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -1948,22 +1962,23 @@ export class RunSupervisor {
       runId: `${ctx.run.id}:review`,
       kind: 'verify', // the reviewer IS a verify actor: executes but never edits
       cwd: ctx.worktree.localPath,
-      prompt: assembleReviewerPrompt({
-        intent: ctx.intent,
-        diffCmd,
-        // Split in two (RUN-177) because the two states are different facts and only one of them
-        // was ever told. A landing run's deterministic command runs AFTER this review, against the
-        // rebased result — telling the reviewer it "already passed" is false there, and it is
-        // instructed not to re-run it, so it cannot find out.
-        verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
-        verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
-        ledger: ctx.ledger,
-        repoContext: reviewerContext,
-        ...(ctx.acceptance?.length
-          ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
-          : {}),
-        ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
-      }),
+      prompt:
+        assembleReviewerPrompt({
+          intent: ctx.intent,
+          diffCmd,
+          // Split in two (RUN-177) because the two states are different facts and only one of them
+          // was ever told. A landing run's deterministic command runs AFTER this review, against the
+          // rebased result — telling the reviewer it "already passed" is false there, and it is
+          // instructed not to re-run it, so it cannot find out.
+          verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
+          verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
+          ledger: ctx.ledger,
+          repoContext: reviewerContext,
+          ...(ctx.acceptance?.length
+            ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+            : {}),
+          ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
+        }) + (ctx.stageAnswer ?? ''),
       // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
       // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
       // a committed manifest handed the reviewer Edit/Write over the very diff it is judging, which
@@ -1971,10 +1986,16 @@ export class RunSupervisor {
       // site; this was the site it missed — and the one that matters most, because a dispatched
       // verify run is opt-in while the inline reviewer gates every build that configures one.
       permission: clampPermissionToWorkflow(manifest.permissions.verify, BUILTIN_WORKFLOWS.verify),
-      // NO noriqMcp, deliberately: one run holds one non-reissuable credential (RUN-43), so a
-      // second inline identity cannot exist — and need not. The reviewer's output IS its report;
-      // the daemon parses the verdict and posts the findings itself. This is also what makes
-      // authorship separation absolute: the reviewer cannot claim, move, or comment as anyone.
+      // The ESCALATION PAIR only. The reviewer had NO noriqMcp for two reasons that both still
+      // hold for everything except these two tools: one run holds one non-reissuable credential
+      // (RUN-43), so a second inline identity cannot exist; and authorship separation means the
+      // reviewer must not claim, move, or comment as anyone. `raise_alert` and `request_input`
+      // move no work — the first notifies, the second PAUSES the run — so the separation
+      // survives, and a reviewer that genuinely cannot judge without a human's answer ("is this
+      // legacy surface load-bearing?") finally has a move that is not guessing a verdict. The
+      // reviewer's output is still its report; the daemon still posts the findings itself.
+      noriqMcp: ctx.noriqMcp,
+      noriqTools: STAGE_NORIQ_TOOLS,
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
       budget: reservation.budget,
@@ -2019,6 +2040,29 @@ export class RunSupervisor {
           passed: false,
           findings: text.trim() || `the reviewer exited ${exit.reason ?? 'without a report'}`,
         };
+      }
+      // The reviewer may have PAUSED the run on a human (RUN-190). Probed before the verdict is
+      // read, because a report written around an open question is not a judgment — the paused
+      // round re-runs FRESH with the Q&A appended, and this round's text is discarded (its own
+      // prompt says so). Uncapped, deliberately: each re-ask costs a human an answer, which is
+      // the real rate limiter — a cap would read a verdict off a report that stopped to ask.
+      if (ctx.runAgent) {
+        const answered = await this.parkStage({
+          run: ctx.run,
+          worktree: ctx.worktree,
+          runAgent: ctx.runAgent,
+          tally: ctx.tally,
+          stage: 'review',
+          tail: text.slice(-400),
+        });
+        if (answered) {
+          this.deps.steering?.unregister(ctx.run.id);
+          return this.runReviewer({
+            ...ctx,
+            asks: (ctx.asks ?? 0) + 1,
+            stageAnswer: `${ctx.stageAnswer ?? ''}${renderPrompt('stage-answer', answered)}`,
+          });
+        }
       }
       // Verdict AND per-criterion evidence, reconciled together (RUN-145) — a PASS the report's
       // own acceptance lines contradict is taken as the FAIL it contains.
@@ -2570,6 +2614,111 @@ export class RunSupervisor {
    * instant would sometimes lose — and losing means finalizing the run and reaping the worktree,
    * which is the exact failure this task exists to fix, except intermittent.
    */
+  /**
+   * Stage parks (RUN-190): the actors that run INSIDE a live `supervise` stack — planner, plan
+   * checker, pattern mapper, inline reviewer — wait here for the human's answer, in process.
+   * Keyed by run id; `resume` delivers into it. One waiter per run, which is an invariant rather
+   * than a limitation: one run executes one stage at a time.
+   */
+  private readonly stageWaiters = new Map<string, (answer: string) => void>();
+
+  /**
+   * Did a STAGE ACTOR park this run on a human (RUN-190)? Probe, and if so: persist the park,
+   * report blocked, and WAIT — in process, the stage's own stack held open — until the answer
+   * arrives over ws. Returns the answer to re-run the stage with, or null when the run is not
+   * parked (the normal case: the stage simply produced what it produced).
+   *
+   * The wait is bounded by the park TTL, not by a timer here: a daemon restart is the only thing
+   * that abandons it, and the persisted record is what makes THAT case legible (see ParkedRun.stage).
+   * The workspace stays leased and the tally keeps its figures — a wait costs no tokens and the
+   * wall-clock ceiling measures sessions, not silence.
+   */
+  private async parkStage(ctx: {
+    run: Run;
+    worktree: Workspace;
+    runAgent: { agentId: string; label: string; token: string };
+    tally: RunTally;
+    stage: 'plan' | 'plan-check' | 'pattern-map' | 'review';
+    /** The stage's trailing output — usually the question, which is what the dashboard shows. */
+    tail: string;
+  }): Promise<{ question: string; answer: string } | null> {
+    const { run } = ctx;
+    if (!this.deps.parked || !this.deps.getParkState) return null;
+    const state = await this.deps.getParkState(run.id).catch(() => null);
+    if (!state?.blocked) return null;
+
+    // The waiter is installed BEFORE the park is persisted or reported: the answer can arrive the
+    // instant the server learns of the question, and a waiter installed after the report races it.
+    // The poll is what lets the wait end WITHOUT an answer — a cancelled run, or a park the TTL
+    // reaper removed, must release this stack rather than hold it forever; each fires `null`,
+    // and the stage proceeds as unanswered into the boundaries that handle each case.
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const answerP = new Promise<string | null>((resolveAnswer) => {
+      this.stageWaiters.set(run.id, (a: string) => {
+        if (poll) clearInterval(poll);
+        resolveAnswer(a);
+      });
+      poll = setInterval(() => {
+        void (async () => {
+          const cancelled = this.deps.steering?.isCancelled?.(run.id) ?? false;
+          // A probe error reads as "still parked" — abandoning a wait on a flaky disk read would
+          // drop a question a human is still typing the answer to.
+          const entry = cancelled ? null : await this.deps.parked?.get(run.id).catch(() => ({}) as ParkedRun);
+          if (!cancelled && entry) return;
+          if (poll) clearInterval(poll);
+          if (this.stageWaiters.delete(run.id)) resolveAnswer(null);
+        })();
+      }, 15_000);
+    });
+
+    const runSpend = ctx.tally.total();
+    await this.deps.parked.park({
+      run,
+      sessionId: null, // an in-process wait has no session to restore — `stage` is the record
+      stage: ctx.stage,
+      agentId: ctx.runAgent.agentId,
+      agentLabel: ctx.runAgent.label,
+      mcpToken: ctx.runAgent.token,
+      workspace: ctx.worktree,
+      spent: {
+        tokens: totalTokens(runSpend),
+        usd: runSpend.costUsd,
+        ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
+      },
+      activeSeconds: 0,
+      parkedAt: new Date().toISOString(),
+      question: state.question,
+    });
+    this.deps.report(run.id, {
+      status: 'blocked',
+      telemetry: runSpend,
+      logTail: ctx.tail || (state.question ?? ''),
+    });
+    this.transcript(run.id).milestone(
+      `the ${ctx.stage} stage asked a human and the run is paused: ${state.question?.slice(0, 200) ?? '(question unavailable)'}`,
+    );
+    this.log.info('stage parked on a human — holding the stage until the answer arrives', {
+      runId: run.id,
+      stage: ctx.stage,
+      question: state.question?.slice(0, 80) ?? null,
+    });
+
+    const answer = await answerP;
+    this.stageWaiters.delete(run.id);
+    if (poll) clearInterval(poll);
+    if (answer === null) {
+      // Cancelled, or the park aged out from under us — the stage proceeds unanswered into the
+      // boundary that handles whichever it was (the cancel check, or the run's own failure path).
+      this.log.info('a stage wait ended without an answer', { runId: run.id, stage: ctx.stage });
+      return null;
+    }
+    this.deps.report(run.id, { status: 'running', phase: 'agent' });
+    this.transcript(run.id).milestone('the human answered — the stage re-runs with the answer');
+    // The question is captured HERE, from the probe that saw it — after the answer lands, the
+    // server's park state is resolved and the question is no longer readable.
+    return { question: state.question ?? '(question unavailable)', answer };
+  }
+
   private async parkIfBlocked(ctx: {
     run: Run;
     repo: ResolvedRepo;
@@ -2669,10 +2818,66 @@ export class RunSupervisor {
    * resume (the WS frame AND the reconnect sweep can both fire for one answer) finds nothing and
    * returns null rather than starting a second process in the same worktree.
    */
+  /**
+   * Deliver a human answer to a stage holding in THIS process (RUN-190). True = delivered; the
+   * caller must not treat the run as needing a session restore. The waiter is REMOVED before it
+   * fires, so a racing duplicate (ws frame + reconnect sweep) finds nothing and no-ops. The park
+   * record is cleaned up best-effort AFTER the wake — a record that outlives its answer is a
+   * stale row the reaper handles; an answer lost to a failed disk flush would be a stuck run.
+   */
+  deliverStageAnswer(runId: string, answer: string): boolean {
+    const waiter = this.stageWaiters.get(runId);
+    if (!waiter) return false;
+    this.stageWaiters.delete(runId);
+    waiter(answer);
+    this.deps.parked?.unpark(runId).catch((err) => {
+      this.log.warn('answered stage park could not be removed from disk — the reaper will', {
+        runId,
+        err: String(err),
+      });
+    });
+    this.log.info('delivered a human answer to a waiting stage', { runId });
+    return true;
+  }
+
   async resume(runId: string, answer: string): Promise<DriverExit | null> {
+    // A STAGE park first (RUN-190): the stage's stack is holding in this very process, so the
+    // answer is delivered rather than restored.
+    if (this.deliverStageAnswer(runId, answer)) {
+      return { outcome: 'done', isError: false, reason: 'stage-answer', telemetry: zeroTelemetry() };
+    }
+
     const entry = await this.deps.parked?.unpark(runId);
     if (!entry) return null;
     const { run } = entry;
+
+    // A stage park with nobody waiting: the daemon restarted while the stage held (RUN-190). The
+    // stack that would consume this answer is gone, and so is any session — but so is any WORK:
+    // a stage park precedes the build (or, for `review`, sits on work already committed to the
+    // run's branch, which the continuation flow can pick up). Failing loudly with the reason is
+    // the honest move; pretending to resume would run a stage against a context nobody holds.
+    if (entry.stage) {
+      this.deps.report(run.id, {
+        status: 'failed',
+        exit: {
+          outcome: 'failed',
+          reason:
+            entry.stage === 'review'
+              ? 'the review stage was awaiting this answer when the daemon restarted — the work is committed on the run branch; continue the run to pick it up'
+              : `the ${entry.stage} stage was awaiting this answer when the daemon restarted — nothing was built yet; re-dispatch the run`,
+        },
+      });
+      this.log.warn('a stage park did not survive a daemon restart — the run must be re-dispatched', {
+        runId: run.id,
+        stage: entry.stage,
+      });
+      return {
+        outcome: 'failed',
+        isError: true,
+        reason: 'stage park lost across restart',
+        telemetry: zeroTelemetry(),
+      };
+    }
 
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
@@ -3086,34 +3291,57 @@ export class RunSupervisor {
       return unplanned;
     }
 
-    const planned = await planRun(this.planHost(), {
-      run,
-      repo: prepared.repo,
-      worktree: prepared.worktree,
-      driver: prepared.driver,
-      runAgent: prepared.runAgent,
-      tally: prepared.tally,
-      prompt: prepared.plannerPrompt,
-      start: {
-        ...prepared.start,
-        permission: plannerPermission(prepared.permission),
-        // NO MCP. Every other actor gets Noriq because it has to report what it did; the planner
-        // reports nothing — the DAEMON writes its spec back, under the daemon's own token and
-        // behind a re-read that will not clobber a human. Handing it the run agent's connection
-        // would have given a "read-only" actor `update_task`, `claim_task` and `post_comment`,
-        // which are writes the filesystem clamp says nothing about, and the server explicitly
-        // permits a run agent to rewrite an execution spec (RUN-160). The narrowest thing that
-        // can do the job is the thing to hand it.
-        noriqMcp: undefined,
-        ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
-        spendGuard: prepared.tally.guard('plan'),
-        clockGuard: prepared.tally.clockGuard(),
-      },
-    }).catch((err) => {
-      // A stage that cannot gate the run must not throw out of it either.
-      this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
-      return null;
-    });
+    // The planner may PAUSE the run on a human (RUN-190): a null outcome is probed against the
+    // park state before it is read as "proceed unplanned" — proceeding while a human types an
+    // answer to the planner's own question would spend the build to ignore them. Each answer
+    // re-runs the planner fresh with the Q&A appended. Deliberately UNCAPPED: every iteration
+    // costs a human an answer, which is the strongest rate limiter this system has — and a cap
+    // would walk the pipeline on while the server still shows the run blocked on an open question.
+    let answerBlock = '';
+    let planned: PlanOutcome = null;
+    for (;;) {
+      planned = await planRun(this.planHost(), {
+        run,
+        repo: prepared.repo,
+        worktree: prepared.worktree,
+        driver: prepared.driver,
+        runAgent: prepared.runAgent,
+        tally: prepared.tally,
+        prompt: `${prepared.plannerPrompt}${answerBlock}`,
+        start: {
+          ...prepared.start,
+          permission: plannerPermission(prepared.permission),
+          // The ESCALATION PAIR and nothing else. The planner used to get NO MCP at all (RUN-140):
+          // the full floor grants writes the filesystem clamp says nothing about — `update_task`,
+          // `claim_task`, `post_comment` — and the daemon writes the spec back itself, so the
+          // planner has nothing to report. Both halves of that reasoning still hold, which is why
+          // `noriqTools` narrows to raise_alert + request_input alone: a planner facing a decision
+          // only a human can make (which of two contradictory requirements wins, whether a
+          // half-migrated seam is the old shape or the new one) used to GUESS, because an actor
+          // with a question and no way to ask does not stop. Now it pauses the run instead.
+          noriqMcp: prepared.noriqMcp,
+          noriqTools: STAGE_NORIQ_TOOLS,
+          ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+          spendGuard: prepared.tally.guard('plan'),
+          clockGuard: prepared.tally.clockGuard(),
+        },
+      }).catch((err) => {
+        // A stage that cannot gate the run must not throw out of it either.
+        this.log.warn('the plan stage failed — proceeding unplanned', { runId: run.id, err: String(err) });
+        return null;
+      });
+      if (planned) break;
+      const answered = await this.parkStage({
+        run,
+        worktree: prepared.worktree,
+        runAgent: prepared.runAgent,
+        tally: prepared.tally,
+        stage: 'plan',
+        tail: '',
+      });
+      if (!answered) break; // genuinely unplanned, not parked
+      answerBlock += renderPrompt('stage-answer', answered);
+    }
     if (!planned) return unplanned;
 
     // The plan checker (RUN-141), through the planner's still-open session. It cannot gate the
@@ -3211,6 +3439,19 @@ export class RunSupervisor {
       return '';
     }
     if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached ?? null);
+    // Shared by the first attempt and the answered re-run (RUN-190): cache the facts on a miss,
+    // render analogs + facts either way.
+    const finish = async (m: NonNullable<Awaited<ReturnType<typeof mapPatterns>>>): Promise<string> => {
+      if (intel && !cached && hasFacts(m.facts)) {
+        await intel
+          .put(prepared.repo.root, prepared.worktree.baseId, m.facts)
+          .catch((err: unknown) =>
+            this.log.warn('could not cache what this run learned', { err: String(err) }),
+          );
+      }
+      return `${renderAnalogs(m.analogs)}${renderRepoFacts(cached ?? m.facts)}`;
+    };
+
     const map = await mapPatterns(this.patternMapHost(prepared.tally), {
       run,
       driver: prepared.driver,
@@ -3219,25 +3460,49 @@ export class RunSupervisor {
       start: {
         ...prepared.start,
         permission: plannerPermission(prepared.permission),
-        noriqMcp: undefined,
+        // The escalation pair, like the planner (see that site for the whole argument).
+        noriqMcp: prepared.noriqMcp,
+        noriqTools: STAGE_NORIQ_TOOLS,
         ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
         spendGuard: prepared.tally.guard('pattern-map'),
         clockGuard: prepared.tally.clockGuard(),
       },
     });
-    if (!map) return renderRepoFacts(cached ?? null);
-
-    // The facts outlive this run; the analogs do not. Written only on a MISS — a hit means an
-    // earlier run already derived them from this same tree. Best-effort either way: a cache that
-    // cannot be written costs the NEXT run its shortcut and this one nothing.
-    if (intel && !cached && hasFacts(map.facts)) {
-      await intel
-        .put(prepared.repo.root, prepared.worktree.baseId, map.facts)
-        .catch((err: unknown) =>
-          this.log.warn('could not cache what this run learned', { err: String(err) }),
-        );
+    // No map may mean the MAPPER PAUSED the run (RUN-190): every answered ask re-runs it with the
+    // Q&A appended — uncapped, the human being the rate limiter — and a mapper that produces
+    // nothing WITHOUT being parked degrades to the cached facts, exactly as before.
+    let current = map;
+    let answerBlock = '';
+    while (!current) {
+      const answered = await this.parkStage({
+        run,
+        worktree: prepared.worktree,
+        runAgent: prepared.runAgent,
+        tally: prepared.tally,
+        stage: 'pattern-map',
+        tail: '',
+      });
+      if (!answered) return renderRepoFacts(cached ?? null);
+      answerBlock += renderPrompt('stage-answer', answered);
+      current = await mapPatterns(this.patternMapHost(prepared.tally), {
+        run,
+        driver: prepared.driver,
+        checked,
+        prompt: `${prepared.mapperPrompt(checked)}${answerBlock}`,
+        start: {
+          ...prepared.start,
+          permission: plannerPermission(prepared.permission),
+          noriqMcp: prepared.noriqMcp,
+          noriqTools: STAGE_NORIQ_TOOLS,
+          ...(reservation.budget ? { budget: plannerBudget(reservation.budget) } : {}),
+          spendGuard: prepared.tally.guard('pattern-map'),
+          clockGuard: prepared.tally.clockGuard(),
+        },
+      });
     }
-    return `${renderAnalogs(map.analogs)}${renderRepoFacts(cached ?? map.facts)}`;
+
+    // The facts outlive this run; the analogs do not (see `finish`).
+    return finish(current);
   }
 
   private patternMapHost(tally: RunTally): PatternMapHost {
@@ -3276,22 +3541,37 @@ export class RunSupervisor {
     const reviewer = prepared.repo.manifest.verify?.agent;
     if (!reviewer) return { checked: planned.checked, findings: '' };
 
-    const result = await checkPlan(this.planCheckHost(planned, prepared.tally, planned.envelope), {
-      run,
-      driver: prepared.driver,
-      checked: planned.checked,
-      maxRounds: reviewer.maxRounds,
-      prompt: (spec, ledger) => prepared.checkerPrompt(spec, ledger),
-      start: {
-        ...prepared.start,
-        // Same narrowing as the planner's, and for the same two reasons: `auto` survives the write
-        // clamp, and a filesystem clamp says nothing about the control plane. A checker emits a
-        // report and nothing else.
-        permission: plannerPermission(prepared.permission),
-        noriqMcp: undefined,
-      },
-    });
-    return { checked: result.checked, findings: result.findings };
+    // One answered re-run (RUN-190): a checker that paused the run gets the answer appended and a
+    // fresh look; a second pause stands as an unjudged plan, which never gates anyway.
+    let answerBlock = '';
+    for (;;) {
+      const result = await checkPlan(this.planCheckHost(planned, prepared.tally, planned.envelope), {
+        run,
+        driver: prepared.driver,
+        checked: planned.checked,
+        maxRounds: reviewer.maxRounds,
+        prompt: (spec, ledger) => `${prepared.checkerPrompt(spec, ledger)}${answerBlock}`,
+        start: {
+          ...prepared.start,
+          // Same narrowing as the planner's, and for the same two reasons: `auto` survives the write
+          // clamp, and a filesystem clamp says nothing about the control plane. A checker emits a
+          // report and nothing else — plus, now, the escalation pair (see the planner site).
+          permission: plannerPermission(prepared.permission),
+          noriqMcp: prepared.noriqMcp,
+          noriqTools: STAGE_NORIQ_TOOLS,
+        },
+      });
+      const answered = await this.parkStage({
+        run,
+        worktree: prepared.worktree,
+        runAgent: prepared.runAgent,
+        tally: prepared.tally,
+        stage: 'plan-check',
+        tail: '',
+      });
+      if (!answered) return { checked: result.checked, findings: result.findings };
+      answerBlock += renderPrompt('stage-answer', answered);
+    }
   }
 
   /**

@@ -115,6 +115,8 @@ export interface DaemonHandle {
 export interface SupervisorLike {
   supervise(run: Run): Promise<unknown>;
   resume(runId: string, answer: string): Promise<unknown>;
+  /** Deliver an answer to a stage holding in-process (RUN-190). True = delivered, no restore. */
+  deliverStageAnswer(runId: string, answer: string): boolean;
   expireStaleParks(): Promise<number>;
 }
 
@@ -869,6 +871,10 @@ export class Daemon {
      * nothing and no-ops rather than starting a rival process in the same worktree.
      */
     const resumeRun = async (runId: string, answer: string): Promise<void> => {
+      // A STAGE park's run is still ACTIVE (RUN-190): its supervise stack is holding, in this
+      // process, waiting for exactly this answer — so the active-guard below must not eat it.
+      // Delivery is in-process and takes no slot; the stack it wakes already holds one.
+      if (supervisor.deliverStageAnswer(runId, answer)) return;
       if (this.active.has(runId)) return; // already coming back
       this.active.add(runId);
       try {

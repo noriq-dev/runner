@@ -768,6 +768,8 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
             return {};
           },
           resume: async () => null,
+          deliverStageAnswer: () => false, // no stage ever waits in this fake
+
           expireStaleParks: async () => 0,
         };
       },

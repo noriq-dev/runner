@@ -88,6 +88,26 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
 const REACH_A_HUMAN = ['raise_alert', 'request_input'];
 
 /**
+ * The Noriq tools a STAGE ACTOR may call — the planner, the plan checker, the pattern mapper, and
+ * the inline reviewer. Exactly the reach-a-human pair, nothing else.
+ *
+ * These actors run under the RUN's one identity (RUN-43: the credential is not re-issuable, so
+ * there is no second identity to mint) and were originally spawned with no Noriq connection at
+ * all: the full kind floor grants writes the filesystem clamp says nothing about — `update_task`,
+ * `claim_task`, `post_comment` — and RUN-140/141 rightly refused to hand a "read-only" actor
+ * those. But the refusal threw out the two tools this file's own REACH_A_HUMAN paragraph says
+ * must never be rationed, and a week of live dogfood showed the cost: planners guessing at
+ * decisions a human had never made, reviewers unable to say "I cannot judge this without knowing
+ * X" in any form that stopped the run. An actor with a question and no way to ask does not stop;
+ * it decides.
+ *
+ * So the narrow set: `raise_alert` moves no work, `request_input` moves no work — it PAUSES the
+ * run, which is the daemon's own machinery answering, not the actor acting. Authorship separation
+ * survives intact: the reviewer still cannot claim, move, comment, or edit anything.
+ */
+export const STAGE_NORIQ_TOOLS: readonly string[] = [...REACH_A_HUMAN];
+
+/**
  * Staying alive — also every kind (RUN-47's "also"). Every Noriq call renews a claim, so
  * heartbeat looks redundant; but a build agent that works 40 minutes without touching Noriq
  * loses its claim and nothing tells it. Denying the one tool whose whole job is "I am still

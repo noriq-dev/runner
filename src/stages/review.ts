@@ -44,6 +44,8 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     // reviewer a command "already passed" when it has not yet run is a false premise handed to a
     // gate — and it is told not to re-run it, so it cannot discover otherwise (RUN-177).
     verifyRan: !ctx.landPolicy,
+    noriqMcp: ctx.noriqMcp,
+    runAgent: ctx.runAgent,
   });
   ctx.ledger = review.ledger; // the freshest adjudication state, for the continuable record
 
