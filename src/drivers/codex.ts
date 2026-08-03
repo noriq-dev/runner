@@ -43,7 +43,12 @@ export type CodexEvent =
   | { type: 'text'; text: string; itemId?: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; cacheReadTokens: number }
   | { type: 'turn_complete' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  // A sign of life and nothing else (RUN-201): any JSON-RPC frame the normalizer does not map —
+  // command execution notifications during a long tool run, new-minor renames — still proves the
+  // child is alive. The driver re-arms its silence deadline on it and otherwise ignores it;
+  // without this, a legitimate 20-minute quiet command would be read as a dead child.
+  | { type: 'activity' };
 
 export interface CodexTransport {
   events: AsyncIterable<CodexEvent>;
@@ -135,6 +140,10 @@ export interface CodexDriverDeps {
  * on the wire. Efforts stop at `high`: codex's `model_reasoning_effort` tops out there, and its
  * driver clamps xhigh/max down, so advertising them would promise a distinction it cannot make.
  */
+/** The session liveness deadline (RUN-201): no transport event for this long → torn down as a
+ *  normal failure. Generous — deep reasoning still ticks usage well inside it. */
+export const CODEX_SILENCE_TEARDOWN_MS = 20 * 60_000;
+
 export const CODEX_CATALOG: DriverCatalog = {
   models: ['gpt-5.6-sol', 'gpt-5.3-codex'],
   efforts: ['low', 'medium', 'high'],
@@ -180,9 +189,11 @@ export class CodexDriver implements AgentDriver {
       settle = resolve;
     });
     let finished = false;
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined;
     const finish = (exit: DriverExit) => {
       if (finished) return;
       finished = true;
+      if (silenceTimer) clearTimeout(silenceTimer);
       try {
         transport.close();
       } catch {
@@ -193,6 +204,29 @@ export class CodexDriver implements AgentDriver {
     };
 
     const live = zeroTelemetry();
+    // RUN-201: liveness is a transport question, one layer below RUN-176's socket deadline —
+    // twice in one live evening a codex child died without its exit ever reaching the loop
+    // below, and the run showed "running" for half an hour with no process behind it. A real
+    // turn emits SOMETHING (deltas, usage ticks) well inside this window; total silence past it
+    // means dead or wedged, and both settle the same way: torn down as an ordinary failure,
+    // which the continuation flow already recovers. Re-armed on every event, cleared at finish.
+    const armSilence = () => {
+      if (finished) return;
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        this.log.warn('codex went silent past the liveness deadline — tearing the session down', {
+          runId: opts.runId,
+        });
+        finish({
+          outcome: 'failed',
+          isError: true,
+          reason: 'driver went silent — torn down (RUN-201)',
+          telemetry: { ...live },
+        });
+      }, CODEX_SILENCE_TEARDOWN_MS);
+      silenceTimer.unref?.();
+    };
+    armSilence();
     // Distinct agentMessage items are distinct model messages with no newline between
     // them — insert a paragraph break when the item id changes (RUN-80; claude does the
     // same at assistant-turn boundaries). Id-less deltas (0.142.x) never trigger it.
@@ -200,6 +234,7 @@ export class CodexDriver implements AgentDriver {
     const consume = async () => {
       try {
         for await (const ev of transport.events) {
+          armSilence();
           if (ev.type === 'text') {
             if (ev.text) {
               if (ev.itemId && lastItemId && ev.itemId !== lastItemId) opts.handlers?.onText?.('\n\n');
@@ -469,10 +504,26 @@ export const defaultSpawnCodex = (
     }
     if (msg.method) {
       const ev = normalizeNotification(msg.method, msg.params ?? {});
-      if (ev) events.push(ev);
+      // Unmapped frames still push `activity` (RUN-201): every frame is proof of life.
+      events.push(ev ?? { type: 'activity' });
     }
   });
   child.on('exit', () => events.close());
+  // RUN-201 belt: twice live, a dead child's exit never surfaced as a closed stream. 'close'
+  // (stdio drained) is a second signal, and the reaper polls the one fact that cannot be missed:
+  // a reaped process has a non-null exitCode. Both funnel into the same idempotent close, and
+  // the reaper dies on every path out — exit, close, or the transport's own close().
+  const reaper = setInterval(() => {
+    if (child.exitCode !== null) {
+      stopReaper();
+      events.close();
+    }
+  }, 30_000);
+  reaper.unref?.();
+  const stopReaper = () => clearInterval(reaper);
+  child.on('exit', stopReaper);
+  child.on('close', stopReaper);
+  child.on('close', () => events.close());
 
   // Handshake → start the thread with the requested sandbox. clientInfo.version became
   // MANDATORY in codex 0.144.x — without it initialize is rejected outright (and that
@@ -513,6 +564,7 @@ export const defaultSpawnCodex = (
       // code was written against — SIGTERM, a chance to clean up. Windows has no equivalent (see
       // proc.ts): "ask nicely" is a WM_CLOSE a console app may ignore, and kill('SIGTERM') there
       // is already a hard TerminateProcess, so graceful-then-force is a POSIX-only idea.
+      stopReaper(); // the liveness poll dies with the transport, whatever the child does (RUN-201)
       killProcessTree(child, { force: false });
     },
   };

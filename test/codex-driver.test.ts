@@ -1,9 +1,10 @@
 import { PassThrough } from 'node:stream';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AsyncQueue } from '../src/async-queue';
 import { noriqToolsFor } from '../src/drivers/claude';
 import {
+  CODEX_SILENCE_TEARDOWN_MS,
   CodexDriver,
   type CodexEvent,
   type CodexTransport,
@@ -150,6 +151,44 @@ describe('normalizeNotification (real app-server shapes)', () => {
 });
 
 describe('CodexDriver', () => {
+  // RUN-201: twice in one live evening a codex child died without its exit reaching the event
+  // loop, and the run showed "running" for half an hour with no process behind it. Silence past
+  // the deadline settles the session as an ordinary failure the continuation flow recovers.
+  it('tears down a session that goes silent past the liveness deadline (RUN-201)', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      const fake = h.getFake();
+      fake.push({ type: 'text', text: 'working…' }); // one sign of life, then nothing
+      await vi.advanceTimersByTimeAsync(CODEX_SILENCE_TEARDOWN_MS + 1);
+      const exit = await h.session.done();
+      expect(exit.outcome).toBe('failed');
+      expect(exit.reason).toContain('silent');
+      expect(fake.closed).toBe(true); // the tree was torn down, not abandoned
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an active session is never torn down — every event re-arms the deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      const fake = h.getFake();
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(CODEX_SILENCE_TEARDOWN_MS - 1000);
+        fake.push({ type: 'usage', inputTokens: i, outputTokens: i, cacheReadTokens: 0 });
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      fake.push({ type: 'turn_complete' });
+      await vi.advanceTimersByTimeAsync(0);
+      const exit = await h.session.done();
+      expect(exit.outcome).toBe('done');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('starts a turn, streams text, sets cumulative telemetry, completes on turn_complete', async () => {
     const h = harness();
     const fake = h.getFake();
