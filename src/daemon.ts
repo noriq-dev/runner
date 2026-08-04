@@ -18,7 +18,7 @@ import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { ParkedStore } from './parked';
-import { buildRegistration } from './registration';
+import { buildRegistration, repoReport } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
@@ -778,6 +778,18 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
+      // Recomputed per (re)connect (RUN-195): the same read-at-use stores dispatch resolution
+      // uses — ManifestStore falls back to the last good manifest on a broken read, and the
+      // WsClient absorbs a thrown refresh by advertising its last good set — so a workflow-file
+      // edit is visible on the next hello, and a broken one can never keep the daemon offline.
+      // Advertise-only either way: dispatch still re-reads and pins its own catalog per run.
+      refreshRepos: () =>
+        Promise.all(
+          repos.map(async (r) => {
+            const manifest = (await manifests.current(r.root)) ?? r.manifest;
+            return repoReport(r, manifest, await workflows.current(r.root, manifest));
+          }),
+        ),
       connect: this.connect,
       // The capacity ledger's view, not a run count (RUN-170): one run's wave is several live
       // processes — and a wave the daemon just granted breadth to is occupied capacity even

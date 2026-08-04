@@ -10,6 +10,7 @@ import type {
 } from '@noriq-dev/shared';
 import { WebSocket } from 'ws';
 import type { logger as Logger } from './logger';
+import type { RepoReport } from './registration';
 
 // Minimal socket surface the client depends on — lets tests inject a fake without
 // pulling in ws's full type. `ws` satisfies it.
@@ -30,7 +31,9 @@ export interface WsIdentity {
   tools: AgentTool[];
   kinds: RunKind[];
   maxConcurrency: number;
-  repos: Array<{ id: string; projectKey: string; name: string; defaultBranch: string | null }>;
+  /** The repo reports the FIRST hello advertises, and the standing fallback when `refreshRepos`
+   *  fails — the same shape registration sent, so the two report paths cannot drift (RUN-195). */
+  repos: RepoReport[];
 }
 
 export interface SteerMsg {
@@ -68,6 +71,15 @@ export interface WsClientOptions {
    *  socket picks up a refreshed token after the 7-day access TTL rolls over. */
   token: string | (() => Promise<string>);
   identity: WsIdentity;
+  /**
+   * Re-resolved on every (re)connect, before the hello, for the same reason the token is (RUN-195):
+   * manifests and workflow files are read-at-use daemon-side, so a reconnect must advertise the
+   * catalogs as they are NOW, not the snapshot the daemon started with. Non-gating by design —
+   * advertising is legibility for the dispatch surface, never what connectivity or dispatch
+   * resolution rests on — so a failed refresh logs, keeps the last good set (initially
+   * `identity.repos`), and the connection proceeds.
+   */
+  refreshRepos?: () => Promise<RepoReport[]>;
   /** Current free capacity, sampled on each heartbeat. */
   freeSlots: () => number;
   heartbeatMs?: number;
@@ -119,6 +131,10 @@ export class WsClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   // Runs the daemon believes are live (non-terminal) — re-asserted on reconnect.
   private readonly liveRuns = new Map<string, Record<string, unknown>>();
+  /** The last good repo reports (RUN-195) — what the next hello advertises. Seeded from the
+   *  identity, replaced by each successful `refreshRepos`, and deliberately KEPT on a failed
+   *  one: a stale advertisement beats an empty one, and either beats not connecting. */
+  private repos: RepoReport[];
 
   constructor(options: WsClientOptions) {
     this.opts = {
@@ -129,6 +145,7 @@ export class WsClient {
     };
     this.connect = options.connect ?? defaultConnect;
     this.log = options.logger ?? { debug() {}, info() {}, warn() {}, error() {} };
+    this.repos = options.identity.repos;
   }
 
   start(): void {
@@ -269,6 +286,22 @@ export class WsClient {
     }
     // stop() may have landed while we were awaiting the token.
     if (this.stopped) return;
+    // Refresh what the hello will advertise (RUN-195) BEFORE dialling: the frame goes out inside
+    // the synchronous 'open' handler, so this is the one moment the current catalogs can be read
+    // without racing the socket. Failure is absorbed here, not propagated — a repo report is
+    // legibility, and a daemon that cannot re-read a manifest must still reconnect (dispatch
+    // resolution reads its own catalog at dispatch time regardless of what was advertised).
+    if (this.opts.refreshRepos) {
+      try {
+        this.repos = await this.opts.refreshRepos();
+      } catch (err) {
+        this.log.warn('could not refresh the repo reports — advertising the last good set', {
+          err: String(err),
+        });
+      }
+      // Same stale-guard as the token above: stop() may have landed while the refresh was pending.
+      if (this.stopped) return;
+    }
     let sock: WsSocket;
     try {
       sock = this.connect(url, { Authorization: `Bearer ${token}` });
@@ -305,7 +338,10 @@ export class WsClient {
       tools: this.opts.identity.tools,
       kinds: this.opts.identity.kinds,
       maxConcurrency: this.opts.identity.maxConcurrency,
-      repos: this.opts.identity.repos,
+      // The set the refresh above resolved for THIS connection — a reconnect after workflow or
+      // manifest edits advertises the changed catalogs, same staleness contract as the rest of
+      // the repo record (RUN-195).
+      repos: this.repos,
     });
     this.startHeartbeat();
     this.log.info(isReconnect ? 'ws reconnected' : 'ws connected', { runnerId: this.opts.runnerId });

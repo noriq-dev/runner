@@ -85,6 +85,51 @@ export function advertisedWorkflows(
   return [...entries.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** One repo as the server hears about it — the same shape rides the registration body AND every
+ *  WS hello's `repos` (RUN-195), so the two report paths cannot drift apart. */
+export interface RepoReport {
+  id: string;
+  projectKey: string;
+  /** The board lock (RUN-71): the marker's committed board NAME, riding the key's rails —
+   *  the server resolves it to a boardId within the resolved project, and that board is
+   *  where this repo's agents land the tasks they create. Null = the project default. */
+  board: string | null;
+  name: string;
+  defaultBranch: string | null;
+  /**
+   * Every workflow a dispatch against this repo can resolve (RUN-195; matches the object arm of
+   * shared `RunnerRepo.workflows`): the three built-ins plus the post-precedence custom catalog,
+   * as `{name, base, description?}`. RUN-121 sent bare NAMES and RUN-125's base advertisement
+   * was reverted because the wire had no way to say "metadata, not authority" — PLNR-240 draws
+   * that line in the contract: `base`/`description` are the posted menu for the dispatch surface,
+   * while the DAEMON still resolves a selected name to its posture locally (`effectiveKind`,
+   * RUN-126), so a mismatched dispatched `kind` can never escalate write. Prompt bytes and local
+   * source paths never cross.
+   */
+  workflows: AdvertisedWorkflowEntry[];
+}
+
+/** The one conversion from what the daemon knows to what the server may hear (RUN-195). Takes the
+ *  manifest as its own argument rather than reading `repo.manifest`, because the manifest is
+ *  read-at-use (ManifestStore) while `DiscoveredRepo` pins the startup snapshot — a reconnect
+ *  report passes the CURRENT one, and the identity fields (id, key, name) are the stable half. */
+export function repoReport(
+  repo: Pick<DiscoveredRepo, 'id' | 'projectKey' | 'name' | 'defaultBranch'>,
+  manifest: Pick<ProjectManifest, 'board' | 'workflows'>,
+  catalog: WorkflowCatalog | undefined,
+): RepoReport {
+  return {
+    id: repo.id,
+    projectKey: repo.projectKey,
+    board: manifest.board,
+    name: repo.name,
+    defaultBranch: repo.defaultBranch,
+    // Built-ins + the merged custom catalog (RUN-195): exactly the list dispatch can resolve,
+    // post-precedence — a definition shadowing a bundled name replaces that entry's metadata.
+    workflows: advertisedWorkflows(catalog, manifest.workflows),
+  };
+}
+
 /** The POST /api/runners body (matches the server's RegisterRunnerBody). The daemon
  *  sends the committed KEY per repo; the server resolves it to a projectId. */
 export interface RunnerRegistration {
@@ -99,27 +144,7 @@ export interface RunnerRegistration {
   agents: AdvertisedAgent[];
   kinds: RunKind[];
   maxConcurrency: number;
-  repos: Array<{
-    id: string;
-    projectKey: string;
-    /** The board lock (RUN-71): the marker's committed board NAME, riding the key's rails —
-     *  the server resolves it to a boardId within the resolved project, and that board is
-     *  where this repo's agents land the tasks they create. Null = the project default. */
-    board: string | null;
-    name: string;
-    defaultBranch: string | null;
-    /**
-     * Every workflow a dispatch against this repo can resolve (RUN-195; matches the object arm of
-     * shared `RunnerRepo.workflows`): the three built-ins plus the post-precedence custom catalog,
-     * as `{name, base, description?}`. RUN-121 sent bare NAMES and RUN-125's base advertisement
-     * was reverted because the wire had no way to say "metadata, not authority" — PLNR-240 draws
-     * that line in the contract: `base`/`description` are the posted menu for the dispatch surface,
-     * while the DAEMON still resolves a selected name to its posture locally (`effectiveKind`,
-     * RUN-126), so a mismatched dispatched `kind` can never escalate write. Prompt bytes and local
-     * source paths never cross.
-     */
-    workflows: AdvertisedWorkflowEntry[];
-  }>;
+  repos: RepoReport[];
 }
 
 const DEFAULT_KINDS: RunKind[] = ['scope', 'build', 'verify'];
@@ -143,15 +168,6 @@ export function buildRegistration(
     agents: agentCatalog(params.tools),
     kinds: params.kinds ?? DEFAULT_KINDS,
     maxConcurrency: params.concurrency,
-    repos: discovered.map((r) => ({
-      id: r.id,
-      projectKey: r.projectKey,
-      board: r.manifest.board,
-      name: r.name,
-      defaultBranch: r.defaultBranch,
-      // Built-ins + the merged custom catalog (RUN-195): exactly the list dispatch can resolve,
-      // post-precedence — a definition shadowing a bundled name replaces that entry's metadata.
-      workflows: advertisedWorkflows(workflowCatalogs.get(r.root), r.manifest.workflows),
-    })),
+    repos: discovered.map((r) => repoReport(r, r.manifest, workflowCatalogs.get(r.root))),
   };
 }

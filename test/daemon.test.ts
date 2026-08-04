@@ -1,9 +1,9 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ExecutionSpec, ProjectManifest, RunnerConfig } from '@noriq-dev/shared';
 import type { Run } from '@noriq-dev/shared';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
 import {
@@ -17,6 +17,7 @@ import {
   workflowRepoResolver,
 } from '../src/daemon';
 import type { DaemonHandle } from '../src/daemon';
+import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
@@ -644,8 +645,10 @@ describe('owedMergeReconciler (RUN-28/85)', () => {
 // property is delicate: a down socket still sets `held.ws`, so keying the clear on its presence
 // (the pre-RUN-173 code) counted a dropped frame as a delivery and lost the record with nothing to
 // correct it. These drive a real `start()` with a fake WsFactory and a fake fetch — no socket, no
-// HTTP, no ~/.noriq — capture the wired-up `report`, and exercise the retention directly.
-describe('daemon.start() executed-spec retention (RUN-173)', () => {
+// HTTP, no ~/.noriq — capture the wired-up `report`, and exercise the retention directly. The same
+// harness now also drives the wiring RUN-170 and RUN-195 added to start(), for the reason this
+// file keeps restating: this wiring is where whole layers have shipped silently dead.
+describe('daemon.start(), driven end to end with fake seams', () => {
   // A socket that records what it is handed — or throws, modelling a down link, which is exactly how
   // `sendRaw` observes a frame that never left. `deliver` flips between frames to bring it up/down.
   class FakeDaemonSocket implements WsSocket {
@@ -968,5 +971,100 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
     // A stray later tick for the same run carries null — nothing lingers past terminal.
     report('run_3', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 7 } });
     expect(s.telemetry().at(-1)!.executedSpec).toBeNull();
+  });
+
+  // RUN-195. The hello's repo reports are recomputed per CONNECTION, never pinned at startup:
+  // workflow files are read-at-use (RUN-192) and the task's staleness contract is "the next
+  // report" — so a reconnect after an edit is exactly when the server's list must change, with
+  // no watcher and no restart.
+  describe('repo workflow reports are recomputed per connection (RUN-195)', () => {
+    const catalogWith = (description: string): WorkflowCatalog => ({
+      definitions: {
+        docs: {
+          base: 'scope',
+          prompt: 'SECRET PROMPT BYTES',
+          promptSource: '/repo/.noriq/workflows/docs.toml',
+          description,
+          source: '/repo/.noriq/workflows/docs.toml',
+          tier: 'project-file',
+        },
+      },
+    });
+
+    /** A real marker under tmp, with a `.git` dir + HEAD pointer so VCS detection and default-
+     *  branch discovery stay pure filesystem reads — no dv probe, no git subprocess succeeding. */
+    const markRepo = async (): Promise<string> => {
+      const repoDir = path.join(tmp, 'repo');
+      await mkdir(path.join(repoDir, '.noriq'), { recursive: true });
+      await writeFile(path.join(repoDir, '.noriq', 'project.toml'), 'key = "RUN"\n');
+      await mkdir(path.join(repoDir, '.git'), { recursive: true });
+      await writeFile(path.join(repoDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+      return repoDir;
+    };
+
+    /** The workflows the socket's hello advertised for the first repo. */
+    const advertised = (socket: FakeDaemonSocket): Array<Record<string, unknown>> => {
+      const hello = JSON.parse(socket.sent[0]!) as {
+        type: string;
+        repos: Array<{ workflows: Array<Record<string, unknown>> }>;
+      };
+      expect(hello.type).toBe('hello');
+      return hello.repos[0]!.workflows;
+    };
+
+    it('registration and the initial hello advertise the current catalog; a reconnect advertises the changed one', async () => {
+      let catalog = catalogWith('v1');
+      const workflows = { current: async () => catalog } as unknown as WorkflowStore;
+      const repoDir = await markRepo();
+      const { sockets, bodies } = await harness({ scanRoots: [repoDir], workflows });
+
+      // REST registration advertised the catalog as read at registration time.
+      const reg = bodies[0] as { repos: Array<{ workflows: unknown }> };
+      expect(reg.repos[0]!.workflows).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
+
+      // The initial hello resolves the same current view — the refresh provider's first run.
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      sockets[0]!.emit('open');
+      expect(advertised(sockets[0]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
+      expect(advertised(sockets[0]!)).toContainEqual({ name: 'build', base: 'build' });
+      // Prompt bytes are daemon-local — they must never cross the socket.
+      expect(sockets[0]!.sent[0]).not.toContain('SECRET PROMPT BYTES');
+
+      // The workflow files change while the daemon runs; the next connection re-reads them.
+      catalog = catalogWith('v2');
+      sockets[0]!.emit('close');
+      await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 5000 });
+      sockets[1]!.emit('open');
+      expect(advertised(sockets[1]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v2' });
+    });
+
+    it('a broken refresh falls back to the last good report and never blocks the reconnect', async () => {
+      let fail = false;
+      const workflows = {
+        current: async () => {
+          if (fail) throw new Error('EACCES: workflows dir unreadable');
+          return catalogWith('v1');
+        },
+      } as unknown as WorkflowStore;
+      const repoDir = await markRepo();
+      const { sockets, deps } = await harness({ scanRoots: [repoDir], workflows });
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      sockets[0]!.emit('open');
+      expect(advertised(sockets[0]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
+
+      fail = true;
+      sockets[0]!.emit('close');
+      // The reconnect still happens and the hello still goes out, carrying the last good set —
+      // advertising is legibility, never the thing connectivity rests on.
+      await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 5000 });
+      sockets[1]!.emit('open');
+      expect(advertised(sockets[1]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
+
+      // …and the advertisement path left no poisoned state behind: dispatch resolution performs
+      // its OWN read-at-use load (RUN-192), answering current the moment the store does again.
+      fail = false;
+      const resolved = await deps.resolveRepo(repoId(repoDir));
+      expect(resolved?.workflowCatalog?.definitions.docs?.description).toBe('v1');
+    });
   });
 });

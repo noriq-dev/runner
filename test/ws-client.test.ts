@@ -44,7 +44,21 @@ const IDENTITY: WsIdentity = {
   tools: ['claude'],
   kinds: ['build'],
   maxConcurrency: 2,
-  repos: [{ id: 'repo_a', projectKey: 'AAA', name: 'a', defaultBranch: 'main' }],
+  // The full report shape (RUN-195) — the hello advertises the same object registration sent.
+  repos: [
+    {
+      id: 'repo_a',
+      projectKey: 'AAA',
+      board: null,
+      name: 'a',
+      defaultBranch: 'main',
+      workflows: [
+        { name: 'build', base: 'build' },
+        { name: 'scope', base: 'scope' },
+        { name: 'verify', base: 'verify' },
+      ],
+    },
+  ],
 };
 
 const RUN = {
@@ -418,6 +432,123 @@ describe('WsClient', () => {
     s1.emit('open');
     expect(s1.msgs().some((m) => m.type === 'run.status')).toBe(false); // nothing live to re-assert
     client.stop();
+  });
+
+  // RUN-195. Manifests and workflow files are read-at-use daemon-side, so what a hello advertises
+  // must be resolved for THIS connection — a reconnect after a workflow edit re-advertising the
+  // startup snapshot would show the server a list a dispatch can no longer resolve.
+  describe('repo reports are re-resolved per connection (RUN-195)', () => {
+    // The provider resolves through microtasks only (no timer is involved), so a few turns of the
+    // queue are all openAsync needs to reach the dial.
+    const flush = async () => {
+      for (let i = 0; i < 4; i++) await Promise.resolve();
+    };
+    const reportWith = (workflows: WsIdentity['repos'][number]['workflows']) => [
+      { id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main', workflows },
+    ];
+
+    it('the initial hello advertises what the provider resolves, contract-valid', async () => {
+      const fresh = reportWith([
+        { name: 'build', base: 'build' },
+        { name: 'docs', base: 'scope', description: 'survey the repo' },
+        { name: 'scope', base: 'scope' },
+        { name: 'verify', base: 'verify' },
+      ]);
+      const client = makeClient({ refreshRepos: async () => fresh });
+      client.start();
+      await flush();
+      const s = sockets[0]!;
+      s.emit('open');
+      const hello = s.msgs()[0]!;
+      expect(hello.type).toBe('hello');
+      expect(hello.repos).toEqual(fresh);
+      // The object workflow entries must satisfy the refreshed vendored contract — an off-contract
+      // hello is dropped server-side without a word back.
+      expect(RunnerClientMessage.safeParse(hello).success).toBe(true);
+      client.stop();
+    });
+
+    it('a reconnect re-resolves — a changed catalog is advertised without a restart', async () => {
+      let calls = 0;
+      const client = makeClient({
+        refreshRepos: async () => {
+          calls += 1;
+          return reportWith([{ name: 'docs', base: 'scope', description: `v${calls}` }]);
+        },
+      });
+      client.start();
+      await flush();
+      const s0 = sockets[0]!;
+      s0.emit('open');
+      expect((s0.msgs()[0]!.repos as Array<{ workflows: unknown }>)[0]!.workflows).toEqual([
+        { name: 'docs', base: 'scope', description: 'v1' },
+      ]);
+
+      s0.emit('close'); // the files changed while the socket was down
+      vi.advanceTimersByTime(1000);
+      await flush();
+      expect(sockets).toHaveLength(2);
+      const s1 = sockets[1]!;
+      s1.emit('open');
+      expect((s1.msgs()[0]!.repos as Array<{ workflows: unknown }>)[0]!.workflows).toEqual([
+        { name: 'docs', base: 'scope', description: 'v2' },
+      ]);
+      client.stop();
+    });
+
+    it('a failed refresh advertises the last good set and still connects — never gates', async () => {
+      let fail = false;
+      const fresh = reportWith([{ name: 'docs', base: 'scope' }]);
+      const client = makeClient({
+        refreshRepos: async () => {
+          if (fail) throw new Error('EACCES: ~/.noriq/workflows');
+          return fresh;
+        },
+      });
+      client.start();
+      await flush();
+      sockets[0]!.emit('open');
+      expect(sockets[0]!.msgs()[0]!.repos).toEqual(fresh);
+
+      fail = true;
+      sockets[0]!.emit('close');
+      vi.advanceTimersByTime(1000);
+      await flush();
+      expect(sockets).toHaveLength(2); // the broken refresh did not keep the daemon offline
+      sockets[1]!.emit('open');
+      const hello = sockets[1]!.msgs()[0]!;
+      expect(hello.type).toBe('hello');
+      expect(hello.repos).toEqual(fresh); // the last good set, not [] and not a crash
+      client.stop();
+    });
+
+    it('without a provider the hello advertises the identity snapshot, synchronously', () => {
+      // The pre-RUN-195 shape must hold byte-for-byte: no provider, no await before the dial.
+      const client = makeClient();
+      client.start();
+      const s = sockets[0]!; // available immediately — the sync path did not gain an await
+      s.emit('open');
+      expect(s.msgs()[0]!.repos).toEqual(IDENTITY.repos);
+      client.stop();
+    });
+
+    it('stop() landing during a pending refresh never dials', async () => {
+      // The stale-guard the async provider needs: stop() can land while the refresh is pending,
+      // and resolving afterwards must not open a socket for a shut-down daemon.
+      let resolveRepos!: (r: WsIdentity['repos']) => void;
+      const client = makeClient({
+        refreshRepos: () =>
+          new Promise((res) => {
+            resolveRepos = res;
+          }),
+      });
+      client.start();
+      client.stop();
+      resolveRepos([]);
+      await flush();
+      vi.advanceTimersByTime(60_000);
+      expect(sockets).toHaveLength(0); // never dialled, never rescheduled
+    });
   });
 
   it('stop() closes the socket and prevents reconnect', () => {

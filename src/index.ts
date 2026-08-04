@@ -167,9 +167,11 @@ export {
   advertisedWorkflows,
   agentCatalog,
   buildRegistration,
+  repoReport,
   type AdvertisedAgent,
   type AdvertisedWorkflowEntry,
   type RegistrationParams,
+  type RepoReport,
   type RunnerRegistration,
 } from './registration';
 export {
