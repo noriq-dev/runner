@@ -430,8 +430,11 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  * dispatch carried. This closes the footgun where a UI (or any client) selects a read-only workflow
  * but leaves `kind = build`: the daemon holds the manifest and decides, so a mismatched dispatched
  * kind can never escalate write. With no explicit selection, a loaded definition matching the
- * kind wins by RUN-192's source precedence; with no such definition (or an unknown explicit name),
- * the dispatched `kind` stands.
+ * kind wins by RUN-192's source precedence; with no such definition, the dispatched `kind` stands.
+ * An unknown EXPLICIT name also leaves the kind standing here — but no dispatch reaches this with
+ * one any more: prepare refuses a selected name that does not resolve (RUN-196) before anything is
+ * acquired, so that arm is the posture fail-safe for the paths that skip prepare's gate (parked
+ * rehydration, `waveFor`, `startAgent`'s clamp), not a dispatch behaviour.
  *
  * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
  * inherited from its base — so it doubles as the posture kind.

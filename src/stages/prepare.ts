@@ -7,16 +7,18 @@
  * returns a discriminated result — a refusal with a reason, or everything the run needs to start —
  * instead of narrowing a context it was handed.
  *
- * Six things can refuse a dispatch here, and they are ordered by what each one costs:
+ * Seven things can refuse a dispatch here, and they are ordered by what each one costs:
  *
  *   1. the repo, and 2. the driver — pure lookups, so they run first;
- *   3. claimability (RUN-81) — one server read, deliberately BEFORE the lease so a declined run
+ *   3. a SELECTED workflow that no longer resolves (RUN-196) — a pure lookup against the catalog
+ *      pinned at dispatch, so it sits with the other costless gates;
+ *   4. claimability (RUN-81) — one server read, deliberately BEFORE the lease so a declined run
  *      leaves nothing behind;
- *   4. the workspace lease;
- *   5. the Noriq identity — no identity, no prompt worth sending;
- *   6. the predictive lock (RUN-103) — last, because it needs the identity's token.
+ *   5. the workspace lease;
+ *   6. the Noriq identity — no identity, no prompt worth sending;
+ *   7. the predictive lock (RUN-103) — last, because it needs the identity's token.
  *
- * Everything from 4 on has something to unwind, and each of those paths says so where it happens.
+ * Everything from 5 on has something to unwind, and each of those paths says so where it happens.
  *
  * `resume` has no prepare: a parked run RESTORES its repo, workspace, identity and session from the
  * park record rather than resolving them again, which is the whole point of parking.
@@ -153,6 +155,28 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const driver = host.driverFor(tool as AgentTool);
   if (!driver) return refuse(`no driver for tool ${tool}`);
 
+  // The catalog pinned with this resolved repo at dispatch (RUN-192), else the manifest's inline
+  // definitions — the one source every workflow resolution in this run reads.
+  const workflowSource = repo.workflowCatalog ?? repo.manifest;
+
+  // A SELECTED workflow must resolve (RUN-196). An explicit `run.workflow` is an operator's pick
+  // from the advertised menu (RUN-195), and a name that no longer resolves — the file deleted
+  // between advertise and dispatch — must not degrade to a built-in whose prompt nobody chose.
+  // Explicit selection only: a null `workflow` is a bare kind, not a pick, and keeps
+  // `runWorkflow`'s fail-safe (including the scope degradation for an out-of-union kind). A
+  // broken definition file is NOT a stale name either — WorkflowStore keeps a scope-posture
+  // tombstone for it, which still resolves; refusing it here would bypass the tombstone's own
+  // rationale. Pure lookup, so it costs nothing and runs with the other costless gates.
+  if (run.workflow && !resolveWorkflow(run.workflow, workflowSource)) {
+    host.log.warn('selected workflow no longer resolves in this repo — declining to spawn', {
+      runId: run.id,
+      workflow: run.workflow,
+    });
+    return refuse(
+      `workflow '${run.workflow}' no longer resolves in this repo — it names neither a loaded definition nor a built-in; not spawning`,
+    );
+  }
+
   // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
   // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
   // overwriting the server's totals with only what this sitting spends) and the adjudication ledger
@@ -189,7 +213,6 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     }
   }
 
-  const workflowSource = repo.workflowCatalog ?? repo.manifest;
   const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
   // The run's workflow (RUN-117): read its flags, don't compare kind. The NAMED one when the repo
   // defines it (RUN-132) — same posture either way, since a custom inherits its base verbatim and

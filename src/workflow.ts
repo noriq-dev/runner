@@ -249,9 +249,14 @@ export function runWorkflow(
   const id = run.workflow ?? run.kind;
   const named = resolveWorkflow(id, source);
   if (named) return named;
-  // A `kind` the wire schema should have rejected falls back to SCOPE — the narrowest posture, not
-  // the nearest one. Unreachable for a real dispatch, and the direction matters anyway: a fallback
-  // that guessed `build` would answer "I don't recognise this" with "then you may write and land".
+  // The id resolved nothing. On the DISPATCH path this is unreachable for a SELECTED name:
+  // prepare's gate (RUN-196) refuses a dispatch whose explicit `workflow` does not resolve before
+  // anything is acquired, rather than running a built-in prompt the operator did not choose. This
+  // fallback stays as the FAIL-SAFE for the paths that never pass that gate — parked rehydration
+  // from disk, `waveFor`, `startAgent`'s clamp — where degrading to a narrow posture is the
+  // security property. A `kind` the wire schema should have rejected falls back to SCOPE — the
+  // narrowest posture, not the nearest one, and the direction matters: a fallback that guessed
+  // `build` would answer "I don't recognise this" with "then you may write and land".
   return Object.hasOwn(BUILTIN_WORKFLOWS, run.kind)
     ? BUILTIN_WORKFLOWS[run.kind as RunKind]
     : BUILTIN_WORKFLOWS.scope;

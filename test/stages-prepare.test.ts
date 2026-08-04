@@ -236,6 +236,52 @@ describe('prepare refuses a dispatch, and says so instead of throwing', () => {
     expect(rec.leases).toBe(1);
   });
 
+  // RUN-196: an operator SELECTED this name from the advertised menu, and it no longer resolves —
+  // the definition file deleted between advertise and dispatch. Falling back to a built-in would
+  // run a prompt nobody chose; refusing costs nothing, like the claim gate above.
+  it('a selected workflow that no longer resolves — before anything is acquired (RUN-196)', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(host, makeRun({ workflow: 'ghost' }));
+    expect(out.ok).toBe(false);
+    expect(out.ok === false && out.reason).toMatch(/workflow 'ghost' no longer resolves.*not spawning/s);
+    expect(rec.leases).toBe(0);
+    expect(rec.identities).toBe(0);
+    expect(rec.reports).toEqual([]);
+  });
+
+  it('but a workflow naming a built-in kind always resolves — never a stale selection', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(host, makeRun({ workflow: 'build' }));
+    expect(out.ok).toBe(true);
+    expect(rec.leases).toBe(1);
+  });
+
+  // A broken definition file is NOT a stale name (RUN-196): WorkflowStore keeps a scope-posture
+  // tombstone for it, which still RESOLVES — a refusal here would bypass the tombstone, whose
+  // point is that falling through to a lower, wider tier turns a typo into a permission change.
+  it('and a broken-file tombstone still resolves — the refusal must not bypass it', async () => {
+    const { host } = harness({
+      repo: {
+        root: '/repo',
+        manifest: manifest(),
+        workflowCatalog: {
+          definitions: {
+            audit: {
+              base: 'scope',
+              prompt: null,
+              promptSource: null,
+              description: null,
+              source: '/repo/.noriq/workflows/audit.toml',
+              tier: 'project-file',
+            },
+          },
+        },
+      },
+    });
+    const out = await prepareRun(host, makeRun({ workflow: 'audit' }));
+    expect(out.ok).toBe(true);
+  });
+
   it('a verify run whose build is gone names the build, not just the git error', async () => {
     const { host } = harness({ leaseThrows: 'no such ref' });
     const out = await prepareRun(host, makeRun({ kind: 'verify', verifiesRunId: 'run_0' }));

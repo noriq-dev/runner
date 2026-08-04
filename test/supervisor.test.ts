@@ -1278,14 +1278,82 @@ describe('RunSupervisor', () => {
     await done;
   });
 
-  it('an unknown workflow name falls back to the built-in for the kind (RUN-121)', async () => {
+  // Was RUN-121's 'an unknown workflow name falls back to the built-in for the kind'. RUN-196
+  // flips it: an explicit `workflow` is a selection from the advertised menu, and a name that no
+  // longer resolves (file deleted between advertise and dispatch) must refuse legibly rather than
+  // run a built-in prompt the operator did not choose. Pre-lease, so a declined run costs nothing
+  // — the claimability-gate precedent.
+  it('a selected workflow that no longer resolves refuses the dispatch (RUN-196)', async () => {
     const h = harness();
-    const done = h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    const exit = await h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/workflow 'nonexistent' no longer resolves/);
+    expect(h.worktrees.created).toEqual([]);
+  });
+
+  // RUN-196's happy halves: a dispatch naming an ADVERTISED workflow resolves to the file-loaded
+  // definition end to end. Direct vs pump is not a wire distinction on the runner — both arrive as
+  // `run.assigned` frames — so the pair is expressed as anchorless vs task-anchored, which is the
+  // only observable difference.
+  const fileWorkflow = (tier: 'user-file' | 'project-file', prompt: string): WorkflowCatalog => {
+    const dir = tier === 'user-file' ? '/home/u/.noriq/workflows' : '/repos/repo_a/.noriq/workflows';
+    return {
+      definitions: {
+        restyle: {
+          base: 'build',
+          prompt,
+          promptSource: `${dir}/restyle.md`,
+          description: null,
+          source: `${dir}/restyle.toml`,
+          tier,
+        },
+      },
+    };
+  };
+
+  it('a direct (anchorless) dispatch selecting a user-dir workflow gets its prompt (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('user-file', 'USER-WF: restyle {{brief}}') });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'restyle' }));
     await flush();
-    // no throw, and the scope built-in prompt is used
-    expect(h.claude.opts?.prompt).toContain('MODE: SCOPE');
+    expect(h.claude.opts?.prompt).toContain('USER-WF: restyle ship the thing');
+    expect(h.claude.opts?.permission.write).toBe(true); // under the base's posture, not a new one
     h.claude.complete('done');
     await done;
+  });
+
+  it('a pump-shaped (task-anchored) dispatch resolves a project-file workflow the same way (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('project-file', 'PROJECT-WF: {{brief}}') });
+    const done = h.supervisor.supervise(
+      makeRun({
+        kind: 'build',
+        workflow: 'restyle',
+        planKey: 'plan_1',
+        anchor: { type: 'task', taskId: 'task_9' },
+      }),
+    );
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('PROJECT-WF: ship the thing');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The catalog is re-read and pinned PER DISPATCH (workflowRepoResolver, RUN-192) — so a project
+  // file appearing between two sittings shadows the user definition on the second, with no new
+  // machinery. The harness's mutable catalog models WorkflowStore's merged output changing on disk.
+  it('a project file appearing between sittings shadows the user definition on the next dispatch (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('user-file', 'USER-WF: {{brief}}') });
+    const first = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'restyle' }));
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('USER-WF: ship the thing');
+    h.claude.complete('done');
+    await first;
+
+    h.setWorkflowCatalog(fileWorkflow('project-file', 'PROJECT-WF: {{brief}}'));
+    const second = h.supervisor.supervise(makeRun({ id: 'run_2', kind: 'build', workflow: 'restyle' }));
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('PROJECT-WF: ship the thing');
+    h.claude.complete('done');
+    await second;
   });
 
   it('a verify run stays read-only even if the manifest grants write (RUN-118 floor)', async () => {
