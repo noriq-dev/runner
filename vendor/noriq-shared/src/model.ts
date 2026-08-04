@@ -18,6 +18,11 @@ export const TaskStatus = z.enum([
   // stays within its CHECK (D1 cannot rebuild tasks to widen it; see 0049) — exactly as
   // RunnerStatus carries 'offboarded', derived from offboarded_at.
   'failed',
+  // A spun-off task awaiting human acceptance (0064 / PLNR-230). WIRE-only, derived from
+  // tasks.proposed_at while the stored status is still `todo` — same pattern as 'failed'.
+  // Inert to every agent path (claim/next_claimable/pump) until a human accepts (→ todo)
+  // or rejects (→ cancelled).
+  'proposed',
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
 
@@ -111,6 +116,10 @@ export const Task = z.object({
   title: z.string().min(1),
   body: z.string().default(''),
   status: TaskStatus,
+  // 0 = MOST urgent, 4 = least (PLNR-231). P0 means "drop everything", as it does in Jira,
+  // Linear and Google — the scale used to run the other way, which read as "P0 · someday" and
+  // sent an agent asked for "the P0" to the least important task in the project. Consequence
+  // for anything sorting by it: most-urgent-first is ORDER BY priority ASC, not DESC.
   priority: z.number().int().min(0).max(4).default(2),
   estimate: z.number().nullable(),
   /** Per-task deadline (PLNR-126); overdue = dueAt < now while not done/cancelled. */

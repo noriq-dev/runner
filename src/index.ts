@@ -164,9 +164,11 @@ export {
 } from './agent-coordinate';
 export { detectTools } from './tools';
 export {
+  advertisedWorkflows,
   agentCatalog,
   buildRegistration,
   type AdvertisedAgent,
+  type AdvertisedWorkflowEntry,
   type RegistrationParams,
   type RunnerRegistration,
 } from './registration';

@@ -366,6 +366,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   tool: null,
   defaultBranch: null,
   land: null,
+  setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
   // No per-kind model/effort by default: this repo takes whatever the tool defaults to,
   // which is what every run got before RUN-33 existed.
@@ -1239,7 +1240,14 @@ describe('RunSupervisor', () => {
 
   it('a custom workflow supplies its own prompt but inherits its base posture (RUN-121)', async () => {
     const m = manifest({
-      workflows: { docs: { base: 'scope', prompt: 'DOCS-MODE: survey {{brief}} read-only' } },
+      workflows: {
+        docs: {
+          base: 'scope',
+          prompt: 'DOCS-MODE: survey {{brief}} read-only',
+          stages: null,
+          description: null,
+        },
+      },
     });
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(
@@ -1256,7 +1264,9 @@ describe('RunSupervisor', () => {
     // The footgun closed daemon-side: dispatch says kind=build (writable) but names a scope-based
     // workflow. The daemon holds the manifest, so the base wins — the run is READ-ONLY regardless.
     const m = manifest({
-      workflows: { docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}' } },
+      workflows: {
+        docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}', stages: null, description: null },
+      },
     });
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'docs' }));
@@ -5244,6 +5254,7 @@ describe('resuming a parked run (RUN-30)', () => {
           base,
           prompt,
           promptSource: '/repo/.noriq/workflows/audit.md',
+          description: null,
           source: '/repo/.noriq/workflows/audit.toml',
           tier: 'project-file',
         },

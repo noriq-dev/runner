@@ -28,6 +28,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   tool: null,
   defaultBranch: null,
   land: null,
+  setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
   defaults: { scope: noModel(), build: noModel(), verify: noModel() },
   workflows: {},

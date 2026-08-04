@@ -219,14 +219,19 @@ const workflowDefinition = (
     return Object.hasOwn(source.definitions, id) ? source.definitions[id] : undefined;
   }
   const custom = source.workflows && Object.hasOwn(source.workflows, id) ? source.workflows[id] : undefined;
-  return custom
-    ? {
-        ...custom,
-        promptSource: custom.prompt === null ? null : '.noriq/project.toml',
-        source: '.noriq/project.toml',
-        tier: 'project-manifest',
-      }
-    : undefined;
+  if (!custom) return undefined;
+  // Mirrors WorkflowStore's inline tier: the v2 contract allows `prompt = { file = ... }` here,
+  // but file prompts are wired only for dedicated workflow files (RUN-192) — an inline one
+  // degrades to the base prompt while the declared posture and description hold.
+  const prompt = typeof custom.prompt === 'string' ? custom.prompt : null;
+  return {
+    base: custom.base,
+    prompt,
+    promptSource: prompt === null ? null : '.noriq/project.toml',
+    description: custom.description,
+    source: '.noriq/project.toml',
+    tier: 'project-manifest',
+  };
 };
 
 /**

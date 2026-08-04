@@ -66,6 +66,7 @@ describe('ParkedStore survives the daemon (RUN-30)', () => {
               base: 'verify',
               prompt: 'Audit {{brief}}',
               promptSource: '/repo/.noriq/workflows/audit.md',
+              description: null,
               source: '/repo/.noriq/workflows/audit.toml',
               tier: 'project-file',
             },

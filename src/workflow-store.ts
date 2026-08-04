@@ -18,6 +18,9 @@ export interface LoadedWorkflowDefinition {
   prompt: string | null;
   /** The file whose bytes supplied `prompt`; null means the base's bundled prompt is used. */
   promptSource: string | null;
+  /** One human line for the dispatch surface (RUN-195/PLNR-240). Cosmetic — nothing executes it;
+   *  it rides the repo report so a workflow picker can say what a name is for. Null = undeclared. */
+  description: string | null;
   /** The TOML source that declared this workflow. */
   source: string;
   tier: WorkflowSourceTier;
@@ -43,6 +46,7 @@ interface FilePrompt {
 interface RawDefinition {
   base?: unknown;
   prompt?: unknown;
+  description?: unknown;
 }
 
 const escapes = (root: string, abs: string): boolean => {
@@ -106,10 +110,22 @@ export class WorkflowStore {
     for (const [name, definition] of Object.entries(manifest.workflows ?? {}).sort(([a], [b]) =>
       a.localeCompare(b),
     )) {
+      // The v2 contract lets prompt be `{ file = ... }` at the inline tier too, but the runner's
+      // file-prompt support (RUN-192) deliberately lives in dedicated workflow files, where the
+      // confinement root is unambiguous. Until that is wired, fall back to the base prompt loudly
+      // rather than half-resolve a path — the declared posture and description still hold.
+      const prompt = typeof definition.prompt === 'string' ? definition.prompt : null;
+      if (definition.prompt !== null && prompt === null) {
+        this.log.warn(
+          'inline [workflows.*] file prompts are not wired — move it to .noriq/workflows/<name>.toml',
+          { workflow: name },
+        );
+      }
       apply(name, {
         base: definition.base,
-        prompt: definition.prompt,
-        promptSource: definition.prompt === null ? null : marker,
+        prompt,
+        promptSource: prompt === null ? null : marker,
+        description: definition.description,
         source: marker,
         tier: 'project-manifest',
       });
@@ -157,7 +173,7 @@ export class WorkflowStore {
         source,
         err: String(err),
       });
-      return { base: 'scope', prompt: null, promptSource: null, source, tier };
+      return { base: 'scope', prompt: null, promptSource: null, description: null, source, tier };
     }
 
     const parsedBase = RunKindSchema.safeParse(raw.base);
@@ -166,17 +182,27 @@ export class WorkflowStore {
         workflow: name,
         source,
       });
-      return { base: 'scope', prompt: null, promptSource: null, source, tier };
+      // The tombstone stands for "broken definition"; carrying its description onto the
+      // advertisement would dress up a definition the daemon refused to load.
+      return { base: 'scope', prompt: null, promptSource: null, description: null, source, tier };
+    }
+
+    // One human line for the dispatch surface (RUN-195). Cosmetic, so a wrong TYPE degrades to
+    // "undeclared" with a warn rather than costing the definition its declared posture.
+    const description = typeof raw.description === 'string' ? raw.description : null;
+    if (raw.description !== undefined && raw.description !== null && description === null) {
+      this.log.warn('workflow description must be a string — ignoring it', { workflow: name, source });
     }
 
     if (raw.prompt === undefined || raw.prompt === null) {
-      return { base: parsedBase.data, prompt: null, promptSource: null, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
     }
     if (typeof raw.prompt === 'string') {
       return {
         base: parsedBase.data,
         prompt: raw.prompt,
         promptSource: source,
+        description,
         source,
         tier,
       };
@@ -188,7 +214,7 @@ export class WorkflowStore {
         workflow: name,
         source,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
     }
 
     const abs = path.resolve(path.dirname(source), prompt.file);
@@ -199,7 +225,7 @@ export class WorkflowStore {
         promptFile: prompt.file,
         root: confinementRoot,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
     }
     try {
       // The production reader opens first, validates that descriptor with openConfined, and reads
@@ -207,7 +233,7 @@ export class WorkflowStore {
       // repository context without moving confinement into a pathname-only pre-check.
       const text = await this.read(abs, WORKFLOW_TEMPLATE_MAX_CHARS, confinementRoot);
       if (text.length > WORKFLOW_TEMPLATE_MAX_CHARS) throw new Error('prompt template is too large');
-      return { base: parsedBase.data, prompt: text, promptSource: abs, source, tier };
+      return { base: parsedBase.data, prompt: text, promptSource: abs, description, source, tier };
     } catch (err) {
       this.log.error('workflow prompt file could not be read safely — using the base prompt', {
         workflow: name,
@@ -215,7 +241,7 @@ export class WorkflowStore {
         promptFile: abs,
         err: String(err),
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
     }
   }
 }

@@ -218,6 +218,7 @@ describe('changedSections', () => {
     tool: null,
     defaultBranch: null,
     land: null,
+    setup: null,
     permissions: {
       scope: { write: false, allow: [], deny: [], auto: false },
       build: { write: true, allow: [], deny: [], auto: false },

@@ -234,6 +234,20 @@ export type Run = z.infer<typeof Run>;
 export const RunnerStatus = z.enum(['online', 'offline', 'draining', 'offboarded']);
 export type RunnerStatus = z.infer<typeof RunnerStatus>;
 
+/**
+ * One workflow a repo advertises for dispatch (PLNR-240). `base` is what lets the dispatch
+ * surfaces be smart — a workflow selector can set the run's kind to the workflow's posture
+ * instead of asking the operator to know it, and a plan pump (which mints build runs) can
+ * offer only build-based workflows. `description` is the human line beside the name.
+ * Advertise-only: the manifest stays the daemon's authority; this is its posted menu.
+ */
+export const AdvertisedWorkflow = z.object({
+  name: z.string().min(1),
+  base: RunKind,
+  description: z.string().nullable().default(null),
+});
+export type AdvertisedWorkflow = z.infer<typeof AdvertisedWorkflow>;
+
 // A repo the daemon discovered (has a .noriq/project.toml marker) and offers as
 // a Run target. The committed KEY resolves to a projectId per configured server
 // (see ./manifest for the resolution contract, RUN-3).
@@ -248,12 +262,13 @@ export const RunnerRepo = z.object({
   boardId: z.string().nullable().default(null),
   name: z.string().default(''), // display name (repo dir basename)
   defaultBranch: z.string().nullable().default(null),
-  // This repo's custom workflow NAMES (RUN-121), advertised so the dashboard can offer them on
-  // dispatch. The three built-ins (scope/build/verify) are always available and are NOT listed.
-  // Names only: the base + prompt live in the committed manifest and stay the runner's authority —
-  // the daemon resolves a selected name to its base+prompt locally (resolveWorkflow), so the wire
-  // carries just the choice.
-  workflows: z.array(z.string()).default([]),
+  // This repo's custom workflows, advertised so the dispatch surfaces can offer them. The three
+  // built-ins (scope/build/verify) are always available and are NOT listed. Two entry shapes in
+  // one array: a bare NAME (RUN-121 — what pre-PLNR-240 daemons send, and all they knew) or the
+  // richer {name, base, description} (PLNR-240), which lets a selector default the run's kind to
+  // the workflow's posture and show a human line. Prompt/stages stay in the committed manifest —
+  // the daemon resolves a selected name locally (resolveWorkflow); the wire carries the choice.
+  workflows: z.array(z.union([z.string(), AdvertisedWorkflow])).default([]),
 });
 export type RunnerRepo = z.infer<typeof RunnerRepo>;
 

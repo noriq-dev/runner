@@ -44,15 +44,48 @@ describe('WorkflowStore (RUN-192)', () => {
       'base = "verify"\nprompt = "project-file"\n',
     );
     const catalog = await new WorkflowStore({ userDir: user }).current(repo, {
-      workflows: { docs: { base: 'scope', prompt: 'manifest' } },
+      workflows: { docs: { base: 'scope', prompt: 'manifest', stages: null, description: null } },
     });
     expect(catalog.definitions.docs).toMatchObject({ base: 'verify', prompt: 'project-file' });
 
     const withoutFile = await new WorkflowStore({
       userDir: user,
       list: async (dir) => (dir === user ? ['docs.toml'] : []),
-    }).current(repo, { workflows: { docs: { base: 'scope', prompt: 'manifest' } } });
+    }).current(repo, {
+      workflows: { docs: { base: 'scope', prompt: 'manifest', stages: null, description: null } },
+    });
     expect(withoutFile.definitions.docs).toMatchObject({ base: 'scope', prompt: 'manifest' });
+  });
+
+  it('retains a declared description per tier and lets precedence replace it (RUN-195)', async () => {
+    const { repo, user } = await fixture();
+    await writeFile(
+      path.join(user, 'docs.toml'),
+      'base = "scope"\nprompt = "user"\ndescription = "user line"\n',
+    );
+    const userOnly = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+    expect(userOnly.definitions.docs).toMatchObject({ base: 'scope', description: 'user line' });
+
+    // The winning tier's description replaces the shadowed one even when it declares NONE —
+    // carrying the loser's line would describe a definition dispatch will not resolve.
+    await writeFile(path.join(repo, '.noriq', 'workflows', 'docs.toml'), 'base = "verify"\n');
+    const merged = await new WorkflowStore({ userDir: user }).current(repo, {
+      workflows: { docs: { base: 'build', prompt: null, stages: null, description: 'manifest line' } },
+    });
+    expect(merged.definitions.docs).toMatchObject({ base: 'verify', description: null });
+  });
+
+  it('the inline manifest tier carries its description and a non-string file one degrades', async () => {
+    const { repo, user } = await fixture();
+    const catalog = await new WorkflowStore({ userDir: user }).current(repo, {
+      workflows: { docs: { base: 'scope', prompt: null, stages: null, description: 'survey only' } },
+    });
+    expect(catalog.definitions.docs).toMatchObject({ base: 'scope', description: 'survey only' });
+
+    // Cosmetic field, cosmetic failure: a wrong TYPE costs the line, never the declared posture.
+    await writeFile(path.join(user, 'odd.toml'), 'base = "build"\ndescription = 7\n');
+    const odd = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+    expect(odd.definitions.odd).toMatchObject({ base: 'build', description: null });
   });
 
   it('re-reads definition and prompt bytes on every dispatch snapshot', async () => {

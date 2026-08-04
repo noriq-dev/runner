@@ -845,6 +845,7 @@ describe('daemon.start() executed-spec retention (RUN-173)', () => {
               base: 'scope',
               prompt: `dispatch-${reads}`,
               promptSource: '/repo/.noriq/workflows/docs.toml',
+              description: null,
               source: '/repo/.noriq/workflows/docs.toml',
               tier: 'project-file',
             },

@@ -244,6 +244,7 @@ describe('runWorkflow — the workflow a run actually executes (RUN-132)', () =>
           base: 'scope',
           prompt: 'read {{brief}}',
           promptSource: source,
+          description: null,
           source: '/repo/.noriq/workflows/docs.toml',
           tier: 'project-file',
         },

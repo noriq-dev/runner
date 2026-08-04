@@ -30,9 +30,24 @@ describe('buildRegistration', () => {
     expect(reg.maxConcurrency).toBe(2);
     expect(reg.tools).toEqual(['claude']);
     expect(reg.kinds).toEqual(['scope', 'build', 'verify']);
+    // A repo with no custom definitions still advertises the three built-ins (RUN-195): the
+    // list the server shows is exactly the list a dispatch can resolve, and every repo
+    // resolves scope/build/verify.
+    const builtins = [
+      { name: 'build', base: 'build' },
+      { name: 'scope', base: 'scope' },
+      { name: 'verify', base: 'verify' },
+    ];
     expect(reg.repos).toEqual([
-      { id: 'repo_a', projectKey: 'AAA', board: 'Runner', name: 'a', defaultBranch: 'main', workflows: [] },
-      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null, workflows: [] },
+      {
+        id: 'repo_a',
+        projectKey: 'AAA',
+        board: 'Runner',
+        name: 'a',
+        defaultBranch: 'main',
+        workflows: builtins,
+      },
+      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null, workflows: builtins },
     ]);
     expect('runnerId' in reg).toBe(false); // omitted on first registration
   });
@@ -47,7 +62,7 @@ describe('buildRegistration', () => {
     expect(reg.repos).toEqual([]);
   });
 
-  it('advertises custom workflow NAMES (RUN-121; base stays the runner’s authority, RUN-126)', () => {
+  it('advertises manifest workflows as {name, base, description?} beside the built-ins (RUN-195)', () => {
     const withWorkflows: DiscoveredRepo[] = [
       {
         id: 'repo_w',
@@ -59,19 +74,26 @@ describe('buildRegistration', () => {
           key: 'WWW',
           board: null,
           workflows: {
-            docs: { base: 'scope', prompt: 'survey it' },
-            hotfix: { base: 'build', prompt: null },
+            docs: { base: 'scope', prompt: 'survey it', stages: null, description: 'survey the repo' },
+            hotfix: { base: 'build', prompt: null, stages: null, description: null },
           },
         } as never,
       },
     ];
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, withWorkflows);
-    // Names only — the daemon resolves each to its base posture (effectiveKind), so the wire needn't
-    // carry it, and this matches shared RunnerRepo.workflows: string[].
-    expect(reg.repos[0]?.workflows).toEqual(['docs', 'hotfix']);
+    // The base rides the wire as advertise-only metadata now (PLNR-240) — the daemon still
+    // resolves a selected name to its posture locally (effectiveKind, RUN-126). A declared
+    // description is preserved; an absent one is OMITTED, not sent null.
+    expect(reg.repos[0]?.workflows).toEqual([
+      { name: 'build', base: 'build' },
+      { name: 'docs', base: 'scope', description: 'survey the repo' },
+      { name: 'hotfix', base: 'build' },
+      { name: 'scope', base: 'scope' },
+      { name: 'verify', base: 'verify' },
+    ]);
   });
 
-  it('advertises merged file/user workflow names without their definitions', () => {
+  it('advertises the merged catalog exactly once per name, shadowing included, without prompt bytes', () => {
     const catalogs = new Map([
       [
         '/x/a',
@@ -81,6 +103,7 @@ describe('buildRegistration', () => {
               base: 'build' as const,
               prompt: 'secret machine-local text',
               promptSource: '/home/me/.noriq/workflows/local.toml',
+              description: 'machine-local build variant',
               source: '/home/me/.noriq/workflows/local.toml',
               tier: 'user-file' as const,
             },
@@ -88,7 +111,18 @@ describe('buildRegistration', () => {
               base: 'scope' as const,
               prompt: 'project text',
               promptSource: '/x/a/.noriq/workflows/docs.toml',
+              description: null,
               source: '/x/a/.noriq/workflows/docs.toml',
+              tier: 'project-file' as const,
+            },
+            // Shadows the bundled name (resolveWorkflow gives the loaded definition precedence),
+            // so the advertised entry must carry the WINNING metadata — and only once.
+            build: {
+              base: 'scope' as const,
+              prompt: null,
+              promptSource: null,
+              description: 'read-only build drill',
+              source: '/x/a/.noriq/workflows/build.toml',
               tier: 'project-file' as const,
             },
           },
@@ -96,9 +130,27 @@ describe('buildRegistration', () => {
       ],
     ]);
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: [] }, repos, catalogs);
-    expect(reg.repos[0]?.workflows).toEqual(['docs', 'local']);
-    expect(JSON.stringify(reg.repos[0])).not.toContain('secret machine-local text');
-    expect(JSON.stringify(reg.repos[0])).not.toContain('base');
+    expect(reg.repos[0]?.workflows).toEqual([
+      { name: 'build', base: 'scope', description: 'read-only build drill' },
+      { name: 'docs', base: 'scope' },
+      { name: 'local', base: 'build', description: 'machine-local build variant' },
+      { name: 'scope', base: 'scope' },
+      { name: 'verify', base: 'verify' },
+    ]);
+    // Prompt text and local source identity are daemon-local — none of it may cross the wire.
+    const serialized = JSON.stringify(reg.repos[0]);
+    expect(serialized).not.toContain('secret machine-local text');
+    expect(serialized).not.toContain('project text');
+    expect(serialized).not.toContain('.noriq/workflows');
+    expect(serialized).not.toContain('/home/me');
+    expect(serialized).not.toContain('tier');
+    expect(serialized).not.toContain('promptSource');
+    // A repo without a loaded catalog for its root still advertises the built-ins.
+    expect(reg.repos[1]?.workflows).toEqual([
+      { name: 'build', base: 'build' },
+      { name: 'scope', base: 'scope' },
+      { name: 'verify', base: 'verify' },
+    ]);
   });
 
   it('advertises the coordinate catalog per installed tool (RUN-115)', () => {

@@ -27,6 +27,11 @@ export const EventVerb = z.enum([
   'task.requeued',
   'dependency.added',
   'dependency.removed',
+  // A task's LAST unfinished blocker settled from another project (PLNR-241). Same-project
+  // unblocking is already visible as the blocker's own task.status_changed in this room's
+  // feed; a cross-project blocker settles in a different room, so the dependent's project
+  // needs its own event or its board never hears.
+  'dependency.unblocked',
   'comment.posted',
   'comment.acknowledged',
   'comment.resolved',
