@@ -158,4 +158,65 @@ describe('WorkflowStore (RUN-192)', () => {
     expect(Object.getPrototypeOf(catalog.definitions)).toBeNull();
     expect(catalog.definitions.__proto__).toMatchObject({ base: 'scope', prompt: 'safe' });
   });
+
+  // RUN-193: a definition's `stages` — array or `[stages.<name>]` table — is carried per tier for
+  // `resolveWorkflow` to clamp. A value that is neither shape degrades to null (the base's own
+  // list) with a warn, the same "keep the posture, drop the broken field" rule as `description`.
+  describe('declared stages (RUN-193)', () => {
+    it('carries the array form (names only, no coordinates)', async () => {
+      const { repo, user } = await fixture();
+      await writeFile(
+        path.join(repo, '.noriq', 'workflows', 'fast.toml'),
+        'base = "build"\nstages = ["plan", "execute", "review"]\n',
+      );
+      const catalog = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+      expect(catalog.definitions.fast).toMatchObject({
+        base: 'build',
+        stages: ['plan', 'execute', 'review'],
+      });
+    });
+
+    it('carries the [stages.<name>] table form with per-stage agents', async () => {
+      const { repo, user } = await fixture();
+      await writeFile(
+        path.join(repo, '.noriq', 'workflows', 'audit.toml'),
+        'base = "build"\n\n[stages.review]\nagent = "codex.gpt-5_6-sol.high"\n\n[stages.execute]\nagent = "claude.opus-4_8.high"\n',
+      );
+      const catalog = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+      expect(catalog.definitions.audit?.stages).toEqual({
+        review: { agent: 'codex.gpt-5_6-sol.high' },
+        execute: { agent: 'claude.opus-4_8.high' },
+      });
+    });
+
+    it('a malformed stages value degrades to null WITHOUT costing the definition its posture', async () => {
+      const { repo, user } = await fixture();
+      await writeFile(
+        path.join(repo, '.noriq', 'workflows', 'broken.toml'),
+        'base = "verify"\nstages = "not-a-list"\n',
+      );
+      const catalog = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+      // The declared posture survives — only the stage list is dropped.
+      expect(catalog.definitions.broken).toMatchObject({ base: 'verify', stages: null });
+    });
+
+    it('the inline manifest tier carries stages too, and an absent one is null', async () => {
+      const { repo, user } = await fixture();
+      const catalog = await new WorkflowStore({ userDir: user }).current(repo, {
+        workflows: {
+          keyed: {
+            base: 'build',
+            prompt: null,
+            stages: { 'plan-check': { agent: 'codex.gpt-5_6-sol.high' } },
+            description: null,
+          },
+          plain: { base: 'scope', prompt: 'x', stages: null, description: null },
+        },
+      });
+      expect(catalog.definitions.keyed?.stages).toEqual({
+        'plan-check': { agent: 'codex.gpt-5_6-sol.high' },
+      });
+      expect(catalog.definitions.plain?.stages).toBeNull();
+    });
+  });
 });

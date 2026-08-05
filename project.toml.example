@@ -149,6 +149,33 @@ defaultBranch = "main"
 # [workflow.hotfix]
 # base = "build"                       # writes + is gated by verify/land — like build
 # prompt = "Ship the smallest safe fix for {{brief}}. {{anchor}}"
+#
+# ── Per-workflow stages + agent coordinates (RUN-193) ────────────────────────
+# A workflow may also declare its PIPELINE and, per stage, the AGENT COORDINATE
+# that stage's actor runs under. A coordinate picks a MODEL, never a posture —
+# the write floor and stage clamp are runner-side and unreachable here — so a repo
+# can plan with one model, build with a cheaper one, and be judged by a third.
+#
+# Two spellings of one declaration (TOML cannot put an array and a table on one
+# key); the declared SET is the array's entries or the table's keys, so declaring
+# only [stages.review] DECLINES the other optional stages (review, integrate):
+#
+#   stages = ["plan", "execute", "review"]        # names only, every stage inherits
+#
+#   [workflow.audit]
+#   base = "build"
+#   [workflow.audit.stages.review]
+#   agent = "codex.gpt-5_6-sol.high"   # judge this build on a stronger, other-vendor model
+#   [workflow.audit.stages.execute]
+#   agent = "claude.opus-4_8.medium"   # …while the builder runs cheaper
+#
+# Addressable stage keys: plan, plan-check, pattern-map, execute, review (and, in
+# a `.noriq/workflows/<name>.toml` file, `[stages.<name>]`). `plan-check` selects
+# the plan-checker's model without being a pipeline stage. The coordinate sits at
+# the TOP of each stage's ladder — above the dispatch coordinate and every manifest
+# field (`[defaults.<kind>]`, `[verify.agent]`). Only optional stages are declinable;
+# order is always the machine's; an unknown name or malformed coordinate is ignored
+# with a warning, never a gate.
 
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this

@@ -27,6 +27,7 @@
 import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
+import { foldStageCoordinate } from '../agent-coordinate';
 import type { RunAgent } from '../client';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
@@ -48,7 +49,13 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
-import { type Workflow, clampPermissionToWorkflow, resolveWorkflow, runWorkflow } from '../workflow';
+import {
+  type Workflow,
+  clampPermissionToWorkflow,
+  resolveWorkflow,
+  runWorkflow,
+  stageCoordinate,
+} from '../workflow';
 import { authorSpecBlock, buildRunBrief } from './brief';
 
 /**
@@ -151,9 +158,6 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
 
   const repo = await host.resolveRepo(run.repoRef);
   if (!repo) return refuse(`repo not found for repoRef ${run.repoRef}`);
-  const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
-  const driver = host.driverFor(tool as AgentTool);
-  if (!driver) return refuse(`no driver for tool ${tool}`);
 
   // The catalog pinned with this resolved repo at dispatch (RUN-192), else the manifest's inline
   // definitions — the one source every workflow resolution in this run reads.
@@ -176,6 +180,24 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       `workflow '${run.workflow}' no longer resolves in this repo — it names neither a loaded definition nor a built-in; not spawning`,
     );
   }
+
+  // The run's workflow (RUN-117/132), resolved BEFORE the driver (RUN-193) — because the driver a
+  // run needs may come from the workflow's execute-stage coordinate: a workflow declaring
+  // `[stages.execute] agent = "codex…"` builds on codex whatever the dispatch named. `kind` is the
+  // posture the daemon decides (RUN-126), not the dispatcher's; both are pure lookups against the
+  // catalog pinned above, so they sit with the other costless gates.
+  const kind = effectiveKind(run, workflowSource);
+  const wf = runWorkflow(run, workflowSource);
+
+  // The builder's coordinate (RUN-193): the execute stage sits at the TOP of the ladder, above the
+  // dispatch coordinate and every manifest field. Its TOOL picks the driver — and `execute` is a
+  // MANDATORY stage, so a coordinate naming a tool this machine has no driver for refuses the run,
+  // exactly as an undriveable dispatch tool does. Fail-closed: a run cannot build on a vendor that
+  // is not installed here.
+  const execCoord = stageCoordinate(wf, 'execute', host.log);
+  const tool = execCoord?.tool ?? resolveAgentTool(run);
+  const driver = host.driverFor(tool as AgentTool);
+  if (!driver) return refuse(`no driver for tool ${tool}`);
 
   // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
   // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
@@ -213,11 +235,6 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     }
   }
 
-  const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
-  // The run's workflow (RUN-117): read its flags, don't compare kind. The NAMED one when the repo
-  // defines it (RUN-132) — same posture either way, since a custom inherits its base verbatim and
-  // `effectiveKind` above decided which base that is; what the named one adds is its stage list.
-  const wf = runWorkflow(run, workflowSource);
   const permission = clampPermissionToWorkflow(repo.manifest.permissions[kind], wf);
   // Only SCOPE gets a physically read-only checkout. A VERIFY agent is told to run the
   // suite and exercise the behavior, which needs a writable tree (node_modules, test
@@ -492,6 +509,14 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
 
   const prompt = buildPrompt(renderedSpec, checkedSpec?.spec ?? null);
 
+  // The builder's model/effort with the execute-stage coordinate folded on top (RUN-193). Computed
+  // here, once, so `start` below and every session that spreads it (chain steps, the dispatched
+  // verify actor) run under the same coordinate. The tool has already picked the driver above.
+  const execModelEffort = foldStageCoordinate(execCoord, {
+    tool: resolveAgentTool(run),
+    ...resolveModel(run, repo.manifest),
+  });
+
   return {
     ok: true,
     // The `plan` stage (RUN-140) needs two things this scope already has: the planner's own brief,
@@ -548,9 +573,12 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       // build, with a verify command to fail. Scope and verify runs want today's behaviour —
       // finish and close — and a session nobody closes hangs the daemon.
       multiTurn: wf.produces && Boolean(repo.manifest.verify),
-      // Dispatch → repo [defaults] → the tool's own (RUN-33). The driver seam for `model` has
-      // existed since RUN-12 and was dead: nothing ever set it, because Run had no field for it.
-      ...resolveModel(run, repo.manifest),
+      // The execute stage's coordinate (RUN-193) atop dispatch → repo [defaults] → the tool's own
+      // (RUN-33). A workflow that pins the builder's model wins over the ladder; with no stage
+      // coordinate `execModelEffort` is byte-identical to `resolveModel` alone. The chain's step
+      // sessions and a dispatched verify actor inherit this by spreading `start` (RUN-149/168).
+      ...(execModelEffort.model ? { model: execModelEffort.model } : {}),
+      ...(execModelEffort.effort ? { effort: execModelEffort.effort } : {}),
       budget: reservation.budget,
       // The live check (RUN-133). `budget` above is a SNAPSHOT, and this session outlives it: it is
       // kept open for hand-back turns, and the reviewer spends from the same ceiling in between, so

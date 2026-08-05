@@ -1,10 +1,17 @@
 import { readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { type ProjectManifest, type RunKind, RunKind as RunKindSchema } from '@noriq-dev/shared';
+import {
+  type ProjectManifest,
+  type RunKind,
+  RunKind as RunKindSchema,
+  type WorkflowStages,
+  WorkflowStages as WorkflowStagesSchema,
+} from '@noriq-dev/shared';
 import { parse as parseToml } from 'smol-toml';
 import type { logger as Logger } from './logger';
 import { type DocReader, defaultDocReader } from './repo-context';
+import { isStageCoordinateKey } from './workflow';
 
 export const DEFAULT_USER_WORKFLOWS_DIR = path.join(os.homedir(), '.noriq', 'workflows');
 export const WORKFLOW_TEMPLATE_MAX_CHARS = 32_000;
@@ -18,6 +25,11 @@ export interface LoadedWorkflowDefinition {
   prompt: string | null;
   /** The file whose bytes supplied `prompt`; null means the base's bundled prompt is used. */
   promptSource: string | null;
+  /** The declared pipeline (RUN-193, contract v2 `WorkflowDef.stages`) — array or `[stages.<name>]`
+   *  table form, both carrying per-stage agent coordinates. Null = inherit the base's stage list.
+   *  `resolveWorkflow` clamps it; a value that could not be parsed degrades to null (keeping the
+   *  declared posture), never a wider one. */
+  stages: WorkflowStages | null;
   /** One human line for the dispatch surface (RUN-195/PLNR-240). Cosmetic — nothing executes it;
    *  it rides the repo report so a workflow picker can say what a name is for. Null = undeclared. */
   description: string | null;
@@ -47,6 +59,7 @@ interface RawDefinition {
   base?: unknown;
   prompt?: unknown;
   description?: unknown;
+  stages?: unknown;
 }
 
 const escapes = (root: string, abs: string): boolean => {
@@ -125,6 +138,9 @@ export class WorkflowStore {
         base: definition.base,
         prompt,
         promptSource: prompt === null ? null : marker,
+        // Already `WorkflowStages | null` off the zod-validated manifest — re-run through the same
+        // name check so an inline typo warns like a file one, then carry it (RUN-193).
+        stages: this.parseStages(definition.stages, name, marker),
         description: definition.description,
         source: marker,
         tier: 'project-manifest',
@@ -173,7 +189,15 @@ export class WorkflowStore {
         source,
         err: String(err),
       });
-      return { base: 'scope', prompt: null, promptSource: null, description: null, source, tier };
+      return {
+        base: 'scope',
+        prompt: null,
+        promptSource: null,
+        stages: null,
+        description: null,
+        source,
+        tier,
+      };
     }
 
     const parsedBase = RunKindSchema.safeParse(raw.base);
@@ -184,8 +208,22 @@ export class WorkflowStore {
       });
       // The tombstone stands for "broken definition"; carrying its description onto the
       // advertisement would dress up a definition the daemon refused to load.
-      return { base: 'scope', prompt: null, promptSource: null, description: null, source, tier };
+      return {
+        base: 'scope',
+        prompt: null,
+        promptSource: null,
+        stages: null,
+        description: null,
+        source,
+        tier,
+      };
     }
+
+    // The declared pipeline (RUN-193). Parsed once here and carried on every valid-base return
+    // below. A malformed value degrades to null (the base's own list) with a warn — a broken
+    // `stages` costs the declaration its pipeline, never its posture, the same rule the whole store
+    // runs on. `resolveWorkflow` does the clamp; this only validates the shape and the names.
+    const stages = this.parseStages(raw.stages, name, source);
 
     // One human line for the dispatch surface (RUN-195). Cosmetic, so a wrong TYPE degrades to
     // "undeclared" with a warn rather than costing the definition its declared posture.
@@ -195,13 +233,14 @@ export class WorkflowStore {
     }
 
     if (raw.prompt === undefined || raw.prompt === null) {
-      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
     }
     if (typeof raw.prompt === 'string') {
       return {
         base: parsedBase.data,
         prompt: raw.prompt,
         promptSource: source,
+        stages,
         description,
         source,
         tier,
@@ -214,7 +253,7 @@ export class WorkflowStore {
         workflow: name,
         source,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
     }
 
     const abs = path.resolve(path.dirname(source), prompt.file);
@@ -225,7 +264,7 @@ export class WorkflowStore {
         promptFile: prompt.file,
         root: confinementRoot,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
     }
     try {
       // The production reader opens first, validates that descriptor with openConfined, and reads
@@ -233,7 +272,7 @@ export class WorkflowStore {
       // repository context without moving confinement into a pathname-only pre-check.
       const text = await this.read(abs, WORKFLOW_TEMPLATE_MAX_CHARS, confinementRoot);
       if (text.length > WORKFLOW_TEMPLATE_MAX_CHARS) throw new Error('prompt template is too large');
-      return { base: parsedBase.data, prompt: text, promptSource: abs, description, source, tier };
+      return { base: parsedBase.data, prompt: text, promptSource: abs, stages, description, source, tier };
     } catch (err) {
       this.log.error('workflow prompt file could not be read safely — using the base prompt', {
         workflow: name,
@@ -241,7 +280,36 @@ export class WorkflowStore {
         promptFile: abs,
         err: String(err),
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, description, source, tier };
+      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
     }
+  }
+
+  /**
+   * Validate a raw `stages` value (RUN-193) against the vendored `WorkflowStages` schema and warn
+   * about keys that name no stage. Returns the validated union, or null — a malformed value costs
+   * the declaration its pipeline (it inherits the base's), never its posture. Unknown keys are kept
+   * in the returned value and dropped later by `resolveWorkflow`'s clamp; warning here is where a
+   * logger exists and where the author's file is named.
+   */
+  private parseStages(raw: unknown, name: string, source: string): WorkflowStages | null {
+    if (raw === undefined || raw === null) return null;
+    const parsed = WorkflowStagesSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.log.warn('workflow stages must be an array of names or a table of [stages.<name>] — ignoring it', {
+        workflow: name,
+        source,
+      });
+      return null;
+    }
+    const keys = Array.isArray(parsed.data) ? parsed.data : Object.keys(parsed.data);
+    const unknown = keys.filter((k) => !isStageCoordinateKey(k));
+    if (unknown.length) {
+      this.log.warn('workflow declares stage names the runner does not run — they are ignored', {
+        workflow: name,
+        source,
+        unknown,
+      });
+    }
+    return parsed.data;
   }
 }

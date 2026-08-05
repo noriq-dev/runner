@@ -146,17 +146,21 @@ export {
 export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
 export {
   BUILTIN_WORKFLOWS,
+  type StageCoordinateKey,
   type Workflow,
   type WorkflowStage,
   clampPermissionToWorkflow,
+  isStageCoordinateKey,
   resolveWorkflow,
   runWorkflow,
+  stageCoordinate,
   stageOf,
   workflowFor,
 } from './workflow';
 export {
   type AgentCoordinate,
   coordinateFromParts,
+  foldStageCoordinate,
   formatCoordinate,
   mergeCoordinate,
   parseCoordinate,
