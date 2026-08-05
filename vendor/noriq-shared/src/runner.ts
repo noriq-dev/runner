@@ -191,7 +191,14 @@ export const Run = z.object({
   // The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
   // workflow is a NAMED variant of `kind` (its base): `kind` still carries the posture (so every
   // permission/gate stays kind-driven and floor-safe), and `workflow` only swaps in the workflow's
-  // own prompt. Null / an unknown name → the built-in for `kind`, unchanged.
+  // own prompt.
+  //
+  // NULL falls back to the built-in for `kind`, unchanged — a bare kind run is not a pick. An
+  // explicit NAME that resolves to neither a loaded definition nor a built-in is REFUSED at the
+  // runner's prepare gate (RUN-196): a name is an operator's choice from the advertised menu
+  // (RUN-195), and a file deleted between advertise and dispatch must not silently degrade to a
+  // prompt nobody chose. A definition whose FILE is broken still resolves — the runner keeps a
+  // scope-posture tombstone for it — so that is a working selection, not a stale name.
   workflow: z.string().nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
