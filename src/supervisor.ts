@@ -69,7 +69,13 @@ import {
 import type { LockConflict } from './lock-client';
 import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
-import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
+import {
+  type ParkedRun,
+  type ParkedStore,
+  continuationResumePrompt,
+  expiredParks,
+  resumePrompt,
+} from './parked';
 import { renderPrompt, renderUserTemplate } from './prompts';
 import { buildRepairSpec } from './repair';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
@@ -343,6 +349,13 @@ export interface RunSupervisorDeps {
    * session that ends is simply finished, exactly as before RUN-30.
    */
   getParkState?: (runId: string) => Promise<ParkState>;
+  /**
+   * Tell the server a run's open blocked question died with the run (RUN-199), on a terminal path
+   * that declines to park it (a budget breach, a crash, a resumable driver with no session).
+   * Omitted → the signal is left standing, the pre-RUN-199 behaviour a human clears by hand. Never
+   * fatal: a failure here must not turn a terminal run into a throw.
+   */
+  abandonSignal?: (runId: string, signalId: string) => Promise<void>;
   /** Where parked runs are remembered across restarts (RUN-30). Omitted → parking is off. */
   parked?: Pick<ParkedStore, 'park' | 'get' | 'unpark' | 'list'>;
   /** Where a failed build's continuation state (spend + adjudication ledger) is kept, so a
@@ -2837,6 +2850,9 @@ export class RunSupervisor {
     worktree: Workspace;
     exit: DriverExit;
     session: DriverSession;
+    /** The driver this session ran on — its `resumableSession` capability decides session-restore
+     *  vs continuation park (RUN-199), read as a capability rather than by the driver's name. */
+    driver: AgentDriver;
     runAgent: RunAgent;
     activeSeconds: number;
     /** The run's spend tallied across every session so far (RUN-59) — what the park persists so a
@@ -2852,10 +2868,10 @@ export class RunSupervisor {
   }): Promise<DriverExit | null> {
     const { run, exit } = ctx;
     if (!this.deps.parked || !this.deps.getParkState) return null;
-    // A budget breach or a crash is terminal even if a question is open: resuming a run that was
-    // killed for overspending would hand it a fresh ceiling, which is the loophole in reverse.
-    if (exit.outcome !== 'done') return null;
 
+    // Ask the row FIRST, even on a non-'done' exit (which used to short-circuit before this): a
+    // failed run may still hold an open blocked question, and the decline paths below owe the
+    // server an abandonment so no blocked signal is left standing on a dead run (RUN-199).
     const state = await this.deps.getParkState(run.id).catch((err) => {
       // Can't tell → finalize, the pre-RUN-30 behaviour. Parking on a guess would strand a
       // finished run as blocked forever, waiting for an answer to a question nobody asked.
@@ -2867,14 +2883,29 @@ export class RunSupervisor {
     });
     if (!state?.blocked) return null;
 
-    const sessionId = ctx.session.sessionId ?? exit.sessionId ?? null;
-    if (!sessionId) {
-      // Nothing to resume: this run can be reported blocked but never brought back, so parking
-      // it would be a promise the daemon cannot keep. Fail it loudly with its context intact.
-      this.log.warn('run asked a human but its tool has no resumable session — cannot park', {
+    // A budget breach or a crash is terminal even if a question is open: resuming a run that was
+    // killed for overspending would hand it a fresh ceiling, which is the loophole in reverse. The
+    // question dies with the run — tell the server so, rather than leaving the signal standing.
+    if (exit.outcome !== 'done') {
+      await this.abandonBlockedSignal(run.id, state.signalId);
+      return null;
+    }
+
+    // A driver with a resumable session (claude) parks its real id and resumes IN it; one without
+    // (codex, RUN-199) parks with `sessionId: null` and resumes CONTINUATION-style — its work
+    // survives on disk in the kept worktree, so a fresh session reads it. The distinction is the
+    // capability, never the driver's name: the seam is the only place a vendor's specifics live.
+    const resumable = ctx.driver.capabilities.resumableSession;
+    const sessionId = resumable ? (ctx.session.sessionId ?? exit.sessionId ?? null) : null;
+    if (resumable && !sessionId) {
+      // A resumable driver that produced no session id is an anomaly: reported blocked, resumable
+      // never, so parking it would be a promise the daemon cannot keep. Fail it loudly with its
+      // context intact, and abandon the signal so the row is not left blocked forever.
+      this.log.warn('run asked a human but its resumable tool returned no session — cannot park', {
         runId: run.id,
         tool: run.agentTool,
       });
+      await this.abandonBlockedSignal(run.id, state.signalId);
       return null;
     }
 
@@ -2921,6 +2952,23 @@ export class RunSupervisor {
     // not this sitting's first-result snapshot, so a caller reading the returned exit agrees with
     // what was reported and parked (RUN-59).
     return { ...exit, outcome: 'done', isError: false, reason: 'parked', sessionId, telemetry: runSpend };
+  }
+
+  /**
+   * A run holding an open blocked question terminated WITHOUT parking (RUN-199) — tell the server
+   * the question died with the run, so the row is not left `blocked` on a question nobody will ever
+   * answer into anything. Best-effort, in the shape every optional side effect here uses: no dep or
+   * no signal is a silent no-op (the pre-RUN-199 behaviour, a human clears it by hand), and a failed
+   * call warns rather than turning a terminal run into a throw.
+   */
+  private async abandonBlockedSignal(runId: string, signalId: string | null): Promise<void> {
+    if (!signalId || !this.deps.abandonSignal) return;
+    await this.deps.abandonSignal(runId, signalId).catch((err) => {
+      this.log.warn('could not tell the server a blocked question died with the run', {
+        runId,
+        err: String(err),
+      });
+    });
   }
 
   /**
@@ -3024,7 +3072,11 @@ export class RunSupervisor {
     const tool = execCoord?.tool ?? resolveAgentTool(run); // the coordinate's tool (RUN-114/193)
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
-    if (!entry.sessionId) return fail('parked run has no session to resume');
+    // A resumable park restores its session and comes back IN it (claude); a non-resumable one
+    // (codex, RUN-199) parked with sessionId:null and comes back CONTINUATION-style — a fresh
+    // session over the kept worktree, re-briefed from scratch. So a null session id no longer
+    // refuses the resume, it SELECTS the path.
+    const isContinuation = !entry.sessionId;
     // The model/effort with the execute stage coordinate folded on top (RUN-193), through the same
     // fold every spawn uses — so a resumed session, and the chain steps that spread this `start`,
     // run under the coordinate the fresh build did.
@@ -3086,6 +3138,66 @@ export class RunSupervisor {
       return fail(`${reservation.breach}: ${reservation.detail}; not resuming`);
     }
 
+    // Where a resumed CHAIN picks up (RUN-168), computed BEFORE `start` because a continuation resume
+    // folds the rebuilt brief into its prompt (RUN-199). The chain is recomputed from the spec as it
+    // stands NOW — the same re-fetch RUN-164 does — so a spec corrected during the park is the one
+    // that governs. A park written before steps existed records no position; its spec may have GAINED
+    // steps since, and chaining it then would treat step one as fresh — erasing the resume session
+    // id, never delivering the answer, replaying done work. Such a park resumes as the single session
+    // it was written as.
+    const resumedChain = entry.stepId ? checkSteps(resumedSpec?.spec) : { steps: [], findings: [] };
+    if (!entry.stepId && checkSteps(resumedSpec?.spec).steps.length) {
+      this.log.info('this park predates step positions — resuming it as the single session it was', {
+        runId,
+      });
+    }
+    // Total length is the wrong question: a two-step chain parked on step two has nothing after it.
+    const resumeAt = resumedChain.steps.findIndex((st) => st.id === entry.stepId);
+    const hasLaterSteps = resumeAt >= 0 && resumeAt < resumedChain.steps.length - 1;
+    // A brief is rebuilt for the later steps (RUN-169) AND for a continuation's own fresh session
+    // (RUN-199), which has none to fall back on. The diff range is the same one `prepare` computes: a
+    // verify actor's whole subject is the accumulated diff (RUN-21), and a leased build branch is
+    // CLEAN — so omitting it would let a resumed verify pass a change it never saw. Non-git backends
+    // have no such command and the prompt points at the workspace instead.
+    const needsBrief = hasLaterSteps || isContinuation;
+    const resumedDiffCmd =
+      needsBrief && run.verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
+        ? `git diff ${(await this.planBase(repo, run).catch(() => null)) ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
+        : undefined;
+    // Rebuilt from the same acquire-nothing assembler `prepare` uses (RUN-169). Never fatal for a
+    // session RESTORE — it falls back to the answer-only prompt the restored session already has the
+    // context for. A CONTINUATION has no such session, so a brief it cannot build IS fatal (below).
+    const resumedBrief = needsBrief
+      ? await buildRunBrief(this.prepareHost(), {
+          run,
+          repo,
+          worktree,
+          task: resumedTask,
+          runAgent,
+          kind,
+          ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
+          workflow: wf,
+        }).catch((err) => {
+          this.log.warn('could not rebuild the brief on resume', { runId, err: String(err) });
+          return null;
+        })
+      : null;
+    if (isContinuation && !resumedBrief) {
+      // A non-resumable park has no session holding the brief, so a fresh one with only the answer
+      // would be worse than not running — an answer to a question it never asked. Fail with the
+      // worktree kept, exactly as the busted reservation above does.
+      return fail('could not rebuild the brief for a continuation resume; not resuming — worktree kept');
+    }
+    // The prompt this sitting opens with. A restore hands the answer alone: the session already holds
+    // the brief, the task and the repo tour (RUN-30), and re-sending them would waste the context and
+    // confuse a conversation mid-thought. A continuation is a FRESH session over the kept worktree
+    // (RUN-199), so it gets the whole brief rebuilt from the spec as it stands now — the same brief a
+    // first dispatch would build — with the Q&A appended.
+    const resumePromptText =
+      resumedBrief && isContinuation
+        ? `${resumedBrief.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null)}${continuationResumePrompt(entry.question, answer, changed)}`
+        : resumePrompt(entry.question, answer, changed);
+
     // The SAME execute stage `supervise` runs (RUN-131) — including its re-park check, because an
     // agent given an answer may well have a second question and there is no reason the second one
     // is worth less than the first. Everything that differs about a resume is resolved here, in
@@ -3094,11 +3206,10 @@ export class RunSupervisor {
       runId: run.id,
       kind,
       cwd: worktree.localPath,
-      // The answer IS the prompt. No brief, no task text, no repo tour: the session already has
-      // all of it, and re-sending it would both waste the context and confuse a conversation
-      // that is mid-thought.
-      prompt: resumePrompt(entry.question, answer, changed),
-      resumeSessionId: entry.sessionId,
+      prompt: resumePromptText,
+      // Restore the session on a resumable driver; omit it on a continuation, which opens a fresh
+      // session the chain path (RUN-168) already treats as such via `resumeSessionId: undefined`.
+      ...(entry.sessionId ? { resumeSessionId: entry.sessionId } : {}),
       permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
       multiTurn: wf.produces && Boolean(repo.manifest.verify),
@@ -3123,56 +3234,6 @@ export class RunSupervisor {
       priorActiveSeconds: entry.activeSeconds,
       start: resumeStart,
     };
-    // A resumed CHAIN picks up where it parked and runs the steps that never got to (RUN-168).
-    // Without this a resume restored one session, ran it, and returned — so a run that parked on
-    // step two of five came back, finished step two, and reported DONE having silently skipped the
-    // rest of its plan. The chain is recomputed from the spec as it stands NOW, which is the same
-    // re-fetch RUN-164 already does, so a spec corrected during the park is the one that governs.
-    // A park written before steps existed (RUN-168) records no position. Its spec may have GAINED
-    // steps since, and chaining it then would treat step one as fresh — erasing the resume session
-    // id, never delivering the human's answer, and replaying work that is already done. Such a park
-    // resumes as the single session it was written as.
-    const resumedChain = entry.stepId ? checkSteps(resumedSpec?.spec) : { steps: [], findings: [] };
-    if (!entry.stepId && checkSteps(resumedSpec?.spec).steps.length) {
-      this.log.info('this park predates step positions — resuming it as the single session it was', {
-        runId,
-      });
-    }
-    // Where the chain picks up, and therefore whether anything is left to brief. Total length is
-    // the wrong question: a two-step chain parked on step two has nothing after it.
-    const resumeAt = resumedChain.steps.findIndex((st) => st.id === entry.stepId);
-    const hasLaterSteps = resumeAt >= 0 && resumeAt < resumedChain.steps.length - 1;
-    // The same range `prepare` computes, resolved only when a later step will need it. A verify
-    // actor's whole subject is the accumulated diff (RUN-21); omitting this falls back to "inspect
-    // the modified files", and a leased build branch is CLEAN — so a resumed verify step would find
-    // nothing to review and could pass the change without ever seeing it. Non-git backends have no
-    // such command and the prompt points at the workspace instead.
-    const resumedDiffCmd =
-      hasLaterSteps && run.verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
-        ? `git diff ${(await this.planBase(repo, run).catch(() => null)) ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
-        : undefined;
-    // The RUN's brief, rebuilt on the resume path (RUN-169) — only when there are later steps to
-    // brief, since building one costs a `[context]` walk and the common resume has nothing after
-    // the session it restores. Never fatal: a resume that cannot build one falls back to what it
-    // always sent, which is the pre-RUN-169 behaviour rather than a new failure.
-    const resumedBrief = hasLaterSteps
-      ? await buildRunBrief(this.prepareHost(), {
-          run,
-          repo,
-          worktree,
-          task: resumedTask,
-          runAgent,
-          kind,
-          ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
-          workflow: wf,
-        }).catch((err) => {
-          this.log.warn('could not rebuild the brief on resume — later steps will not run', {
-            runId,
-            err: String(err),
-          });
-          return null;
-        })
-      : null;
     const executed = resumedChain.steps.length
       ? await executeChain(this.executeHost(), {
           ...resumeBase,

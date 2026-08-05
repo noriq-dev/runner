@@ -731,6 +731,9 @@ export class Daemon {
       // the agent calls request_input over its own MCP transport, straight past the daemon — so
       // the daemon asks the row rather than trying to observe the call.
       getParkState: (runId) => client.getParkState(runId),
+      // When a run holding an open blocked question terminates without parking (a breach, a crash),
+      // tell the server the question died with the run so no signal is left standing (RUN-199).
+      abandonSignal: (runId, signalId) => client.abandonBlockedSignal(runId, signalId),
       parked,
       continuable,
       // The line whose absence made RUN-103's predictive layer dead code in production: the dep

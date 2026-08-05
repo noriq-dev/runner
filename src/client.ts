@@ -252,6 +252,20 @@ export class NoriqClient {
   }
 
   /**
+   * Tell the server a run's open blocked question died with the run (RUN-199).
+   *
+   * When a run holding an open `request_input` terminates WITHOUT parking — a budget breach, a
+   * crash, or (the anomaly) a resumable driver that produced no session — the row is left `blocked`
+   * on a question nobody will ever answer into anything. This resolves the signal as abandoned so
+   * the dashboard is not left showing a dead run waiting for input. Fire-and-forget from the
+   * supervisor, which swallows a failure: an older server without this endpoint just leaves the
+   * signal standing, the pre-RUN-199 behaviour a human clears by hand.
+   */
+  async abandonBlockedSignal(runId: string, signalId: string): Promise<void> {
+    await this.request('POST', `/api/runs/${runId}/park/abandon`, { signalId });
+  }
+
+  /**
    * Merge requests this runner still owes (RUN-28).
    *
    * The durable half of plan completion: the WS `plan.completed` frame is only the fast path. A

@@ -33,8 +33,15 @@ export interface ParkedRun {
    * that already started. Older parks omit this field and keep their pre-RUN-192 behaviour.
    */
   workflowCatalog?: WorkflowCatalog;
-  /** What `resume` takes. Null on a driver with no resumable session — such a run can be
-   *  reported blocked but not brought back, so we refuse to park it (see supervisor). */
+  /**
+   * What `resume` restores. A driver with a resumable session (claude) parks its real id and comes
+   * back IN that session with only the answer as its prompt.
+   *
+   * Null on a driver with no resumable session (codex, RUN-199) — its work survives on disk in the
+   * kept worktree, so the run parks anyway and resumes CONTINUATION-style: a fresh session over that
+   * worktree, briefed from scratch with the question and answer appended (see supervisor). Null also
+   * on a stage park (RUN-190, `stage` below), which is an in-process wait with no session at all.
+   */
   sessionId: string | null;
   /** The run's Noriq agent, which OUTLIVES the process: one identity per run, across parks. */
   agentId: string;
@@ -230,4 +237,15 @@ export const expiredParks = (
  * changed under it.
  */
 export const resumePrompt = (question: string | null, answer: string, changed = ''): string =>
-  renderPrompt('resume', { question, answer, changed });
+  renderPrompt('resume', { question, answer, changed, fresh: false });
+
+/**
+ * What a CONTINUATION resume is handed AFTER the rebuilt brief (RUN-199).
+ *
+ * A non-resumable driver parks with `sessionId: null` and comes back as a FRESH session over the
+ * kept worktree — it holds none of the prior conversation, so unlike `resumePrompt` this is appended
+ * to a full run brief and tells the agent its earlier work is already on disk, rather than assuming a
+ * context it does not have. `changed` carries the same RUN-164 spec diff as the session-restore path.
+ */
+export const continuationResumePrompt = (question: string | null, answer: string, changed = ''): string =>
+  renderPrompt('resume', { question, answer, changed, fresh: true });

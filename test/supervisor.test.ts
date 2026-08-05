@@ -528,6 +528,8 @@ function harness(
   const continuable = new FakeContinuable();
   if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
+  /** Signals the daemon told the server died with a run that declined to park (RUN-199). */
+  const abandons: Array<{ runId: string; signalId: string }> = [];
   const claimChecks: string[] = [];
   /** Cancellation records settle cleaned up (RUN-165) — the steering `forget` calls. */
   const forgets: string[] = [];
@@ -606,6 +608,9 @@ function harness(
         ...park.state,
       };
     },
+    abandonSignal: async (runId, signalId) => {
+      abandons.push({ runId, signalId });
+    },
     ...('claimGate' in over
       ? {
           checkClaimable: async (taskId: string) => {
@@ -652,6 +657,7 @@ function harness(
     parked,
     continuable,
     parkChecks,
+    abandons,
     claimChecks,
     agentCreates,
     forgets,
@@ -5368,9 +5374,43 @@ describe('parking a run on a human (RUN-30)', () => {
     expect(await h.parked.list()).toEqual([]);
   });
 
-  it('refuses to park when the tool has no resumable session', async () => {
-    // Parking it would promise a return the daemon cannot deliver: reported blocked, resumable
-    // never. Fail it loudly with its worktree intact instead.
+  it('parks a NON-resumable driver with a null session instead of refusing (RUN-199)', async () => {
+    // A codex run that asked a human and exited cleanly used to die no_changes ("its tool has no
+    // resumable session"), stranding an open question nobody could answer into anything. Its work
+    // survives on disk in the kept worktree, so it parks — just with `sessionId: null`, which the
+    // resume path reads as "come back CONTINUATION-style" rather than "restore a session".
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.complete('done');
+    await done;
+
+    expect(h.reports.at(-1)?.status).toBe('blocked');
+    expect(h.worktrees.removed).toEqual([]); // the work is kept
+    const entry = await h.parked.get('run_1');
+    expect(entry?.sessionId).toBeNull(); // nothing to restore — a fresh session reads the worktree
+    expect(entry?.question).toBe('Approach A or B?');
+    // It PARKED, so the question did not die — nothing is abandoned.
+    expect(h.abandons).toEqual([]);
+  });
+
+  it('a RESUMABLE driver still parks with its real session (claude path unchanged)', async () => {
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.reports.at(-1)?.status).toBe('blocked');
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake');
+    expect(h.abandons).toEqual([]);
+  });
+
+  it('abandons the signal when a RESUMABLE driver returns no session (anomaly)', async () => {
+    // A resumable tool that somehow produced no session id cannot be brought back — parking it would
+    // promise a return the daemon cannot deliver. Fail it with its worktree intact, AND tell the
+    // server the open question died with the run so no blocked signal is left standing (RUN-199).
     const h = harness({ parkState: asked });
     h.claude.sessionId = null;
     const done = h.supervisor.supervise(buildRun());
@@ -5379,6 +5419,19 @@ describe('parking a run on a human (RUN-30)', () => {
     await done;
     expect(await h.parked.list()).toEqual([]);
     expect(h.reports.at(-1)?.status).not.toBe('blocked');
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
+  });
+
+  it('abandons the signal when a run FAILS with a question still open (RUN-199)', async () => {
+    // A budget breach or crash stays terminal even with a question open (the spend loophole in
+    // reverse) — but the server still holds the open question, so it is told the question died.
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    expect((await done).outcome).toBe('failed');
+    expect(await h.parked.list()).toEqual([]);
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
   });
 });
 
@@ -5410,6 +5463,38 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.resumeSessionId).toBe('sess-fake');
     expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
     expect(h.worktrees.created).toHaveLength(1); // only the original
+    // The answer IS the prompt — the restored session already holds the brief (RUN-30).
+    expect(second.prompt).toContain('Use B.');
+    expect(second.prompt).not.toContain('ship the thing'); // no brief re-sent
+  });
+
+  it('resumes a NULL-session park CONTINUATION-style: fresh session, full brief + Q&A (RUN-199)', async () => {
+    // The codex path: parked with sessionId:null, it comes back as a fresh session over the kept
+    // worktree — no session to restore, so it is re-briefed from scratch with the Q&A appended.
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.complete('done');
+    await done;
+    expect((await h.parked.get('run_1'))?.sessionId).toBeNull();
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.codex.complete('done');
+    await resumed;
+
+    const start = h.codex.starts.at(-1)!;
+    expect(start.resumeSessionId).toBeUndefined(); // a FRESH session, not a restore
+    expect(start.cwd).toBe('/wt/run_1'); // the same worktree, holding the earlier work
+    expect(h.worktrees.created).toHaveLength(1); // reused, never re-leased
+    // Briefed from scratch — the whole run brief — with the question and answer appended, not the
+    // answer alone the restored path sends.
+    expect(start.prompt).toContain('ship the thing'); // the run's brief
+    expect(start.prompt).toContain('Use B.'); // the human's answer
+    expect(start.prompt).toContain('Approach A or B?'); // the question it had asked
   });
 
   it('keeps the dispatch workflow snapshot when definitions change while parked (RUN-192)', async () => {
@@ -6726,8 +6811,10 @@ describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)',
   });
 
   // finding 1a: a build under [stages.execute] agent that PARKS must resume on that coordinate's
-  // driver and model — the parked session belongs to it, and the dispatch driver cannot resume it.
-  it('a resumed build (and its chain steps) run on the execute stage’s coordinate, not the dispatch driver', async () => {
+  // driver and model — the dispatch driver cannot pick the work back up. codex is non-resumable, so
+  // it parks with sessionId:null and resumes CONTINUATION-style (RUN-199), but STILL on the
+  // coordinate's driver and model: those follow the execute coordinate, not the session.
+  it('a resumed build runs on the execute stage’s coordinate, not the dispatch driver', async () => {
     const h = harness({
       parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
       workflowCatalog: catalog('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
@@ -6736,14 +6823,14 @@ describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)',
     await flush();
     h.codex.complete('done'); // the builder ran on the execute coord (codex) and parks on the question
     await done;
-    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake'); // parked the codex session
+    expect((await h.parked.get('run_1'))?.sessionId).toBeNull(); // codex is non-resumable → null
 
     h.answerIt();
     const resumed = h.supervisor.resume('run_1', 'Use B.');
     await flush();
     const start = h.codex.starts.at(-1);
     if (!start) throw new Error('the resume never started on codex');
-    expect(start.resumeSessionId).toBe('sess-fake'); // resumed the codex session, not a fresh claude one
+    expect(start.resumeSessionId).toBeUndefined(); // a fresh continuation session, not a claude one
     expect(start.model).toBe('gpt-5.6-sol'); // …under the execute coordinate's model, as the fresh build was
     expect(start.effort).toBe('high');
     h.codex.complete('done');
