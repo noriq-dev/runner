@@ -40,7 +40,7 @@ const MAX_OUTPUT = 16 * 1024; // keep the tail — the failing error is usually 
 /** How long to wait for the process group to actually die before giving up on it. */
 const KILL_GRACE_MS = 5_000;
 
-const defaultExec: VerifyExec = (cmd, cwd, timeoutMs, shell) =>
+export const defaultExec: VerifyExec = (cmd, cwd, timeoutMs, shell) =>
   new Promise((resolve) => {
     // Sanitized env (RUN-24): the verify command runs repo code — no secrets, no push.
     // `detached` puts the shell and everything it spawns in one process group, so the

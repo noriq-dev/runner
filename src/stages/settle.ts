@@ -17,6 +17,7 @@
 
 import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
 import { totalTokens } from '../drivers/budget';
+import { clearSetupMarker } from '../setup';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
 
@@ -192,6 +193,12 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     await vcs
       .dispose(worktree)
       .catch((err) => host.log.warn('worktree cleanup failed', { err: String(err) }));
+    // The bootstrap marker is keyed by workspace PATH and lives outside the tree (RUN-202), so a
+    // disposed workspace must forget it: a backend that later leases the same directory would
+    // otherwise skip installing into a tree that no longer holds what the last run installed. A
+    // KEPT workspace deliberately keeps its marker — that is the continuation case the marker is
+    // for. Best-effort, like the dispose above.
+    await clearSetupMarker(worktree.localPath);
   }
   // The run is terminal, so its cancellation record has nothing left to protect (RUN-165) —
   // without this a long-lived daemon keeps one entry per cancelled run for its whole life.

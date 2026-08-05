@@ -288,6 +288,15 @@ export {
 } from './supervisor';
 export { RunTranscript, nullTranscript, type RunLogRole, type RunLogSegment } from './transcript';
 export {
+  SETUP_MARKER_DIR,
+  clearSetupMarker,
+  runSetup,
+  setupBriefNote,
+  setupMilestone,
+  type SetupResult,
+  type SetupCommandResult,
+} from './setup';
+export {
   runVerify,
   verifyFailureComment,
   verifyFixRounds,

@@ -263,6 +263,32 @@ defaultBranch = "main"
 # A [verify] section with NEITHER is a config error, refused at parse — silence
 # must not read as a gate that isn't there.
 #
+# ---------------------------------------------------------------------------
+# [setup] — what the DAEMON runs to make a fresh workspace usable, before any
+# agent starts (RUN-202). Optional; omit it and nothing changes.
+#
+# Why it exists: every run gets its own worktree, and a fresh worktree has no
+# node_modules. Without this, the agent's first turns go on discovering that —
+# and a read-only reviewer, which may not be allowed to install anything, can
+# end up unable to run the suite it was spawned to judge. That is machine work
+# at model prices.
+#
+# The rules, so nothing here surprises you:
+#   - Runs after the workspace is leased, before EVERY actor (planner included).
+#   - Same credential posture as `verify.cmd`: no push credentials, no Noriq
+#     token. These commands are as trusted as your verify command — no more.
+#   - FAIL-OPEN. A failing command is reported in the run's transcript and in
+#     the agent's brief ("the environment may be incomplete"), and the run goes
+#     ahead. Setup is preparation, not a gate; verify still judges the result.
+#   - Runs ONCE per workspace: a continuation or a resumed park re-enters an
+#     already-bootstrapped tree and skips it. Editing `cmds` re-runs it.
+#   - Setup seconds do not count against the run's wall-clock budget, which
+#     measures agent time.
+#
+# [setup]
+# cmds = ["npm ci"]        # in order; the first failure stops the rest
+# timeoutSeconds = 600     # per COMMAND; raise it for heavy bootstraps
+
 # Put tsc in `cmd`: vitest/esbuild do NOT catch type errors.
 [verify]
 cmd = "npm run typecheck && npm test"

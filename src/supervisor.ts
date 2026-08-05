@@ -77,6 +77,7 @@ import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
 import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget';
 import { type StageName, stagesFor, stopBefore } from './run-machine';
 import { STAGE_NORIQ_TOOLS, sanitizedAgentEnv } from './security';
+import { runSetup } from './setup';
 import {
   type ExecuteHost,
   type ExecuteOutcome,
@@ -111,7 +112,14 @@ import type { ChainWave, StepSummary } from './stages/chain';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
-import { type VerifyExec, type VerifySpec, runVerify, verifyFeedbackPrompt, verifyFixRounds } from './verify';
+import {
+  type VerifyExec,
+  type VerifySpec,
+  defaultExec,
+  runVerify,
+  verifyFeedbackPrompt,
+  verifyFixRounds,
+} from './verify';
 import {
   type VerifyVerdict,
   assembleVerifyPrompt,
@@ -372,6 +380,9 @@ export interface RunSupervisorDeps {
   waveLimit?: (runId: string) => number;
   /** Injectable command runner for the deterministic verify floor (RUN-19). */
   verifyExec?: VerifyExec;
+  /** Where workspace-bootstrap markers live (RUN-202). Injected so tests never touch ~/.noriq —
+   *  the marker is keyed by workspace PATH, and fake paths collide across a suite. */
+  setupMarkerDir?: string;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
   postComment?: (projectId: string, taskId: string, body: string) => void;
   logger?: typeof defaultLogger;
@@ -3883,6 +3894,20 @@ export class RunSupervisor {
           }
         : {}),
       lockScopeBranch: (repo, run) => this.lockScopeBranch(repo, run),
+      // Mechanical workspace bootstrap (RUN-202), over the SAME exec seam verify uses — so it
+      // inherits the sanitized env, the process-group kill and the output cap, and a test that
+      // injects `verifyExec` fakes both without touching a shell.
+      runSetup: (spec, cwd) =>
+        runSetup(
+          spec,
+          cwd,
+          this.deps.verifyExec ?? defaultExec,
+          {
+            info: (m, d) => this.log.info(m, d as Record<string, unknown>),
+            warn: (m, d) => this.log.warn(m, d as Record<string, unknown>),
+          },
+          this.deps.setupMarkerDir,
+        ),
       lockEnforcerFor: (repo, run, worktree, kind, token) =>
         this.lockEnforcerFor(repo, run, worktree, kind, token),
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,

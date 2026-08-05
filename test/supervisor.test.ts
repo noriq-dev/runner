@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
 import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
@@ -431,6 +432,13 @@ function harness(
     verifyPasses?: boolean;
     /** Per-call verify outcomes, in order — models the agent fixing it (RUN-29). */
     verifyResults?: boolean[];
+    /** Replace the exec seam outright (RUN-202): setup and verify share it, so a test that cares
+     *  about WHICH commands ran drives this instead of the scripted verify outcomes. */
+    verifyExec?: (
+      cmd: string,
+      cwd: string,
+      timeoutMs: number,
+    ) => Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
     defaultBudget?: RunBudget | null;
     /** false → the agent left the worktree pristine (a no-op run). */
     changed?: boolean;
@@ -527,6 +535,8 @@ function harness(
   // Mutable, because the real thing is: once a human answers, the server marks the signal
   // answered and moves the run back to running, so the NEXT check says "not blocked".
   const park = { state: over.parkState };
+  // Unique per harness so no two tests share bootstrap state (RUN-202).
+  const markerDir = path.join(tmpdir(), `noriq-test-markers-${Math.random().toString(36).slice(2)}`);
   const supervisor = new RunSupervisor({
     drivers: over.drivers ?? (over.onlyClaude ? { claude } : { claude, codex }),
     vcs: worktrees,
@@ -555,21 +565,26 @@ function harness(
     pathProbe: over.pathProbe ?? (async () => 'missing'),
     readDoc: over.readDoc ?? (async () => ''),
     ...(over.contextBudget !== undefined ? { contextBudget: over.contextBudget } : {}),
-    verifyExec: async () => {
-      verifyRan = true;
-      verifyCalls += 1;
-      // `verifyResults` scripts a sequence, so a test can model "fails, agent fixes it, passes" —
-      // the whole point of RUN-29's loop. Falls back to the old fixed behaviour.
-      const scripted = over.verifyResults?.[verifyCalls - 1];
-      if (scripted !== undefined) {
-        return scripted
-          ? { exitCode: 0, output: 'ok', timedOut: false }
-          : { exitCode: 1, output: 'TS2322: type error', timedOut: false };
-      }
-      return over.verifyPasses === false
-        ? { exitCode: 1, output: 'TS2322: type error', timedOut: false }
-        : { exitCode: 0, output: 'ok', timedOut: false };
-    },
+    // RUN-202: markers keyed by workspace PATH, and these tests all use `/wt/run_1` — a real
+    // ~/.noriq dir would make one test's success silently skip the next test's bootstrap.
+    setupMarkerDir: markerDir,
+    verifyExec: over.verifyExec
+      ? over.verifyExec
+      : async () => {
+          verifyRan = true;
+          verifyCalls += 1;
+          // `verifyResults` scripts a sequence, so a test can model "fails, agent fixes it, passes" —
+          // the whole point of RUN-29's loop. Falls back to the old fixed behaviour.
+          const scripted = over.verifyResults?.[verifyCalls - 1];
+          if (scripted !== undefined) {
+            return scripted
+              ? { exitCode: 0, output: 'ok', timedOut: false }
+              : { exitCode: 1, output: 'TS2322: type error', timedOut: false };
+          }
+          return over.verifyPasses === false
+            ? { exitCode: 1, output: 'TS2322: type error', timedOut: false }
+            : { exitCode: 0, output: 'ok', timedOut: false };
+        },
     createRunAgent: async (_runId, opts) => {
       agentCreates.push(opts ?? {});
       return testAgent();
@@ -954,6 +969,84 @@ describe('the build brief states its own definition of done (RUN-127)', () => {
     });
     expect(p).not.toContain('Done means all of these');
     expect(p).toContain('Success = a proposed plan is emitted');
+  });
+});
+
+// RUN-202. The daemon makes the workspace ready before any agent spends a token in it — the whole
+// point is that the first turn is work, not bootstrap discovery.
+describe('mechanical workspace setup (RUN-202)', () => {
+  const withSetup = (cmds: string[]) => manifest({ setup: { cmds, timeoutSeconds: 600 }, verify: null });
+  /** Setup adds real async hops before the spawn, so a single `flush()` tick lands too early. */
+  const onDriverStart = async (h: ReturnType<typeof harness>) => {
+    for (let i = 0; i < 200 && !h.claude.opts; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  it('runs the bootstrap BEFORE the agent starts, in the run’s workspace', async () => {
+    const order: string[] = [];
+    const h = harness({
+      manifest: withSetup(['npm ci']),
+      verifyExec: async (cmd: string, cwd: string) => {
+        order.push(`exec:${cmd}@${cwd}`);
+        return { exitCode: 0, output: '', timedOut: false };
+      },
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await onDriverStart(h);
+    order.push('driver-started');
+    h.claude.complete('done');
+    await done;
+    // The ordering IS the feature: an agent that starts first is an agent that discovers the
+    // missing toolchain itself, which is the turn-burning this removes.
+    expect(order[0]).toBe('exec:npm ci@/wt/run_1');
+    expect(order).toContain('driver-started');
+  });
+
+  // Preparation, never a gate — the deterministic verify still judges whatever gets built.
+  it('a FAILED bootstrap does not refuse the run; the agent is told, in its own brief', async () => {
+    const h = harness({
+      manifest: withSetup(['npm ci']),
+      verifyExec: async () => ({
+        exitCode: 1,
+        output: 'npm ERR! EAI_AGAIN registry.npmjs.org',
+        timedOut: false,
+      }),
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await onDriverStart(h);
+    const prompt = h.claude.opts?.prompt ?? '';
+    expect(prompt).toContain('WORKSPACE SETUP FAILED');
+    expect(prompt).toContain('EAI_AGAIN'); // the diagnostic, not just the verdict
+    expect(prompt).toContain('not your mistake');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done'); // the run proceeded
+  });
+
+  it('a healthy bootstrap stays out of the prompt entirely', async () => {
+    const h = harness({
+      manifest: withSetup(['npm ci']),
+      verifyExec: async () => ({ exitCode: 0, output: '', timedOut: false }),
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await onDriverStart(h);
+    expect(h.claude.opts?.prompt ?? '').not.toContain('WORKSPACE SETUP');
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a repo with no [setup] spawns exactly as before — nothing executed', async () => {
+    let execCalls = 0;
+    const h = harness({
+      manifest: manifest({ verify: null }),
+      verifyExec: async () => {
+        execCalls += 1;
+        return { exitCode: 0, output: '', timedOut: false };
+      },
+    });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await onDriverStart(h);
+    h.claude.complete('done');
+    await done;
+    expect(execCalls).toBe(0);
   });
 });
 

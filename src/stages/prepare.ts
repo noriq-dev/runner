@@ -24,7 +24,7 @@
  * park record rather than resolving them again, which is the whole point of parking.
  */
 
-import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind } from '@noriq-dev/shared';
+import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind, SetupSpec } from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
@@ -36,6 +36,7 @@ import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
 import type { DocReader, PathProbe } from '../repo-context';
 import { noriqToolNamesFor } from '../security';
+import { type SetupResult, setupBriefNote, setupMilestone } from '../setup';
 import {
   type AnchorTask,
   type ResolvedRepo,
@@ -86,6 +87,9 @@ export interface PrepareHost {
   /** RUN-103's declared scope resolver. Absent → the predictive layer no-ops. */
   resolveLockScope?: (run: Run, spec: ExecutionSpec | null) => Promise<string[] | null> | string[] | null;
   lockScopeBranch(repo: ResolvedRepo, run: Run): string | null;
+  /** Mechanical workspace bootstrap (RUN-202). Absent → no setup runs, exactly as before the
+   *  feature; the daemon binds it, and it never throws (see `runSetup`). */
+  runSetup?(spec: SetupSpec | null, cwd: string): Promise<SetupResult | null>;
   /** The reactive per-edit enforcer (RUN-101), or undefined when there is no lock layer. */
   lockEnforcerFor(
     repo: ResolvedRepo,
@@ -320,6 +324,26 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   host.report(run.id, { status: 'running', worktreePath: worktree.localPath, phase: 'agent' });
   host.log.info('run started', { runId: run.id, kind, tool: run.agentTool, worktree: worktree.localPath });
 
+  // The workspace is made READY before any agent — planner included — spends a token in it
+  // (RUN-202). Here and not later because every actor benefits: a planner that can run the suite
+  // plans against what the repo does, not what it reads. Fail-open by construction: `runSetup`
+  // never throws, and a failure becomes a milestone plus a line in the brief rather than a refusal
+  // — the environment is preparation, and the deterministic verify still gates the result.
+  // WRITABLE workspaces only, and the reason is physical rather than a policy choice: a
+  // non-producing workflow's worktree is chmod'd read-only at lease (RUN-11), so `npm ci` there
+  // cannot create anything — running it would guarantee a failure note on every scope and verify
+  // run of a repo that declares setup. The motivating actor is still covered: the INLINE reviewer
+  // judges inside the BUILD's writable worktree, so it inherits that run's bootstrap. What is not
+  // covered is a dispatched read-only verify run, which would need lease-writable-then-chmod — a
+  // VcsBackend change, deliberately out of scope here and noted rather than half-built.
+  const setup =
+    host.runSetup && wf.worktreeWritable
+      ? await host.runSetup(repo.manifest.setup ?? null, worktree.localPath)
+      : null;
+  const setupNote = setupBriefNote(setup);
+  const milestone = setupMilestone(setup);
+  if (milestone) host.transcript(run.id).milestone(milestone);
+
   // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
   // a lookup failure degrades to the bare id rather than sinking the run.
   const task: AnchorTask | null =
@@ -507,7 +531,10 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   }
   const renderedSpec = authorSpecBlock(task, checkedSpec);
 
-  const prompt = buildPrompt(renderedSpec, checkedSpec?.spec ?? null);
+  // `setupNote` is '' unless the bootstrap FAILED (RUN-202), so this is a no-op on every healthy
+  // run — and on a broken one it reaches EVERY actor below, because every one of them can hit the
+  // missing toolchain and read it as its own fault.
+  const prompt = buildPrompt(`${renderedSpec}${setupNote}`, checkedSpec?.spec ?? null);
 
   // The builder's model/effort with the execute-stage coordinate folded on top (RUN-193). Computed
   // here, once, so `start` below and every session that spreads it (chain steps, the dispatched
@@ -527,22 +554,26 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // forever — the field is no longer null, so nothing would ever fill it.
     plannedTask:
       hasExecutionSpec(task?.executionSpec) || task?.executionSpecUnreadable ? null : (task ?? null),
-    plannerPrompt: buildPrompt('', null, 'planner'),
+    plannerPrompt: buildPrompt(setupNote, null, 'planner'),
     // The checker reads a SPEC, so its prompt is built per round from whatever the plan is now
     // (RUN-141) — the same closure, so the facts around the spec cannot drift between rounds.
     // The DETERMINISTIC findings travel with it: a checker that cannot see the repo disagreeing
     // with the plan would raise the same points itself, at model prices.
     mapperPrompt: (checked) =>
-      buildPrompt(renderExecutionSpec(checked, { audience: 'checker' }), null, 'pattern-mapper'),
+      buildPrompt(
+        `${renderExecutionSpec(checked, { audience: 'checker' })}${setupNote}`,
+        null,
+        'pattern-mapper',
+      ),
     checkerPrompt: (spec, ledger) =>
       buildPrompt(
-        renderExecutionSpec({ spec, findings: checkedSpec?.findings ?? [] }, { audience: 'checker' }),
+        `${renderExecutionSpec({ spec, findings: checkedSpec?.findings ?? [] }, { audience: 'checker' })}${setupNote}`,
         null,
         'plan-checker',
         ledger,
       ),
     rebuildPrompt: (checked, extra = '') =>
-      buildPrompt(`${renderExecutionSpec(checked)}${extra}`, checked?.spec ?? null),
+      buildPrompt(`${renderExecutionSpec(checked)}${extra}${setupNote}`, checked?.spec ?? null),
     checkedSpec,
     repo,
     driver,
