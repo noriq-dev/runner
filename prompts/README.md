@@ -49,12 +49,48 @@ One workflow definition may live in any of these places, in precedence order:
 3. `~/.noriq/workflows/<name>.toml` on this machine;
 4. the bundled `scope`, `build`, or `verify` workflow.
 
-Dedicated files use the same `base` + `prompt` shape as the inline table:
+Dedicated files use the same `base` + `prompt` shape as the inline table, and add `[stages.<name>]`
+to pick, per stage, the **agent coordinate** its actor runs under (RUN-193). The filename is the
+workflow name, so the file carries its keys at the top level with no `[workflow.<name>]` wrapper:
 
 ```toml
 base = "scope"
 prompt = { file = "docs-plan.md" }
 ```
+
+A worked two-file example — one repo expressing its own pipeline: plan on a cheap-but-careful model,
+build on a second vendor, judge the build on a third. Copy these into `.noriq/workflows/` and
+dispatch with `workflow = "plan"` / `workflow = "build"`:
+
+```toml
+# .noriq/workflows/plan.toml
+base = "scope"                          # read-only; produces a plan, not a diff
+
+[stages.plan]
+agent = "claude.fable-5.high"           # the planner drafts the spec on Fable
+
+[stages.plan-check]
+agent = "codex.gpt-5_6-sol.high"        # a second vendor audits that spec
+```
+
+```toml
+# .noriq/workflows/build.toml
+base = "build"                          # writes, then verify + review + land
+
+[stages.execute]
+agent = "codex.gpt-5_6-sol.medium"      # the builder writes the diff on Codex
+
+[stages.review]
+agent = "claude.opus-4_8.high"          # Opus judges it — a third model
+```
+
+A coordinate escapes a dotted model version's dots as underscores (`opus-4_8` is opus-4.8,
+`gpt-5_6-sol` is gpt-5.6-sol; a dashless id like `fable-5` is written verbatim), picks a MODEL and
+never a posture, and degrades to a warning — never a gate — when it is malformed or names a key that
+is not `plan` / `plan-check` / `pattern-map` / `execute` / `review`. `build.toml`'s `[stages.review]`
+chooses which model reviews but does not enable reviewing: the inline reviewer runs only when the
+repo's `.noriq/project.toml` also carries a `[verify.agent]` section, and the deterministic
+`[verify] cmd` floor is a separate, always-on gate the coordinate does not replace.
 
 An inline string remains valid (`prompt = "Survey {{brief}}"`). A prompt file is resolved beside
 the TOML that names it. Project prompts are confined to the repository; machine-local prompts are

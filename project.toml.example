@@ -177,6 +177,51 @@ defaultBranch = "main"
 # order is always the machine's; an unknown name or malformed coordinate is ignored
 # with a warning, never a gate.
 
+# ── The FILE form: a two-workflow worked example (RUN-192/193) ────────────────
+# A definition too big for an inline `[workflow.<name>]` table lives in its own
+# file at `.noriq/workflows/<NAME>.toml` — the FILENAME is the workflow name, so
+# the file carries `base` / `prompt` / `stages` at the TOP LEVEL, with no
+# `[workflow.<name>]` wrapper. A dispatch selects it by name (`workflow = "plan"`);
+# a project file wins over an inline `[workflow.<name>]` table, which wins over a
+# `~/.noriq/workflows/<name>.toml` machine-local file, which wins over the bundled
+# scope/build/verify name.
+#
+# The two files below are one repo dogfooding its own pipeline: PLAN the work on a
+# cheap-but-careful model, BUILD it on a second vendor, and JUDGE the build on a
+# third. Each `[stages.<name>]` picks only the MODEL its actor runs — the write
+# floor and stage clamp are runner-side and unreachable from here (RUN-118/132), so
+# no coordinate can move a posture:
+#
+#   ── .noriq/workflows/plan.toml ──   dispatch as  workflow = "plan"
+#   base = "scope"                        # read-only; produces a plan, not a diff
+#
+#   [stages.plan]
+#   agent = "claude.fable-5.high"         # the planner drafts the spec on Fable
+#
+#   [stages.plan-check]
+#   agent = "codex.gpt-5_6-sol.high"      # a second vendor audits that spec
+#
+#   ── .noriq/workflows/build.toml ──  dispatch as  workflow = "build"
+#   base = "build"                        # writes, then verify + review + land
+#
+#   [stages.execute]
+#   agent = "codex.gpt-5_6-sol.medium"    # the builder writes the diff on Codex…
+#
+#   [stages.review]
+#   agent = "claude.opus-4_8.high"        # …and Opus judges it — a third model
+#
+# Two things a copier needs to get right:
+#   • Coordinate spelling — a dotted model version writes its dots as underscores,
+#     so `opus-4_8` means opus-4.8 and `gpt-5_6-sol` means gpt-5.6-sol; a dashed id
+#     with no dots (`fable-5`) is written verbatim. Every string above parses under
+#     the coordinate grammar in src/agent-coordinate.ts.
+#   • `build.toml`'s `[stages.review]` names the MODEL that reviews, but it does not
+#     turn reviewing ON. The inline reviewer runs only when this project.toml also
+#     carries a `[verify.agent]` section (see below) — a review coordinate with no
+#     `[verify.agent]` names a reviewer that never spawns. The deterministic
+#     `[verify] cmd` floor is a separate, always-on, zero-token gate and is left
+#     exactly as it is here — the review coordinate does not replace it.
+
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this
 # section contains:
