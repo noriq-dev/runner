@@ -38,6 +38,11 @@ export interface StageHost {
   /** Drop a terminal run's cancellation record (RUN-165). Optional: a caller with no steering
    *  bridge has none to drop. */
   forgetCancellation?(runId: string): void;
+  /** A run reaching `settle` has terminated WITHOUT parking (a successful park returns before this
+   *  stage). If the server still holds an open blocked question for it, that question is orphaned —
+   *  tell the server it died with the run so no `blocked` signal is left standing (RUN-199).
+   *  Best-effort and self-probing: absent deps or any failure is a silent no-op. */
+  abandonOrphanedSignal(runId: string): Promise<void>;
   readonly log: typeof defaultLogger;
   /** Report a frame to the server (status, telemetry, phase). Best-effort by contract. */
   report(runId: string, frame: RunReport): void;

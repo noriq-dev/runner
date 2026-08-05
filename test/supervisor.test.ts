@@ -3001,6 +3001,29 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
     expect(h.worktrees.removed).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
   });
 
+  // RUN-199. A wave child cannot park (childHost stubs `parkIfBlocked`), so a child that asks a
+  // human leaves the RUN blocked server-side and the chain reports `steps:child-asked` — a terminal
+  // failure. That run never passed through `parkIfBlocked`'s decline branches, so the abandonment
+  // has to be a property of the run TERMINATING (settle), or the failed run is left blocked forever.
+  it('a wave child that asked abandons the orphaned signal on terminal (RUN-199)', async () => {
+    const h = harness({
+      anchorTask: threeParallel(),
+      leasesOverlap: true,
+      waveLimit: 3,
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await pump(() => h.claude.starts.length >= 2);
+    settleAt(h, 0);
+    settleAt(h, 1); // both wave children land; the post-wave probe then sees the run blocked
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('steps:child-asked');
+    expect(await h.parked.list()).toEqual([]); // a wave child cannot park
+    // settle told the server the question died with the run — no blocked signal left standing.
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
+  });
+
   // A child checkout is the SAME run's workspace, so it carries the parent's physical posture: a
   // decomposed read-only run (scope) whose steps overlap must not receive writable child trees.
   // The permission clamp already denies the edit tools (RUN-118); this is the worktree-level floor
@@ -5431,6 +5454,23 @@ describe('parking a run on a human (RUN-30)', () => {
     h.claude.complete('failed');
     expect((await done).outcome).toBe('failed');
     expect(await h.parked.list()).toEqual([]);
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
+  });
+
+  it('abandons the signal when the park WRITE fails (RUN-199)', async () => {
+    // The intent names this case ("refused/failed"): the park record cannot be persisted, so the run
+    // cannot be resumed and does not park — but the server still holds the question, and settle
+    // abandons it at the terminal boundary rather than leaving a blocked signal on a finished run.
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    h.parked.park = async () => {
+      throw new Error('disk full');
+    };
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // asks a human; the park write then fails and it finalizes
+    await done;
+    expect(await h.parked.list()).toEqual([]); // nothing persisted
+    expect(h.reports.at(-1)?.status).not.toBe('blocked');
     expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
   });
 });

@@ -200,6 +200,13 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     // for. Best-effort, like the dispose above.
     await clearSetupMarker(worktree.localPath);
   }
+  // A run reaching settle has NOT parked (a successful park returns before this stage), so if the
+  // server still calls it blocked its agent asked a question that never parked — a wave child that
+  // asked, a park write that failed, a decline branch. Abandon that orphaned signal so no `blocked`
+  // row is left standing on a terminal run (RUN-199). The ONE terminal boundary every such path
+  // flows through, which is why it lives here rather than bolted onto each refusal.
+  await host.abandonOrphanedSignal(run.id);
+
   // The run is terminal, so its cancellation record has nothing left to protect (RUN-165) —
   // without this a long-lived daemon keeps one entry per cancelled run for its whole life.
   host.forgetCancellation?.(run.id);

@@ -1179,6 +1179,7 @@ export class RunSupervisor {
   private stageHost(): StageHost {
     return {
       forgetCancellation: (runId) => this.deps.steering?.forget?.(runId),
+      abandonOrphanedSignal: (runId) => this.abandonOrphanedSignal(runId),
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       // A no-op without a comment sink, which is exactly how every call site already treated it.
@@ -2868,10 +2869,12 @@ export class RunSupervisor {
   }): Promise<DriverExit | null> {
     const { run, exit } = ctx;
     if (!this.deps.parked || !this.deps.getParkState) return null;
+    // A budget breach or a crash is terminal even if a question is open: resuming a run that was
+    // killed for overspending would hand it a fresh ceiling, which is the loophole in reverse. It
+    // still may hold an open question — `settle` abandons that (RUN-199), the ONE terminal boundary
+    // every declining path here flows through, so no branch needs to abandon on its own.
+    if (exit.outcome !== 'done') return null;
 
-    // Ask the row FIRST, even on a non-'done' exit (which used to short-circuit before this): a
-    // failed run may still hold an open blocked question, and the decline paths below owe the
-    // server an abandonment so no blocked signal is left standing on a dead run (RUN-199).
     const state = await this.deps.getParkState(run.id).catch((err) => {
       // Can't tell → finalize, the pre-RUN-30 behaviour. Parking on a guess would strand a
       // finished run as blocked forever, waiting for an answer to a question nobody asked.
@@ -2883,14 +2886,6 @@ export class RunSupervisor {
     });
     if (!state?.blocked) return null;
 
-    // A budget breach or a crash is terminal even if a question is open: resuming a run that was
-    // killed for overspending would hand it a fresh ceiling, which is the loophole in reverse. The
-    // question dies with the run — tell the server so, rather than leaving the signal standing.
-    if (exit.outcome !== 'done') {
-      await this.abandonBlockedSignal(run.id, state.signalId);
-      return null;
-    }
-
     // A driver with a resumable session (claude) parks its real id and resumes IN it; one without
     // (codex, RUN-199) parks with `sessionId: null` and resumes CONTINUATION-style — its work
     // survives on disk in the kept worktree, so a fresh session reads it. The distinction is the
@@ -2899,47 +2894,58 @@ export class RunSupervisor {
     const sessionId = resumable ? (ctx.session.sessionId ?? exit.sessionId ?? null) : null;
     if (resumable && !sessionId) {
       // A resumable driver that produced no session id is an anomaly: reported blocked, resumable
-      // never, so parking it would be a promise the daemon cannot keep. Fail it loudly with its
-      // context intact, and abandon the signal so the row is not left blocked forever.
+      // never, so parking it would be a promise the daemon cannot keep. Finalize with its context
+      // intact; `settle` abandons the orphaned signal so the row is not left blocked forever.
       this.log.warn('run asked a human but its resumable tool returned no session — cannot park', {
         runId: run.id,
         tool: run.agentTool,
       });
-      await this.abandonBlockedSignal(run.id, state.signalId);
       return null;
     }
 
     // The RUN's spend, not just this sitting's (RUN-59): the tally already folds any prior park and
     // every session that billed. Persisting the mix keeps a resume's breakdown summing to its total.
     const runSpend = ctx.tally.total();
-    await this.deps.parked.park({
-      run,
-      // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
-      // editing a workflow while the question is open affects the next dispatch only, including
-      // when the daemon restarts before the answer arrives.
-      ...(ctx.repo.workflowCatalog ? { workflowCatalog: ctx.repo.workflowCatalog } : {}),
-      sessionId,
-      agentId: ctx.runAgent.agentId,
-      agentLabel: ctx.runAgent.label,
-      mcpToken: ctx.runAgent.token,
-      workspace: ctx.worktree,
-      spent: {
-        tokens: totalTokens(runSpend),
-        usd: runSpend.costUsd,
-        ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
-      },
-      activeSeconds: ctx.activeSeconds,
-      // Where the chain stopped (RUN-168). Omitted entirely for an undecomposed run, so its park
-      // record is byte-identical to one written before chains existed — a park is a persisted file
-      // other tooling reads, and a field that appears on every record to say "not applicable" is a
-      // shape change for nothing.
-      ...(ctx.stepId ? { stepId: ctx.stepId } : {}),
-      // The hand-off a resumed chain would otherwise start without (RUN-171). Omitted when empty,
-      // for the same reason `stepId` is: an undecomposed park keeps the shape it always had.
-      ...(ctx.priorSteps?.length ? { priorSteps: ctx.priorSteps } : {}),
-      parkedAt: new Date().toISOString(),
-      question: state.question,
-    });
+    try {
+      await this.deps.parked.park({
+        run,
+        // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
+        // editing a workflow while the question is open affects the next dispatch only, including
+        // when the daemon restarts before the answer arrives.
+        ...(ctx.repo.workflowCatalog ? { workflowCatalog: ctx.repo.workflowCatalog } : {}),
+        sessionId,
+        agentId: ctx.runAgent.agentId,
+        agentLabel: ctx.runAgent.label,
+        mcpToken: ctx.runAgent.token,
+        workspace: ctx.worktree,
+        spent: {
+          tokens: totalTokens(runSpend),
+          usd: runSpend.costUsd,
+          ...(runSpend.modelUsage ? { modelUsage: runSpend.modelUsage } : {}),
+        },
+        activeSeconds: ctx.activeSeconds,
+        // Where the chain stopped (RUN-168). Omitted entirely for an undecomposed run, so its park
+        // record is byte-identical to one written before chains existed — a park is a persisted file
+        // other tooling reads, and a field that appears on every record to say "not applicable" is a
+        // shape change for nothing.
+        ...(ctx.stepId ? { stepId: ctx.stepId } : {}),
+        // The hand-off a resumed chain would otherwise start without (RUN-171). Omitted when empty,
+        // for the same reason `stepId` is: an undecomposed park keeps the shape it always had.
+        ...(ctx.priorSteps?.length ? { priorSteps: ctx.priorSteps } : {}),
+        parkedAt: new Date().toISOString(),
+        question: state.question,
+      });
+    } catch (err) {
+      // The park could not be PERSISTED (a disk failure). Without the record the run can never be
+      // resumed, so parking it would be a promise the daemon cannot keep — finalize instead, its
+      // worktree kept by `settle`'s own probe. The intent names this case ("refused/**failed**"):
+      // the orphaned signal is abandoned at the terminal boundary like every other declining path.
+      this.log.warn('could not persist the park — the run cannot be resumed; finalizing instead', {
+        runId: run.id,
+        err: String(err),
+      });
+      return null;
+    }
     // The server already moved the row to blocked when the agent asked; reporting it back is what
     // makes the daemon's view and the dashboard's agree, and it carries the final spend.
     this.deps.report(run.id, { status: 'blocked', telemetry: runSpend, logTail: ctx.tail });
@@ -2955,12 +2961,27 @@ export class RunSupervisor {
   }
 
   /**
-   * A run holding an open blocked question terminated WITHOUT parking (RUN-199) — tell the server
-   * the question died with the run, so the row is not left `blocked` on a question nobody will ever
-   * answer into anything. Best-effort, in the shape every optional side effect here uses: no dep or
-   * no signal is a silent no-op (the pre-RUN-199 behaviour, a human clears it by hand), and a failed
-   * call warns rather than turning a terminal run into a throw.
+   * A run terminated WITHOUT parking while the server still holds an open blocked question — tell
+   * the server the question died with the run (RUN-199), so the row is not left `blocked` on a
+   * question nobody will ever answer into anything. `settle` calls this at the ONE terminal boundary
+   * every declining path flows through — the primary session's decline branches, a park write that
+   * failed, and a WAVE CHILD that asked (a child cannot park, and the chain reports it failed) — so
+   * the abandonment is a property of the run terminating, not a call bolted onto each refusal.
+   *
+   * Self-probing: a run reaching `settle` has NOT parked (a successful park returns before it), so
+   * `blocked === true` here means the question is orphaned. Best-effort throughout — no probe dep,
+   * no abandon dep, or any failure is a silent no-op (the pre-RUN-199 behaviour a human clears by
+   * hand), never a throw that could wedge a terminal run.
    */
+  private async abandonOrphanedSignal(runId: string): Promise<void> {
+    if (!this.deps.getParkState || !this.deps.abandonSignal) return;
+    const state = await this.deps.getParkState(runId).catch(() => null);
+    if (!state?.blocked) return;
+    await this.abandonBlockedSignal(runId, state.signalId);
+  }
+
+  /** Tell the server one specific blocked question died with its run (RUN-199). Best-effort: a
+   *  missing dep or absent signal is a no-op, and a failed call warns rather than throwing. */
   private async abandonBlockedSignal(runId: string, signalId: string | null): Promise<void> {
     if (!signalId || !this.deps.abandonSignal) return;
     await this.deps.abandonSignal(runId, signalId).catch((err) => {
