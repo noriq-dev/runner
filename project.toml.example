@@ -190,37 +190,58 @@ defaultBranch = "main"
 # cheap-but-careful model, BUILD it on a second vendor, and JUDGE the build on a
 # third. Each `[stages.<name>]` picks only the MODEL its actor runs — the write
 # floor and stage clamp are runner-side and unreachable from here (RUN-118/132), so
-# no coordinate can move a posture:
+# no coordinate can move a posture.
+#
+# READ THIS BEFORE COPYING: a `[stages.…]` block is a RESTRICTIVE SET, not a set of
+# per-stage overrides. The moment a file declares ANY `[stages.<name>]`, the stages
+# that run become exactly {mandatory ∪ the optional ones you listed} ∩ {stages this
+# base runs} — so an OPTIONAL stage you leave out is DECLINED, and a stage the base
+# does not run is dropped even if you name it. Mandatory stages (prepare, execute,
+# verify, settle) always run; the OPTIONAL, declinable ones are plan, plan-check,
+# pattern-map, review, integrate. A `scope` base runs NONE of those optional stages
+# (they all require a producing workflow), so a scope run's own planner is its
+# `execute` stage — which is why plan/plan-check are illustrated under `build` below,
+# not under `plan`.
 #
 #   ── .noriq/workflows/plan.toml ──   dispatch as  workflow = "plan"
-#   base = "scope"                        # read-only; produces a plan, not a diff
+#   base = "scope"                        # read-only; produces a plan, not a diff.
+#                                         # scope has no optional stages, so listing
+#                                         # execute declines nothing.
+#   [stages.execute]
+#   agent = "claude.fable-5.high"         # the scope run's planner runs on Fable
 #
+#   ── .noriq/workflows/build.toml ──  dispatch as  workflow = "build"
+#   base = "build"                        # writes; verify + review gate it, and it
+#                                         # lands only when [land] is configured.
+#                                         # Every optional stage kept below MUST be
+#                                         # listed, or declaring any one declines it.
 #   [stages.plan]
-#   agent = "claude.fable-5.high"         # the planner drafts the spec on Fable
+#   agent = "claude.fable-5.high"         # planner drafts the spec (task w/o a spec)
 #
 #   [stages.plan-check]
 #   agent = "codex.gpt-5_6-sol.high"      # a second vendor audits that spec
 #
-#   ── .noriq/workflows/build.toml ──  dispatch as  workflow = "build"
-#   base = "build"                        # writes, then verify + review + land
+#   [stages.pattern-map]                  # kept; no agent = inherit the run's model
 #
 #   [stages.execute]
-#   agent = "codex.gpt-5_6-sol.medium"    # the builder writes the diff on Codex…
+#   agent = "codex.gpt-5_6-sol.medium"    # the builder writes the diff on Codex
 #
 #   [stages.review]
-#   agent = "claude.opus-4_8.high"        # …and Opus judges it — a third model
+#   agent = "claude.opus-4_8.high"        # Opus judges it — a third model
+#
+#   [stages.integrate]                    # kept, so a passing build can still land
 #
 # Two things a copier needs to get right:
 #   • Coordinate spelling — a dotted model version writes its dots as underscores,
 #     so `opus-4_8` means opus-4.8 and `gpt-5_6-sol` means gpt-5.6-sol; a dashed id
 #     with no dots (`fable-5`) is written verbatim. Every string above parses under
 #     the coordinate grammar in src/agent-coordinate.ts.
-#   • `build.toml`'s `[stages.review]` names the MODEL that reviews, but it does not
-#     turn reviewing ON. The inline reviewer runs only when this project.toml also
-#     carries a `[verify.agent]` section (see below) — a review coordinate with no
-#     `[verify.agent]` names a reviewer that never spawns. The deterministic
-#     `[verify] cmd` floor is a separate, always-on, zero-token gate and is left
-#     exactly as it is here — the review coordinate does not replace it.
+#   • Naming a stage's MODEL does not turn the stage ON. `plan-check` and `review`
+#     both run only when this project.toml also carries a `[verify.agent]` section
+#     (see below) — a review coordinate with no `[verify.agent]` names a reviewer
+#     that never spawns; `integrate` lands only when `[land]` is configured. The
+#     deterministic `[verify] cmd` floor is a separate, always-on, zero-token gate
+#     and is left exactly as it is here — the review coordinate does not replace it.
 
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this

@@ -59,38 +59,54 @@ prompt = { file = "docs-plan.md" }
 ```
 
 A worked two-file example — one repo expressing its own pipeline: plan on a cheap-but-careful model,
-build on a second vendor, judge the build on a third. Copy these into `.noriq/workflows/` and
-dispatch with `workflow = "plan"` / `workflow = "build"`:
+build on a second vendor, judge the build on a third. **A `[stages.…]` block is a restrictive set,
+not a bag of per-stage overrides:** declaring any `[stages.<name>]` makes the stages that run exactly
+`{mandatory ∪ the optional ones you listed} ∩ {stages this base runs}`, so an optional stage you
+leave out is *declined*, and a stage the base does not run is dropped even if you name it. Mandatory
+stages (`prepare`, `execute`, `verify`, `settle`) always run; the optional, declinable ones are
+`plan`, `plan-check`, `pattern-map`, `review`, `integrate`. A `scope` base runs none of those
+optional stages — a scope run's own planner is its `execute` stage — which is why `plan`/`plan-check`
+appear under `build.toml`, not under `plan.toml`. Copy these into `.noriq/workflows/` and dispatch
+with `workflow = "plan"` / `workflow = "build"`:
 
 ```toml
-# .noriq/workflows/plan.toml
-base = "scope"                          # read-only; produces a plan, not a diff
+# .noriq/workflows/plan.toml — a read-only scoping run; its planner is `execute`
+base = "scope"
 
-[stages.plan]
-agent = "claude.fable-5.high"           # the planner drafts the spec on Fable
-
-[stages.plan-check]
-agent = "codex.gpt-5_6-sol.high"        # a second vendor audits that spec
+[stages.execute]
+agent = "claude.fable-5.high"           # the scope run's planner runs on Fable
 ```
 
 ```toml
-# .noriq/workflows/build.toml
-base = "build"                          # writes, then verify + review + land
+# .noriq/workflows/build.toml — writes, then verify + review gate it; lands only
+# when [land] is set. Every optional stage kept MUST be listed (declaring any one
+# declines the rest).
+base = "build"
+
+[stages.plan]
+agent = "claude.fable-5.high"           # planner drafts the spec (task without one)
+
+[stages.plan-check]
+agent = "codex.gpt-5_6-sol.high"        # a second vendor audits that spec
+
+[stages.pattern-map]                    # kept; no agent = inherit the run's model
 
 [stages.execute]
 agent = "codex.gpt-5_6-sol.medium"      # the builder writes the diff on Codex
 
 [stages.review]
 agent = "claude.opus-4_8.high"          # Opus judges it — a third model
+
+[stages.integrate]                      # kept, so a passing build can still land
 ```
 
 A coordinate escapes a dotted model version's dots as underscores (`opus-4_8` is opus-4.8,
 `gpt-5_6-sol` is gpt-5.6-sol; a dashless id like `fable-5` is written verbatim), picks a MODEL and
 never a posture, and degrades to a warning — never a gate — when it is malformed or names a key that
-is not `plan` / `plan-check` / `pattern-map` / `execute` / `review`. `build.toml`'s `[stages.review]`
-chooses which model reviews but does not enable reviewing: the inline reviewer runs only when the
-repo's `.noriq/project.toml` also carries a `[verify.agent]` section, and the deterministic
-`[verify] cmd` floor is a separate, always-on gate the coordinate does not replace.
+is not `plan` / `plan-check` / `pattern-map` / `execute` / `review`. Naming a stage's model does not
+turn the stage on: `plan-check` and `review` run only when the repo's `.noriq/project.toml` also
+carries a `[verify.agent]` section, `integrate` lands only when `[land]` is configured, and the
+deterministic `[verify] cmd` floor is a separate, always-on gate the coordinate does not replace.
 
 An inline string remains valid (`prompt = "Survey {{brief}}"`). A prompt file is resolved beside
 the TOML that names it. Project prompts are confined to the repository; machine-local prompts are
