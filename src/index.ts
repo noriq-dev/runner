@@ -124,6 +124,7 @@ export {
   DEFAULT_PARKED_PATH,
   DEFAULT_PARK_TTL_HOURS,
   ParkedStore,
+  continuationResumePrompt,
   expiredParks,
   resumePrompt,
   type ParkedRun,

@@ -245,7 +245,12 @@ export const resumePrompt = (question: string | null, answer: string, changed = 
  * A non-resumable driver parks with `sessionId: null` and comes back as a FRESH session over the
  * kept worktree — it holds none of the prior conversation, so unlike `resumePrompt` this is appended
  * to a full run brief and tells the agent its earlier work is already on disk, rather than assuming a
- * context it does not have. `changed` carries the same RUN-164 spec diff as the session-restore path.
+ * context it does not have.
+ *
+ * No `changed` param: the RUN-164 spec-diff exists to tell a RESTORED session (which holds the old
+ * spec) that the plan moved, and a continuation's brief is rebuilt from the current spec already —
+ * rendering it again here would show the spec twice and frame the second copy as a correction to an
+ * original this session never saw.
  */
-export const continuationResumePrompt = (question: string | null, answer: string, changed = ''): string =>
-  renderPrompt('resume', { question, answer, changed, fresh: true });
+export const continuationResumePrompt = (question: string | null, answer: string): string =>
+  renderPrompt('resume', { question, answer, changed: '', fresh: true });

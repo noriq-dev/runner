@@ -3193,9 +3193,20 @@ export class RunSupervisor {
     // confuse a conversation mid-thought. A continuation is a FRESH session over the kept worktree
     // (RUN-199), so it gets the whole brief rebuilt from the spec as it stands now — the same brief a
     // first dispatch would build — with the Q&A appended.
+    // The Q&A block a continuation gets — appended to the whole-run brief for an undecomposed run,
+    // and (RUN-199) to the RESUMED STEP's own brief for a decomposed one, which the chain assembles
+    // from `resumedStepQa` so that fresh session is told which step it is on rather than the whole
+    // sequence. Empty string on a restore, which never reads it.
+    //
+    // No `changed` (RUN-164) here: that block re-renders the CURRENT spec framed as "the plan changed
+    // — this REPLACES what you were told", which orients a RESTORED session holding the OLD spec. A
+    // continuation's brief is rebuilt from the current spec already, so passing it would render the
+    // spec twice and frame the second copy as a correction to an original this fresh session never
+    // received.
+    const continuationQa = isContinuation ? continuationResumePrompt(entry.question, answer) : '';
     const resumePromptText =
       resumedBrief && isContinuation
-        ? `${resumedBrief.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null)}${continuationResumePrompt(entry.question, answer, changed)}`
+        ? `${resumedBrief.buildPrompt(authorSpecBlock(resumedTask, resumedSpec), resumedSpec?.spec ?? null)}${continuationQa}`
         : resumePrompt(entry.question, answer, changed);
 
     // The SAME execute stage `supervise` runs (RUN-131) — including its re-park check, because an
@@ -3239,6 +3250,10 @@ export class RunSupervisor {
           ...resumeBase,
           steps: resumedChain.steps,
           ...(entry.stepId ? { resumeFromStepId: entry.stepId } : {}),
+          // The Q&A appended to the RESUMED step's own brief when it comes back a FRESH session
+          // (RUN-199) — so a decomposed continuation's parked step is told which step it is on and
+          // what earlier steps concluded, rather than the whole-run brief a restore would carry.
+          ...(continuationQa ? { resumedStepQa: continuationQa } : {}),
           // What the steps before the parked one concluded (RUN-171) — without it, the step after
           // the resume rediscovers everything the run had already established.
           ...(entry.priorSteps?.length ? { priorSteps: entry.priorSteps } : {}),

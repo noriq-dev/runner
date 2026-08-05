@@ -5629,6 +5629,62 @@ describe('resuming a parked run (RUN-30)', () => {
     await resumed;
   });
 
+  // RUN-199. A CONTINUATION resume of a decomposed run opens a FRESH session for the parked step —
+  // the codex path parks with sessionId:null — so it must be briefed like any other fresh step:
+  // which step it is on, and what the earlier steps concluded. Handed `start` verbatim (the whole-run
+  // brief a restore carries), it would be told to do the sequence from step one, redoing landed work.
+  it('a continuation briefs the PARKED STEP, not the whole sequence from step one (RUN-199)', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'three steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+          { id: 's3', title: 'third' },
+        ],
+      }),
+    };
+    // A codex (non-resumable) chain: step one concludes, step two parks on a question.
+    const h = harness({ anchorTask: task, parkState: { blocked: false } });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.emitText('STEP-ONE-CONCLUSION');
+    h.codex.complete('done'); // step one
+    for (let i = 0; i < 300 && h.codex.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.parkNext();
+    h.codex.complete('done'); // step two parks
+    await done;
+
+    const parked = h.parked.entries.get('run_1')!;
+    expect(parked.stepId).toBe('s2');
+    expect(parked.sessionId).toBeNull(); // codex is non-resumable → continuation resume
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const resumedStep = h.codex.starts.at(-1)!;
+    // A FRESH session, told WHICH step it is on and what step one concluded — not the whole-run
+    // brief that would make it redo the sequence from step one.
+    expect(resumedStep.resumeSessionId).toBeUndefined();
+    expect(resumedStep.prompt).toContain('YOU ARE DOING STEP 2 OF 3: second');
+    expect(resumedStep.prompt).toContain('STEP-ONE-CONCLUSION'); // the RUN-171 hand-off reaches it
+    expect(resumedStep.prompt).toContain('Use B.'); // the human's answer, appended
+
+    const before = h.codex.starts.length;
+    h.codex.complete('done'); // the resumed step two
+    for (let i = 0; i < 300 && h.codex.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    // Step three is an ordinary fresh step — never handed step two's answer.
+    expect(h.codex.starts.at(-1)!.prompt).not.toContain('Use B.');
+    h.codex.complete('done'); // step three
+    await resumed;
+  });
+
   // A park lasts up to 72 hours and the spec may be corrected while it waits (RUN-164), so the step
   // that parked can be gone from the recomputed chain. Restarting from the top would redo landed
   // work and skipping to the end would abandon it — neither is a guess worth making.
