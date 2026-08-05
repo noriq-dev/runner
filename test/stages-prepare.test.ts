@@ -513,4 +513,19 @@ describe("the execute stage's coordinate picks the builder's agent (RUN-193)", (
     expect(out.driver.tool).toBe('codex'); // the model was chosen…
     expect(out.permission.write).toBe(false); // …the posture was not
   });
+
+  // Acceptance 4: the dispatched verify actor IS a verify-based workflow's own execute stage, so its
+  // coordinate is selected through the SAME prepare path as the builder — nothing verify-specific.
+  it('a verify-based workflow’s execute coordinate selects the verify actor’s driver + model', async () => {
+    const { host } = harness({
+      drivers: { claude: driver, codex: codexDriver },
+      repo: repoWith('verify', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const out = await prepareRun(host, makeRun({ kind: 'verify', workflow: 'fast', verifiesRunId: 'run_0' }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(out.driver.tool).toBe('codex');
+    expect(out.start.model).toBe('gpt-5.6-sol');
+    expect(out.start.effort).toBe('high');
+    expect(out.permission.write).toBe(false); // verify judges, never edits (RUN-118) — model only
+  });
 });

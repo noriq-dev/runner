@@ -1994,7 +1994,26 @@ export class RunSupervisor {
     // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields — but
     // the stage coordinate above wins over both.
     const reviewerCoord = reviewer?.agent ? tryParseCoordinate(reviewer.agent) : null;
-    const reviewerTool = stageCoord?.tool ?? reviewerCoord?.tool ?? reviewer?.tool ?? null;
+    // The `[verify.agent]` + `[defaults.verify]` answer — the pre-RUN-193 ladder, UNCHANGED: the
+    // `.agent` coordinate over the legacy `.tool/.model/.effort` fields, and `[defaults.verify]`
+    // severed only when `[verify.agent]` itself named a tool (a model id is not portable across
+    // vendors). This is the fallback the stage coordinate then folds over.
+    const verifyTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
+    const verifyFallback = {
+      tool: verifyTool ?? ctx.driver.tool,
+      model:
+        reviewerCoord?.model ??
+        reviewer?.model ??
+        (verifyTool ? null : (manifest.defaults?.verify?.model ?? null)),
+      effort: reviewerCoord?.effort ?? reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null,
+    };
+    // The review stage coordinate on TOP (RUN-193), through the SAME `foldStageCoordinate` every
+    // other spawn uses — so a stage tool that differs from `[verify.agent]`'s severs its model too,
+    // not only `[defaults.verify]`'s. The hand-rolled `?? reviewerCoord?.model` ladder leaked exactly
+    // there: `[stages.review] agent = "codex"` inherited `[verify.agent]`'s claude model onto codex.
+    const resolved = foldStageCoordinate(stageCoord, verifyFallback);
+    // Whether a tool was NAMED at all (stage or `[verify.agent]`) — the run's own driver otherwise.
+    const reviewerTool = stageCoord?.tool ?? verifyTool;
     // The reviewer's driver (RUN-70): the repo — or now the workflow's review stage (RUN-193) — may
     // put a different VENDOR's model in judgment, the strongest form of the reviewer's independence.
     // Fail-closed when the named tool has no driver here: silently reviewing with the builder's own
@@ -2007,22 +2026,8 @@ export class RunSupervisor {
         findings: `a '${reviewerTool}' reviewer was asked for (the workflow's review stage or [verify.agent]) but this runner has no such driver — install the tool on this machine or change the coordinate`,
       };
     }
-    // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
-    // dispatched verify run climbs (RUN-33), because this is the same role inlined. EXCEPT when a
-    // TOOL is named (the stage coordinate or [verify.agent]): model names are vendor-specific and
-    // [defaults.verify] may name the other vendor's, so the fallback is severed and the tool's own
-    // default holds. Effort still falls through — it is tool-agnostic intent, mapped per driver.
-    const model =
-      stageCoord?.model ??
-      reviewerCoord?.model ??
-      reviewer?.model ??
-      (reviewerTool ? null : (manifest.defaults?.verify?.model ?? null));
-    const effort =
-      stageCoord?.effort ??
-      reviewerCoord?.effort ??
-      reviewer?.effort ??
-      manifest.defaults?.verify?.effort ??
-      null;
+    const model = resolved.model;
+    const effort = resolved.effort;
     // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
     // work, so a bare `git diff` shows nothing — the range is the review. A live backend
     // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
@@ -3000,10 +3005,22 @@ export class RunSupervisor {
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
     // posture either way; what the named one adds is its declared stage list.
     const wf = runWorkflow(run, workflowSource);
-    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
+    // The builder's coordinate (RUN-193), resolved the SAME way `prepare` does — the execute stage's
+    // agent on top of the dispatch coordinate. Not honoring it here would resume a build that ran on
+    // codex onto claude: the parked session belongs to the coordinate's driver, so restoring it on
+    // any other is a session that cannot resume, not merely a wrong model.
+    const execCoord = stageCoordinate(wf, 'execute', this.log);
+    const tool = execCoord?.tool ?? resolveAgentTool(run); // the coordinate's tool (RUN-114/193)
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
     if (!entry.sessionId) return fail('parked run has no session to resume');
+    // The model/effort with the execute stage coordinate folded on top (RUN-193), through the same
+    // fold every spawn uses — so a resumed session, and the chain steps that spread this `start`,
+    // run under the coordinate the fresh build did.
+    const resumeModelEffort = foldStageCoordinate(execCoord, {
+      tool: resolveAgentTool(run),
+      ...resolveModel(run, repo.manifest),
+    });
 
     // The workspace is REUSED, never re-leased: it holds the work the agent did before it
     // asked, and the session it is about to resume expects to find it exactly as it left it.
@@ -3074,10 +3091,11 @@ export class RunSupervisor {
       permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
       multiTurn: wf.produces && Boolean(repo.manifest.verify),
-      // The same model it was running before it parked (RUN-33): the session being resumed is
-      // that model's conversation, and quietly finishing the job on a different one would make
-      // "resumed with its context intact" only half true.
-      ...resolveModel(run, repo.manifest),
+      // The same model it was running before it parked (RUN-33/193): the session being resumed is
+      // that model's conversation — the execute-stage coordinate included — and quietly finishing
+      // the job on a different one would make "resumed with its context intact" only half true.
+      ...(resumeModelEffort.model ? { model: resumeModelEffort.model } : {}),
+      ...(resumeModelEffort.effort ? { effort: resumeModelEffort.effort } : {}),
       // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
       // a run spawns, rather than a resume-only helper beside a reviewer that had none.
       budget: reservation.budget,

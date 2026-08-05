@@ -6611,4 +6611,49 @@ describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)',
     h.claude.complete('done');
     expect((await done).outcome).toBe('done');
   });
+
+  // finding 1b: a review coordinate that names only a TOOL must sever the [verify.agent] MODEL too,
+  // not only [defaults.verify]'s — a claude model id means nothing to the codex driver.
+  it('a review coordinate naming only a tool severs the [verify.agent] model onto that tool', async () => {
+    const h = harness({
+      manifest: reviewed('claude.opus-4_8.high'), // [verify.agent] = claude/opus/high
+      workflowCatalog: catalog('build', { review: { agent: 'codex' } }), // tool only, no model
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    h.claude.complete('done'); // build on claude (no execute coordinate)
+    await waitFor(() => h.codex.opts?.runId === 'run_1:review');
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    if (!review) throw new Error('the reviewer never started on codex');
+    expect(review.model).toBeUndefined(); // NOT 'opus-4.8' — the claude model did not ride onto codex
+    expect(review.effort).toBe('high'); // effort is tool-agnostic intent and still falls through
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  // finding 1a: a build under [stages.execute] agent that PARKS must resume on that coordinate's
+  // driver and model — the parked session belongs to it, and the dispatch driver cannot resume it.
+  it('a resumed build (and its chain steps) run on the execute stage’s coordinate, not the dispatch driver', async () => {
+    const h = harness({
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+      workflowCatalog: catalog('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const done = h.supervisor.supervise(auditRun({ agent: 'claude.opus-4_8.low' }));
+    await flush();
+    h.codex.complete('done'); // the builder ran on the execute coord (codex) and parks on the question
+    await done;
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake'); // parked the codex session
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const start = h.codex.starts.at(-1);
+    if (!start) throw new Error('the resume never started on codex');
+    expect(start.resumeSessionId).toBe('sess-fake'); // resumed the codex session, not a fresh claude one
+    expect(start.model).toBe('gpt-5.6-sol'); // …under the execute coordinate's model, as the fresh build was
+    expect(start.effort).toBe('high');
+    h.codex.complete('done');
+    expect((await resumed)?.outcome).toBe('done');
+  });
 });
