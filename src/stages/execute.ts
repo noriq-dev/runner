@@ -57,6 +57,11 @@ export interface ExecuteHost {
     worktree: Workspace;
     exit: DriverExit;
     session: DriverSession;
+    /** The driver this session ran on — its `resumableSession` capability decides whether a park
+     *  restores the session (claude) or resumes CONTINUATION-style over the kept worktree (codex,
+     *  RUN-199). Read here rather than by the driver's NAME: the seam is the only place a vendor's
+     *  specifics live. */
+    driver: AgentDriver;
     runAgent: RunAgent;
     activeSeconds: number;
     tally: RunTally;
@@ -181,6 +186,7 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
     worktree: plan.worktree,
     exit,
     session: budgetRun.session,
+    driver: plan.driver,
     runAgent: plan.runAgent,
     activeSeconds: plan.priorActiveSeconds + (monotonicMs() - startedAt) / 1000,
     tally,

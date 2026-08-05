@@ -137,6 +137,16 @@ export interface ChainPlan extends Omit<ExecutePlan, 'stepId'> {
    *  Absent on a fresh run. */
   resumeFromStepId?: string;
   /**
+   * The question-and-answer block appended to the RESUMED step's prompt when it comes back as a
+   * FRESH session — a non-resumable driver's continuation resume (RUN-199), which `plan.start`
+   * reveals by carrying no `resumeSessionId`. That session holds none of the prior conversation, so
+   * unlike a restore it must be briefed like any other fresh step (its own `stepPrompt` — brief,
+   * step focus, prior-step hand-off) with the Q&A appended, NOT handed `plan.start` verbatim (a
+   * whole-run brief with no step focus, which would make it redo the sequence from step one). Absent
+   * on a session RESTORE, whose restored session already knows which step it is on.
+   */
+  resumedStepQa?: string;
+  /**
    * Stop once the resumed step finishes, even with steps left, and report the run incomplete.
    *
    * Set on the resume path, and it is a limitation stated rather than a policy chosen. A fresh
@@ -307,10 +317,15 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       return budgetStop(i, reservation.breach);
     }
 
-    // The FIRST step of a resumed chain is the parked session coming back, so it keeps the caller's
-    // `start` verbatim — its resume session id and the human's answer as its prompt. Every other
-    // step is a fresh session with its own brief.
+    // The FIRST step of a resumed chain is the parked one coming back. On a RESTORE (a resumable
+    // driver, `plan.start` carries its session id) it keeps `plan.start` verbatim — the restored
+    // session already knows which step it is on, and its prompt is the human's answer. On a
+    // CONTINUATION (RUN-199, no session id) it opens a FRESH session that knows none of that, so it
+    // is briefed like any other fresh step — its own `stepPrompt` — with the Q&A appended, NOT the
+    // whole-run brief `plan.start` carries (no step focus, which would redo the sequence from step
+    // one). Every non-resumed step is a fresh session with its own brief.
     const resumingThisOne = i === from && Boolean(plan.resumeFromStepId);
+    const restoringSession = resumingThisOne && Boolean(plan.start.resumeSessionId);
     const outcome = await executeRun(host, {
       ...plan,
       stepId: step.id,
@@ -320,11 +335,15 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
       // Its own tally slot, or N steps would overwrite one another's spend and the run would report
       // only the last (RUN-133's accounting is last-writer-wins PER SLOT).
       slot: `step:${step.id}`,
-      start: resumingThisOne
+      start: restoringSession
         ? plan.start
         : {
             ...plan.start,
-            prompt: plan.stepPrompt(step, i, prior),
+            // A resumed FRESH session (RUN-199) gets this step's own brief plus the Q&A; a fresh
+            // non-resumed step gets the brief alone.
+            prompt: resumingThisOne
+              ? `${plan.stepPrompt(step, i, prior)}${plan.resumedStepQa ?? ''}`
+              : plan.stepPrompt(step, i, prior),
             // A fresh session, never the previous step's: inheriting it would make this one long
             // context wearing a decomposition, which is the thing being avoided.
             resumeSessionId: undefined,

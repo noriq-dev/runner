@@ -20,7 +20,7 @@ call site — these files are the literal text an agent reads, so they cannot ca
 | `reviewer-contest.md` | `verify-reviewer.ts` `reviewerContestPrompt` | the builder, after a TERMINAL reviewer FAIL — one contest turn, no code change (RUN-174) |
 | `verify-feedback.md` | `verify.ts` `verifyFeedbackPrompt` | the builder, after the verify cmd failed |
 | `conflict.md` | `land.ts` `assembleConflictPrompt` | the builder, mid-rebase conflict |
-| `resume.md` | `parked.ts` `resumePrompt` | a parked agent being resumed (RUN-30) |
+| `resume.md` | `parked.ts` `resumePrompt` / `continuationResumePrompt` | a parked agent being resumed — session restore (RUN-30) or continuation (RUN-199) |
 
 ## Syntax
 

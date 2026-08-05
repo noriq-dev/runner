@@ -528,6 +528,8 @@ function harness(
   const continuable = new FakeContinuable();
   if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
+  /** Signals the daemon told the server died with a run that declined to park (RUN-199). */
+  const abandons: Array<{ runId: string; signalId: string }> = [];
   const claimChecks: string[] = [];
   /** Cancellation records settle cleaned up (RUN-165) — the steering `forget` calls. */
   const forgets: string[] = [];
@@ -606,6 +608,9 @@ function harness(
         ...park.state,
       };
     },
+    abandonSignal: async (runId, signalId) => {
+      abandons.push({ runId, signalId });
+    },
     ...('claimGate' in over
       ? {
           checkClaimable: async (taskId: string) => {
@@ -652,6 +657,7 @@ function harness(
     parked,
     continuable,
     parkChecks,
+    abandons,
     claimChecks,
     agentCreates,
     forgets,
@@ -2993,6 +2999,29 @@ describe('a decomposed run’s wave overlaps (RUN-170)', () => {
     ]);
     // Landed children are disposed; the parent workspace survives for the human's review.
     expect(h.worktrees.removed).toEqual(['/wt/run_1--s1', '/wt/run_1--s2']);
+  });
+
+  // RUN-199. A wave child cannot park (childHost stubs `parkIfBlocked`), so a child that asks a
+  // human leaves the RUN blocked server-side and the chain reports `steps:child-asked` — a terminal
+  // failure. That run never passed through `parkIfBlocked`'s decline branches, so the abandonment
+  // has to be a property of the run TERMINATING (settle), or the failed run is left blocked forever.
+  it('a wave child that asked abandons the orphaned signal on terminal (RUN-199)', async () => {
+    const h = harness({
+      anchorTask: threeParallel(),
+      leasesOverlap: true,
+      waveLimit: 3,
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+    });
+    const done = h.supervisor.supervise(buildRun());
+    await pump(() => h.claude.starts.length >= 2);
+    settleAt(h, 0);
+    settleAt(h, 1); // both wave children land; the post-wave probe then sees the run blocked
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toBe('steps:child-asked');
+    expect(await h.parked.list()).toEqual([]); // a wave child cannot park
+    // settle told the server the question died with the run — no blocked signal left standing.
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
   });
 
   // A child checkout is the SAME run's workspace, so it carries the parent's physical posture: a
@@ -5368,9 +5397,43 @@ describe('parking a run on a human (RUN-30)', () => {
     expect(await h.parked.list()).toEqual([]);
   });
 
-  it('refuses to park when the tool has no resumable session', async () => {
-    // Parking it would promise a return the daemon cannot deliver: reported blocked, resumable
-    // never. Fail it loudly with its worktree intact instead.
+  it('parks a NON-resumable driver with a null session instead of refusing (RUN-199)', async () => {
+    // A codex run that asked a human and exited cleanly used to die no_changes ("its tool has no
+    // resumable session"), stranding an open question nobody could answer into anything. Its work
+    // survives on disk in the kept worktree, so it parks — just with `sessionId: null`, which the
+    // resume path reads as "come back CONTINUATION-style" rather than "restore a session".
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.complete('done');
+    await done;
+
+    expect(h.reports.at(-1)?.status).toBe('blocked');
+    expect(h.worktrees.removed).toEqual([]); // the work is kept
+    const entry = await h.parked.get('run_1');
+    expect(entry?.sessionId).toBeNull(); // nothing to restore — a fresh session reads the worktree
+    expect(entry?.question).toBe('Approach A or B?');
+    // It PARKED, so the question did not die — nothing is abandoned.
+    expect(h.abandons).toEqual([]);
+  });
+
+  it('a RESUMABLE driver still parks with its real session (claude path unchanged)', async () => {
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.reports.at(-1)?.status).toBe('blocked');
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake');
+    expect(h.abandons).toEqual([]);
+  });
+
+  it('abandons the signal when a RESUMABLE driver returns no session (anomaly)', async () => {
+    // A resumable tool that somehow produced no session id cannot be brought back — parking it would
+    // promise a return the daemon cannot deliver. Fail it with its worktree intact, AND tell the
+    // server the open question died with the run so no blocked signal is left standing (RUN-199).
     const h = harness({ parkState: asked });
     h.claude.sessionId = null;
     const done = h.supervisor.supervise(buildRun());
@@ -5379,6 +5442,36 @@ describe('parking a run on a human (RUN-30)', () => {
     await done;
     expect(await h.parked.list()).toEqual([]);
     expect(h.reports.at(-1)?.status).not.toBe('blocked');
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
+  });
+
+  it('abandons the signal when a run FAILS with a question still open (RUN-199)', async () => {
+    // A budget breach or crash stays terminal even with a question open (the spend loophole in
+    // reverse) — but the server still holds the open question, so it is told the question died.
+    const h = harness({ parkState: asked });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('failed');
+    expect((await done).outcome).toBe('failed');
+    expect(await h.parked.list()).toEqual([]);
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
+  });
+
+  it('abandons the signal when the park WRITE fails (RUN-199)', async () => {
+    // The intent names this case ("refused/failed"): the park record cannot be persisted, so the run
+    // cannot be resumed and does not park — but the server still holds the question, and settle
+    // abandons it at the terminal boundary rather than leaving a blocked signal on a finished run.
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    h.parked.park = async () => {
+      throw new Error('disk full');
+    };
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done'); // asks a human; the park write then fails and it finalizes
+    await done;
+    expect(await h.parked.list()).toEqual([]); // nothing persisted
+    expect(h.reports.at(-1)?.status).not.toBe('blocked');
+    expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
   });
 });
 
@@ -5410,6 +5503,38 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(second.resumeSessionId).toBe('sess-fake');
     expect(second.cwd).toBe('/wt/run_1'); // reused, never recreated
     expect(h.worktrees.created).toHaveLength(1); // only the original
+    // The answer IS the prompt — the restored session already holds the brief (RUN-30).
+    expect(second.prompt).toContain('Use B.');
+    expect(second.prompt).not.toContain('ship the thing'); // no brief re-sent
+  });
+
+  it('resumes a NULL-session park CONTINUATION-style: fresh session, full brief + Q&A (RUN-199)', async () => {
+    // The codex path: parked with sessionId:null, it comes back as a fresh session over the kept
+    // worktree — no session to restore, so it is re-briefed from scratch with the Q&A appended.
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.complete('done');
+    await done;
+    expect((await h.parked.get('run_1'))?.sessionId).toBeNull();
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    h.codex.complete('done');
+    await resumed;
+
+    const start = h.codex.starts.at(-1)!;
+    expect(start.resumeSessionId).toBeUndefined(); // a FRESH session, not a restore
+    expect(start.cwd).toBe('/wt/run_1'); // the same worktree, holding the earlier work
+    expect(h.worktrees.created).toHaveLength(1); // reused, never re-leased
+    // Briefed from scratch — the whole run brief — with the question and answer appended, not the
+    // answer alone the restored path sends.
+    expect(start.prompt).toContain('ship the thing'); // the run's brief
+    expect(start.prompt).toContain('Use B.'); // the human's answer
+    expect(start.prompt).toContain('Approach A or B?'); // the question it had asked
   });
 
   it('keeps the dispatch workflow snapshot when definitions change while parked (RUN-192)', async () => {
@@ -5541,6 +5666,62 @@ describe('resuming a parked run (RUN-30)', () => {
     // Step three is briefed with step one's conclusion, not only step two's.
     expect(h.claude.starts.at(-1)!.prompt).toContain('STEP-ONE-CONCLUSION');
     h.claude.complete('done');
+    await resumed;
+  });
+
+  // RUN-199. A CONTINUATION resume of a decomposed run opens a FRESH session for the parked step —
+  // the codex path parks with sessionId:null — so it must be briefed like any other fresh step:
+  // which step it is on, and what the earlier steps concluded. Handed `start` verbatim (the whole-run
+  // brief a restore carries), it would be told to do the sequence from step one, redoing landed work.
+  it('a continuation briefs the PARKED STEP, not the whole sequence from step one (RUN-199)', async () => {
+    const task: AnchorTask = {
+      key: 'ACME-1',
+      title: 'three steps',
+      body: null,
+      executionSpec: ExecutionSpec.parse({
+        steps: [
+          { id: 's1', title: 'first' },
+          { id: 's2', title: 'second' },
+          { id: 's3', title: 'third' },
+        ],
+      }),
+    };
+    // A codex (non-resumable) chain: step one concludes, step two parks on a question.
+    const h = harness({ anchorTask: task, parkState: { blocked: false } });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.codex.emitText('STEP-ONE-CONCLUSION');
+    h.codex.complete('done'); // step one
+    for (let i = 0; i < 300 && h.codex.starts.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    h.parkNext();
+    h.codex.complete('done'); // step two parks
+    await done;
+
+    const parked = h.parked.entries.get('run_1')!;
+    expect(parked.stepId).toBe('s2');
+    expect(parked.sessionId).toBeNull(); // codex is non-resumable → continuation resume
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const resumedStep = h.codex.starts.at(-1)!;
+    // A FRESH session, told WHICH step it is on and what step one concluded — not the whole-run
+    // brief that would make it redo the sequence from step one.
+    expect(resumedStep.resumeSessionId).toBeUndefined();
+    expect(resumedStep.prompt).toContain('YOU ARE DOING STEP 2 OF 3: second');
+    expect(resumedStep.prompt).toContain('STEP-ONE-CONCLUSION'); // the RUN-171 hand-off reaches it
+    expect(resumedStep.prompt).toContain('Use B.'); // the human's answer, appended
+
+    const before = h.codex.starts.length;
+    h.codex.complete('done'); // the resumed step two
+    for (let i = 0; i < 300 && h.codex.starts.length <= before; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    // Step three is an ordinary fresh step — never handed step two's answer.
+    expect(h.codex.starts.at(-1)!.prompt).not.toContain('Use B.');
+    h.codex.complete('done'); // step three
     await resumed;
   });
 
@@ -6726,8 +6907,10 @@ describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)',
   });
 
   // finding 1a: a build under [stages.execute] agent that PARKS must resume on that coordinate's
-  // driver and model — the parked session belongs to it, and the dispatch driver cannot resume it.
-  it('a resumed build (and its chain steps) run on the execute stage’s coordinate, not the dispatch driver', async () => {
+  // driver and model — the dispatch driver cannot pick the work back up. codex is non-resumable, so
+  // it parks with sessionId:null and resumes CONTINUATION-style (RUN-199), but STILL on the
+  // coordinate's driver and model: those follow the execute coordinate, not the session.
+  it('a resumed build runs on the execute stage’s coordinate, not the dispatch driver', async () => {
     const h = harness({
       parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
       workflowCatalog: catalog('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
@@ -6736,14 +6919,14 @@ describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)',
     await flush();
     h.codex.complete('done'); // the builder ran on the execute coord (codex) and parks on the question
     await done;
-    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake'); // parked the codex session
+    expect((await h.parked.get('run_1'))?.sessionId).toBeNull(); // codex is non-resumable → null
 
     h.answerIt();
     const resumed = h.supervisor.resume('run_1', 'Use B.');
     await flush();
     const start = h.codex.starts.at(-1);
     if (!start) throw new Error('the resume never started on codex');
-    expect(start.resumeSessionId).toBe('sess-fake'); // resumed the codex session, not a fresh claude one
+    expect(start.resumeSessionId).toBeUndefined(); // a fresh continuation session, not a claude one
     expect(start.model).toBe('gpt-5.6-sol'); // …under the execute coordinate's model, as the fresh build was
     expect(start.effort).toBe('high');
     h.codex.complete('done');
