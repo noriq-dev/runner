@@ -334,8 +334,14 @@ with which facts. The build inlines them via esbuild `define` (`__RUNNER_PROMPTS
 but never edits) are the three **built-in workflows** (`src/workflow.ts` `BUILTIN_WORKFLOWS`). Since
 RUN-116/117 they are *data*, not a `switch`: a `Workflow` descriptor carries `promptShape`,
 `worktreeWritable`, `produces`, `verifyActor`, `usesPlanBase`, and `supervisor.ts` reads those flags
-— it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119): a named
-variant of a built-in `base` that inherits the base's posture verbatim and only swaps in a prompt.
+— it no longer compares `run.kind`. A repo may define its own `[workflow.<name>]` (RUN-119), or put
+the same `base` + `prompt` shape in `.noriq/workflows/<name>.toml` (RUN-192); machine-local
+definitions live in `~/.noriq/workflows/<name>.toml`. `WorkflowStore` re-reads and pins a merged
+catalog per dispatch: project file > inline project table > user file > bundled name. Every
+definition inherits its base's posture verbatim and only swaps in a prompt. A file prompt resolves
+beside its TOML and reads through `openConfined`, rooted at the repo or user workflow directory.
+User-authored templates render leniently with source-naming warnings, while bundled templates keep
+strict failures; verify-based custom text stays quoted inside the daemon-owned verify frame.
 
 Since RUN-132 a `Workflow` also carries `stages` — its pipeline, declared rather than derived from
 `RunStage.appliesTo`. The division of labour is the design and reversing it would put a manifest
@@ -346,9 +352,30 @@ ends, so a declaration can switch an *optional* stage off, can never switch on o
 not run, and can never decline one `RunStage.optional` marks mandatory (only `review` and
 `integrate` are declinable). Order always comes from `RUN_STAGES` — landing before judging is
 landing unreviewed — and `clampStagesToWorkflow` narrows a `role` wider than the machine's `actor`.
-The TOML surface (`[workflow.<name>].stages`, and the per-stage agent coordinate) is **not wired**:
-`WorkflowDef` is the vendored contract and carries `base` + `prompt` only, so a custom workflow
-inherits its base's list until the phase-3 vendor refresh grows the field.
+The TOML surface is wired (RUN-193, contract v2 `WorkflowDef.stages`):
+`[stages.<name>]` (or `stages = ["…"]`) declares which optional stages run AND, per stage, the
+**agent coordinate** its actor runs under — `[stages.review] agent = "codex.gpt-5_6-sol.high"`.
+`WorkflowStore` parses it per file tier (degrading a malformed value to null — the base's list, not
+a wider posture), `resolveWorkflow` swaps the base's list for the declared one through the same
+clamp, and `stageCoordinate(wf, key)` is the one place the string is parsed (tryParse + warn, so a
+bad coordinate falls to the next rung rather than gating).
+
+Every stage spawn folds that coordinate in at the TOP of one documented ladder (RUN-193), the model
+choice only — permission still flows through `clampPermissionToWorkflow`/`clampStagesToWorkflow`
+untouched, so a coordinate never moves a posture:
+
+- **execute / dispatched verify** (`stageOf(wf,'execute')?.agent`, resolved in `prepare` before the
+  driver is chosen) → the sub-ladder below it is `resolveModel`'s unchanged dispatch > `[defaults.<kind>].agent`
+  > legacy model/effort > tool default; the chain's step sessions inherit it by spreading `start`;
+- **review** (`stageOf(wf,'review')?.agent`, in `runReviewer`) → above `[verify.agent].agent` >
+  `[verify.agent]` fields > severed-unless-same-tool `[defaults.verify]`;
+- **plan / plan-check / pattern-map** → above the run's prepared coordinate.
+
+`plan-check` is a recognized coordinate key that never enters the pipeline set (it addresses the
+plan-checker's model); there is no `verify-agent` key — that actor IS the verify workflow's own
+`execute` stage. The stage coordinate's TOOL picks the driver: a mandatory `execute` naming an
+uninstalled vendor refuses the run (fail-closed), while a non-fatal pre-execution stage falls back
+to the run's driver with a warn, because losing the enrichment is worse than declining the run.
 
 A **resumed** park re-fetches its anchor task and re-checks the spec against the workspace before
 handing the answer over (RUN-164), and sends the DIFFERENCE when either moved — a park lasts up to
@@ -377,12 +404,14 @@ coordinates by default", and the dashboard sends `agent` only when a model or ef
 the clock has not started (`runCoordinate` /
 `resolveAgentTool` normalize either form, so a legacy dispatch resolves byte-identically).
 
-### Two-file config
+### Configuration sources
 
 - `~/.noriq/runner.toml` — machine-local, never committed (`config.ts`; see `runner.toml.example`).
 - `.noriq/project.toml` — committed per-repo marker: project KEY, verify cmd, tool, `[land]`,
   per-kind permission profiles (`discovery.ts` + `manifest-store.ts`; see `project.toml.example`).
   `ManifestStore` re-reads it per Run, so editing it takes effect on the next dispatch with no restart.
+- `.noriq/workflows/*.toml` / `~/.noriq/workflows/*.toml` — project and machine-local workflow
+  definitions, merged and re-read by `WorkflowStore` for each dispatch.
 
 ## Invariants (do not regress these)
 

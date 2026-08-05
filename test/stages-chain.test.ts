@@ -772,3 +772,43 @@ describe('degrading to the sequential chain, which is always correct (RUN-170)',
     await running;
   });
 });
+
+// RUN-193. Steps are one run's sessions under one identity — they take the execute stage's
+// coordinate by INHERITANCE, because `prepare` folded it into `start` (the model/effort and the
+// driver) before the chain ever ran, and `chain.ts` spreads that `start` verbatim per step. So the
+// wiring point is prepare, not chain; this only pins that the spread carries the coordinate through.
+describe('chain steps inherit the execute stage’s coordinate via plan.start (RUN-193)', () => {
+  const twoDependent = () => steps({ id: 'a' }, { id: 'b', dependsOn: ['a'] });
+
+  it('every step session spreads plan.start’s model and effort', async () => {
+    const h = harness();
+    const running = executeChain(
+      h.host,
+      h.plan({
+        steps: twoDependent(),
+        // What prepare hands over once the execute-stage coordinate is folded in (RUN-193): the
+        // builder's chosen model/effort live on `start`, and the driver is `plan.driver`.
+        start: {
+          runId: 'run_1',
+          kind: 'build',
+          cwd: parentWs.localPath,
+          prompt: 'go',
+          permission: {} as never,
+          model: 'gpt-5.6-sol',
+          effort: 'high',
+        },
+      }),
+    );
+    await until(() => h.spawns.length === 1);
+    h.spawns[0]!.end();
+    await until(() => h.spawns.length === 2);
+    h.spawns[1]!.end();
+    const out = await running;
+    if ('chainFailed' in out || out.parked) throw new Error('expected a finished chain');
+    expect(h.spawns.map((s) => s.opts.model)).toEqual(['gpt-5.6-sol', 'gpt-5.6-sol']);
+    expect(h.spawns.map((s) => s.opts.effort)).toEqual(['high', 'high']);
+    // One driver for the whole chain — the run's, which prepare already pointed at the coordinate's
+    // tool. Steps never re-resolve it.
+    expect(h.spawns.every((s) => s.opts.runId === 'run_1')).toBe(true);
+  });
+});

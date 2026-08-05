@@ -119,3 +119,33 @@ export function mergeCoordinate(
   }
   return { tool, model, effort };
 }
+
+/**
+ * Fold a workflow's per-stage coordinate (RUN-193) over the coordinate a run already resolved.
+ *
+ * The stage sits on TOP of that resolution — a workflow whose point is "audit with a stronger
+ * model" says so on the stage, not by moving the one setting every other workflow shares. Its tool
+ * always wins; its model and effort win when the stage pins them, otherwise the fallback fills each
+ * field. `null` stage → the fallback verbatim, so a workflow declaring no coordinate resolves
+ * byte-identically to today.
+ *
+ * The model fallback is SEVERED when the stage names a DIFFERENT tool than the fallback resolved:
+ * a model id is vendor-specific (`opus-4.8` means nothing to codex), so inheriting the run's model
+ * for another vendor's driver would hand it a name it cannot honor — the tool's own default is the
+ * safe answer. This is the same rule `[verify.agent]` already applies when it names its own tool
+ * (RUN-70). Effort is tool-agnostic intent (mapped per driver), so it always falls through.
+ */
+export function foldStageCoordinate(
+  stage: AgentCoordinate | null,
+  fallback: { tool: string; model?: string | null; effort?: RunEffort | null },
+): { tool: string; model: string | null; effort: RunEffort | null } {
+  const fbModel = fallback.model ?? null;
+  const fbEffort = fallback.effort ?? null;
+  if (!stage) return { tool: fallback.tool, model: fbModel, effort: fbEffort };
+  const sameTool = stage.tool === fallback.tool;
+  return {
+    tool: stage.tool,
+    model: stage.model ?? (sameTool ? fbModel : null),
+    effort: stage.effort ?? fbEffort,
+  };
+}

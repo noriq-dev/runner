@@ -502,6 +502,7 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
           },
           tool: null,
           defaultBranch: 'main',
+          setup: null,
           land: {
             branch: 'noriq/integration',
             mergeTarget: null,

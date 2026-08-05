@@ -25,6 +25,7 @@ import type { BudgetRun } from '../drivers/budget';
 import type { AgentDriver, DriverSession, DriverStartOptions } from '../drivers/types';
 import type { CheckedExecutionSpec } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
+import { renderPrompt } from '../prompts';
 import type { ResolvedRepo, RunReport, RunTally } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { Workspace } from '../vcs/types';
@@ -32,6 +33,10 @@ import type { Workspace } from '../vcs/types';
 /** How much planner output is kept. One spec plus its preamble is a few kB; a model producing
  *  more than this is not producing a spec. */
 export const PLANNER_OUTPUT_CAP = 64_000;
+
+/** The repair turn's own deadline (RUN-197): the stage's budget may carry no duration ceiling,
+ *  and a turn that never settles must still reach abandon() rather than hold the slot forever. */
+export const REPAIR_TURN_TIMEOUT_MS = 10 * 60_000;
 
 export interface PlanHost {
   readonly log: typeof defaultLogger;
@@ -77,22 +82,44 @@ export interface PlanInput {
  * run proceeds unplanned.
  */
 export function parsePlannedSpec(text: string): ExecutionSpec | null {
+  return parsePlannedSpecDetailed(text).spec;
+}
+
+/**
+ * The same parse, with WHY it failed — the words the repair turn hands back (RUN-197). The error
+ * is the LAST candidate's, which is the block the model most recently meant; earlier drafts'
+ * failures would send it fixing text it already superseded.
+ */
+export function parsePlannedSpecDetailed(text: string): {
+  spec: ExecutionSpec | null;
+  error: string | null;
+} {
   const fenced = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((m) => m[1] ?? '');
   const candidates = fenced.length
     ? fenced.reverse()
     : [bareObject(text)].filter((c): c is string => c !== null);
+  let error: string | null = candidates.length ? null : 'no JSON object found in the output at all';
   for (const c of candidates) {
     try {
       const parsed = ExecutionSpecSchema.safeParse(JSON.parse(c));
       // safeParse and not parse: a planner naming a path that leaves the repo, or a change kind
       // that does not exist, has written something this contract refuses — and the answer to that
       // is an unplanned run, never a thrown stage.
-      if (parsed.success) return parsed.data;
-    } catch {
+      if (parsed.success) return { spec: parsed.data, error: null };
+      if (!error) {
+        error = `the JSON parsed but the spec contract refused it: ${parsed.error.issues
+          .slice(0, 5)
+          .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
+          .join('; ')}`;
+      }
+    } catch (err) {
       // Not JSON. Try the next candidate; a model that emitted two blocks may have got one right.
+      // An unterminated block is the live-observed shape: a session that ended mid-emission left
+      // no closing fence, so the bare-object fallback caught a truncated `{…` and failed here.
+      if (!error) error = `the output is not valid JSON: ${String(err)}`;
     }
   }
-  return null;
+  return { spec: null, error };
 }
 
 /** The outermost `{…}` in a body with no fence. Deliberately crude: this is the fallback path. */
@@ -135,6 +162,9 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   host.transcript(run.id).milestone('no execution spec on this task — planning it in a fresh context first');
 
   let text = '';
+  /** Non-null only while a repair (RUN-197) or revision (RUN-198) turn runs — that turn's own
+   *  bounded accumulator, because a length snapshot into the sliding tail cap cannot isolate one. */
+  let repairBuf: string | null = null;
   const startedAt = Date.now();
   const budgetRun = host.startAgent(plan.driver, {
     ...plan.start,
@@ -155,6 +185,10 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
         // will not be a spec. Keeping the TAIL rather than the head is deliberate — the block the
         // parser wants is the last one.
         text = (text + t).slice(-PLANNER_OUTPUT_CAP);
+        // The repair turn's own accumulator (RUN-197). A length snapshot into `text` cannot
+        // isolate a turn: the tail cap SLIDES once the buffer is full, so `slice(before)` would
+        // drop the head of the re-emission by however much the first attempt overflowed.
+        if (repairBuf !== null) repairBuf = (repairBuf + t).slice(-PLANNER_OUTPUT_CAP);
         host.transcript(run.id).text('agent', t);
       },
     },
@@ -194,10 +228,37 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
     return abandon(`planning did not finish (${exit.reason ?? 'failed'})`);
   }
 
-  const spec = parsePlannedSpec(text);
+  let { spec, error } = parsePlannedSpecDetailed(text);
   if (!spec) {
-    host.log.warn('planner produced no usable spec — the run proceeds unplanned', { runId: run.id });
-    return abandon('planning produced nothing usable');
+    // ONE repair turn through the still-open session (RUN-197), before the bin. The live failure
+    // this closes: a planner streamed a complete ~15k spec, ended its turn mid-JSON, and the run
+    // proceeded UNPLANNED with the whole plan sitting one `continueWith` away — the session is
+    // already open for the checker's revise loop, so asking costs a turn, not a context.
+    const turn = budgetRun.session.continueWith;
+    if (turn) {
+      host.log.warn('planner spec did not parse — asking the same session to re-emit', {
+        runId: run.id,
+        error,
+      });
+      host.transcript(run.id).milestone('the planned spec did not parse — asking the planner to re-emit it');
+      repairBuf = '';
+      // Bounded even when the stage's own budget carries no duration ceiling: a repair turn that
+      // never settles must still reach abandon(), or the stage holds its slot forever.
+      const repaired = await Promise.race([
+        turn
+          .call(budgetRun.session, renderPrompt('plan-reparse', { error: error ?? 'unparseable output' }))
+          .catch(() => null),
+        new Promise<null>((r) => setTimeout(r, REPAIR_TURN_TIMEOUT_MS, null)),
+      ]);
+      // The repair turn's OWN accumulator only — `text` still holds the broken block, and parsing
+      // the whole of it would find that block again.
+      if (repaired?.outcome === 'done') spec = parsePlannedSpecDetailed(repairBuf).spec;
+      repairBuf = null;
+    }
+    if (!spec) {
+      host.log.warn('planner produced no usable spec — the run proceeds unplanned', { runId: run.id });
+      return abandon('planning produced nothing usable');
+    }
   }
 
   // Checked exactly as a delivered spec is (RUN-139), and for a sharper reason: the planner wrote
@@ -252,23 +313,26 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
     checked,
     envelope: plan.start.budget ?? null,
     revise: async (feedback: string) => {
-      // Parse only THIS turn's output. `text` accumulates every turn, so parsing the whole buffer
-      // would find the ORIGINAL plan's fence and hand it back as the revision — a revision that
-      // emitted prose, or a bare object, or nothing, would silently look like a successful one.
-      // The reviewer loop takes the same snapshot for the same reason (RUN-79).
-      const before = text.length;
+      // Parse only THIS turn's output — through the turn accumulator, not a length snapshot into
+      // `text`: the tail cap SLIDES once the buffer is full, and a slid snapshot misaligns every
+      // later parse (RUN-198; the exact bug RUN-197 fixed for the repair turn — "could not
+      // revise" on the live run was this). Parsing the whole buffer would be worse still: it
+      // finds the ORIGINAL plan's fence and hands it back as the revision.
       const turn = budgetRun.session.continueWith;
       if (!turn) return null;
+      repairBuf = '';
       const revisedExit = await turn.call(budgetRun.session, feedback).catch((err) => {
         host.log.warn('could not hand the plan findings back', { runId: run.id, err: String(err) });
         return null;
       });
+      const turnText = repairBuf;
+      repairBuf = null;
       if (!revisedExit || revisedExit.outcome !== 'done') return null;
-      const revised = parsePlannedSpec(text.slice(before));
+      const revised = parsePlannedSpec(turnText);
       // The revision REPLACES the plan, so nothing parseable means the previous one stands rather
       // than being lost — a checker round that produced no new plan has cost tokens, not a plan.
       if (!revised) return null;
-      return { checked: await host.checkSpec(revised, plan.worktree.localPath), text: text.slice(before) };
+      return { checked: await host.checkSpec(revised, plan.worktree.localPath), text: turnText };
     },
     close: async (final: CheckedExecutionSpec) => {
       // STOPPING IS UNCONDITIONAL. Saving first and stopping after meant a save that hung or threw

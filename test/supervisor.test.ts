@@ -37,6 +37,7 @@ import {
 } from '../src/supervisor';
 import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 import { BUILTIN_WORKFLOWS } from '../src/workflow';
+import type { WorkflowCatalog } from '../src/workflow-store';
 
 // A driver whose run the test completes by calling complete() — which drives the
 // wrapped onExit (superviseBudget resolves its done from it).
@@ -365,6 +366,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   tool: null,
   defaultBranch: null,
   land: null,
+  setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
   // No per-kind model/effort by default: this repo takes whatever the tool defaults to,
   // which is what every run got before RUN-33 existed.
@@ -423,6 +425,9 @@ function harness(
     manifest?: ProjectManifest;
     hasRepo?: boolean;
     drivers?: Partial<Record<'claude' | 'codex', AgentDriver>>;
+    /** Wire ONLY claude (RUN-193): models a machine that lacks the vendor a stage coordinate names,
+     *  keeping the returned `h.claude` the same instance a test drives. */
+    onlyClaude?: boolean;
     verifyPasses?: boolean;
     /** Per-call verify outcomes, in order — models the agent fixing it (RUN-29). */
     verifyResults?: boolean[];
@@ -480,11 +485,14 @@ function harness(
     waveLimit?: number;
     /** RUN-170: the fake backend's isolation model. true = git's (leases overlap). */
     leasesOverlap?: boolean;
+    /** Mutable dispatch catalog, so a park test can model workflow files changing while it waits. */
+    workflowCatalog?: WorkflowCatalog;
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
   // (RUN-164) — a test of a resumed chain has to be able to model that.
   let anchorTask = over.anchorTask ?? null;
+  let workflowCatalog = over.workflowCatalog;
   const worktrees = new FakeWorktrees();
   if (over.leasesOverlap) worktrees.leasesOverlap = true;
   if (over.changed === false) worktrees.changed = false;
@@ -520,7 +528,7 @@ function harness(
   // answered and moves the run back to running, so the NEXT check says "not blocked".
   const park = { state: over.parkState };
   const supervisor = new RunSupervisor({
-    drivers: over.drivers ?? { claude, codex },
+    drivers: over.drivers ?? (over.onlyClaude ? { claude } : { claude, codex }),
     vcs: worktrees,
     resolveRepo: (repoRef) =>
       over.hasRepo === false
@@ -528,6 +536,7 @@ function harness(
         : {
             root: `/repos/${repoRef}`,
             manifest: over.manifest ?? manifest(),
+            ...(workflowCatalog ? { workflowCatalog } : {}),
             ...(over.repoVcs ? { vcs: over.repoVcs } : {}),
           },
     report: (runId, r) => {
@@ -638,6 +647,10 @@ function harness(
     /** Model a human rewriting the task's spec while the run is parked. */
     setAnchorTask: (t: AnchorTask | null) => {
       anchorTask = t;
+    },
+    /** Model workflow TOML changing after this run prepared but before its answer arrives. */
+    setWorkflowCatalog: (catalog: WorkflowCatalog) => {
+      workflowCatalog = catalog;
     },
     /** Model the human answering: the server stops calling the run blocked. */
     answerIt: () => {
@@ -787,6 +800,87 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
       repoContext: block,
     });
     expect(p).not.toContain('This repo says of itself');
+  });
+
+  it('an intentionally empty custom prompt does not fall back to the bundled prompt', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope', workflow: 'docs' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: customWf(''),
+    });
+    expect(p).toBe('');
+  });
+
+  it('a custom scope prompt receives identity, project, task, context, and spec variables', () => {
+    const p = assemblePrompt(
+      makeRun({ kind: 'scope', workflow: 'docs', anchor: { type: 'task', taskId: 'task_9' } }),
+      manifest({ key: 'RUN' }),
+      {
+        agent: testAgent(),
+        server: 'https://s',
+        task: { key: 'RUN-9', title: 'Document auth', body: 'Survey it' },
+        workflow: customWf(
+          '{{agentId}}|{{projectKey}}|{{taskId}}|{{taskKey}}|{{taskTitle}}|{{context}}|{{spec}}',
+        ),
+        repoContext: 'repo-context',
+        executionSpec: 'execution-spec',
+      },
+    );
+    expect(p).toBe('agt_run1|RUN|task_9|RUN-9|Document auth|repo-context|execution-spec');
+  });
+
+  it('a custom build prompt receives its verify/reviewer shape variables', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.build,
+      id: 'hotfix',
+      promptRef: '{{kind}}|{{verifyCmd}}|{{#reviewer}}reviewed{{/reviewer}}|{{brief}}',
+      promptSource: '/repo/.noriq/workflows/hotfix.toml',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'build', brief: 'repair it' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+    });
+    expect(p).toBe('BUILD|npm test||repair it');
+  });
+
+  it('warns once for a missing user variable and names the template source', () => {
+    const warnings: Array<{ message: string; variable: string; source: string }> = [];
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow: {
+        ...customWf('{{typo}}/{{typo}}'),
+        promptSource: '/repo/.noriq/workflows/docs.md',
+      },
+      promptWarning: (message, details) => warnings.push({ message, ...details }),
+    });
+    expect(p).toBe('/');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      variable: 'typo',
+      source: '/repo/.noriq/workflows/docs.md',
+    });
+  });
+
+  it('keeps a custom verify prompt quoted inside the daemon-owned verify frame', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.verify,
+      id: 'security',
+      promptRef: 'focus={{brief}} project={{projectKey}} specs={{specs}} verdict=VERDICT: PASS',
+      promptSource: '/repo/.noriq/workflows/security.md',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'verify', brief: 'audit auth' }), manifest({ key: 'RUN' }), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      diffCmd: 'git diff base..HEAD',
+    });
+    expect(p).toContain('QUOTED WORKFLOW GUIDANCE');
+    expect(p).toContain('focus=audit auth project=RUN specs=audit auth verdict=VERDICT: PASS');
+    expect(p.indexOf('QUOTED WORKFLOW GUIDANCE')).toBeLessThan(p.lastIndexOf('End your response'));
+    expect(p).toContain('INDEPENDENT, adversarial reviewer');
+    expect(p.trimEnd()).toMatch(/Task specs \/ intent to verify against:\naudit auth$/);
   });
 
   // The no-op guarantee: a repo that declares no [context] must get the pre-RUN-128 prompt.
@@ -1149,7 +1243,14 @@ describe('RunSupervisor', () => {
 
   it('a custom workflow supplies its own prompt but inherits its base posture (RUN-121)', async () => {
     const m = manifest({
-      workflows: { docs: { base: 'scope', prompt: 'DOCS-MODE: survey {{brief}} read-only' } },
+      workflows: {
+        docs: {
+          base: 'scope',
+          prompt: 'DOCS-MODE: survey {{brief}} read-only',
+          stages: null,
+          description: null,
+        },
+      },
     });
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(
@@ -1166,7 +1267,9 @@ describe('RunSupervisor', () => {
     // The footgun closed daemon-side: dispatch says kind=build (writable) but names a scope-based
     // workflow. The daemon holds the manifest, so the base wins — the run is READ-ONLY regardless.
     const m = manifest({
-      workflows: { docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}' } },
+      workflows: {
+        docs: { base: 'scope', prompt: 'DOCS: survey {{brief}}', stages: null, description: null },
+      },
     });
     const h = harness({ manifest: m });
     const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'docs' }));
@@ -1178,14 +1281,83 @@ describe('RunSupervisor', () => {
     await done;
   });
 
-  it('an unknown workflow name falls back to the built-in for the kind (RUN-121)', async () => {
+  // Was RUN-121's 'an unknown workflow name falls back to the built-in for the kind'. RUN-196
+  // flips it: an explicit `workflow` is a selection from the advertised menu, and a name that no
+  // longer resolves (file deleted between advertise and dispatch) must refuse legibly rather than
+  // run a built-in prompt the operator did not choose. Pre-lease, so a declined run costs nothing
+  // — the claimability-gate precedent.
+  it('a selected workflow that no longer resolves refuses the dispatch (RUN-196)', async () => {
     const h = harness();
-    const done = h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    const exit = await h.supervisor.supervise(makeRun({ kind: 'scope', workflow: 'nonexistent' }));
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/workflow 'nonexistent' no longer resolves/);
+    expect(h.worktrees.created).toEqual([]);
+  });
+
+  // RUN-196's happy halves: a dispatch naming an ADVERTISED workflow resolves to the file-loaded
+  // definition end to end. Direct vs pump is not a wire distinction on the runner — both arrive as
+  // `run.assigned` frames — so the pair is expressed as anchorless vs task-anchored, which is the
+  // only observable difference.
+  const fileWorkflow = (tier: 'user-file' | 'project-file', prompt: string): WorkflowCatalog => {
+    const dir = tier === 'user-file' ? '/home/u/.noriq/workflows' : '/repos/repo_a/.noriq/workflows';
+    return {
+      definitions: {
+        restyle: {
+          base: 'build',
+          prompt,
+          promptSource: `${dir}/restyle.md`,
+          stages: null,
+          description: null,
+          source: `${dir}/restyle.toml`,
+          tier,
+        },
+      },
+    };
+  };
+
+  it('a direct (anchorless) dispatch selecting a user-dir workflow gets its prompt (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('user-file', 'USER-WF: restyle {{brief}}') });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'restyle' }));
     await flush();
-    // no throw, and the scope built-in prompt is used
-    expect(h.claude.opts?.prompt).toContain('MODE: SCOPE');
+    expect(h.claude.opts?.prompt).toContain('USER-WF: restyle ship the thing');
+    expect(h.claude.opts?.permission.write).toBe(true); // under the base's posture, not a new one
     h.claude.complete('done');
     await done;
+  });
+
+  it('a pump-shaped (task-anchored) dispatch resolves a project-file workflow the same way (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('project-file', 'PROJECT-WF: {{brief}}') });
+    const done = h.supervisor.supervise(
+      makeRun({
+        kind: 'build',
+        workflow: 'restyle',
+        planKey: 'plan_1',
+        anchor: { type: 'task', taskId: 'task_9' },
+      }),
+    );
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('PROJECT-WF: ship the thing');
+    h.claude.complete('done');
+    await done;
+  });
+
+  // The catalog is re-read and pinned PER DISPATCH (workflowRepoResolver, RUN-192) — so a project
+  // file appearing between two sittings shadows the user definition on the second, with no new
+  // machinery. The harness's mutable catalog models WorkflowStore's merged output changing on disk.
+  it('a project file appearing between sittings shadows the user definition on the next dispatch (RUN-196)', async () => {
+    const h = harness({ workflowCatalog: fileWorkflow('user-file', 'USER-WF: {{brief}}') });
+    const first = h.supervisor.supervise(makeRun({ kind: 'build', workflow: 'restyle' }));
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('USER-WF: ship the thing');
+    h.claude.complete('done');
+    await first;
+
+    h.setWorkflowCatalog(fileWorkflow('project-file', 'PROJECT-WF: {{brief}}'));
+    const second = h.supervisor.supervise(makeRun({ id: 'run_2', kind: 'build', workflow: 'restyle' }));
+    await flush();
+    expect(h.claude.opts?.prompt).toContain('PROJECT-WF: ship the thing');
+    h.claude.complete('done');
+    await second;
   });
 
   it('a verify run stays read-only even if the manifest grants write (RUN-118 floor)', async () => {
@@ -5147,6 +5319,45 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(h.worktrees.created).toHaveLength(1); // only the original
   });
 
+  it('keeps the dispatch workflow snapshot when definitions change while parked (RUN-192)', async () => {
+    const catalog = (base: 'verify' | 'build', prompt: string): WorkflowCatalog => ({
+      definitions: {
+        audit: {
+          base,
+          prompt,
+          promptSource: '/repo/.noriq/workflows/audit.md',
+          stages: null,
+          description: null,
+          source: '/repo/.noriq/workflows/audit.toml',
+          tier: 'project-file',
+        },
+      },
+    });
+    const h = harness({ parkState: asked, workflowCatalog: catalog('verify', 'Audit {{brief}}') });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'verify', workflow: 'audit', anchor: { type: 'task', taskId: 'task_9' } }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    expect((await h.parked.get('run_1'))?.workflowCatalog?.definitions.audit?.base).toBe('verify');
+    // This edit belongs to the NEXT dispatch. Before the fix, resume re-resolved it and granted
+    // the waiting run the build posture and producing pipeline.
+    h.setWorkflowCatalog(catalog('build', 'Build {{brief}}'));
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Continue the audit.');
+    await flush();
+    const start = h.claude.starts.at(-1)!;
+    expect(start.kind).toBe('verify');
+    expect(start.permission.write).toBe(false);
+    expect(start.multiTurn).toBe(false);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    expect(await resumed).toMatchObject({ outcome: 'done' });
+    expect(h.worktrees.commits).toEqual([]);
+  });
+
   // RUN-168 recorded WHERE a chain parked; RUN-169 is what lets the rest of it run. Before the
   // first, a resume restored one session and reported the run DONE having silently skipped its
   // plan. Between them, it finished the parked step and reported incomplete — honest, but a
@@ -6250,5 +6461,199 @@ describe('a cancelled run does not go on to build (RUN-165)', () => {
     expect(h.worktrees.removed).toHaveLength(0); // the workspace kept — never force-deleted
     expect(h.forgets).toEqual(['run_1']); // the cancellation record cleaned up
     expect(h.transcript.at(-1)!.text).toContain('cancelled'); // the transcript closed on the terminal
+  });
+});
+
+// RUN-193: every stage spawn folds the workflow's per-stage coordinate in at the TOP of its ladder.
+// The ladder's own algebra is unit-tested in workflow.test.ts (foldStageCoordinate); these drive it
+// through supervise(), one rung per spawn site — reviewer, builder, planner.
+describe('a stage spawns under the workflow’s per-stage coordinate (RUN-193)', () => {
+  const reviewed = (agent: string | null): ProjectManifest =>
+    manifest({
+      verify: {
+        cmd: null,
+        timeoutSeconds: null,
+        shell: null,
+        maxRounds: 0,
+        agent: { agent, tool: null, model: null, effort: null, maxRounds: 0 },
+      },
+    });
+  const catalog = (
+    base: 'scope' | 'build' | 'verify',
+    stages: import('@noriq-dev/shared').WorkflowStages,
+  ): WorkflowCatalog => ({
+    definitions: {
+      audit: {
+        base,
+        prompt: null,
+        promptSource: null,
+        stages,
+        description: null,
+        source: '/repos/repo_a/.noriq/workflows/audit.toml',
+        tier: 'project-file',
+      },
+    },
+  });
+  const auditRun = (over: Partial<Run> = {}) =>
+    makeRun({ kind: 'build', workflow: 'audit', anchor: { type: 'task', taskId: 'task_9' }, ...over });
+  const specless = (): AnchorTask => ({ key: 'ACME-1', title: 'do the thing', body: null });
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const waitFor = async (pred: () => boolean) => {
+    for (let i = 0; i < 300 && !pred(); i++) await tick();
+    if (!pred()) throw new Error('condition never held');
+  };
+
+  it('the inline reviewer runs on the review stage’s coordinate, beating [verify.agent]', async () => {
+    const h = harness({
+      manifest: reviewed('claude.opus-4_8.high'), // [verify.agent] would otherwise be claude/opus
+      workflowCatalog: catalog('build', { review: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    h.claude.complete('done'); // the build turn, on the dispatch driver
+    await waitFor(() => h.codex.opts?.runId === 'run_1:review');
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    if (!review) throw new Error('the reviewer never started on codex');
+    expect(review.model).toBe('gpt-5.6-sol');
+    expect(review.effort).toBe('high');
+    expect(review.permission.write).toBe(false); // a coordinate picks a model, never a posture
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  it('with no review coordinate the reviewer still climbs [verify.agent] — byte-identical', async () => {
+    const h = harness({
+      manifest: reviewed('codex.gpt-5_6-sol.high'),
+      workflowCatalog: catalog('build', ['review']), // declared, no coordinate
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    h.claude.complete('done');
+    await waitFor(() => h.codex.opts?.runId === 'run_1:review');
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    expect(review?.model).toBe('gpt-5.6-sol');
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('a review coordinate naming a driverless tool fail-closes the gate (RUN-70)', async () => {
+    const h = harness({
+      onlyClaude: true, // no codex installed here
+      manifest: reviewed('claude.opus-4_8.high'),
+      workflowCatalog: catalog('build', { review: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    h.claude.complete('done'); // build; the reviewer cannot spawn — its driver is absent
+    const exit = await done;
+    expect(exit.outcome).toBe('failed');
+    expect(exit.reason).toMatch(/review/); // review:no-verdict — a gate that could not run did not pass
+    expect(h.comments.map((c) => c.body).join('\n')).toMatch(/no such driver/);
+  });
+
+  it('the builder runs on the execute stage’s coordinate, over the dispatch coordinate', async () => {
+    const h = harness({
+      workflowCatalog: catalog('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const done = h.supervisor.supervise(auditRun({ agent: 'claude.opus-4_8.low', anchor: null }));
+    await flush();
+    const build = h.codex.starts.find((s) => s.runId === 'run_1');
+    if (!build) throw new Error('the builder never started on codex');
+    expect(build.model).toBe('gpt-5.6-sol');
+    expect(build.effort).toBe('high');
+    h.codex.complete('done');
+    await done;
+  });
+
+  it('the planner runs on the plan stage’s coordinate, keeping its read-only narrowing', async () => {
+    const h = harness({
+      anchorTask: specless(), // no spec → the plan stage applies
+      workflowCatalog: catalog('build', {
+        plan: { agent: 'codex.gpt-5_6-sol.high' },
+        execute: { agent: null }, // the build stays on the dispatch driver (claude)
+      }),
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    const planner = h.codex.starts.find((s) => s.runId === 'run_1');
+    if (!planner) throw new Error('the planner never started on codex');
+    expect(planner.model).toBe('gpt-5.6-sol');
+    expect(planner.effort).toBe('high');
+    // A coordinate is a model choice only: the planner keeps plannerPermission's narrowing…
+    expect(planner.permission.write).toBe(false);
+    expect(planner.permission.auto).toBe(false);
+    // …and the escalation-pair-only Noriq tools (STAGE_NORIQ_TOOLS).
+    expect(planner.noriqTools).toEqual(['raise_alert', 'request_input']);
+    h.codex.complete('done'); // no parseable spec → the run proceeds unplanned
+    await waitFor(() => h.claude.starts.some((s) => s.runId === 'run_1')); // the build, on claude
+    h.claude.complete('done');
+    await done;
+  });
+
+  it('a plan coordinate naming a driverless tool falls back to the run’s driver — never fatal', async () => {
+    const h = harness({
+      onlyClaude: true, // no codex
+      anchorTask: specless(),
+      workflowCatalog: catalog('build', {
+        plan: { agent: 'codex.gpt-5_6-sol.high' },
+        execute: { agent: null },
+      }),
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    // The planner ran anyway, on claude (the prepared driver) — enrichment lost only its model, not
+    // its existence, because these stages are never fatal.
+    await waitFor(() => h.claude.starts.length >= 1);
+    h.claude.complete('done'); // planner: no spec → unplanned
+    await waitFor(() => h.claude.starts.length >= 2); // the build follows on the same driver
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  // finding 1b: a review coordinate that names only a TOOL must sever the [verify.agent] MODEL too,
+  // not only [defaults.verify]'s — a claude model id means nothing to the codex driver.
+  it('a review coordinate naming only a tool severs the [verify.agent] model onto that tool', async () => {
+    const h = harness({
+      manifest: reviewed('claude.opus-4_8.high'), // [verify.agent] = claude/opus/high
+      workflowCatalog: catalog('build', { review: { agent: 'codex' } }), // tool only, no model
+    });
+    const done = h.supervisor.supervise(auditRun());
+    await flush();
+    h.claude.complete('done'); // build on claude (no execute coordinate)
+    await waitFor(() => h.codex.opts?.runId === 'run_1:review');
+    const review = h.codex.starts.find((s) => s.runId === 'run_1:review');
+    if (!review) throw new Error('the reviewer never started on codex');
+    expect(review.model).toBeUndefined(); // NOT 'opus-4.8' — the claude model did not ride onto codex
+    expect(review.effort).toBe('high'); // effort is tool-agnostic intent and still falls through
+    h.codex.emitText('VERDICT: PASS');
+    h.codex.complete('done');
+    expect((await done).outcome).toBe('done');
+  });
+
+  // finding 1a: a build under [stages.execute] agent that PARKS must resume on that coordinate's
+  // driver and model — the parked session belongs to it, and the dispatch driver cannot resume it.
+  it('a resumed build (and its chain steps) run on the execute stage’s coordinate, not the dispatch driver', async () => {
+    const h = harness({
+      parkState: { blocked: true, signalId: 'sig_1', question: 'A or B?' },
+      workflowCatalog: catalog('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const done = h.supervisor.supervise(auditRun({ agent: 'claude.opus-4_8.low' }));
+    await flush();
+    h.codex.complete('done'); // the builder ran on the execute coord (codex) and parks on the question
+    await done;
+    expect((await h.parked.get('run_1'))?.sessionId).toBe('sess-fake'); // parked the codex session
+
+    h.answerIt();
+    const resumed = h.supervisor.resume('run_1', 'Use B.');
+    await flush();
+    const start = h.codex.starts.at(-1);
+    if (!start) throw new Error('the resume never started on codex');
+    expect(start.resumeSessionId).toBe('sess-fake'); // resumed the codex session, not a fresh claude one
+    expect(start.model).toBe('gpt-5.6-sol'); // …under the execute coordinate's model, as the fresh build was
+    expect(start.effort).toBe('high');
+    h.codex.complete('done');
+    expect((await resumed)?.outcome).toBe('done');
   });
 });

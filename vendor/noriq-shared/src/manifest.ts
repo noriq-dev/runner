@@ -231,19 +231,92 @@ export const LandPolicy = z.object({
 export type LandPolicy = z.infer<typeof LandPolicy>;
 
 /**
- * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
+ * Mechanical workspace bootstrap (PLNR-242): commands the DAEMON runs, in order, to make a
+ * fresh worktree ready before any agent starts — `npm install`, codegen, submodule init.
+ *
+ * Exists because of a live dogfood cost: a fresh worktree has no node_modules, so every agent
+ * spent its first (most valuable) turns bootstrapping an environment — and sometimes failed
+ * under a restricted-network profile — doing work the machine could have done for free before
+ * the run began. Mechanical setup is not agent work.
+ *
+ * Schema half only: execution semantics (working dir, env, failure handling, caching, whether
+ * a failed setup blocks the run) are the RUNNER's own contract, defined where they are
+ * enforced. This section just carries the words. Not part of the security floor in the way
+ * `permissions` is — but note these commands run OUTSIDE any agent sandbox, daemon-privileged,
+ * from a COMMITTED file: cloning a repo and running its runner executes its [setup]. That is
+ * the same trust boundary `verify.cmd` already crosses, no wider.
+ */
+export const SetupSpec = z.object({
+  // Run in order; each must exit 0. Empty = nothing to do (same as omitting the section).
+  cmds: z.array(z.string().min(1)).default([]),
+  // Per-COMMAND ceiling, seconds. The default absorbs a cold `npm install` on a slow link;
+  // repos with heavier bootstraps (toolchain downloads, large codegen) raise it explicitly.
+  timeoutSeconds: z.number().int().positive().default(600),
+});
+export type SetupSpec = z.infer<typeof SetupSpec>;
+
+/**
+ * Per-stage configuration inside a workflow (PLNR-238 / the runner's Workflows v3 plan).
+ *
+ * `agent` is the coordinate (RUN-113: `claude.fable-5.high`) this stage's actor runs under —
+ * INCLUDING the adversary stages (plan-check, review, verify-agent), which is the point: a repo
+ * can plan with one model, build with a cheaper one, and be judged by a third. A coordinate
+ * chooses a MODEL and never a posture: the write floor (RUN-118) and the stage clamp (RUN-132)
+ * are runner-side and unreachable from here. Free string, not an enum — model ids are the
+ * vendor's and change weekly; the runner's coordinate parser validates it.
+ */
+export const WorkflowStageDef = z.object({
+  agent: z.string().min(1).nullable().default(null),
+});
+export type WorkflowStageDef = z.infer<typeof WorkflowStageDef>;
+
+/**
+ * A workflow's declared pipeline (PLNR-238). Two spellings of one fact, because TOML cannot put
+ * an array and a `[stages.<name>]` table on the same key:
+ *
+ *   stages = ["plan", "plan-check", "execute"]        — names only, nothing per-stage
+ *   [stages.plan-check] agent = "claude.fable-5.high" — the same declaration, keyed, with config
+ *
+ * A SET, not a sequence: order always comes from the machine's RUN_STAGES ("reviews before it
+ * integrates" is a security ordering, not a preference — RUN-132), so the table form's
+ * unordered keys lose nothing. The runner clamps exactly as today: (mandatory ∪ declared) ∩
+ * appliesTo — a declaration can decline an optional stage, never enable one its posture may not
+ * run, never shed a mandatory one.
+ */
+export const WorkflowStages = z.union([
+  z.array(z.string().min(1)),
+  z.record(z.string().min(1), WorkflowStageDef),
+]);
+export type WorkflowStages = z.infer<typeof WorkflowStages>;
+
+/**
+ * A repo-defined workflow (RUN-119, contract v2 in PLNR-238): a NAMED variant of a built-in run
+ * kind. Its NAME is not a field — it is the file the workflow lives in (`.noriq/workflows/<name>.toml`,
+ * Workflows v3) or its key under `[workflows.<name>]` in the project manifest. It inherits the
  * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
  * because scope is, and no field here can change that (the write floor is enforced in the runner,
- * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
- * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
- * (scope/build/verify) are always present and need no declaration.
+ * RUN-118). What a workflow may vary: the PROMPT its agents get, which OPTIONAL stages run, and
+ * which agent coordinate does each stage's work. The three built-ins (scope/build/verify) are
+ * always present and need no declaration.
+ *
+ * v1 compatibility is a hard rule: `{base, prompt: "text"}` parses byte-identically (prompt's
+ * string arm), every v2 field is optional, and unknown keys pass through un-strictly — the
+ * vendored-contract ordering (VENDORED-CONTRACT.md) means this schema must never reject a
+ * manifest an older daemon wrote.
  */
 export const WorkflowDef = z.object({
   // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
   base: RunKind,
-  // A prompt template name or inline text overriding the base's default brief (RUN-121). Null =
-  // use the base's own prompt, exactly as the built-in kind would.
-  prompt: z.string().nullable().default(null),
+  // The brief: inline template text / template name (the v1 string form, RUN-121), or
+  // `{ file = "plan.md" }` — a file the DAEMON resolves relative to the workflow's own
+  // directory and confines there (the same no-escaping-the-root rule as ProjectContext).
+  // Null = the base's own prompt, exactly as the built-in kind would.
+  prompt: z.union([z.string(), z.object({ file: z.string().min(1) })]).nullable().default(null),
+  // The declared pipeline (see WorkflowStages). Null = the base's own stage list, unchanged.
+  stages: WorkflowStages.nullable().default(null),
+  // One line for humans choosing a workflow at dispatch (PLNR-240 advertises {name, base,
+  // description} per repo). Cosmetic — nothing executes it.
+  description: z.string().nullable().default(null),
 });
 export type WorkflowDef = z.infer<typeof WorkflowDef>;
 
@@ -310,6 +383,9 @@ export const ProjectManifest = z.object({
   // silently rebound. Null = the project's default board, exactly as before.
   board: z.string().min(1).max(80).nullable().default(null),
   verify: VerifySpec.nullable().default(null),
+  // Workspace bootstrap the daemon runs before any agent (PLNR-242). Null = nothing to run,
+  // byte-identical to every manifest written before this existed.
+  setup: SetupSpec.nullable().default(null),
   // What the repo tells every agent about itself before it starts (RUN-128). Empty = today's
   // behaviour, a brief carrying only the task. Not part of the security floor: getting this
   // wrong costs an agent orientation, never safety.

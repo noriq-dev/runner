@@ -18,7 +18,7 @@ import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { ParkedStore } from './parked';
-import { buildRegistration } from './registration';
+import { buildRegistration, repoReport } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
 import { SteeringBridge } from './steering';
@@ -31,6 +31,7 @@ import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
 import { PerforceBackend } from './vcs/perforce';
 import type { VcsBackend } from './vcs/types';
+import { type WorkflowCatalog, WorkflowStore } from './workflow-store';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient, type WsFactory } from './ws-client';
 
@@ -103,6 +104,35 @@ export interface DaemonHandle {
   runnerId: string;
   /** Stop live agents, let them report, then close the socket. Await it before exiting. */
   stop(): Promise<void>;
+}
+
+/**
+ * Build the dispatch-time repo resolver from read-at-use stores (RUN-192).
+ *
+ * Extracted because this composition is the property: both reads happen for every dispatch, and
+ * the returned manifest/catalog pair is then pinned together for that run. Keeping it behind
+ * injectable functions proves that wiring without making a test walk a real repo or invoke git.
+ */
+export function workflowRepoResolver(deps: {
+  repos: ReadonlyArray<{ id: string; root: string }>;
+  manifestFor: (root: string) => Promise<ProjectManifest | null>;
+  workflowsFor: (root: string, manifest: ProjectManifest) => Promise<WorkflowCatalog>;
+  vcsFor?: (root: string) => VcsBackend | undefined;
+}): RunSupervisorDeps['resolveRepo'] {
+  const reposById = new Map(deps.repos.map((repo) => [repo.id, repo]));
+  return async (repoRef) => {
+    const repo = reposById.get(repoRef);
+    if (!repo) return null;
+    const manifest = await deps.manifestFor(repo.root);
+    if (!manifest) return null;
+    const workflowCatalog = await deps.workflowsFor(repo.root, manifest);
+    return {
+      root: repo.root,
+      manifest,
+      workflowCatalog,
+      ...(deps.vcsFor ? { vcs: deps.vcsFor(repo.root) } : {}),
+    };
+  };
 }
 
 /**
@@ -456,6 +486,7 @@ export class Daemon {
   private readonly parkedStore?: ParkedStore;
   private readonly continuableStore?: ContinuableStore;
   private readonly stateFile?: string;
+  private readonly workflowStore?: WorkflowStore;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -476,6 +507,9 @@ export class Daemon {
       parked?: ParkedStore;
       continuable?: ContinuableStore;
       stateFile?: string;
+      /** Workflow filesystem seam — a fake can prove registration and dispatch re-read without
+       *  touching the operator's ~/.noriq directory. */
+      workflows?: WorkflowStore;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -487,6 +521,7 @@ export class Daemon {
     this.parkedStore = deps.parked;
     this.continuableStore = deps.continuable;
     this.stateFile = deps.stateFile;
+    this.workflowStore = deps.workflows;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -554,9 +589,16 @@ export class Daemon {
 
     const state = await loadState(this.stateFile);
     const tools = this.config.tools ?? detectTools();
+    const workflows = this.workflowStore ?? new WorkflowStore({ logger: this.log });
+    const registrationCatalogs = new Map(
+      await Promise.all(
+        repos.map(async (repo) => [repo.root, await workflows.current(repo.root, repo.manifest)] as const),
+      ),
+    );
     const registration = buildRegistration(
       { label: this.config.label, concurrency: this.config.concurrency, tools, runnerId: state.runnerId },
       repos,
+      registrationCatalogs,
     );
     const runner = await client.registerRunner(registration);
     await saveState({ runnerId: runner.id }, this.stateFile);
@@ -570,11 +612,17 @@ export class Daemon {
     // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
     // ws's onAssigned drives the supervisor). Each Run's agent identity is created by the
     // runner up front (RUN-43) and reached with a token bound to it alone.
-    const reposById = new Map(repos.map((r) => [r.id, r]));
+    const reposById = new Map(repos.map((repo) => [repo.id, repo]));
     // The committed marker is re-read per Run, so editing .noriq/project.toml takes
     // effect on the next dispatch instead of waiting for someone to restart the daemon.
     const manifests = new ManifestStore({ logger: this.log });
     for (const r of repos) manifests.seed(r.root, r.manifest);
+    const resolveRepo = workflowRepoResolver({
+      repos,
+      manifestFor: (root) => manifests.current(root),
+      workflowsFor: (root, manifest) => workflows.current(root, manifest),
+      vcsFor: (root) => backendFor.get(root),
+    });
     const held: { ws?: WsClient } = {};
     // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
     // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
@@ -600,13 +648,7 @@ export class Daemon {
         codex: new CodexDriver({ logger: this.log }),
       },
       vcs,
-      resolveRepo: async (repoRef) => {
-        const r = reposById.get(repoRef);
-        if (!r) return null;
-        const manifest = await manifests.current(r.root);
-        // The repo's detected backend rides along (RUN-60); omitted = the git default.
-        return manifest ? { root: r.root, manifest, vcs: backendFor.get(r.root) } : null;
-      },
+      resolveRepo,
       // Transcript segments (RUN-74) ride their own frame, same best-effort posture as
       // telemetry: a batch the socket misses is gone, and that must never gate a run.
       reportLog: (runId, segments) => {
@@ -736,6 +778,18 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
+      // Recomputed per (re)connect (RUN-195): the same read-at-use stores dispatch resolution
+      // uses — ManifestStore falls back to the last good manifest on a broken read, and the
+      // WsClient absorbs a thrown refresh by advertising its last good set — so a workflow-file
+      // edit is visible on the next hello, and a broken one can never keep the daemon offline.
+      // Advertise-only either way: dispatch still re-reads and pins its own catalog per run.
+      refreshRepos: () =>
+        Promise.all(
+          repos.map(async (r) => {
+            const manifest = (await manifests.current(r.root)) ?? r.manifest;
+            return repoReport(r, manifest, await workflows.current(r.root, manifest));
+          }),
+        ),
       connect: this.connect,
       // The capacity ledger's view, not a run count (RUN-170): one run's wave is several live
       // processes — and a wave the daemon just granted breadth to is occupied capacity even

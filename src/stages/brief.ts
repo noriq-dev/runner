@@ -151,6 +151,7 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
       ...(shape ? { promptShapeOverride: shape } : {}),
       ...(ledger !== undefined ? { ledger } : {}),
       ...(input.workflow ? { workflow: input.workflow } : {}),
+      promptWarning: (message, details) => host.log.warn(message, details),
     })) as BuildPrompt;
 
   return { repoCtx, checkedSpec, buildPrompt };

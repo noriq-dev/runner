@@ -322,6 +322,18 @@ export function stage(name: StageName): RunStage {
   return found;
 }
 
+const STAGE_NAMES: ReadonlySet<string> = new Set(RUN_STAGES.map((s) => s.name));
+
+/** Whether a raw string names a machine stage (RUN-193). A declared `[stages.<name>]` whose key is
+ *  not one of these is not a pipeline stage — `plan-check` is the recognized non-pipeline key, and
+ *  anything else is a typo the clamp drops. Runtime companion to the `StageName` type. */
+export const isStageName = (name: string): name is StageName => STAGE_NAMES.has(name);
+
+/** The machine actor a declared stage would run under, for building a `WorkflowStage` before the
+ *  clamp overwrites `role` with this same value. Undefined for a non-stage key. */
+export const stageActorFor = (name: StageName): StageActor =>
+  RUN_STAGES.find((s) => s.name === name)?.actor ?? 'none';
+
 /** Every terminal reason the pipeline can produce, deduped. A run that fails for a reason outside
  *  this set means a stage grew one without declaring it. */
 export function declaredTerminals(): readonly string[] {

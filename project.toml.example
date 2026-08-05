@@ -122,14 +122,25 @@ defaultBranch = "main"
 # agent = "codex.gpt-5_6-sol.high"   # a different vendor, in one line
 
 # ---------------------------------------------------------------------------
-# Custom workflows (RUN-119) — named variants of a built-in run kind.
+# Custom workflows (RUN-119/192) — named variants of a built-in run kind.
 # ---------------------------------------------------------------------------
 # A workflow inherits the security POSTURE of its `base` (one of scope/build/verify)
 # and cannot escape it — a scope-based workflow is read-only because scope is, no
 # matter what. What it varies is the PROMPT the agent is briefed with. The three
-# built-ins are always available and need no declaration; a name that collides with
-# one is ignored (you cannot redefine `build`). {{brief}}, {{anchor}}, {{identity}}
-# are available in the prompt.
+# built-ins are always available and need no declaration. Project definitions win
+# over ~/.noriq/workflows definitions and bundled names. The full shape-specific
+# variable dictionary is documented in prompts/README.md; common values include
+# {{identity}}, {{brief}}, {{anchor}}, {{context}}, {{projectKey}}, and task fields.
+#
+# A larger definition can instead live at `.noriq/workflows/docs.toml` (the
+# filename is the workflow name), with a prompt beside it:
+#
+#   base = "scope"
+#   prompt = { file = "docs-plan.md" }
+#
+# Machine-only definitions use the same shape under ~/.noriq/workflows/. Files and
+# their prompt bytes are re-read at dispatch; prompt paths are confined to the repo
+# or the user workflow directory respectively.
 #
 # [workflow.docs]
 # base = "scope"                       # read-only, produces a plan — like scope
@@ -138,6 +149,99 @@ defaultBranch = "main"
 # [workflow.hotfix]
 # base = "build"                       # writes + is gated by verify/land — like build
 # prompt = "Ship the smallest safe fix for {{brief}}. {{anchor}}"
+#
+# ── Per-workflow stages + agent coordinates (RUN-193) ────────────────────────
+# A workflow may also declare its PIPELINE and, per stage, the AGENT COORDINATE
+# that stage's actor runs under. A coordinate picks a MODEL, never a posture —
+# the write floor and stage clamp are runner-side and unreachable here — so a repo
+# can plan with one model, build with a cheaper one, and be judged by a third.
+#
+# Two spellings of one declaration (TOML cannot put an array and a table on one
+# key); the declared SET is the array's entries or the table's keys, so declaring
+# only [stages.review] DECLINES the other optional stages (review, integrate):
+#
+#   stages = ["plan", "execute", "review"]        # names only, every stage inherits
+#
+#   [workflow.audit]
+#   base = "build"
+#   [workflow.audit.stages.review]
+#   agent = "codex.gpt-5_6-sol.high"   # judge this build on a stronger, other-vendor model
+#   [workflow.audit.stages.execute]
+#   agent = "claude.opus-4_8.medium"   # …while the builder runs cheaper
+#
+# Addressable stage keys: plan, plan-check, pattern-map, execute, review (and, in
+# a `.noriq/workflows/<name>.toml` file, `[stages.<name>]`). `plan-check` selects
+# the plan-checker's model without being a pipeline stage. The coordinate sits at
+# the TOP of each stage's ladder — above the dispatch coordinate and every manifest
+# field (`[defaults.<kind>]`, `[verify.agent]`). Only optional stages are declinable;
+# order is always the machine's; an unknown name or malformed coordinate is ignored
+# with a warning, never a gate.
+
+# ── The FILE form: a two-workflow worked example (RUN-192/193) ────────────────
+# A definition too big for an inline `[workflow.<name>]` table lives in its own
+# file at `.noriq/workflows/<NAME>.toml` — the FILENAME is the workflow name, so
+# the file carries `base` / `prompt` / `stages` at the TOP LEVEL, with no
+# `[workflow.<name>]` wrapper. A dispatch selects it by name (`workflow = "plan"`);
+# a project file wins over an inline `[workflow.<name>]` table, which wins over a
+# `~/.noriq/workflows/<name>.toml` machine-local file, which wins over the bundled
+# scope/build/verify name.
+#
+# The two files below are one repo dogfooding its own pipeline: PLAN the work on a
+# cheap-but-careful model, BUILD it on a second vendor, and JUDGE the build on a
+# third. Each `[stages.<name>]` picks only the MODEL its actor runs — the write
+# floor and stage clamp are runner-side and unreachable from here (RUN-118/132), so
+# no coordinate can move a posture.
+#
+# READ THIS BEFORE COPYING: a `[stages.…]` block is a RESTRICTIVE SET, not a set of
+# per-stage overrides. The moment a file declares ANY `[stages.<name>]`, the stages
+# that run become exactly {mandatory ∪ the optional ones you listed} ∩ {stages this
+# base runs} — so an OPTIONAL stage you leave out is DECLINED, and a stage the base
+# does not run is dropped even if you name it. Mandatory stages (prepare, execute,
+# verify, settle) always run; the OPTIONAL, declinable ones are plan, plan-check,
+# pattern-map, review, integrate. A `scope` base runs NONE of those optional stages
+# (they all require a producing workflow), so a scope run's own planner is its
+# `execute` stage — which is why plan/plan-check are illustrated under `build` below,
+# not under `plan`.
+#
+#   ── .noriq/workflows/plan.toml ──   dispatch as  workflow = "plan"
+#   base = "scope"                        # read-only; produces a plan, not a diff.
+#                                         # scope has no optional stages, so listing
+#                                         # execute declines nothing.
+#   [stages.execute]
+#   agent = "claude.fable-5.high"         # the scope run's planner runs on Fable
+#
+#   ── .noriq/workflows/build.toml ──  dispatch as  workflow = "build"
+#   base = "build"                        # writes; verify + review gate it, and it
+#                                         # lands only when [land] is configured.
+#                                         # Every optional stage kept below MUST be
+#                                         # listed, or declaring any one declines it.
+#   [stages.plan]
+#   agent = "claude.fable-5.high"         # planner drafts the spec (task w/o a spec)
+#
+#   [stages.plan-check]
+#   agent = "codex.gpt-5_6-sol.high"      # a second vendor audits that spec
+#
+#   [stages.pattern-map]                  # kept; no agent = inherit the run's model
+#
+#   [stages.execute]
+#   agent = "codex.gpt-5_6-sol.medium"    # the builder writes the diff on Codex
+#
+#   [stages.review]
+#   agent = "claude.opus-4_8.high"        # Opus judges it — a third model
+#
+#   [stages.integrate]                    # kept, so a passing build can still land
+#
+# Two things a copier needs to get right:
+#   • Coordinate spelling — a dotted model version writes its dots as underscores,
+#     so `opus-4_8` means opus-4.8 and `gpt-5_6-sol` means gpt-5.6-sol; a dashed id
+#     with no dots (`fable-5`) is written verbatim. Every string above parses under
+#     the coordinate grammar in src/agent-coordinate.ts.
+#   • Naming a stage's MODEL does not turn the stage ON. `plan-check` and `review`
+#     both run only when this project.toml also carries a `[verify.agent]` section
+#     (see below) — a review coordinate with no `[verify.agent]` names a reviewer
+#     that never spawns; `integrate` lands only when `[land]` is configured. The
+#     deterministic `[verify] cmd` floor is a separate, always-on, zero-token gate
+#     and is left exactly as it is here — the review coordinate does not replace it.
 
 # ── The verify stage: a CHOICE (RUN-61) ──────────────────────────────────────
 # What gates a BUILD run after its agent exits clean, decided by what this

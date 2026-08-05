@@ -35,6 +35,116 @@ exactly what the agent reads. Keep section tags inside lines: a conditional sent
 own leading newline (see `build.md`). The file's trailing newline is stripped; everything else is
 verbatim.
 
+Bundled templates use strict rendering: a variable their call site omitted is a programming error
+and throws. Workflow templates are operator/repo-authored, so they use lenient rendering instead:
+an unknown interpolation becomes `''`, an unknown section is falsy, and the daemon logs one warning
+per unknown name for that render. The warning names both the variable and the template file.
+
+## Workflow templates
+
+One workflow definition may live in any of these places, in precedence order:
+
+1. `.noriq/workflows/<name>.toml` in the project;
+2. `[workflow.<name>]` in `.noriq/project.toml`;
+3. `~/.noriq/workflows/<name>.toml` on this machine;
+4. the bundled `scope`, `build`, or `verify` workflow.
+
+Dedicated files use the same `base` + `prompt` shape as the inline table, and add `[stages.<name>]`
+to pick, per stage, the **agent coordinate** its actor runs under (RUN-193). The filename is the
+workflow name, so the file carries its keys at the top level with no `[workflow.<name>]` wrapper:
+
+```toml
+base = "scope"
+prompt = { file = "docs-plan.md" }
+```
+
+A worked two-file example — one repo expressing its own pipeline: plan on a cheap-but-careful model,
+build on a second vendor, judge the build on a third. **A `[stages.…]` block is a restrictive set,
+not a bag of per-stage overrides:** declaring any `[stages.<name>]` makes the stages that run exactly
+`{mandatory ∪ the optional ones you listed} ∩ {stages this base runs}`, so an optional stage you
+leave out is *declined*, and a stage the base does not run is dropped even if you name it. Mandatory
+stages (`prepare`, `execute`, `verify`, `settle`) always run; the optional, declinable ones are
+`plan`, `plan-check`, `pattern-map`, `review`, `integrate`. A `scope` base runs none of those
+optional stages — a scope run's own planner is its `execute` stage — which is why `plan`/`plan-check`
+appear under `build.toml`, not under `plan.toml`. Copy these into `.noriq/workflows/` and dispatch
+with `workflow = "plan"` / `workflow = "build"`:
+
+```toml
+# .noriq/workflows/plan.toml — a read-only scoping run; its planner is `execute`
+base = "scope"
+
+[stages.execute]
+agent = "claude.fable-5.high"           # the scope run's planner runs on Fable
+```
+
+```toml
+# .noriq/workflows/build.toml — writes, then verify + review gate it; lands only
+# when [land] is set. Every optional stage kept MUST be listed (declaring any one
+# declines the rest).
+base = "build"
+
+[stages.plan]
+agent = "claude.fable-5.high"           # planner drafts the spec (task without one)
+
+[stages.plan-check]
+agent = "codex.gpt-5_6-sol.high"        # a second vendor audits that spec
+
+[stages.pattern-map]                    # kept; no agent = inherit the run's model
+
+[stages.execute]
+agent = "codex.gpt-5_6-sol.medium"      # the builder writes the diff on Codex
+
+[stages.review]
+agent = "claude.opus-4_8.high"          # Opus judges it — a third model
+
+[stages.integrate]                      # kept, so a passing build can still land
+```
+
+A coordinate escapes a dotted model version's dots as underscores (`opus-4_8` is opus-4.8,
+`gpt-5_6-sol` is gpt-5.6-sol; a dashless id like `fable-5` is written verbatim), picks a MODEL and
+never a posture, and degrades to a warning — never a gate — when it is malformed or names a key that
+is not `plan` / `plan-check` / `pattern-map` / `execute` / `review`. Naming a stage's model does not
+turn the stage on: `plan-check` and `review` run only when the repo's `.noriq/project.toml` also
+carries a `[verify.agent]` section, `integrate` lands only when `[land]` is configured, and the
+deterministic `[verify] cmd` floor is a separate, always-on gate the coordinate does not replace.
+
+An inline string remains valid (`prompt = "Survey {{brief}}"`). A prompt file is resolved beside
+the TOML that names it. Project prompts are confined to the repository; machine-local prompts are
+confined to `~/.noriq/workflows`, not the wider home directory. Both the definition and prompt are
+re-read for each dispatch and then pinned for that run.
+
+The dictionaries below are exact. `null` interpolates as empty and is falsy in a section; `''` is
+also falsy. Extra supplied values are harmless. A misspelled name is not an alias for anything.
+
+Common to `scope`, `build`, and `verify` custom prompts:
+
+- `identity`: the rendered daemon-owned identity header;
+- `label`, `agentId`, `kind`, `projectKey`, `projectId`, `server`: identity and project facts;
+- `runId`, `repoRef`, `workflow`, `planId`: run/repository/workflow facts (`planId` is otherwise null);
+- `taskId`, `taskKey`, `taskTitle`, `taskBody`: anchor task facts, or `null` without that fact;
+- `brief`, `anchor`: the dispatched brief and rendered task/plan anchor;
+- `context`: author context for scope/build; bounded names-only quoted context for verify.
+
+`scope` adds `spec`, the rendered execution spec or `''`.
+
+`build` adds:
+
+- `spec`: the rendered execution spec or `''`;
+- `verifyCmd`: the deterministic verify command or `null`;
+- `reviewer`: boolean, true only when an inline reviewer is configured.
+
+`verify` adds:
+
+- `spec`: always `''`; judging actors do not receive the author's working spec;
+- `specs`: the dispatched brief plus anchor, which the daemon later repeats as task intent;
+- `diffCmd`: the backend's diff command or `null`;
+- `acceptance`: the numbered acceptance checklist or `null`;
+- `acceptanceOverflow`: how many criteria did not fit, normally `0`.
+
+A verify-based custom template does not become the outer verifier prompt. Its rendered text is
+quoted as repo/operator-controlled workflow guidance inside `verify-agent.md`; acceptance handling,
+independent-review rules, and the daemon's verdict instructions remain after it.
+
 `{{context}}` is the repo's own orientation block (`[context]` in `.noriq/project.toml`, RUN-128),
 resolved by `src/repo-context.ts` from the **run's workspace** — not the discovered checkout, which
 may be on a different branch. It carries its own leading blank line, so inline the tag

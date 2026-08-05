@@ -56,6 +56,33 @@ describe('ParkedStore survives the daemon (RUN-30)', () => {
     expect(ws?.location).toEqual({ repoRoot: '/repos/repo_a', branch: 'noriq/run/run_1' });
   });
 
+  it('round-trips the dispatch workflow snapshot across a daemon restart (RUN-192)', async () => {
+    const f = file();
+    await new ParkedStore(f).park(
+      entry({
+        workflowCatalog: {
+          definitions: {
+            audit: {
+              base: 'verify',
+              prompt: 'Audit {{brief}}',
+              promptSource: '/repo/.noriq/workflows/audit.md',
+              stages: null,
+              description: null,
+              source: '/repo/.noriq/workflows/audit.toml',
+              tier: 'project-file',
+            },
+          },
+        },
+      }),
+    );
+
+    const restored = await new ParkedStore(f).get('run_1');
+    expect(restored?.workflowCatalog?.definitions.audit).toMatchObject({
+      base: 'verify',
+      prompt: 'Audit {{brief}}',
+    });
+  });
+
   it('drops a pre-RUN-50 park (no workspace) instead of resuming what it cannot read', async () => {
     const f = file();
     // The old loose fields, and no workspace — what a pre-RUN-50 daemon wrote.

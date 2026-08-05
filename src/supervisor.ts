@@ -11,7 +11,12 @@ import type {
 } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
-import { type AcceptanceItem, acceptanceOverflow, enumerateAcceptance } from './acceptance';
+import {
+  type AcceptanceItem,
+  acceptanceOverflow,
+  enumerateAcceptance,
+  renderAcceptanceChecklist,
+} from './acceptance';
 import {
   type Finding,
   type FindingResponse,
@@ -28,7 +33,12 @@ import {
   subclaimsOf,
   taskRefsIn,
 } from './adjudication';
-import { type AgentCoordinate, coordinateFromParts, tryParseCoordinate } from './agent-coordinate';
+import {
+  type AgentCoordinate,
+  coordinateFromParts,
+  foldStageCoordinate,
+  tryParseCoordinate,
+} from './agent-coordinate';
 import type { ParkState, RunAgent, SpinOffProvenance } from './client';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
@@ -60,7 +70,7 @@ import type { LockConflict } from './lock-client';
 import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
 import { type ParkedRun, type ParkedStore, expiredParks, resumePrompt } from './parked';
-import { renderPrompt, renderTemplate } from './prompts';
+import { renderPrompt, renderUserTemplate } from './prompts';
 import { buildRepairSpec } from './repair';
 import { type DocReader, type PathProbe, loadRepoContextBrief } from './repo-context';
 import { type RepoIntel, hasFacts, renderRepoFacts } from './repo-intel';
@@ -111,12 +121,15 @@ import {
 import { assembleReviewerPrompt, reviewerContestPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
 import {
   BUILTIN_WORKFLOWS,
+  type StageCoordinateKey,
   type Workflow,
   clampPermissionToWorkflow,
   resolveWorkflow,
   runWorkflow,
+  stageCoordinate,
   workflowFor,
 } from './workflow';
+import type { WorkflowCatalog } from './workflow-store';
 
 // Wires the two core run kinds through a real cycle: resolve the repo → prepare an
 // isolated worktree (scope/verify read-only, build read-write) → assemble the
@@ -172,6 +185,8 @@ export type SupervisorVcs = Pick<
 export interface ResolvedRepo {
   root: string;
   manifest: ProjectManifest;
+  /** Freshly loaded at dispatch and pinned with this resolved repo for the run. */
+  workflowCatalog?: WorkflowCatalog;
   /**
    * This repo's backend (RUN-60), when it is not the machine default — the daemon detects per
    * repo (git by `.git`, Diversion by the dv registry) and routes here. Omitted → `deps.vcs`,
@@ -421,7 +436,12 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  * (a `docs` workflow based on `scope` is read-only), so the base wins over whatever `kind` the
  * dispatch carried. This closes the footgun where a UI (or any client) selects a read-only workflow
  * but leaves `kind = build`: the daemon holds the manifest and decides, so a mismatched dispatched
- * kind can never escalate write. No workflow (or an unknown name) → the dispatched `kind` stands.
+ * kind can never escalate write. With no explicit selection, a loaded definition matching the
+ * kind wins by RUN-192's source precedence; with no such definition, the dispatched `kind` stands.
+ * An unknown EXPLICIT name also leaves the kind standing here — but no dispatch reaches this with
+ * one any more: prepare refuses a selected name that does not resolve (RUN-196) before anything is
+ * acquired, so that arm is the posture fail-safe for the paths that skip prepare's gate (parked
+ * rehydration, `waveFor`, `startAgent`'s clamp), not a dispatch behaviour.
  *
  * `promptShape` is the base kind by construction — a built-in's is its own id, a custom's is
  * inherited from its base — so it doubles as the posture kind.
@@ -435,9 +455,9 @@ export function resolveAgentTool(run: Pick<Run, 'agent' | 'agentTool' | 'model' 
  */
 export function effectiveKind(
   run: Pick<Run, 'kind' | 'workflow'>,
-  manifest: Pick<ProjectManifest, 'workflows'>,
+  source: Pick<ProjectManifest, 'workflows'> | WorkflowCatalog,
 ): RunKind {
-  const wf = run.workflow ? resolveWorkflow(run.workflow, manifest) : undefined;
+  const wf = resolveWorkflow(run.workflow ?? run.kind, source);
   const kind = (wf?.promptShape ?? run.kind) as RunKind;
   // A kind outside the union degrades to SCOPE rather than being passed through. Everything
   // downstream indexes a fixed-key record with this — `manifest.permissions[kind]`,
@@ -467,6 +487,23 @@ export function resolveModel(
   // "absent" as "don't pass it", which is what lets the tool apply its own default.
   return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
+
+/**
+ * Replace a prepared start's model/effort with a stage's resolved pair (RUN-193). The prepared
+ * values are dropped FIRST: a stage coordinate that names a different vendor severs the model to the
+ * tool's default, and spreading over `...prepared.start` would otherwise leave the prepared model —
+ * the wrong vendor's — behind. With no stage coordinate the resolved pair equals the prepared one,
+ * so this is a no-op there.
+ */
+const withStageModel = (
+  start: Omit<DriverStartOptions, 'handlers' | 'env'>,
+  resolved: { model?: string; effort?: RunEffort },
+): Omit<DriverStartOptions, 'handlers' | 'env'> => {
+  // Overwrite rather than merge: a stage coordinate that names a different vendor severs the model
+  // to the tool's default, so the prepared model/effort (the wrong vendor's) must be REPLACED, not
+  // filled in behind. Absent → undefined, which the drivers read as "don't pass it".
+  return { ...start, model: resolved.model, effort: resolved.effort };
+};
 
 /** Sum two model mixes model-by-model, field-by-field (RUN-59). Absent on both sides → absent. */
 export const mergeModelUsage = (
@@ -821,9 +858,13 @@ export function assemblePrompt(
     promptShapeOverride?: 'planner' | 'plan-checker' | 'pattern-mapper';
     /** The adjudication ledger, for the plan checker's own prior-rounds section (RUN-141). */
     ledger?: string;
+    /** User-template diagnostics. The default is quiet for pure callers; production binds the
+     *  daemon logger in buildRunBrief. */
+    promptWarning?: (message: string, details: { variable: string; source: string }) => void;
   },
 ): string {
   const anchor = renderAnchor(run, ctx.task);
+  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   // The daemon created this identity before the process existed and handed it a token that
   // can only be this agent, so there is nothing to register (RUN-43). The old prompt asked
   // the model to call set_agent_identity — which made attribution depend on it complying,
@@ -847,7 +888,7 @@ export function assemblePrompt(
           ? 'PLAN CHECK'
           : ctx.promptShapeOverride === 'pattern-mapper'
             ? 'PATTERN MAP'
-            : run.kind.toUpperCase(),
+            : wf.promptShape.toUpperCase(),
     projectKey: manifest.key,
     server: ctx.server,
     // The planner and the checker are spawned with NO `noriqMcp` (RUN-140/141), so the shared
@@ -861,7 +902,6 @@ export function assemblePrompt(
   // families. A custom workflow's own prompt receives it as `{{context}}` but must PLACE that tag
   // to get it — a template we do not control cannot have text injected into it. The verify family
   // gets the NAMES-ONLY rendering instead (RUN-154), for the reason below.
-  const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   // Which rendering an actor gets follows what it IS, not which template it uses. `verifyActor` is
   // the flag that means "this one judges" — so a repo-defined workflow based on `verify` (RUN-119)
   // gets the bounded, explicitly-untrusted block through its own `{{context}}` too, instead of 16k
@@ -902,19 +942,67 @@ export function assemblePrompt(
       ledger: ctx.ledger ?? '',
     });
   }
-  if (wf.promptRef) {
-    // A repo-defined workflow's own brief (RUN-121), rendered with the SAME vars the built-in
-    // templates get — an author places {{identity}} / {{brief}} / {{anchor}} as they need. The
-    // workflow's inherited posture (write floor, gates) still governs everything else.
-    return renderTemplate(wf.promptRef, {
+  if (wf.promptRef !== null && wf.promptRef !== undefined) {
+    const template = wf.promptRef;
+    const common = {
       identity,
+      label: ctx.agent.label,
+      agentId: ctx.agent.agentId,
+      kind: wf.promptShape.toUpperCase(),
+      projectKey: manifest.key,
+      projectId: run.projectId,
       server: ctx.server,
+      runId: run.id,
+      repoRef: run.repoRef,
+      workflow: wf.id,
+      planId: run.anchor?.type === 'plan' ? run.anchor.planId : null,
+      taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+      taskKey: ctx.task?.key ?? null,
+      taskTitle: ctx.task?.title ?? null,
+      taskBody: ctx.task?.body ?? null,
       brief: run.brief,
       anchor,
       context: repoContext,
+    };
+    const source = wf.promptSource ?? '.noriq/project.toml';
+    const render = (vars: Parameters<typeof renderUserTemplate>[1]) =>
+      renderUserTemplate(template, vars, { source, warn: ctx.promptWarning });
+
+    if (wf.promptShape === 'verify') {
+      const acceptance = ctx.acceptance?.length
+        ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
+        : null;
+      const workflowPrompt = render({
+        ...common,
+        // Kept for templates written before criteria were structured. A verify actor receives no
+        // author spec; `acceptance` is its execution-definition input.
+        spec: '',
+        specs: `${run.brief}${anchor}`,
+        diffCmd: ctx.diffCmd ?? null,
+        acceptance,
+        acceptanceOverflow: ctx.acceptanceOverflow ?? 0,
+      });
+      return assembleVerifyPrompt(`${run.brief}${anchor}`, {
+        agent: ctx.agent,
+        server: ctx.server,
+        diffCmd: ctx.diffCmd,
+        repoContext,
+        workflowPrompt,
+        ...(ctx.acceptance?.length
+          ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+          : {}),
+      });
+    }
+
+    return render({
+      ...common,
       spec: executionSpec,
-      verifyCmd: manifest.verify?.cmd ?? '',
-      reviewer: manifest.verify?.agent ? 'true' : '',
+      ...(wf.promptShape === 'build'
+        ? {
+            verifyCmd: manifest.verify?.cmd ?? null,
+            reviewer: Boolean(manifest.verify?.agent),
+          }
+        : {}),
     });
   }
   if (wf.promptShape === 'scope') {
@@ -1125,7 +1213,7 @@ export class RunSupervisor {
     // non-producing run (scope, verify) whose steps overlap must not receive writable child trees
     // when its parent tree is read-only. The permission clamp already denies the edit tools
     // (RUN-118); this keeps the worktree-level floor symmetric with the sitting that leased first.
-    const readOnly = !runWorkflow(run, repo.manifest).worktreeWritable;
+    const readOnly = !runWorkflow(run, repo.workflowCatalog ?? repo.manifest).worktreeWritable;
     return {
       // All three run-addressed pieces, or none: a backend (or fake) that declares overlap but
       // lacks the return-trip verbs cannot bring a child's work back, and absence is defined as
@@ -1891,42 +1979,55 @@ export class RunSupervisor {
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
+    // The review stage's coordinate (RUN-193) sits at the TOP of this ladder, above `[verify.agent]`
+    // — a workflow whose point is a harder look ("audit") says so on the stage rather than by moving
+    // the one setting every other workflow shares. Resolved HERE from the run + the pinned catalog,
+    // not threaded in: runReviewer is reached by two entry paths (a finished run and one resumed in
+    // another process, RUN-30) and only the first ever assembled a context to thread — the same
+    // reason `reviewerContext` resolves at the point of use.
+    const stageCoord = stageCoordinate(
+      runWorkflow(ctx.run, ctx.repo.workflowCatalog ?? ctx.repo.manifest),
+      'review',
+      this.log,
+    );
     // The reviewer as a coordinate (RUN-113): `[verify.agent].agent = "codex.gpt-5_6-sol.high"`
-    // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields.
-    //
-    // RUN-132 gives the workflow's `review` stage a coordinate slot of its own, which belongs in
-    // this ladder above `[verify.agent]` — a workflow whose point is a harder look ("audit") should
-    // say so on the stage rather than by moving the one setting every other workflow shares. It is
-    // NOT wired here, and deliberately: `WorkflowDef` is the VENDORED wire contract and carries
-    // `base` + `prompt` only, so nothing can set a stage coordinate and the branch would be
-    // unreachable. When the phase-3 vendor refresh grows the field this method needs the run's
-    // workflow threaded in (it has `ctx.run` + the manifest but does not resolve one today) and
-    // `stageOf(wf, 'review')?.agent` folded in ahead of `reviewer?.agent` — which means it also
-    // has to enter the tool/model/effort precedence below, not just the coordinate parse.
+    // names tool+model+effort in one string and WINS over the legacy tool/model/effort fields — but
+    // the stage coordinate above wins over both.
     const reviewerCoord = reviewer?.agent ? tryParseCoordinate(reviewer.agent) : null;
-    const reviewerTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
-    // The reviewer's driver (RUN-70): the repo may put a different VENDOR's model in judgment —
-    // the strongest form of the reviewer's independence. Fail-closed when the named tool has no
-    // driver here: silently reviewing with the builder's own vendor would defeat the choice, the
-    // same reasoning that makes an absent `shell` pin fail the cmd gate outright (RUN-42).
+    // The `[verify.agent]` + `[defaults.verify]` answer — the pre-RUN-193 ladder, UNCHANGED: the
+    // `.agent` coordinate over the legacy `.tool/.model/.effort` fields, and `[defaults.verify]`
+    // severed only when `[verify.agent]` itself named a tool (a model id is not portable across
+    // vendors). This is the fallback the stage coordinate then folds over.
+    const verifyTool = reviewerCoord?.tool ?? reviewer?.tool ?? null;
+    const verifyFallback = {
+      tool: verifyTool ?? ctx.driver.tool,
+      model:
+        reviewerCoord?.model ??
+        reviewer?.model ??
+        (verifyTool ? null : (manifest.defaults?.verify?.model ?? null)),
+      effort: reviewerCoord?.effort ?? reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null,
+    };
+    // The review stage coordinate on TOP (RUN-193), through the SAME `foldStageCoordinate` every
+    // other spawn uses — so a stage tool that differs from `[verify.agent]`'s severs its model too,
+    // not only `[defaults.verify]`'s. The hand-rolled `?? reviewerCoord?.model` ladder leaked exactly
+    // there: `[stages.review] agent = "codex"` inherited `[verify.agent]`'s claude model onto codex.
+    const resolved = foldStageCoordinate(stageCoord, verifyFallback);
+    // Whether a tool was NAMED at all (stage or `[verify.agent]`) — the run's own driver otherwise.
+    const reviewerTool = stageCoord?.tool ?? verifyTool;
+    // The reviewer's driver (RUN-70): the repo — or now the workflow's review stage (RUN-193) — may
+    // put a different VENDOR's model in judgment, the strongest form of the reviewer's independence.
+    // Fail-closed when the named tool has no driver here: silently reviewing with the builder's own
+    // vendor would defeat the choice, the same reasoning that fails an absent `shell` pin (RUN-42).
     const driver = reviewerTool ? this.deps.drivers[reviewerTool as AgentTool] : ctx.driver;
     if (!driver) {
       return {
         verdict: 'unknown',
         passed: false,
-        findings: `the manifest asks for a '${reviewerTool}' reviewer but this runner has no such driver — install the tool on this machine or change [verify.agent]`,
+        findings: `a '${reviewerTool}' reviewer was asked for (the workflow's review stage or [verify.agent]) but this runner has no such driver — install the tool on this machine or change the coordinate`,
       };
     }
-    // The reviewer's own model/effort, else the repo's verify defaults — the same ladder a
-    // dispatched verify run climbs (RUN-33), because this is the same role inlined. EXCEPT when
-    // the reviewer names its own tool: model names are vendor-specific and [defaults.verify]
-    // may name the other vendor's, so the fallback is severed and the tool's own default holds.
-    // Effort still falls through — it is tool-agnostic intent, mapped per driver.
-    const model =
-      reviewerCoord?.model ??
-      reviewer?.model ??
-      (reviewerTool ? null : (manifest.defaults?.verify?.model ?? null));
-    const effort = reviewerCoord?.effort ?? reviewer?.effort ?? manifest.defaults?.verify?.effort ?? null;
+    const model = resolved.model;
+    const effort = resolved.effort;
     // The diff since the fork, for a git-shaped backend. checkpoint() has already committed the
     // work, so a bare `git diff` shows nothing — the range is the review. A live backend
     // (Perforce/Diversion) has no git to ask; the prompt points at the working tree instead.
@@ -2771,6 +2872,10 @@ export class RunSupervisor {
     const runSpend = ctx.tally.total();
     await this.deps.parked.park({
       run,
+      // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
+      // editing a workflow while the question is open affects the next dispatch only, including
+      // when the daemon restarts before the answer arrives.
+      ...(ctx.repo.workflowCatalog ? { workflowCatalog: ctx.repo.workflowCatalog } : {}),
       sessionId,
       agentId: ctx.runAgent.agentId,
       agentLabel: ctx.runAgent.label,
@@ -2885,16 +2990,37 @@ export class RunSupervisor {
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     };
 
-    const repo = await this.deps.resolveRepo(run.repoRef);
-    if (!repo) return fail(`repo not found for repoRef ${run.repoRef}`);
-    const kind = effectiveKind(run, repo.manifest); // RUN-126: a workflow's base posture is authoritative
+    const currentRepo = await this.deps.resolveRepo(run.repoRef);
+    if (!currentRepo) return fail(`repo not found for repoRef ${run.repoRef}`);
+    // Re-resolve the repository because the task/spec and manifest may legitimately move during a
+    // 72-hour park, but keep the workflow snapshot this dispatch prepared under (RUN-192). Without
+    // this overlay, changing a verify-based definition to build while it waits grants the resumed
+    // session build posture and runs the producing pipeline. A park written before RUN-192 has no
+    // snapshot and retains the old best-effort fallback to the current catalog.
+    const repo = entry.workflowCatalog
+      ? { ...currentRepo, workflowCatalog: entry.workflowCatalog }
+      : currentRepo;
+    const workflowSource = repo.workflowCatalog ?? repo.manifest;
+    const kind = effectiveKind(run, workflowSource); // RUN-126: a workflow's base posture is authoritative
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
     // posture either way; what the named one adds is its declared stage list.
-    const wf = runWorkflow(run, repo.manifest);
-    const tool = resolveAgentTool(run); // the coordinate's tool (RUN-114), else agentTool
+    const wf = runWorkflow(run, workflowSource);
+    // The builder's coordinate (RUN-193), resolved the SAME way `prepare` does — the execute stage's
+    // agent on top of the dispatch coordinate. Not honoring it here would resume a build that ran on
+    // codex onto claude: the parked session belongs to the coordinate's driver, so restoring it on
+    // any other is a session that cannot resume, not merely a wrong model.
+    const execCoord = stageCoordinate(wf, 'execute', this.log);
+    const tool = execCoord?.tool ?? resolveAgentTool(run); // the coordinate's tool (RUN-114/193)
     const driver = this.deps.drivers[tool as AgentTool];
     if (!driver) return fail(`no driver for tool ${tool}`);
     if (!entry.sessionId) return fail('parked run has no session to resume');
+    // The model/effort with the execute stage coordinate folded on top (RUN-193), through the same
+    // fold every spawn uses — so a resumed session, and the chain steps that spread this `start`,
+    // run under the coordinate the fresh build did.
+    const resumeModelEffort = foldStageCoordinate(execCoord, {
+      tool: resolveAgentTool(run),
+      ...resolveModel(run, repo.manifest),
+    });
 
     // The workspace is REUSED, never re-leased: it holds the work the agent did before it
     // asked, and the session it is about to resume expects to find it exactly as it left it.
@@ -2965,10 +3091,11 @@ export class RunSupervisor {
       permission: clampPermissionToWorkflow(repo.manifest.permissions[kind], wf),
       noriqMcp,
       multiTurn: wf.produces && Boolean(repo.manifest.verify),
-      // The same model it was running before it parked (RUN-33): the session being resumed is
-      // that model's conversation, and quietly finishing the job on a different one would make
-      // "resumed with its context intact" only half true.
-      ...resolveModel(run, repo.manifest),
+      // The same model it was running before it parked (RUN-33/193): the session being resumed is
+      // that model's conversation — the execute-stage coordinate included — and quietly finishing
+      // the job on a different one would make "resumed with its context intact" only half true.
+      ...(resumeModelEffort.model ? { model: resumeModelEffort.model } : {}),
+      ...(resumeModelEffort.effort ? { effort: resumeModelEffort.effort } : {}),
       // The REMAINDER, reserved from the tally above (RUN-133) — one allocator for every session
       // a run spawns, rather than a resume-only helper beside a reviewer that had none.
       budget: reservation.budget,
@@ -3026,7 +3153,7 @@ export class RunSupervisor {
           runAgent,
           kind,
           ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
-          ...(run.workflow ? { workflow: wf } : {}),
+          workflow: wf,
         }).catch((err) => {
           this.log.warn('could not rebuild the brief on resume — later steps will not run', {
             runId,
@@ -3257,6 +3384,49 @@ export class RunSupervisor {
   }
 
   /**
+   * The driver + model/effort a PRE-EXECUTION stage runs under (RUN-193): the workflow's stage
+   * coordinate on TOP of the run's prepared coordinate (the sub-ladder locked decision #2 names).
+   *
+   * These stages — planner, plan-checker, pattern-mapper — are NEVER fatal, so their missing-driver
+   * behaviour differs from the mandatory `execute` stage's: a coordinate naming a tool this machine
+   * has no driver for does NOT refuse the run, it falls back to the prepared driver with a warn
+   * (and drops the stage's model with it — a model id is not portable to another vendor's driver),
+   * because losing the enrichment entirely is worse than producing it on the run's own driver. When
+   * the tool IS present, `foldStageCoordinate` layers the coordinate over the prepared model/effort
+   * with the same sever-unless-same-tool rule the reviewer uses.
+   */
+  private resolveStageAgent(
+    coord: AgentCoordinate | null,
+    prepared: PreparedRun,
+    runId: string,
+    stage: StageCoordinateKey,
+  ): { driver: AgentDriver; model?: string; effort?: RunEffort } {
+    const inherited = {
+      ...(prepared.start.model ? { model: prepared.start.model } : {}),
+      ...(prepared.start.effort ? { effort: prepared.start.effort } : {}),
+    };
+    if (!coord) return { driver: prepared.driver, ...inherited };
+    const staged = this.deps.drivers[coord.tool as AgentTool];
+    if (!staged) {
+      this.log.warn(
+        `the ${stage} stage names a '${coord.tool}' agent but this runner has no such driver — using the run's driver`,
+        { runId, tool: coord.tool },
+      );
+      return { driver: prepared.driver, ...inherited };
+    }
+    const folded = foldStageCoordinate(coord, {
+      tool: prepared.driver.tool,
+      model: prepared.start.model ?? null,
+      effort: prepared.start.effort ?? null,
+    });
+    return {
+      driver: staged,
+      ...(folded.model ? { model: folded.model } : {}),
+      ...(folded.effort ? { effort: folded.effort } : {}),
+    };
+  }
+
+  /**
    * Run the `plan` stage when it applies, and fold its result into the builder's brief (RUN-140).
    *
    * Returns `prepared.start` untouched whenever planning does not apply or does not work, which is
@@ -3297,6 +3467,15 @@ export class RunSupervisor {
     // re-runs the planner fresh with the Q&A appended. Deliberately UNCAPPED: every iteration
     // costs a human an answer, which is the strongest rate limiter this system has — and a cap
     // would walk the pipeline on while the server still shows the run blocked on an open question.
+    // The planner's own coordinate (RUN-193): `[stages.plan] agent` on top of the run's prepared
+    // coordinate. A model choice only — the planner keeps `plannerPermission`'s narrowing and the
+    // escalation-pair MCP below whatever model it runs on.
+    const planAgent = this.resolveStageAgent(
+      stageCoordinate(prepared.workflow, 'plan', this.log),
+      prepared,
+      run.id,
+      'plan',
+    );
     let answerBlock = '';
     let planned: PlanOutcome = null;
     for (;;) {
@@ -3304,12 +3483,12 @@ export class RunSupervisor {
         run,
         repo: prepared.repo,
         worktree: prepared.worktree,
-        driver: prepared.driver,
+        driver: planAgent.driver,
         runAgent: prepared.runAgent,
         tally: prepared.tally,
         prompt: `${prepared.plannerPrompt}${answerBlock}`,
         start: {
-          ...prepared.start,
+          ...withStageModel(prepared.start, planAgent),
           permission: plannerPermission(prepared.permission),
           // The ESCALATION PAIR and nothing else. The planner used to get NO MCP at all (RUN-140):
           // the full floor grants writes the filesystem clamp says nothing about — `update_task`,
@@ -3452,13 +3631,21 @@ export class RunSupervisor {
       return `${renderAnalogs(m.analogs)}${renderRepoFacts(cached ?? m.facts)}`;
     };
 
+    // The mapper's own coordinate (RUN-193): `[stages.pattern-map] agent` on top of the prepared
+    // coordinate. Resolved once and reused across the answered re-run below.
+    const mapAgent = this.resolveStageAgent(
+      stageCoordinate(prepared.workflow, 'pattern-map', this.log),
+      prepared,
+      run.id,
+      'pattern-map',
+    );
     const map = await mapPatterns(this.patternMapHost(prepared.tally), {
       run,
-      driver: prepared.driver,
+      driver: mapAgent.driver,
       checked,
       prompt: prepared.mapperPrompt(checked),
       start: {
-        ...prepared.start,
+        ...withStageModel(prepared.start, mapAgent),
         permission: plannerPermission(prepared.permission),
         // The escalation pair, like the planner (see that site for the whole argument).
         noriqMcp: prepared.noriqMcp,
@@ -3486,11 +3673,11 @@ export class RunSupervisor {
       answerBlock += renderPrompt('stage-answer', answered);
       current = await mapPatterns(this.patternMapHost(prepared.tally), {
         run,
-        driver: prepared.driver,
+        driver: mapAgent.driver,
         checked,
         prompt: `${prepared.mapperPrompt(checked)}${answerBlock}`,
         start: {
-          ...prepared.start,
+          ...withStageModel(prepared.start, mapAgent),
           permission: plannerPermission(prepared.permission),
           noriqMcp: prepared.noriqMcp,
           noriqTools: STAGE_NORIQ_TOOLS,
@@ -3541,18 +3728,26 @@ export class RunSupervisor {
     const reviewer = prepared.repo.manifest.verify?.agent;
     if (!reviewer) return { checked: planned.checked, findings: '' };
 
+    // The plan-checker's own coordinate (RUN-193): `[stages.plan-check] agent` — a key that selects
+    // this actor's model without being a pipeline stage — on top of the prepared coordinate.
+    const checkAgent = this.resolveStageAgent(
+      stageCoordinate(prepared.workflow, 'plan-check', this.log),
+      prepared,
+      run.id,
+      'plan-check',
+    );
     // One answered re-run (RUN-190): a checker that paused the run gets the answer appended and a
     // fresh look; a second pause stands as an unjudged plan, which never gates anyway.
     let answerBlock = '';
     for (;;) {
       const result = await checkPlan(this.planCheckHost(planned, prepared.tally, planned.envelope), {
         run,
-        driver: prepared.driver,
+        driver: checkAgent.driver,
         checked: planned.checked,
         maxRounds: reviewer.maxRounds,
         prompt: (spec, ledger) => `${prepared.checkerPrompt(spec, ledger)}${answerBlock}`,
         start: {
-          ...prepared.start,
+          ...withStageModel(prepared.start, checkAgent),
           // Same narrowing as the planner's, and for the same two reasons: `auto` survives the write
           // clamp, and a filesystem clamp says nothing about the control plane. A checker emits a
           // report and nothing else — plus, now, the escalation pair (see the planner site).
@@ -3754,7 +3949,7 @@ export class RunSupervisor {
     const continued = ctx.continued ?? null;
     // The run's workflow (RUN-117), the NAMED one when the repo defines it (RUN-132) — same
     // posture either way; what the named one adds is its declared stage list.
-    const wf = runWorkflow(run, repo.manifest);
+    const wf = runWorkflow(run, repo.workflowCatalog ?? repo.manifest);
 
     // The pipeline as an explicit SEQUENCE (RUN-131). What used to be ~390 lines of gates in one
     // method is now `stagesFor(wf)` — a declared, ordered list this loop walks, so the two flag

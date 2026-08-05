@@ -123,6 +123,56 @@ describe('pulling a spec out of a planner’s answer', () => {
   });
 });
 
+describe('a spec that did not parse gets ONE repair turn (RUN-197)', () => {
+  // The live failure: a planner streamed a complete spec, ended its turn mid-JSON, and the run
+  // proceeded unplanned with the whole plan one `continueWith` away from an already-open session.
+  it('feeds the failure back through the open session and takes the re-emission', async () => {
+    let repairPrompt = '';
+    const base = driverSaying('unused');
+    const drv: AgentDriver = {
+      ...base,
+      start: (opts: DriverStartOptions) => {
+        const exit: DriverExit = {
+          outcome: 'done',
+          isError: false,
+          reason: null,
+          telemetry: zeroTelemetry(),
+        };
+        queueMicrotask(() => {
+          opts.handlers?.onText?.('```json\n{"requirementIds":["R1"], "anticipatedFiles": ['); // cut mid-stream
+          opts.handlers?.onExit?.(exit);
+        });
+        return {
+          runId: opts.runId,
+          pushInput: () => true,
+          interrupt: async () => {},
+          stop: async () => {},
+          done: async () => exit,
+          continueWith: async (feedback: string) => {
+            repairPrompt = feedback;
+            opts.handlers?.onText?.('\n```json\n{"requirementIds":["R1"]}\n```');
+            return exit;
+          },
+        };
+      },
+    };
+    const h = host();
+    const planned = await planRun(h, input(drv));
+    expect(planned).not.toBeNull();
+    expect(planned!.checked.spec.requirementIds).toEqual(['R1']);
+    expect(repairPrompt).toContain('could not be read'); // the exact failure rides the turn
+    expect(h.milestones.some((m) => m.includes('asking the planner to re-emit'))).toBe(true);
+    await planned!.close(planned!.checked);
+  });
+
+  it('a repair that also fails leaves the run exactly as unplanned as before', async () => {
+    const h = host();
+    // driverSaying's continueWith returns done with NO new text — the repair yields nothing.
+    const planned = await planRun(h, input(driverSaying('nothing like json here')));
+    expect(planned).toBeNull();
+  });
+});
+
 describe('the plan stage', () => {
   it('plans, checks the result, and writes it back to the task', async () => {
     const h = host();

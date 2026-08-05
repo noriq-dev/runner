@@ -28,6 +28,7 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   tool: null,
   defaultBranch: null,
   land: null,
+  setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
   defaults: { scope: noModel(), build: noModel(), verify: noModel() },
   workflows: {},
@@ -78,6 +79,12 @@ const driver: AgentDriver = {
   catalog: { models: [], efforts: [] },
   start: () => ({}) as DriverSession,
 };
+const codexDriver: AgentDriver = {
+  tool: 'codex',
+  capabilities: CAPS,
+  catalog: { models: [], efforts: [] },
+  start: () => ({}) as DriverSession,
+};
 
 const ws = (over: Partial<Workspace> = {}): Workspace => ({
   runId: 'run_1',
@@ -104,6 +111,9 @@ function harness(
   over: {
     repo?: ResolvedRepo | null;
     driver?: AgentDriver | undefined;
+    /** A per-tool driver table (RUN-193): when present, `driverFor` keys by the requested tool, so
+     *  a stage coordinate naming another vendor selects (or fails to find) the right driver. */
+    drivers?: Record<string, AgentDriver | undefined>;
     claimGate?: { claimable: boolean; reason: string | null } | null;
     claimThrows?: boolean;
     leaseThrows?: string;
@@ -164,7 +174,8 @@ function harness(
     resolveRepo: async () => repo,
     // `Object.hasOwn`, not a `?? driver` default: the point of the "no driver" test is passing an
     // explicit undefined, which a default would quietly turn back into a driver.
-    driverFor: () => (Object.hasOwn(over, 'driver') ? over.driver : driver),
+    driverFor: (tool: string) =>
+      over.drivers ? over.drivers[tool] : Object.hasOwn(over, 'driver') ? over.driver : driver,
     vcsFor: () => vcs as never,
     ...(over.claimGate !== undefined || over.claimThrows
       ? {
@@ -233,6 +244,53 @@ describe('prepare refuses a dispatch, and says so instead of throwing', () => {
     const out = await prepareRun(host, makeRun({ anchor: { type: 'task', taskId: 'task_9' } }));
     expect(out.ok).toBe(true);
     expect(rec.leases).toBe(1);
+  });
+
+  // RUN-196: an operator SELECTED this name from the advertised menu, and it no longer resolves —
+  // the definition file deleted between advertise and dispatch. Falling back to a built-in would
+  // run a prompt nobody chose; refusing costs nothing, like the claim gate above.
+  it('a selected workflow that no longer resolves — before anything is acquired (RUN-196)', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(host, makeRun({ workflow: 'ghost' }));
+    expect(out.ok).toBe(false);
+    expect(out.ok === false && out.reason).toMatch(/workflow 'ghost' no longer resolves.*not spawning/s);
+    expect(rec.leases).toBe(0);
+    expect(rec.identities).toBe(0);
+    expect(rec.reports).toEqual([]);
+  });
+
+  it('but a workflow naming a built-in kind always resolves — never a stale selection', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(host, makeRun({ workflow: 'build' }));
+    expect(out.ok).toBe(true);
+    expect(rec.leases).toBe(1);
+  });
+
+  // A broken definition file is NOT a stale name (RUN-196): WorkflowStore keeps a scope-posture
+  // tombstone for it, which still RESOLVES — a refusal here would bypass the tombstone, whose
+  // point is that falling through to a lower, wider tier turns a typo into a permission change.
+  it('and a broken-file tombstone still resolves — the refusal must not bypass it', async () => {
+    const { host } = harness({
+      repo: {
+        root: '/repo',
+        manifest: manifest(),
+        workflowCatalog: {
+          definitions: {
+            audit: {
+              base: 'scope',
+              prompt: null,
+              promptSource: null,
+              stages: null,
+              description: null,
+              source: '/repo/.noriq/workflows/audit.toml',
+              tier: 'project-file',
+            },
+          },
+        },
+      },
+    });
+    const out = await prepareRun(host, makeRun({ workflow: 'audit' }));
+    expect(out.ok).toBe(true);
   });
 
   it('a verify run whose build is gone names the build, not just the git error', async () => {
@@ -365,5 +423,109 @@ describe('what preparation hands to execute', () => {
     if (!out.ok) throw new Error(out.reason);
     expect(out.continued?.spent.tokens).toBe(900);
     expect(out.tally.total().costUsd).toBe(1.5);
+  });
+});
+
+// RUN-193: the workflow's `[stages.execute] agent` picks the BUILDER's driver + model, at the top
+// of the ladder — above the dispatch coordinate and [defaults.<kind>]. The source is a declared
+// TOML stage list carried on the catalog, not a hand-built Workflow. Chain steps and a dispatched
+// verify actor inherit this by spreading the same `start`, so this is where it is exercised.
+describe("the execute stage's coordinate picks the builder's agent (RUN-193)", () => {
+  const definition = (
+    base: 'scope' | 'build' | 'verify',
+    stages: import('@noriq-dev/shared').WorkflowStages | null,
+  ) => ({
+    base,
+    prompt: null,
+    promptSource: null,
+    stages,
+    description: null,
+    source: '/repo/.noriq/workflows/fast.toml',
+    tier: 'project-file' as const,
+  });
+  const repoWith = (
+    base: 'scope' | 'build' | 'verify',
+    stages: import('@noriq-dev/shared').WorkflowStages | null,
+    manifestOver: Partial<ProjectManifest> = {},
+  ): ResolvedRepo => ({
+    root: '/repo',
+    manifest: manifest(manifestOver),
+    workflowCatalog: { definitions: { fast: definition(base, stages) } },
+  });
+
+  it('wins over the dispatch coordinate AND [defaults.build], selecting that vendor’s driver', async () => {
+    const { host } = harness({
+      drivers: { claude: driver, codex: codexDriver },
+      repo: repoWith(
+        'build',
+        { execute: { agent: 'codex.gpt-5_6-sol.high' } },
+        {
+          defaults: {
+            scope: noModel(),
+            build: { agent: 'claude.opus-4_8.low', model: null, effort: null },
+            verify: noModel(),
+          },
+        },
+      ),
+    });
+    const out = await prepareRun(host, makeRun({ workflow: 'fast', agent: 'claude.sonnet-4_5.medium' }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(out.driver.tool).toBe('codex');
+    expect(out.start.model).toBe('gpt-5.6-sol');
+    expect(out.start.effort).toBe('high');
+  });
+
+  it('absent stage agent leaves resolution byte-identical — the dispatch coordinate wins as before', async () => {
+    const { host } = harness({
+      drivers: { claude: driver, codex: codexDriver },
+      repo: repoWith('build', null),
+    });
+    const out = await prepareRun(host, makeRun({ workflow: 'fast', agent: 'claude.sonnet-4_5.medium' }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(out.driver.tool).toBe('claude');
+    expect(out.start.model).toBe('sonnet-4.5');
+    expect(out.start.effort).toBe('medium');
+  });
+
+  // Execute is a MANDATORY stage: a coordinate naming an uninstalled vendor cannot silently fall
+  // back to the run's driver (the builder IS the run). Fail-closed, exactly as an undriveable
+  // dispatch tool does, and before the lease.
+  it('a stage coordinate naming a driverless tool refuses the run before anything is acquired', async () => {
+    const { host, rec } = harness({
+      drivers: { claude: driver },
+      repo: repoWith('build', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const out = await prepareRun(host, makeRun({ workflow: 'fast' }));
+    expect(out.ok).toBe(false);
+    expect(out.ok === false && out.reason).toMatch(/no driver for tool codex/);
+    expect(rec.leases).toBe(0);
+  });
+
+  // A coordinate chooses a MODEL, never a posture: the write floor is workflow-independent
+  // (RUN-118), so a scope-based workflow with an execute agent still gets a read-only posture.
+  it('does not widen write — a scope-based workflow with an execute agent stays read-only', async () => {
+    const { host } = harness({
+      drivers: { claude: driver, codex: codexDriver },
+      repo: repoWith('scope', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const out = await prepareRun(host, makeRun({ kind: 'scope', workflow: 'fast', agent: 'claude' }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(out.driver.tool).toBe('codex'); // the model was chosen…
+    expect(out.permission.write).toBe(false); // …the posture was not
+  });
+
+  // Acceptance 4: the dispatched verify actor IS a verify-based workflow's own execute stage, so its
+  // coordinate is selected through the SAME prepare path as the builder — nothing verify-specific.
+  it('a verify-based workflow’s execute coordinate selects the verify actor’s driver + model', async () => {
+    const { host } = harness({
+      drivers: { claude: driver, codex: codexDriver },
+      repo: repoWith('verify', { execute: { agent: 'codex.gpt-5_6-sol.high' } }),
+    });
+    const out = await prepareRun(host, makeRun({ kind: 'verify', workflow: 'fast', verifiesRunId: 'run_0' }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(out.driver.tool).toBe('codex');
+    expect(out.start.model).toBe('gpt-5.6-sol');
+    expect(out.start.effort).toBe('high');
+    expect(out.permission.write).toBe(false); // verify judges, never edits (RUN-118) — model only
   });
 });

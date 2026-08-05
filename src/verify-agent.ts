@@ -64,6 +64,9 @@ export interface VerifyPromptContext {
    *  repo's conventions, so being told nothing about them was backwards; the contents are left
    *  out because the diff already owns this actor's context. Absent = renders as it did before. */
   repoContext?: string;
+  /** Rendered custom workflow text. It is evidence supplied by the repo/operator and is quoted
+   *  inside the daemon-owned verify frame; it never replaces the verdict instructions. */
+  workflowPrompt?: string;
   /** The spec's acceptance criteria, numbered, for a per-item answer (RUN-145). Empty/absent →
    *  the section renders nothing and this actor answers in prose as it did before. */
   acceptance?: AcceptanceItem[];
@@ -91,6 +94,7 @@ export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): s
     server: ctx.server,
     diffCmd: ctx.diffCmd ?? null,
     context: ctx.repoContext ?? '',
+    workflowPrompt: ctx.workflowPrompt ?? '',
     acceptance: ctx.acceptance?.length
       ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
       : null,
