@@ -376,6 +376,7 @@ export {
   type ReviewerPromptContext,
 } from './verify-reviewer';
 export type {
+  ChangesBetweenResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,
@@ -433,6 +434,7 @@ export {
   comparableWorktreePath,
   DEFAULT_WORKTREES_DIR,
   WORKTREE_BRANCH_PREFIX,
+  CHANGES_BETWEEN_MAX_PATHS,
   type WorktreeInfo,
   type CreateWorktreeOptions,
   type GitRunner,

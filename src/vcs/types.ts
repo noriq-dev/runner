@@ -128,6 +128,32 @@ export type IndexSnapshotResult =
   | { ok: true; snapshot: IndexSnapshot }
   | { ok: false; reason: 'busy' | 'unsupported'; detail?: string };
 
+/**
+ * The outcome of `VcsBackend.changesBetween` (RUN-212) — named as an OUTCOME, never a bare diff:
+ * either "here is what moved" or "ask me for everything". The two arms must never be confused
+ * (locked decision 1): an empty diff and "I could not tell" are the same SHAPE and opposite
+ * MEANINGS, and the wrong one is silent — an index kept serving a stale generation while every
+ * consumer believes it is current. This is `hasWork`'s rule one verb over, for a caller that acts
+ * CREDULOUSLY on the answer (skips re-indexing) rather than destructively — just as bad, and
+ * harder to notice, because nothing crashes.
+ *
+ * `{ok:true}` with both lists empty is a REAL, DISTINCT answer meaning nothing changed (locked
+ * decision 2) — not a stand-in for "could not tell". Every backend that cannot relate two bases
+ * with confidence — unrelated histories, a base it can no longer resolve, an ambiguous
+ * relationship, a query that errored, a rename it cannot express, or a change set past this
+ * backend's own bound — answers `full-index-required` instead, never an empty or partial list.
+ *
+ * A RENAME is a deletion of the old path PLUS a change at the new path (locked decision 3) —
+ * never its own arm, never a from/to pair. The index is path-keyed (the server's generation
+ * carries `deletions: RepoPath[]` and file records by path), so an undecomposed rename would
+ * leave the old path in the index forever, describing a file that no longer exists. Whether a
+ * backend detected a rename via a similarity heuristic must not change the index's contents —
+ * only which of these two lists a path lands in.
+ */
+export type ChangesBetweenResult =
+  | { ok: true; changed: string[]; deleted: string[] }
+  | { ok: false; reason: 'full-index-required'; detail: string };
+
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
@@ -435,6 +461,35 @@ export interface VcsBackend {
    * minted, which is refuse it, not silently succeed.
    */
   releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void>;
+
+  /**
+   * Relate two opaque bases in THIS backend's own id-space and report what moved between them —
+   * for background indexing (RUN-212), never for an agent. `ChangesBetweenResult`'s doc carries
+   * the full outcome contract; this doc carries the interface-level obligations.
+   *
+   * REQUIRED, not optional — `openReview`'s precedent, stated in its own doc, applies verbatim
+   * (locked decision 5): an omitted method reads as "nobody thought about this backend", while a
+   * present method that refuses records that it WAS considered and why, and leaves the note
+   * where a future implementer will be standing. Git answers this precisely (`worktree.ts`'s
+   * `changesBetween`, the git half of this contract); Diversion and Perforce refuse with
+   * `full-index-required` and a `detail` naming the backend and what a real implementation would
+   * need. Callers treat both identically, so requiring the method everywhere costs nothing and
+   * the information it carries when refused is not nothing.
+   *
+   * Common code — everything outside `git.ts`/`worktree.ts` — never assumes a SHA, a branch
+   * name, a numeric ordering, or an ancestry direction from `from`/`to` (locked decision 6):
+   * they are opaque tokens, exactly `Workspace.baseId`'s contract, handed to the SAME backend
+   * that minted them and never interpreted by a caller. A caller that sorted the two, or assumed
+   * `from` is an ancestor of `to`, would work on git and silently invert — or simply have no
+   * meaning — on a backend where ids are not ordered at all.
+   *
+   * Paths in both of `ChangesBetweenResult`'s lists are repository-relative with FORWARD
+   * SLASHES, matching what `src/index-scan.ts` produces and what the sensitive-file deny list
+   * matches on (locked decision 7): these lists join to the scanner's output and to
+   * `IndexGenerationManifest.deletions`, and two spellings of one path would silently double-
+   * count on Windows — `comparableWorktreePath`'s exact concern, one layer up.
+   */
+  changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

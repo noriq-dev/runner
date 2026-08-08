@@ -383,6 +383,21 @@ describe('PerforceBackend — index snapshot (RUN-211): try-acquire only, never 
   });
 });
 
+// RUN-212: no live p4d to measure a cross-revision diff against, so this backend always answers
+// full-index-required — but it must do so HONESTLY (never throw, never fabricate an empty diff)
+// and it must name itself, per `openReview`'s precedent (locked decision 5).
+describe('PerforceBackend — changesBetween (RUN-212): unconditional full-index-required', () => {
+  it('never throws, never reports an empty diff, and names the backend in the detail', async () => {
+    const { backend } = fakes({});
+    const res = await backend.changesBetween('/ws1', '100', '105');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('Perforce'),
+    });
+  });
+});
+
 describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)', () => {
   it('shelves an orphaned noriq changelist with opened files, reverts, and reports it', async () => {
     const { backend, calls } = fakes({

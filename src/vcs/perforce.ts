@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { LockDelegate } from './git';
 import type {
+  ChangesBetweenResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,
@@ -610,6 +611,28 @@ export class PerforceBackend implements VcsBackend {
    *  refuse it outright, the same discipline `p4Location` applies to a foreign `Workspace`. */
   async releaseIndexSnapshot(_snapshot: IndexSnapshot): Promise<void> {
     throw new Error('Perforce never mints an index snapshot — nothing here was leased, refusing to touch it');
+  }
+
+  /**
+   * No cross-revision diff has been measured against a live p4d (RUN-212): RUN-55 §10 proved
+   * `submit`-as-CAS and the headless `merge3` conflict loop, never relating two arbitrary
+   * changelist/commit ids across the whole depot tree. Answering `full-index-required`
+   * unconditionally is `openReview`'s precedent applied here (locked decision 5) — present, and
+   * naming what a real implementation needs, rather than silently absent. A real one would need a
+   * measured whole-tree diff (`p4 diff2` across two revisions of the client's view, or an
+   * equivalent) that reports deletions and reads renames from Perforce's own integration history
+   * rather than a similarity heuristic — unmeasured here.
+   */
+  async changesBetween(_repoRoot: string, _from: string, _to: string): Promise<ChangesBetweenResult> {
+    return {
+      ok: false,
+      reason: 'full-index-required',
+      detail:
+        'Perforce has no measured cross-revision diff path (RUN-55 §10 covered submit-as-CAS and ' +
+        'the merge3 conflict loop, not a from/to compare) — a real implementation needs a ' +
+        'measured whole-tree diff (e.g. p4 diff2) that reports deletions and reads renames from ' +
+        'integration history',
+    };
   }
 
   /**

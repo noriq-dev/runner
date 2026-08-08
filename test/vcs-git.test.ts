@@ -51,6 +51,7 @@ function recorder() {
     reapOrphans: record('reapOrphans', 2),
     createIndexSnapshot: record('createIndexSnapshot', snapshotHandle),
     removeIndexSnapshot: record('removeIndexSnapshot', undefined),
+    changesBetween: record('changesBetween', { ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] }),
   };
   return { ops, calls };
 }
@@ -258,6 +259,19 @@ describe('GitBackend — index snapshot (RUN-211)', () => {
     await expect(vcs.releaseIndexSnapshot(alien)).rejects.toThrow(
       /not an index snapshot this backend minted/,
     );
+  });
+});
+
+// RUN-212: same delegation discipline as every other verb — a pure pass-through, no wrap/unwrap,
+// because `from`/`to` are already opaque commit ids and `ChangesBetweenResult` is already the
+// backend-neutral shape. Real git behaviour (renames, deletions, the full-index fallbacks) is
+// worktree.test.ts's job, exactly as `create`'s real git behaviour is.
+describe('GitBackend — changesBetween (RUN-212)', () => {
+  it('passes repoRoot/from/to straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).changesBetween('/repo', 'sha-from', 'sha-to');
+    expect(res).toEqual({ ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] });
+    expect(calls).toEqual([{ method: 'changesBetween', args: ['/repo', 'sha-from', 'sha-to'] }]);
   });
 });
 

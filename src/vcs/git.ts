@@ -2,6 +2,7 @@ import type { LockClient } from '../lock-client';
 import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
 import type {
+  ChangesBetweenResult,
   IndexSnapshot,
   IndexSnapshotResult,
   LeaseOptions,
@@ -36,6 +37,7 @@ export type GitOps = Pick<
   | 'reapOrphans'
   | 'createIndexSnapshot'
   | 'removeIndexSnapshot'
+  | 'changesBetween'
 >;
 
 /**
@@ -109,6 +111,8 @@ function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLoca
  *   integrateFromRun → rebaseOnto(runBranch) · publishToRun → landFastForward(runBranch)
  *   openReview → openMergeRequest (merge-request.ts — gh, not WorktreeManager)
  *   leaseIndexSnapshot → createIndexSnapshot · releaseIndexSnapshot → removeIndexSnapshot
+ *   changesBetween → changesBetween (RUN-212, same name both sides — no wrapping needed, the
+ *     result shape is `ChangesBetweenResult` on both ends of the delegation)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
@@ -250,6 +254,13 @@ export class GitBackend implements VcsBackend {
   async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
     const loc = gitIndexSnapshotLocation(snapshot);
     await this.git.removeIndexSnapshot({ repoRoot: loc.repoRoot, path: snapshot.localPath });
+  }
+
+  /** Pure pass-through (RUN-212): `WorktreeManager.changesBetween` already speaks
+   *  `ChangesBetweenResult` and needs nothing from `Workspace`/`IndexSnapshot` to interpret
+   *  `from`/`to` — they are opaque commit ids, and git is the one place allowed to know that. */
+  changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
+    return this.git.changesBetween(repoRoot, from, to);
   }
 
   /**

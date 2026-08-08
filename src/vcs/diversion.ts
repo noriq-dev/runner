@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { LockDelegate } from './git';
 import type {
+  ChangesBetweenResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,
@@ -547,6 +548,27 @@ export class DiversionBackend implements VcsBackend {
     throw new Error(
       'Diversion never mints an index snapshot — nothing here was leased, refusing to touch it',
     );
+  }
+
+  /**
+   * No cross-commit compare has been measured against a live Diversion server (RUN-212): §9
+   * proved branch heads (`GET /branches/{name}`) and server-side merges, never an arbitrary
+   * from/to diff across the whole tree. Answering `full-index-required` unconditionally is
+   * `openReview`'s precedent applied here (locked decision 5) — present, and naming what a real
+   * implementation needs, rather than silently absent. A real one would need a MEASURED endpoint
+   * (a `GET /diff?from=&to=` or equivalent) that reports path-level changes AND deletions and
+   * decomposes renames the way this interface requires (`ChangesBetweenResult`'s locked decision
+   * 3) — no such surface has been checked against api.diversion.dev.
+   */
+  async changesBetween(_repoRoot: string, _from: string, _to: string): Promise<ChangesBetweenResult> {
+    return {
+      ok: false,
+      reason: 'full-index-required',
+      detail:
+        'Diversion has no measured cross-commit diff path (§9 covered branch heads and merges, ' +
+        'not an arbitrary from/to compare) — a real implementation needs a measured diff ' +
+        'endpoint that reports deletions and decomposes renames',
+    };
   }
 
   /**

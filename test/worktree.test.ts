@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { WorktreeManager, runBranch } from '../src/worktree';
+import { CHANGES_BETWEEN_MAX_PATHS, WorktreeManager, runBranch } from '../src/worktree';
 
 const execFileP = promisify(execFile);
 const git = (args: string[], cwd: string) => execFileP('git', args, { cwd });
@@ -933,5 +934,212 @@ describe('index snapshots (RUN-211, real git)', () => {
 
     await snapWm.remove(run);
     await snapWm.removeIndexSnapshot(snap);
+  });
+});
+
+// RUN-212. `full-index-required` is acted on CREDULOUSLY by every future caller — it means "skip
+// re-indexing, the answer is trustworthy" — so every condition this backend cannot be confident
+// about has to reach that arm rather than an empty (or partial) `changed`/`deleted` pair. Fake
+// GitRunner, same rail `hasChanges`/`changedPaths` already use for their own "cannot answer" tests
+// above: these are query-shape assertions, not git behaviour, so no real repo is needed here.
+describe('changesBetween cannot answer "no changes" for "could not tell" (RUN-212)', () => {
+  const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+    new WorktreeManager({ baseDir: base, git });
+
+  it('rejects (full-index-required) when a base does not resolve to a commit', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse' && args.some((a) => a.includes('missing-sha'))) {
+        throw new Error('fatal: bad revision');
+      }
+      return { stdout: 'sha\n', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'missing-sha', 'good-sha');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('missing-sha'),
+    });
+  });
+
+  it('rejects when the two bases share no common ancestor', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') throw new Error('fatal: no common ancestor'); // git's own exit
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('could not relate'),
+    });
+  });
+
+  it('rejects an ambiguous relationship — more than one best common ancestor', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc1\nanc2\n', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('ambiguous'),
+    });
+  });
+
+  // The acceptance line this test is FOR: "a git query that fails yields full-index-required,
+  // never {ok:true} with empty lists — asserted with an injected failing GitRunner."
+  it('rejects when the diff query itself fails, never answering an empty diff', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc\n', stderr: '' };
+      if (args[0] === 'diff') throw new Error('fatal: loose object is corrupt');
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('loose object is corrupt'),
+    });
+  });
+
+  it('rejects a change set past the cap rather than returning a huge list', async () => {
+    const tokens: string[] = [];
+    for (let i = 0; i <= CHANGES_BETWEEN_MAX_PATHS; i++) tokens.push('M', `f${i}.ts`);
+    const diffOut = `${tokens.join('\0')}\0`;
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc\n', stderr: '' };
+      if (args[0] === 'diff') return { stdout: diffOut, stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('full-index-required');
+      expect(res.detail).toContain(String(CHANGES_BETWEEN_MAX_PATHS));
+    }
+  });
+});
+
+// RUN-212. The acceptance line is "matches a full-index comparison", not "pins git's own
+// --name-status output back at itself" (locked decision 8) — so the expectation here is built by
+// an INDEPENDENT reconstruction (`git ls-tree` + `git show` at each endpoint, diffed by path and
+// content hash from first principles), never by re-deriving what `changesBetween` itself parses.
+// Own repo, like the index-snapshot block above, so committing on the shared primary checkout here
+// cannot leak into any other describe block's assumptions.
+describe('changesBetween (RUN-212, real git): reconciles with an independent full listing', () => {
+  let cbRepo: string;
+  let cbWm: WorktreeManager;
+  const gitc = (args: string[]) => git(['-c', 'user.email=t@t', '-c', 'user.name=T', ...args], cbRepo);
+
+  async function fullTree(ref: string): Promise<Map<string, string>> {
+    const { stdout } = await git(['ls-tree', '-r', '--name-only', '-z', ref], cbRepo);
+    const map = new Map<string, string>();
+    for (const p of stdout.split('\0').filter(Boolean)) {
+      const { stdout: blob } = await git(['show', `${ref}:${p}`], cbRepo);
+      map.set(p, createHash('sha256').update(blob).digest('hex'));
+    }
+    return map;
+  }
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-cb-'));
+    cbRepo = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', cbRepo]);
+    cbWm = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees') });
+
+    await writeFile(path.join(cbRepo, 'keep.txt'), 'unchanged\n');
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v1\n');
+    await writeFile(path.join(cbRepo, 'del.txt'), 'gone soon\n');
+    await writeFile(path.join(cbRepo, 'ren_from.txt'), 'rename me, content unchanged\n');
+    await gitc(['add', '.']);
+    await gitc(['commit', '-q', '-m', 'base']);
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(cbRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('an added, a modified-twice, a deleted, and a renamed file all land in the right list', async () => {
+    const { stdout: fromRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const from = fromRaw.trim();
+
+    // Modified TWICE across the range — the reconciliation must see only the net change.
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v2\n');
+    await gitc(['commit', '-qam', 'first change to mod.txt']);
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v3\n');
+    await gitc(['commit', '-qam', 'second change to mod.txt']);
+    // Deleted.
+    await gitc(['rm', '-q', 'del.txt']);
+    await gitc(['commit', '-qm', 'delete del.txt']);
+    // Renamed (pure rename, content untouched, so git's similarity detector finds it at 100%).
+    await gitc(['mv', 'ren_from.txt', 'ren_to.txt']);
+    await gitc(['commit', '-qm', 'rename ren_from.txt -> ren_to.txt']);
+    // Added.
+    await writeFile(path.join(cbRepo, 'new.txt'), 'brand new\n');
+    await gitc(['add', 'new.txt']);
+    await gitc(['commit', '-qm', 'add new.txt']);
+
+    const { stdout: toRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const to = toRaw.trim();
+
+    const res = await cbWm.changesBetween(cbRepo, from, to);
+    if (!res.ok) throw new Error(`expected ok:true, got full-index-required: ${res.detail}`);
+
+    const fromTree = await fullTree(from);
+    const toTree = await fullTree(to);
+    const expectedDeleted = [...fromTree.keys()].filter((p) => !toTree.has(p));
+    const expectedChanged = [...toTree.keys()].filter(
+      (p) => !fromTree.has(p) || fromTree.get(p) !== toTree.get(p),
+    );
+
+    expect([...res.changed].sort()).toEqual(expectedChanged.sort());
+    expect([...res.deleted].sort()).toEqual(expectedDeleted.sort());
+
+    // Named explicitly too, so a bug shared between this test's own reconstruction and the
+    // implementation could not hide behind agreeing with itself.
+    expect([...res.changed].sort()).toEqual(['mod.txt', 'new.txt', 'ren_to.txt']);
+    expect([...res.deleted].sort()).toEqual(['del.txt', 'ren_from.txt']);
+    // A rename is a deletion of the old path PLUS a change at the new — never its own shape
+    // (locked decision 3): nothing here names both `ren_from.txt` and `ren_to.txt` together.
+    expect(res.changed).not.toContain('keep.txt');
+    expect(res.deleted).not.toContain('keep.txt');
+  });
+
+  it('two identical bases yield ok:true with empty lists — a real answer, not full-index-required', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const sha = stdout.trim();
+    expect(await cbWm.changesBetween(cbRepo, sha, sha)).toEqual({ ok: true, changed: [], deleted: [] });
+  });
+
+  it('two unrelated bases (separate root commits) yield full-index-required, not an empty diff', async () => {
+    const { stdout: mainRaw } = await git(['rev-parse', 'main'], cbRepo);
+    const mainSha = mainRaw.trim();
+
+    await gitc(['checkout', '-q', '--orphan', 'unrelated']);
+    await git(['rm', '-rf', '-q', '.'], cbRepo);
+    await writeFile(path.join(cbRepo, 'orphan.txt'), 'lonely\n');
+    await gitc(['add', 'orphan.txt']);
+    await gitc(['commit', '-qm', 'unrelated root commit']);
+    const { stdout: orphanRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const orphanSha = orphanRaw.trim();
+
+    const res = await cbWm.changesBetween(cbRepo, mainSha, orphanSha);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('full-index-required');
+
+    await gitc(['checkout', '-q', 'main']);
+    await gitc(['branch', '-D', 'unrelated']);
+  });
+
+  it('a base the backend cannot resolve yields full-index-required', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const res = await cbWm.changesBetween(cbRepo, stdout.trim(), 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('full-index-required');
   });
 });

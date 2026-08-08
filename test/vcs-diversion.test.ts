@@ -612,6 +612,21 @@ describe('DiversionBackend — index snapshot (RUN-211): try-acquire only, never
   });
 });
 
+// RUN-212: no live server to measure a cross-commit diff against, so this backend always answers
+// full-index-required — but it must do so HONESTLY (never throw, never fabricate an empty diff)
+// and it must name itself, per `openReview`'s precedent (locked decision 5).
+describe('DiversionBackend — changesBetween (RUN-212): unconditional full-index-required', () => {
+  it('never throws, never reports an empty diff, and names the backend in the detail', async () => {
+    const { backend } = fakes({});
+    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('Diversion'),
+    });
+  });
+});
+
 describe('DiversionBackend — locking (RUN-100): Noriq view authoritative, soft lock degrades', () => {
   const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
 

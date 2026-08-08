@@ -5,6 +5,7 @@ import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import type { ChangesBetweenResult } from './vcs/types';
 
 const execFileP = promisify(execFile);
 
@@ -97,6 +98,19 @@ export interface IndexSnapshotHandle {
    *  `WorktreeInfo.baseSha`, though nothing can move a detached HEAD here after the fact. */
   baseSha: string;
 }
+
+/**
+ * Past this many changed+deleted paths, `changesBetween` (below) declines with
+ * `full-index-required` rather than returning a huge list (RUN-212 locked decision 4): a base
+ * pair spanning months of history can produce a change list larger than the repo's own file set,
+ * at which point the "incremental" path is a slower full index with none of the savings — worse
+ * than asking for one outright. Kept well under `IndexPolicy.maxFiles`'s default (20,000,
+ * `index-policy.ts`) rather than tied to it: a rename counts TWICE here (its old path in
+ * `deleted`, its new path in `changed` — locked decision 3), so the same nominal file-count
+ * budget buys roughly half as many entries before this trips, and this module has no per-repo
+ * config to read in the first place.
+ */
+export const CHANGES_BETWEEN_MAX_PATHS = 10_000;
 
 /** The infix that makes a snapshot's directory unmistakably not a run worktree (`<repo>-<runId>`
  *  never contains this), both for a human reading `~/.noriq/worktrees` and for the reap sweep's
@@ -394,6 +408,129 @@ export class WorktreeManager {
     // at the base, a run branch full of commits reports no paths, and it is that BRANCH that lands.
     if (!set.size) await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
     return [...set];
+  }
+
+  /**
+   * Relate two commits and report what moved between them — git's half of `changesBetween`
+   * (RUN-212; `VcsBackend.changesBetween`'s doc on `vcs/types.ts` carries the full outcome
+   * contract this implements). Needs no worktree at all: `git diff`/`git merge-base` read the
+   * object database directly, so this runs straight against `repoRoot` — a caller never has to
+   * hold a snapshot it does not need just to compare two bases.
+   *
+   * Every uncertain condition below answers `full-index-required` rather than throwing or
+   * reporting an empty diff (the interface's locked decision 1):
+   *
+   *  - either endpoint fails `rev-parse --verify …^{commit}` — gone, never fetched, or simply
+   *    not a commit at all;
+   *  - `merge-base --all` finds no common ancestor (unrelated histories — two separate root
+   *    commits report exit 1 with no output, folded into the generic query-failure branch below
+   *    rather than given its own detail, because the caller does not need to tell "unrelated"
+   *    from "the query broke") or MORE than one (an ambiguous, criss-cross relationship) —
+   *    `--all` rather than the bare form, because the bare form silently picks ONE of several
+   *    best common ancestors instead of ever reporting the ambiguity;
+   *  - the diff query itself fails for any reason (a corrupt object, a transient git error) —
+   *    the path an injected failing `GitRunner` exercises in tests, per this task's acceptance;
+   *  - the reported change set exceeds `CHANGES_BETWEEN_MAX_PATHS`.
+   *
+   * `--name-status -z -M` reports a rename as `R<score>\0old\0new\0` — destination LAST, unlike
+   * `status --porcelain -z`'s destination-FIRST convention `changedPaths` above relies on;
+   * measured, not assumed, the same discipline this file applies everywhere it parses git's
+   * output. A rename decomposes into `deleted: [old]` + `changed: [new]` (locked decision 3); a
+   * copy (`C<score>\0src\0dst`) reports only its destination as changed — the source was never
+   * touched, so it belongs in neither list. `A`/`M`/`T` (add/modify/type-change) all fold into
+   * `changed`: the index treats an added and a modified path identically (both need re-reading),
+   * so a third list would be structure with no consumer (this task's discretion note 5).
+   */
+  async changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
+    for (const [label, id] of [
+      ['from', from],
+      ['to', to],
+    ] as const) {
+      const resolves = await this.git(['rev-parse', '--verify', '--quiet', `${id}^{commit}`], repoRoot).then(
+        () => true,
+        () => false,
+      );
+      if (!resolves) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `${label} base ${JSON.stringify(id)} does not resolve to a commit in ${repoRoot} — gone, never fetched, or invalid`,
+        };
+      }
+    }
+
+    let ancestors: string[];
+    try {
+      const { stdout } = await this.git(['merge-base', '--all', from, to], repoRoot);
+      ancestors = stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `could not relate ${from} and ${to}: ${(err as Error).message}`,
+      };
+    }
+    if (ancestors.length !== 1) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${from} and ${to} have ${ancestors.length} best common ancestor(s) — ambiguous relationship`,
+      };
+    }
+
+    let raw: string;
+    try {
+      const { stdout } = await this.git(['diff', '--name-status', '-z', '-M', from, to], repoRoot);
+      raw = stdout;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `diff query between ${from} and ${to} failed: ${(err as Error).message}`,
+      };
+    }
+
+    const changed = new Set<string>();
+    const deleted = new Set<string>();
+    const tokens = raw.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const status = tokens[i];
+      i += 1;
+      if (!status) continue;
+      const kind = status[0];
+      if (kind === 'R' || kind === 'C') {
+        // Two fields follow: source, then destination (measured above — the reverse of
+        // `status --porcelain -z`'s order).
+        const oldPath = tokens[i];
+        const newPath = tokens[i + 1];
+        i += 2;
+        if (!oldPath || !newPath) continue;
+        if (kind === 'R') deleted.add(oldPath);
+        changed.add(newPath);
+      } else if (kind === 'D') {
+        const p = tokens[i];
+        i += 1;
+        if (p) deleted.add(p);
+      } else {
+        const p = tokens[i];
+        i += 1;
+        if (p) changed.add(p);
+      }
+    }
+
+    if (changed.size + deleted.size > CHANGES_BETWEEN_MAX_PATHS) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${changed.size + deleted.size} changed paths between ${from} and ${to} exceeds the ${CHANGES_BETWEEN_MAX_PATHS}-path cap`,
+      };
+    }
+
+    return { ok: true, changed: [...changed], deleted: [...deleted] };
   }
 
   /** Tear down a worktree + delete its (never-pushed) branch. Safe to call twice. */
