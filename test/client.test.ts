@@ -48,7 +48,15 @@ describe('NoriqClient', () => {
       kinds: ['build'],
       maxConcurrency: 1,
       repos: [
-        { id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main', workflows: [] },
+        {
+          id: 'repo_a',
+          projectKey: 'AAA',
+          board: null,
+          name: 'a',
+          defaultBranch: 'main',
+          repositoryKey: null,
+          workflows: [],
+        },
       ],
     });
     expect(runner.id).toBe('rnr_1');

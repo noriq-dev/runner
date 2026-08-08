@@ -35,6 +35,8 @@ const SECTIONS = [
   'context',
   'tool',
   'defaultBranch',
+  'repositoryKey',
+  'index',
   'land',
   'permissions',
   'workflows',

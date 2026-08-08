@@ -52,6 +52,7 @@ const IDENTITY: WsIdentity = {
       board: null,
       name: 'a',
       defaultBranch: 'main',
+      repositoryKey: null,
       workflows: [
         { name: 'build', base: 'build' },
         { name: 'scope', base: 'scope' },
@@ -444,7 +445,15 @@ describe('WsClient', () => {
       for (let i = 0; i < 4; i++) await Promise.resolve();
     };
     const reportWith = (workflows: WsIdentity['repos'][number]['workflows']) => [
-      { id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main', workflows },
+      {
+        id: 'repo_a',
+        projectKey: 'AAA',
+        board: null,
+        name: 'a',
+        defaultBranch: 'main',
+        repositoryKey: null,
+        workflows,
+      },
     ];
 
     it('the initial hello advertises what the provider resolves, contract-valid', async () => {

@@ -12,10 +12,20 @@ export {
   type DiscoveredRepo,
   discoverRepos,
   legacyNetworkKinds,
+  loadIndexConfig,
   loadManifest,
   manifestPath,
   repoId,
 } from './discovery';
+export {
+  INDEX_LANGUAGES,
+  IndexContentMode,
+  IndexPolicy,
+  refuseIndexGlob,
+  resolveIndexConfig,
+  type IndexLanguage,
+  type ResolvedIndexConfig,
+} from './index-policy';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,

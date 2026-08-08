@@ -31,6 +31,92 @@ tool = "claude"
 # The repo's main branch, if the daemon should reference it. Optional.
 defaultBranch = "main"
 
+# ── Canonical repository identity (Project Memory §6, RUN-208) ───────────────
+# Optional. A short, portable, project-local SLUG — never a path, never this daemon's own
+# local checkout id — that stays stable across re-clones and machine changes, which a
+# checkout id is by definition not. It is what lets a memory, an episode, or an index
+# generation say "this came from repository X" in a way that survives you moving the repo
+# to a new laptop.
+#
+# TOP-LEVEL, not a `[repository]` table, despite what that might suggest: the shared wire
+# contract (vendor/noriq-shared/src/manifest.ts) declares `repositoryKey` as a plain field
+# on the manifest, and this file always matches the schema's own spelling, not the other
+# way around.
+#
+# Rules, checked with the same validator the server uses (`RepositoryKey` in
+# vendor/noriq-shared/src/memory.ts) — a malformed value is a VISIBLE failure (logged,
+# reported to the server as null), never silently rebound to `key`, the repo's directory
+# name, or the daemon's own internal repo id:
+#   - letters, digits, `.`, `_`, `-` only, and must START with a letter
+#   - 1–64 characters
+#   - must NOT start with `ckt_` — that prefix is reserved for this daemon's own
+#     runner-local checkout ids (a different, opaque id space you never write by hand)
+#
+# Blank = no Project Memory association for this repo: nothing about it is ever cited as
+# evidence, and no index generation can be attributed to it.
+# repositoryKey = "noriq-runner"
+
+# ── Repository indexing (Project Memory §7) ───────────────────────────────────
+# Optional, and OFF unless you say otherwise: a repo you never opt in here never has its
+# files read for the project memory graph. There is no inference from what the repo
+# contains, no default-on, and an `[index]` table present with `enabled` left unset is
+# still OFF — the same "opt-in, never assumed" posture as `[land].autoPush` and
+# `[permissions.*].auto` elsewhere in this file.
+#
+# Two schemas share this one table, and the split is deliberate (VENDORED-CONTRACT.md):
+#   enabled / include / exclude   — the WIRE contract (vendor/noriq-shared's `IndexSpec`).
+#                                    These decide WHETHER and WHAT SCOPE; they can, in
+#                                    principle, matter to the server some day.
+#   everything else below         — this DAEMON's own execution posture. These never
+#                                    cross the wire; only this runner reads them.
+#
+# [index]
+# enabled = true                 # OFF (default) unless this is explicitly true.
+#
+# include = ["src/**", "docs/**"]   # Glob patterns, relative to the repo root. Empty
+# exclude = ["**/*.generated.*"]    # (default) means "everything not excluded". Every
+#                                    # glob is CONFINED to the repo root at config load —
+#                                    # an absolute path or one that escapes via `..` (e.g.
+#                                    # "../../.ssh/**") is refused and named in the log; a
+#                                    # bad glob turns indexing off for this repo without
+#                                    # touching anything else the daemon does with it.
+#
+# languages = ["typescript", "javascript", "markdown", "json", "toml"]
+#                                 # Which file types are actually read. This is the full
+#                                 # initial set (also the default when the key is
+#                                 # omitted) — narrow it if this repo's index should only
+#                                 # cover a subset. An unrecognized name REFUSES indexing
+#                                 # for this repo (named in the log) rather than silently
+#                                 # skipping that language: a typo here should not read as
+#                                 # "configured" while indexing nothing for it.
+#
+# contentMode = "full"           # "full" (default) stores the read file content, bounded
+#                                 # by the size knobs below, for later phases to parse.
+#                                 # "metadata" records only path/language/symbol facts —
+#                                 # never raw source text — for a repo willing to be
+#                                 # indexed but not to have its source land in the memory
+#                                 # store.
+#
+# maxFiles = 20000               # Bounded size/count controls — daemon POSTURE, not wire
+# maxFileBytes = 1000000         # contract, so raising them never needs a server change.
+# maxTotalBytes = 500000000      # Defaults: 20k files and 500 MB total keep a large
+#                                 # monorepo bounded without truncating an ordinary repo;
+#                                 # 1 MB per file excludes generated/minified/binary-shaped
+#                                 # files without excluding ordinary hand-written source.
+#
+# readDeadlineMs = 120000        # Wall-clock ceiling on ONE indexing pass (2 minutes),
+#                                 # so a slow or huge filesystem walk cannot hang the
+#                                 # daemon indefinitely.
+#
+# pollIntervalMinutes = 60       # Reindex cadence. PARSED ONLY today — nothing schedules
+#                                 # on it yet (that is a later phase); hourly is the
+#                                 # sensible default once something does.
+#
+# An invalid value anywhere in this table (a negative bound, an unrecognized key, a
+# non-numeric cadence, a glob that escapes the root) refuses INDEXING for this repo only,
+# with an `error`-level log naming the offending key — it never takes discovery or
+# dispatch down with it. Indexing is an enrichment; the run path is the product.
+
 # ── What this repo tells every agent about itself (RUN-128/129) ──────────────
 # Optional — but NOT inert when omitted: if this repo has a CLAUDE.md or AGENTS.md
 # at its root, the daemon inlines it into every scope/build brief by default. Those

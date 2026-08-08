@@ -3,6 +3,8 @@ import type { DiscoveredRepo } from './discovery';
 import { CLAUDE_CATALOG } from './drivers/claude';
 import { CODEX_CATALOG } from './drivers/codex';
 import type { DriverCatalog } from './drivers/types';
+import { logger as defaultLogger } from './logger';
+import { parseRepositoryKey } from './memory-contract';
 import { VERSION } from './version';
 import type { WorkflowCatalog } from './workflow-store';
 
@@ -97,6 +99,15 @@ export interface RepoReport {
   name: string;
   defaultBranch: string | null;
   /**
+   * The canonical, project-local repository key (Project Memory §6, RUN-208) — validated with
+   * `parseRepositoryKey` before it may reach the server (see `repoReport` below). Null when the
+   * manifest names none, or when the committed value is malformed: a bad key is a VISIBLE
+   * association failure, logged and reported as null — NEVER a silent fallback to `projectKey`,
+   * `name`, or `repoId()` (decision 6). Rides both the registration body and every WS hello,
+   * since both are built from this one `RepoReport` shape.
+   */
+  repositoryKey: string | null;
+  /**
    * Every workflow a dispatch against this repo can resolve (RUN-195; matches the object arm of
    * shared `RunnerRepo.workflows`): the three built-ins plus the post-precedence custom catalog,
    * as `{name, base, description?}`. RUN-121 sent bare NAMES and RUN-125's base advertisement
@@ -109,14 +120,40 @@ export interface RepoReport {
   workflows: AdvertisedWorkflowEntry[];
 }
 
+/**
+ * Validate the manifest's committed `repositoryKey` before it may reach the server (RUN-208,
+ * decision 6/8) — the one call site `repoReport` uses, so every wire report gets the same
+ * "malformed → log + null" treatment regardless of which of the two report paths (registration
+ * body, WS hello refresh) called it. Re-validates from whatever manifest it is handed, FRESH —
+ * `refreshRepos` (daemon.ts) passes a manifest just re-read by `ManifestStore`, so an operator
+ * fixing a typo'd key is reflected on the next hello, no restart, the same contract every other
+ * section of the marker already keeps.
+ */
+function resolveReportedRepositoryKey(
+  raw: string | null | undefined,
+  log: Pick<typeof defaultLogger, 'error'>,
+): string | null {
+  if (!raw) return null; // no committed key — null, never inferred (Project Memory §4)
+  const result = parseRepositoryKey(raw);
+  if (!result.ok) {
+    log.error('repositoryKey in project.toml is malformed — reporting no canonical repository identity', {
+      repositoryKey: raw,
+      reason: result.reason,
+    });
+    return null;
+  }
+  return result.key;
+}
+
 /** The one conversion from what the daemon knows to what the server may hear (RUN-195). Takes the
  *  manifest as its own argument rather than reading `repo.manifest`, because the manifest is
  *  read-at-use (ManifestStore) while `DiscoveredRepo` pins the startup snapshot — a reconnect
  *  report passes the CURRENT one, and the identity fields (id, key, name) are the stable half. */
 export function repoReport(
   repo: Pick<DiscoveredRepo, 'id' | 'projectKey' | 'name' | 'defaultBranch'>,
-  manifest: Pick<ProjectManifest, 'board' | 'workflows'>,
+  manifest: Pick<ProjectManifest, 'board' | 'workflows' | 'repositoryKey'>,
   catalog: WorkflowCatalog | undefined,
+  log: Pick<typeof defaultLogger, 'error'> = defaultLogger,
 ): RepoReport {
   return {
     id: repo.id,
@@ -124,6 +161,7 @@ export function repoReport(
     board: manifest.board,
     name: repo.name,
     defaultBranch: repo.defaultBranch,
+    repositoryKey: resolveReportedRepositoryKey(manifest.repositoryKey, log),
     // Built-ins + the merged custom catalog (RUN-195): exactly the list dispatch can resolve,
     // post-precedence — a definition shadowing a bundled name replaces that entry's metadata.
     workflows: advertisedWorkflows(catalog, manifest.workflows),
