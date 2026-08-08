@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { RepositoryKey } from './memory';
 import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
 // ---------------------------------------------------------------------------
@@ -367,6 +368,21 @@ export const ProjectContext = z.object({
 });
 export type ProjectContext = z.infer<typeof ProjectContext>;
 
+/**
+ * Repository indexing (Project Memory §7, PLNR-244): enabled explicitly per
+ * repository — a repo the operator never opted in never has its files read
+ * for the graph. Include/exclude are confined to this repository; there is no
+ * cross-repo glob. Execution semantics (parser selection, the non-overridable
+ * sensitive-file deny list, batching) belong to the Runner indexer that reads
+ * this, not to this schema.
+ */
+export const IndexSpec = z.object({
+  enabled: z.boolean().default(false),
+  include: z.array(z.string().min(1)).default([]),
+  exclude: z.array(z.string().min(1)).default([]),
+});
+export type IndexSpec = z.infer<typeof IndexSpec>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -392,6 +408,13 @@ export const ProjectManifest = z.object({
   context: ProjectContext.prefault({}),
   tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
   defaultBranch: z.string().nullable().default(null),
+  // The canonical, project-local repository identity (Project Memory §6, PLNR-244) — distinct
+  // from any runner-local checkout id, and stable across re-clones and machine changes in a way
+  // a checkout id is not. Null on a manifest that has not opted into Project Memory yet.
+  repositoryKey: RepositoryKey.nullable().default(null),
+  // Null = indexing off for this repo, byte-identical to every manifest written before this
+  // existed.
+  index: IndexSpec.nullable().default(null),
   // null = no auto-landing; every run's diff waits on its own branch for a human.
   land: LandPolicy.nullable().default(null),
   permissions: KindPermissions.default(defaultPermissions),

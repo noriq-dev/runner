@@ -217,6 +217,8 @@ describe('changedSections', () => {
     context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
     tool: null,
     defaultBranch: null,
+    repositoryKey: null,
+    index: null,
     land: null,
     setup: null,
     permissions: {

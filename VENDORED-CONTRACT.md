@@ -3,7 +3,7 @@
 How the runner and planar share a wire contract, why the slice is vendored rather than published,
 and what would change that.
 
-Was `PLANAR-PORT.md`, a record of one crossing. It has now carried four, and per-crossing status
+Was `PLANAR-PORT.md`, a record of one crossing. It has now carried five, and per-crossing status
 belongs in the git log and the ticket comments rather than in a document that goes stale between
 them — so this is the standing explanation instead.
 
@@ -30,8 +30,12 @@ correct it. RUN-150's `step` label and RUN-166's executed-spec record are both i
 CLAUDE.md has said "vendored until the contract freezes" since the split. **It is not frozen**, and
 this was checked rather than assumed: the contract changed four times in a single day of work —
 `ExecutionStep` (RUN-148), `[context].agentInstructions` (RUN-155), the transcript's `step` label
-(RUN-150), and `run.telemetry.executedSpec` (RUN-166). A published package would have meant four
-releases, four version bumps, and four windows in which the two repos disagreed.
+(RUN-150), and `run.telemetry.executedSpec` (RUN-166) — and a fifth time weeks later, when Project
+Memory's own schemas landed (RUN-207): a new `memory.ts` file plus additive fields on
+`ProjectManifest` (`repositoryKey`, `index`) and `RunnerRepo` (`repositoryKey`), and a new
+`memory.changed` event verb. A published package would have meant five releases, five version
+bumps, and five windows in which the two repos disagreed — and the fifth crossing landing weeks
+after the first four is itself evidence against "frozen": the condition below has still not held.
 
 Vendoring buys exactly one thing and costs exactly one thing. It buys atomicity: the runner's
 `vendor/` and planar's `packages/shared/src` are the same bytes at the same commit, so there is no
@@ -46,8 +50,14 @@ is moving. Until then this is the cheaper side.
 ## What crosses, and what does not
 
 **In the slice** (both repos, byte-identical): the wire frames (`ws.ts`), the run and runner model
-(`runner.ts`), the project manifest (`manifest.ts`), the execution spec (`execution-spec.ts`), and
-the model catalogue (`model.ts`).
+(`runner.ts`), the project manifest (`manifest.ts`), the execution spec (`execution-spec.ts`), the
+model catalogue (`model.ts`), and — since RUN-207 — Project Memory's own schemas (`memory.ts`):
+canonical repository identity, evidence/authority, the memory item, the knowledge graph node/edge
+vocabulary, effort episodes, index generations/batches, context packs, and the entity-URI helpers.
+The runner consumes it through `src/memory-contract.ts` (RUN-207), the one file every other runner
+module imports it through, rather than reaching into `@noriq-dev/shared` piecemeal — narrower than
+the whole slice on purpose, widened only as a later phase (ingest, episode assembly, context-pack
+rendering) needs a name.
 
 **Planar-side only**: migrations, the Durable Object write paths, MCP tool definitions, and the
 dashboard. These consume the slice; they are not in it.

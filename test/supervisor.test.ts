@@ -366,6 +366,8 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
   tool: null,
   defaultBranch: null,
+  repositoryKey: null,
+  index: null,
   land: null,
   setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },

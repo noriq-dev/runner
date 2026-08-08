@@ -4,3 +4,4 @@ export * from './runner';
 export * from './ws';
 export * from './manifest';
 export * from './execution-spec';
+export * from './memory';

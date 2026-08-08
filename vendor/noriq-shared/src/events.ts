@@ -43,6 +43,11 @@ export const EventVerb = z.enum([
   'run.created',
   'run.dispatched',
   'run.status_changed',
+  // ProjectMemory's outbox delivered a canonical mutation into this project's event stream
+  // (PLNR-247). One compact verb for every memory change — kind/authority/etc. ride the
+  // payload's summary, never the memory body itself (§3/§4: D1 never holds memory content).
+  // Delivered as actorKind 'system', not 'agent' — it must never renew a claim or presence.
+  'memory.changed',
 ]);
 export type EventVerb = z.infer<typeof EventVerb>;
 
@@ -53,7 +58,7 @@ export const NoriqEvent = z.object({
   actorKind: ActorKind,
   actorId: z.string(),
   verb: EventVerb,
-  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent', 'run']),
+  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent', 'run', 'memory']),
   subjectId: z.string(),
   payload: z.record(z.string(), z.unknown()).default({}), // zod v4: record requires an explicit key type
   createdAt: z.string().datetime(),
