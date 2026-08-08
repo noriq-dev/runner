@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
@@ -81,6 +82,30 @@ export interface CreateWorktreeOptions {
   readOnly?: boolean;
   /** Base ref to branch from. Defaults to the repo's current HEAD. */
   baseRef?: string;
+}
+
+/**
+ * A read-only index snapshot's git-level handle (RUN-211) — `WorktreeManager.createIndexSnapshot`'s
+ * return, wrapped by `GitBackend.leaseIndexSnapshot` into the backend-neutral `IndexSnapshot`.
+ * Deliberately narrower than `WorktreeInfo`: no `branch` (a snapshot is detached — see
+ * `createIndexSnapshot`) and no `runId` (a snapshot belongs to no run).
+ */
+export interface IndexSnapshotHandle {
+  repoRoot: string;
+  path: string;
+  /** The commit the snapshot is pinned at — resolved at create time, same reasoning as
+   *  `WorktreeInfo.baseSha`, though nothing can move a detached HEAD here after the fact. */
+  baseSha: string;
+}
+
+/** The infix that makes a snapshot's directory unmistakably not a run worktree (`<repo>-<runId>`
+ *  never contains this), both for a human reading `~/.noriq/worktrees` and for the reap sweep's
+ *  own naming-based recognition below — a snapshot has no branch, so it cannot be recognized the
+ *  way `listManaged` recognizes a run (RUN-211). */
+const INDEX_SNAPSHOT_INFIX = 'index-snapshot';
+
+function indexSnapshotDirName(repoRoot: string, id: string): string {
+  return `${path.basename(repoRoot)}-${INDEX_SNAPSHOT_INFIX}-${id}`;
 }
 
 // Recursively flip write bits on a checkout. Skips the .git pointer. Best-effort:
@@ -198,6 +223,75 @@ export class WorktreeManager {
     };
     if (info.readOnly) await setReadOnly(dir);
     return info;
+  }
+
+  /**
+   * Pin a DETACHED worktree at `baseRef` (default HEAD) for read-only indexing (RUN-211) — never
+   * for an agent. No branch, ever: indexing the repo root directly would read the operator's
+   * working tree — dirty files, a mid-rebase state — so the index would describe a tree no
+   * `baseId` names, and a pinned detached checkout is what makes the result deterministic for a
+   * given base instead. No branch also means nothing can land from it, and `reapOrphans`'s own
+   * branch-name recognition (`listManaged`) never mistakes it for an orphaned RUN — the directory
+   * naming (`<repo>-index-snapshot-<id>`, never `<repo>-<runId>`) is what the sweep below uses to
+   * recognize one on its own terms.
+   *
+   * Space-isolated like `create`: every call mints its own worktree, so many snapshots — and a
+   * snapshot alongside any number of run worktrees — may coexist without contention.
+   */
+  async createIndexSnapshot(repoRoot: string, opts: { baseRef?: string } = {}): Promise<IndexSnapshotHandle> {
+    await mkdir(this.baseDir, { recursive: true });
+    const baseRef = opts.baseRef ?? 'HEAD';
+    const dir = path.join(this.baseDir, indexSnapshotDirName(repoRoot, randomUUID()));
+    const { stdout: baseSha } = await this.git(['rev-parse', baseRef], repoRoot);
+    await this.git(['worktree', 'add', '--detach', dir, baseRef], repoRoot);
+    return { repoRoot, path: dir, baseSha: baseSha.trim() };
+  }
+
+  /**
+   * Remove a snapshot minted by `createIndexSnapshot`. IDEMPOTENT: a second call (or one racing a
+   * prior removal) finds `git worktree remove` failing on an already-gone path, which is
+   * swallowed the same way `remove()` swallows it for a run's worktree — a no-op, not an error.
+   * No branch to delete: a snapshot never had one.
+   */
+  async removeIndexSnapshot(handle: Pick<IndexSnapshotHandle, 'repoRoot' | 'path'>): Promise<void> {
+    await this.git(['worktree', 'remove', '--force', handle.path], handle.repoRoot).catch(() => {});
+    await this.git(['worktree', 'prune'], handle.repoRoot).catch(() => {});
+  }
+
+  /** Snapshot worktrees left behind by a crashed daemon, recognized by directory naming alone —
+   *  they carry no branch, so `listManaged`'s branch-based recognition can never see them. Used
+   *  only by `reapOrphans`, which prunes every one it finds unconditionally (RUN-211 locked
+   *  decision 9): a snapshot is detached, was never written, and holds no work by construction —
+   *  the one worktree here that is always safe to delete, regardless of `isOwned`. */
+  private async listIndexSnapshots(repoRoot: string): Promise<string[]> {
+    let stdout: string;
+    try {
+      ({ stdout } = await this.git(['worktree', 'list', '--porcelain'], repoRoot));
+    } catch {
+      return [];
+    }
+    const out: string[] = [];
+    let curPath: string | null = null;
+    let detached = false;
+    const flush = () => {
+      if (curPath && detached && path.basename(curPath).includes(`-${INDEX_SNAPSHOT_INFIX}-`)) {
+        out.push(curPath);
+      }
+      curPath = null;
+      detached = false;
+    };
+    for (const line of stdout.split('\n')) {
+      if (line.startsWith('worktree ')) {
+        flush();
+        curPath = line.slice('worktree '.length).trim();
+      } else if (line.trim() === 'detached') {
+        detached = true;
+      } else if (line.trim() === '') {
+        flush();
+      }
+    }
+    flush();
+    return out;
   }
 
   /**
@@ -622,6 +716,16 @@ export class WorktreeManager {
       await this.remove({ repoRoot, path: w.path, branch: w.branch });
       removed += 1;
     }
+
+    // Index snapshots (RUN-211) are pruned unconditionally, `isOwned` notwithstanding, and are
+    // NEVER added to `removed`: a snapshot is not a run, and counting it would corrupt the
+    // reaped-run total the daemon logs at startup. Safe by construction — detached, never
+    // written, holds no work — so "never force-delete work that exists nowhere else" cannot apply
+    // to it the way it applies to `managed` above.
+    for (const snapshotPath of await this.listIndexSnapshots(repoRoot)) {
+      await this.removeIndexSnapshot({ repoRoot, path: snapshotPath });
+    }
+
     return removed;
   }
 

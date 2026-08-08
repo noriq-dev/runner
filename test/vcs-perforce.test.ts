@@ -352,6 +352,37 @@ describe('PerforceBackend — run-addressed verbs decline honestly (RUN-170)', (
   });
 });
 
+// RUN-211: no live p4d to measure a real read-only snapshot against, so this backend only ever
+// answers unsupported — but the pool-contention check is real and testable without a server,
+// and is exactly what stands between a background indexer and the deadlock
+// `leaseIndexSnapshot`'s doc warns about (waiting behind a run lease this same process holds).
+describe('PerforceBackend — index snapshot (RUN-211): try-acquire only, never a real snapshot', () => {
+  it('answers unsupported when the workspace is free — no measured snapshot path exists here', async () => {
+    const { backend } = fakes({});
+    expect(await backend.leaseIndexSnapshot('/ws1')).toEqual({
+      ok: false,
+      reason: 'unsupported',
+      detail: expect.stringContaining('Perforce'),
+    });
+  });
+
+  it('answers busy IMMEDIATELY while a run holds the workspace — never chains onto the lease queue', async () => {
+    const { backend } = fakes({});
+    const ws = await backend.lease('/ws1', 'run_1'); // holds the pool; never disposed here
+    // A wrong implementation chaining onto `queue` would hang until `dispose`, which never runs
+    // in this test — vitest's own timeout would fail it rather than this awaiting forever.
+    expect(await backend.leaseIndexSnapshot('/ws1')).toEqual({ ok: false, reason: 'busy' });
+    await backend.dispose(ws);
+  });
+
+  it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
+    const { backend } = fakes({});
+    await expect(
+      backend.releaseIndexSnapshot({ localPath: '/ws1', baseId: 'x', readOnly: true, location: {} }),
+    ).rejects.toThrow(/never mints an index snapshot/);
+  });
+});
+
 describe('PerforceBackend — the reaper (shelve, then clean — §5 measured)', () => {
   it('shelves an orphaned noriq changelist with opened files, reverts, and reports it', async () => {
     const { backend, calls } = fakes({

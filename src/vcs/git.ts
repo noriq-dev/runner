@@ -2,6 +2,8 @@ import type { LockClient } from '../lock-client';
 import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
 import type {
+  IndexSnapshot,
+  IndexSnapshotResult,
   LeaseOptions,
   LockContext,
   LockOutcome,
@@ -32,6 +34,8 @@ export type GitOps = Pick<
   | 'landFastForward'
   | 'pushBranch'
   | 'reapOrphans'
+  | 'createIndexSnapshot'
+  | 'removeIndexSnapshot'
 >;
 
 /**
@@ -64,6 +68,29 @@ function gitLocation(ws: Workspace): GitLocation {
 }
 
 /**
+ * What git stashes in an `IndexSnapshot`'s `location` (RUN-211): which repo, tagged with a
+ * discriminant NO run `Workspace` ever carries. The tag is not decoration — `IndexSnapshot` and
+ * `Workspace` are structurally close enough (both carry `localPath`/`baseId`/`readOnly`/
+ * `location`) that a `Workspace` variable satisfies `IndexSnapshot`'s type at a call site by
+ * ordinary structural typing, so `kind` is what lets `gitIndexSnapshotLocation` tell them apart
+ * at runtime — the only thing standing between a foreign object and `git worktree remove`.
+ */
+interface GitIndexSnapshotLocation {
+  repoRoot: string;
+  kind: 'index-snapshot';
+}
+
+function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLocation {
+  const loc = snapshot.location as Partial<GitIndexSnapshotLocation> | null | undefined;
+  if (typeof loc?.repoRoot === 'string' && loc.kind === 'index-snapshot') {
+    return { repoRoot: loc.repoRoot, kind: 'index-snapshot' };
+  }
+  throw new Error(
+    'not an index snapshot this backend minted — refusing to remove it (a run workspace, or a hand-edited object, must never reach worktree removal through this path)',
+  );
+}
+
+/**
  * Git, as a VcsBackend (RUN-49).
  *
  * Deliberately a thin delegation over WorktreeManager rather than a move of its code: the git
@@ -81,6 +108,7 @@ function gitLocation(ws: Workspace): GitLocation {
  *   publish → landFastForward · share → pushBranch · reapOrphans → reapOrphans
  *   integrateFromRun → rebaseOnto(runBranch) · publishToRun → landFastForward(runBranch)
  *   openReview → openMergeRequest (merge-request.ts — gh, not WorktreeManager)
+ *   leaseIndexSnapshot → createIndexSnapshot · releaseIndexSnapshot → removeIndexSnapshot
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
@@ -195,6 +223,33 @@ export class GitBackend implements VcsBackend {
     opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
   ): Promise<number> {
     return this.git.reapOrphans(repoRoot, opts);
+  }
+
+  /**
+   * Git isolates in SPACE (RUN-211, `leasesOverlap`'s reasoning one verb over): a snapshot is
+   * just another detached worktree, so it costs nothing extra and this never queues, never
+   * refuses `busy`. `WorktreeManager.createIndexSnapshot` owns the git vocabulary (detached, no
+   * branch, its own directory naming); this stays the naming boundary and only wraps the result
+   * the way `lease` wraps `create`.
+   */
+  async leaseIndexSnapshot(repoRoot: string): Promise<IndexSnapshotResult> {
+    const handle = await this.git.createIndexSnapshot(repoRoot);
+    return {
+      ok: true,
+      snapshot: {
+        localPath: handle.path,
+        baseId: handle.baseSha,
+        readOnly: true,
+        // No `branch`: the snapshot is DETACHED by construction (RUN-211 locked decision 6) —
+        // there is no scope name to report.
+        location: { repoRoot: handle.repoRoot, kind: 'index-snapshot' } satisfies GitIndexSnapshotLocation,
+      },
+    };
+  }
+
+  async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
+    const loc = gitIndexSnapshotLocation(snapshot);
+    await this.git.removeIndexSnapshot({ repoRoot: loc.repoRoot, path: snapshot.localPath });
   }
 
   /**

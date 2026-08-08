@@ -580,6 +580,38 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
   });
 });
 
+// RUN-211: Diversion has no measured read-only snapshot path (§9), so it only ever answers
+// unsupported — but the pool-contention check is real and testable without a server, and is
+// exactly what stands between a background indexer and the deadlock `leaseIndexSnapshot`'s doc
+// warns about (waiting behind a run lease this same process holds, with nothing to time out).
+describe('DiversionBackend — index snapshot (RUN-211): try-acquire only, never a real snapshot', () => {
+  it('answers unsupported when the pool is free — no measured snapshot path exists here', async () => {
+    const { backend } = fakes({});
+    expect(await backend.leaseIndexSnapshot('/repo')).toEqual({
+      ok: false,
+      reason: 'unsupported',
+      detail: expect.stringContaining('Diversion'),
+    });
+  });
+
+  it('answers busy IMMEDIATELY while a run holds the pool — never chains onto the lease queue', async () => {
+    const { backend } = fakes({});
+    const held = await backend.lease('/repo', 'run_1'); // holds the pool; never disposed here
+    // If this wrongly chained onto `queue`, it would hang until `dispose` — which never runs in
+    // this test — and the vitest default timeout would fail the test rather than this awaiting
+    // forever silently.
+    expect(await backend.leaseIndexSnapshot('/repo')).toEqual({ ok: false, reason: 'busy' });
+    await backend.dispose(held);
+  });
+
+  it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
+    const { backend } = fakes({});
+    await expect(
+      backend.releaseIndexSnapshot({ localPath: '/repo', baseId: 'x', readOnly: true, location: {} }),
+    ).rejects.toThrow(/never mints an index snapshot/);
+  });
+});
+
 describe('DiversionBackend — locking (RUN-100): Noriq view authoritative, soft lock degrades', () => {
   const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
 

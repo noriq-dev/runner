@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GitBackend, type GitOps } from '../src/vcs/git';
-import type { Workspace } from '../src/vcs/types';
-import type { WorktreeInfo } from '../src/worktree';
+import type { IndexSnapshot, Workspace } from '../src/vcs/types';
+import type { IndexSnapshotHandle, WorktreeInfo } from '../src/worktree';
 
 // GitBackend is a naming boundary, so its whole contract is the MAPPING: each outcome reaches
 // the right git verb, with the arguments passed through untouched and the result returned
@@ -19,6 +19,12 @@ const info: WorktreeInfo = {
   branch: 'noriq/run/run_1',
   readOnly: false,
   baseSha: 'base0000',
+};
+
+const snapshotHandle: IndexSnapshotHandle = {
+  repoRoot: '/repo',
+  path: '/wt/repo-index-snapshot-abc',
+  baseSha: 'snap0000',
 };
 
 function recorder() {
@@ -43,6 +49,8 @@ function recorder() {
     landFastForward: record('landFastForward', { ok: true, sha: 'sha1' } as const),
     pushBranch: record('pushBranch', { ok: false, detail: 'offline' } as const),
     reapOrphans: record('reapOrphans', 2),
+    createIndexSnapshot: record('createIndexSnapshot', snapshotHandle),
+    removeIndexSnapshot: record('removeIndexSnapshot', undefined),
   };
   return { ops, calls };
 }
@@ -182,6 +190,74 @@ describe('GitBackend — the outcome→verb mapping', () => {
     await expect(vcs.publish(alien, 'main')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.publishToRun(alien, 'run_1')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
+  });
+});
+
+// RUN-211: leaseIndexSnapshot/releaseIndexSnapshot follow the same naming-boundary discipline as
+// every other verb above — this pins the wrap/unwrap and the foreign-object refusal; real git
+// detachment/pinning/reap behaviour is worktree.test.ts's job, exactly as `create`'s is.
+describe('GitBackend — index snapshot (RUN-211)', () => {
+  it('leaseIndexSnapshot wraps the handle into an IndexSnapshot: no branch, readOnly true', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).leaseIndexSnapshot('/repo');
+    expect(res).toEqual({
+      ok: true,
+      snapshot: {
+        localPath: '/wt/repo-index-snapshot-abc',
+        baseId: 'snap0000',
+        readOnly: true,
+        location: { repoRoot: '/repo', kind: 'index-snapshot' },
+      },
+    });
+    expect(calls).toEqual([{ method: 'createIndexSnapshot', args: ['/repo'] }]);
+  });
+
+  it('releaseIndexSnapshot unwraps location and calls removeIndexSnapshot verbatim', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const res = await vcs.leaseIndexSnapshot('/repo');
+    calls.length = 0;
+    if (!res.ok) throw new Error('expected ok:true');
+    await vcs.releaseIndexSnapshot(res.snapshot);
+    expect(calls).toEqual([
+      {
+        method: 'removeIndexSnapshot',
+        args: [{ repoRoot: '/repo', path: '/wt/repo-index-snapshot-abc' }],
+      },
+    ]);
+  });
+
+  it('refuses to release a Workspace — structurally close enough to typecheck, refused at runtime anyway', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const runWorkspace: Workspace = {
+      runId: 'run_1',
+      localPath: '/wt/run_1',
+      readOnly: false,
+      baseId: 'base0000',
+      workRef: 'noriq/run/run_1',
+      location: { repoRoot: '/repo', branch: 'noriq/run/run_1' }, // a REAL run's location
+    };
+    // Passed as an IndexSnapshot: exactly the structural-typing hazard the interface doc warns
+    // about — Workspace satisfies IndexSnapshot's shape with an extra field or two.
+    await expect(vcs.releaseIndexSnapshot(runWorkspace as unknown as IndexSnapshot)).rejects.toThrow(
+      /not an index snapshot this backend minted/,
+    );
+    expect(calls.some((c) => c.method === 'removeIndexSnapshot')).toBe(false); // nothing touched
+  });
+
+  it('refuses a hand-edited object with no location at all', async () => {
+    const { ops } = recorder();
+    const vcs = new GitBackend(ops);
+    const alien: IndexSnapshot = {
+      localPath: '/somewhere',
+      baseId: 'x',
+      readOnly: true,
+      location: { not: 'a snapshot' },
+    };
+    await expect(vcs.releaseIndexSnapshot(alien)).rejects.toThrow(
+      /not an index snapshot this backend minted/,
+    );
   });
 });
 

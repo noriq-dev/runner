@@ -376,6 +376,8 @@ export {
   type ReviewerPromptContext,
 } from './verify-reviewer';
 export type {
+  IndexSnapshot,
+  IndexSnapshotResult,
   IntegrateResult,
   LeaseOptions,
   LockContext,
@@ -434,6 +436,7 @@ export {
   type WorktreeInfo,
   type CreateWorktreeOptions,
   type GitRunner,
+  type IndexSnapshotHandle,
 } from './worktree';
 export * from './repo-intel';
 export {

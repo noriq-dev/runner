@@ -837,3 +837,98 @@ describe('a wave’s return trip (real git)', () => {
     await wm.remove(parent);
   });
 });
+
+// RUN-211: a read-only lease over the repo's tree for background indexing — never for an agent,
+// and never a run. Own repo (rather than the shared `repo`/`wm` above) so committing to move
+// HEAD and dirtying the working tree — the whole point of the pinning test — cannot leak into
+// any other describe block's assumptions about the shared fixture's state.
+describe('index snapshots (RUN-211, real git)', () => {
+  let snapRepo: string;
+  let snapWm: WorktreeManager;
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-snap-'));
+    snapRepo = path.join(tmp, 'repo');
+    const snapBase = path.join(tmp, 'worktrees');
+    await execFileP('git', ['init', '-q', '-b', 'main', snapRepo]);
+    await writeFile(path.join(snapRepo, 'README.md'), '# hi\n');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'add', '.'], snapRepo);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'init'], snapRepo);
+    snapWm = new WorktreeManager({ baseDir: snapBase });
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(snapRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('pins a DETACHED worktree, named distinctly from a run worktree', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    expect(existsSync(snap.path)).toBe(true);
+    expect(path.basename(snap.path)).toContain('index-snapshot'); // never `<repo>-<runId>`
+
+    const { stdout } = await git(['worktree', 'list', '--porcelain'], snapRepo);
+    const block = stdout.split('\n\n').find((b) => b.includes('detached'));
+    expect(block).toBeDefined(); // no branch — nothing can land from it
+    expect(block).not.toMatch(/\nbranch /);
+
+    await snapWm.removeIndexSnapshot(snap);
+  });
+
+  it('is pinned: moving HEAD and dirtying the operator’s tree leaves it unchanged', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const before = await readFile(path.join(snap.path, 'README.md'), 'utf8');
+
+    // Move the repo's own HEAD, and dirty its working tree — what a snapshot exists to insulate
+    // the indexer from reading.
+    await writeFile(path.join(snapRepo, 'README.md'), '# operator is mid-edit\n');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-am', 'operator commit'], snapRepo);
+
+    expect(await readFile(path.join(snap.path, 'README.md'), 'utf8')).toBe(before);
+    const { stdout: snapHead } = await git(['rev-parse', 'HEAD'], snap.path);
+    expect(snapHead.trim()).toBe(snap.baseSha); // the reported baseId still names it
+
+    await snapWm.removeIndexSnapshot(snap);
+  });
+
+  it('release is idempotent — a second call is a no-op, not an error', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    await snapWm.removeIndexSnapshot(snap);
+    expect(existsSync(snap.path)).toBe(false);
+    await expect(snapWm.removeIndexSnapshot(snap)).resolves.toBeUndefined();
+  });
+
+  it('never touches a live run worktree held while the snapshot is released', async () => {
+    const run = await snapWm.create(snapRepo, 'liveWhileSnapshotting');
+    await writeFile(path.join(run.path, 'precious.ts'), 'export const keep = true;\n');
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+
+    await snapWm.removeIndexSnapshot(snap);
+
+    expect(existsSync(run.path)).toBe(true);
+    expect(existsSync(path.join(run.path, 'precious.ts'))).toBe(true);
+    const branches = await git(['branch', '--list', run.branch], snapRepo);
+    expect(branches.stdout.trim()).not.toBe(''); // the run's branch is untouched
+
+    await snapWm.remove(run);
+  });
+
+  it('reapOrphans prunes a leftover snapshot unconditionally, uncounted in the reaped-run total', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const reaped = await snapWm.reapOrphans(snapRepo);
+    expect(reaped).toBe(0); // no run worktrees here — the snapshot must not inflate this number
+    expect(existsSync(snap.path)).toBe(false); // yet it was pruned
+  });
+
+  it('reapOrphans prunes a snapshot even alongside a run the daemon still owns', async () => {
+    // isOwned is a RUN concept; a snapshot is pruned regardless of it (locked decision 9) — it is
+    // detached, was never written, and holds no work by construction.
+    const run = await snapWm.create(snapRepo, 'ownedRun');
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const reaped = await snapWm.reapOrphans(snapRepo, { isOwned: (id) => id === 'ownedRun' });
+    expect(reaped).toBe(0); // the owned run was spared, and correctly not counted
+    expect(existsSync(run.path)).toBe(true); // the run survives
+    expect(existsSync(snap.path)).toBe(false); // the snapshot does not
+
+    await snapWm.remove(run);
+  });
+});

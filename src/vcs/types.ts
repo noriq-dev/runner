@@ -67,6 +67,67 @@ export interface Workspace {
   location: unknown;
 }
 
+/**
+ * A read-only lease over the repo's tree for BACKGROUND INDEXING (RUN-211) — never for an agent.
+ * Repeats `Workspace`'s type discipline exactly, for the reason `Workspace`'s own comment gives:
+ * `localPath` is the ONLY field here that is a filesystem path, `baseId` is an opaque token in
+ * the owning backend's id-space, and `location` is backend-owned `unknown` state, so reaching in
+ * is a type error rather than a code-review catch. No ref, branch (beyond the display-only field
+ * below), or sha field is added that common code could pass back to a backend as an operand —
+ * RUN-50's trap applies here verbatim: a Perforce depot path satisfies both `startsWith('/')` and
+ * `path.isAbsolute()` while being no filesystem path at all, and git fuses the two namespaces so a
+ * git-first design never notices. The fusion has to stay unrepresentable, not merely discouraged.
+ */
+export interface IndexSnapshot {
+  /** Where the indexer reads from — a real filesystem path, the ONLY field here that is one. */
+  localPath: string;
+  /**
+   * The snapshot's base, in the backend's own id-space. `Workspace.baseId`'s contract verbatim:
+   * an opaque token, hand it back to the SAME backend as a ref, display it, never parse it.
+   */
+  baseId: string;
+  /**
+   * Reported scope, in words — for logs and the index generation manifest's `branch` field.
+   * `Workspace.workRef`'s exact status, not a looser one: display ONLY, and the moment this
+   * becomes an operand it is `location` smuggled past the type system. Shared's
+   * `IndexGenerationManifest.branch` is a `BranchRef` the server stores as the scope a `baseId`
+   * is fresh against, and its own definition admits a symbolic class ("default", "integration")
+   * where no single branch applies — this is that scope metadata crossing the wire, not a ref
+   * crossing the seam. Absent when the backend's snapshot has no branch at all (git: detached, by
+   * design — see `VcsBackend.leaseIndexSnapshot`).
+   */
+  branch?: string;
+  /**
+   * Intent, not enforcement (discretion note 8 in RUN-211's spec): no backend chmods this tree.
+   * The invariant is structural instead — no agent ever runs in an index snapshot, the indexer
+   * opens files `O_RDONLY` through `openConfined`, and a snapshot (detached, or a pool-of-1
+   * backend's idle workspace) can land nothing — so a full recursive chmod would pay a
+   * monorepo-sized tree walk to defend a property nothing here can violate. Always `true` on an
+   * `ok:true` acquisition result; kept as a field (not dropped) so a caller reads intent without
+   * having to know that fact about every backend.
+   */
+  readOnly: true;
+  /** Backend-owned state, opaque to everything outside the backend that minted it — see
+   *  `Workspace.location`'s comment; the same reasoning applies verbatim. Unlike `Workspace`,
+   *  never round-trips through JSON (a snapshot is never parked), so it carries no
+   *  serializability obligation of its own. */
+  location: unknown;
+}
+
+/**
+ * The outcome of asking for an index snapshot (RUN-211). A discriminated result, never a throw,
+ * for the two ROUTINE conditions: `busy` (a backend whose leases cannot overlap is occupied —
+ * indexing yields to a run, not the other way round) and `unsupported` (this backend cannot
+ * produce a read-only snapshot at all). The same judgement `publish`'s `{ok:false,
+ * reason:'race'}` already records: indexing is background work, so "not now" is an expected
+ * outcome, and a throw would make a routine, correct condition look like a fault. A backend's own
+ * infra failures (a git command that genuinely errors) still reject the promise, exactly as
+ * `lease` does today — this union is for outcomes a caller is meant to branch on, not for faults.
+ */
+export type IndexSnapshotResult =
+  | { ok: true; snapshot: IndexSnapshot }
+  | { ok: false; reason: 'busy' | 'unsupported'; detail?: string };
+
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
@@ -342,6 +403,38 @@ export interface VcsBackend {
     repoRoot: string,
     opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
   ): Promise<number>;
+
+  /**
+   * Acquire a read-only snapshot of the repo's tree for indexing (RUN-211) — never for an agent.
+   * REQUIRED, not optional: `openReview`'s precedent, stated in its own doc, applies verbatim —
+   * an omitted method would BE the silence this verb exists to remove, and a backend that cannot
+   * produce a snapshot says so with `{ok:false, reason:'unsupported'}` rather than by absence.
+   *
+   * Concurrency is preserved PER BACKEND, deliberately not uniform — the same isolation split
+   * `leasesOverlap` names for run leases, one verb over: git isolates in SPACE, so a snapshot
+   * costs nothing extra and many may be held at once, overlapping run leases freely. A live
+   * backend's pool-of-1 (`leasesOverlap` absent) must TRY-ACQUIRE and never enqueue — a snapshot
+   * requested while the SAME process holds a run lease is exactly when indexing is triggered
+   * (after landing or publishing), so chaining onto that queue is `integrateFromRun`'s documented
+   * deadlock shape one verb over: an in-process promise chain with nothing to time out. Refusing
+   * outranks waiting for a second reason too: run execution outranks background indexing.
+   */
+  leaseIndexSnapshot(repoRoot: string): Promise<IndexSnapshotResult>;
+
+  /**
+   * Give a snapshot back. IDEMPOTENT (a second call is a no-op) and structurally incapable of
+   * touching a Run workspace: it removes only a snapshot IT minted, identified through its own
+   * `location`, and refuses anything else — a `Workspace`, or a hand-edited object — with a
+   * message naming the problem, the way `gitLocation` already refuses a foreign workspace.
+   * `IndexSnapshot` and `Workspace` are structurally close enough (both carry
+   * `localPath`/`baseId`/`readOnly`/`location`) that a `Workspace` variable satisfies this
+   * parameter's TYPE by ordinary structural typing — so this runtime check is the only thing
+   * standing between a foreign object and whatever destructive op the backend performs.
+   * REQUIRED for the same reason `leaseIndexSnapshot` is: a backend that answers `unsupported` to
+   * every acquisition still has to say what release does with an object it could never have
+   * minted, which is refuse it, not silently succeed.
+   */
+  releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

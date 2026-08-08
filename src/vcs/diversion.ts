@@ -5,6 +5,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { LockDelegate } from './git';
 import type {
+  IndexSnapshot,
+  IndexSnapshotResult,
   IntegrateResult,
   LeaseOptions,
   LockContext,
@@ -513,6 +515,38 @@ export class DiversionBackend implements VcsBackend {
       if (b.branch_name?.startsWith('noriq/run/')) opts?.onSkip?.(b.branch_name);
     }
     return 0;
+  }
+
+  /**
+   * Try-acquire only, never enqueue (RUN-211 locked decision 5): a snapshot requested while this
+   * process holds the pool-of-1 lease — exactly when indexing is triggered, right after landing
+   * or publishing — must not wait behind it, or it deadlocks with nothing to time out, the same
+   * shape `integrateFromRun`'s doc warns about one verb over. `held` IS the pool's occupancy
+   * (populated in `lease`, cleared in `dispose`), so checking its size answers "is the pool held"
+   * without touching `queue` — the chain this must never join.
+   *
+   * When the pool is free this still answers `unsupported`, deliberately the conservative half of
+   * the execution spec's discretion note: a real in-place snapshot (a second checkout, or reading
+   * through the CLI without touching the leased workspace) has never been measured against a live
+   * server, and this file's whole discipline (§9) is measured shape or nothing. Revisit only once
+   * that measurement exists.
+   */
+  async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
+    if (this.held.size > 0) return { ok: false, reason: 'busy' };
+    return {
+      ok: false,
+      reason: 'unsupported',
+      detail:
+        'Diversion has no measured read-only snapshot path (§9) — only the pool-of-1 workspace lease exists today',
+    };
+  }
+
+  /** Never mints a snapshot (see `leaseIndexSnapshot`), so anything reaching here is foreign —
+   *  refuse it outright, the same discipline `dvLocation` applies to a foreign `Workspace`. */
+  async releaseIndexSnapshot(_snapshot: IndexSnapshot): Promise<void> {
+    throw new Error(
+      'Diversion never mints an index snapshot — nothing here was leased, refusing to touch it',
+    );
   }
 
   /**

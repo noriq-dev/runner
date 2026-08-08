@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import type { LockDelegate } from './git';
 import type {
+  IndexSnapshot,
+  IndexSnapshotResult,
   IntegrateResult,
   LeaseOptions,
   LockContext,
@@ -578,6 +580,36 @@ export class PerforceBackend implements VcsBackend {
       opts?.onSkip?.(`change ${change} (noriq run ${m[2]}) — shelved server-side`);
     }
     return cleaned;
+  }
+
+  /**
+   * Try-acquire only, never enqueue (RUN-211 locked decision 5) — same reasoning as
+   * `DiversionBackend.leaseIndexSnapshot`, which this mirrors: `held` is exactly the pool-of-1
+   * lease's occupancy (populated in `lease`, cleared in `dispose`), so checking its size answers
+   * "is the workspace held" without ever chaining onto `queue`. A snapshot requested while this
+   * process holds the pool is exactly when indexing is triggered — right after landing — and
+   * waiting behind it would deadlock with nothing to time out.
+   *
+   * When the workspace is free this still answers `unsupported`: a real read-only snapshot on
+   * Perforce would mean a second client workspace (or `p4 print`-ing a whole tree cheaply), and
+   * neither has been measured against a live p4d the way every other mapping in this file was
+   * (RUN-55, §10) — the conservative half of the execution spec's discretion note. Revisit only
+   * once that measurement exists.
+   */
+  async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
+    if (this.held.size > 0) return { ok: false, reason: 'busy' };
+    return {
+      ok: false,
+      reason: 'unsupported',
+      detail:
+        'Perforce has no measured read-only snapshot path (RUN-55 §10) — only the pool-of-1 client workspace lease exists today',
+    };
+  }
+
+  /** Never mints a snapshot (see `leaseIndexSnapshot`), so anything reaching here is foreign —
+   *  refuse it outright, the same discipline `p4Location` applies to a foreign `Workspace`. */
+  async releaseIndexSnapshot(_snapshot: IndexSnapshot): Promise<void> {
+    throw new Error('Perforce never mints an index snapshot — nothing here was leased, refusing to touch it');
   }
 
   /**
