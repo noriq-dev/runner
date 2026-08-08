@@ -41,9 +41,20 @@ import { openConfined } from './repo-context';
  * pointing INSIDE the root once it discovers the target is not a regular file. Both refusals
  * happen for free at the one place a path is actually opened.
  *
- * **This module does no parsing.** It yields file identity, size, content, a content hash, and a
- * status — never language detection or entity extraction (Phase 3's job, deliberately deferred so
- * the confinement boundary is reviewable on its own, without tree-sitter in the same diff).
+ * **This module does no parsing.** It yields file identity, size, a content hash, a status, and —
+ * gated by `contentMode` — content: never language detection or entity extraction (Phase 3's job,
+ * deliberately deferred so the confinement boundary is reviewable on its own, without tree-sitter
+ * in the same diff).
+ *
+ * **`contentMode: 'metadata'` withholds source text, not the read itself** (RUN-209 follow-up,
+ * closing the gap RUN-210 documented rather than fixed): the file is still opened through
+ * `openConfined`, still bounded and binary-sniffed exactly as `'full'` mode reads it, and the hash
+ * still covers the same bytes — citation verification (a later phase) compares hashes, and a hash
+ * is a fact about bytes, never the bytes themselves. Only the decoded string is dropped before it
+ * ever reaches an `IndexFileCandidate`. Which mode produced a candidate is carried ON the
+ * candidate (`contentMode`), not left for a reader to re-derive from the config that made it —
+ * `content` is typed `null` on the `'metadata'` branch, so "no content" and "content withheld by
+ * policy" cannot be confused the way a bare nullable field would invite.
  *
  * **Binary detection is content-based**, never extension-based (locked decision 9): a NUL byte or
  * invalid UTF-8 in a bounded prefix, so a `.ts` file that is actually a binary blob is reported
@@ -90,23 +101,41 @@ export interface IndexStatusRecord {
   detail?: string;
 }
 
-export interface IndexFileCandidate {
+interface IndexFileCandidateCommon {
   /** Repository-relative, POSIX-separated. */
   path: string;
   bytes: number;
-  /** UTF-8 text. Every candidate here already passed the binary sniff, so decoding is safe —
-   *  a binary file never reaches this shape, it becomes a `binary` status record instead. */
-  content: string;
   /**
    * SHA-256 over the RAW bytes (not the decoded string), hex-encoded. Picked once, per the
    * execution spec's discretion note, and not to be changed casually: later phases (citation
    * verification) compare these hashes, so a silent algorithm swap would silently invalidate
    * every citation minted before it. Hashing the raw bytes rather than the decoded string keeps
    * the digest platform-stable — a decode/re-encode round trip is one more place two platforms
-   * could disagree about a byte that never actually changed.
+   * could disagree about a byte that never actually changed. Produced in EVERY `contentMode`,
+   * because a hash is not source text — it is the fact citation verification needs, and
+   * `'metadata'` mode exists to withhold the latter while still allowing the former.
    */
   contentHash: string;
 }
+
+/** `[index].contentMode === 'full'`: the decoded UTF-8 text. Every candidate here already passed
+ *  the binary sniff, so decoding is safe — a binary file never reaches this shape, it becomes a
+ *  `binary` status record instead. */
+export interface IndexFileCandidateFull extends IndexFileCandidateCommon {
+  contentMode: 'full';
+  content: string;
+}
+
+/** `[index].contentMode === 'metadata'`: the read succeeded and was hashed, but the decoded text
+ *  was never retained — `content` is `null` BY POLICY, not by a read failure (a read failure is a
+ *  status record, this module never returns a candidate for one). Path/size/hash are still real
+ *  facts about a real file; only the source text itself is missing on purpose. */
+export interface IndexFileCandidateMetadata extends IndexFileCandidateCommon {
+  contentMode: 'metadata';
+  content: null;
+}
+
+export type IndexFileCandidate = IndexFileCandidateFull | IndexFileCandidateMetadata;
 
 export interface IndexScanResult {
   candidates: IndexFileCandidate[];
@@ -118,7 +147,8 @@ export interface IndexScanResult {
   statusOverflow: number;
   /** Files actually opened (successfully or not) — the number `maxFiles` bounds. */
   filesOpened: number;
-  /** Bytes actually kept as candidate content — the number `maxTotalBytes` bounds. */
+  /** Bytes actually read into a candidate — the number `maxTotalBytes` bounds. Counted the same in
+   *  every `contentMode`: the bound guards the read/hash cost, not whether the string is kept. */
   totalBytesRead: number;
   /** True when `maxFiles`, `maxTotalBytes`, or `readDeadlineMs` cut the walk short: the result is
    *  a PREFIX of the repo, not the whole thing, and a caller must not treat an empty remainder as
@@ -360,12 +390,18 @@ async function evaluateCandidate(
       return;
     }
     state.totalBytesRead += buf.length;
-    state.candidates.push({
-      path: relPath,
-      bytes: buf.length,
-      content: buf.toString('utf8'),
-      contentHash: createHash('sha256').update(buf).digest('hex'),
-    });
+    const contentHash = createHash('sha256').update(buf).digest('hex');
+    state.candidates.push(
+      config.contentMode === 'full'
+        ? {
+            path: relPath,
+            bytes: buf.length,
+            content: buf.toString('utf8'),
+            contentHash,
+            contentMode: 'full',
+          }
+        : { path: relPath, bytes: buf.length, content: null, contentHash, contentMode: 'metadata' },
+    );
   } catch (err) {
     // A read failure after a successful open (EIO, the file vanishing mid-read, …) — bounded and
     // reported, never fatal to the rest of the scan.

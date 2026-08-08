@@ -48,6 +48,7 @@ describe('scanRepoForIndex — ordinary files', () => {
     const r = await scanRepoForIndex(root, cfg());
     const c = byPath(r, 'a.ts');
     expect(c?.content).toBe('export const x = 1;\n');
+    expect(c?.contentMode).toBe('full');
     expect(c?.bytes).toBe(Buffer.byteLength('export const x = 1;\n'));
     // sha256('export const x = 1;\n')
     expect(c?.contentHash).toMatch(/^[0-9a-f]{64}$/);
@@ -80,6 +81,59 @@ describe('scanRepoForIndex — ordinary files', () => {
     });
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
+  });
+});
+
+// RUN-209 follow-up (closing the RUN-210 finding): `contentMode` is honoured at the scan
+// boundary rather than parsed-but-ignored.
+describe('scanRepoForIndex — contentMode', () => {
+  it('withholds raw content in metadata mode where full mode returns it, for the same file', async () => {
+    await writeFile(path.join(root, 'a.ts'), 'export const x = 1;\n');
+    const full = await scanRepoForIndex(root, cfg({ contentMode: 'full' }));
+    const metadata = await scanRepoForIndex(root, cfg({ contentMode: 'metadata' }));
+    expect(byPath(full, 'a.ts')?.content).toBe('export const x = 1;\n');
+    expect(byPath(full, 'a.ts')?.contentMode).toBe('full');
+    expect(byPath(metadata, 'a.ts')?.content).toBeNull();
+    expect(byPath(metadata, 'a.ts')?.contentMode).toBe('metadata');
+    // Never merely absent from the object — actually the string, never present anywhere in the
+    // serialized result, the same "prove the byte isn't there" standard the symlink tests use.
+    expect(JSON.stringify(metadata)).not.toContain('export const x = 1');
+  });
+
+  it('still produces an identical hash and size in metadata mode as in full mode', async () => {
+    await writeFile(path.join(root, 'a.ts'), 'export const x = 1;\n');
+    const full = await scanRepoForIndex(root, cfg({ contentMode: 'full' }));
+    const metadata = await scanRepoForIndex(root, cfg({ contentMode: 'metadata' }));
+    const fc = byPath(full, 'a.ts');
+    const mc = byPath(metadata, 'a.ts');
+    expect(mc?.contentHash).toBe(fc?.contentHash);
+    expect(mc?.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(mc?.bytes).toBe(fc?.bytes);
+  });
+
+  it('still opens and confines reads in metadata mode — binary detection and deny/bounds unchanged', async () => {
+    // Binary detection: a NUL byte is still refused as `binary`, never silently admitted because
+    // no content was going to be kept anyway.
+    await writeFile(path.join(root, 'blob.ts'), Buffer.from([0x00, 0x01, 0x02, 0xff]));
+    // Deny list: still non-overridable, even though nothing would leak into `content`.
+    await writeFile(path.join(root, '.env'), 'SECRET=1');
+    // Per-file bound: still enforced.
+    await writeFile(path.join(root, 'big.ts'), 'x'.repeat(1000));
+    const spy = vi.spyOn(repoContext, 'openConfined');
+    const r = await scanRepoForIndex(root, cfg({ contentMode: 'metadata', maxFileBytes: 10 }));
+    expect(statusFor(r, 'blob.ts')?.reason).toBe('binary');
+    expect(statusFor(r, '.env')?.reason).toBe('denied');
+    expect(statusFor(r, 'big.ts')?.reason).toBe('too-large');
+    expect(spy).toHaveBeenCalledWith(path.join(root, 'blob.ts'), root);
+    spy.mockRestore();
+  });
+
+  it('leaves full mode byte-identical to today (default cfg() is full)', async () => {
+    await writeFile(path.join(root, 'a.ts'), 'export const x = 1;\n');
+    const r = await scanRepoForIndex(root, cfg());
+    const c = byPath(r, 'a.ts');
+    expect(c?.contentMode).toBe('full');
+    expect(c?.content).toBe('export const x = 1;\n');
   });
 });
 
@@ -122,7 +176,7 @@ describe('scanRepoForIndex — symlinks, traversal, and the deny list', () => {
     // never reaches it, not merely that this one glob failed to ask for it.
     const r = await scanRepoForIndex(root, cfg({ include: ['**/*'] }));
     expect(byPath(r, 'outdir/secret.txt')).toBeUndefined();
-    expect(r.candidates.some((c) => c.content.includes('TOP SECRET'))).toBe(false);
+    expect(r.candidates.some((c) => c.content?.includes('TOP SECRET'))).toBe(false);
     expect(JSON.stringify(r)).not.toContain('TOP SECRET');
   });
 
