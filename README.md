@@ -89,8 +89,12 @@ prefixes (`FOO=1 npm test`), `2>&1`, `$VAR`, and shell globbing are not. Pin
 **`init` already did this** — read on only if you need to re-authorize, point at a second
 server, or you configured by hand.
 
-The daemon dials the Noriq server with **your OAuth token** — the only secret that
-crosses the wire (model + git credentials never leave the box). One command gets one:
+The daemon dials the Noriq server with **your OAuth token**. Model credentials and git/forge
+credentials never leave the box — nothing changes that. (One other thing can cross, and only if
+you turn it on per repo: a committed `[index].enabled = true` lets this daemon read — and, once a
+later phase ships the transport, send — a bounded slice of that repo's own source. Never a
+credential. See [Repository intelligence](#repository-intelligence-index--off-by-default) below
+and [`THREAT-MODEL.md`](THREAT-MODEL.md).) One command gets your token:
 
 ```bash
 noriq-runner auth        # opens your browser, approve, done
@@ -302,14 +306,48 @@ oversight. Point `branch` at something auto-deploying and you've given that up; 
 in [`THREAT-MODEL.md`](THREAT-MODEL.md). Omit `[land]` and nothing auto-lands: every diff
 waits on its own branch, as before.
 
+## Repository intelligence (`[index]`) — off by default
+
+Project Memory can build a searchable index of a repo's own source — file paths, content, and
+hashes — so future runs get better context and evidence-backed answers. It reads no more than a
+repo explicitly opts into, per repo, in `.noriq/project.toml`:
+
+```toml
+[index]
+enabled = true                    # OFF (default) unless this is explicitly true
+include = ["src/**", "docs/**"]   # optional; default is everything not excluded
+exclude = ["**/*.generated.*"]
+```
+
+What that turns on: this daemon reads a bounded slice of the repo's own SOURCE off disk — never
+model or git/forge credentials, which stay off this path entirely (a non-overridable deny list
+also refuses `.env` files, key material, and credential directories outright, on top of whatever
+you exclude). Turn it off again by removing `[index]` or setting `enabled = false`.
+
+Two things worth knowing before you opt in:
+
+- **No implicit exclusions.** Unlike repo discovery, the indexer does not skip
+  `node_modules`/`dist`/`.git` on its own — write `[index].exclude` yourself, or a repo that opts
+  in without one gets everything not caught by the size/time caps, which is not the same as a
+  sensible default.
+- **Source structure and excerpts are business-sensitive even where they hold no credential** —
+  treat this as a data-classification decision, not only a security one.
+
+As shipped, this is the read-and-confine half only: nothing in this daemon yet transmits an index
+anywhere (the upload transport is a later, unbuilt phase). The full trade — what's enforced today,
+what's designed but not yet built, and every residual risk — is in
+[`THREAT-MODEL.md`](THREAT-MODEL.md), under "Repository intelligence upload (`[index]`)".
+
 ## Security model
 
 One git worktree per Run on a throwaway branch; scope runs read-only; per-kind
 permission profiles (including which Noriq MCP tools each kind may call); daemon-enforced
 budgets (SIGTERM on breach); **no push credentials for any agent, ever, and the daemon
 publishes only where the repo opted it in — never merging into the protected branch**;
-secrets stay local (only the OAuth token crosses the wire, injected into the agent's MCP
-transport rather than its shell). A repo that trusts its agents can opt a kind out of the
+model and git/forge credentials stay local (the OAuth token crosses the wire injected
+into the agent's MCP transport rather than its shell; the only other thing that can — a
+repo's own source, and only on an explicit `[index]` opt-in — is covered above). A repo
+that trusts its agents can opt a kind out of the
 command allowlist into the driver's own auto mode (`[permissions.<kind>] auto = true`) —
 read-only stays read-only and the Noriq tool floor holds regardless, but the bash
 allowlist is the price. Full threat model — and the explicit trades auto-landing and

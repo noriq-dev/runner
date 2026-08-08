@@ -436,6 +436,16 @@ and should be updated alongside any change here.
   read-only), `deny`, env credential stripping, and the server-enforced Noriq tool floor (RUN-47).
   ~~never granted~~ was the pre-RUN-68 wording; do not restore it — see `mapPermission`, `mapSandbox`.
 - **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
+- **Model credentials, git/forge credentials, and unrelated machine secrets never leave the box —
+  one explicit, committed exception.** `sanitizedAgentEnv` strips the agent's env; `src/index-deny.ts`
+  `isDeniedIndexPath` is a second, independent, non-overridable floor under the one thing that CAN
+  cross now: on a repo's own `[index].enabled = true`, this daemon reads a bounded, deny-filtered,
+  confined slice of that repo's own SOURCE (never a credential) for Project Memory. As landed
+  (RUN-207…209) this is the read/confinement half only — nothing in the daemon's own pipeline calls
+  the scanner yet, and no transport exists to ship its output anywhere. "Only the OAuth token
+  crosses the wire" was the pre-RUN-207 shorthand for this line; it is narrower now, not false, and
+  THREAT-MODEL.md's "Repository intelligence upload (`[index]`)" section states the boundary —
+  don't restate it more strongly than that there.
 - **The verify agent executes but never edits** — authorship separation is the point of the gate.
   Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
   `write = false` for any non-producing workflow at every permission site, so no manifest — built-in

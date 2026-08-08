@@ -17,8 +17,17 @@ that contain it. Security here is load-bearing, not polish.
   driving untrusted model output through a shell.
 - **The Noriq server is the control plane; the daemon is the muscle.** Only the
   daemon dials out (a WebSocket to `/ws/runner/:id`); the server never dials in.
-- **The only secret that crosses the wire is the Noriq OAuth token.** Model
-  credentials (Anthropic/OpenAI) and git credentials never leave the box.
+- ~~The only secret that crosses the wire is the Noriq OAuth token.~~ Narrower now, and still
+  absolute for what it protected: **model credentials (Anthropic/OpenAI), git/forge credentials,
+  and unrelated machine secrets never leave the box** — `sanitizedAgentEnv` strips the agent's env,
+  and the index deny list (below) is a second, independent reason none of those specifically are
+  ever read for this purpose. What changed: on a repo's own explicit, committed
+  `[index].enabled = true`, this daemon reads a bounded, deny-filtered, confined slice of that
+  repo's **source** — never a credential — and Project Memory's design ships it to the server once
+  a later phase builds the transport. See "Repository intelligence upload (`[index]`)" below for
+  what that means precisely, what is enforced today versus merely designed, and the residual risk.
+  The v1 sentence is quoted elsewhere (README, CLAUDE.md) and worth keeping visible rather than
+  silently rewritten — RUN-210.
 
 ## Threats & defenses
 
@@ -37,6 +46,7 @@ that contain it. Security here is load-bearing, not polish.
 | A committed `[setup]` turns the daemon into an exec primitive | **It runs at the agent's posture, not the daemon's.** The bootstrap commands a marker declares (RUN-202) execute under `sanitizedAgentEnv` in the run's own workspace — the same stripped env, the same process-group kill and output cap as `verify.cmd`, which is the boundary a committed file already crossed. Cloning a marked repo and running its runner executes its `[setup]`, exactly as it executes its verify command: no wider, and the same thing to check before trusting a repo. Fail-OPEN by design — a failed bootstrap is reported to the agent and the run proceeds, so this can never gate work either | `setup.ts`, `stages/prepare.ts` |
 | Agent reads the stored credential off disk | `~/.noriq/credentials.json` is written `0600` under a `0700` dir, and no agent is granted bare `Bash` or unrestricted reads outside its worktree. **Not a hard boundary**: the file is readable by the uid the daemon and the agents share, so this rests on the permission profiles, not on the filesystem. **The mode bits are POSIX-only** — Node ignores `mode` on Windows apart from the read-only flag, so on Windows this file is protected by whatever ACL `%USERPROFILE%` carries (by default: that user, SYSTEM, and Administrators) and *not* by anything this daemon sets. The permission profiles are load-bearing on every platform; on Windows they are the only thing here. It holds a **90-day refresh token** — a longer-lived secret than the 7-day access token — so revoke the connection (*Settings → Agent connections*) if a box is suspect; rotation makes the stolen pair single-use but does not by itself evict a thief | `credentials.ts`, `token.ts` |
 | Committed context or workflow config turns the daemon into an arbitrary-file-read primitive | `[context]` (RUN-128/129) and workflow `prompt = { file = "..." }` (RUN-192) inline file **contents** into a prompt, while `.noriq/project.toml` and `.noriq/workflows/*.toml` travel with the repo — so every path in them is untrusted input read on the operator's box. **Confinement binds the OPEN, not a name** (RUN-151): the shared reader opens first, then requires the re-resolved path to sit inside the re-resolved root *and* to be the same inode (`dev`/`ino`) as the descriptor it holds — then reads from that descriptor and never consults the path again. Project workflow reads are rooted at the repo; machine-local workflow reads at `~/.noriq/workflows`, never the wider home. A symlink out, a symlinked parent directory, or a swap racing the check is refused. Reads are bounded and the open is `O_NONBLOCK`, so hostile config can neither OOM nor hang prompt assembly. **Where it stops**: an attacker who can already write to the checkout as the operator can hardlink or bind-mount an outside file to a genuinely in-repo path — the inodes match because it is the same file, and no fd check distinguishes that from ordinary repo content. That attacker is inside the boundary already. What is defended is committed config on a box the daemon trusts. | `repo-context.ts` `openConfined`, `defaultDocReader`; `workflow-store.ts` |
+| A committed `[index]` turns the daemon into a source-exfiltration primitive | **Opt-in only, and off by construction until a repo says otherwise.** `[index].enabled` must be explicitly `true` — no inference, no default-on; an `[index]` table present with the key merely unset is still OFF. Every discovered path passes a **non-overridable deny list** as the LAST filter stage, strictly after `include`/`exclude`, so no glob can re-admit a denied path; every byte is read through the same confined-open gate `[context]` already uses (RUN-151), never a second, weaker check; file count, per-file bytes, aggregate bytes, and wall-clock are all bounded, and every refusal is a visible, bounded status record. **As landed (RUN-207…209), this is the read/confinement half only**: nothing in the daemon's own run pipeline calls the scanner yet (`resolveIndexConfig` is wired into repo discovery; `scanRepoForIndex` has no caller outside its own tests), and no transport exists to ship its output anywhere. See "Repository intelligence upload" below for the full trade and what remains designed rather than built | `src/index-policy.ts` `resolveIndexConfig`, `src/index-deny.ts` `isDeniedIndexPath`, `src/index-scan.ts` `scanRepoForIndex`, `repo-context.ts` `openConfined` |
 | A repo's committed manifest or workflow prompt talks its own gate into a PASS | Since RUN-154 the repo's `[context]` reaches the **verify actor and inline reviewer**, and RUN-192 lets a verify-based custom workflow add prompt text. Both are deliberate and both stay **quoted evidence, not instructions**: they say they cannot change review rules, scope, acceptance handling, or verdict; an attempt to do so is itself a finding; and daemon-owned verdict instructions remain after them. A custom verify template is rendered first and inserted into `verify-agent.md` rather than replacing that frame. Context remains bounded and names-only. A prompt frame is not isolation and is not claimed as one: the real floors are unchanged (`clampPermissionToWorkflow` keeps the actor read-only, the reviewer holds no Noriq credential, and a gate's verdict still only gates — it never merges). | `repo-context.ts` `renderRepoContext` (reviewer audience), `supervisor.ts` `assemblePrompt`, `prompts/verify-agent.md`, `prompts/reviewer.md` |
 | A runaway agent burns unbounded tokens/$$ | **Daemon-enforced budget**: token / USD / wall-clock ceilings watched from the telemetry stream; breach → SIGTERM → `failed{budget}`. A Run with a budget can never run unbounded | `drivers/budget.ts` |
 | A run buys a fresh budget by asking a question | A resumed park (RUN-30) inherits the **remainder**, never a new ceiling: token/USD spend carries across sittings, and only a run that exited **cleanly** may park at all — a budget breach is terminal, so it cannot resume its way past the limit it just hit. Wall-clock is the deliberate exception: it counts **active** seconds only, because charging a run for the hours a human took to answer would make every overnight answer arrive to a dead run | `parked.ts` `remainingBudget`, `supervisor.ts` `parkIfBlocked` |
@@ -204,6 +214,58 @@ detail of the one above.
 | **Server-backed VCS (Diversion/Perforce)** | The daemon opens nothing: `gh` is not the review surface there, and no Diversion pending-merge or Perforce/Swarm review API has been measured, so none is called (RUN-85). A hand-written `[land].mergeTarget` on such a repo gets an explicit warning and a recorded failure naming the backend and where review actually happens (the Diversion app; Perforce's own tooling) — never the silent nothing it used to get. No new credential appears: refusing to act needs none. |
 | **Durability** | Completion is recorded server-side, not just pushed down a socket. A plan can finish while the box is off, the runner is offboarded, or the socket is reconnecting — a fire-and-forget notification would drop the merge request silently, forever. The daemon asks on startup and on every reconnect; the record makes it idempotent, so re-asking cannot open a second PR. |
 
+## Repository intelligence upload (`[index]`) — an explicit trade, mostly not yet built
+
+Every other section in this document is about an *agent's* reach. This one is different in kind:
+indexing is **daemon work**. No agent runs, no model credential is spent, no token is charged —
+`[index]` never touches a driver, a worktree write, or a run's budget at all. Say that explicitly
+because it is the reason none of the agent-facing boundaries above change: the write floor, the
+push-credential absence, the verify-agent separation, the Noriq tool floor — every one of those is
+about what a spawned agent may do, and this feature never spawns one.
+
+What it is: on a committed `[index].enabled = true`, this daemon reads repository **source** —
+file paths, file content, and content hashes, under `[index].include`/`.exclude` — off disk. It is
+never model output, never a credential, never a diff an agent produced. Project Memory's design ships that source to the Noriq server as
+staged index generations and batches (the vendored contract's own §7/§8) so later retrieval can
+cite it; RUN-207…209 land the runner-side identity, config, and the confined, deny-filtered read
+path. **They do not land a caller for it or a transport.**
+
+| | |
+|---|---|
+| **What crosses, and what categorically does not** | Source structure and file content/hashes from an opted-in repo. Model credentials (Anthropic/OpenAI), git/forge credentials, and unrelated machine secrets never leave the box regardless — `sanitizedAgentEnv` and the deny list below are two independent reasons, not one relying on the other |
+| **The opt-in** | `[index].enabled`, checked first, refusing to proceed on anything else: absent, `false`, or an unparseable `[index]` table all mean OFF, logged and named, never silently narrowed | `src/index-policy.ts` `resolveIndexConfig` (`if (!manifestIndex?.enabled) return null`) |
+| **Scope** | `include`/`exclude` globs, confined to the repo root at config load — an absolute path or a `..`-escaping glob refuses INDEXING for the whole repo (named in the log) rather than silently dropping just that glob | `src/index-policy.ts` `refuseIndexGlob` |
+| **The non-overridable deny list** | Runs strictly AFTER include/exclude and takes no override input at all, matched against every path segment (`foo/.ssh/id_rsa` denies exactly like `.ssh/id_rsa`), case-insensitively. Covers `.env*`, SSH/TLS/PKCS key material, VCS-internal directories, cloud-credential directories (`.aws`, `.azure`, `.gcloud`, `.kube`, `.ssh`), shell/package-manager credential files (`.netrc`, `.npmrc`, `.pypirc`), and this daemon's own state (`credentials*.json`, `.docker/config.json`, `.noriq/parked-runs.json`). A FLOOR: extended when a new category turns up, never narrowed by a repo's own config | `src/index-deny.ts` `isDeniedIndexPath` |
+| **Confinement** | Every read goes through the identical open-then-verify-identity gate `[context]` already uses (RUN-151) — open first, then require the re-resolved path inside the re-resolved root and the SAME inode as the held descriptor. No second, weaker confinement mechanism exists for indexed reads | `repo-context.ts` `openConfined` |
+| **Bounds** | Per-file bytes, aggregate bytes, file count, and wall-clock all cap one scan; hitting any of them stops the whole walk rather than degrading silently. Committed execution knobs, trusted at the same level `[verify].cmd` already is — nothing clamps an operator's own absurd value from above beyond ordinary positive-number validation | `src/index-policy.ts` `IndexPolicy`, `src/index-scan.ts` (`state.filesOpened >= config.maxFiles`, `deadlinePassed`) |
+| **Visibility (status records)** | A repo that turns this on can see exactly what was read, what was refused, and why: `IndexStatusReason` is a closed, named list (`denied`, `excluded`, `too-large`, `binary`, `budget-exhausted`, …) — nothing is silently dropped. The record list is itself bounded (1000) with a visible overflow COUNT rather than growing without limit — the same "bounded, and honestly so" shape as the byte bounds above, one level up | `src/index-scan.ts` `IndexStatusRecord`, `MAX_STATUS_RECORDS`, `pushStatus` |
+| **What is NOT yet true, precisely** | `resolveIndexConfig` is wired into repo discovery, so a malformed `[index]` table is already visible in the daemon's logs today. But `scanRepoForIndex` has no caller anywhere outside its own test file — nothing in `daemon.ts` or `supervisor.ts` invokes it, on a schedule or otherwise. **Turning `[index].enabled` on today changes nothing observable**: it validates a config and nothing more. `contentMode` (`full` vs `metadata`) is likewise parsed and validated but never consulted by the scanner — it always reads full content into every candidate regardless of the configured mode, so the opt-down to metadata-only does not yet do anything | (no `Where` for either — this is the absence of a call site and an unread config field, not a control) |
+| **DESIGNED, NOT YET IMPLEMENTED (Phase 4)** | Short-lived, single-purpose ingest capability tokens scoped to one generation's upload — never the operator's own OAuth token, and never long-lived; staging uploaded batches in object storage (R2) before one atomic activation transaction selects a generation as active, only once its counts/hashes/deletions validate (`IndexGenerationManifest` stays queryable as "pending" until then); an upload journal with resume, so a killed daemon mid-upload does not have to restart a whole generation; capability revocation, so a compromised or stale ingest token can be cut off independent of the operator's own credential. None of this exists in this tree. Described here as the intended contract, never in the present tense, and with no `Where` pointing at code that does not exist |
+| **Prompt injection** | Indexed content is source TEXT, never instructions to an agent, and nothing in RUN-207…209 renders scanned content into any prompt — that is a context-pack concern (episodes/retrieval, PLNR-264/267/270), itself unbuilt in this tree. The intended treatment, once retrieval does render indexed content back into a brief, is the same quoted-evidence framing `renderRepoContext`'s reviewer audience already applies to `[context]`: evidence about the codebase, explicitly marked as unable to change review rules or a verdict, never instructions the reading agent should follow | `repo-context.ts` `renderRepoContext` (the existing pattern the future renderer is expected to reuse) |
+| **Residual risk — a secret pasted into an ordinary file** | The deny list covers known secret-bearing PATHS (`.env`, `id_rsa`, …), never file CONTENT. An API key hardcoded into an ordinary source file (`src/config.ts`, a test fixture, a `.md` note) is indexed like any other line — no path-based list can see it. This is the honest limit of a path-based control, not a gap to be silently patched later |
+| **Residual risk — business sensitivity, not only security** | Source structure and excerpts are proprietary even when they hold no credential at all. The opt-in is a data-classification decision as much as a security one, which is why `[index]`'s default is OFF — the same posture as `autoPush`, for a different reason |
+| **Residual risk — the hardlink/bind-mount case** | An attacker who can already write to the checkout as the operator can hardlink or bind-mount an outside file onto a path that is genuinely inside the repo; the inodes then match because it really is the same file, and no fd check can tell that from ordinary repo content. `openConfined`'s own comment names this limit and it applies here unchanged: that attacker is already inside the boundary this defends | `repo-context.ts` `openConfined` (doc comment, "What this does NOT cover") |
+| **Residual risk — deletion does not unsend** | Once content has actually shipped (Phase 4, unbuilt), deleting the local `.noriq` state or unsetting `[index].enabled` does not retract what already reached the server. This daemon has no delete-on-the-server story to point at here, because it has no upload story yet either |
+
+**What this pass measured but does not (yet) cover — reported by the RUN-209 implementer, not hidden:**
+
+- **Directory-symlink pruning rests on one signal.** The walk never recurses into a symlinked
+  directory because `Dirent.isDirectory()` reports the entry's OWN type, never a symlink target's —
+  correct Node behaviour today, but there is no second, independent check confirming it. If that
+  ever changed, "never even discovered" would degrade to "discovered but refused" — `openConfined`
+  still holds either way, so no leak, only a difference in which layer catches it.
+- **No implicit exclude list.** Unlike `discovery.ts`'s own repo-marker walk, the indexer has no
+  built-in `node_modules`/`dist`/`.git`-shaped exclusions beyond the hard deny list — a repo that
+  enables indexing without writing `[index].exclude` itself walks everything, bounded only by the
+  size/count/time caps and not by any sensible default. This is a real sharp edge for a first
+  opt-in and is called out in the README.
+- **Binary sniffing reads a bounded 8000-byte prefix.** A file that only turns binary after that
+  point (rare, but possible for a text format with a late-appended binary trailer) is classified as
+  text and its full content is read as a candidate.
+
+Leave `[index]` out entirely (the default) and none of this applies: no path outside the ordinary
+run pipeline is ever opened for this purpose.
+
 ## Updating the daemon (`[update]`) — why it only checks
 
 `[update]` tells this box to notice when it is behind. It does **not** replace anything, and the
@@ -258,5 +320,10 @@ change; a human running `npm i -g` is exposed to the same artifact, but at a mom
 - **The MCP-server credential wiring** (how the agent gets Noriq access without the
   token in its shell env) is finalized at the dogfood; `sanitizedAgentEnv` already
   assumes the token reaches the agent over MCP, not the environment.
+- **Repository intelligence (`[index]`) is a second, narrower category of thing that leaves the
+  box, opt-in per repo.** Its own residual risks — a secret pasted into an ordinary source file,
+  business sensitivity distinct from security, the hardlink/bind-mount case, and deletion not
+  unsending an upload — are catalogued in "Repository intelligence upload (`[index]`)" above,
+  rather than repeated here.
 
 Report security issues privately to the maintainers rather than opening a public issue.
