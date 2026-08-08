@@ -912,23 +912,26 @@ describe('index snapshots (RUN-211, real git)', () => {
     await snapWm.remove(run);
   });
 
-  it('reapOrphans prunes a leftover snapshot unconditionally, uncounted in the reaped-run total', async () => {
+  it('reapOrphans prunes a leftover snapshot on the startup sweep, uncounted in the reaped-run total', async () => {
+    // No `isOwned` — the startup meaning: every prior process, and so every lease, is dead.
     const snap = await snapWm.createIndexSnapshot(snapRepo);
     const reaped = await snapWm.reapOrphans(snapRepo);
     expect(reaped).toBe(0); // no run worktrees here — the snapshot must not inflate this number
     expect(existsSync(snap.path)).toBe(false); // yet it was pruned
   });
 
-  it('reapOrphans prunes a snapshot even alongside a run the daemon still owns', async () => {
-    // isOwned is a RUN concept; a snapshot is pruned regardless of it (locked decision 9) — it is
-    // detached, was never written, and holds no work by construction.
+  it('reapOrphans spares a snapshot on the periodic sweep — indistinguishable from a leased one', async () => {
+    // `isOwned` present means this is a MID-FLIGHT sweep: a snapshot on lease (RUN-214) looks
+    // exactly like this leftover one, and deleting it would pull the tree out from under an
+    // in-flight scan. Only the startup sweep may assume no lease is held.
     const run = await snapWm.create(snapRepo, 'ownedRun');
     const snap = await snapWm.createIndexSnapshot(snapRepo);
     const reaped = await snapWm.reapOrphans(snapRepo, { isOwned: (id) => id === 'ownedRun' });
     expect(reaped).toBe(0); // the owned run was spared, and correctly not counted
     expect(existsSync(run.path)).toBe(true); // the run survives
-    expect(existsSync(snap.path)).toBe(false); // the snapshot does not
+    expect(existsSync(snap.path)).toBe(true); // so does the snapshot — this sweep must not prune it
 
     await snapWm.remove(run);
+    await snapWm.removeIndexSnapshot(snap);
   });
 });

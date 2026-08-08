@@ -260,9 +260,12 @@ export class WorktreeManager {
 
   /** Snapshot worktrees left behind by a crashed daemon, recognized by directory naming alone —
    *  they carry no branch, so `listManaged`'s branch-based recognition can never see them. Used
-   *  only by `reapOrphans`, which prunes every one it finds unconditionally (RUN-211 locked
-   *  decision 9): a snapshot is detached, was never written, and holds no work by construction —
-   *  the one worktree here that is always safe to delete, regardless of `isOwned`. */
+   *  only by `reapOrphans`, which prunes every one it finds ONLY on the startup sweep (`isOwned`
+   *  absent): a snapshot is detached and was never written, so no PROCESS crash can lose work by
+   *  leaving one behind — but a snapshot currently on lease (RUN-214) is indistinguishable from a
+   *  leaked one by inspection, same as a live run's workspace, and deleting it out from under an
+   *  in-flight indexing scan pulls the tree out from under it mid-read. Startup is the one time
+   *  that risk cannot exist: every prior process, and so every lease, died with it. */
   private async listIndexSnapshots(repoRoot: string): Promise<string[]> {
     let stdout: string;
     try {
@@ -717,13 +720,19 @@ export class WorktreeManager {
       removed += 1;
     }
 
-    // Index snapshots (RUN-211) are pruned unconditionally, `isOwned` notwithstanding, and are
-    // NEVER added to `removed`: a snapshot is not a run, and counting it would corrupt the
-    // reaped-run total the daemon logs at startup. Safe by construction — detached, never
-    // written, holds no work — so "never force-delete work that exists nowhere else" cannot apply
-    // to it the way it applies to `managed` above.
-    for (const snapshotPath of await this.listIndexSnapshots(repoRoot)) {
-      await this.removeIndexSnapshot({ repoRoot, path: snapshotPath });
+    // Index snapshots (RUN-211) are pruned only on the STARTUP sweep — `opts.isOwned` absent,
+    // this same doc's "Absent = the startup meaning" above. At startup no process survives, so no
+    // snapshot can be on lease, and it is safe by construction: detached, never written, holds no
+    // work. Mid-flight (`isOwned` present) a leased snapshot looks exactly like a leaked one — the
+    // same problem `isOwned` exists to solve for `managed` above — and unlike a run's worktree it
+    // has no "still holds unsaved work" check to fall back on, because nothing is ever written to
+    // one; the failure mode instead is deleting the tree out from under an in-flight scan reading
+    // it (RUN-214's coordinator leases and releases one). Never added to `removed` either way: a
+    // snapshot is not a run, and counting it would corrupt the reaped-run total the daemon logs.
+    if (!opts.isOwned) {
+      for (const snapshotPath of await this.listIndexSnapshots(repoRoot)) {
+        await this.removeIndexSnapshot({ repoRoot, path: snapshotPath });
+      }
     }
 
     return removed;
