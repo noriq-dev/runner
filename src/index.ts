@@ -26,6 +26,16 @@ export {
   type IndexLanguage,
   type ResolvedIndexConfig,
 } from './index-policy';
+export { isDeniedIndexPath } from './index-deny';
+export {
+  MAX_STATUS_RECORDS,
+  scanRepoForIndex,
+  type IndexFileCandidate,
+  type IndexScanDeps,
+  type IndexScanResult,
+  type IndexStatusReason,
+  type IndexStatusRecord,
+} from './index-scan';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,
