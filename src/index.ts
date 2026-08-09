@@ -52,6 +52,24 @@ export {
   type IndexSourceRefusalReason,
   type ShouldDescend,
 } from './index-source';
+// The two backend-native sources (RUN-254/255). Neither materializes a tree — Perforce reads the
+// depot with no client workspace, Diversion reads its REST API with no checkout — so they are the
+// reason `IndexSnapshot.source` exists at all. On the surface because RUN-214's coordinator is the
+// first caller that has to construct one, and a public symbol reachable only through its own
+// backend is a symbol the next subsystem re-exports by hand.
+export {
+  PerforceDepotIndexSource,
+  realP4RawCli,
+  stripDepotPrefix,
+  type P4RawCli,
+  type PerforceDepotIndexSourceOpts,
+} from './vcs/perforce-index-source';
+export {
+  DiversionIndexSource,
+  decodeObjectStatus,
+  isDirectoryMode,
+  type DvChangeVerb,
+} from './vcs/diversion-index-source';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,
@@ -437,7 +455,9 @@ export {
   dvMergeUrl,
   dvStoredToken,
   realDvHttp,
+  realDvBlobHttp,
   type DiversionBackendOpts,
+  type DvBlobHttp,
   type DvCli,
   type DvHttp,
   type DvHttpResponse,
