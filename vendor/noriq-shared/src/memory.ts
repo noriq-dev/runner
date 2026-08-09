@@ -353,6 +353,72 @@ export const IndexBatch = z.object({
 export type IndexBatch = z.infer<typeof IndexBatch>;
 
 // ---------------------------------------------------------------------------
+// Runner-reachable index cursor + checkout association (§4/§6/§7, PLNR-306)
+//
+// The response shapes for POST /api/runner-memory/index-cursor — the agentAuth read a runner
+// daemon uses for RUN-213's reconciliation (unchanged / incremental / full / incompatible-version
+// / association-error) and, separately, whether ITS OWN checkout is associated with the canonical
+// repository it resolved to. Mirrors the server's own `IndexGenerationSummary`
+// (apps/api/src/do/ProjectMemory.ts) and `RepositoryMemoryState`/`CheckoutAssociationState`
+// (apps/api/src/lib/project-memory.ts) field-for-field; this is the vendored slice the runner
+// re-vendors against (server lands first, see VENDORED-CONTRACT.md), not an import of either.
+// ---------------------------------------------------------------------------
+
+/** One `index_generations` row as the runner needs it — same fields as the operator-facing
+ *  `IndexGenerationSummary`. */
+export const RunnerIndexGeneration = z.object({
+  id: z.string(),
+  branch: z.string(),
+  baseId: z.string(),
+  indexerVersion: z.string(),
+  status: z.enum(['staged', 'active', 'superseded']),
+  batchCount: z.number().int(),
+  fileCount: z.number().int(),
+  sealedAt: z.string().nullable(),
+  validationProblems: z.array(z.string()),
+  createdAt: z.string(),
+  activatedAt: z.string().nullable(),
+});
+export type RunnerIndexGeneration = z.infer<typeof RunnerIndexGeneration>;
+
+/** A staged generation plus whether it is safe to treat as a resume target — sealed with zero
+ *  validation problems. */
+export const RunnerStagedGeneration = RunnerIndexGeneration.extend({ validated: z.boolean() });
+export type RunnerStagedGeneration = z.infer<typeof RunnerStagedGeneration>;
+
+/**
+ * Whether ONE runner-local checkout (`RunnerRepo.id`) is associated with the canonical repository
+ * it resolved to (§4) — derived live from `repository_checkouts`, never a stored column. 'conflict'
+ * is distinguishable from 'not-associated': a checkout bound to a DIFFERENT canonical repository is
+ * a visible failure (§4's "ambiguous or conflicting associations are visible, never silently
+ * rebound"), not the same as never having been associated at all.
+ */
+export const RunnerCheckoutAssociationState = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('not-associated') }),
+  z.object({ state: z.literal('associated'), projectRepositoryId: z.string() }),
+  z.object({ state: z.literal('conflict'), projectRepositoryId: z.string(), reason: z.string() }),
+]);
+export type RunnerCheckoutAssociationState = z.infer<typeof RunnerCheckoutAssociationState>;
+
+/** The response of POST /api/runner-memory/index-cursor — everything RUN-213's reconciliation
+ *  needs for one (repositoryKey, checkout) in a single round trip: the active generation's
+ *  baseId/branch/indexerVersion, staged generations for a resume decision, `stale` (computed by
+ *  the SAME code the human-facing GET /api/projects/:pid/memory/repositories uses — never a
+ *  second, independently-drifting copy), and the checkout's own association state. */
+export const RunnerIndexCursor = z.object({
+  repositoryKey: RepositoryKey,
+  defaultBranch: z.string().nullable(),
+  latestObservedBase: z.string().nullable(),
+  activeGeneration: RunnerIndexGeneration.nullable(),
+  stagedGenerations: z.array(RunnerStagedGeneration),
+  stale: z.boolean(),
+  failedIngest: z.boolean(),
+  failedIngestProblems: z.array(z.string()),
+  association: RunnerCheckoutAssociationState,
+});
+export type RunnerIndexCursor = z.infer<typeof RunnerIndexCursor>;
+
+// ---------------------------------------------------------------------------
 // Context packs (§10, PLNR-267)
 // ---------------------------------------------------------------------------
 

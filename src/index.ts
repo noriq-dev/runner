@@ -240,6 +240,14 @@ export {
   type HeartbeatInput,
 } from './client';
 export {
+  INDEXER_VERSION,
+  associationNotice,
+  reconcile,
+  type IndexReconcileOutcome,
+  type ReconcileInput,
+  type ResumeCandidate,
+} from './index-reconcile';
+export {
   WsClient,
   runnerWsUrl,
   type WsClientOptions,
@@ -506,4 +514,10 @@ export {
   type ParseRepositoryKeyResult,
   type RunnerCheckoutId,
   type VerificationState,
+} from './memory-contract';
+export {
+  RunnerIndexCursor,
+  type RunnerCheckoutAssociationState,
+  type RunnerIndexGeneration,
+  type RunnerStagedGeneration,
 } from './memory-contract';

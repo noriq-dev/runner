@@ -362,3 +362,113 @@ describe('getTask spin-off provenance (RUN-188)', () => {
     expect(await client.getTask('K-1')).toBeNull();
   });
 });
+
+// RUN-213: PLNR-306's agentAuth route, reached over the plain REST rail (not MCP) — the daemon's
+// only way to see the server's index cursor at all, since the human-facing read lives under
+// /api/projects/:pid/* (userAuth-gated, unreachable for a Bearer-only daemon).
+describe('getIndexCursor (RUN-213)', () => {
+  const VALID_CURSOR = {
+    repositoryKey: 'my-repo',
+    defaultBranch: 'main',
+    latestObservedBase: 'base-1',
+    activeGeneration: {
+      id: 'gen_1',
+      branch: 'main',
+      baseId: 'base-1',
+      indexerVersion: '1',
+      status: 'active',
+      batchCount: 1,
+      fileCount: 10,
+      sealedAt: '2026-08-01T00:00:00.000Z',
+      validationProblems: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      activatedAt: '2026-08-01T00:00:00.000Z',
+    },
+    stagedGenerations: [],
+    stale: false,
+    failedIngest: false,
+    failedIngestProblems: [],
+    association: { state: 'associated', projectRepositoryId: 'prjrepo_1' },
+  };
+
+  it('POSTs the four fields to the runner-memory route and parses a valid cursor', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_CURSOR, captured),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toEqual(VALID_CURSOR);
+    expect(captured[0]).toMatchObject({
+      url: 'https://a.b/api/runner-memory/index-cursor',
+      method: 'POST',
+      body: { projectId: 'prj_1', repositoryKey: 'my-repo', runnerId: 'rnr_1', checkoutId: 'repo_abc' },
+    });
+  });
+
+  it('an unresolved project (projectId null) is refused before any request is attempted', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_CURSOR, captured),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: null,
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+    expect(captured).toHaveLength(0); // no I/O attempted at all
+  });
+
+  it('a non-2xx response is a null cursor, never a thrown error', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'no repository registered' }, []),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+
+  it('a body that does not parse as RunnerIndexCursor is a null cursor, not a hand-read partial', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      // missing every required field
+      fetchImpl: fakeFetch(200, { ok: true }, []),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+
+  it('a network error is a null cursor', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: (async () => {
+        throw new Error('ECONNREFUSED');
+      }) as typeof fetch,
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+});

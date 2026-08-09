@@ -22,10 +22,13 @@ import type {
   IndexGenerationManifest,
   MemoryItem,
   MemoryKind,
+  RunnerCheckoutAssociationState,
   RunnerCheckoutId,
+  RunnerIndexGeneration,
+  RunnerStagedGeneration,
   VerificationState,
 } from '@noriq-dev/shared';
-import { RepositoryKey } from '@noriq-dev/shared';
+import { RepositoryKey, RunnerIndexCursor } from '@noriq-dev/shared';
 
 // ---------------------------------------------------------------------------
 // The runner's single import surface for the Project Memory slice (RUN-207).
@@ -60,6 +63,16 @@ export type { MemoryItem, MemoryKind, AuthorityLevel };
 
 // Repository ingest — index generations and batches (§7, §8).
 export type { IndexGenerationManifest, IndexBatch };
+
+// The runner-reachable index cursor (RUN-213, PLNR-306) — `RunnerIndexCursor` is re-exported as a
+// VALUE (the zod schema) for the same reason `RepositoryKey` is: it is the ONLY parser this
+// daemon runs over `POST /api/runner-memory/index-cursor`'s response body (locked decision — see
+// `client.ts`'s `getIndexCursor`). The server computes `stale`/`activeGeneration`/
+// `stagedGenerations` with the exact function the human-facing dashboard route uses
+// (`deriveRepositoryMemoryState`), so a hand-rolled type here would be a second, independently
+// drifting opinion about the same wire shape.
+export { RunnerIndexCursor };
+export type { RunnerIndexGeneration, RunnerStagedGeneration, RunnerCheckoutAssociationState };
 
 // Effort episodes (§14).
 export type {

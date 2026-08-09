@@ -1,4 +1,5 @@
 import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
+import { RunnerIndexCursor } from './memory-contract';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
@@ -471,6 +472,47 @@ export class NoriqClient {
       return { claimable: out.claimable, reason: typeof out.reason === 'string' ? out.reason : null };
     } catch {
       return null; // probe unavailable or errored → fail open, never strand a run
+    }
+  }
+
+  /**
+   * Fetch RUN-213's index cursor — the active generation's baseId/branch/indexerVersion, staged
+   * generations, staleness, and this checkout's own repository association, in one round trip
+   * (`POST /api/runner-memory/index-cursor`, PLNR-306's agentAuth read). Deliberately OUTSIDE
+   * `/api/projects/:pid/*`: that subtree runs `userAuth` before any route-level auth, so a
+   * Bearer-only daemon can never reach it (VENDORED-CONTRACT.md, this task's locked decision 2).
+   *
+   * `input.projectId` is `null` when this daemon has not resolved which Noriq project the repo's
+   * key belongs to on this server yet (`RegisteredRunnerRepo.projectId`, set from registration) —
+   * the route requires one, so that precondition is refused BEFORE any request is attempted. This
+   * reads as `unavailable` to `index-reconcile.ts`'s `reconcile`, never as `association-conflict`:
+   * that verdict requires the server to have actually compared this checkout against a *resolved*
+   * canonical repository, which requires a projectId to ask it with in the first place.
+   *
+   * Returns `null` on every OTHER failure mode too — network error, non-2xx, or a body that does
+   * not parse as the vendored `RunnerIndexCursor` (locked decision 3: this is the ONLY parser run
+   * over the response, never a hand-rolled read off `unknown` — the server computes `stale` with
+   * the exact function the human-facing dashboard route uses, so a second, independently-typed
+   * reading of the same wire shape is exactly how the two would drift). `reconcile` treats every
+   * `null` identically: schedule nothing, and let the next trigger retry (decision 6) — a fetch
+   * hiccup must cost a retry, never a full reindex of a monorepo.
+   */
+  async getIndexCursor(
+    runnerId: string,
+    input: { projectId: string | null; repositoryKey: string; checkoutId: string },
+  ): Promise<RunnerIndexCursor | null> {
+    if (!input.projectId) return null; // unresolved project — see this method's doc
+    try {
+      const out = await this.request('POST', '/api/runner-memory/index-cursor', {
+        projectId: input.projectId,
+        repositoryKey: input.repositoryKey,
+        runnerId,
+        checkoutId: input.checkoutId,
+      });
+      const parsed = RunnerIndexCursor.safeParse(out);
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
     }
   }
 }
