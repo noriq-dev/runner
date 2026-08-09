@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { FakeIndexSource, FilesystemIndexSource } from '../src/index-source';
 import { GitBackend, type GitOps } from '../src/vcs/git';
 import type { IndexSnapshot, Workspace } from '../src/vcs/types';
 import type { IndexSnapshotHandle, WorktreeInfo } from '../src/worktree';
@@ -201,15 +202,19 @@ describe('GitBackend — index snapshot (RUN-211)', () => {
   it('leaseIndexSnapshot wraps the handle into an IndexSnapshot: no branch, readOnly true', async () => {
     const { ops, calls } = recorder();
     const res = await new GitBackend(ops).leaseIndexSnapshot('/repo');
-    expect(res).toEqual({
-      ok: true,
-      snapshot: {
-        localPath: '/wt/repo-index-snapshot-abc',
-        baseId: 'snap0000',
-        readOnly: true,
-        location: { repoRoot: '/repo', kind: 'index-snapshot' },
-      },
+    if (!res.ok) throw new Error('expected an acquired snapshot');
+    expect(res.snapshot).toMatchObject({
+      localPath: '/wt/repo-index-snapshot-abc',
+      baseId: 'snap0000',
+      readOnly: true,
+      location: { repoRoot: '/repo', kind: 'index-snapshot' },
     });
+    // Git materializes, so it reads through the FILESYSTEM source (RUN-252/254/255) — and rooted at
+    // the SNAPSHOT, never at the repo, or the indexer would read the operator's working tree
+    // instead of the pinned base. `source` is the field the indexer actually consumes, so asserting
+    // its identity and root matters more than the `localPath` beside it.
+    expect(res.snapshot.source).toBeInstanceOf(FilesystemIndexSource);
+    expect(res.snapshot.source.kind).toBe('filesystem');
     expect(calls).toEqual([{ method: 'createIndexSnapshot', args: ['/repo'] }]);
   });
 
@@ -251,6 +256,7 @@ describe('GitBackend — index snapshot (RUN-211)', () => {
     const { ops } = recorder();
     const vcs = new GitBackend(ops);
     const alien: IndexSnapshot = {
+      source: new FakeIndexSource([]),
       localPath: '/somewhere',
       baseId: 'x',
       readOnly: true,

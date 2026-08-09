@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentDriver, DriverExit, DriverStartOptions } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
+import { FakeIndexSource } from '../src/index-source';
 import { RunSupervisor } from '../src/supervisor';
 import { DiversionBackend, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
 import type { LockDelegate } from '../src/vcs/git';
@@ -607,7 +608,13 @@ describe('DiversionBackend — index snapshot (RUN-211): try-acquire only, never
   it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
     const { backend } = fakes({});
     await expect(
-      backend.releaseIndexSnapshot({ localPath: '/repo', baseId: 'x', readOnly: true, location: {} }),
+      backend.releaseIndexSnapshot({
+        source: new FakeIndexSource([]),
+        localPath: '/repo',
+        baseId: 'x',
+        readOnly: true,
+        location: {},
+      }),
     ).rejects.toThrow(/never mints an index snapshot/);
   });
 });

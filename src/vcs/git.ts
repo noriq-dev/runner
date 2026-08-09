@@ -1,3 +1,4 @@
+import { FilesystemIndexSource } from '../index-source';
 import type { LockClient } from '../lock-client';
 import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
@@ -241,6 +242,10 @@ export class GitBackend implements VcsBackend {
     return {
       ok: true,
       snapshot: {
+        // Git DOES materialize (a detached worktree), so it reads through the filesystem source —
+        // `openConfined` and every RUN-209 guarantee, unchanged. The depot- and API-backed
+        // backends hand over their own source instead and set no `localPath` at all.
+        source: new FilesystemIndexSource(handle.path),
         localPath: handle.path,
         baseId: handle.baseSha,
         readOnly: true,
@@ -253,6 +258,17 @@ export class GitBackend implements VcsBackend {
 
   async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
     const loc = gitIndexSnapshotLocation(snapshot);
+    // `localPath` is optional on the seam now that a depot- or API-backed snapshot materializes
+    // nothing (RUN-252/254/255). Git's always has one, so its ABSENCE here means this object did
+    // not come from `leaseIndexSnapshot` — the same class of mistake `gitIndexSnapshotLocation`
+    // already refuses, and refused rather than defaulted for the same reason: this method deletes a
+    // directory, and a released snapshot with no path would otherwise reach `removeIndexSnapshot`
+    // with `undefined` and let git decide what that means.
+    if (snapshot.localPath === undefined) {
+      throw new Error(
+        'refusing to release a git index snapshot with no localPath — it was minted by another backend or an incompatible daemon version',
+      );
+    }
     await this.git.removeIndexSnapshot({ repoRoot: loc.repoRoot, path: snapshot.localPath });
   }
 

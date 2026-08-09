@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { FakeIndexSource } from '../src/index-source';
 import type { LockDelegate } from '../src/vcs/git';
 import { type P4Cli, PerforceBackend } from '../src/vcs/perforce';
 import type { VcsBackend } from '../src/vcs/types';
@@ -378,7 +379,13 @@ describe('PerforceBackend — index snapshot (RUN-211): try-acquire only, never 
   it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
     const { backend } = fakes({});
     await expect(
-      backend.releaseIndexSnapshot({ localPath: '/ws1', baseId: 'x', readOnly: true, location: {} }),
+      backend.releaseIndexSnapshot({
+        source: new FakeIndexSource([]),
+        localPath: '/ws1',
+        baseId: 'x',
+        readOnly: true,
+        location: {},
+      }),
     ).rejects.toThrow(/never mints an index snapshot/);
   });
 });

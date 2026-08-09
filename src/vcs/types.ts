@@ -1,3 +1,4 @@
+import type { IndexSource } from '../index-source';
 import type { LockConflict, LockGrant } from '../lock-client';
 
 /**
@@ -70,17 +71,39 @@ export interface Workspace {
 /**
  * A read-only lease over the repo's tree for BACKGROUND INDEXING (RUN-211) — never for an agent.
  * Repeats `Workspace`'s type discipline exactly, for the reason `Workspace`'s own comment gives:
- * `localPath` is the ONLY field here that is a filesystem path, `baseId` is an opaque token in
- * the owning backend's id-space, and `location` is backend-owned `unknown` state, so reaching in
- * is a type error rather than a code-review catch. No ref, branch (beyond the display-only field
- * below), or sha field is added that common code could pass back to a backend as an operand —
+ * `localPath` is the only field here that is EVER a filesystem path (and is now optional — see
+ * `source`), `baseId` is an opaque token in the owning backend's id-space, and `location` is
+ * backend-owned `unknown` state, so reaching in is a type error rather than a code-review catch.
+ * No ref, branch (beyond the display-only field below), or sha field is added that common code
+ * could pass back to a backend as an operand —
  * RUN-50's trap applies here verbatim: a Perforce depot path satisfies both `startsWith('/')` and
  * `path.isAbsolute()` while being no filesystem path at all, and git fuses the two namespaces so a
  * git-first design never notices. The fusion has to stay unrepresentable, not merely discouraged.
  */
 export interface IndexSnapshot {
-  /** Where the indexer reads from — a real filesystem path, the ONLY field here that is one. */
-  localPath: string;
+  /**
+   * How the indexer READS this snapshot (RUN-252/254/255). The one field a caller needs, and the
+   * reason `localPath` below is no longer it: a snapshot's job is to hand over a source, not to
+   * promise a directory.
+   *
+   * Requiring a filesystem path was the seam bug that made both live backends answer
+   * `unsupported` (RUN-211). It forced every backend to MATERIALIZE a full tree first — on a
+   * deliberately-large Perforce depot the single most expensive thing that could be asked of it —
+   * when both live backends can serve file content at a revision far more cheaply: Perforce reads
+   * the depot with no client workspace at all, and Diversion reads its REST API with no checkout.
+   * Neither needs to write a byte to disk, and neither should have to.
+   */
+  source: IndexSource;
+  /**
+   * Where this snapshot materialized a tree, IF it did — for logs and diagnostics only. Absent on
+   * a backend that materializes nothing (Perforce's depot, Diversion's API), and a real filesystem
+   * path when present, the ONLY field here that is one.
+   *
+   * Optional rather than a union arm deliberately: every consumer reads `source`, so a discriminant
+   * would make callers narrow a shape they never branch on. Absent-means-nothing-on-disk is a fact
+   * a log line wants and the indexer does not.
+   */
+  localPath?: string;
   /**
    * The snapshot's base, in the backend's own id-space. `Workspace.baseId`'s contract verbatim:
    * an opaque token, hand it back to the SAME backend as a ref, display it, never parse it.
