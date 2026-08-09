@@ -12,6 +12,7 @@ import {
   type DriverCapabilities,
   type DriverCatalog,
   type DriverExit,
+  type DriverOutcome,
   type DriverSession,
   type DriverStartOptions,
   type NoriqMcp,
@@ -52,7 +53,16 @@ export type CodexEvent =
 
 export interface CodexTransport {
   events: AsyncIterable<CodexEvent>;
-  /** Start the first user turn with the initial prompt. */
+  /**
+   * Start a turn on the thread: the first with the initial prompt, and — under `multiTurn`
+   * (RUN-200) — any later hand-back turn too. The real transport posts `turn/start` against
+   * whatever `threadId` already exists (buffering only until the thread itself has started), so
+   * calling this again once a prior turn has completed is a SECOND `turn/start` on the SAME live
+   * thread, not a resume and not a new process — confirmed against the app-server's own schema:
+   * every per-turn override field on `TurnStartParams` (model, effort, cwd, …) is documented as
+   * applying "to this turn and subsequent turns", which only makes sense if repeated calls on one
+   * thread are the intended shape.
+   */
   sendUserTurn(text: string): void;
   /** Steer the active turn with additional user input (mid-session).
    *  @returns false if there is no live turn to steer — the caller must fall back
@@ -133,7 +143,10 @@ export interface CodexDriverDeps {
 
 /**
  * Drives Codex via app-server protocol mode with spawn/stream/steer/interrupt
- * parity with the Claude driver. Completes on the first turn/completed.
+ * parity with the Claude driver. `done()` completes on the first turn/completed;
+ * under `multiTurn` (RUN-200) the process stays live past it and `continueWith`
+ * posts further `turn/start`s on the same thread, mirroring the Claude driver's
+ * own multiTurn/continueWith pair.
  */
 /**
  * Codex's advertised coordinate menu (RUN-115). A suggestion, not a whitelist — `model` is free
@@ -188,17 +201,40 @@ export class CodexDriver implements AgentDriver {
     const donePromise = new Promise<DriverExit>((resolve) => {
       settle = resolve;
     });
+    // `finished` gates `done()` — it settles once, on the FIRST terminal event, exactly like the
+    // Claude driver. `torndown` gates the PROCESS: under multiTurn the run is not over when the
+    // first turn completes (that is the whole point, RUN-200), so the two must not be the same
+    // flag — collapsing them is what used to close the transport under the caller's feet the
+    // instant a fix round would have needed it.
     let finished = false;
+    let torndown = false;
+    // The first turn's own outcome, kept so a LATER continueWith can tell a thread that never
+    // successfully started from one merely idle between turns (RUN-200 discretion: a continueWith
+    // on a thread whose foundation never completed must be an honest failure, not a multi-minute
+    // hang waiting on a turn/completed that will never arrive).
+    let firstOutcome: DriverOutcome | null = null;
+    /** Armed by continueWith: the next terminal event belongs to THAT turn, not to done(). */
+    let awaitingTurn: ((exit: DriverExit) => void) | null = null;
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (exit: DriverExit) => {
-      if (finished) return;
-      finished = true;
+    const teardown = () => {
+      if (torndown) return;
+      torndown = true;
       if (silenceTimer) clearTimeout(silenceTimer);
       try {
         transport.close();
       } catch {
         /* already gone */
       }
+    };
+    const finish = (exit: DriverExit) => {
+      if (finished) return;
+      finished = true;
+      firstOutcome = exit.outcome;
+      // multiTurn keeps the process alive past its first terminal event so the caller can hand
+      // work back (RUN-200, mirroring claude.ts's own multiTurn/continueWith). The caller then
+      // owns it and must stop() — settle's stopSession is that caller, and nothing else ever
+      // closes a multiTurn codex session.
+      if (!opts.multiTurn) teardown();
       opts.handlers?.onExit?.(exit);
       settle(exit);
     };
@@ -209,20 +245,29 @@ export class CodexDriver implements AgentDriver {
     // below, and the run showed "running" for half an hour with no process behind it. A real
     // turn emits SOMETHING (deltas, usage ticks) well inside this window; total silence past it
     // means dead or wedged, and both settle the same way: torn down as an ordinary failure,
-    // which the continuation flow already recovers. Re-armed on every event, cleared at finish.
+    // which the continuation flow already recovers. Re-armed on every event, cleared at teardown
+    // — NOT at `finished` (RUN-200): a multiTurn session's first result leaves `finished` true
+    // while the process, and the watchdog over it, both have to keep running for every turn after.
     const armSilence = () => {
-      if (finished) return;
+      if (torndown) return;
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
         this.log.warn('codex went silent past the liveness deadline — tearing the session down', {
           runId: opts.runId,
         });
-        finish({
+        const exit: DriverExit = {
           outcome: 'failed',
           isError: true,
           reason: 'driver went silent — torn down (RUN-201)',
           telemetry: { ...live },
-        });
+        };
+        teardown();
+        // A wedge mid-hand-back must fail the turn awaiting it, not the (already-settled) run —
+        // the same split `stop()` makes below. With nobody awaiting, it is the ordinary case.
+        const pending = awaitingTurn;
+        awaitingTurn = null;
+        if (pending) pending(exit);
+        else finish(exit);
       }, CODEX_SILENCE_TEARDOWN_MS);
       silenceTimer.unref?.();
     };
@@ -250,23 +295,73 @@ export class CodexDriver implements AgentDriver {
           } else if (ev.type === 'turn_complete') {
             live.numTurns += 1;
             opts.handlers?.onTelemetry?.({ ...live });
-            finish({ outcome: 'done', isError: false, reason: null, telemetry: { ...live } });
-            return;
+            const exit: DriverExit = {
+              outcome: 'done',
+              isError: false,
+              reason: null,
+              telemetry: { ...live },
+            };
+            // A completion that belongs to a continueWith turn settles THAT, not the run — the
+            // run is not over, someone handed it more work and is waiting on the answer (RUN-200,
+            // mirroring claude.ts). Only the FIRST completion (no turn awaiting it) is `done()`'s.
+            const turn = awaitingTurn;
+            awaitingTurn = null;
+            if (turn) {
+              turn(exit);
+            } else {
+              finish(exit);
+              // Single-turn: the process was just torn down by finish() above, so there is
+              // nothing left to read. Under multiTurn the loop keeps going — a hand-back turn's
+              // events (deltas, usage, its own turn_complete) still have to reach this consumer,
+              // and stop() is what ends it (RUN-200: the caller owns a multiTurn session).
+              if (!opts.multiTurn) return;
+            }
           } else if (ev.type === 'error') {
             opts.handlers?.onError?.(new Error(ev.message));
-            finish({ outcome: 'failed', isError: true, reason: ev.message, telemetry: { ...live } });
-            return;
+            const exit: DriverExit = {
+              outcome: 'failed',
+              isError: true,
+              reason: ev.message,
+              telemetry: { ...live },
+            };
+            const turn = awaitingTurn;
+            awaitingTurn = null;
+            if (turn) {
+              turn(exit);
+            } else {
+              finish(exit);
+              if (!opts.multiTurn) return;
+            }
           }
         }
-        finish({
+        // The event stream ended — the process is gone, whatever turn was in flight included.
+        // Under multiTurn this can arrive well after the first turn: no `armSilence` catches it
+        // faster than 20 minutes, but a clean exit/close still closes the queue immediately, and
+        // that must fail the turn actually waiting rather than the (already-settled) run.
+        const exit: DriverExit = {
           outcome: 'failed',
           isError: true,
           reason: 'codex stream ended without completing a turn',
           telemetry: { ...live },
-        });
+        };
+        teardown();
+        const pending = awaitingTurn;
+        awaitingTurn = null;
+        if (pending) pending(exit);
+        else finish(exit);
       } catch (err) {
+        const exit: DriverExit = {
+          outcome: 'failed',
+          isError: true,
+          reason: (err as Error).message,
+          telemetry: { ...live },
+        };
         opts.handlers?.onError?.(err as Error);
-        finish({ outcome: 'failed', isError: true, reason: (err as Error).message, telemetry: { ...live } });
+        teardown();
+        const pending = awaitingTurn;
+        awaitingTurn = null;
+        if (pending) pending(exit);
+        else finish(exit);
       }
     };
     void consume();
@@ -274,13 +369,44 @@ export class CodexDriver implements AgentDriver {
     return {
       runId: opts.runId,
       pushInput: (text: string): boolean => transport.steer(text),
+      // Only present under multiTurn (RUN-200) — the contract marks it optional for exactly that
+      // reason (drivers/types.ts). A second `turn/start` on the SAME live thread: `sendUserTurn`
+      // already posts exactly that once `threadId` exists, which by now it does (continueWith is
+      // only ever reachable after the first turn settled `firstOutcome`).
+      continueWith: opts.multiTurn
+        ? (text: string): Promise<DriverExit> =>
+            new Promise<DriverExit>((resolve, reject) => {
+              if (awaitingTurn) return reject(new Error('a turn is already in flight'));
+              // An honest failure (RUN-200 discretion), never a fabricated success: a torn-down
+              // process, or a thread whose FIRST turn never actually completed, has nothing live
+              // to hand another turn to — the same "closed input" case claude.ts rejects on,
+              // and it avoids waiting on a turn/completed that a dead thread will never send.
+              if (torndown || firstOutcome !== 'done') {
+                reject(new Error('no live codex thread to continue'));
+                return;
+              }
+              awaitingTurn = resolve;
+              transport.sendUserTurn(text);
+            })
+        : undefined,
       interrupt: async () => {
         this.log.debug('codex interrupt', { runId: opts.runId });
         transport.interrupt();
       },
       stop: async () => {
-        transport.close();
+        teardown();
         finish({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        // Settle a turn that was IN FLIGHT. `finish` is one-shot and was already consumed by the
+        // session's first result under multiTurn, so it does nothing here — and continueWith's
+        // promise has its own resolver, which only the event stream ever calls. Without this a
+        // stop() mid-hand-back would leave reviewWithFeedback/verifyWithFeedback awaiting a turn
+        // that can never arrive: the process is gone and the stream is closed (RUN-200, mirroring
+        // claude.ts's own stop()).
+        const pending = awaitingTurn;
+        if (pending) {
+          awaitingTurn = null;
+          pending({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        }
       },
       done: () => donePromise,
     };
