@@ -125,7 +125,7 @@ describe('buildDebugReport — over a real runIndexer result', () => {
     for (const e of report.entities.shown) expect(e.content).toBeUndefined();
   });
 
-  it('a real secret-shaped value pasted into an ordinary source file never reaches the report, even under --show-content', async () => {
+  it('a credential-marker secret is withheld at the SOURCE (RUN-258) — the raw record already carries no content, before the report layer runs at all', async () => {
     const config = cfg();
     const { registry } = buildIndexAdapterRegistry(config);
     const secretToken = 'ghp_ThisLooksLikeARealGithubToken1234567890';
@@ -137,9 +137,49 @@ describe('buildDebugReport — over a real runIndexer result', () => {
       },
     ]);
     const result = await runIndexer(source, config, target(), { adapters: registry });
-    // The raw record itself DOES carry the secret — `indexer.ts` never redacts file/tree-sitter
-    // content (see this module's own doc). This is what makes the report-layer check meaningful:
-    // if it did nothing, the assertion below on the RENDERED report would fail.
+    // `indexer.ts` now withholds a `full`-mode file's content itself when it contains a
+    // high-confidence credential marker (RUN-258) — a known issuer prefix is exactly that, so the
+    // raw record is ALREADY redacted here, unlike the entropy-only case below. Symbol parsing is
+    // skipped for the same file (same RUN-258 change), so there is no `withSecret` symbol entity
+    // to carry the token back out through `node.text` either.
+    const rawJson = JSON.stringify(result.records);
+    expect(rawJson).not.toContain(secretToken);
+    expect(result.records.some((r) => r.kind === 'node' && r.type === 'symbol')).toBe(false);
+
+    const report = buildDebugReport(result, {
+      root: '/repo',
+      configSource: 'project.toml',
+      config,
+      limit: 100,
+      showContent: true,
+    });
+    const reportJson = JSON.stringify(report);
+    expect(reportJson).not.toContain(secretToken);
+    const renderedText = renderDebugReport(report);
+    expect(renderedText).not.toContain(secretToken);
+
+    const fileEntity = report.entities.shown.find((e) => e.uri.endsWith('/secret.ts'));
+    expect(fileEntity?.content).toBeNull();
+  });
+
+  it('a high-entropy secret with NO known marker is left alone by the indexer (RUN-258 is marker-only, not entropy) — the debug tool’s OWN redaction floor is what catches it, even under --show-content', async () => {
+    const config = cfg();
+    const { registry } = buildIndexAdapterRegistry(config);
+    // High entropy (mixed case + digits, well over the length floor) but no PEM/JWT/issuer-prefix
+    // shape — `index-redact.ts`'s `scanTextForCredentialMarkers` doc names this exact boundary: the
+    // entropy heuristic does not transfer to whole-file scanning, so RUN-258 deliberately does not
+    // apply it here. This is the case that proves the report layer's own floor still does real work.
+    const secretToken = 'aB3xQ9zM2kLp7vN4wR8tYcJ6hGdFsE1u';
+    const source = new FakeIndexSource([
+      {
+        kind: 'file',
+        path: 'src/secret.ts',
+        content: `export function withSecret() {\n  const token = "${secretToken}";\n  return token;\n}\n`,
+      },
+    ]);
+    const result = await runIndexer(source, config, target(), { adapters: registry });
+    // The raw record itself DOES carry the secret — measured, not assumed: this is what makes the
+    // report-layer assertion below meaningful, rather than trivially true because nothing reached it.
     const rawJson = JSON.stringify(result.records);
     expect(rawJson).toContain(secretToken);
 

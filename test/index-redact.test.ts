@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   keyLooksSensitive,
   looksHighEntropy,
+  scanTextForCredentialMarkers,
   scanTextForSecretShapedContent,
   shouldWithholdValue,
   valueLooksSecret,
@@ -196,5 +197,88 @@ describe('scanTextForSecretShapedContent', () => {
       'See https://example.com/docs/setup for details. The last known-good commit was ' +
       'a94a8fe5ccb19ba61c4c0873d391e987982fbbd3.';
     expect(scanTextForSecretShapedContent(text)).toBeNull();
+  });
+});
+
+describe('scanTextForCredentialMarkers — RUN-258, the marker-only whole-file entry point', () => {
+  it('flags a PEM header anywhere in a larger file', () => {
+    const text =
+      'const key = `\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\n`;';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/PEM/);
+  });
+
+  it('flags a JWT-shaped value anywhere in a larger file', () => {
+    const text =
+      'const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+      'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+
+  it.each([
+    'const token = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";',
+    'const token = "gho_16C7e42F292c6912E7710c838347Ae178B4a";',
+    'const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";',
+    'const bot = "xoxb-1234567890-abcdefghijklmnop";',
+    'const id = "AKIAIOSFODNN7EXAMPLE";',
+    'const key = "AIzaSyDaGmWKa4JsXZ-HjGw7ISLan_Amoqrkps0";',
+  ])('flags a known issuer prefix at a real token boundary: %s', (text) => {
+    expect(scanTextForCredentialMarkers(text)).toMatch(/prefix/);
+  });
+
+  it('never embeds the matched value or prefix in the returned reason', () => {
+    const cases = [
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----',
+      'const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+        'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";',
+      'const token = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";',
+    ];
+    for (const text of cases) {
+      const reason = scanTextForCredentialMarkers(text);
+      expect(reason).not.toBeNull();
+      expect(reason).not.toMatch(/ghp_|gho_|github_pat_|sk-|xox[abprs]-|AKIA|AIza|MIIEow|eyJ/);
+    }
+  });
+
+  // The whole reason this function exists rather than reusing `scanTextForSecretShapedContent`
+  // directly (locked decision 6): composing the VALUE-level checks over WHOLE FILES over-redacts.
+  it('does NOT run the entropy heuristic — a high-entropy token with no known marker is left alone', () => {
+    const text = 'const token = "Kj8xQ9Lm2Wz4Rt6Yh1Bv3Nc5Fh7Gd0SaP2mK9";';
+    expect(scanTextForSecretShapedContent(text)).toMatch(/entropy/); // the VALUE-level scan DOES fire
+    expect(scanTextForCredentialMarkers(text)).toBeNull(); // the marker-only scan does not
+  });
+
+  // The measured false positive locked decision 1 names: a plain substring match on `sk-` (the
+  // naive composition this task explicitly rejects) fires inside ordinary English — `task-`,
+  // `risk-`, `desk-` all contain the literal substring `sk-`. This is the exact shape that made
+  // `src/adjudication.ts` lose its entire content under the naive alternative.
+  it.each(['a task-completion helper', 'handles the risk-scoring path', 'render to the desk-view panel'])(
+    'does not flag "sk-" embedded mid-word in ordinary English: %s',
+    (text) => {
+      expect(scanTextForCredentialMarkers(text)).toBeNull();
+    },
+  );
+
+  it('still flags a real "sk-" token at a genuine word boundary, right after ordinary prose containing "task-"', () => {
+    const text = 'a task-completion helper using key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/prefix/);
+  });
+
+  it('does not flag ordinary documentation prose', () => {
+    const text =
+      'Run `npm run check` before calling work done. It runs the typechecker, the linter, and the ' +
+      'full test suite in sequence, and the whole thing normally finishes in under a minute.';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  it('does not flag an ordinary source file (a real one from this repo) with no credential in it', () => {
+    // A short but representative excerpt — plain TypeScript, no secret-shaped content at all.
+    const text = `
+export function add(a: number, b: number): number {
+  return a + b;
+}
+
+export const DEFAULT_TIMEOUT_MS = 30_000;
+`;
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
   });
 });

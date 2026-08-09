@@ -22,6 +22,7 @@ import {
 } from './index-entity';
 import type { ResolvedIndexConfig } from './index-policy';
 import { INDEXER_VERSION } from './index-reconcile';
+import { scanTextForCredentialMarkers } from './index-redact';
 import { scanIndexSource } from './index-scan';
 import type { IndexScanDeps, IndexStatusRecord } from './index-scan';
 import type { IndexSource } from './index-source';
@@ -60,6 +61,21 @@ import type { IndexSource } from './index-source';
  * source text, not the read" posture (`index-scan.ts`'s module doc) carrying through unchanged:
  * `contentMode: 'metadata'` costs symbol extraction the same way it costs the file's own stored
  * content, for the same reason.
+ *
+ * **A `'full'`-mode candidate whose content carries a high-confidence credential marker is treated
+ * the same way** (RUN-258, closing the residual risk THREAT-MODEL.md's `[index]` section names: a
+ * token hardcoded into ordinary source, not a value an adapter extracted from JSON/TOML/markdown —
+ * `index-redact.ts`'s existing value floor never saw a whole file's raw text). Checked here, BEFORE
+ * the file entity's `content` is even assigned — this is the one place that field is set, which
+ * makes it the chokepoint (RUN-90's rule) — via `scanTextForCredentialMarkers`, the marker-only
+ * sibling of `index-redact.ts`'s existing value-shape checks: PEM headers, JWTs, known issuer
+ * prefixes, deliberately WITHOUT the entropy/key-name heuristics tuned for a short isolated value,
+ * which over-fire on whole files of real code (that function's own doc has the measured cases). A
+ * hit withholds the file entity's `content` (never masked, per locked decision 3) and skips adapter
+ * parsing for that file exactly like `'metadata'` mode does above — a symbol's own `content` is
+ * raw source text too (`index-treesitter.ts`'s `node.text`), so parsing a file whose content this
+ * pass just decided not to trust would hand the same bytes back out through a different entity
+ * kind. A bounded diagnostic records the file and the marker CLASS, never the matched bytes.
  *
  * **`imports` edges are resolved SNAPSHOT-LOCAL and TWO-PASS** (RUN-217 locked decision 2): an
  * adapter reports `ParsedImport.specifier` as a literal string with no idea what else this
@@ -219,18 +235,34 @@ export async function runIndexer(
     const path = normalizeRepoPath(candidate.path);
     currentPaths.push(path);
 
+    // RUN-258: a high-confidence credential marker in FULL-mode content withholds this file's
+    // `content` the same way `contentMode: 'metadata'` does — see this module's doc for why the
+    // check runs here, before the field is assigned, and why it forecloses adapter parsing below
+    // rather than only nulling the file entity.
+    const credentialMarker =
+      candidate.contentMode === 'full' ? scanTextForCredentialMarkers(candidate.content) : null;
+    if (credentialMarker) {
+      diagnostics.push({
+        path,
+        message: `file content withheld: contains a credential marker (${credentialMarker})`,
+        severity: 'warning',
+        source: 'index-redact',
+      });
+    }
+
     const fileUri = buildFileEntityUri(scope, path);
     records.push({
       kind: 'node',
       uri: fileUri,
       type: 'file',
       label: path.split('/').pop() || path,
-      content: candidate.contentMode === 'full' ? candidate.content : null,
+      content: candidate.contentMode === 'full' && !credentialMarker ? candidate.content : null,
     });
 
-    // Adapters need decoded source text — a 'metadata'-mode candidate contributes only the file
-    // entity above (see this module's doc).
-    if (candidate.contentMode !== 'full') continue;
+    // Adapters need decoded source text — a 'metadata'-mode candidate, or a 'full'-mode candidate
+    // whose content was just withheld for a credential marker, contributes only the file entity
+    // above (see this module's doc).
+    if (candidate.contentMode !== 'full' || credentialMarker) continue;
 
     const adapter = registry.select(path);
     if (!adapter) continue;

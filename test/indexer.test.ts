@@ -248,6 +248,129 @@ describe('runIndexer — content modes', () => {
   });
 });
 
+describe('runIndexer — credential-marker withholding (RUN-258)', () => {
+  const GHP_TOKEN = 'ghp_16C7e42F292c6912E7710c838347Ae178B4a';
+
+  it('withholds a full-mode file’s content when it contains a high-confidence credential marker, and skips adapter parsing for it', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        {
+          kind: 'file',
+          path: 'src/secret.ts',
+          content: `function useToken() {\n  return "${GHP_TOKEN}";\n}\n`,
+        },
+      ]),
+      cfg(),
+      target(),
+      { adapters: registry() },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    expect(rows).toHaveLength(1); // the file entity only — no symbol, no declares edge.
+    expect(rows[0]).toMatchObject({ kind: 'node', type: 'file', content: null });
+    expect(Object.keys(result.parserVersions)).toHaveLength(0);
+
+    // The token appears nowhere in the encoded output at all — not just the file's own content.
+    const encodedText = result.batches.map((b) => JSON.stringify(decodeBatchRows(b.compressed))).join('\n');
+    expect(encodedText).not.toContain(GHP_TOKEN);
+  });
+
+  it('records a bounded diagnostic naming the file and the marker CLASS, never the matched bytes', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/secret.ts', content: `const token = "${GHP_TOKEN}";\n` },
+      ]),
+      cfg(),
+      target(),
+      { adapters: registry() },
+    );
+    expect(result.diagnostics).toHaveLength(1);
+    const diagnostic = result.diagnostics[0]!;
+    expect(diagnostic.path).toBe('src/secret.ts');
+    expect(diagnostic.severity).toBe('warning');
+    expect(diagnostic.message).toMatch(/credential marker/);
+    expect(diagnostic.message).toMatch(/known credential prefix/);
+    expect(diagnostic.message).not.toContain(GHP_TOKEN);
+    expect(diagnostic.message).not.toContain('ghp_');
+  });
+
+  it('a PEM header, a JWT, and each issuer prefix all withhold the whole file’s content', async () => {
+    const cases: Array<[string, string]> = [
+      [
+        'src/pem.ts',
+        'const key = `\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\n`;\n',
+      ],
+      [
+        'src/jwt.ts',
+        'const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+          'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";\n',
+      ],
+      ['src/ghp.ts', `const t = "${GHP_TOKEN}";\n`],
+    ];
+    const result = await runIndexer(
+      new FakeIndexSource(cases.map(([path, content]) => ({ kind: 'file' as const, path, content }))),
+      cfg(),
+      target(),
+      { adapters: registry() },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    for (const [path] of cases) {
+      const row = rows.find((r) => r.kind === 'node' && String(r.uri).endsWith(`/${path.split('/').pop()}`));
+      expect(row?.content).toBeNull();
+    }
+  });
+
+  it('leaves an ordinary source file with no marker untouched', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'function foo() {}\nfunction bar() {}\n' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: registry() },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const fileRow = rows.find((r) => r.kind === 'node' && r.type === 'file');
+    expect(fileRow?.content).toBe('function foo() {}\nfunction bar() {}\n');
+    expect(result.diagnostics).toHaveLength(0);
+    // The adapter still ran — symbols exist for the un-withheld file.
+    expect(rows.some((r) => r.kind === 'node' && r.type === 'symbol')).toBe(true);
+  });
+
+  it('does not withhold the OTHER file when only one candidate in the same run carries a marker', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'function foo() {}\n' },
+        { kind: 'file', path: 'src/secret.ts', content: `const t = "${GHP_TOKEN}";\n` },
+      ]),
+      cfg(),
+      target(),
+      { adapters: registry() },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const aRow = rows.find((r) => r.kind === 'node' && r.type === 'file' && String(r.uri).endsWith('/a.ts'));
+    const secretRow = rows.find(
+      (r) => r.kind === 'node' && r.type === 'file' && String(r.uri).endsWith('/secret.ts'),
+    );
+    expect(aRow?.content).toBe('function foo() {}\n');
+    expect(secretRow?.content).toBeNull();
+  });
+
+  it("leaves contentMode: 'metadata' behaviour unchanged — still one diagnostic-free, content-null file entity", async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/secret.ts', content: `const t = "${GHP_TOKEN}";\n` }]),
+      cfg({ contentMode: 'metadata' }),
+      target(),
+      { adapters: registry() },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'node', type: 'file', content: null });
+    // No credential-marker diagnostic — the marker scan only runs on full-mode content, and
+    // metadata mode already withholds via the pre-existing path (this module's own doc).
+    expect(result.diagnostics).toHaveLength(0);
+  });
+});
+
 describe('runIndexer — diagnostics', () => {
   it('bounds diagnostics and never lets them reorder or alter successful records', async () => {
     const fixedContent = 'function foo() {}\n';

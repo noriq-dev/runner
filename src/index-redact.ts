@@ -32,6 +32,15 @@
  * hardcoded into an ordinary `config.json`, a bearer example pasted into a `.md` doc) — the
  * residual risk `THREAT-MODEL.md`'s `[index]` section already names ("a secret pasted into an
  * ordinary file ... no path-based list can see it"). Neither floor substitutes for the other.
+ *
+ * **A third caller, a third entry point, RUN-258.** `indexer.ts`'s `full`-mode FILE content (raw
+ * decoded source, never an adapter-extracted value) was outside every check above until now — the
+ * residual risk THREAT-MODEL.md's `[index]` section names ("a token hardcoded into `src/foo.ts` is
+ * in the payload exactly as before"). `scanTextForCredentialMarkers` is that third entry point:
+ * deliberately the marker-only third of `scanTextForSecretShapedContent`, with NO key-name check
+ * (a whole file has no single "key") and NO entropy scan (tuned for a short isolated value, not
+ * hundreds of lines of real code — see that function's own doc for the measured false positives on
+ * this repo's own source). `indexer.ts` is the only caller.
  */
 
 // ---------------------------------------------------------------------------
@@ -106,6 +115,28 @@ const ISSUER_PREFIXES = [
 function matchedIssuerPrefix(value: string): string | null {
   return ISSUER_PREFIXES.find((p) => value.startsWith(p)) ?? null;
 }
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * `ISSUER_PREFIXES`, matched at a TOKEN boundary — a whole-file caller's own need, never the
+ * isolated-VALUE callers' (`matchedIssuerPrefix`, unchanged, plain `startsWith`): an already-isolated
+ * JSON/TOML leaf has nothing else for `sk-` to be a substring OF, but a whole file of English
+ * identifiers does — `risk-`, `desk-`, `task-`, `kiosk-` all contain the literal substring `sk-`
+ * measured directly against this repo's own `src/adjudication.ts` (RUN-258, the false positive
+ * locked decision 1 names). A negative lookbehind requiring the character immediately before the
+ * prefix to be absent or non-word (never a letter/digit/`_`) rejects exactly those — `task-`'s `s`
+ * is preceded by the word character `a`, so no boundary exists there — while still matching a real
+ * token wherever it actually starts a word: a quote, `=`, whitespace, or the start of the file. This
+ * is deliberately NOT applied to `matchedIssuerPrefix`/`scanTextForSecretShapedContent` above, whose
+ * VALUE-level behaviour this task must not change (their own caller already isolated the value, so
+ * there is no surrounding word for the prefix to hide inside).
+ */
+const ISSUER_PREFIX_TOKEN_RE = new RegExp(
+  `(?<![A-Za-z0-9_])(?:${ISSUER_PREFIXES.map(escapeRegExp).join('|')})`,
+);
 
 // ---------------------------------------------------------------------------
 // High-entropy heuristic
@@ -212,6 +243,13 @@ export function shouldWithholdValue(key: string | null, value: string): string |
  * that would have carried the text (locked decision 3, one level up: the heading/label survives,
  * the section body does not) — there is no masked or trimmed return value here, only a reason or
  * null, by the same design as `shouldWithholdValue`.
+ *
+ * Unchanged by RUN-258 (out of scope — that task adds a THIRD, marker-only entry point below for a
+ * whole FILE, `scanTextForCredentialMarkers`, and is explicit that this function's own tuning must
+ * not move): plain substring matching here, not `ISSUER_PREFIX_TOKEN_RE`'s token-boundary version,
+ * because this function's callers already isolated the blob (a markdown section, a code fence) —
+ * there is no surrounding English word for `sk-` to hide inside the way there is in a whole file of
+ * source (`src/adjudication.ts`'s own `task-`, measured — see `scanTextForCredentialMarkers`'s doc).
  */
 export function scanTextForSecretShapedContent(text: string): string | null {
   if (PEM_HEADER_RE.test(text)) return 'PEM key/certificate header';
@@ -223,5 +261,37 @@ export function scanTextForSecretShapedContent(text: string): string | null {
     const token = rawToken.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
     if (looksHighEntropy(token)) return 'high-entropy token';
   }
+  return null;
+}
+
+/**
+ * The marker-only entry point RUN-258 needs: a `full`-mode FILE's raw decoded source
+ * (`indexer.ts`'s file-entity push), never an adapter-isolated value. Reuses this module's existing
+ * marker PATTERNS (`PEM_HEADER_RE`, `JWT_SEARCH_RE`, `ISSUER_PREFIXES` — the vocabulary lives in
+ * exactly one place, per locked decision 5) but composes them differently from every caller above,
+ * for two reasons specific to scanning a WHOLE file rather than one isolated value:
+ *
+ * 1. **No key-name check, no entropy scan.** `keyLooksSensitive`/`looksHighEntropy` were tuned
+ *    against short, isolated values and do not transfer to hundreds of lines of real code — measured
+ *    directly against this repo's own source (`index-redact.test.ts`'s fixtures were never run
+ *    against a whole file): `src/acceptance.ts` trips the entropy test on a regex literal. Composing
+ *    either heuristic over whole-file text is the "obvious alternative" this task's locked decisions
+ *    name and reject, not an oversight to "complete" back toward `scanTextForSecretShapedContent`.
+ * 2. **The issuer-prefix check is TOKEN-BOUNDARY-AWARE** (`ISSUER_PREFIX_TOKEN_RE`), not the plain
+ *    substring match every VALUE-level caller above uses. `sk-` as a bare substring matches inside
+ *    ordinary English — `risk-`, `desk-`, and this repo's own `src/adjudication.ts`, which repeats
+ *    `task-` throughout its prose (measured: composing the plain substring check here withheld that
+ *    file's entire content, exactly the false positive locked decision 1 names). A PEM header and a
+ *    JWT are already specific enough at any length that they need no such change — `PEM_HEADER_RE`/
+ *    `JWT_SEARCH_RE` are reused verbatim, unmodified from the VALUE-level checks above.
+ *
+ * Only ever returns the marker CLASS (never the matched bytes or even the matched prefix, same
+ * reasoning as `valueLooksSecret`), so a caller may safely surface the return value in a status
+ * record or diagnostic. `indexer.ts` is the only caller.
+ */
+export function scanTextForCredentialMarkers(text: string): string | null {
+  if (PEM_HEADER_RE.test(text)) return 'PEM key/certificate header';
+  if (JWT_SEARCH_RE.test(text)) return 'JWT-shaped value (three dot-separated base64url segments)';
+  if (ISSUER_PREFIX_TOKEN_RE.test(text)) return 'known credential prefix';
   return null;
 }
