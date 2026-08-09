@@ -42,9 +42,14 @@ import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
  * and nothing else in this file talks to a socket. `IndexRunTarget`'s identity fields are locally
  * synthesized, never resolved against Noriq — this command has no server to resolve them against.
  * The VCS backend construction added for `buildVcsIgnoredPredicate` (RUN-256) does not change this:
- * only git and Perforce are ever routed to from here (`backendFor`'s own doc says why Diversion is
- * not), and both backends' `queryIgnored` is a LOCAL process (`git check-ignore`, `p4 ignores -i` —
- * both measured to need no server connection at all) — never a network call.
+ * only git and Perforce are ever routed to from here (`backendFor`'s own doc says why), and both
+ * backends' `queryIgnored` is a LOCAL process (`git check-ignore`, `p4 ignores -i` — both measured
+ * to need no server connection at all) — never a network call. This is now the OPERATIVE reason
+ * Diversion stays unrouted here, corrected after being wrong: Diversion's own `queryIgnored`
+ * (`diversion.ts`, corrected post-RUN-256) genuinely reaches `api.diversion.dev` — there turned
+ * out to be no local-only primitive for it, unlike git/Perforce — so wiring it into THIS command
+ * would break the zero-network guarantee this whole file exists to keep. Diversion's exclusion is
+ * therefore a real, still-current constraint; only the reasoning behind it changed.
  *
  * **Why this file, and not the daemon's snapshot path, asks a `VcsBackend` what it ignores**
  * (RUN-256). `leaseIndexSnapshot` only ever hands back TRACKED content (git: a detached worktree;
@@ -128,16 +133,24 @@ function gitRevParse(root: string, args: string[]): string | null {
  * Route `root` to a real `VcsBackend` instance (RUN-256) — a CHEAP, LOCAL-ONLY version of
  * `detectVcs`'s own precedence (`vcs/detect.ts`), deliberately NOT a call to that function:
  * `detectVcs`'s Diversion arm spawns `dv repo` whenever NEITHER `.git` nor `.p4config` is present
- * at the root, and that is exactly the shape of a plain scratch directory with no VCS at all —
- * this command's own fixtures included. Paying that spawn to detect a backend whose
- * `queryIgnored` always answers `unknown` regardless (`diversion.ts`'s own doc: no measured local
- * ignore-check primitive exists) would trade this file's "zero network, zero model calls" posture
- * for a guaranteed no-op, so Diversion is never routed to here — `null` (no VCS-ignore filtering
- * attempted at all) is the honest, and cheaper, answer for a root neither marker names. The
- * `.git`/`.p4config` check itself duplicates `detect.ts`'s own convention rather than importing
- * it, on purpose: importing `detect.ts` here would still make Diversion's arm reachable from this
- * file's graph for no benefit, and the convention is two `existsSync` checks, not logic worth a
- * shared abstraction.
+ * at the root, which both costs a spawn this file's fixtures would pay for nothing (a plain
+ * scratch directory with no VCS at all) AND, unlike the checks below, cannot stay purely local —
+ * `dv repo` itself talks to Diversion's own registry.
+ *
+ * **Diversion is never routed to here, and the reason changed under this same task.** The first
+ * version of this comment said `queryIgnored` "always answers unknown regardless" so detecting
+ * Diversion would only buy a guaranteed no-op — true when written, false by the time this file's
+ * own sibling correction landed: `diversion.ts`'s `queryIgnored` now genuinely determines ignore
+ * status, by combining a REST tree fetch with a CLI status parse. What did NOT change is that it
+ * has no local-only path — `GET /trees/{ref}` reaches `api.diversion.dev` — so routing Diversion
+ * through THIS command would cost a real network call and break the zero-network guarantee this
+ * whole file exists to keep (see the module doc). The exclusion is correct for a different, better
+ * reason than the one that used to justify it.
+ *
+ * The `.git`/`.p4config` check itself duplicates `detect.ts`'s own convention rather than
+ * importing it, on purpose: importing `detect.ts` here would still make Diversion's arm reachable
+ * from this file's graph for no benefit, and the convention is two `existsSync` checks, not logic
+ * worth a shared abstraction.
  */
 function backendFor(root: string): VcsBackend | null {
   if (existsSync(path.join(root, '.git'))) {

@@ -234,6 +234,41 @@ interface MergeConflict {
   base?: { path?: string };
 }
 
+/** `queryIgnored`'s cached result shape — see its own doc and `computeKnownPaths`'s. */
+interface KnownPaths {
+  /** Every path Diversion tracks at HEAD, plus every locally-added path `dv status` reports under
+   *  `New:` (untracked but NOT ignored). */
+  files: Set<string>;
+  /** Every ancestor directory of every path in `files` — the O(1) answer for a directory
+   *  candidate, computed once rather than scanned per call. */
+  dirPrefixes: Set<string>;
+}
+
+/**
+ * `dv status`'s prose sections (`New:`/`Modified:`/`Deleted:`, each followed by tab-indented
+ * paths, one per line, until the next section header or EOF) — `hasWork` above already parses
+ * this SAME output shape with a boolean regex; this is the same grammar generalized to collect
+ * the paths themselves rather than only testing for a match. A header line is matched at column
+ * zero (`^`) so an indented path line that happens to start with a section-header WORD (unlikely,
+ * but this is prose, not a wire format) is never mistaken for a new section.
+ */
+function parseStatusSection(stdout: string, section: 'New' | 'Modified' | 'Deleted'): string[] {
+  const lines = stdout.split('\n');
+  const out: string[] = [];
+  let inSection = false;
+  for (const line of lines) {
+    if (/^(New|Modified|Deleted):/.test(line)) {
+      inSection = line.startsWith(`${section}:`);
+      continue;
+    }
+    if (inSection) {
+      const path = line.trim();
+      if (path) out.push(path);
+    }
+  }
+  return out;
+}
+
 export class DiversionBackend implements VcsBackend {
   readonly kind = 'diversion';
   /** Unlanded work survives dispose without help: checkpointed commits live on the run's
@@ -255,6 +290,11 @@ export class DiversionBackend implements VcsBackend {
   private readonly pendingMerges = new Map<string, string>();
   /** Release functions for held leases, keyed by run. */
   private readonly held = new Map<string, () => void>();
+  /** `queryIgnored`'s one-shot cache (RUN-256 correction) — keyed by `repoRoot` rather than
+   *  assumed singular, but in practice one backend instance sees one repoRoot for one debug walk's
+   *  whole lifetime, so this pays the tree-fetch cost ONCE regardless of how many directories the
+   *  walk visits. See `knownPathsFor`'s own doc for why this must be one-shot at all. */
+  private readonly knownPathsCache = new Map<string, Promise<KnownPaths | null>>();
 
   constructor(opts: DiversionBackendOpts) {
     this.repoId = opts.repoId;
@@ -276,6 +316,18 @@ export class DiversionBackend implements VcsBackend {
    * then declines to describe, and it used to collapse into the same null — so `hasWork` reported
    * "no work" for a response it could not read at all, and the caller acts on `false` by disposing.
    */
+  /** Resolve a branch NAME to its id via the list endpoint (`GET /branches`, the same shape
+   *  `reapOrphans` already reads) — the workaround for `GET /branches/{name}`'s live 500, for a
+   *  caller that (unlike `leaseIndexSnapshot`) needs an arbitrary CURRENT branch rather than the
+   *  repo's fixed default. `null` on anything short of an exact match: a renamed-away or deleted
+   *  branch is a real "cannot resolve", never a guess at the nearest name. */
+  private async branchIdByName(name: string): Promise<string | null> {
+    const res = await this.api('GET', '/branches');
+    if (res.status !== 200) return null;
+    const items = (res.body as { items?: Array<{ branch_name?: string; branch_id?: string }> }).items ?? [];
+    return items.find((b) => b.branch_name === name)?.branch_id ?? null;
+  }
+
   private async branchHead(branch: string): Promise<string | null> {
     const res = await this.api('GET', `/branches/${encodeURIComponent(branch)}`);
     if (res.status === 404) return null;
@@ -748,26 +800,119 @@ export class DiversionBackend implements VcsBackend {
   }
 
   /**
-   * Always `unknown`, REASONED rather than measured (RUN-256): `dv --help`'s full command list
-   * (checked directly against a live `dv` install) has nothing shaped like `check-ignore`/`p4
-   * ignores` — the closest is `dv clean` ("Remove ignored/untracked files from the workspace"),
-   * which ACTS rather than reports and offers no dry-run/query flag to observe what it would
-   * remove without removing it. Building a `.dvignore`-plus-`.gitignore` dialect parser ourselves
-   * to fill that gap is exactly what this task's own git-side decision argues against doing for
-   * GIT'S OWN dialect (`git.ts`'s `queryIgnored` doc): shelling to the tool that defines the
-   * semantics beats reimplementing it, and no such tool exists here to shell to. `.dvignore`'s
-   * NAME never appears outside this backend (the seam's own floor), and this method never reads
-   * one — it states a fact about Diversion, the same posture `openReview` already takes here.
+   * **Corrected after being wrong.** The first landing of this method concluded `dv --help` names
+   * no `check-ignore`/`p4 ignores` equivalent and returned `unknown` unconditionally. That premise
+   * was true and the conclusion was not: there is no DEDICATED query command, but Diversion still
+   * honours `.dvignore` AND `.gitignore` (docs.diversion.dev/basic/dvignore, and confirmed live
+   * against a real repo — `dv status` silently omits a file matching either from its `New:`
+   * section while an unmatched sibling appears, for both dialects). The fix is not a parser for
+   * either dialect (still forbidden — see the module-level `.dvignore`/`.gitignore` floor); it is
+   * asking Diversion the SAME two ways this backend already asks it everything else:
+   *
+   *   1. **What does Diversion TRACK** — `GET /trees/{ref}?recurse=true`, the exact endpoint
+   *      `DiversionIndexSource` already uses for real indexing (reused via its own `.list()`
+   *      rather than re-walked here, so there is exactly one implementation of that pagination).
+   *      A path in this set is definitely not ignored — ignore rules only ever gate whether a NEW
+   *      path gets added, never an already-tracked one.
+   *   2. **What would Diversion ADD if asked** — `dv status`'s `New:` section, the CLI's own
+   *      answer to "which untracked files are not ignored" (reusing `hasWork`'s already-measured
+   *      section-header parsing, extended to collect paths rather than only testing for a match).
+   *
+   * A path on disk in NEITHER set is ignored — the caller (`buildVcsIgnoredPredicate`,
+   * `index-repo.ts`) only ever asks about paths a real `readdir` produced, so "absent from both"
+   * cannot mean "does not exist".
+   *
+   * **Neither endpoint offers a per-directory batch** — `/trees` always pages the WHOLE tree
+   * (`DiversionIndexSource`'s own doc: `ShouldDescend` "buys back only pipeline cost, never
+   * network cost"), and `dv status <paths>` — the form that WOULD scope to a batch — switches to
+   * per-file SYNC-status reporting and answers "Synced" for literally any argument, including a
+   * path that does not exist, discarding the ignore signal entirely (measured, not assumed,
+   * against the same live repo). So this cannot be the cheap, PER-DIRECTORY primitive
+   * `git check-ignore --stdin`/`p4 ignores -i` are — it is one FULL, EXPENSIVE fetch, cached for
+   * the rest of this backend instance's life (`knownPathsFor` below), never repeated per
+   * directory. A backend answering this way is the honest tradeoff for a REST-and-CLI-only VCS
+   * with no local index to consult, not a shortcut.
    */
-  async queryIgnored(_repoRoot: string, _paths: string[]): Promise<IgnoreQueryResult> {
-    return {
-      ok: false,
-      reason: 'unknown',
-      detail:
-        'Diversion has no measured local ignore-check primitive (`dv --help` names none, and ' +
-        '`dv clean` only acts, it does not report) — .dvignore/.gitignore semantics are not ' +
-        'reimplemented here',
-    };
+  async queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
+    const known = await this.knownPathsFor(repoRoot);
+    if (!known) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail:
+          'could not resolve what Diversion tracks for this workspace (no current branch, or ' +
+          'the tree/status fetch failed) — see the daemon log for the underlying error',
+      };
+    }
+    const ignored = new Set<string>();
+    for (const p of paths) {
+      if (known.files.has(p) || known.dirPrefixes.has(p)) continue;
+      ignored.add(p);
+    }
+    return { ok: true, ignored };
+  }
+
+  /**
+   * The one-shot fetch `queryIgnored` above never repeats per directory (its own doc explains
+   * why). `dirPrefixes` holds every ANCESTOR directory of every known file (`Content/Base/Crow` for
+   * `Content/Base/Crow/ABP_Crow.uasset`) so a directory candidate resolves in O(1) rather than a
+   * per-call scan over the whole tree — computed once here, alongside the files themselves, never
+   * recomputed by a caller.
+   *
+   * Returns `null` — never throws — on anything that stops this from being trustworthy: no
+   * resolvable branch, a non-200 tree page, a CLI failure. `null` reads as "unknown" one layer up,
+   * per this method's own may-miss-never-invent contract; a PARTIAL tree (a page fetched, a later
+   * one failed) is exactly as untrustworthy as no tree at all, so it is not returned as if it were
+   * complete.
+   */
+  private async knownPathsFor(repoRoot: string): Promise<KnownPaths | null> {
+    let cached = this.knownPathsCache.get(repoRoot);
+    if (!cached) {
+      cached = this.computeKnownPaths(repoRoot);
+      this.knownPathsCache.set(repoRoot, cached);
+    }
+    return cached;
+  }
+
+  private async computeKnownPaths(repoRoot: string): Promise<KnownPaths | null> {
+    try {
+      const { stdout: branchRaw } = await this.cli(['branch-name'], repoRoot);
+      const branch = branchRaw.trim();
+      if (!branch) return null;
+      // NAME, not id (this measured live, 2026-08-09, against every branch on a real account,
+      // not only the default one `leaseIndexSnapshot`'s own comment first found this on):
+      // `GET /branches/{name}` 500s and `GET /branches/{id}` 200s for the exact same branch,
+      // every time. `branchHead` places its argument straight into that URL segment with no
+      // resolution of its own, so passing the id it already accepts (`leaseIndexSnapshot`'s own
+      // `default_branch_id` precedent) is what keeps this call from joining that defect — see
+      // RUN-256's filed follow-up for every OTHER `branchHead(name)` call site in this class,
+      // which this fix does not touch.
+      const branchId = await this.branchIdByName(branch);
+      if (!branchId) return null;
+      const head = await this.branchHead(branchId);
+      if (!head) return null;
+
+      const files = new Set<string>();
+      const dirPrefixes = new Set<string>();
+      const source = new DiversionIndexSource(this.repoId, head, this.http, this.blobHttp);
+      for await (const item of source.list()) {
+        if (item.kind !== 'file') return null; // a refused '.' means the whole listing failed
+        files.add(item.entry.path);
+        const segments = item.entry.path.split('/');
+        for (let i = 1; i < segments.length; i++) dirPrefixes.add(segments.slice(0, i).join('/'));
+      }
+
+      const { stdout: statusRaw } = await this.cli(['status', '--nowait', '--no-limit'], repoRoot);
+      for (const newPath of parseStatusSection(statusRaw, 'New')) {
+        files.add(newPath);
+        const segments = newPath.split('/');
+        for (let i = 1; i < segments.length; i++) dirPrefixes.add(segments.slice(0, i).join('/'));
+      }
+
+      return { files, dirPrefixes };
+    } catch {
+      return null; // network error, missing dv binary, malformed response — all unknown, never a guess
+    }
   }
 
   /**

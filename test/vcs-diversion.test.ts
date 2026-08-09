@@ -62,24 +62,47 @@ function fakes(over: {
   locks?: LockDelegate;
   /** Model a non-Pro workspace: the soft-lock endpoint answers 402 (native degrades). */
   softLockUnavailable?: boolean;
+  /** `GET /trees/{ref}` items for `queryIgnored` (RUN-256 correction) — file paths only; a
+   *  directory-mode entry is never in this list, matching what the real endpoint would omit via
+   *  `isDirectoryMode`. `undefined` (vs. `[]`) makes the fake 500 the tree endpoint, modelling a
+   *  server that cannot answer at all. */
+  tree?: string[];
+  /** When true, the SECOND page of the tree fetch answers with a non-200 — models a fetch that
+   *  starts fine and fails partway through. */
+  treeFailsOnSecondPage?: boolean;
 }) {
   const branches: Record<string, string> = over.branches ?? { main: 'dv.commit.10' };
   const mergeQueue = [...(over.mergeResponses ?? [])];
   const calls: Call[] = [];
 
+  // A branch's fake ID, distinguishable from its name on purpose (`dv.branch.<name>`, never just
+  // `<name>` — the POST /branches creation response below already reuses the name as a shorthand
+  // id, and reusing THAT convention here would make it impossible for a test to tell "resolved
+  // and looked up by id" apart from "looked up by name straight off `dv branch-name`", which is
+  // exactly the distinction the live 500 (`GET /branches/{name}` fails, `GET /branches/{id}`
+  // does not — measured 2026-08-09, every branch on a real account, not modeled by the plain
+  // name-keyed arm below since dozens of pre-existing tests assume that arm succeeds) makes real.
+  const branchId = (name: string) => `dv.branch.${name}`;
+
   const http: DvHttp = async (method, apiPath) => {
     calls.push({ kind: 'http', what: `${method} ${apiPath}` });
     const branchGet = apiPath.match(/\/branches\/([^/?]+)$/);
     if (method === 'GET' && branchGet) {
-      const name = decodeURIComponent(branchGet[1] ?? '');
-      return branches[name]
-        ? { status: 200, body: { commit_id: branches[name] } }
+      const token = decodeURIComponent(branchGet[1] ?? '');
+      const byId = Object.keys(branches).find((n) => branchId(n) === token);
+      if (byId) return { status: 200, body: { commit_id: branches[byId] } };
+      // The plain name-keyed arm — kept succeeding (unlike the live API) so the 60+ pre-existing
+      // tests in this file that call `lease`/`publish`/`hasWork` etc. through a branch NAME are
+      // untouched; RUN-256's filed follow-up is what reconciles those call sites with reality,
+      // not this fake.
+      return token in branches
+        ? { status: 200, body: { commit_id: branches[token] } }
         : { status: 404, body: null };
     }
     if (method === 'GET' && apiPath.endsWith('/branches')) {
       return {
         status: 200,
-        body: { items: Object.keys(branches).map((b) => ({ branch_name: b })) },
+        body: { items: Object.keys(branches).map((b) => ({ branch_name: b, branch_id: branchId(b) })) },
       };
     }
     if (method === 'POST' && apiPath.includes('/branches?')) {
@@ -107,6 +130,17 @@ function fakes(over: {
       return over.softLockUnavailable
         ? { status: 402, body: { error: 'Pro required' } }
         : { status: 200, body: {} };
+    }
+    const treeGet = method === 'GET' && apiPath.match(/\/trees\/[^?]+\?recurse=true&limit=(\d+)&skip=(\d+)/);
+    if (treeGet) {
+      if (over.tree === undefined) return { status: 500, body: { error: 'no tree fixture configured' } };
+      const limit = Number(treeGet[1]);
+      const skip = Number(treeGet[2]);
+      if (over.treeFailsOnSecondPage && skip > 0) {
+        return { status: 500, body: { error: 'simulated mid-fetch failure' } };
+      }
+      const page = over.tree.slice(skip, skip + limit);
+      return { status: 200, body: { items: page.map((p) => ({ path: p, mode: 33188 })) } };
     }
     throw new Error(`fake has no answer for ${method} ${apiPath}`);
   };
@@ -366,18 +400,89 @@ describe('DiversionBackend — the rest of the surface', () => {
     expect(calls).toEqual([]); // no network call is part of the contract, not an accident
   });
 
-  it('queryIgnored is always unknown, reasoned rather than measured (RUN-256): zero calls', async () => {
-    // No `dv check-ignore`/equivalent exists (spot-checked against a live `dv --help`) — the
-    // honest answer is a refusal, and stating it must not act on the server, same discipline
-    // `openReview` above already pins.
-    const { backend, calls } = fakes({});
-    const res = await backend.queryIgnored('/repo', ['node_modules', 'src/a.ts']);
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.reason).toBe('unknown');
-      expect(res.detail).toMatch(/dv --help/);
-    }
-    expect(calls).toEqual([]);
+  describe('queryIgnored (RUN-256, corrected)', () => {
+    // Diversion has no per-directory check-ignore primitive (spot-checked against a live
+    // `dv --help`, and `dv status <paths>` measured to discard the ignore signal entirely — see
+    // the method's own doc) but DOES honour .dvignore/.gitignore, confirmed live: a matching path
+    // is silently absent from `dv status`'s `New:` section while a sibling appears. These tests
+    // model that via the two real primitives combined — the tracked tree and the status delta —
+    // never via a hand-rolled ignore-file parser (the seam floor: no dialect logic outside the
+    // per-VCS files).
+
+    it('a tracked file is never ignored, even if a caller asks about a path outside status/tree', async () => {
+      const { backend } = fakes({ tree: ['src/a.ts', 'src/b.ts'] });
+      const res = await backend.queryIgnored('/repo', ['src/a.ts']);
+      expect(res).toEqual({ ok: true, ignored: new Set() });
+    });
+
+    it('an untracked path Diversion would add (New:) is not ignored', async () => {
+      const { backend } = fakes({ tree: [], status: 'New:\n\t src/new-file.ts\n' });
+      const res = await backend.queryIgnored('/repo', ['src/new-file.ts']);
+      expect(res).toEqual({ ok: true, ignored: new Set() });
+    });
+
+    it('a path absent from both the tree and New: is ignored', async () => {
+      const { backend } = fakes({ tree: ['src/a.ts'], status: 'New:\n\t src/new-file.ts\n' });
+      const res = await backend.queryIgnored('/repo', ['node_modules']);
+      expect(res).toEqual({ ok: true, ignored: new Set(['node_modules']) });
+    });
+
+    it('a directory containing a tracked file is not ignored, via the precomputed dirPrefixes', async () => {
+      const { backend } = fakes({ tree: ['Content/Base/Crow/ABP_Crow.uasset'] });
+      const res = await backend.queryIgnored('/repo', ['Content', 'Content/Base', 'Content/Base/Crow']);
+      expect(res).toEqual({ ok: true, ignored: new Set() });
+    });
+
+    it('a directory with nothing tracked or new under it is ignored (the debug walk prunes it)', async () => {
+      const { backend } = fakes({ tree: ['src/a.ts'] });
+      const res = await backend.queryIgnored('/repo', ['build']);
+      expect(res).toEqual({ ok: true, ignored: new Set(['build']) });
+    });
+
+    it('the tree fetch is paginated and every page is consulted', async () => {
+      const many = Array.from({ length: 5 }, (_, i) => `src/f${i}.ts`);
+      const { backend } = fakes({ tree: many });
+      const res = await backend.queryIgnored('/repo', ['src/f4.ts', 'src/ignored.ts']);
+      expect(res).toEqual({ ok: true, ignored: new Set(['src/ignored.ts']) });
+    });
+
+    it('a mid-fetch tree failure is unknown, never a partial answer treated as complete', async () => {
+      const many = Array.from({ length: 3000 }, (_, i) => `src/f${i}.ts`);
+      const { backend } = fakes({ tree: many, treeFailsOnSecondPage: true });
+      const res = await backend.queryIgnored('/repo', ['src/f0.ts']);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    });
+
+    it('no tree fixture configured (a server that cannot answer at all) is unknown', async () => {
+      const { backend } = fakes({});
+      const res = await backend.queryIgnored('/repo', ['src/a.ts']);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    });
+
+    it('is called ONCE per backend instance regardless of how many queryIgnored calls follow', async () => {
+      const { backend, calls } = fakes({ tree: ['src/a.ts'] });
+      await backend.queryIgnored('/repo', ['src/a.ts']);
+      await backend.queryIgnored('/repo', ['src/b.ts']);
+      await backend.queryIgnored('/repo', ['src/c.ts']);
+      const treeCalls = calls.filter((c) => c.kind === 'http' && c.what.includes('/trees/'));
+      const statusCalls = calls.filter((c) => c.kind === 'cli' && c.what === 'dv status --nowait --no-limit');
+      expect(treeCalls).toHaveLength(1);
+      expect(statusCalls).toHaveLength(1);
+    });
+
+    it('resolves the branch ID before looking up its head — never the bare name from `dv branch-name`', async () => {
+      // Live-measured, 2026-08-09, against a real account: GET /branches/{name} 500s and
+      // GET /branches/{id} 200s for the SAME branch, every branch tried. `branchHead` places its
+      // argument straight into the URL with no resolution of its own, so calling it with a name
+      // here would be exactly the defect this test exists to catch — see the filed follow-up for
+      // every OTHER call site in this class still doing that.
+      const { backend, calls } = fakes({ tree: ['src/a.ts'], currentBranch: 'main' });
+      await backend.queryIgnored('/repo', ['src/a.ts']);
+      const branchGets = calls.filter((c) => c.kind === 'http' && /\/branches\/[^/?]+$/.test(c.what));
+      expect(branchGets).toEqual([{ kind: 'http', what: 'GET /repos/dv.repo.test/branches/dv.branch.main' }]);
+    });
   });
 
   it('hasWork: uncommitted changes count, and so do commits past the lease base', async () => {
