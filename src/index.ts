@@ -248,6 +248,22 @@ export {
   type ResumeCandidate,
 } from './index-reconcile';
 export {
+  DEFAULT_JOURNAL_PATH,
+  IndexJournal,
+  fileJournalStore,
+  type IndexJournalEntry,
+  type IndexJournalKey,
+  type JournalStore,
+} from './index-journal';
+export {
+  IndexCoordinator,
+  type IndexCoordinatorDeps,
+  type IndexTarget,
+  type IndexWorkContext,
+  type IndexWorkOutcome,
+  type IndexWorkStep,
+} from './index-coordinator';
+export {
   WsClient,
   runnerWsUrl,
   type WsClientOptions,

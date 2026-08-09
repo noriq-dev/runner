@@ -19,6 +19,7 @@ import {
 import type { DaemonHandle } from '../src/daemon';
 import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { IndexCoordinator } from '../src/index-coordinator';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
@@ -752,6 +753,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       superviseGate?: Promise<void>;
       scanRoots?: string[];
       workflows?: WorkflowStore;
+      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll'>;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
@@ -773,6 +775,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
+      indexCoordinator: over.indexCoordinator,
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -832,6 +835,34 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  // RUN-214, locked decision 11: `stop()` must cancel and JOIN in-flight index work, beside where
+  // it already joins the in-flight orphan sweep — returning while a snapshot is still being read
+  // is the same race the sweep join exists to prevent. Nothing triggers a real index job yet
+  // (RUN-222 owns that), so this proves the WIRING: a fake coordinator's `cancelAll` is awaited to
+  // completion before `stop()` itself resolves.
+  it('stop() cancels and joins the index coordinator before returning (RUN-214)', async () => {
+    const order: string[] = [];
+    let resolveCancel!: () => void;
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll'> = {
+      cancelAll: () =>
+        new Promise<void>((resolve) => {
+          order.push('cancelAll called');
+          resolveCancel = () => {
+            order.push('cancelAll resolved');
+            resolve();
+          };
+        }),
+    };
+    const { handle } = await harness({ indexCoordinator });
+    handles.pop(); // this test manages this handle's stop() itself — afterEach must not double-stop it
+    const stopped = handle.stop().then(() => order.push('stop() returned'));
+    await tick();
+    expect(order).toEqual(['cancelAll called']); // stop() is genuinely waiting on it
+    resolveCancel();
+    await stopped;
+    expect(order).toEqual(['cancelAll called', 'cancelAll resolved', 'stop() returned']);
   });
 
   it('re-reads and pins a workflow catalog beside the manifest for each dispatch', async () => {

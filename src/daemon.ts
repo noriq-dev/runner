@@ -9,10 +9,12 @@ import type {
 } from '@noriq-dev/shared';
 import { NoriqClient, type OwedMerge } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
-import { discoverRepos } from './discovery';
+import { discoverRepos, loadIndexConfig } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
+import { IndexCoordinator } from './index-coordinator';
+import { IndexJournal, fileJournalStore } from './index-journal';
 import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
@@ -487,6 +489,7 @@ export class Daemon {
   private readonly continuableStore?: ContinuableStore;
   private readonly stateFile?: string;
   private readonly workflowStore?: WorkflowStore;
+  private readonly indexCoordinatorOverride?: Pick<IndexCoordinator, 'cancelAll'>;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -510,6 +513,10 @@ export class Daemon {
       /** Workflow filesystem seam — a fake can prove registration and dispatch re-read without
        *  touching the operator's ~/.noriq directory. */
       workflows?: WorkflowStore;
+      /** RUN-214's index job coordinator — real production wiring by default; a test substitutes
+       *  a fake with a spy `cancelAll` to prove `stop()` joins it without driving an actual index
+       *  job (nothing triggers one yet — RUN-222 owns that). */
+      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll'>;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -522,6 +529,7 @@ export class Daemon {
     this.continuableStore = deps.continuable;
     this.stateFile = deps.stateFile;
     this.workflowStore = deps.workflows;
+    this.indexCoordinatorOverride = deps.indexCoordinator;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -903,6 +911,35 @@ export class Daemon {
     };
     scheduleSweep();
 
+    // RUN-214's index job coordinator: real production wiring from day one, even though nothing
+    // calls `.trigger()` on it yet — RUN-222 owns the trigger points (startup, after landing,
+    // after publishing, a poll) and deliberately is not added here (locked decision 12: wiring
+    // WHEN into the thing that decides HOW would put two tasks fighting over this file). `runWork`
+    // is a genuine no-op for the same reason: Phase 3/4 own the real parse/batch/upload step, and
+    // inventing content for it here — however small — is exactly the placeholder RUN-214's own
+    // locked decision 1 says not to leave for that phase to go find. Constructing the coordinator
+    // NOW, unused, means the one thing this task owns outright — cancel-and-join on shutdown — is
+    // already correct on the day a trigger first reaches it, rather than a race nobody notices
+    // until then.
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll'> =
+      this.indexCoordinatorOverride ??
+      new IndexCoordinator({
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        resolveConfig: (root) => loadIndexConfig(root, this.log),
+        getCursor: (target) =>
+          client.getIndexCursor(runner.id, {
+            projectId: target.projectId,
+            repositoryKey: target.repositoryKey,
+            checkoutId: target.checkoutId,
+          }),
+        runWork: async () => {},
+        journal: new IndexJournal(fileJournalStore()),
+        // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
+        // (`this.active`) — one honest definition of busy, not a second one invented here.
+        isRunBusy: () => this.active.size > 0,
+        logger: this.log,
+      });
+
     /**
      * Open a merge request for every plan that finished and still owes one (RUN-28).
      *
@@ -1030,6 +1067,14 @@ export class Daemon {
       // Join a sweep that was already running when stop() was called — `clearTimeout` cancels the
       // NEXT one, never git commands already in flight.
       await sweepInFlight.catch(() => {});
+      // Same race, one subsystem over (RUN-214, locked decision 11): cancel and JOIN any in-flight
+      // index work before this method returns, not merely signal it — returning while a snapshot
+      // is still being read is how a shutdown races its own cleanup, exactly the orphan-sweep join
+      // above. Placed beside it on purpose: both are background maintenance holding a workspace
+      // resource that must be released before the daemon actually exits.
+      await indexCoordinator
+        .cancelAll()
+        .catch((err) => this.log.warn('index coordinator shutdown failed', { err: String(err) }));
       await client
         .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
         .catch((err) =>
