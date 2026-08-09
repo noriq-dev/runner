@@ -188,7 +188,7 @@ export function dedupeSymbolPaths(paths: ReadonlyArray<readonly string[]>): stri
   const seen = new Map<string, number>();
   const out: string[][] = [];
   for (const path of paths) {
-    const key = path.join(' ');
+    const key = path.join('\u0000');
     const count = (seen.get(key) ?? 0) + 1;
     seen.set(key, count);
     if (count === 1) {

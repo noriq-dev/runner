@@ -1,4 +1,5 @@
 import type { MemoryNodeType } from '@noriq-dev/shared';
+import type { IndexLanguage } from './index-policy';
 
 /**
  * The parser adapter registry (RUN-215) — the seam RUN-216 (tree-sitter) and RUN-218 (non-
@@ -67,6 +68,28 @@ export interface ParsedSymbol {
    *  adapter has nothing content-shaped to offer for this symbol kind. Never a chunk with its own
    *  identity (locked decision 8) — this is one entity's `content` field, nothing more. */
   content: string | null;
+  /** Where this declaration sits in the file. Optional per RUN-217/218's own "declines by
+   *  omission" posture: an adapter with no defensible span for a symbol leaves it off rather than
+   *  reporting a guessed one. */
+  range?: SymbolRange;
+}
+
+/**
+ * A declaration's own line span — 1-based and INCLUSIVE at both ends, the spelling a human reads
+ * in an editor and a diff, so a rendered citation needs no off-by-one legend.
+ *
+ * **This never reaches the wire, and that is a contract gap rather than a choice** — the vendored
+ * `MemoryNode` (`vendor/noriq-shared/src/memory.ts`) carries `type`/`uri`/`label` and nothing
+ * positional, and the vendored slice must land planar-side FIRST (see VENDORED-CONTRACT.md), so a
+ * range added here would be dropped by `index-batch.ts`'s wire encoding today. It is recorded
+ * anyway because it is free to compute where the parse already knows it, is what local citation
+ * verification and the debug CLI (RUN-219) read, and is the field a later planar widening would
+ * carry — the same "compute it, count it, say out loud that the wire has nowhere to put it" posture
+ * `IndexerResult.inferredEdgesOmitted` already takes one layer up.
+ */
+export interface SymbolRange {
+  startLine: number;
+  endLine: number;
 }
 
 export interface ParsedDiagnostic {
@@ -149,6 +172,19 @@ export interface IndexParserAdapter {
    *  same reasoning `INDEXER_VERSION` (`index-reconcile.ts`) states one level up, scoped to one
    *  parser instead of the whole daemon. */
   readonly version: string;
+  /**
+   * Which `[index].languages` entries this adapter serves — the join that makes that policy field a
+   * real control rather than a parsed-and-ignored one (`index-policy.ts` documents it as "feeds a
+   * per-language parser selection later", and Phase 3 is that later). A composition layer filters
+   * adapters on it; `select()` below never consults it, because the registry's contract is
+   * path-only and policy has no business inside the seam.
+   *
+   * OPTIONAL, and absent means UNGATED, not "serves nothing" — `NOOP_ADAPTER` claims every path and
+   * must survive every language configuration, since a file entity exists whether or not any
+   * adapter recognises the file (`indexer.ts`'s own invariant). Narrowing `languages` therefore
+   * costs symbol coverage for those languages, never file coverage.
+   */
+  readonly languages?: readonly IndexLanguage[];
   canParse(path: string): boolean;
   parse(input: AdapterParseInput): Promise<AdapterParseResult>;
 }
