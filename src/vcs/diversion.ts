@@ -309,27 +309,52 @@ export class DiversionBackend implements VcsBackend {
   }
 
   /**
+   * Resolve a branch NAME to its id via the list endpoint (`GET /branches`, the same shape
+   * `reapOrphans` already reads). `branchHead` below is this method's only caller now — folding
+   * the two together would work too (see that method's doc for why it stays a separate name),
+   * but "list branches and find one by name" is a distinct enough question to name on its own.
+   *
+   * `null` on anything short of an exact match: a renamed-away or deleted branch is a real
+   * "cannot resolve", never a guess at the nearest name. A failed LIST call is a different animal
+   * and is not folded into that null — it throws, so a transient failure resolving a name is never
+   * silently reported as "no such branch" to a caller that acts on that answer (`lease` treats it
+   * as "start fresh"; `hasWork`/`targetExists` treat it as "nothing here").
+   */
+  private async branchIdByName(name: string): Promise<string | null> {
+    const res = await this.api('GET', '/branches');
+    if (res.status !== 200) {
+      throw new Error(`could not list branches in ${this.repoId} to resolve ${name}: HTTP ${res.status}`);
+    }
+    const items = (res.body as { items?: Array<{ branch_name?: string; branch_id?: string }> }).items ?? [];
+    return items.find((b) => b.branch_name === name)?.branch_id ?? null;
+  }
+
+  /**
    * The branch's tip, or null when the branch does not exist yet — which is an ANSWER: a run that
    * has committed nothing has no branch, and that is the ordinary state of a fresh lease.
    *
    * A 200 carrying no `commit_id` is not that (RUN-157). It is a branch the server says exists and
    * then declines to describe, and it used to collapse into the same null — so `hasWork` reported
    * "no work" for a response it could not read at all, and the caller acts on `false` by disposing.
+   *
+   * Accepts a branch NAME or a `dv.branch.` id (RUN-259), discriminated on that prefix — Diversion's
+   * own id shape, already relied on elsewhere in this file (the test fake's `branchId` helper,
+   * `leaseIndexSnapshot`'s `default_branch_id`). This is not convenience overloading: `GET
+   * /branches/{name}` measured a reproducible 500 against a real account — `main`, and a feature
+   * branch, every branch tried, not only the default one an earlier fix here scoped itself to —
+   * while `GET /branches/{id}` (the exact same endpoint) answered 200 every time. Whether the 500
+   * is this account's own quirk or true of every Diversion account is unmeasured and open; the fix
+   * below is correct either way, since the id lookup works in both worlds. Six call sites in this
+   * class hand this method a name; resolving HERE, once, is what stops a seventh from reopening the
+   * bug the way the sixth already did. An id-shaped argument skips the resolve round trip entirely
+   * (`leaseIndexSnapshot`, `computeKnownPaths` — both already hold an id and should keep paying for
+   * only the one call); anything else resolves through `branchIdByName` first, and a name that
+   * resolves to nothing is `null` — the same "no such branch" answer a 404 gives below, not a throw.
    */
-  /** Resolve a branch NAME to its id via the list endpoint (`GET /branches`, the same shape
-   *  `reapOrphans` already reads) — the workaround for `GET /branches/{name}`'s live 500, for a
-   *  caller that (unlike `leaseIndexSnapshot`) needs an arbitrary CURRENT branch rather than the
-   *  repo's fixed default. `null` on anything short of an exact match: a renamed-away or deleted
-   *  branch is a real "cannot resolve", never a guess at the nearest name. */
-  private async branchIdByName(name: string): Promise<string | null> {
-    const res = await this.api('GET', '/branches');
-    if (res.status !== 200) return null;
-    const items = (res.body as { items?: Array<{ branch_name?: string; branch_id?: string }> }).items ?? [];
-    return items.find((b) => b.branch_name === name)?.branch_id ?? null;
-  }
-
   private async branchHead(branch: string): Promise<string | null> {
-    const res = await this.api('GET', `/branches/${encodeURIComponent(branch)}`);
+    const id = branch.startsWith('dv.branch.') ? branch : await this.branchIdByName(branch);
+    if (id === null) return null;
+    const res = await this.api('GET', `/branches/${encodeURIComponent(id)}`);
     if (res.status === 404) return null;
     if (res.status !== 200) throw new Error(`branch lookup for ${branch} failed: HTTP ${res.status}`);
     const b = res.body as { commit_id?: string; branch_id?: string };
@@ -656,13 +681,15 @@ export class DiversionBackend implements VcsBackend {
    * exactly when landing/publishing triggers it. The snapshot is pinned to the repo's DEFAULT
    * branch's current head (never a moving branch NAME — a long scan must not have its base slide
    * out from under it), read via `GET /repos/{repo}` then `branchHead`, the same lookup `lease`
-   * already trusts — with one deliberate deviation `lease` does not need: `branchHead` is called
-   * with `default_branch_ID`, never `default_branch_NAME`, because `GET /branches/{name}` measured
-   * a reproducible `500` on this account's own default branch (named `main`) while
-   * `GET /branches/{id}` (the SAME endpoint, an id instead of a name) answered `200` every time —
-   * `branchHead` places whatever string it is given straight into that one URL segment, so this
-   * costs nothing but the choice of which field to read. `default_branch_name` is kept only for
-   * the snapshot's own DISPLAY field (`IndexSnapshot.branch`'s contract: never an operand).
+   * already trusts — passing `default_branch_ID`, never `default_branch_NAME`. `branchHead` itself
+   * resolves a name now too (RUN-259: `GET /branches/{name}` measured a reproducible 500 against a
+   * real account, on every branch tried, not only this repo's default — `branchIdByName` covers it
+   * for any caller that only has a name), so passing the id here is no longer required for
+   * correctness, only for cost: this snapshot already holds `default_branch_id` for free off the
+   * same `GET /repos/{repo}` call, and handing it straight to `branchHead` skips the extra
+   * `GET /branches` list round trip name resolution would otherwise cost. `default_branch_name` is
+   * kept only for the snapshot's own DISPLAY field (`IndexSnapshot.branch`'s contract: never an
+   * operand).
    */
   async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
     const repoRes = await this.api('GET', '');
@@ -879,17 +906,12 @@ export class DiversionBackend implements VcsBackend {
       const { stdout: branchRaw } = await this.cli(['branch-name'], repoRoot);
       const branch = branchRaw.trim();
       if (!branch) return null;
-      // NAME, not id (this measured live, 2026-08-09, against every branch on a real account,
-      // not only the default one `leaseIndexSnapshot`'s own comment first found this on):
-      // `GET /branches/{name}` 500s and `GET /branches/{id}` 200s for the exact same branch,
-      // every time. `branchHead` places its argument straight into that URL segment with no
-      // resolution of its own, so passing the id it already accepts (`leaseIndexSnapshot`'s own
-      // `default_branch_id` precedent) is what keeps this call from joining that defect — see
-      // RUN-256's filed follow-up for every OTHER `branchHead(name)` call site in this class,
-      // which this fix does not touch.
-      const branchId = await this.branchIdByName(branch);
-      if (!branchId) return null;
-      const head = await this.branchHead(branchId);
+      // `branchHead` resolves a NAME itself now (RUN-259, the follow-up RUN-256 filed: `GET
+      // /branches/{name}` 500s and `GET /branches/{id}` 200s for the exact same branch, measured
+      // live against every branch on a real account, not only the default one this call first hit
+      // it on) — the explicit branchIdByName-then-branchHead(id) two-step this used to need is
+      // redundant now that a single call does both steps INSIDE branchHead, not per caller.
+      const head = await this.branchHead(branch);
       if (!head) return null;
 
       const files = new Set<string>();

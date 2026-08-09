@@ -89,15 +89,17 @@ function fakes(over: {
     const branchGet = apiPath.match(/\/branches\/([^/?]+)$/);
     if (method === 'GET' && branchGet) {
       const token = decodeURIComponent(branchGet[1] ?? '');
+      if (!token.startsWith('dv.branch.')) {
+        // RUN-259: reproduces the live 500 (measured 2026-08-09, every branch tried, whether or
+        // not it exists) rather than the documented-shape 200/404 the old fake modeled — THAT
+        // politeness is exactly why six call sites shipped broken while every test stayed green.
+        // `branchHead` never sends this shape for a real lookup anymore — it resolves through
+        // `GET /branches` (the list, below) first — so a test reaching this arm is exercising a
+        // call this class must no longer make.
+        return { status: 500, body: { error: 'simulated: GET /branches/{name} 500s live (RUN-259)' } };
+      }
       const byId = Object.keys(branches).find((n) => branchId(n) === token);
-      if (byId) return { status: 200, body: { commit_id: branches[byId] } };
-      // The plain name-keyed arm — kept succeeding (unlike the live API) so the 60+ pre-existing
-      // tests in this file that call `lease`/`publish`/`hasWork` etc. through a branch NAME are
-      // untouched; RUN-256's filed follow-up is what reconciles those call sites with reality,
-      // not this fake.
-      return token in branches
-        ? { status: 200, body: { commit_id: branches[token] } }
-        : { status: 404, body: null };
+      return byId ? { status: 200, body: { commit_id: branches[byId] } } : { status: 404, body: null };
     }
     if (method === 'GET' && apiPath.endsWith('/branches')) {
       return {
@@ -518,11 +520,23 @@ describe('DiversionBackend — the rest of the surface', () => {
     };
     /** A workspace with no uncommitted edits, so the answer turns entirely on the branch lookup. */
     const cleanCli: DvCli = async () => ({ stdout: '', stderr: '' });
+    /** `hasWork` resolves `ws.location.branch` (a NAME) through `branchHead` (RUN-259), which
+     *  first lists branches to find its id — this always answers that list with a fixed id for
+     *  the workspace's own branch, so the test-configured `status`/`body` below still lands on
+     *  exactly the id-shaped lookup these tests exist to exercise. */
     const withBranchGet = (body: unknown, status = 200) =>
       new DiversionBackend({
         repoId: 'dv.repo.x',
         cli: cleanCli,
-        http: async () => ({ status, body }) as never,
+        http: async (method, apiPath) => {
+          if (method === 'GET' && apiPath.endsWith('/branches')) {
+            return {
+              status: 200,
+              body: { items: [{ branch_name: ws.workRef, branch_id: 'dv.branch.noriq-run-run_1' }] },
+            };
+          }
+          return { status, body } as never;
+        },
       });
 
     it('a branch that does not exist yet is no work — the ordinary state of a fresh lease', async () => {
@@ -537,6 +551,49 @@ describe('DiversionBackend — the rest of the surface', () => {
     it('still reports work when the branch has moved past the base', async () => {
       expect(await withBranchGet({ commit_id: 'dv.commit.9' }).hasWork(ws)).toBe(true);
     });
+  });
+
+  // RUN-259. `GET /repos/{repo}/branches/{name}` measured a live 500 on a real Diversion account
+  // (2026-08-09) — `main`, and a feature branch, every branch tried, not only the default one an
+  // earlier fix here (`leaseIndexSnapshot`'s `default_branch_id`) scoped itself to. `GET
+  // /branches/{id}` (the same endpoint, an id instead of a name) answered 200 every time. The fix
+  // moved resolution INSIDE `branchHead`, once, rather than into each of the six callers that used
+  // to hand it a bare name — these two tests are the acceptance gate for that: one proves no call
+  // site still constructs the broken shape, the other proves a failed resolution is a throw, not a
+  // silent "no such branch".
+  it('RUN-259: no branchHead call site issues GET /branches/<a name> — every lookup is id-shaped', async () => {
+    const { backend, calls } = fakes({
+      branches: { main: 'dv.commit.10' },
+      mergeResponses: [{ status: 200 }, { status: 200 }], // publish: nothing to land
+    });
+    const ws = await backend.lease('/repo', 'run_1'); // branchHead(name) x2 (no prior branch)
+    await backend.hasWork(ws); // branchHead(loc.branch)
+    await backend.targetExists('/repo', 'main'); // branchHead(target)
+    await backend.createTarget('/repo', 'noriq/integration', 'main'); // branchHead(from)
+    await backend.publish(ws, 'main'); // guard(200) + landing(200) → branchHead(target)
+
+    const branchLookups = calls
+      .filter((c) => c.kind === 'http' && /\/branches\/[^/?]+$/.test(c.what))
+      .map((c) => c.what);
+    expect(branchLookups.length).toBeGreaterThan(0); // the assertion below must have something to bite
+    for (const call of branchLookups) {
+      expect(call).toMatch(/\/branches\/dv\.branch\./); // never a bare name in that URL segment
+    }
+  });
+
+  it('a failing GET /branches (the list, resolving a NAME) throws — never reported as "no such branch"', async () => {
+    const http: DvHttp = async (method, apiPath) => {
+      if (method === 'GET' && apiPath.endsWith('/branches')) return { status: 500, body: { error: 'boom' } };
+      throw new Error(`unexpected call ${method} ${apiPath}`);
+    };
+    const backend = new DiversionBackend({
+      repoId: 'dv.repo.test',
+      http,
+      cli: async () => ({ stdout: '', stderr: '' }),
+    });
+    // `targetExists` maps `branchHead`'s null (no such branch) to `false` — a thrown list failure
+    // must not collapse into that same false, which is what "silent success" would look like here.
+    await expect(backend.targetExists('/repo', 'main')).rejects.toThrow(/could not list branches/);
   });
 
   it('reapOrphans destroys nothing — a dead run’s work is already durable server-side', async () => {
@@ -903,9 +960,23 @@ function indexFakes(opts: {
     }
     const branchGet = apiPath.match(/\/branches\/([^/?]+)$/);
     if (method === 'GET' && branchGet) {
-      const name = decodeURIComponent(branchGet[1] ?? '');
-      const commit = branches[name];
-      return commit ? { status: 200, body: { commit_id: commit } } : { status: 404, body: null };
+      const token = decodeURIComponent(branchGet[1] ?? '');
+      const direct = branches[token];
+      if (direct) return { status: 200, body: { commit_id: direct } };
+      // A `dv.branch.<name>` id synthesized by the list handler below, for a name this fixture
+      // never stored under that literal key — fall back to the underlying name.
+      const byId = token.startsWith('dv.branch.') ? branches[token.slice('dv.branch.'.length)] : undefined;
+      return byId ? { status: 200, body: { commit_id: byId } } : { status: 404, body: null };
+    }
+    if (method === 'GET' && apiPath.endsWith('/branches')) {
+      // Only `lease()`'s NAME resolution (RUN-259) reaches this — every other call in this file's
+      // index-surface tests already holds an id (`default_branch_id`, or one from `branches`
+      // directly). Synthesizes `dv.branch.<name>` for whichever bare keys `branches` carries;
+      // `branchGet` above resolves that exact shape back via its own `dv.branch.` fallback.
+      const items = Object.keys(branches)
+        .filter((k) => !k.startsWith('dv.branch.') && !k.startsWith('dv.commit.'))
+        .map((name) => ({ branch_name: name, branch_id: `dv.branch.${name}` }));
+      return { status: 200, body: { items } };
     }
     // `lease()` (exercised by the "held run lease" test) creates the run's own branch — not part
     // of the indexing surface, but needed so that test can hold a REAL lease alongside a snapshot.
