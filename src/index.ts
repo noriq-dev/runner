@@ -366,6 +366,26 @@ export {
   type IndexJournalKey,
   type JournalStore,
 } from './index-journal';
+// Local staging + the upload phase itself (RUN-221) — the journal above records job/batch
+// progress; these two land alongside it as the disposable on-disk copy and the orchestration
+// that drives begin/batch/complete resumably against it. Neither has a caller in `daemon.ts` yet
+// (RUN-222 owns wiring a trigger to reach them) — see VENDORED-CONTRACT.md's phase list.
+export {
+  DEFAULT_STAGING_ROOT,
+  fileStagingStore,
+  stagingDirFor,
+  stagingId,
+  sweepOrphanedStaging,
+  type StagingStore,
+} from './index-stage';
+export {
+  DEFAULT_MAX_STAGED_BYTES,
+  uploadGeneration,
+  type UploadGenerationDeps,
+  type UploadGenerationInput,
+  type UploadOutcome,
+  type UploadProgress,
+} from './index-upload';
 export {
   IndexCoordinator,
   type IndexCoordinatorDeps,

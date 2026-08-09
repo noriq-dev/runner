@@ -121,4 +121,28 @@ export class IndexJournal {
     delete file[key.server]?.[key.repositoryKey]?.[key.generationId];
     await this.store.write(file);
   }
+
+  /**
+   * Every entry currently recorded, across every server/repo/generation. Used ONLY by the RUN-221
+   * staging sweep (`index-stage.ts`'s `sweepOrphanedStaging`) to compute the LIVE set of staging
+   * directories — never by upload/resume logic itself, which stays keyed to one exact 5-tuple
+   * (locked decision 5's per-key contract is unaffected by this method's existence). Defensive the
+   * same way `read`/`get` are: a malformed nested shape at any level is skipped rather than thrown,
+   * because a corrupt journal must degrade toward "fewer entries survive" (costing the sweep a
+   * false orphan at worst), never toward a crash.
+   */
+  async list(): Promise<IndexJournalEntry[]> {
+    const file = await this.read();
+    const out: IndexJournalEntry[] = [];
+    for (const forServer of Object.values(file)) {
+      if (typeof forServer !== 'object' || forServer === null) continue;
+      for (const forRepo of Object.values(forServer)) {
+        if (typeof forRepo !== 'object' || forRepo === null) continue;
+        for (const entry of Object.values(forRepo)) {
+          if (entry && typeof entry === 'object') out.push(entry as IndexJournalEntry);
+        }
+      }
+    }
+    return out;
+  }
 }

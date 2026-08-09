@@ -106,3 +106,43 @@ describe('writing', () => {
     await expect(new IndexJournal(memStore()).forget(KEY())).resolves.toBeUndefined();
   });
 });
+
+describe('list (RUN-221 — the staging sweep’s only consumer)', () => {
+  it('is empty for a fresh journal', async () => {
+    expect(await new IndexJournal(memStore()).list()).toEqual([]);
+  });
+
+  it('returns every entry across servers, repos, and generations', async () => {
+    const store = memStore();
+    const journal = new IndexJournal(store);
+    await journal.put(KEY(), { batchesUploaded: 1 });
+    await journal.put(KEY({ generationId: 'gen_2' }), { batchesUploaded: 2 });
+    await journal.put(KEY({ server: 'https://b.test', repositoryKey: 'other-repo' }), {
+      batchesUploaded: 3,
+    });
+    const entries = await journal.list();
+    expect(entries).toHaveLength(3);
+    expect(entries.map((e) => e.generationId).sort()).toEqual(['gen_1', 'gen_1', 'gen_2'].sort());
+  });
+
+  it('a corrupt store yields an empty list, never a throw', async () => {
+    const broken: JournalStore = {
+      read: async () => {
+        throw new Error('disk read failed');
+      },
+      write: async () => {},
+    };
+    expect(await new IndexJournal(broken).list()).toEqual([]);
+  });
+
+  it('skips a malformed nested shape rather than throwing', async () => {
+    const weird: JournalStore = {
+      read: async () =>
+        ({
+          'https://noriq.test': { 'my-repo': null, 'other-repo': 'not-an-object' },
+        }) as never,
+      write: async () => {},
+    };
+    expect(await new IndexJournal(weird).list()).toEqual([]);
+  });
+});
