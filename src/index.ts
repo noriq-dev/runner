@@ -52,6 +52,70 @@ export {
   type IndexSourceRefusalReason,
   type ShouldDescend,
 } from './index-source';
+// The indexer proper (RUN-215): identity, the adapter registry RUN-216/217/218 plug into, the
+// deterministic batch model, and the orchestrator. Both RUN-215 and RUN-220 ran in parallel and
+// were fenced off this file to avoid conflicting on one import block, so their exports land here.
+export {
+  DiagnosticsCollector,
+  MAX_PARSE_DIAGNOSTICS,
+  buildFileEntityUri,
+  buildSymbolEntityUri,
+  computeDeletions,
+  decodeSymbolPath,
+  decodeUriPath,
+  dedupeSymbolPaths,
+  encodeSymbolPath,
+  encodeUriPath,
+  normalizeRepoPath,
+  type EdgeRecord,
+  type EntityRecord,
+  type IndexDiagnostic,
+  type IndexRecord,
+  type SymbolLikeKind,
+  type UriScope,
+} from './index-entity';
+export {
+  IndexAdapterRegistry,
+  NOOP_ADAPTER,
+  createDefaultAdapterRegistry,
+  type AdapterParseInput,
+  type AdapterParseResult,
+  type IndexParserAdapter,
+  type ParsedDiagnostic,
+  type ParsedSymbol,
+  type SymbolNodeType,
+} from './index-adapters';
+export {
+  MAX_INGEST_BATCH_BYTES,
+  assembleManifest,
+  computeBatchHash,
+  computeContentHash,
+  deriveGenerationId,
+  encodeBatches,
+  sortRecords,
+  toStagedRow,
+  type AssembleManifestInput,
+  type EncodeBatchesOptions,
+  type EncodedBatch,
+  type GenerationIdentity,
+  type StagedEdgeRow,
+  type StagedNodeRow,
+  type StagedRow,
+} from './index-batch';
+export { runIndexer, type IndexRunTarget, type IndexerDeps, type IndexerResult } from './indexer';
+export {
+  IngestError,
+  IngestUpload,
+  openIngestUpload,
+  type BeginEpisodeIngestInput,
+  type BeginIndexIngestInput,
+  type IngestBatchResult,
+  type IngestCompleteEpisodeResult,
+  type IngestCompleteIndexResult,
+  type IngestFailureReason,
+  type IngestPurpose,
+  type IngestStatusResult,
+} from './ingest-client';
 // The two backend-native sources (RUN-254/255). Neither materializes a tree — Perforce reads the
 // depot with no client workspace, Diversion reads its REST API with no checkout — so they are the
 // reason `IndexSnapshot.source` exists at all. On the surface because RUN-214's coordinator is the
@@ -235,6 +299,9 @@ export {
 } from './registration';
 export {
   NoriqClient,
+  NoriqHttpError,
+  type IngestCapabilityGrant,
+  type MintIngestCapabilityInput,
   type NoriqClientOptions,
   type RegisteredRunner,
   type HeartbeatInput,
