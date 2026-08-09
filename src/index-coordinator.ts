@@ -65,6 +65,13 @@ export interface IndexTarget {
   projectId: string | null;
   /** The canonical, project-local repository key (Project Memory §6) — the job key's other half. */
   repositoryKey: string;
+  /** The committed project KEY (`.noriq/project.toml`'s `key`) — distinct from `repositoryKey`
+   *  above, and from `projectId`: `IndexRunTarget.projectKey` (`indexer.ts`'s `UriScope`) needs it
+   *  to mint entity URIs, and nothing else on this daemon derives a project's key from its id or
+   *  its repository key. Threaded here (RUN-222) rather than looked up inside the work step —
+   *  the trigger layer already holds the repo's manifest when it builds this target, and a second
+   *  lookup inside the work step would be a second answer to "what identifies this project." */
+  projectKey: string;
   /** This runner-local checkout's own id (`RunnerRepo.id`/`repoId()`) — `client.ts`'s
    *  `checkoutId`, distinct from the job key: many checkouts may share one `repositoryKey`. */
   checkoutId: string;

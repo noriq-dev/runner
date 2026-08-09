@@ -15,6 +15,9 @@ import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
 import { IndexCoordinator } from './index-coordinator';
 import { IndexJournal, fileJournalStore } from './index-journal';
+import { fileStagingStore, sweepOrphanedStaging } from './index-stage';
+import { IndexTriggerHub, type IndexTriggerRepo } from './index-triggers';
+import { createIndexWorkStep } from './index-work';
 import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
@@ -489,7 +492,13 @@ export class Daemon {
   private readonly continuableStore?: ContinuableStore;
   private readonly stateFile?: string;
   private readonly workflowStore?: WorkflowStore;
-  private readonly indexCoordinatorOverride?: Pick<IndexCoordinator, 'cancelAll'>;
+  private readonly indexCoordinatorOverride?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
+  private readonly indexTriggersOverride?: Pick<
+    IndexTriggerHub,
+    'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'
+  >;
+  private readonly indexJournalPath?: string;
+  private readonly indexStagingRoot?: string;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -514,9 +523,23 @@ export class Daemon {
        *  touching the operator's ~/.noriq directory. */
       workflows?: WorkflowStore;
       /** RUN-214's index job coordinator — real production wiring by default; a test substitutes
-       *  a fake with a spy `cancelAll` to prove `stop()` joins it without driving an actual index
-       *  job (nothing triggers one yet — RUN-222 owns that). */
-      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll'>;
+       *  a fake with a spy `cancelAll`/`trigger` to prove `stop()` joins it, and the trigger layer
+       *  (RUN-222) reaches it, without driving an actual index job. */
+      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
+      /** RUN-222's trigger layer — real production wiring by default; a test substitutes a fake to
+       *  prove the daemon calls `reconcileOnStartup`/`startPolling`/`stop` without a real VCS or
+       *  clock. */
+      indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
+      /** Where RUN-214's upload journal lives — defaults to `~/.noriq/index-journal.json`; a test
+       *  points this at a temp file, the same `parked`/`continuable`/`stateFile` reasoning: the
+       *  journal is read (`sweepOrphanedStaging`'s `journal.list()`, locked decision 8) on EVERY
+       *  `start()`, real production wiring or not, so an un-pointed test would read the operator's
+       *  own machine on every daemon test in this suite. */
+      indexJournalPath?: string;
+      /** Where RUN-221's staging directories live — defaults to `~/.noriq/index-staging`; same
+       *  reasoning as `indexJournalPath`, and the same root the real work step (`index-work.ts`)
+       *  stages batches under, so the sweep and the work step always agree on where "here" is. */
+      indexStagingRoot?: string;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -530,6 +553,9 @@ export class Daemon {
     this.stateFile = deps.stateFile;
     this.workflowStore = deps.workflows;
     this.indexCoordinatorOverride = deps.indexCoordinator;
+    this.indexTriggersOverride = deps.indexTriggers;
+    this.indexJournalPath = deps.indexJournalPath;
+    this.indexStagingRoot = deps.indexStagingRoot;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -615,6 +641,75 @@ export class Daemon {
       status: runner.status,
       repos: runner.repos.map((r) => `${r.projectKey}→${r.projectId ?? 'unresolved'}`),
     });
+
+    // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
+    // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
+    // this file stays wiring-only. `resolveIndexConfigForRoot` is the ONE enabled/off gate both
+    // the coordinator and the trigger layer below consult — never two copies of it. Built here,
+    // before the supervisor, because the landing/publish trigger site (RUN-222) is a supervisor
+    // dep (`onLanded`) that needs the trigger hub to already exist.
+    const resolveIndexConfigForRoot = (root: string) => loadIndexConfig(root, this.log);
+    const indexJournal = new IndexJournal(fileJournalStore(this.indexJournalPath));
+    // Locked decision 8: the orphaned-staging sweep runs EXACTLY here — startup only, before the
+    // coordinator's first trigger, never on a timer. `sweepOrphanedStaging`'s own doc: a snapshot
+    // mid-write or mid-upload looks identical, by inspection, to one a crashed process left behind,
+    // and only "nothing survived the last exit" (true right here, true nowhere later) makes every
+    // directory with no live journal entry unreachable BY CONSTRUCTION rather than unlucky timing.
+    await sweepOrphanedStaging(indexJournal, this.indexStagingRoot)
+      .then(({ removed }) => {
+        if (removed.length) this.log.info(`swept ${removed.length} orphaned index-staging dir(s)`);
+      })
+      .catch((err) => this.log.warn('index staging sweep failed', { err: String(err) }));
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll' | 'trigger'> =
+      this.indexCoordinatorOverride ??
+      new IndexCoordinator({
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        resolveConfig: resolveIndexConfigForRoot,
+        getCursor: (target) =>
+          client.getIndexCursor(runner.id, {
+            projectId: target.projectId,
+            repositoryKey: target.repositoryKey,
+            checkoutId: target.checkoutId,
+          }),
+        runWork: createIndexWorkStep({
+          client,
+          runnerId: runner.id,
+          vcsFor: (root) => backendFor.get(root) ?? vcs,
+          staging: fileStagingStore(this.indexStagingRoot),
+          logger: this.log,
+        }),
+        journal: indexJournal,
+        // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
+        // (`this.active`) — one honest definition of busy, not a second one invented here.
+        isRunBusy: () => this.active.size > 0,
+        logger: this.log,
+      });
+
+    // RUN-222's trigger layer: turns startup, a landing, and a periodic poll into debounced calls
+    // to the coordinator above. `projectIdFor` closes over the registration response — the server
+    // resolves a repo's projectId at registration, and re-deriving it per trigger would be a
+    // second source of truth for a fact that does not change over this daemon's lifetime.
+    const projectIdFor = new Map(runner.repos.map((r) => [r.id, r.projectId] as const));
+    const indexTriggerRepos: IndexTriggerRepo[] = repos
+      .filter((r): r is typeof r & { repositoryKey: string } => r.repositoryKey !== null)
+      .map((r) => ({
+        repoRoot: r.root,
+        repositoryKey: r.repositoryKey,
+        checkoutId: r.id,
+        projectId: projectIdFor.get(r.id) ?? null,
+        projectKey: r.manifest.key,
+        defaultBranch: r.manifest.defaultBranch ?? r.defaultBranch,
+      }));
+    const indexTriggers =
+      this.indexTriggersOverride ??
+      new IndexTriggerHub({
+        server: this.config.server,
+        coordinator: indexCoordinator,
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        resolveConfig: resolveIndexConfigForRoot,
+        repos: indexTriggerRepos,
+        logger: this.log,
+      });
 
     // Supervisor composes worktree + driver + budget per dispatched Run. The `held`
     // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
@@ -752,6 +847,11 @@ export class Daemon {
       // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
       // feature that has never run.
       saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+      // Background indexing's landing/publish trigger site (RUN-222). Fire-and-forget: `onLanded`
+      // itself never throws (it catches everything internally) and this daemon never awaits it.
+      onLanded: (repoRoot, branch, sha) => {
+        void indexTriggers.onLanded?.(repoRoot, branch, sha);
+      },
       // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
@@ -911,34 +1011,14 @@ export class Daemon {
     };
     scheduleSweep();
 
-    // RUN-214's index job coordinator: real production wiring from day one, even though nothing
-    // calls `.trigger()` on it yet — RUN-222 owns the trigger points (startup, after landing,
-    // after publishing, a poll) and deliberately is not added here (locked decision 12: wiring
-    // WHEN into the thing that decides HOW would put two tasks fighting over this file). `runWork`
-    // is a genuine no-op for the same reason: Phase 3/4 own the real parse/batch/upload step, and
-    // inventing content for it here — however small — is exactly the placeholder RUN-214's own
-    // locked decision 1 says not to leave for that phase to go find. Constructing the coordinator
-    // NOW, unused, means the one thing this task owns outright — cancel-and-join on shutdown — is
-    // already correct on the day a trigger first reaches it, rather than a race nobody notices
-    // until then.
-    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll'> =
-      this.indexCoordinatorOverride ??
-      new IndexCoordinator({
-        vcsFor: (root) => backendFor.get(root) ?? vcs,
-        resolveConfig: (root) => loadIndexConfig(root, this.log),
-        getCursor: (target) =>
-          client.getIndexCursor(runner.id, {
-            projectId: target.projectId,
-            repositoryKey: target.repositoryKey,
-            checkoutId: target.checkoutId,
-          }),
-        runWork: async () => {},
-        journal: new IndexJournal(fileJournalStore()),
-        // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
-        // (`this.active`) — one honest definition of busy, not a second one invented here.
-        isRunBusy: () => this.active.size > 0,
-        logger: this.log,
-      });
+    // RUN-222 acceptance: every enabled repo is reconciled once at startup, and the shared poll
+    // ticker starts right after — one cheap current-base check per enabled repo, never a lease, so
+    // there is nothing here worth racing the rest of startup over. Awaited so a startup that races
+    // the very first heartbeat still has this done, but never allowed to fail startup itself.
+    await indexTriggers
+      .reconcileOnStartup()
+      .catch((err) => this.log.warn('index startup reconcile failed', { err: String(err) }));
+    indexTriggers.startPolling();
 
     /**
      * Open a merge request for every plan that finished and still owes one (RUN-28).
@@ -1067,6 +1147,10 @@ export class Daemon {
       // Join a sweep that was already running when stop() was called — `clearTimeout` cancels the
       // NEXT one, never git commands already in flight.
       await sweepInFlight.catch(() => {});
+      // Stop the trigger layer FIRST (RUN-222) — clears its poll ticker and every PENDING debounce
+      // timer so no new job is handed to the coordinator after this point. A job already in flight
+      // is the coordinator's own `cancelAll`'s job, right below.
+      indexTriggers.stop();
       // Same race, one subsystem over (RUN-214, locked decision 11): cancel and JOIN any in-flight
       // index work before this method returns, not merely signal it — returning while a snapshot
       // is still being read is how a shutdown races its own cleanup, exactly the orphan-sweep join

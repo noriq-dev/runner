@@ -610,6 +610,46 @@ describe('PerforceBackend — leaseIndexSnapshot / releaseIndexSnapshot (RUN-254
   });
 });
 
+// RUN-222: exactly `leaseIndexSnapshot`'s own `baseId` derivation, MEASURED against the real p4d
+// rig (2026-08-09, `noriq-p4d:2026.1`) at 4ms with no client sync — see this method's own doc.
+describe('PerforceBackend — currentBase (RUN-222)', () => {
+  it('answers the depot head under this client’s view — no client mint, no sync', async () => {
+    const { backend, calls } = fakes({ changeHead: '2' });
+    expect(await backend.currentBase('/ws1')).toEqual({ ok: true, baseId: '2' });
+    expect(calls.some((c) => c.what.startsWith('p4 client -i'))).toBe(false);
+    expect(calls.some((c) => c.what.startsWith('p4 sync'))).toBe(false);
+  });
+
+  it('ignores a branch argument — Perforce has no branch concept', async () => {
+    const { backend } = fakes({ changeHead: '2' });
+    expect(await backend.currentBase('/ws1', 'main')).toEqual({ ok: true, baseId: '2' });
+  });
+
+  it('answers unknown when the depot prefix has no submitted changelist at all', async () => {
+    const { backend } = fakes({ changeHead: '' });
+    expect(await backend.currentBase('/ws1')).toMatchObject({ ok: false, reason: 'unknown' });
+  });
+
+  it('answers unknown, never throws, when the client spec has no View mapping', async () => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o')
+        return { stdout: 'Client: ws1\nOptions: noallwrite\n', stderr: '' };
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const backend = new PerforceBackend({ p4 });
+    const res = await backend.currentBase('/ws1');
+    expect(res).toMatchObject({ ok: false, reason: 'unknown' });
+  });
+
+  it('never touches the pool-of-1 lease — held WHILE this is asked, same as leaseIndexSnapshot', async () => {
+    const { backend } = fakes({ changeHead: '2' });
+    const ws = await backend.lease('/ws1', 'run_1');
+    expect(await backend.currentBase('/ws1')).toEqual({ ok: true, baseId: '2' });
+    await backend.dispose(ws);
+  });
+});
+
 // RUN-254 replaces RUN-212's unconditional `full-index-required` with a real `p4 diff2 -q`-backed
 // answer. `changeHead`/`fstat` are irrelevant here — `changesBetween` never lists a tree, only
 // `resolveDepotPrefix` (client -o) and `describe`/`diff2` matter.

@@ -8,6 +8,7 @@ import { DiversionIndexSource, decodeObjectStatus, isDirectoryMode } from './div
 import type { LockDelegate } from './git';
 import type {
   ChangesBetweenResult,
+  CurrentBaseResult,
   IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
@@ -738,6 +739,56 @@ export class DiversionBackend implements VcsBackend {
   async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
     dvIndexSnapshotLocation(snapshot);
     await snapshot.source.close?.();
+  }
+
+  /**
+   * The cheap "what is current" check (RUN-222). An EXPLICIT `branch` is a three-line delegation
+   * to `branchHead`, which resolves a NAME itself as of RUN-259 — no extra round trip. Omitted →
+   * this resolves the repo's DEFAULT branch first, via the exact same call `leaseIndexSnapshot`
+   * above already makes (`GET /repos/{repo}` → `default_branch_id`), then delegates the same way.
+   *
+   * **Deliberately NOT `dv branch-name` via `this.cli`**, despite `computeKnownPaths` using exactly
+   * that CLI call for a similar-sounding question. The two questions are NOT the same: this backend
+   * is pool-of-1 (§9 at the top of this file) — `repoRoot` is ONE shared local checkout that every
+   * lease/dispose cycle re-`checkout`s to a different branch (`lease()` itself), so `dv branch-name`
+   * answers "what is THIS WORKSPACE showing right now," never "what is the repo's default branch."
+   * `computeKnownPaths` gets away with it because `queryIgnored`'s only caller is the operator-run
+   * `index-repo` debug command, never this daemon's own background path. `currentBase` is the
+   * opposite: the trigger layer calls it with no `isRunBusy` gate in front (that check lives INSIDE
+   * the coordinator's `attempt()`, downstream of where the trigger layer already computed
+   * `currentBaseId`), and `onLanded` fires BEFORE the just-finished run's workspace is disposed — so
+   * the likely moment for this fallback to run on a repo with no configured `defaultBranch` is
+   * exactly when the shared workspace is still checked out to that run's own throwaway branch. A
+   * `dv branch-name` fallback would then hand `branchHead` that run's branch name and report ITS
+   * head as "the current base" — a confidently WRONG answer, not an honest `unknown`, the one thing
+   * `CurrentBaseResult`'s doc forbids. The API-based resolution has no such window: `GET /repos`
+   * asks the SERVER for the repo's own identity fact, never the local checkout's transient state.
+   */
+  async currentBase(_repoRoot: string, branch?: string): Promise<CurrentBaseResult> {
+    try {
+      let resolved = branch;
+      if (!resolved) {
+        const repoRes = await this.api('GET', '');
+        if (repoRes.status !== 200) {
+          return {
+            ok: false,
+            reason: 'unknown',
+            detail: `could not read repo ${this.repoId} to resolve its default branch: HTTP ${repoRes.status}`,
+          };
+        }
+        const repoBody = repoRes.body as { default_branch_id?: string };
+        if (!repoBody.default_branch_id) {
+          return { ok: false, reason: 'unknown', detail: `repo ${this.repoId} reports no default branch` };
+        }
+        resolved = repoBody.default_branch_id;
+      }
+      const head = await this.branchHead(resolved);
+      return head === null
+        ? { ok: false, reason: 'unknown', detail: `branch ${resolved} does not resolve in ${this.repoId}` }
+        : { ok: true, baseId: head };
+    } catch (err) {
+      return { ok: false, reason: 'unknown', detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /**

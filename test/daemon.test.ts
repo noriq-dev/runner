@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,6 +21,7 @@ import type { DaemonHandle } from '../src/daemon';
 import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { IndexCoordinator } from '../src/index-coordinator';
+import type { IndexTriggerHub } from '../src/index-triggers';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
@@ -753,7 +755,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       superviseGate?: Promise<void>;
       scanRoots?: string[];
       workflows?: WorkflowStore;
-      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll'>;
+      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
+      indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
@@ -776,6 +779,14 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
       indexCoordinator: over.indexCoordinator,
+      indexTriggers: over.indexTriggers,
+      // RUN-222: a REAL IndexCoordinator/IndexTriggerHub is constructed whenever a test does not
+      // override them (most tests here don't) — and `sweepOrphanedStaging`/the journal are read on
+      // every `start()` regardless, so without this every daemon test in this suite would touch
+      // the operator's own `~/.noriq/index-journal.json` and `~/.noriq/index-staging`, the same
+      // `parked`/`continuable`/`stateFile` reasoning one layer up.
+      indexJournalPath: path.join(tmp, 'index-journal.json'),
+      indexStagingRoot: path.join(tmp, 'index-staging'),
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -845,7 +856,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
   it('stop() cancels and joins the index coordinator before returning (RUN-214)', async () => {
     const order: string[] = [];
     let resolveCancel!: () => void;
-    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll'> = {
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll' | 'trigger'> = {
       cancelAll: () =>
         new Promise<void>((resolve) => {
           order.push('cancelAll called');
@@ -854,6 +865,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
             resolve();
           };
         }),
+      trigger: async () => {},
     };
     const { handle } = await harness({ indexCoordinator });
     handles.pop(); // this test manages this handle's stop() itself — afterEach must not double-stop it
@@ -863,6 +875,76 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     resolveCancel();
     await stopped;
     expect(order).toEqual(['cancelAll called', 'cancelAll resolved', 'stop() returned']);
+  });
+
+  // RUN-222: the trigger layer's own lifecycle hooks — startup reconcile once, polling starts,
+  // and shutdown stops it BEFORE the coordinator's own cancelAll (so no new job is handed to a
+  // coordinator that is about to be torn down).
+  it('reconciles once and starts polling at startup, and stops the trigger layer before the coordinator on shutdown', async () => {
+    const order: string[] = [];
+    const indexTriggers: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'> =
+      {
+        reconcileOnStartup: async () => {
+          order.push('reconcileOnStartup');
+        },
+        startPolling: () => {
+          order.push('startPolling');
+        },
+        stop: () => {
+          order.push('indexTriggers.stop');
+        },
+        onLanded: async () => {},
+      };
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll' | 'trigger'> = {
+      cancelAll: async () => {
+        order.push('indexCoordinator.cancelAll');
+      },
+      trigger: async () => {},
+    };
+    const { handle } = await harness({ indexTriggers, indexCoordinator });
+    expect(order).toEqual(['reconcileOnStartup', 'startPolling']);
+    await handle.stop();
+    handles.pop(); // already stopped above — afterEach must not double-stop it
+    expect(order).toEqual([
+      'reconcileOnStartup',
+      'startPolling',
+      'indexTriggers.stop',
+      'indexCoordinator.cancelAll',
+    ]);
+  });
+
+  // RUN-222 locked decision 8: the orphaned-staging sweep runs at STARTUP, for real, through the
+  // REAL `sweepOrphanedStaging` (never faked out) — driven here by pointing `indexStagingRoot` at
+  // a tmp dir holding a directory with NO matching journal entry, exactly what an orphan looks
+  // like. There is exactly one call site for it in daemon.ts, unconditionally inside `start()`,
+  // never inside `scheduleSweep`'s timer closure or the poll ticker — so "never reached from a
+  // timer" holds by construction, not by racing a fake clock against unrelated async work this
+  // suite does not otherwise fake.
+  it('sweeps an orphaned index-staging directory at startup (RUN-221/222)', async () => {
+    // Matches the path `harness()` itself points `indexStagingRoot` at.
+    const stagingRoot = path.join(tmp, 'index-staging');
+    const orphan = path.join(stagingRoot, 'orphan-with-no-journal-entry');
+    await mkdir(orphan, { recursive: true });
+    await harness({});
+    expect(existsSync(orphan)).toBe(false);
+  });
+
+  // RUN-222: the landing/publish trigger site — a supervisor dep the daemon wires to the trigger
+  // hub, fire-and-forget.
+  it('wires onLanded through to the trigger hub', async () => {
+    const landed: Array<{ repoRoot: string; branch: string; sha: string }> = [];
+    const indexTriggers: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'> =
+      {
+        reconcileOnStartup: async () => {},
+        startPolling: () => {},
+        stop: () => {},
+        onLanded: async (repoRoot, branch, sha) => {
+          landed.push({ repoRoot, branch, sha });
+        },
+      };
+    const { deps } = await harness({ indexTriggers });
+    deps.onLanded?.('/repo/a', 'main', 'sha-1');
+    expect(landed).toEqual([{ repoRoot: '/repo/a', branch: 'main', sha: 'sha-1' }]);
   });
 
   it('re-reads and pins a workflow catalog beside the manifest for each dispatch', async () => {

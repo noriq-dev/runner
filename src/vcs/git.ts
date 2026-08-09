@@ -4,6 +4,7 @@ import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
 import type {
   ChangesBetweenResult,
+  CurrentBaseResult,
   IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
@@ -41,6 +42,7 @@ export type GitOps = Pick<
   | 'removeIndexSnapshot'
   | 'changesBetween'
   | 'checkIgnored'
+  | 'currentBase'
 >;
 
 /**
@@ -117,6 +119,7 @@ function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLoca
  *   changesBetween → changesBetween (RUN-212, same name both sides — no wrapping needed, the
  *     result shape is `ChangesBetweenResult` on both ends of the delegation)
  *   queryIgnored → checkIgnored (RUN-256, same reasoning: `IgnoreQueryResult` on both ends)
+ *   currentBase → currentBase (RUN-222, same reasoning again: `CurrentBaseResult` on both ends)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
@@ -288,6 +291,13 @@ export class GitBackend implements VcsBackend {
    *  exit-code convention this wraps. */
   queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
     return this.git.checkIgnored(repoRoot, paths);
+  }
+
+  /** Pure pass-through (RUN-222): `WorktreeManager.currentBase` already speaks
+   *  `CurrentBaseResult` and needs nothing from `Workspace`/`IndexSnapshot` — a bare `rev-parse`,
+   *  the same reasoning `changesBetween` above gives one method over. */
+  currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult> {
+    return this.git.currentBase(repoRoot, branch);
   }
 
   /**

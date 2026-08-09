@@ -1088,6 +1088,98 @@ describe('DiversionBackend — index snapshot (RUN-255): real, API-only, never b
   });
 });
 
+// RUN-222 locked decision 3: a three-line delegation to `branchHead`, which resolves a NAME
+// itself since RUN-259 — no `GET /repos` round trip, no lease.
+describe('DiversionBackend — currentBase (RUN-222)', () => {
+  it('an EXPLICIT branch name resolves to its head, exactly as branchHead would — no GET /repos call', async () => {
+    // `fakes()`'s http has no route for a bare `GET /repos/{repoId}` at all — if the explicit-
+    // branch path ever made that call (rather than skipping straight to branchHead), this fake
+    // would throw "no answer for GET …" instead of resolving, so a clean resolve IS the proof.
+    const { backend } = fakes({ branches: { main: 'dv.commit.10' } });
+    expect(await backend.currentBase('/repo', 'main')).toEqual({ ok: true, baseId: 'dv.commit.10' });
+  });
+
+  it('an EXPLICIT id-shaped branch too — branchHead skips name resolution for it', async () => {
+    const { backend } = fakes({ branches: { main: 'dv.commit.10' } });
+    expect(await backend.currentBase('/repo', 'dv.branch.main')).toEqual({
+      ok: true,
+      baseId: 'dv.commit.10',
+    });
+  });
+
+  it('an EXPLICIT branch that does not resolve answers unknown, never throws', async () => {
+    const { backend } = fakes({ branches: { main: 'dv.commit.10' } });
+    expect(await backend.currentBase('/repo', 'no-such-branch')).toMatchObject({
+      ok: false,
+      reason: 'unknown',
+    });
+  });
+
+  it('never touches the pool-of-1 lease — held WHILE this is asked, same as leaseIndexSnapshot', async () => {
+    const { backend } = fakes({ branches: { main: 'dv.commit.10' } });
+    const runWs = await backend.lease('/repo', 'run_1');
+    expect(await backend.currentBase('/repo', 'main')).toEqual({ ok: true, baseId: 'dv.commit.10' });
+    await backend.dispose(runWs);
+  });
+
+  // No branch given: resolves the repo's DEFAULT branch itself, via the same GET /repos call
+  // `leaseIndexSnapshot` already makes — never `dv branch-name`. See this method's own doc for why:
+  // the pool-of-1 shared workspace is re-checked-out per lease, so a CLI read answers "what is
+  // showing right now," not "what is the default branch."
+  describe('no branch given — resolves the DEFAULT branch via GET /repos, never dv branch-name', () => {
+    it('resolves the default branch and its head, mirroring leaseIndexSnapshot', async () => {
+      const { http, blobHttp } = indexFakes({ branches: { 'dv.branch.1': 'dv.commit.473' } });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+      expect(await backend.currentBase('/repo')).toEqual({ ok: true, baseId: 'dv.commit.473' });
+    });
+
+    it('is UNAFFECTED by what the local CLI would report — proof it never consults dv branch-name', async () => {
+      const { http, blobHttp } = indexFakes({ branches: { 'dv.branch.1': 'dv.commit.473' } });
+      // Models the pool-of-1 workspace mid-checkout on some OTHER run's throwaway branch — the
+      // exact state `dv branch-name` would report right after a landing, before dispose() runs.
+      // If `currentBase` ever asked the CLI, this is what it would wrongly resolve instead.
+      const cliCalls: string[][] = [];
+      const misleadingCli: DvCli = async (args) => {
+        cliCalls.push(args);
+        if (args[0] === 'branch-name') return { stdout: 'noriq/run/some-other-run\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      };
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: misleadingCli });
+      expect(await backend.currentBase('/repo')).toEqual({ ok: true, baseId: 'dv.commit.473' });
+      expect(cliCalls).toEqual([]); // the CLI was never called at all
+    });
+
+    it('a repo lookup failure (HTTP) answers unknown, never throws', async () => {
+      const { http, blobHttp } = indexFakes({ repoStatus: 500 });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+      expect(await backend.currentBase('/repo')).toEqual({
+        ok: false,
+        reason: 'unknown',
+        detail: expect.stringContaining('500'),
+      });
+    });
+
+    it('a repo that reports no default branch answers unknown, never throws', async () => {
+      const { http, blobHttp } = indexFakes({ repoBody: { ...REPO_META, default_branch_id: undefined } });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+      expect(await backend.currentBase('/repo')).toMatchObject({ ok: false, reason: 'unknown' });
+    });
+
+    it('never touches the pool-of-1 lease either — held WHILE this is asked', async () => {
+      // `main` (a plain name) alongside the id form: `lease()`'s own baseBranch resolution goes
+      // through `branchIdByName` (the LIST route), which only ever sees non-`dv.branch.`-prefixed
+      // keys — `dv.branch.1` alone isn't enough to let a real `lease()` succeed here.
+      const { http, blobHttp } = indexFakes({
+        branches: { main: 'dv.commit.473', 'dv.branch.1': 'dv.commit.473' },
+      });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+      const runWs = await backend.lease('/repo', 'run_1');
+      expect(await backend.currentBase('/repo')).toEqual({ ok: true, baseId: 'dv.commit.473' });
+      await backend.dispose(runWs);
+    });
+  });
+});
+
 describe('DiversionIndexSource — list() (RUN-255): /trees, sorted, directories filtered', () => {
   it('yields file entries in the order the tree already reports, skipping both real directories', async () => {
     const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 200, body: TREE_PAGE_SAMPLE }) });

@@ -116,6 +116,15 @@ export interface StageHost {
   runBudget(run: Run): RunBudget | undefined;
   /** The continuation store, when one is wired. Absent = no continue-a-failed-run support. */
   readonly continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
+  /**
+   * A landing just moved `branch` to `sha` on this repo (RUN-222) — background indexing's one
+   * landing/publish trigger site. Fire-and-forget by construction: this returns nothing for the
+   * caller to await, and the one implementation swallows every failure internally (`IndexTriggerHub
+   * .onLanded`'s own doc) — a landing's own outcome must never depend on whether indexing noticed.
+   * Absent = no index trigger layer wired (indexing off machine-wide, or a test with nothing to
+   * prove here).
+   */
+  onLanded?(repo: ResolvedRepo, branch: string, sha: string): void;
 }
 
 /**

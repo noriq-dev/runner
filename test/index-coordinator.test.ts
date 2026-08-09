@@ -73,6 +73,7 @@ const TARGET = (over: Partial<IndexTarget> = {}): IndexTarget => ({
   projectId: 'prj_1',
   repositoryKey: 'my-repo',
   checkoutId: 'repo_a',
+  projectKey: 'RUN',
   repoRoot: '/repo/a',
   currentBaseId: 'base-2', // moved from GEN()'s base-1, so the ordinary case is incremental
   ...over,

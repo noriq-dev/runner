@@ -196,6 +196,22 @@ export type IgnoreQueryResult =
   | { ok: true; ignored: Set<string> }
   | { ok: false; reason: 'unknown'; detail?: string };
 
+/**
+ * The outcome of `VcsBackend.currentBase` (RUN-222) — an outcome union, `IgnoreQueryResult`'s
+ * exact shape one method over, for the same reason: "this is the current base" and "I cannot
+ * tell" are the same SHAPE and opposite MEANINGS, and the wrong one is silent. The one caller
+ * (the background-indexing trigger layer, never an agent) treats `{ok:false}` as "fire no trigger
+ * for this repository right now" — never a guess at a base, because a fabricated one would make
+ * `reconcile` answer `unchanged` (indexing silently stops forever) or `full` (an unrelated-looking
+ * base re-indexes a whole monorepo) on a fact this method never actually held.
+ *
+ * `baseId` is opaque, in the backend's own id-space — `Workspace.baseId`'s exact contract:
+ * `===`-only, handed back to the SAME backend, never parsed.
+ */
+export type CurrentBaseResult =
+  | { ok: true; baseId: string }
+  | { ok: false; reason: 'unknown'; detail?: string };
+
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
@@ -563,6 +579,36 @@ export interface VcsBackend {
    * not crash a debug command over it.
    */
   queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult>;
+
+  /**
+   * The cheap "what is current" check (RUN-222) that background indexing's trigger layer needs on
+   * every startup reconcile, every poll tick, and every landing — without ever touching the lease
+   * pool. REQUIRED, not optional — `openReview`/`changesBetween`/`queryIgnored`'s precedent,
+   * stated in each of their own docs, applies verbatim: an omitted method reads as "nobody
+   * considered this backend."
+   *
+   * **Takes no lease, materializes no tree** (locked decision 1). This is NOT `leaseIndexSnapshot`
+   * priced down — git's `leaseIndexSnapshot` mints a real detached worktree (cheap, but a
+   * filesystem write on every call), and a live backend's snapshot, though itself lease-free
+   * today, constructs a whole `IndexSnapshot` (a source object, an id-space token) a caller then
+   * owns the release of. Neither is safe to call once a minute forever; this is one shell-out or
+   * one REST call, nothing minted, nothing to release.
+   *
+   * `branch` is the scope to check, in the backend's own naming (a git ref name, a Diversion
+   * branch name/id) — OPTIONAL, and each backend documents its own fallback: git defaults to
+   * `HEAD` (this repo's own checked-out scope, `leaseIndexSnapshot`'s exact default), Perforce
+   * ignores it (there are no branches — the client's own view mapping is the only scope, exactly
+   * `leaseIndexSnapshot`'s own source of `baseId`), Diversion resolves its own DEFAULT branch when
+   * omitted — the same `GET /repos` call `leaseIndexSnapshot` already makes, never the local `dv`
+   * CLI: this backend's pool-of-1 workspace is re-checked-out per lease, so a CLI read of "what is
+   * this workspace showing" would answer with whatever run last held it, not the repo's default —
+   * `diversion.ts`'s own `currentBase` doc carries the full reasoning.
+   *
+   * Never throws for an ordinary "cannot tell" (a repo with no commits yet, a branch that does not
+   * resolve, a transient network error) — `CurrentBaseResult`'s own doc carries the outcome
+   * contract and its own reasoning for why a caller must never guess a base from a miss.
+   */
+  currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

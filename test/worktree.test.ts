@@ -1212,3 +1212,42 @@ describe('checkIgnored (RUN-256, real git)', () => {
     }
   });
 });
+
+// RUN-222: the cheap "what is current" check. Real git, against the shared `repo` fixture
+// (`beforeAll` at the top of this file) — never a worktree, never a lease.
+describe('currentBase (RUN-222, real git)', () => {
+  it('defaults to HEAD — the same scope createIndexSnapshot defaults to', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], repo);
+    const res = await wm.currentBase(repo);
+    expect(res).toEqual({ ok: true, baseId: stdout.trim() });
+  });
+
+  it('resolves a named branch when one is given', async () => {
+    const { stdout } = await git(['rev-parse', 'main'], repo);
+    const res = await wm.currentBase(repo, 'main');
+    expect(res).toEqual({ ok: true, baseId: stdout.trim() });
+  });
+
+  it('mints no worktree and takes no lease — the repo has none besides what earlier tests left', async () => {
+    const before = (await wm.listManaged(repo)).length;
+    await wm.currentBase(repo);
+    expect((await wm.listManaged(repo)).length).toBe(before);
+  });
+
+  it('a branch that does not exist answers unknown, never throws', async () => {
+    const res = await wm.currentBase(repo, 'no-such-branch-at-all');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('unknown');
+  });
+
+  it('a real failure (not a git repo at all) answers unknown, never throws', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-cb-not-a-repo-'));
+    try {
+      const res = await wm.currentBase(notARepo);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    } finally {
+      await rm(notARepo, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});

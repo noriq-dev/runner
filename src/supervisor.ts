@@ -332,6 +332,11 @@ export interface RunSupervisorDeps {
   /** Write a planned spec back onto the anchor task (RUN-140). Omitted → the spec is used for this
    *  run and not persisted, which costs reusability and a human's chance to correct it. */
   saveExecutionSpec?: (projectId: string, taskId: string, spec: ExecutionSpec) => Promise<boolean>;
+  /** Background indexing's landing/publish trigger site (RUN-222, → `IndexTriggerHub.onLanded`).
+   *  Fire-and-forget: called after a successful landing, never awaited by anything whose outcome
+   *  the run reports (`stages/integrate.ts`'s own call site). Omitted → no index trigger layer
+   *  wired, and a landing simply triggers nothing, exactly as before this existed. */
+  onLanded?: (repoRoot: string, branch: string, sha: string) => void;
   /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
    *  which is exactly the behaviour before it existed. */
   repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
@@ -1207,6 +1212,7 @@ export class RunSupervisor {
       verifyWithFeedback: (ctx) => this.verifyWithFeedback(ctx),
       reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
       landRun: (ctx) => this.landRun(ctx),
+      onLanded: (repo, branch, sha) => this.deps.onLanded?.(repo.root, branch, sha),
       // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
       // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
       // that the run's sessions divide one ceiling rather than each receiving a copy of it.

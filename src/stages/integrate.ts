@@ -58,6 +58,11 @@ export const integrateStage = async (host: StageHost, ctx: RunPipeline): Promise
       sha: outcome.sha,
       resolvedByAgent: outcome.resolvedByAgent,
     });
+    // Background indexing's landing/publish trigger site (RUN-222) — fire-and-forget, never
+    // awaited: this run's own outcome is already decided, and indexing must never become a
+    // dependency of it. `outcome.sha` is always present once `outcome.landed` is true
+    // (`LandOutcome`'s own contract — `sha` comes from `vcs.publish`'s `{ok:true, sha}` arm).
+    if (outcome.sha) host.onLanded?.(repo, outcome.branch, outcome.sha);
   } else {
     host.log.warn('could not land — the diff stays on its branch', {
       runId: run.id,

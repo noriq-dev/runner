@@ -522,6 +522,8 @@ function harness(
     text: string;
   }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
+  /** Background indexing's landing trigger (RUN-222) — every call the supervisor makes to it. */
+  const landedEvents: Array<{ repoRoot: string; branch: string; sha: string }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
   let verifyRan = false;
@@ -561,6 +563,7 @@ function harness(
     },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
+    onLanded: (repoRoot, branch, sha) => landedEvents.push({ repoRoot, branch, sha }),
     // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
     // repo roots (`/repos/repo_a`) do not exist, and a real fs round-trip settles on the
     // threadpool — LATER than the single `flush()` tick these tests spawn within, which would
@@ -653,6 +656,7 @@ function harness(
     worktrees,
     reports,
     comments,
+    landedEvents,
     transcript,
     claude,
     codex,
@@ -2588,6 +2592,26 @@ describe('landing a passing build (no human per run)', () => {
     // The diff lives on the integration branch now; keeping a per-run directory forever
     // is exactly the graveyard this replaces.
     expect(h.worktrees.removed).toEqual(['/wt/run_1']);
+  });
+
+  it('fires the index trigger hook (RUN-222) once a build actually lands, with the landed branch and sha', async () => {
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.landedEvents).toEqual([
+      { repoRoot: '/repos/repo_a', branch: 'noriq/integration', sha: 'landedsha' },
+    ]);
+  });
+
+  it('never fires the index trigger hook when landing failed', async () => {
+    const h = harness({ manifest: LANDING(), verifyPasses: false });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.landedEvents).toEqual([]);
   });
 
   it('creates the landing branch from defaultBranch on first use', async () => {

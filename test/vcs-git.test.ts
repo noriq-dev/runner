@@ -54,6 +54,7 @@ function recorder() {
     removeIndexSnapshot: record('removeIndexSnapshot', undefined),
     changesBetween: record('changesBetween', { ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] }),
     checkIgnored: record('checkIgnored', { ok: true, ignored: new Set(['node_modules']) } as const),
+    currentBase: record('currentBase', { ok: true, baseId: 'cur0000' } as const),
   };
   return { ops, calls };
 }
@@ -290,6 +291,23 @@ describe('GitBackend — queryIgnored (RUN-256)', () => {
     const res = await new GitBackend(ops).queryIgnored('/repo', ['node_modules', 'src']);
     expect(res).toEqual({ ok: true, ignored: new Set(['node_modules']) });
     expect(calls).toEqual([{ method: 'checkIgnored', args: ['/repo', ['node_modules', 'src']] }]);
+  });
+});
+
+// RUN-222: same pure pass-through discipline again — worktree.test.ts owns the real `rev-parse`
+// behaviour, this only pins the delegation (and that `branch` really is optional).
+describe('GitBackend — currentBase (RUN-222)', () => {
+  it('passes repoRoot/branch straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).currentBase('/repo', 'main');
+    expect(res).toEqual({ ok: true, baseId: 'cur0000' });
+    expect(calls).toEqual([{ method: 'currentBase', args: ['/repo', 'main'] }]);
+  });
+
+  it('omitting branch passes undefined through, never a synthesized default', async () => {
+    const { ops, calls } = recorder();
+    await new GitBackend(ops).currentBase('/repo');
+    expect(calls).toEqual([{ method: 'currentBase', args: ['/repo', undefined] }]);
   });
 });
 

@@ -11,6 +11,7 @@ import {
 } from './perforce-index-source';
 import type {
   ChangesBetweenResult,
+  CurrentBaseResult,
   IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
@@ -776,6 +777,36 @@ export class PerforceBackend implements VcsBackend {
   async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
     p4IndexSnapshotLocation(snapshot); // throws on a foreign object — see its own doc
     await snapshot.source.close?.();
+  }
+
+  /**
+   * The cheap "what is current" check (RUN-222): exactly `leaseIndexSnapshot`'s own `baseId`
+   * derivation (`resolveDepotPrefix` + `p4 changes -m1 <prefix>`) and nothing else — no client
+   * creation, no sync. MEASURED against the rig (2026-08-09, `noriq-p4d:2026.1`, the provisioned
+   * sample depot): `p4 -Ztag -F '%change%' changes -m1 //depot/...` against the pre-existing
+   * `noriq-sample` client answered `2` in 4ms with no prior `p4 sync` — confirming this needs no
+   * tree materialization, exactly `leaseIndexSnapshot`'s own doc already establishes for the
+   * identical call. `branch` is ignored: this backend has no branch concept (see the model note
+   * at the top of this file) — the client's own View mapping is the only scope there is.
+   */
+  async currentBase(repoRoot: string, _branch?: string): Promise<CurrentBaseResult> {
+    try {
+      const prefix = await this.resolveDepotPrefix(repoRoot);
+      const { stdout: changeRaw } = await this.p4(
+        ['-Ztag', '-F', '%change%', 'changes', '-m1', prefix],
+        repoRoot,
+      );
+      const change = changeRaw.trim();
+      return change
+        ? { ok: true, baseId: change }
+        : { ok: false, reason: 'unknown', detail: `no submitted changelist exists under ${prefix}` };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `could not resolve the current change under this client's view: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 
   /**

@@ -5,7 +5,7 @@ import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { ChangesBetweenResult, IgnoreQueryResult } from './vcs/types';
+import type { ChangesBetweenResult, CurrentBaseResult, IgnoreQueryResult } from './vcs/types';
 
 const execFileP = promisify(execFile);
 
@@ -266,6 +266,32 @@ export class WorktreeManager {
     };
     if (info.readOnly) await setReadOnly(dir);
     return info;
+  }
+
+  /**
+   * The cheap "what is current" check (RUN-222, `VcsBackend.currentBase`'s git half): the SAME
+   * scope `createIndexSnapshot` below defaults to (`baseRef ?? 'HEAD'`) — this repo's own
+   * checked-out HEAD, or a named ref when the caller has one — priced at one `rev-parse`, never a
+   * worktree and never a lease. `--quiet` is what keeps a repo with no commits yet (or a branch
+   * that does not exist) an ANSWER (empty stdout, nonzero exit) rather than git's own noisy
+   * "fatal: ambiguous argument" on stderr — this method never throws for that ordinary case,
+   * `CurrentBaseResult`'s own contract.
+   */
+  async currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult> {
+    const ref = branch ?? 'HEAD';
+    try {
+      const { stdout } = await this.git(['rev-parse', '--verify', '--quiet', ref], repoRoot);
+      const sha = stdout.trim();
+      return sha
+        ? { ok: true, baseId: sha }
+        : { ok: false, reason: 'unknown', detail: `${ref} did not resolve to a commit in ${repoRoot}` };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `could not resolve ${ref} in ${repoRoot}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 
   /**
