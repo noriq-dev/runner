@@ -3,6 +3,12 @@ import { rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { LockDelegate } from './git';
+import {
+  type P4RawCli,
+  PerforceDepotIndexSource,
+  realP4RawCli,
+  stripDepotPrefix,
+} from './perforce-index-source';
 import type {
   ChangesBetweenResult,
   IndexSnapshot,
@@ -123,8 +129,81 @@ function p4Location(ws: Workspace): P4Location {
   );
 }
 
+/**
+ * What this backend stashes in an `IndexSnapshot`'s `location` (RUN-254) — tagged with a
+ * discriminant, the same reasoning `GitIndexSnapshotLocation` gives: `IndexSnapshot` and
+ * `Workspace` are structurally close enough (both carry `localPath`/`baseId`/`readOnly`/
+ * `location`) that a `Workspace` variable satisfies this type by ordinary structural typing, so
+ * `kind` is what lets `p4IndexSnapshotLocation` refuse a foreign object — a run's `P4Location`
+ * (`client`+`change`) rather than a snapshot's (`prefix`+`change`) — at runtime.
+ */
+interface P4IndexSnapshotLocation {
+  kind: 'perforce-index-snapshot';
+  prefix: string;
+  change: string;
+}
+
+function p4IndexSnapshotLocation(snapshot: IndexSnapshot): P4IndexSnapshotLocation {
+  const loc = snapshot.location as Partial<P4IndexSnapshotLocation> | null | undefined;
+  if (
+    loc?.kind === 'perforce-index-snapshot' &&
+    typeof loc.prefix === 'string' &&
+    typeof loc.change === 'string'
+  ) {
+    return { kind: loc.kind, prefix: loc.prefix, change: loc.change };
+  }
+  throw new Error(
+    'Perforce refuses to release an index snapshot it did not mint — this location was minted by another backend or an incompatible daemon version',
+  );
+}
+
+/**
+ * Mirrors `worktree.ts`'s `CHANGES_BETWEEN_MAX_PATHS` — same reasoning (past this many
+ * changed+deleted paths, the "incremental" path is a slower full index with none of the savings),
+ * kept as an independent constant so the two backends never share an accidental coupling.
+ */
+const PERFORCE_CHANGES_BETWEEN_MAX_PATHS = 10_000;
+
+/**
+ * `p4 diff2 -q` answers "these two bases are identical" as TEXT on an exit-0 call —
+ * `"<pattern>@<from> - no differing files."`, on STDERR, with stdout left EMPTY — the same
+ * "emptiness is an answer, not a failure" shape `P4_NOTHING_HERE` above already handles for
+ * `opened`/`reconcile`, and the same stream split `changelistExists` hit for "no such
+ * changelist." (both messages measured on stderr despite an exit-0 success). Measured against the
+ * rig, not assumed.
+ */
+const P4_DIFF2_EMPTY = /no differing files/i;
+
+/**
+ * One `p4 diff2 -q` header line, parsed by POSITION — never by counting `=` (RUN-254 locked
+ * decision 5, measured against the rig): the deleted arm's trailing marker is `===` (three
+ * characters) where the added and modified arms end in `====` (four), which reads exactly like a
+ * typo and would silently drop every deletion under a parser that counts equals signs instead.
+ * `<none>` on either side of the ` - ` separator names which arm this is; the trailing ` content`
+ * marker (present only on the modified arm, because `-q` still prints its header even though it
+ * suppresses the diff body) is otherwise unused here — the caller already knows a path changed
+ * from the fact that `-q` produced a header line for it at all, since it never lists an unchanged
+ * file.
+ */
+function parseDiff2Header(line: string): { left: string | null; right: string | null } | null {
+  const m = line.match(/^==== (.+?) =+(?: content)?$/);
+  if (!m?.[1]) return null;
+  const sepIdx = m[1].indexOf(' - ');
+  if (sepIdx < 0) return null;
+  // Each named side is `//depot/path#rev` (plus ` (type)` on the modified arm) — strip BOTH the
+  // trailing `#rev` and the type annotation so what is returned is a plain depot path
+  // `stripDepotPrefix` can relativize, never a revision-suffixed one that would silently
+  // never match a real indexed path.
+  const stripType = (side: string) =>
+    side === '<none>' ? null : side.replace(/ \([^()]*\)$/, '').replace(/#\d+$/, '');
+  return { left: stripType(m[1].slice(0, sepIdx)), right: stripType(m[1].slice(sepIdx + 3)) };
+}
+
 export interface PerforceBackendOpts {
   p4?: P4Cli;
+  /** Injectable Buffer-safe runner for the depot index source's content reads (RUN-254) — see
+   *  `perforce-index-source.ts`'s module doc for why `p4` (string-based) cannot serve this role. */
+  p4Raw?: P4RawCli;
   /** Injectable for tests — writes the merge3 marker file into the workspace. */
   writeFileFn?: (p: string, content: string) => Promise<void>;
   /** The Noriq lock view (RUN-99). Perforce has real exclusive locks, but the runner's cross-run
@@ -138,6 +217,7 @@ export class PerforceBackend implements VcsBackend {
   readonly kind = 'perforce';
   readonly disposePreservesWork = true;
   private readonly p4: P4Cli;
+  private readonly p4Raw: P4RawCli;
   private readonly write: (p: string, content: string) => Promise<void>;
   private readonly locks?: LockDelegate;
   private queue: Promise<unknown> = Promise.resolve();
@@ -145,8 +225,54 @@ export class PerforceBackend implements VcsBackend {
 
   constructor(opts: PerforceBackendOpts = {}) {
     this.p4 = opts.p4 ?? realP4Cli;
+    this.p4Raw = opts.p4Raw ?? realP4RawCli;
     this.write = opts.writeFileFn ?? ((p, c) => writeFile(p, c, 'utf8'));
     this.locks = opts.locks;
+  }
+
+  /**
+   * The depot path prefix this repo's client is configured to view (RUN-254) — read from the
+   * OPERATOR's own client spec (`p4 client -o`), never from caller input: `leaseIndexSnapshot` and
+   * `changesBetween` both scope their queries to this, and `perforce-index-source.ts`'s module doc
+   * carries the full containment rationale for why that trust placement is what makes the depot
+   * source's guarantee hold. Read-only — `client -o` outputs the spec, it does not touch it.
+   *
+   * Only the FIRST `View:` line is read (discretion: a multi-line view, or a stream client whose
+   * view p4 assembles rather than stores literally, is unmeasured here) — a documented limitation,
+   * not a silent one.
+   */
+  private async resolveDepotPrefix(repoRoot: string): Promise<string> {
+    const client = await this.clientName(repoRoot);
+    const { stdout: spec } = await this.p4(['client', '-o', client], repoRoot);
+    const m = spec.match(/^View:\s*\r?\n\t(\S+)/m);
+    if (!m?.[1]) {
+      throw new Error(
+        `client ${client}'s spec has no View mapping this backend could read a depot prefix from — cannot build an index source without one`,
+      );
+    }
+    return m[1];
+  }
+
+  /**
+   * Is `change` a real, currently-visible submitted changelist? p4 answers "no" as EXIT-0 TEXT
+   * (`"<n> - no such changelist."`) from `describe -s`, not a nonzero exit — measured directly
+   * (RUN-254), and load-bearing: `p4 diff2`/`p4 files` do NOT error for an out-of-range changelist
+   * number either, they silently clamp to the depot's current head, which would otherwise make
+   * `changesBetween` answer a confident, WRONG diff for a `to`/`from` that never existed. This
+   * check is what stands between that silent clamp and an honest `full-index-required`. A
+   * syntactically invalid id (non-numeric, negative, zero) exits NONZERO (a usage error) and folds
+   * into the same "could not confirm it" answer via the caller's own try/catch.
+   */
+  private async changelistExists(change: string, cwd: string): Promise<boolean> {
+    // "no such changelist." arrives on STDERR despite the exit-0 success (measured against the
+    // live rig, the hard way — a first cut of this check read only `stdout`, which is where the
+    // message lands when a shell merges the two streams for a human to read, and so it passed
+    // every FAKE-driven unit test while silently treating a bogus changelist as real against a
+    // live server). Both streams are checked so neither p4's human-facing convention nor a fake
+    // that puts the message on the "wrong" stream can hide the answer.
+    const { stdout, stderr } = await this.p4(['describe', '-s', change], cwd);
+    const notFound = `${change} - no such changelist.`;
+    return stdout.trim() !== notFound && stderr.trim() !== notFound;
   }
 
   private async clientName(cwd: string): Promise<string> {
@@ -584,55 +710,191 @@ export class PerforceBackend implements VcsBackend {
   }
 
   /**
-   * Try-acquire only, never enqueue (RUN-211 locked decision 5) — same reasoning as
-   * `DiversionBackend.leaseIndexSnapshot`, which this mirrors: `held` is exactly the pool-of-1
-   * lease's occupancy (populated in `lease`, cleared in `dispose`), so checking its size answers
-   * "is the workspace held" without ever chaining onto `queue`. A snapshot requested while this
-   * process holds the pool is exactly when indexing is triggered — right after landing — and
-   * waiting behind it would deadlock with nothing to time out.
+   * Mints a REAL depot-backed snapshot (RUN-254) — deliberately NOT a try-acquire against
+   * `held`, the pool-of-1 lease's own occupancy. RUN-211's original design assumed a snapshot
+   * would need SOME workspace, so a busy check stood between it and the deadlock
+   * `integrateFromRun`'s doc warns about (an in-process promise chain with nothing to time out).
+   * That assumption does not hold for this backend: every query below — `p4 client -o` to read
+   * the operator's own View mapping, `p4 changes -m1` for the depot head, and everything
+   * `PerforceDepotIndexSource` itself issues (`fstat`, `print`, `diff2`) — is a pure depot read
+   * that needs no client workspace and touches no pending changelist, measured with
+   * `P4CLIENT=no-such-client-at-all` against the rig (`perforce-index-source.ts`'s module doc
+   * carries the full design). So this method never consults `held`: a snapshot may be requested
+   * and answered while this SAME process holds the run pool, with zero contention — the
+   * acceptance truth RUN-254 exists to prove, not merely assert. (Diversion, RUN-255, is a
+   * different backend with its own measured shape and may still need the try-acquire this file's
+   * own history shows.)
    *
-   * When the workspace is free this still answers `unsupported`: a real read-only snapshot on
-   * Perforce would mean a second client workspace (or `p4 print`-ing a whole tree cheaply), and
-   * neither has been measured against a live p4d the way every other mapping in this file was
-   * (RUN-55, §10) — the conservative half of the execution spec's discretion note. Revisit only
-   * once that measurement exists.
+   * Mints nothing on disk: `location` names the `(prefix, change)` pair the returned
+   * `PerforceDepotIndexSource` reads through, and `localPath`/`branch` are both left absent —
+   * the honest answer for a backend that materialized no tree and has no branch concept.
+   *
+   * `resolveDepotPrefix`'s own infra failures (no client mapped, an unreadable spec) and the
+   * `changes -m1` probe's both REJECT the promise rather than answering here — the same posture
+   * `lease` takes (this union is for outcomes a caller branches on, not for faults;
+   * `IndexSnapshotResult`'s own doc states this).
    */
-  async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
-    if (this.held.size > 0) return { ok: false, reason: 'busy' };
+  async leaseIndexSnapshot(repoRoot: string): Promise<IndexSnapshotResult> {
+    const prefix = await this.resolveDepotPrefix(repoRoot);
+    const { stdout: changeRaw } = await this.p4(
+      ['-Ztag', '-F', '%change%', 'changes', '-m1', prefix],
+      repoRoot,
+    );
+    const change = changeRaw.trim();
+    if (!change) {
+      return {
+        ok: false,
+        reason: 'unsupported',
+        detail: `no submitted changelist exists under ${prefix} — nothing for an index snapshot to pin to`,
+      };
+    }
     return {
-      ok: false,
-      reason: 'unsupported',
-      detail:
-        'Perforce has no measured read-only snapshot path (RUN-55 §10) — only the pool-of-1 client workspace lease exists today',
+      ok: true,
+      snapshot: {
+        source: new PerforceDepotIndexSource({
+          p4: this.p4,
+          p4Raw: this.p4Raw,
+          cwd: repoRoot,
+          prefix,
+          change,
+        }),
+        baseId: change,
+        readOnly: true,
+        location: { kind: 'perforce-index-snapshot', prefix, change } satisfies P4IndexSnapshotLocation,
+      },
     };
-  }
-
-  /** Never mints a snapshot (see `leaseIndexSnapshot`), so anything reaching here is foreign —
-   *  refuse it outright, the same discipline `p4Location` applies to a foreign `Workspace`. */
-  async releaseIndexSnapshot(_snapshot: IndexSnapshot): Promise<void> {
-    throw new Error('Perforce never mints an index snapshot — nothing here was leased, refusing to touch it');
   }
 
   /**
-   * No cross-revision diff has been measured against a live p4d (RUN-212): RUN-55 §10 proved
-   * `submit`-as-CAS and the headless `merge3` conflict loop, never relating two arbitrary
-   * changelist/commit ids across the whole depot tree. Answering `full-index-required`
-   * unconditionally is `openReview`'s precedent applied here (locked decision 5) — present, and
-   * naming what a real implementation needs, rather than silently absent. A real one would need a
-   * measured whole-tree diff (`p4 diff2` across two revisions of the client's view, or an
-   * equivalent) that reports deletions and reads renames from Perforce's own integration history
-   * rather than a similarity heuristic — unmeasured here.
+   * IDEMPOTENT and structurally incapable of touching a run `Workspace` (`p4IndexSnapshotLocation`
+   * refuses anything but this backend's own `{kind:'perforce-index-snapshot', …}` tag) — but there
+   * is nothing ELSE to clean up: `leaseIndexSnapshot` materialized no client, no sync, no tree, so
+   * releasing one is closing whatever the source itself held (nothing, today — `close` is a no-op
+   * on `PerforceDepotIndexSource`) and no more.
    */
-  async changesBetween(_repoRoot: string, _from: string, _to: string): Promise<ChangesBetweenResult> {
-    return {
-      ok: false,
-      reason: 'full-index-required',
-      detail:
-        'Perforce has no measured cross-revision diff path (RUN-55 §10 covered submit-as-CAS and ' +
-        'the merge3 conflict loop, not a from/to compare) — a real implementation needs a ' +
-        'measured whole-tree diff (e.g. p4 diff2) that reports deletions and reads renames from ' +
-        'integration history',
-    };
+  async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
+    p4IndexSnapshotLocation(snapshot); // throws on a foreign object — see its own doc
+    await snapshot.source.close?.();
+  }
+
+  /**
+   * `p4 diff2 -q` across the client's own depot prefix (RUN-254) — chosen over iterating
+   * `changes`+`files@=<change>` because it reports the whole `from`→`to` delta, deletions
+   * included, in ONE call regardless of how many intervening changelists separate them; the
+   * iterate-and-union alternative pays one round trip per intervening changelist for the same
+   * answer. `parseDiff2Header` above (measured against the rig) does the parsing: by POSITION
+   * (`<none>`'s side, the trailing `content` marker), never by counting `=` — the deleted arm's
+   * `===` vs the other arms' `====` reads exactly like a typo, and a parser that counted equals
+   * signs would silently drop every deletion, the one thing an index must never lose track of
+   * (locked decision 5).
+   *
+   * Every uncertain condition below answers `full-index-required` rather than throwing or
+   * reporting an empty diff (`ChangesBetweenResult`'s locked decision 1), mirroring
+   * `WorktreeManager.changesBetween`'s git-side structure:
+   *  - the depot prefix cannot be resolved (no client mapped, an unreadable spec);
+   *  - either `from` or `to` does not resolve to a real submitted changelist (RUN-254 locked
+   *    decision 7) — checked explicitly via `changelistExists`, because `diff2` itself does NOT
+   *    error for an unknown/future changelist number, it silently answers as of the depot's
+   *    current head (measured, and the reason this check exists at all);
+   *  - the `diff2` query itself fails (a connection drop, a server error);
+   *  - any header line fails to parse (`parseDiff2Header` returns `null`, or names `<none>` on
+   *    BOTH sides — a shape p4 has never been measured to produce and this refuses to guess at);
+   *  - the reported change set exceeds `PERFORCE_CHANGES_BETWEEN_MAX_PATHS`.
+   *
+   * `{ok:true, changed:[], deleted:[]}` is a real, distinct answer (locked decision 2): p4 reports
+   * two identical bases as `"... - no differing files."` on STDERR with stdout left empty, exit
+   * 0 — recognized below by the empty stdout (and, defensively, `P4_DIFF2_EMPTY` against either
+   * stream), never conflated with an unparseable or failed query.
+   */
+  async changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
+    let prefix: string;
+    try {
+      prefix = await this.resolveDepotPrefix(repoRoot);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `could not resolve a depot prefix for ${repoRoot}: ${(err as Error).message}`,
+      };
+    }
+
+    for (const [label, id] of [
+      ['from', from],
+      ['to', to],
+    ] as const) {
+      let exists: boolean;
+      try {
+        exists = await this.changelistExists(id, repoRoot);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `could not confirm the ${label} changelist ${JSON.stringify(id)}: ${(err as Error).message}`,
+        };
+      }
+      if (!exists) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `${label} changelist ${JSON.stringify(id)} does not resolve to a real submitted changelist under ${prefix} — unknown, purged, or invalid`,
+        };
+      }
+    }
+
+    let stdout: string;
+    let stderr: string;
+    try {
+      ({ stdout, stderr } = await this.p4(['diff2', '-q', `${prefix}@${from}`, `${prefix}@${to}`], repoRoot));
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `diff2 between ${from} and ${to} failed: ${(err as Error).message}`,
+      };
+    }
+
+    // Every header line lives on STDOUT (measured); "no differing files." lives on STDERR with
+    // stdout EMPTY (measured — the same stream split `changelistExists` hit for "no such
+    // changelist."). So an empty stdout is already the reliable signal; `P4_DIFF2_EMPTY` against
+    // BOTH streams is the defensive extra layer in case a future p4 version routes it elsewhere.
+    const trimmed = stdout.trim();
+    if (!trimmed || P4_DIFF2_EMPTY.test(stdout) || P4_DIFF2_EMPTY.test(stderr)) {
+      return { ok: true, changed: [], deleted: [] };
+    }
+
+    const changed = new Set<string>();
+    const deleted = new Set<string>();
+    for (const line of trimmed.split('\n')) {
+      if (!line.trim()) continue;
+      const parsed = parseDiff2Header(line);
+      if (!parsed || (parsed.left === null && parsed.right === null)) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `unparseable diff2 header between ${from} and ${to}: ${JSON.stringify(line)}`,
+        };
+      }
+      if (parsed.left === null) {
+        const rel = parsed.right ? stripDepotPrefix(prefix, parsed.right) : null;
+        if (rel !== null) changed.add(rel);
+      } else if (parsed.right === null) {
+        const rel = stripDepotPrefix(prefix, parsed.left);
+        if (rel !== null) deleted.add(rel);
+      } else {
+        const rel = stripDepotPrefix(prefix, parsed.right);
+        if (rel !== null) changed.add(rel);
+      }
+    }
+
+    if (changed.size + deleted.size > PERFORCE_CHANGES_BETWEEN_MAX_PATHS) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${changed.size + deleted.size} changed paths between ${from} and ${to} exceeds the ${PERFORCE_CHANGES_BETWEEN_MAX_PATHS}-path cap`,
+      };
+    }
+
+    return { ok: true, changed: [...changed], deleted: [...deleted] };
   }
 
   /**

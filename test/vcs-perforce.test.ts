@@ -1,8 +1,140 @@
 import { describe, expect, it } from 'vitest';
+import { INDEX_LANGUAGES, type ResolvedIndexConfig } from '../src/index-policy';
+import { scanIndexSource } from '../src/index-scan';
 import { FakeIndexSource } from '../src/index-source';
 import type { LockDelegate } from '../src/vcs/git';
 import { type P4Cli, PerforceBackend } from '../src/vcs/perforce';
+import { type P4RawCli, PerforceDepotIndexSource } from '../src/vcs/perforce-index-source';
 import type { VcsBackend } from '../src/vcs/types';
+
+/** A fully-populated `ResolvedIndexConfig`, mirroring `index-scan.test.ts`'s own helper — used
+ *  only by the deny-list integration test below, which proves the hard deny list still binds
+ *  when the bytes come from a depot read (RUN-254 acceptance truth), not by anything else here. */
+const indexCfg = (over: Partial<ResolvedIndexConfig> = {}): ResolvedIndexConfig => ({
+  languages: [...INDEX_LANGUAGES],
+  contentMode: 'full',
+  maxFiles: 10_000,
+  maxFileBytes: 1_000_000,
+  maxTotalBytes: 500_000_000,
+  readDeadlineMs: 120_000,
+  pollIntervalMinutes: 60,
+  include: [],
+  exclude: [],
+  ...over,
+});
+
+/**
+ * Verbatim `p4 -Ztag fstat -Ol //depot/...@2` output, captured from the p4d rig (RUN-253/254,
+ * p4d 2026.1) — the fixture every RUN-254 unit test below is driven by, per the task's own
+ * requirement that CI stay hermetic while the fixtures still match what a real server said.
+ * `scripts/p4d-rig/measure.sh` re-produces this; see also `test/vcs-perforce-live.test.ts`, which
+ * re-asserts it against a live rig when one is up.
+ */
+const FSTAT_AT_2 = `... depotFile //depot/config/.env
+... headAction add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 1
+... headModTime 1786236019
+... fileSize 37
+... digest D201650FF5B00A890392F0F1679CF825
+
+... depotFile //depot/config/app.json
+... headAction add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 1
+... headModTime 1786236019
+... fileSize 19
+... digest 763063E8F517C405C3B5D56DEA039E61
+
+... depotFile //depot/docs/NEW.md
+... headAction add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 2
+... headModTime 1786236019
+... fileSize 12
+... digest 59E3CFC1EBE6DE8FC3E9B44CE531E3A5
+
+... depotFile //depot/docs/OLD.md
+... headAction delete
+... headType text
+... headTime 1786236019
+... headRev 2
+... headChange 2
+... headModTime 0
+
+... depotFile //depot/docs/README.md
+... headAction add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 1
+... headModTime 1786236019
+... fileSize 37
+... digest 1EFBF2CAB2538A00A43A683F9C9210A4
+
+... depotFile //depot/src/add.ts
+... headAction edit
+... headType text
+... headTime 1786236019
+... headRev 2
+... headChange 2
+... headModTime 1786236019
+... fileSize 74
+... digest C24DE970FC860A6C2E3CAB19C7605A35
+
+... depotFile //depot/src/after.ts
+... headAction move/add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 2
+... headModTime 1786236019
+... fileSize 14
+... digest 13DA84E897C5487341147CBC4C8CB588
+
+... depotFile //depot/src/before.ts
+... headAction move/delete
+... headType text
+... headTime 1786236019
+... headRev 2
+... headChange 2
+... headModTime 0
+
+... depotFile //depot/src/blob.bin
+... headAction add
+... headType binary
+... headTime 1786236019
+... headRev 1
+... headChange 1
+... headModTime 1786236019
+... fileSize 4096
+... digest 606C60A90062D5E25E723E159667072F
+
+... depotFile //depot/src/util/name.ts
+... headAction add
+... headType text
+... headTime 1786236019
+... headRev 1
+... headChange 1
+... headModTime 1786236019
+... fileSize 30
+... digest F2E1142E43EB5D1AB9538269B2BBBB1D
+`;
+
+/** Verbatim `p4 diff2 -q //depot/...@1 //depot/...@2` output, captured from the same rig session
+ *  — the deleted arm's `===` (three) vs the other arms' `====` (four) is not a typo in this
+ *  fixture; it is the exact trap RUN-254's parser is built to survive. */
+const DIFF2_1_TO_2 = `==== <none> - //depot/docs/NEW.md#1 ====
+==== //depot/docs/OLD.md#1 - <none> ===
+==== //depot/src/add.ts#1 (text) - //depot/src/add.ts#2 (text) ==== content
+==== <none> - //depot/src/after.ts#1 ====
+==== //depot/src/before.ts#1 - <none> ===`;
 
 /** A fake Noriq lock view (the authoritative coordination layer) that records calls and returns
  *  a configurable acquire result. */
@@ -39,6 +171,15 @@ interface Call {
   stdin?: string;
 }
 
+/** `fakes()` never spawns anything real — a test that reaches this without configuring
+ *  `over.p4Raw` explicitly is a test that forgot it needs one, not a test allowed to fall through
+ *  to `realP4RawCli` (RUN-254: CI must stay hermetic, `npm run check` runs with no container). */
+const throwingP4Raw: P4RawCli = async (args) => {
+  throw new Error(
+    `fakes(): no p4Raw configured — pass over.p4Raw for a test whose PerforceDepotIndexSource calls read()/digest() (attempted: p4 ${args.join(' ')})`,
+  );
+};
+
 function fakes(over: {
   /** Lines `p4 opened -c N` prints; empty = nothing opened. */
   opened?: string;
@@ -50,6 +191,20 @@ function fakes(over: {
   submitRefuses?: string;
   /** changes -l output (for the reaper / fromRunId lookup). */
   changesLong?: string;
+  /** `changes -m1 <spec>` answer (RUN-254: both `lease`'s `#have` probe and
+   *  `leaseIndexSnapshot`'s depot-head probe share this condition) — defaults to '7', unchanged
+   *  from before RUN-254 touched this file. */
+  changeHead?: string;
+  /** `-Ztag fstat -Ol <prefix>@<change>` answer, for the depot index source's enumeration. */
+  fstat?: string;
+  /** Changelist ids `describe -s` answers "no such changelist." for (RUN-254). */
+  describeMissing?: Set<string>;
+  /** Changelist ids `describe -s` answers with a nonzero-exit usage error for (RUN-254). */
+  describeInvalid?: Set<string>;
+  /** `diff2 -q` answer, for `changesBetween`. */
+  diff2?: string;
+  /** Buffer-safe runner for the depot source's content reads — see `throwingP4Raw`. */
+  p4Raw?: P4RawCli;
   /** The Noriq lock view to inject (RUN-99). */
   locks?: LockDelegate;
 }) {
@@ -62,10 +217,26 @@ function fakes(over: {
     const cmd = args.filter((a) => !a.startsWith('-') || a === '-n').join(' ');
     if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
     if (args[0] === 'client' && args[1] === '-o')
-      return { stdout: 'Client: ws1\nOptions: noallwrite noclobber\n', stderr: '' };
+      // The View line is what RUN-254's `resolveDepotPrefix` reads — added for every test, not
+      // just the new ones, since a client spec with no View is not a shape any real `p4 client -o`
+      // produces for a client that has ever been usable.
+      return {
+        stdout: 'Client: ws1\nOptions: noallwrite noclobber\nView:\n\t//depot/... //ws1/...\n',
+        stderr: '',
+      };
     if (args[0] === 'client' && args[1] === '-i') return { stdout: 'Client ws1 saved.\n', stderr: '' };
     if (args[0] === 'sync') return { stdout: '', stderr: '' };
-    if (args.includes('changes') && args.includes('-m1')) return { stdout: '7\n', stderr: '' };
+    if (args[0] === '-Ztag' && args.includes('fstat')) return { stdout: over.fstat ?? '', stderr: '' };
+    if (args[0] === 'describe' && args[1] === '-s') {
+      const id = args[2] ?? '';
+      if (over.describeInvalid?.has(id))
+        throw new Error(`p4 describe exited 1: Invalid changelist number '${id}'.`);
+      if (over.describeMissing?.has(id)) return { stdout: `${id} - no such changelist.\n`, stderr: '' };
+      return { stdout: `Change ${id} by noriq@ws1 on 2026/08/09 00:00:00\n\n\tsample\n`, stderr: '' };
+    }
+    if (args[0] === 'diff2') return { stdout: over.diff2 ?? '', stderr: '' };
+    if (args.includes('changes') && args.includes('-m1'))
+      return { stdout: `${over.changeHead ?? '7'}\n`, stderr: '' };
     if (args.includes('changes')) return { stdout: over.changesLong ?? '', stderr: '' };
     if (args.includes('change') && args.includes('-o')) {
       // --field applies the description into the emitted spec, exactly like the real p4.
@@ -119,6 +290,7 @@ function fakes(over: {
 
   const backend = new PerforceBackend({
     p4,
+    p4Raw: over.p4Raw ?? throwingP4Raw,
     writeFileFn: async (path, content) => {
       writes.push({ path, content });
     },
@@ -353,55 +525,403 @@ describe('PerforceBackend — run-addressed verbs decline honestly (RUN-170)', (
   });
 });
 
-// RUN-211: no live p4d to measure a real read-only snapshot against, so this backend only ever
-// answers unsupported — but the pool-contention check is real and testable without a server,
-// and is exactly what stands between a background indexer and the deadlock
-// `leaseIndexSnapshot`'s doc warns about (waiting behind a run lease this same process holds).
-describe('PerforceBackend — index snapshot (RUN-211): try-acquire only, never a real snapshot', () => {
-  it('answers unsupported when the workspace is free — no measured snapshot path exists here', async () => {
-    const { backend } = fakes({});
-    expect(await backend.leaseIndexSnapshot('/ws1')).toEqual({
-      ok: false,
-      reason: 'unsupported',
-      detail: expect.stringContaining('Perforce'),
-    });
+// RUN-254 replaces RUN-211's `unsupported` refusal with a real depot-backed snapshot: a depot
+// read needs no client workspace at all (measured with P4CLIENT=no-such-client-at-all against the
+// rig), so — unlike the old design's assumption — a snapshot never contends with this backend's
+// own pool-of-1 run lease. `changeHead: '2'` below is what makes `resolveDepotPrefix` + the head
+// probe answer deterministically across these tests.
+describe('PerforceBackend — leaseIndexSnapshot / releaseIndexSnapshot (RUN-254): real depot reads', () => {
+  it('mints a real snapshot: no localPath, no client/sync calls, baseId is the depot head', async () => {
+    const { backend, calls } = fakes({ changeHead: '2', fstat: FSTAT_AT_2 });
+    const res = await backend.leaseIndexSnapshot('/ws1');
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('expected ok:true');
+    expect(res.snapshot.baseId).toBe('2');
+    expect(res.snapshot.readOnly).toBe(true);
+    expect(res.snapshot.localPath).toBeUndefined(); // materializes nothing — locked decision 1
+    expect(res.snapshot.branch).toBeUndefined();
+    expect(res.snapshot.source.kind).toBe('perforce-depot');
+    // No client mint, no sync, no changelist creation — the acceptance truth that indexing never
+    // touches the workspace.
+    expect(calls.some((c) => c.what.startsWith('p4 client -i'))).toBe(false);
+    expect(calls.some((c) => c.what.startsWith('p4 sync'))).toBe(false);
+    expect(calls.some((c) => c.what.startsWith('p4 change -i'))).toBe(false);
   });
 
-  it('answers busy IMMEDIATELY while a run holds the workspace — never chains onto the lease queue', async () => {
-    const { backend } = fakes({});
-    const ws = await backend.lease('/ws1', 'run_1'); // holds the pool; never disposed here
-    // A wrong implementation chaining onto `queue` would hang until `dispose`, which never runs
-    // in this test — vitest's own timeout would fail it rather than this awaiting forever.
-    expect(await backend.leaseIndexSnapshot('/ws1')).toEqual({ ok: false, reason: 'busy' });
+  it('mints a real snapshot even while a run lease is held — no pool contention (RUN-254)', async () => {
+    const { backend } = fakes({ changeHead: '2', fstat: FSTAT_AT_2 });
+    const ws = await backend.lease('/ws1', 'run_1'); // holds the pool; never disposed until below
+    const res = await backend.leaseIndexSnapshot('/ws1');
+    expect(res.ok).toBe(true);
     await backend.dispose(ws);
   });
 
-  it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
+  it('answers unsupported when the depot prefix has no submitted changelist at all', async () => {
+    const { backend } = fakes({ changeHead: '' });
+    expect(await backend.leaseIndexSnapshot('/ws1')).toEqual({
+      ok: false,
+      reason: 'unsupported',
+      detail: expect.stringContaining('//depot/...'),
+    });
+  });
+
+  it('rejects (an infra fault, not a routine negative) when the client spec has no View mapping', async () => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o')
+        return { stdout: 'Client: ws1\nOptions: noallwrite\n', stderr: '' };
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const backend = new PerforceBackend({ p4 });
+    await expect(backend.leaseIndexSnapshot('/ws1')).rejects.toThrow(/View mapping/);
+  });
+
+  it('releases a real snapshot idempotently (nothing was materialized, so nothing to remove)', async () => {
+    const { backend } = fakes({ changeHead: '2', fstat: FSTAT_AT_2 });
+    const res = await backend.leaseIndexSnapshot('/ws1');
+    if (!res.ok) throw new Error('expected ok:true');
+    await backend.releaseIndexSnapshot(res.snapshot);
+    await backend.releaseIndexSnapshot(res.snapshot); // second call — idempotent
+  });
+
+  it('refuses to release a foreign run Workspace (no `perforce-index-snapshot` tag)', async () => {
     const { backend } = fakes({});
     await expect(
       backend.releaseIndexSnapshot({
         source: new FakeIndexSource([]),
         localPath: '/ws1',
-        baseId: 'x',
+        baseId: '7',
         readOnly: true,
-        location: {},
+        location: { client: 'ws1', change: '42' }, // a run's own P4Location shape
       }),
-    ).rejects.toThrow(/never mints an index snapshot/);
+    ).rejects.toThrow(/did not mint/);
+  });
+
+  it('refuses to release a git-shaped index snapshot (a different backend`s discriminant)', async () => {
+    const { backend } = fakes({});
+    await expect(
+      backend.releaseIndexSnapshot({
+        source: new FakeIndexSource([]),
+        baseId: 'deadbeef',
+        readOnly: true,
+        location: { repoRoot: '/repo', kind: 'index-snapshot' },
+      }),
+    ).rejects.toThrow(/did not mint/);
   });
 });
 
-// RUN-212: no live p4d to measure a cross-revision diff against, so this backend always answers
-// full-index-required — but it must do so HONESTLY (never throw, never fabricate an empty diff)
-// and it must name itself, per `openReview`'s precedent (locked decision 5).
-describe('PerforceBackend — changesBetween (RUN-212): unconditional full-index-required', () => {
-  it('never throws, never reports an empty diff, and names the backend in the detail', async () => {
-    const { backend } = fakes({});
-    const res = await backend.changesBetween('/ws1', '100', '105');
-    expect(res).toEqual({
-      ok: false,
-      reason: 'full-index-required',
-      detail: expect.stringContaining('Perforce'),
+// RUN-254 replaces RUN-212's unconditional `full-index-required` with a real `p4 diff2 -q`-backed
+// answer. `changeHead`/`fstat` are irrelevant here — `changesBetween` never lists a tree, only
+// `resolveDepotPrefix` (client -o) and `describe`/`diff2` matter.
+describe('PerforceBackend — changesBetween (RUN-254): p4 diff2 -q, measured', () => {
+  it('decomposes add/delete/modify/move exactly as the rig reported them, deletions included', async () => {
+    const { backend } = fakes({ diff2: DIFF2_1_TO_2 });
+    const res = await backend.changesBetween('/ws1', '1', '2');
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('expected ok:true');
+    expect(new Set(res.changed)).toEqual(new Set(['docs/NEW.md', 'src/add.ts', 'src/after.ts']));
+    expect(new Set(res.deleted)).toEqual(new Set(['docs/OLD.md', 'src/before.ts']));
+  });
+
+  it('reports two identical bases as a REAL empty diff, not full-index-required (locked decision 2)', async () => {
+    const { backend } = fakes({ diff2: '//depot/...@1 - no differing files.\n' });
+    expect(await backend.changesBetween('/ws1', '1', '1')).toEqual({ ok: true, changed: [], deleted: [] });
+  });
+
+  it('escalates on an unknown changelist — diff2 itself would silently clamp to head instead', async () => {
+    const { backend } = fakes({ describeMissing: new Set(['999999']), diff2: DIFF2_1_TO_2 });
+    const res = await backend.changesBetween('/ws1', '1', '999999');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+    if (res.ok) throw new Error('expected ok:false');
+    expect(res.detail).toContain('999999');
+  });
+
+  it('escalates on a syntactically invalid changelist id', async () => {
+    const { backend } = fakes({ describeInvalid: new Set(['abc']) });
+    const res = await backend.changesBetween('/ws1', 'abc', '2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+  });
+
+  it('escalates when the diff2 query itself fails', async () => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o')
+        return { stdout: 'Client: ws1\nView:\n\t//depot/... //ws1/...\n', stderr: '' };
+      if (args[0] === 'describe') return { stdout: 'Change 1 by noriq@ws1\n\n\tx\n', stderr: '' };
+      if (args[0] === 'diff2') throw new Error('Connect to server failed; check $P4PORT.');
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const res = await new PerforceBackend({ p4 }).changesBetween('/ws1', '1', '2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+  });
+
+  it('escalates on an unparseable diff2 header rather than guessing', async () => {
+    const { backend } = fakes({ diff2: 'this is not a diff2 header at all' });
+    const res = await backend.changesBetween('/ws1', '1', '2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+  });
+
+  it('escalates past the changed+deleted path cap rather than returning a huge list', async () => {
+    const lines = Array.from(
+      { length: 10_001 },
+      (_, i) => `==== <none> - //depot/src/file${i}.ts#1 ====`,
+    ).join('\n');
+    const { backend } = fakes({ diff2: lines });
+    const res = await backend.changesBetween('/ws1', '1', '2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+    if (res.ok) throw new Error('expected ok:false');
+    expect(res.detail).toContain('10001');
+  });
+
+  it('escalates (never throws) when the depot prefix cannot be resolved', async () => {
+    const p4: P4Cli = async (args) => {
+      if (args.includes('info')) return { stdout: 'ws1\n', stderr: '' };
+      if (args[0] === 'client' && args[1] === '-o')
+        return { stdout: 'Client: ws1\nOptions: noallwrite\n', stderr: '' };
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const res = await new PerforceBackend({ p4 }).changesBetween('/ws1', '1', '2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+  });
+});
+
+describe('PerforceDepotIndexSource (RUN-254): list/read/digest against the rig fixture', () => {
+  const src = (over: { fstat?: string; p4Raw?: P4RawCli } = {}) => {
+    const p4: P4Cli = async (args) => {
+      if (args[0] === '-Ztag' && args.includes('fstat'))
+        return { stdout: over.fstat ?? FSTAT_AT_2, stderr: '' };
+      throw new Error(`unexpected p4 call: ${args.join(' ')}`);
+    };
+    return new PerforceDepotIndexSource({
+      p4,
+      p4Raw: over.p4Raw ?? throwingP4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
     });
+  };
+
+  async function drain(source: PerforceDepotIndexSource) {
+    const items: Array<{ kind: string; path: string; size?: number }> = [];
+    for await (const item of source.list()) {
+      items.push(
+        item.kind === 'file'
+          ? { kind: 'file', path: item.entry.path, size: item.entry.size }
+          : { kind: 'refused', path: item.path },
+      );
+    }
+    return items;
+  }
+
+  it('lists present files only, path-sorted, dropping delete/move-delete records', async () => {
+    const items = await drain(src());
+    expect(items.map((i) => i.path)).toEqual([
+      'config/.env',
+      'config/app.json',
+      'docs/NEW.md',
+      'docs/README.md',
+      'src/add.ts',
+      'src/after.ts',
+      'src/blob.bin',
+      'src/util/name.ts',
+    ]);
+    // docs/OLD.md (delete) and src/before.ts (move/delete) never appear — locked decision 4.
+    expect(items.some((i) => i.path === 'docs/OLD.md' || i.path === 'src/before.ts')).toBe(false);
+    expect(items.find((i) => i.path === 'src/add.ts')?.size).toBe(74);
+  });
+
+  it('surfaces a refusal (never throws) when the fstat call itself fails', async () => {
+    const source = new PerforceDepotIndexSource({
+      p4: async () => {
+        throw new Error('Connect to server failed; check $P4PORT.');
+      },
+      p4Raw: throwingP4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
+    });
+    const items = await drain(source);
+    expect(items).toEqual([{ kind: 'refused', path: '.' }]);
+  });
+
+  it('reads a text file byte-for-byte', async () => {
+    const calls: string[] = [];
+    const p4Raw: P4RawCli = async (args) => {
+      calls.push(args.join(' '));
+      return {
+        stdout: Buffer.from('export function add(a, b) {\n  return a + b;\n}\n'),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      };
+    };
+    const source = src({ p4Raw });
+    const res = await source.read('src/add.ts', 1_000_000);
+    expect(res).toEqual({
+      ok: true,
+      bytes: Buffer.from('export function add(a, b) {\n  return a + b;\n}\n'),
+      overLimit: false,
+    });
+    expect(calls).toEqual(['print -q //depot/src/add.ts@2']);
+  });
+
+  it('reads a binary file byte-for-byte — the whole reason P4RawCli is Buffer-only, never string', async () => {
+    // Bytes chosen to be INVALID UTF-8 (a lone continuation byte, then a truncated multi-byte
+    // lead) — a string round trip through `Buffer += data` would replace these with U+FFFD and
+    // re-encode to a DIFFERENT byte sequence. If this source used `P4Cli` for `print`, this
+    // assertion would fail.
+    const binary = Buffer.from([0x00, 0x80, 0xff, 0xfe, 0xc3, 0x28, 0x01, 0x02]);
+    const p4Raw: P4RawCli = async () => ({ stdout: binary, stderr: Buffer.alloc(0), code: 0 });
+    const res = await src({ p4Raw }).read('src/blob.bin', 1_000_000);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('expected ok:true');
+    expect(Buffer.compare(res.bytes, binary)).toBe(0);
+  });
+
+  it('truncates at maxBytes and reports overLimit — the mechanical stop, never a source decision', async () => {
+    const full = Buffer.from('0123456789');
+    const p4Raw: P4RawCli = async () => ({ stdout: full, stderr: Buffer.alloc(0), code: 0 });
+    const res = await src({ p4Raw }).read('src/add.ts', 4);
+    expect(res).toEqual({ ok: true, bytes: Buffer.from('0123'), overLimit: true });
+  });
+
+  it('maps both measured "absent" stderr messages to not-found', async () => {
+    for (const stderr of [
+      '//depot/x.ts@2 - no such file(s).',
+      '//depot/x.ts@1 - no file(s) at that changelist number.',
+    ]) {
+      const p4Raw: P4RawCli = async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.from(stderr), code: 0 });
+      const res = await src({ p4Raw }).read('does/not/exist.ts', 1000);
+      expect(res).toMatchObject({ ok: false, reason: 'not-found' });
+    }
+  });
+
+  // Measured, documented limitation (see the module doc): a path deleted AT this exact revision
+  // prints silently empty through `print -q` — no message on either stream. This pins that
+  // exact, known trap rather than letting it drift unnoticed; the reason it is safe in practice
+  // is that `list()`'s own headAction filter never hands such a path to `read()` in the first place.
+  it('a path deleted at this revision reads as an empty (not refused) file — the documented trap', async () => {
+    const p4Raw: P4RawCli = async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), code: 0 });
+    const res = await src({ p4Raw }).read('docs/OLD.md', 1000);
+    expect(res).toEqual({ ok: true, bytes: Buffer.alloc(0), overLimit: false });
+  });
+
+  it('refuses a relPath trying to escape the depot prefix before ever building an argument', async () => {
+    const calls: string[] = [];
+    const p4Raw: P4RawCli = async (args) => {
+      calls.push(args.join(' '));
+      throw new Error('should never be called');
+    };
+    const source = src({ p4Raw });
+    for (const bad of ['../secret.txt', '/etc/passwd', 'a/../../b.ts', 'a/./b.ts']) {
+      const res = await source.read(bad, 1000);
+      expect(res).toMatchObject({ ok: false, reason: 'outside-root' });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('digest() serves list()`s cache without a second p4 call', async () => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      if (args[0] === '-Ztag' && args.includes('fstat')) return { stdout: FSTAT_AT_2, stderr: '' };
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const source = new PerforceDepotIndexSource({
+      p4,
+      p4Raw: throwingP4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
+    });
+    await drain(source); // populates the cache
+    calls.length = 0;
+    expect(await source.digest('src/add.ts')).toBe('C24DE970FC860A6C2E3CAB19C7605A35');
+    expect(calls).toEqual([]); // served from cache, no fresh fstat
+  });
+
+  it('digest() falls back to a fresh single-path fstat when not cached', async () => {
+    const calls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      calls.push(args.join(' '));
+      return {
+        stdout:
+          '... depotFile //depot/src/util/name.ts\n... headAction add\n... headType text\n... fileSize 30\n... digest F2E1142E43EB5D1AB9538269B2BBBB1D\n',
+        stderr: '',
+      };
+    };
+    const source = new PerforceDepotIndexSource({
+      p4,
+      p4Raw: throwingP4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
+    });
+    expect(await source.digest('src/util/name.ts')).toBe('F2E1142E43EB5D1AB9538269B2BBBB1D');
+    expect(calls).toEqual(['-Ztag fstat -Ol //depot/src/util/name.ts@2']);
+  });
+});
+
+// RUN-254 acceptance truth: "A hard-denied depot path (config/.env) yields a `denied` status and
+// its content is never read — asserted on the depot source specifically." The deny list itself
+// lives entirely in `index-scan.ts` (locked decision 8) — this proves the INTEGRATION, not a
+// second copy of the rule.
+describe('PerforceDepotIndexSource + index-scan.ts (RUN-254): the deny list still binds', () => {
+  it('config/.env is denied and its bytes are never read, driven through the real scan pipeline', async () => {
+    const readCalls: string[] = [];
+    const p4: P4Cli = async (args) => {
+      if (args[0] === '-Ztag' && args.includes('fstat')) return { stdout: FSTAT_AT_2, stderr: '' };
+      throw new Error(`unexpected p4 call: ${args.join(' ')}`);
+    };
+    const p4Raw: P4RawCli = async (args) => {
+      readCalls.push(args[args.length - 1] ?? '');
+      return { stdout: Buffer.from('irrelevant'), stderr: Buffer.alloc(0), code: 0 };
+    };
+    const source = new PerforceDepotIndexSource({
+      p4,
+      p4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
+    });
+    const result = await scanIndexSource(source, indexCfg());
+    const denied = result.statuses.find((s) => s.path === 'config/.env');
+    expect(denied?.reason).toBe('denied');
+    expect(readCalls.some((spec) => spec.includes('.env'))).toBe(false);
+    expect(result.candidates.some((c) => c.path === 'config/.env')).toBe(false);
+  });
+
+  it('the content hash for a depot-sourced file matches a filesystem source hashing the same bytes', async () => {
+    const content = 'export function add(a, b) {\n  return a + b;\n}\n';
+    const p4: P4Cli = async (args) => {
+      if (args[0] === '-Ztag' && args.includes('fstat'))
+        return {
+          stdout:
+            '... depotFile //depot/src/add.ts\n... headAction edit\n... headType text\n... fileSize 47\n',
+          stderr: '',
+        };
+      throw new Error(`unexpected: ${args.join(' ')}`);
+    };
+    const p4Raw: P4RawCli = async () => ({ stdout: Buffer.from(content), stderr: Buffer.alloc(0), code: 0 });
+    const source = new PerforceDepotIndexSource({
+      p4,
+      p4Raw,
+      cwd: '/ws1',
+      prefix: '//depot/...',
+      change: '2',
+    });
+    const result = await scanIndexSource(source, indexCfg());
+    const candidate = result.candidates.find((c) => c.path === 'src/add.ts');
+    expect(candidate?.contentMode).toBe('full');
+    expect(candidate?.content).toBe(content);
+    // The scanner's own SHA-256, not Perforce's MD5 `digest` — asserted against a fresh source
+    // instance built over an in-memory fixture with the SAME bytes.
+    const fsEquivalent = await scanIndexSource(
+      new FakeIndexSource([{ kind: 'file', path: 'src/add.ts', content }]),
+      indexCfg(),
+    );
+    expect(candidate?.contentHash).toBe(
+      fsEquivalent.candidates.find((c) => c.path === 'src/add.ts')?.contentHash,
+    );
   });
 });
 
