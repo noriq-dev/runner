@@ -121,6 +121,7 @@ import type { DeliveredSteer } from './steering';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
+import type { VerificationReportWire } from './verification-report';
 import {
   type CommandObservation,
   type VerifyExec,
@@ -357,6 +358,15 @@ export interface RunSupervisorDeps {
    * posture and every host before this task.
    */
   recordEpisode?: (episode: EffortEpisode) => void;
+  /**
+   * Hand a freshly built verification report to delivery (RUN-230, `PrepareHost.reportVerification`
+   * — that seam's own doc names this exact wiring point). `daemon.ts` binds it to
+   * `verification-report.ts`'s `deliverVerificationReport`, which enqueues durably before
+   * attempting a network call — this dep itself must stay synchronous and fire-and-forget for the
+   * identical reason `recordEpisode` does. Omitted → no delivery layer wired, a test's ordinary
+   * posture and every host before this task.
+   */
+  reportVerification?: (runId: string, agentToken: string, report: VerificationReportWire) => void;
   /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
    *  which is exactly the behaviour before it existed. */
   repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
@@ -4125,6 +4135,12 @@ export class RunSupervisor {
         this.lockEnforcerFor(repo, run, worktree, kind, token),
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
       ...(this.deps.getContextPack ? { getContextPack: this.deps.getContextPack } : {}),
+      ...(this.deps.reportVerification
+        ? {
+            reportVerification: (runId: string, agentToken: string, report: VerificationReportWire) =>
+              this.deps.reportVerification!(runId, agentToken, report),
+          }
+        : {}),
       context: {
         ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
         ...(this.deps.specPathProbe ? { specProbe: this.deps.specPathProbe } : {}),

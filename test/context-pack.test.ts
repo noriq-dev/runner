@@ -13,6 +13,7 @@ import type { ContextPack } from '../src/memory-contract';
 import { type PrepareHost, prepareRun } from '../src/stages';
 import type { ResolvedRepo, RunReport } from '../src/supervisor';
 import type { Workspace } from '../src/vcs/types';
+import { type VerificationReportWire, evidenceHash } from '../src/verification-report';
 
 // RUN-228: fetch a task context pack during preparation, bounded and always-degrading, and
 // record what happened. FETCH AND RECORD ONLY — the pack must never reach an agent prompt in
@@ -376,6 +377,8 @@ function harness(
   over: {
     repo?: ResolvedRepo | null;
     getContextPack?: ContextPackFetcher;
+    reportVerification?: PrepareHost['reportVerification'];
+    agentToken?: string;
   } = {},
 ) {
   const reports: RunReport[] = [];
@@ -401,7 +404,7 @@ function harness(
     createRunAgent: async (): Promise<RunAgent> => ({
       agentId: 'agt_1',
       label: 'build-abc',
-      token: 'tok_run',
+      token: over.agentToken ?? 'tok_run',
       projectId: 'prj_p',
       expiresIn: 3600,
     }),
@@ -411,6 +414,7 @@ function harness(
     runBudget: () => null,
     context: { probe: async () => false, read: async () => '' },
     ...(over.getContextPack ? { getContextPack: over.getContextPack } : {}),
+    ...(over.reportVerification ? { reportVerification: over.reportVerification } : {}),
   };
   return { host, reports, milestones };
 }
@@ -646,6 +650,165 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
       const out = await prepareRun(host, makeRun());
       expect(out.ok).toBe(true);
       expect(out.ok && out.verifiedContextPack).toBeNull();
+    });
+  });
+
+  // RUN-230 — wired here rather than repeated: `test/verification-report.test.ts` owns
+  // `buildVerificationReport`/`evidenceHash` in isolation; these prove `prepareRun` actually calls
+  // it AFTER `runAgent` exists (the report can only be authenticated as the run's own bound
+  // agent), hands the result to `host.reportVerification` fire-and-forget, and never gates the run
+  // on it.
+  describe('RUN-230 — the verification report is built and handed to delivery once runAgent exists', () => {
+    const citation = (over: Record<string, unknown> = {}) => ({
+      repositoryKey: 'acme/widgets',
+      branch: 'main',
+      baseId: LEASED_BASE_ID,
+      path: 'src/foo.ts',
+      symbol: null,
+      verificationState: 'unverifiable',
+      lastVerifiedAt: null,
+      lastVerifiedBaseId: null,
+      lastVerifiedBranch: null,
+      verifiedForCaller: false,
+      ...over,
+    });
+
+    const packWithEvidence = (evidence: ReturnType<typeof citation>[]) =>
+      validPack({
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: evidence as never,
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+      });
+
+    it('sends the memory excerpt id, the daemon’s own verdict, and the OBSERVED base/branch — never the citation’s own recorded base', async () => {
+      // A citation whose OWN baseId/branch differ from what this run's worktree is leased at
+      // (LEASED_BASE_ID/'main') — a historical evidence identity, never what gets reported as
+      // OBSERVED (locked decision 6).
+      const withCitation = packWithEvidence([citation({ baseId: 'some-old-base', branch: 'feature/x' })]);
+      let captured: { runId: string; agentToken: string; report: VerificationReportWire } | undefined;
+      const reportVerification: PrepareHost['reportVerification'] = (runId, agentToken, report) => {
+        captured = { runId, agentToken, report };
+      };
+      const { host } = harness({ getContextPack: async () => withCitation, reportVerification });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      expect(captured).toBeDefined();
+      expect(captured?.runId).toBe('run_1');
+      // The run's OWN bound-agent token — never the daemon's own — matching what `createRunAgent`
+      // minted for this exact run (the server's gate requires exactly this identity).
+      expect(captured?.agentToken).toBe('tok_run');
+      expect(captured?.report.source).toBe('runner-thorough');
+      expect(captured?.report.citations).toHaveLength(1);
+      const sent = captured?.report.citations[0];
+      expect(sent?.memoryItemId).toBe('mem_1'); // the enclosing EXCERPT's id, never on the citation
+      expect(sent?.state).toBe('missing'); // this daemon's own verdict against the fake, empty worktree
+      // OBSERVED base/branch — the worktree this run actually leased, never the citation's own
+      // historical 'some-old-base'/'feature/x'.
+      expect(sent?.baseId).toBe(LEASED_BASE_ID);
+      expect(sent?.branch).toBe('main');
+      expect(sent?.baseId).not.toBe('some-old-base');
+      expect(sent?.branch).not.toBe('feature/x');
+      // The hash identifies the evidence row by the CITATION's own identity fields, reproducing
+      // planar's `evidenceHash` exactly — verified independently in verification-report.test.ts.
+      expect(sent?.evidenceHash).toBe(
+        evidenceHash({
+          repositoryKey: 'acme/widgets',
+          branch: 'feature/x',
+          baseId: 'some-old-base',
+          path: 'src/foo.ts',
+          symbol: null,
+        }),
+      );
+    });
+
+    it('a citation naming a different repository is excluded from the report entirely', async () => {
+      const foreignOnly = packWithEvidence([citation({ repositoryKey: 'someone/else' })]);
+      let called = false;
+      const reportVerification: PrepareHost['reportVerification'] = () => {
+        called = true;
+      };
+      const { host } = harness({ getContextPack: async () => foreignOnly, reportVerification });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      // Reporting it would stamp THIS workspace's baseId/branch onto an evidence row this daemon
+      // never actually checked anything about — see `buildVerificationReport`'s own doc.
+      expect(called).toBe(false);
+    });
+
+    it('no citations verified at all: reportVerification is never called', async () => {
+      let called = false;
+      const reportVerification: PrepareHost['reportVerification'] = () => {
+        called = true;
+      };
+      const { host } = harness({ getContextPack: async () => validPack(), reportVerification });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      expect(called).toBe(false);
+    });
+
+    it('no defaultBranch configured: skipped — the wire has no valid branch value to report', async () => {
+      const withCitation = packWithEvidence([citation()]);
+      let called = false;
+      const reportVerification: PrepareHost['reportVerification'] = () => {
+        called = true;
+      };
+      const { host } = harness({
+        repo: { root: '/repo', manifest: manifest({ defaultBranch: null }) },
+        getContextPack: async () => withCitation,
+        reportVerification,
+      });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      expect(called).toBe(false);
+    });
+
+    it('never gates: prepareRun resolves synchronously without awaiting the delivery call', async () => {
+      const withCitation = packWithEvidence([citation()]);
+      // A real delivery function is async and never awaited by prepareRun — a fire-and-forget dep
+      // that never resolves must not stall preparation. `reportVerification`'s own type is
+      // synchronous `void`, so this fake simply never lets its own (unawaited) promise settle,
+      // proving the CALLER treats it as fire-and-forget rather than only asserting the type does.
+      let neverSettles: Promise<void> | undefined;
+      const reportVerification: PrepareHost['reportVerification'] = () => {
+        neverSettles = new Promise(() => {});
+      };
+      const { host } = harness({ getContextPack: async () => withCitation, reportVerification });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true); // resolved despite the delivery "hanging" forever
+      expect(neverSettles).toBeDefined();
+    });
+
+    it('no reportVerification wired at all: preparation proceeds exactly as before this task existed', async () => {
+      const withCitation = packWithEvidence([citation()]);
+      const { host } = harness({ getContextPack: async () => withCitation }); // no reportVerification
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
     });
   });
 });

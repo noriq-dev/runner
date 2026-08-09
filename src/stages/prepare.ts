@@ -57,6 +57,7 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
+import { type VerificationReportWire, buildVerificationReport } from '../verification-report';
 import {
   type Workflow,
   clampPermissionToWorkflow,
@@ -111,6 +112,14 @@ export interface PrepareHost {
    *  own `runnerId`). Absent → retrieval is not wired at all, which `context-pack.ts` treats
    *  identically to every other degradation: preparation proceeds exactly as it does today. */
   getContextPack?: ContextPackFetcher;
+  /**
+   * RUN-230: hand a freshly built verification report to delivery — fire-and-forget, the same
+   * shape as `postComment`/`recordEpisode`: this function itself must stay synchronous (durability
+   * happens inside it, before any network attempt — `deliverVerificationReport`'s own doc), so
+   * `prepareRun` never awaits a round trip to send a report that must never gate a run. Absent →
+   * no delivery layer wired, exactly the posture every host had before this task existed.
+   */
+  reportVerification?: (runId: string, agentToken: string, report: VerificationReportWire) => void;
   /** How `[context]` paths are probed and read (RUN-128/129) — injected so tests touch no disk. */
   readonly context: {
     probe?: PathProbe;
@@ -494,6 +503,36 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       .dispose(worktree)
       .catch(() => {});
     return refuse('no Noriq identity for this run — the daemon must create the agent before spawning it');
+  }
+
+  // RUN-230: report RUN-229's verdicts back to Noriq — here, not beside `verifyContextPack` above,
+  // because the send is authenticated as THIS run's own bound agent (planar's own locked decision:
+  // `conn.boundAgent.id === run.agentId`), and `runAgent` does not exist until this point. Built
+  // from `verifiedContextPack` alone — nothing an agent said can reach this channel, since nothing
+  // downstream of this line has run an agent turn yet. Skipped (never a refusal — this never gates
+  // a run) when there is nothing reportable, or when this workspace has no valid `branch`/
+  // `repositoryKey` to observe AGAINST: `defaultBranch` is optional on a manifest, but the wire's
+  // `branch` field is not nullable server-side, so a repo with none configured has no honest value
+  // to report and every citation would 400 the whole request rather than skip cleanly.
+  if (
+    verifiedContextPack &&
+    repo.manifest.repositoryKey &&
+    repo.manifest.defaultBranch &&
+    host.reportVerification
+  ) {
+    const report = buildVerificationReport(verifiedContextPack, {
+      repositoryKey: repo.manifest.repositoryKey,
+      observedBaseId: worktree.baseId,
+      observedBranch: repo.manifest.defaultBranch,
+    });
+    if (report) {
+      host.reportVerification(run.id, runAgent.token, report);
+      host
+        .transcript(run.id)
+        .milestone(
+          `verification report for ${report.citations.length} citation(s) handed to delivery (fire-and-forget)`,
+        );
+    }
   }
 
   // Dispatch-time predictive locking (RUN-103): with a DECLARED scope, take its locks now — as

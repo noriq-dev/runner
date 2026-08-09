@@ -40,6 +40,12 @@ import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
 import { PerforceBackend } from './vcs/perforce';
 import type { VcsBackend } from './vcs/types';
+import { VerificationPendingStore, filePendingVerificationStore } from './verification-pending';
+import {
+  type VerificationReportDeliveryDeps,
+  deliverVerificationReport,
+  drainPendingVerificationReports,
+} from './verification-report';
 import { type WorkflowCatalog, WorkflowStore } from './workflow-store';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient, type WsFactory } from './ws-client';
@@ -529,6 +535,9 @@ export class Daemon {
    *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning: a test points this at a
    *  temp file so a fully-driven `start()` never touches the operator's own home directory. */
   private readonly episodePendingPath?: string;
+  /** Where RUN-230's undelivered-verification-report queue lives — defaults to
+   *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
+  private readonly verificationPendingPath?: string;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -586,6 +595,9 @@ export class Daemon {
       /** Where RUN-227's undelivered-episode queue lives — defaults to
        *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning. */
       episodePendingPath?: string;
+      /** Where RUN-230's undelivered-verification-report queue lives — defaults to
+       *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
+      verificationPendingPath?: string;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -606,6 +618,7 @@ export class Daemon {
     this.indexControlInfoPath = deps.indexControlInfoPath;
     this.indexControlOverride = deps.indexControl;
     this.episodePendingPath = deps.episodePendingPath;
+    this.verificationPendingPath = deps.verificationPendingPath;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -711,6 +724,30 @@ export class Daemon {
         if (delivered) this.log.info(`delivered ${delivered} previously pending episode(s)`);
       })
       .catch((err) => this.log.warn('startup episode delivery retry failed', { err: String(err) }));
+
+    // RUN-230's undelivered-verification-report queue, and its own delivery deps — a SEPARATE
+    // store from the episode one above (`verification-pending.ts`'s own doc on why: no shared
+    // `mint`-style identity, and a retry here can go permanently dead in a way an episode retry
+    // never does).
+    const verificationPending = new VerificationPendingStore(
+      filePendingVerificationStore(this.verificationPendingPath),
+    );
+    const verificationReportDeliveryDeps: VerificationReportDeliveryDeps = {
+      client,
+      pending: verificationPending,
+      logger: this.log,
+    };
+    // Same startup-drain reasoning as episodes just above: a daemon that crashed or was simply off
+    // holds reports nothing has retried since.
+    void drainPendingVerificationReports(verificationReportDeliveryDeps)
+      .then(({ delivered, dropped }) => {
+        if (delivered) this.log.info(`delivered ${delivered} previously pending verification report(s)`);
+        if (dropped)
+          this.log.warn(`dropped ${dropped} undeliverable verification report(s) (run agent token revoked)`);
+      })
+      .catch((err) =>
+        this.log.warn('startup verification report delivery retry failed', { err: String(err) }),
+      );
 
     // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
     // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
@@ -976,6 +1013,15 @@ export class Daemon {
           this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
         );
       },
+      // RUN-230's delivery sink. Fire-and-forget for the identical reason `recordEpisode` above is:
+      // `deliverVerificationReport` enqueues durably before it ever touches the network, so this
+      // dep stays synchronous and returns before any I/O settles — `prepareRun` never awaits it.
+      reportVerification: (runId, agentToken, report) => {
+        void deliverVerificationReport(runId, agentToken, report, verificationReportDeliveryDeps).catch(
+          (err) =>
+            this.log.warn('verification report delivery failed unexpectedly', { runId, err: String(err) }),
+        );
+      },
       // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
@@ -1091,6 +1137,12 @@ export class Daemon {
           // for "worth trying delivery again" short of a fixed-interval timer (discretion 3).
           void drainPendingEpisodes(episodeDeliveryDeps).catch((err) =>
             this.log.warn('episode delivery retry on reconnect failed', { err: String(err) }),
+          );
+          // Same shape again for RUN-230's pending verification reports — a reconnect is precisely
+          // "the server might be reachable now when it was not a moment ago", the identical signal
+          // episodes already use it for.
+          void drainPendingVerificationReports(verificationReportDeliveryDeps).catch((err) =>
+            this.log.warn('verification report delivery retry on reconnect failed', { err: String(err) }),
           );
         },
       },

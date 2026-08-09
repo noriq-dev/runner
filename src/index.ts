@@ -575,6 +575,30 @@ export {
   type UploadEpisodeOutcome,
 } from './episode-upload';
 export {
+  DEFAULT_PENDING_VERIFICATION_PATH,
+  DEFAULT_MAX_PENDING_VERIFICATION,
+  DEFAULT_MAX_PENDING_VERIFICATION_AGE_HOURS,
+  VerificationPendingStore,
+  filePendingVerificationStore,
+  trimPendingVerification,
+  type PendingVerificationReport,
+  type PendingVerificationFileStore,
+} from './verification-pending';
+export {
+  VERIFICATION_REPORT_SOURCE,
+  buildVerificationReport,
+  deliverVerificationReport,
+  drainPendingVerificationReports,
+  evidenceHash,
+  sendVerificationReport,
+  type VerificationReportContext,
+  type VerificationReportCitationWire,
+  type VerificationReportDeliveryDeps,
+  type VerificationReportOutcome,
+  type VerificationReportResult,
+  type VerificationReportWire,
+} from './verification-report';
+export {
   checkSteps,
   planWaves,
   renderSteps,

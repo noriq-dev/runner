@@ -1,6 +1,7 @@
 import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
 import { ContextPack, type ContextPackRole, RunnerIndexCursor } from './memory-contract';
 import type { RunnerRegistration } from './registration';
+import type { VerificationReportResult, VerificationReportWire } from './verification-report';
 import { VERSION } from './version';
 
 /** Where a spun-off task came from (RUN-188): the run and finding that spawned it. Runner-local,
@@ -648,5 +649,34 @@ export class NoriqClient {
    */
   async mintIngestCapability(input: MintIngestCapabilityInput): Promise<IngestCapabilityGrant> {
     return (await this.request('POST', '/api/runner-ingest/capability', input)) as IngestCapabilityGrant;
+  }
+
+  /**
+   * Send RUN-230's verification report — `POST /api/runs/:runId/verification-report`, the
+   * ordinary agentAuth run surface (planar's own locked decision: capability tokens are for BULK
+   * payloads, this is small and belongs where every other run-scoped agent action already lives).
+   *
+   * Deliberately bypasses `request()`'s Authorization header: that always sends THIS client's own
+   * token (the daemon's), but the server's gate here is `conn.boundAgent.id === run.agentId` —
+   * only a token minted for the run's own agent identity (`RunAgent.token`, from
+   * `createRunAgent`) can satisfy it. `agentToken` is the caller's, never this client's `getToken`.
+   */
+  async reportVerification(
+    runId: string,
+    agentToken: string,
+    report: VerificationReportWire,
+  ): Promise<VerificationReportResult> {
+    const pathname = `/api/runs/${runId}/verification-report`;
+    const res = await this.fetchImpl(`${this.base}${pathname}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${agentToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+    });
+    const text = await res.text();
+    if (!res.ok)
+      throw new NoriqHttpError(`POST ${pathname} → ${res.status}: ${text.slice(0, 500)}`, res.status, text);
+    return text
+      ? (JSON.parse(text) as VerificationReportResult)
+      : { applied: 0, skipped: 0, touchedMemoryIds: [] };
   }
 }
