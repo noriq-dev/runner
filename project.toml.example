@@ -81,6 +81,24 @@ defaultBranch = "main"
 #                                    # bad glob turns indexing off for this repo without
 #                                    # touching anything else the daemon does with it.
 #
+# excludeDefaults = true          # ON by default — layers a conservative, machine-wide exclude
+#                                  # for committed generated content UNDER whatever `exclude`
+#                                  # above already says (RUN-262): today, package/lockfiles
+#                                  # (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`,
+#                                  # `pnpm-lock.yaml`) and a committed `node_modules/`. These are
+#                                  # machine-regenerated bookkeeping no agent will ever cite, and
+#                                  # `package-lock.json` alone was measured hitting the per-file
+#                                  # entity cap and spending a fifth of a small repo's entity
+#                                  # budget on it. This is a QUALITY default, NOT a security
+#                                  # floor like the sensitive-file deny list below `[index]`'s
+#                                  # reach — set `excludeDefaults = false` if this repo genuinely
+#                                  # wants a defaulted-out path (e.g. its own lockfile) indexed;
+#                                  # nothing here can be turned into a second non-overridable
+#                                  # floor. A file dropped by this default reports a distinct
+#                                  # `excluded-default` reason (vs. `excluded` for the list
+#                                  # above), so a missing file is diagnosable as "the daemon
+#                                  # assumed that" rather than "I wrote that exclude".
+#
 # languages = ["typescript", "javascript", "markdown", "json", "toml"]
 #                                 # Which file types are actually read. This is the full
 #                                 # initial set (also the default when the key is

@@ -1,6 +1,8 @@
 import type { IndexSpec } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { IndexPolicy, refuseIndexGlob, resolveIndexConfig } from '../src/index-policy';
+import { DEFAULT_EXCLUDE_GLOBS, IndexPolicy, refuseIndexGlob, resolveIndexConfig } from '../src/index-policy';
+import { scanIndexSource } from '../src/index-scan';
+import { FakeIndexSource } from '../src/index-source';
 
 function spyLogger() {
   const errors: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
@@ -88,6 +90,9 @@ describe('resolveIndexConfig — decision 4/5: off unless enabled, invalid refus
     expect(resolved).toEqual({
       include: ['src/**'],
       exclude: ['**/*.gen.ts'],
+      // RUN-262: the machine-wide default is layered on UNDER `exclude`, never merged into it —
+      // `exclude` above is exactly what the repo declared, unchanged.
+      defaultExclude: DEFAULT_EXCLUDE_GLOBS,
       languages: ['typescript', 'javascript', 'markdown', 'json', 'toml'],
       contentMode: 'metadata',
       maxFiles: 10,
@@ -138,5 +143,84 @@ describe('resolveIndexConfig — decision 4/5: off unless enabled, invalid refus
     expect(resolveIndexConfig(spec(), undefined)).toEqual(
       expect.objectContaining({ maxFiles: 20_000, pollIntervalMinutes: 60 }),
     );
+  });
+});
+
+describe('resolveIndexConfig — RUN-262 default exclude for committed generated content', () => {
+  it('applies the machine-wide default when the repo declares no excludeDefaults of its own', () => {
+    const resolved = resolveIndexConfig(spec(), { enabled: true });
+    expect(resolved?.defaultExclude).toEqual(DEFAULT_EXCLUDE_GLOBS);
+  });
+
+  it('a repo can turn the default off entirely — declaring intent to index a defaulted-out path', () => {
+    const resolved = resolveIndexConfig(spec(), { enabled: true, excludeDefaults: false });
+    expect(resolved?.defaultExclude).toEqual([]);
+  });
+
+  it('a repo’s own `exclude` is untouched by the default — no merging, no duplication', () => {
+    const resolved = resolveIndexConfig(spec({ exclude: ['**/*.gen.ts'] }), {
+      enabled: true,
+      exclude: ['**/*.gen.ts'],
+    });
+    expect(resolved?.exclude).toEqual(['**/*.gen.ts']); // exactly what the repo wrote, nothing added
+    expect(resolved?.defaultExclude).toEqual(DEFAULT_EXCLUDE_GLOBS); // the default still applies, separately
+  });
+
+  it('refuses on a non-boolean excludeDefaults — a typo/wrong type does not silently pass through', () => {
+    const { errors, log } = spyLogger();
+    const resolved = resolveIndexConfig(spec(), { enabled: true, excludeDefaults: 'nope' }, log);
+    expect(resolved).toBeNull();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.fields?.key).toBe('excludeDefaults');
+  });
+
+  it('a genuine typo of the key (`excludeDefault`) refuses via the ordinary unknown-key path', () => {
+    // `excludeDefault` (missing the trailing `s`) is NOT the stripped key, so it survives into
+    // `policyRaw` and hits `IndexPolicy`'s own `.strict()` unrecognized-key refusal — the same
+    // path a typo of any other execution knob takes (see the sibling test above this describe
+    // block). zod reports an `unrecognized_keys` issue at the object root, not per-key, which is
+    // why this asserts the same "(index table)" fallback the existing unknown-key test expects.
+    const { errors, log } = spyLogger();
+    const resolved = resolveIndexConfig(spec(), { enabled: true, excludeDefault: false }, log);
+    expect(resolved).toBeNull();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.fields?.key).toBe('(index table)');
+  });
+});
+
+describe('scanIndexSource — RUN-262 default exclude actually drops the file (not just the config field)', () => {
+  it('drops a committed package-lock.json under the default, reporting `excluded-default`', async () => {
+    const config = resolveIndexConfig(spec(), { enabled: true });
+    const source = new FakeIndexSource([
+      { kind: 'file', path: 'package-lock.json', content: '{"lockfileVersion": 3}\n' },
+      { kind: 'file', path: 'src/a.ts', content: 'export const x = 1;\n' },
+    ]);
+    const result = await scanIndexSource(source, config);
+    expect(result.candidates.map((c) => c.path)).toEqual(['src/a.ts']);
+    expect(result.statuses).toContainEqual({ path: 'package-lock.json', reason: 'excluded-default' });
+  });
+
+  it('indexes package-lock.json once the repo declares `excludeDefaults = false`', async () => {
+    const config = resolveIndexConfig(spec(), { enabled: true, excludeDefaults: false });
+    const source = new FakeIndexSource([
+      { kind: 'file', path: 'package-lock.json', content: '{"lockfileVersion": 3}\n' },
+    ]);
+    const result = await scanIndexSource(source, config);
+    expect(result.candidates.map((c) => c.path)).toEqual(['package-lock.json']);
+    expect(result.statuses).toEqual([]);
+  });
+
+  it('a repo’s own exclude still reports the pre-existing `excluded` reason, distinct from the default', async () => {
+    const config = resolveIndexConfig(spec({ exclude: ['**/*.gen.ts'] }), {
+      enabled: true,
+      exclude: ['**/*.gen.ts'],
+    });
+    const source = new FakeIndexSource([
+      { kind: 'file', path: 'foo.gen.ts', content: '// generated\n' },
+      { kind: 'file', path: 'package-lock.json', content: '{}\n' },
+    ]);
+    const result = await scanIndexSource(source, config);
+    expect(result.statuses).toContainEqual({ path: 'foo.gen.ts', reason: 'excluded' });
+    expect(result.statuses).toContainEqual({ path: 'package-lock.json', reason: 'excluded-default' });
   });
 });

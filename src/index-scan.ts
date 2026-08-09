@@ -22,13 +22,21 @@ import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason, ShouldDes
  * stayed.
  *
  * **The pipeline, and why the order is fixed** (locked decision 1, unchanged from RUN-209): for
- * every entry a source offers, enumerate → include filter → exclude filter → HARD DENY → per-file
- * bounds → read → regular-file/binary check → hash + status record. An `include` glob can never
- * re-admit a denied path because the deny check runs strictly after it and takes no input that
- * could override it. "Non-overridable" has to be a property of the ORDER, not of a comment saying
- * so — and now also a property of WHO gets asked: a source is never handed the deny list or the
- * include/exclude globs, so it cannot re-implement this filter even by accident, and the deny list
- * holds for every source alike rather than only for the ones that remembered it (RUN-158's shape).
+ * every entry a source offers, enumerate → include filter → exclude filter → default-exclude
+ * filter → HARD DENY → per-file bounds → read → regular-file/binary check → hash + status record.
+ * An `include` glob can never re-admit a denied path because the deny check runs strictly after it
+ * and takes no input that could override it. "Non-overridable" has to be a property of the ORDER,
+ * not of a comment saying so — and now also a property of WHO gets asked: a source is never handed
+ * the deny list or the include/exclude globs, so it cannot re-implement this filter even by
+ * accident, and the deny list holds for every source alike rather than only for the ones that
+ * remembered it (RUN-158's shape).
+ *
+ * **The default-exclude filter (RUN-262) sits beside `exclude`, never inside it** — a repo's own
+ * `exclude` and the daemon's conservative `defaultExclude` are checked as two SEPARATE regex sets
+ * so the resulting status can say which one dropped a file (`excluded` vs `excluded-default`).
+ * Unlike the deny list two lines below, this one IS overridable — `resolveIndexConfig`
+ * (`index-policy.ts`) is where a repo turns it off, never here; this file only consumes whatever
+ * `config.defaultExclude` already resolved to.
  *
  * **The hard deny list stays directory-aware via a predicate, not directory-blind** (RUN-252
  * follow-up, closing a regression the first cut of this split shipped with). That first cut read
@@ -107,6 +115,14 @@ import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason, ShouldDes
 export type IndexStatusReason =
   | 'denied'
   | 'excluded'
+  /** Dropped by `[index].defaultExclude` (RUN-262) — the daemon's own conservative, overridable
+   *  default for committed generated content (lockfiles, a committed `node_modules`), never a
+   *  repo's own `[index].exclude` entry. Distinct from `excluded` for the same reason `vcs-ignored`
+   *  is distinct from it: an operator debugging a missing file needs to tell "I wrote that exclude"
+   *  from "the daemon assumed that" without re-deriving it from `detail` text. Turn it off entirely
+   *  with `[index].excludeDefaults = false` if a repo genuinely wants a defaulted-out path indexed —
+   *  this is a QUALITY default, not the `denied` floor below. */
+  | 'excluded-default'
   | 'not-included'
   | 'binary'
   | 'too-large'
@@ -219,6 +235,9 @@ interface ScanState {
   stop: boolean;
   includeRe: RegExp[];
   excludeRe: RegExp[];
+  /** RUN-262: the daemon's own conservative default, compiled separately from `excludeRe` so a
+   *  match can be reported `excluded-default` rather than `excluded` — see the module doc. */
+  defaultExcludeRe: RegExp[];
   /** Ancestor directory prefixes already reported as `denied` — see the module doc's "hard deny
    *  list is directory-aware" note. Keyed on the exact prefix string `classifyDenial` computed. */
   deniedPrefixes: Set<string>;
@@ -483,6 +502,13 @@ async function evaluateEntry(
     pushStatus(state, relPath, 'excluded');
     return;
   }
+  // Checked separately from `excludeRe` (RUN-262), never merged into it — a repo's own `exclude`
+  // and the daemon's default report distinct reasons (`excluded` vs `excluded-default`) so an
+  // operator debugging a missing file can tell which rule dropped it.
+  if (matchesAny(state.defaultExcludeRe, relPath)) {
+    pushStatus(state, relPath, 'excluded-default');
+    return;
+  }
 
   const denial = classifyDenial(relPath, state.deniedPrefixes);
   if (denial === 'suppressed') return;
@@ -597,6 +623,10 @@ export async function scanIndexSource(
     stop: false,
     includeRe: config.include.map(globToRegExp),
     excludeRe: config.exclude.map(globToRegExp),
+    // `?? []`: `defaultExclude` is OPTIONAL on `ResolvedIndexConfig` (see that type's own doc) so
+    // every hand-built config literal elsewhere in the suite keeps compiling unmodified; an absent
+    // value here means simply "no machine-wide default was resolved for this config."
+    defaultExcludeRe: (config.defaultExclude ?? []).map(globToRegExp),
     deniedPrefixes: new Set(),
     vcsIgnoredPrefixes: new Set(),
     vcsIgnored: deps.vcsIgnored,

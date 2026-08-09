@@ -119,6 +119,14 @@ describe('DiscoveredRepo.indexConfig / loadIndexConfig (RUN-208)', () => {
     expect(repo?.indexConfig).toEqual({
       include: ['src/**'],
       exclude: ['**/*.gen.ts'],
+      // RUN-262: the machine-wide default is layered on under `exclude`, not merged into it.
+      defaultExclude: [
+        '**/package-lock.json',
+        '**/npm-shrinkwrap.json',
+        '**/yarn.lock',
+        '**/pnpm-lock.yaml',
+        '**/node_modules/**',
+      ],
       languages: ['typescript', 'markdown'],
       contentMode: 'metadata',
       maxFiles: 500,

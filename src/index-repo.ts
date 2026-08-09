@@ -6,7 +6,7 @@ import path from 'node:path';
 import { loadIndexConfig, loadManifest } from './discovery';
 import { DEFAULT_DEBUG_LIMIT, buildDebugReport, compareGenerations } from './index-debug';
 import type { BuildDebugReportOptions, DeterminismCheck, IndexDebugReport } from './index-debug';
-import { IndexPolicy } from './index-policy';
+import { DEFAULT_EXCLUDE_GLOBS, IndexPolicy } from './index-policy';
 import type { ResolvedIndexConfig } from './index-policy';
 import { buildIndexAdapterRegistry } from './index-registry';
 import { FilesystemIndexSource } from './index-source';
@@ -91,8 +91,16 @@ export interface IndexRepoRun {
  *  applies — `IndexPolicy`'s own schema defaults (every language, `contentMode: 'full'`, the
  *  ordinary bounds), scoped to nothing extra via empty `include`/`exclude`. Built once: `IndexPolicy`
  *  parsing an empty table is a pure, deterministic function of the schema alone, so there is nothing
- *  gained by re-parsing it per call the way `resolveIndexConfig` re-reads a committed file per run. */
-const FORCED_DEFAULT_CONFIG: ResolvedIndexConfig = { ...IndexPolicy.parse({}), include: [], exclude: [] };
+ *  gained by re-parsing it per call the way `resolveIndexConfig` re-reads a committed file per run.
+ *  `defaultExclude` (RUN-262) is included here too — bypassing a repo's consent (`--force`) says
+ *  nothing about bypassing the daemon's own quality defaults, and this is the only code path that
+ *  can demonstrate them on a repo with no committed `[index]` table of its own, this one included. */
+const FORCED_DEFAULT_CONFIG: ResolvedIndexConfig = {
+  ...IndexPolicy.parse({}),
+  include: [],
+  exclude: [],
+  defaultExclude: [...DEFAULT_EXCLUDE_GLOBS],
+};
 
 /**
  * Resolve the config to index under. Returns `null` — refused — when `[index].enabled` is not
