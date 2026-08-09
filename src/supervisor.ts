@@ -178,6 +178,12 @@ export type SupervisorVcs = Pick<
   | 'publish'
   | 'share'
   | 'disposePreservesWork'
+  // RUN-229: citation verification's own drift signal — required, not optional, because every
+  // real backend already implements it (`VcsBackend.changesBetween`'s own doc: "REQUIRED, not
+  // optional"), so widening this Pick costs nothing except a fake that never bothered typing
+  // itself as `SupervisorVcs` in the first place (every existing test fake casts `as never` at
+  // its `vcsFor` call site instead).
+  | 'changesBetween'
 > &
   // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.

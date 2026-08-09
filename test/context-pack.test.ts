@@ -519,4 +519,133 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
     expect(called).toBe(false);
     expect(out.ok && out.contextPack.omission).toEqual({ reason: 'no-task' });
   });
+
+  // RUN-229 — wired here rather than repeated: `test/citation-verify.test.ts` owns the
+  // classification rules exhaustively; these two prove `prepareRun` actually calls it, attaches
+  // the result under `verifiedContextPack`, and degrades the same way every other pre-execution
+  // enrichment in this file does.
+  describe('RUN-229 — citation verification runs after retrieval and attaches to the prepared run', () => {
+    it('a retrieved pack is verified against the leased worktree — the citation carries its verdict inline', async () => {
+      const withCitation = validPack({
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: [
+                  {
+                    repositoryKey: 'acme/widgets', // repo.manifest.repositoryKey — this test's `harness()`
+                    branch: 'main',
+                    baseId: LEASED_BASE_ID, // the SAME base as the leased worktree
+                    path: 'src/nonexistent-in-this-fake-worktree.ts',
+                    symbol: null,
+                    verificationState: 'unverifiable',
+                    lastVerifiedAt: null,
+                    lastVerifiedBaseId: null,
+                    lastVerifiedBranch: null,
+                    verifiedForCaller: false,
+                  },
+                ],
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+      });
+      const getContextPack: ContextPackFetcher = async () => withCitation;
+      const { host } = harness({ getContextPack });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      if (!out.ok) return;
+      expect(out.verifiedContextPack).not.toBeNull();
+      const excerpt = out.verifiedContextPack?.sections[0]?.excerpts[0];
+      expect(excerpt?.excerptKind).toBe('memory');
+      if (excerpt?.excerptKind !== 'memory') return;
+      // The fake worktree's `localPath` (`/wt/run_1`) is not a real directory, so the ONLY honest
+      // classification is `missing` — proving the daemon's default reader ran for real rather
+      // than being silently skipped, without this test needing to fabricate a real checkout.
+      expect(excerpt.evidence[0]?.verification.state).toBe('missing');
+    });
+
+    it('a citation naming a different repository than this run is unverifiable, never checked against the wrong tree', async () => {
+      const foreign = validPack({
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: [
+                  {
+                    repositoryKey: 'someone/else', // NOT repo.manifest.repositoryKey
+                    branch: 'main',
+                    baseId: LEASED_BASE_ID,
+                    path: 'src/foo.ts',
+                    symbol: null,
+                    verificationState: 'valid', // the server's own belief — must not be trusted verbatim
+                    lastVerifiedAt: null,
+                    lastVerifiedBaseId: null,
+                    lastVerifiedBranch: null,
+                    verifiedForCaller: true,
+                  },
+                ],
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+      });
+      const getContextPack: ContextPackFetcher = async () => foreign;
+      const { host } = harness({ getContextPack });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      if (!out.ok) return;
+      const excerpt = out.verifiedContextPack?.sections[0]?.excerpts[0];
+      if (excerpt?.excerptKind !== 'memory') throw new Error('expected a memory excerpt');
+      expect(excerpt.evidence[0]?.verification.state).toBe('unverifiable');
+      expect(excerpt.evidence[0]?.verification.agreesWithServer).toBe(false);
+    });
+
+    it('no pack retrieved: verifiedContextPack is null, never a stale or empty stand-in', async () => {
+      const { host } = harness({}); // no getContextPack wired at all
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      expect(out.ok && out.verifiedContextPack).toBeNull();
+    });
+  });
 });

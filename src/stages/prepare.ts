@@ -28,6 +28,7 @@ import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind, SetupSpec }
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
+import { type VerifiedContextPack, verifyContextPack } from '../citation-verify';
 import type { RunAgent } from '../client';
 import {
   type ContextPackFetcher,
@@ -156,6 +157,14 @@ export interface PreparedRun {
    * never reads this field, and neither may anything added after it until those tasks land.
    */
   contextPack: ContextPackRetrieval;
+  /**
+   * RUN-229: `contextPack.pack`'s citations, verified against THIS run's own leased worktree —
+   * every memory excerpt's evidence carries its own verdict inline (`citation-verify.ts`'s own
+   * locked decision: "a consumer must not be able to read an excerpt without them"). Null when
+   * there was nothing to verify (no pack, or verification failed — this task classifies evidence,
+   * it does not gate a run over a verification failure). Rendering it into a prompt is RUN-230/231.
+   */
+  verifiedContextPack: VerifiedContextPack | null;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -393,6 +402,32 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     host.transcript(run.id).milestone(summarizeContextPackRetrieval(contextPack));
   }
 
+  // RUN-229: verify the pack's citations against the workspace this daemon actually leased —
+  // before anything downstream can read an excerpt without its verdict attached. Best-effort,
+  // like every other pre-execution enrichment in this file (`runSetup`, the pattern mapper): a
+  // verification failure degrades to null rather than refusing the run — this task classifies
+  // evidence, it does not gate on it (rendering/gating is RUN-230/231's job).
+  let verifiedContextPack: VerifiedContextPack | null = null;
+  if (contextPack.pack) {
+    try {
+      verifiedContextPack = await verifyContextPack(contextPack.pack, {
+        vcs: host.vcsFor(repo),
+        repoRoot: repo.root,
+        worktree,
+        // The CANONICAL identity, same as the request above — never the local `repo_<sha>`
+        // checkout id, and never assumed equal to the citation's own `repositoryKey` (a pack may
+        // legitimately cite a sibling repo in a multi-repo project; that citation is
+        // `unverifiable` against THIS workspace, not silently checked against the wrong tree).
+        repositoryKey: repo.manifest.repositoryKey,
+      });
+    } catch (err) {
+      host.log.warn('context pack citation verification failed — proceeding without verdicts', {
+        runId: run.id,
+        err: String(err),
+      });
+    }
+  }
+
   // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
   // a lookup failure degrades to the bare id rather than sinking the run.
   const task: AnchorTask | null =
@@ -625,6 +660,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       buildPrompt(`${renderExecutionSpec(checked)}${extra}${setupNote}`, checked?.spec ?? null),
     checkedSpec,
     contextPack,
+    verifiedContextPack,
     repo,
     driver,
     workflow: wf,

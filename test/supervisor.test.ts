@@ -37,7 +37,7 @@ import {
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
-import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
+import type { ChangesBetweenResult, LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 import { BUILTIN_WORKFLOWS } from '../src/workflow';
 import type { WorkflowCatalog } from '../src/workflow-store';
 
@@ -343,6 +343,13 @@ class FakeWorktrees {
     this.pushes.push({ root, branch });
     return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
   };
+
+  // RUN-229: no supervisor test here exercises citation verification (that seam is covered in
+  // `test/citation-verify.test.ts` and `test/stages-prepare.test.ts` against their own fakes) — a
+  // no-op stub only exists so `FakeWorktrees` keeps satisfying `SupervisorVcs`'s now-required
+  // `changesBetween` (RUN-212's own doc: "REQUIRED, not optional", the same reasoning that made
+  // widening this Pick free for every real backend).
+  changesBetween = async (): Promise<ChangesBetweenResult> => ({ ok: true, changed: [], deleted: [] });
 
   // ── waves (RUN-170) ────────────────────────────────────────────────────────
   /** Opt a test into overlapping leases. False (the default) is the pool-of-1 posture, so every

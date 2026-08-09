@@ -708,3 +708,16 @@ export {
   type ContextPackRequest,
   type ContextPackRetrieval,
 } from './context-pack';
+export {
+  MAX_CITATION_READ_BYTES,
+  readCitationFile,
+  verifyContextPack,
+  type CitationFileRead,
+  type CitationFileReader,
+  type CitationVerdict,
+  type CitationVerifyContext,
+  type VerifiedCitation,
+  type VerifiedContextPack,
+  type VerifiedContextPackExcerpt,
+  type VerifiedContextPackSection,
+} from './citation-verify';
