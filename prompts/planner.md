@@ -4,7 +4,7 @@ MODE: PLAN (read-only). You are NOT implementing this task. You are writing the 
 
 You have read access to this repo's workspace and nothing else — no Noriq tools, no way to change a task, nothing to report to. Your entire output is the block below; the daemon does the rest. Read enough to be specific: name the files this work will actually touch, and the ones whoever does it must read first. A spec that could have been written without opening the repo is worth nothing — that is the state this exists to replace.{{context}}
 
-Brief: {{brief}}{{anchor}}
+Brief: {{brief}}{{anchor}}{{memory}}
 
 Write the spec as ONE fenced ```json block, and nothing else after it. Every field is optional — leave out what you do not know rather than inventing it. A short honest spec beats a long speculative one, and a wrong `anticipatedFiles` entry costs the next agent more than an absent one.
 

@@ -1037,6 +1037,62 @@ describe('the memory evidence block reaches the brief (RUN-231)', () => {
   });
 });
 
+// RUN-232: the three pre-execution shape overrides read `ctx.memory`/`ctx.memoryBrief` DIRECTLY,
+// never the `memory` local that follows the outer run's own `wf.verifyActor` — a build run's
+// planner/pattern-mapper must not lose the AUTHOR rendering just because `kind: 'build'` happens
+// to share a manifest permission slot with a verify-shaped workflow elsewhere.
+describe('the memory evidence block reaches the pre-execution actors (RUN-232)', () => {
+  it('the planner gets the AUTHOR rendering — a decision already settled is what it should not re-derive', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'planner',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  it('the pattern mapper gets the AUTHOR rendering — a verified citation IS "a file and a line"', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'pattern-mapper',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  // The checker is a JUDGING actor even though the run it is planning FOR is a build
+  // (`wf.verifyActor` false there) — it gets the REVIEWER rendering regardless.
+  it('the plan checker gets the REVIEWER rendering, even planning a build (it judges the spec, not the diff)', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'plan-checker',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+  });
+
+  it('renders exactly as before when neither block is supplied, for all three overrides', () => {
+    for (const shape of ['planner', 'pattern-mapper', 'plan-checker'] as const) {
+      const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+        agent: testAgent(),
+        server: 'https://s',
+        promptShapeOverride: shape,
+      });
+      expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+      expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+    }
+  });
+});
+
 describe('the build brief states its own definition of done (RUN-127)', () => {
   const build = (over: Partial<ProjectManifest> = {}) =>
     assemblePrompt(makeRun({ kind: 'build' }), manifest(over), {

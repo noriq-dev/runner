@@ -9,6 +9,7 @@ import {
   MEMORY_AUTHOR_MAX_CHARS,
   MEMORY_REVIEWER_MAX_CHARS,
   renderMemoryEvidence,
+  suggestedMemoryPaths,
 } from '../src/memory-render';
 
 // RUN-231: the one bounded quoted-evidence renderer that opens the gate RUN-228/229/230 left
@@ -172,6 +173,21 @@ describe('renderMemoryEvidence — the frame', () => {
   it('explains what the quote prefix means', () => {
     const out = renderMemoryEvidence(p, { audience: 'author' });
     expect(out).toContain('Every line beginning with "| "');
+  });
+
+  // RUN-232 locked decision 5: precedence stated PLAINLY, and only in the AUTHOR frame — the actor
+  // that writes the spec or the code, and so the one that could otherwise let a memory outrank a
+  // decision already settled. The plan checker (REVIEWER audience) is the one actor whose job is
+  // to disagree with the spec it is handed, so it gets no "the spec wins" instruction at all.
+  it('author audience states the execution spec and the repository outrank it on conflict', () => {
+    const out = renderMemoryEvidence(p, { audience: 'author' });
+    expect(out).toMatch(/locked decision in this task's execution spec/);
+    expect(out).toMatch(/the spec and the repository win/);
+  });
+
+  it('reviewer audience carries no spec-precedence sentence — it is the actor that judges the spec', () => {
+    const out = renderMemoryEvidence(p, { audience: 'reviewer' });
+    expect(out).not.toMatch(/locked decision/);
   });
 });
 
@@ -509,5 +525,83 @@ describe('renderMemoryEvidence — budgets (locked decision 4)', () => {
         expect(kept.charCodeAt(i + 1)).toBeGreaterThanOrEqual(0xdc00);
       }
     }
+  });
+});
+
+// RUN-232: the raw material for a visible SUGGESTION, never a lock — `continuationLockScope`
+// (daemon.ts) takes no pack and stays `spec.anticipatedFiles ∪ prior.changedPaths`, so nothing
+// this function returns can reach it by construction. Pure, no prompt, no frame — the renderer
+// tests above are about what a MODEL reads; these are about what the DAEMON derives for a human.
+describe('suggestedMemoryPaths (RUN-232)', () => {
+  it('surfaces a verified citation whose path the caller did not already declare', () => {
+    const p = pack([section({ excerpts: [memoryExcerpt({ evidence: [citation({ path: 'src/a.ts' })] })] })]);
+    expect(suggestedMemoryPaths(p, [])).toEqual(['src/a.ts']);
+  });
+
+  it('excludes a citation whose path is already in the declared scope', () => {
+    const p = pack([section({ excerpts: [memoryExcerpt({ evidence: [citation({ path: 'src/a.ts' })] })] })]);
+    expect(suggestedMemoryPaths(p, ['src/a.ts'])).toEqual([]);
+  });
+
+  // Locked decision 4: only a LOCALLY-valid citation counts. `missing`/`changed`/`unverifiable`
+  // still render as evidence inside a demoted LEAD (`renderMemoryEvidence` already does that) —
+  // offering one here as a "current" suggestion is the exact stale-path failure the acceptance bars.
+  it.each(['missing', 'changed', 'unverifiable'] as const)(
+    'excludes a citation whose local verification is %s',
+    (state) => {
+      const p = pack([
+        section({
+          excerpts: [
+            memoryExcerpt({
+              evidence: [
+                citation({
+                  path: 'src/a.ts',
+                  verification: { state, reason: 'x', serverState: state, agreesWithServer: true },
+                }),
+              ],
+            }),
+          ],
+        }),
+      ]);
+      expect(suggestedMemoryPaths(p, [])).toEqual([]);
+    },
+  );
+
+  it('dedupes a path cited by more than one excerpt', () => {
+    const p = pack([
+      section({
+        excerpts: [
+          memoryExcerpt({ id: 'mem_1', evidence: [citation({ path: 'src/a.ts' })] }),
+          memoryExcerpt({ id: 'mem_2', evidence: [citation({ path: 'src/a.ts' })] }),
+        ],
+      }),
+    ]);
+    expect(suggestedMemoryPaths(p, [])).toEqual(['src/a.ts']);
+  });
+
+  // Only a CITATION earns "current" — an episode's `support[]` is a differently-shaped field with
+  // no per-item verification at all (`citation-verify.ts`'s own doc), and a graph entity or an
+  // `items` blob passes through `verifyContextPack` completely unverified.
+  it('an episode excerpt contributes nothing, however path-shaped its support text looks', () => {
+    const p = pack([
+      section({
+        excerpts: [episodeExcerpt({ support: [{ kind: 'file', detail: 'src/a.ts' }] })],
+      }),
+    ]);
+    expect(suggestedMemoryPaths(p, [])).toEqual([]);
+  });
+
+  it('a graph entity or an uninterpreted item contributes nothing — neither was independently verified', () => {
+    const p = pack([
+      section({
+        graphEntities: [{ type: 'file', label: 'a.ts', depth: 1, edgePath: 'imports', uri: 'src/a.ts' }],
+        items: [{ path: 'src/a.ts' }],
+      }),
+    ]);
+    expect(suggestedMemoryPaths(p, [])).toEqual([]);
+  });
+
+  it('nothing to suggest renders an empty list, not an error, on a pack with no sections', () => {
+    expect(suggestedMemoryPaths(pack([]), ['src/a.ts'])).toEqual([]);
   });
 });

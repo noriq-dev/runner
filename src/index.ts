@@ -752,5 +752,6 @@ export {
   MEMORY_AUTHOR_MAX_CHARS,
   MEMORY_REVIEWER_MAX_CHARS,
   renderMemoryEvidence,
+  suggestedMemoryPaths,
   type MemoryAudience,
 } from './memory-render';

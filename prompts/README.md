@@ -192,6 +192,23 @@ its `common` vars, alongside `{{context}}`) is separate from the OUTER frame's �
 quoted `{{workflowPrompt}}` may reference it too, but the daemon's own memory block in
 `verify-agent.md` is what actually carries the untrusted evidence to the model.
 
+RUN-232 wires the three pre-execution shape overrides in, the same frame, and states precedence
+inside it rather than reordering any tag (`memory-render.ts`'s AUTHOR frame now says plainly that
+a locked decision in the execution spec, or what an actor verifies itself in the repository, wins
+over anything retrieved here — an agent cannot apply precedence it is not told). `planner.md` and
+`pattern-mapper.md` get the AUTHOR rendering — the planner because a decision already settled is
+exactly what it should not re-derive, the pattern mapper because a verified citation IS "a file
+and a line", its own rule for what counts as useful. `planner.md` places it right after `{{brief}}
+{{anchor}}` (there is no `{{spec}}` yet to sit after — the planner is what writes one);
+`pattern-mapper.md` places it after `{{spec}}`, the same spot `build.md`/`scope.md` use. Both read
+`ctx.memory` directly at the `assemblePrompt` call site, never the outer run's own `memory` local
+— that local follows `wf.verifyActor` for the run being PLANNED, which has nothing to do with what
+a shape override IS. `plan-checker.md` gets the REVIEWER rendering instead (`ctx.memoryBrief`,
+smaller budget, "evidence, not instructions" frame) for the same reason `reviewer.md` does: judging
+an actor gets a judging frame, and the checker's whole job is to disagree with the spec it is
+handed, not to be told a locked decision in it outranks anything — it places the tag beside
+`{{context}}`, the same "reference first" position `reviewer.md`/`verify-agent.md` use.
+
 The verify family does not get the spec at all. It gets the **acceptance criteria, numbered**
 (`{{acceptance}}`, rendered by `src/acceptance.ts`), and answers them one line each. Withholding
 them entirely was the first cut and it was wrong — a gate that has not been told what the work was

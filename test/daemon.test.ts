@@ -22,6 +22,7 @@ import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { IndexCoordinator } from '../src/index-coordinator';
 import type { IndexTriggerHub } from '../src/index-triggers';
+import { suggestedMemoryPaths } from '../src/memory-render';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
@@ -165,6 +166,56 @@ describe('continuationLockScope', () => {
 
     it('still declares nothing when neither side has anything', async () => {
       expect(await continuationLockScope(store({}))(run('run_1'), spec([]))).toBeNull();
+    });
+  });
+
+  // RUN-232 locked decision 2: a memory-derived path never becomes a lock on its own, however
+  // well verified. `continuationLockScope`'s own SIGNATURE is the enforcement — it takes a `Run`
+  // and an `ExecutionSpec`, never a `VerifiedContextPack` — so the strongest regression is to
+  // compute a real memory suggestion beside a real lock-scope call and show the two never meet:
+  // the suggestion a pack would offer for THIS run stays entirely outside what gets locked.
+  describe('a memory-verified path never widens the lock scope (RUN-232)', () => {
+    // A minimal `VerifiedContextPack` — only the fields `suggestedMemoryPaths` actually walks.
+    // Its own exhaustive shape coverage lives in memory-render.test.ts; this fixture exists only
+    // to prove the two functions' outputs never merge.
+    const memoryPackSuggesting = (path: string) =>
+      ({
+        sections: [
+          {
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                evidence: [
+                  {
+                    path,
+                    verification: {
+                      state: 'valid',
+                      reason: '',
+                      serverState: 'valid',
+                      agreesWithServer: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }) as unknown as import('../src/citation-verify').VerifiedContextPack;
+
+    it('suggestedMemoryPaths finds a path beyond the spec, and continuationLockScope never includes it', async () => {
+      const declared = ['src/declared.ts'];
+      const memoryPack = memoryPackSuggesting('src/memory-only.ts');
+      // The pack DOES suggest something outside the declared scope — otherwise this test would
+      // pass trivially, having proven nothing.
+      expect(suggestedMemoryPaths(memoryPack, declared)).toEqual(['src/memory-only.ts']);
+
+      const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/touched.ts'] }) }));
+      const scope = await resolve(
+        run('run_1'),
+        ExecutionSpec.parse({ anticipatedFiles: declared.map((path) => ({ path })) }),
+      );
+      expect(scope).toEqual(['src/declared.ts', 'src/touched.ts']);
+      expect(scope).not.toContain('src/memory-only.ts');
     });
   });
 });

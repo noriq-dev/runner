@@ -41,6 +41,7 @@ import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
+import { suggestedMemoryPaths } from '../memory-render';
 import type { DocReader, PathProbe } from '../repo-context';
 import { noriqToolNamesFor } from '../security';
 import { type SetupResult, setupBriefNote, setupMilestone } from '../setup';
@@ -193,6 +194,11 @@ export interface PreparedRun {
    */
   start: Omit<DriverStartOptions, 'handlers' | 'env'>;
 }
+
+/** How many memory-suggested paths the transcript names before it counts the rest (RUN-232). A
+ *  count with a sample, not a dump: the point of the line is that a divergence HAPPENED and roughly
+ *  where — the paths themselves are already in the agent's own rendered evidence block. */
+const SUGGESTED_PATHS_SHOWN = 12;
 
 export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOutcome> => {
   const refuse = (reason: string): PrepareOutcome => ({ ok: false, reason });
@@ -652,6 +658,37 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // lets whatever the agent then decides become the de-facto plan — the same overwrite RUN-135's
     // flag exists to prevent, one layer along. So it goes in the PROMPT, not only the log.
     host.log.warn('[spec] the server holds an unreadable execution spec for this task', { runId: run.id });
+  }
+
+  // RUN-232: a memory-verified path beyond the spec's OWN declared scope is a SUGGESTION, never a
+  // fold into it (locked decision: "cannot silently broaden the task") — recorded where a human
+  // reads it, the same transcript channel `summarizeContextPackRetrieval` above already uses, and
+  // never in `anticipatedFiles`/`resolveLockScope`'s scope, which stays exactly what the spec (and
+  // a continuation's own touched paths) declared. Only meaningful once a spec exists to diverge
+  // FROM — the planner runs before one is written, so this has nothing to compare against yet.
+  if (verifiedContextPack && checkedSpec?.spec) {
+    const suggested = suggestedMemoryPaths(
+      verifiedContextPack,
+      checkedSpec.spec.anticipatedFiles.map((f) => f.path),
+    );
+    if (suggested.length) {
+      // Bounded and single-line, for the reason `summarizeContextPackRetrieval` above states about
+      // its own line: this is a line the DAEMON writes into a human-facing stream out of what the
+      // server said. A `valid` verdict proves each path exists inside this workspace — so the
+      // content is sound — but neither the COUNT nor a filename's own characters are bounded by
+      // that, and a memory citing two hundred files, or one legal POSIX name carrying a newline,
+      // would either drown the transcript or break the frame's own line shape.
+      const shown = suggested.slice(0, SUGGESTED_PATHS_SHOWN).map((p) => p.replace(/\s+/g, ' '));
+      const more = suggested.length - shown.length;
+      host
+        .transcript(run.id)
+        .milestone(
+          `project memory suggests ${suggested.length} path(s) beyond the spec's declared scope — ` +
+            `evidence for the agent to consider, never a lock: ${shown.join(', ')}${
+              more > 0 ? ` (+${more} more)` : ''
+            }`,
+        );
+    }
   }
   const renderedSpec = authorSpecBlock(task, checkedSpec);
 

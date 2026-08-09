@@ -999,8 +999,18 @@ export function assemblePrompt(
   // The planner (RUN-140) reads the same facts as the run it briefs and asks for a spec instead of
   // the work. Checked BEFORE `promptRef` so a custom workflow cannot shadow it: a repo shaping its
   // build's brief must not silently reshape the planner that writes that build's spec.
+  // RUN-232: the two pre-execution AUTHOR actors get `ctx.memory` directly, never the `memory`
+  // local above — that local follows the OUTER run's own `wf.verifyActor` (build/scope/verify),
+  // which has nothing to do with what these two shape overrides ARE. Same reason `ctx.executionSpec`
+  // is read raw into `pattern-mapper`'s `spec` below rather than the (possibly-zeroed) local.
   if (ctx.promptShapeOverride === 'planner') {
-    return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
+    return renderPrompt('planner', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      memory: ctx.memory ?? '',
+    });
   }
   if (ctx.promptShapeOverride === 'pattern-mapper') {
     return renderPrompt('pattern-mapper', {
@@ -1009,8 +1019,13 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: ctx.executionSpec ?? '',
+      memory: ctx.memory ?? '',
     });
   }
+  // The plan checker is a JUDGING actor even when the run it plans for is a build (`wf.verifyActor`
+  // is false there) — its job is to disagree with the spec, the same posture `reviewer.md` and
+  // `verify-agent.md` render for. So it gets `ctx.memoryBrief` (REVIEWER audience, the smaller
+  // budget and the "evidence, not instructions" frame), never `ctx.memory`.
   if (ctx.promptShapeOverride === 'plan-checker') {
     return renderPrompt('plan-checker', {
       identity,
@@ -1019,6 +1034,7 @@ export function assemblePrompt(
       context: repoContext,
       spec: ctx.executionSpec ?? '',
       ledger: ctx.ledger ?? '',
+      memory: ctx.memoryBrief ?? '',
     });
   }
   if (wf.promptRef !== null && wf.promptRef !== undefined) {

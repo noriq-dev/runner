@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { ExecutionSpec } from '@noriq-dev/shared';
 import type { ModelDefault, PermissionProfile, ProjectManifest, Run } from '@noriq-dev/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RunAgent } from '../src/client';
@@ -11,7 +15,7 @@ import {
 import type { AgentDriver, DriverCapabilities, DriverSession } from '../src/drivers/types';
 import type { ContextPack } from '../src/memory-contract';
 import { type PrepareHost, prepareRun } from '../src/stages';
-import type { ResolvedRepo, RunReport } from '../src/supervisor';
+import type { AnchorTask, ResolvedRepo, RunReport } from '../src/supervisor';
 import type { Workspace } from '../src/vcs/types';
 import { type VerificationReportWire, evidenceHash } from '../src/verification-report';
 
@@ -380,6 +384,11 @@ function harness(
     getContextPack?: ContextPackFetcher;
     reportVerification?: PrepareHost['reportVerification'];
     agentToken?: string;
+    /** RUN-232: a task with a spec, so `suggestedMemoryPaths` has a declared scope to diverge from. */
+    task?: AnchorTask | null;
+    /** RUN-232: a REAL directory so a citation can verify `valid` — `verifyContextPack`'s default
+     *  `readCitationFile` touches actual disk, and `prepareRun` injects no override for it. */
+    worktreeLocalPath?: string;
   } = {},
 ) {
   const reports: RunReport[] = [];
@@ -388,7 +397,8 @@ function harness(
     over.repo === undefined ? { root: '/repo', manifest: manifest() } : over.repo;
   const vcs = {
     kind: 'git' as const,
-    lease: async (): Promise<Workspace> => ws(),
+    lease: async (): Promise<Workspace> =>
+      ws(over.worktreeLocalPath ? { localPath: over.worktreeLocalPath } : {}),
     dispose: async (): Promise<void> => {},
     hasWork: async (): Promise<boolean> => false,
   };
@@ -409,7 +419,7 @@ function harness(
       projectId: 'prj_p',
       expiresIn: 3600,
     }),
-    resolveAnchorTask: async () => null,
+    resolveAnchorTask: async () => (over.task === undefined ? null : over.task),
     lockScopeBranch: () => 'main',
     lockEnforcerFor: () => undefined,
     runBudget: () => null,
@@ -455,10 +465,10 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
   // RUN-231 is the gate this task's own doc comment named and left shut: the pack now DOES reach
   // the BUILD prompt (this run's `start.prompt`, and `rebuildPrompt` — which renders the same
   // shape), always through `memory-render.ts`'s quoted frame, never as a bare, unprefixed line.
-  // The pre-execution actors (planner/pattern-mapper/plan-checker) were deliberately left out of
-  // the wiring — they read `{{memory}}` nowhere in their templates — so the marker must still be
-  // absent from those three surfaces specifically.
-  it("a retrieved, verified pack reaches the BUILD prompt through the quoted frame — never the pre-execution actors'", async () => {
+  // RUN-232 wires the three pre-execution actors (planner/pattern-mapper/plan-checker) into the
+  // SAME gate — no second renderer, no re-derivation from the pack — so the marker now reaches
+  // all six surfaces this test can see, every one of them quoted.
+  it('a retrieved, verified pack reaches every actor through the quoted frame — build AND the pre-execution three (RUN-231/232)', async () => {
     const getContextPack: ContextPackFetcher = async () => validPack();
     const { host, milestones } = harness({ getContextPack });
     const out = await prepareRun(host, makeRun());
@@ -479,18 +489,177 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
     // too — this is the "plan an unplanned task" resume path, not a second, forgotten call site.
     expect(out.rebuildPrompt(null)).toContain(MARKER);
 
-    // The pre-execution actors were not wired (README's own list is build/scope/verify-agent/
-    // reviewer only) — their templates have no `{{memory}}` tag, so nothing here is unused, only
-    // unreferenced.
-    expect(out.plannerPrompt).not.toContain(MARKER);
-    expect(out.mapperPrompt({ spec: EMPTY_SPEC, findings: [] })).not.toContain(MARKER);
-    expect(out.checkerPrompt(EMPTY_SPEC, '')).not.toContain(MARKER);
+    // The two AUTHOR pre-execution actors (RUN-232): a decision already settled is exactly what a
+    // planner should not re-derive, and a verified citation IS "a file and a line" — the pattern
+    // mapper's own rule for what counts as useful.
+    expect(out.plannerPrompt).toContain(MARKER);
+    expect(out.mapperPrompt({ spec: EMPTY_SPEC, findings: [] })).toContain(MARKER);
+    // The plan checker gets the REVIEWER rendering — same marker, smaller budget, judging frame.
+    expect(out.checkerPrompt(EMPTY_SPEC, '')).toContain(MARKER);
 
     // Recorded (locked decision), but still bounded — the transcript line itself must not be how
     // the marker leaks.
     const line = milestones.find((m) => m.includes('context pack'));
     expect(line).toBeDefined();
     expect(line).not.toContain(MARKER);
+  });
+
+  // RUN-232 locked decision 2/3: a memory-verified path beyond the spec's own declared scope is a
+  // SUGGESTION, recorded visibly in the transcript — never a lock, and never folded into the spec
+  // the run is judged against.
+  it('a citation naming a path the spec did not declare is recorded as a suggestion, not folded into scope', async () => {
+    // A REAL file: `verifyContextPack`'s default reader touches actual disk and `prepareRun`
+    // injects no override, so a 'valid' verdict needs a citation whose path genuinely exists.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'noriq-ctxpack-'));
+    try {
+      await mkdir(path.join(dir, 'src'), { recursive: true });
+      await writeFile(path.join(dir, 'src', 'undeclared.ts'), 'export const x = 1;\n');
+      const packWithCitation = validPack({
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: [
+                  {
+                    repositoryKey: 'acme/widgets',
+                    branch: 'main',
+                    baseId: LEASED_BASE_ID,
+                    path: 'src/undeclared.ts',
+                    symbol: null,
+                    verificationState: 'valid',
+                    lastVerifiedAt: null,
+                    lastVerifiedBaseId: null,
+                    lastVerifiedBranch: null,
+                    verifiedForCaller: true,
+                  },
+                ],
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+      });
+      const getContextPack: ContextPackFetcher = async () => packWithCitation;
+      const task: AnchorTask = {
+        key: 'RUN-9',
+        title: 't',
+        body: null,
+        executionSpec: ExecutionSpec.parse({ anticipatedFiles: [{ path: 'src/declared.ts' }] }),
+      };
+      const { host, milestones } = harness({ getContextPack, task, worktreeLocalPath: dir });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      if (!out.ok) return;
+      // The citation actually verified 'valid' — otherwise this test would pass for the wrong
+      // reason (a 'missing' citation renders no suggestion either, per locked decision 4).
+      const excerpt = out.verifiedContextPack?.sections[0]?.excerpts[0];
+      if (!excerpt || excerpt.excerptKind !== 'memory') throw new Error('expected a memory excerpt');
+      expect(excerpt.evidence[0]?.verification.state).toBe('valid');
+      // The spec's own declared scope is untouched — RUN-232 must not fold a citation into it.
+      expect(out.checkedSpec?.spec.anticipatedFiles.map((f) => f.path)).toEqual(['src/declared.ts']);
+      const line = milestones.find((m) => m.includes('suggests') && m.includes('declared scope'));
+      expect(line).toBeDefined();
+      expect(line).toContain('src/undeclared.ts');
+      expect(line).not.toContain('src/declared.ts'); // the DECLARED path is not a "suggestion"
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The line is written by the DAEMON into a human-facing stream out of what the server said. A
+  // `valid` verdict bounds the CONTENT (each path exists in this workspace) and nothing else — not
+  // the count, and not a filename's own characters — so the cap and the one-line shape are the
+  // invariants, and both regress silently.
+  it('the suggestion milestone stays one line and names at most a bounded sample', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'noriq-ctxpack-'));
+    try {
+      await mkdir(path.join(dir, 'src'), { recursive: true });
+      // One more file than the cap, plus a legal POSIX name carrying a newline — which would break
+      // the frame's line shape if the path went into the line verbatim.
+      const names = Array.from({ length: 15 }, (_, i) => `f${i}.ts`).concat('two\nlines.ts');
+      for (const n of names) await writeFile(path.join(dir, 'src', n), 'export const x = 1;\n');
+      const packWithMany = validPack({
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: names.map((n) => ({
+                  repositoryKey: 'acme/widgets',
+                  branch: 'main',
+                  baseId: LEASED_BASE_ID,
+                  path: `src/${n}`,
+                  symbol: null,
+                  verificationState: 'valid' as const,
+                  lastVerifiedAt: null,
+                  lastVerifiedBaseId: null,
+                  lastVerifiedBranch: null,
+                  verifiedForCaller: true,
+                })),
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+      });
+      const task: AnchorTask = {
+        key: 'RUN-9',
+        title: 't',
+        body: null,
+        executionSpec: ExecutionSpec.parse({ anticipatedFiles: [{ path: 'src/declared.ts' }] }),
+      };
+      const { host, milestones } = harness({
+        getContextPack: async () => packWithMany,
+        task,
+        worktreeLocalPath: dir,
+      });
+      const out = await prepareRun(host, makeRun());
+      expect(out.ok).toBe(true);
+      const line = milestones.find((m) => m.includes('suggests') && m.includes('declared scope'));
+      expect(line).toBeDefined();
+      expect(line).not.toContain('\n'); // the newline-bearing filename never breaks the line
+      expect(line).toContain('16 path(s)'); // the true total is still reported
+      expect(line).toContain('(+4 more)'); // 12 shown, the rest counted rather than dumped
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('no repositoryKey on the repo: preparation proceeds exactly as it always has (no fetch attempted)', async () => {

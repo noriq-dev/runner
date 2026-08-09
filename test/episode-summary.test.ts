@@ -412,9 +412,21 @@ describe('buildEpisode — selfSummary (RUN-226)', () => {
     });
     expect(omitted.selfSummary).toBeNull();
     expect(nulled.selfSummary).toBeNull();
-    // `id`/`createdAt` are freshly minted per call (randomUUID + `new Date()`) and expected to
-    // differ — the property under test is everything ELSE being identical either way.
-    expect({ ...omitted, id: '', createdAt: '' }).toEqual({ ...nulled, id: '', createdAt: '' });
+    // THREE fields are freshly minted per call, not two, and missing the third is what made this
+    // assertion flake at roughly one run in four under full-suite load (measured, then diagnosed —
+    // it was reported twice as unreproducible before the loop caught it): `id` (randomUUID),
+    // `createdAt`, and the timeline's own `settle:` entry, whose `at` is stamped inside
+    // `timelineOf`. Two calls straddling a millisecond boundary disagree on that entry, so the
+    // whole deep-equal failed for a reason that had nothing to do with `selfSummary`. Normalizing
+    // every minted field rather than pinning the clock keeps the property under test what it says
+    // it is: everything ELSE is identical whether the field is omitted or explicitly null.
+    const stable = (e: typeof omitted) => ({
+      ...e,
+      id: '',
+      createdAt: '',
+      timeline: e.timeline.map((t) => (t.label.startsWith('settle:') ? { ...t, at: '' } : t)),
+    });
+    expect(stable(omitted)).toEqual(stable(nulled));
   });
 });
 
