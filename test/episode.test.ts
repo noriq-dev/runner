@@ -20,7 +20,16 @@ import { BUILTIN_WORKFLOWS } from '../src/workflow';
 // integration tests at the bottom cover the two properties that live in the CALL SITE, not the
 // assembler: where it runs relative to `report`/`dispose`, and that it can never gate settlement.
 
-const run = { id: 'run_1', projectId: 'prj_p', anchor: null } as Run;
+const run = {
+  id: 'run_1',
+  projectId: 'prj_p',
+  anchor: null,
+  // RUN-227: widens `timelineOf` with these two fields when present — set on the shared fixture so
+  // every test below exercises the widened shape rather than the pre-RUN-227 one, matching a real
+  // dispatch (`dispatchRun`/`createRun` both re-read the row after writing `dispatched_at`).
+  createdAt: '2026-08-01T00:00:00.000Z',
+  dispatchedAt: '2026-08-01T00:00:05.000Z',
+} as Run;
 const repo: ResolvedRepo = { root: '/repo', manifest: { repositoryKey: 'myrepo' } as never };
 const worktree: Workspace = {
   runId: 'run_1',
@@ -164,10 +173,36 @@ describe('buildEpisode — across every terminal path', () => {
     });
     const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(EffortEpisode.safeParse(episode).success).toBe(true);
-    expect(episode.timeline).toHaveLength(2);
-    expect(episode.timeline[0]).toEqual({ at: continued.failedAt, label: expect.any(String) });
+    // queued, dispatched, the continuation boundary, settle — RUN-227 widened this from 2 to 4.
+    expect(episode.timeline).toHaveLength(4);
+    expect(episode.timeline[2]).toEqual({ at: continued.failedAt, label: expect.any(String) });
     // The continuation's finding appears once, from ctx.ledger — not duplicated by the timeline entry.
     expect(episode.findings).toHaveLength(1);
+  });
+});
+
+describe('buildEpisode — timeline widened to cover the server’s own skeleton (RUN-227)', () => {
+  it('queued/dispatched read straight off the dispatched Run, ahead of the settle entry', () => {
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.timeline).toEqual([
+      { at: run.createdAt, label: 'queued' },
+      { at: run.dispatchedAt, label: 'dispatched to runner' },
+      { at: expect.any(String), label: expect.stringContaining('settle:') },
+    ]);
+  });
+
+  it('a Run with no dispatchedAt yet (defensive — a real dispatch always sets it) omits that entry', () => {
+    const undispatched = { ...run, dispatchedAt: null } as Run;
+    const episode = buildEpisode(baseCtx({ run: undispatched }), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.timeline.map((e) => e.label)).toEqual(['queued', expect.stringContaining('settle:')]);
   });
 });
 

@@ -6,8 +6,12 @@
  * already owns true cumulative spend, the terminal verdict, the adjudication ledger, and the
  * workspace's fate. This module is the pure half of that: one function from a settled
  * `RunPipeline` (plus the handful of facts only `settle` itself can answer — see `EpisodeExtra`) to
- * one `EffortEpisode` payload. Assembly only: no upload, no transport, no capability mint (RUN-227,
- * blocked on PLNR-340). `selfSummary` (RUN-226) is the one field this module does not derive from
+ * one `EffortEpisode` payload. Assembly only: no upload, no transport, no capability mint — that is
+ * `episode-upload.ts`/`episode-pending.ts` (RUN-227), which this module knows nothing about beyond
+ * the `deriveEpisodeScopeId` identity helper below, kept here because it derives from the same
+ * `EffortEpisode.createdAt` this module mints.
+ *
+ * `selfSummary` (RUN-226) is the one field this module does not derive from
  * `ctx` at all — requesting, bounding and validating it means talking to a live session, which is
  * exactly what this module's purity rules out, so `episode-summary.ts`'s `requestSelfSummary` does
  * that work and hands the settled value (or null) in through `extra`, same as everything else this
@@ -30,7 +34,7 @@
  * this module is judged on, not the absence of wrong values.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type {
   EffortEpisode as EffortEpisodeType,
   EpisodeFinding,
@@ -238,18 +242,65 @@ function landingOutcomeOf(ctx: RunPipeline, hasRemainingWork: boolean): EpisodeL
   return ctx.exit.outcome === 'done' ? 'not_landed' : 'failed';
 }
 
-/** The runner's own contribution to the timeline (discretion: the server independently knows
- *  dispatch/start/exit from its `runs` row, so this adds only what the runner sees that the server
- *  does not). Two entries, both sourced from state `settle` already holds, never a fresh
- *  instrumentation pass: a continuation's prior sitting boundary (`ContinuableRun.failedAt`, already
- *  persisted for exactly this purpose) and this sitting's own settle moment. */
+/**
+ * The runner's own contribution to the timeline — widened (RUN-227 locked decision 6) so an
+ * UPLOADED episode cannot lose ground the server's own automatically-recorded skeleton episode
+ * already covers. `ProjectMemory.recordEpisode` is last-writer-wins per field: PLNR-263 already
+ * fires a skeleton write (`memory/episodes.ts`'s `recordEpisodeForRun`) off the SAME terminal
+ * transition our own upload only starts FROM, essentially instantly (one D1 batch, no network
+ * round trip) — so by the time our own richer upload's `complete()` reaches the server, the
+ * skeleton's four-entry `timelineFor` (queued/dispatched/agent started/run <outcome>) is
+ * ordinarily already the stored value, and our own `timeline` field REPLACES it wholesale.
+ *
+ * Two of those four entries cost nothing to add — they are already sitting on `ctx.run`, the
+ * dispatched `Run` this sitting never re-fetches:
+ */
 function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
   const out: EpisodeTimelineEntry[] = [];
+  // Defensive `if`, not an assumption the wire schema is honoured: `createdAt` is required on
+  // `Run` and `dispatchRun`/`createRun` (server-side) both re-read the row AFTER writing
+  // `dispatched_at`, so a REAL dispatch carries both — but a hand-built fixture or a future wire
+  // change must degrade to "fewer timeline entries", never to a thrown, unparseable datetime.
+  if (ctx.run.createdAt) out.push({ at: ctx.run.createdAt, label: 'queued' });
+  if (ctx.run.dispatchedAt) out.push({ at: ctx.run.dispatchedAt, label: 'dispatched to runner' });
+  // NOT widened here, on purpose rather than by oversight: the skeleton's third entry, "agent
+  // started" (`runs.started_at`, stamped when the server processes this run's FIRST `running`
+  // status frame), has no counterpart anywhere in `RunPipeline` — no stage threads a daemon-
+  // observed "the primary session actually began" instant this far downstream. Building one would
+  // mean capturing a fresh timestamp in `stages/execute.ts` AND `stages/chain.ts` (a chain's true
+  // start is its FIRST step, not whichever step's outcome happens to reach `afterDriver`) and
+  // adding a field to `RunPipeline` itself — three files outside this task's own scope, on the hot
+  // path budget enforcement and steering both depend on. Left undone rather than invented: an
+  // upload whose `complete()` lands after the server's automatic skeleton (the ordinary case) will
+  // clobber "agent started" out of the stored timeline until a later task threads it through. The
+  // skeleton's fourth entry, its own "run <outcome>" moment, is NOT a gap — it is already
+  // covered below by this sitting's own `settle:` entry, which is later and strictly more precise.
   if (ctx.continued) {
     out.push({ at: ctx.continued.failedAt, label: 'continuation: resumed from a kept worktree' });
   }
   out.push({ at: new Date().toISOString(), label: 'settle: transcript closed, locks released' });
   return out;
+}
+
+/**
+ * A pure function of run identity plus this sitting's terminal moment (RUN-227 locked decision
+ * 2) — never the bare `runId`. Two requirements pull against each other and this satisfies both:
+ *
+ *   - a RETRY of the same sitting must converge on the same `scopeId`, or the server accumulates
+ *     orphaned in-flight uploads (RUN-221's `deriveGenerationId` is the precedent);
+ *   - a SECOND SITTING of the same run id (RUN-182 reopens a failed build rather than minting a
+ *     new run) must NOT reuse it: `beginIngestEpisode` throws "already complete — this purpose
+ *     cannot be reopened" for a scope the server finished, so a reused scopeId would have the
+ *     second sitting's enrichment silently refused.
+ *
+ * The wire `Run` carries no sitting number, so `terminalAt` — `episode.createdAt`, captured ONCE
+ * when `buildEpisode` assembled this sitting's payload, and persisted verbatim from then on — is
+ * the discriminator actually available. `epi_` mirrors `deriveGenerationId`'s `gen_` prefix:
+ * readability only, nothing parses it back apart.
+ */
+export function deriveEpisodeScopeId(input: { runId: string; terminalAt: string }): string {
+  const material = [input.runId, input.terminalAt].join('::');
+  return `epi_${createHash('sha256').update(material, 'utf8').digest('hex')}`;
 }
 
 /** How much of a command string is worth keeping (RUN-225) — the manifest's own committed text,

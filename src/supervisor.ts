@@ -1,5 +1,6 @@
 import type {
   AgentTool,
+  EffortEpisode,
   LandPolicy,
   PermissionProfile,
   ProjectManifest,
@@ -340,6 +341,15 @@ export interface RunSupervisorDeps {
    *  the run reports (`stages/integrate.ts`'s own call site). Omitted → no index trigger layer
    *  wired, and a landing simply triggers nothing, exactly as before this existed. */
   onLanded?: (repoRoot: string, branch: string, sha: string) => void;
+  /**
+   * Hand a freshly assembled effort episode to delivery (RUN-227, `StageHost.recordEpisode`'s own
+   * seam — its doc names this exact wiring point). `daemon.ts` binds it to `episode-upload.ts`'s
+   * `deliverEpisode`, which enqueues durably before attempting a network call — this dep itself
+   * must stay synchronous and fire-and-forget the same way, or `settle` would be awaiting a network
+   * round trip it is documented never to. Omitted → no delivery layer wired, a test's ordinary
+   * posture and every host before this task.
+   */
+  recordEpisode?: (episode: EffortEpisode) => void;
   /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
    *  which is exactly the behaviour before it existed. */
   repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
@@ -1221,6 +1231,10 @@ export class RunSupervisor {
       reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
       landRun: (ctx) => this.landRun(ctx),
       onLanded: (repo, branch, sha) => this.deps.onLanded?.(repo.root, branch, sha),
+      // RUN-227: the seam `StageHost.recordEpisode`'s own doc names as unwired until this task.
+      // `this.deps.recordEpisode` is itself synchronous (see that dep's doc) — nothing here awaits
+      // it, so `settle` calling this stays exactly as non-blocking as it was before it existed.
+      recordEpisode: (episode) => this.deps.recordEpisode?.(episode),
       // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
       // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
       // that the run's sessions divide one ceiling rather than each receiving a copy of it.

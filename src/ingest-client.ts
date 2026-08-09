@@ -66,6 +66,18 @@ export interface IngestCompleteEpisodeResult {
   ok: true;
   batchesReceived: number;
   rowCount: number;
+  /**
+   * RUN-227's own load-bearing check (measured against `ProjectMemory.completeEpisodeIngest`,
+   * `apps/api/src/do/ProjectMemory.ts`, not invented): every accumulated row is parsed and either
+   * RECORDED or SKIPPED (a malformed row, a run unknown in this project, or — the case that will
+   * actually happen — a run with no terminal `exit` row yet, RUN-227 locked decision 5's race).
+   * The HTTP call succeeds either way, so `recorded`/`skipped` are the only honest signal: a caller
+   * that reads `ok`/`batchesReceived` alone reports a delivered episode the server silently threw
+   * away. Absent from this interface until RUN-227 — the server has returned both fields since
+   * PLNR-263 landed; nothing here READ them, which is exactly the gap this comment closes.
+   */
+  recorded: number;
+  skipped: number;
 }
 
 export interface IngestStatusResult {

@@ -13,6 +13,8 @@ import { discoverRepos, loadIndexConfig } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
+import { EpisodePendingStore, filePendingEpisodeStore } from './episode-pending';
+import { type EpisodeDeliveryDeps, deliverEpisode, drainPendingEpisodes } from './episode-upload';
 import { IndexControlServer } from './index-control';
 import { IndexCoordinator } from './index-coordinator';
 import { IndexJournal, fileJournalStore } from './index-journal';
@@ -523,6 +525,10 @@ export class Daemon {
   private readonly indexStatusPath?: string;
   private readonly indexControlInfoPath?: string;
   private readonly indexControlOverride?: Pick<IndexControlServer, 'start' | 'stop'>;
+  /** Where RUN-227's undelivered-episode queue lives — defaults to
+   *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning: a test points this at a
+   *  temp file so a fully-driven `start()` never touches the operator's own home directory. */
+  private readonly episodePendingPath?: string;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -577,6 +583,9 @@ export class Daemon {
        *  default; a test substitutes a fake with a spy `start`/`stop` to prove the daemon starts
        *  and stops it in the right place without binding a real port. */
       indexControl?: Pick<IndexControlServer, 'start' | 'stop'>;
+      /** Where RUN-227's undelivered-episode queue lives — defaults to
+       *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning. */
+      episodePendingPath?: string;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -596,6 +605,7 @@ export class Daemon {
     this.indexStatusPath = deps.indexStatusPath;
     this.indexControlInfoPath = deps.indexControlInfoPath;
     this.indexControlOverride = deps.indexControl;
+    this.episodePendingPath = deps.episodePendingPath;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -681,6 +691,26 @@ export class Daemon {
       status: runner.status,
       repos: runner.repos.map((r) => `${r.projectKey}→${r.projectId ?? 'unresolved'}`),
     });
+
+    // RUN-227's undelivered-episode queue, and the delivery deps every enqueue/retry site below
+    // shares. Built here, once `runner.id` exists — `EpisodeDeliveryDeps.runnerId` is captured into
+    // every `PendingEpisode.mint` at enqueue time (locked decision 8's identity half), and this is
+    // the daemon's own registration id, stable across a restart (`saveState` above persists it).
+    const episodePending = new EpisodePendingStore(filePendingEpisodeStore(this.episodePendingPath));
+    const episodeDeliveryDeps: EpisodeDeliveryDeps = {
+      client,
+      runnerId: runner.id,
+      pending: episodePending,
+      logger: this.log,
+    };
+    // Retry whatever a prior process left pending, once, at startup — mirrors the orphaned-staging
+    // sweep just below: a daemon that crashed or was simply off holds episodes nothing has retried
+    // since, and "the box just came up" is exactly the moment worth spending one drain pass on.
+    void drainPendingEpisodes(episodeDeliveryDeps)
+      .then(({ delivered }) => {
+        if (delivered) this.log.info(`delivered ${delivered} previously pending episode(s)`);
+      })
+      .catch((err) => this.log.warn('startup episode delivery retry failed', { err: String(err) }));
 
     // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
     // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
@@ -934,6 +964,14 @@ export class Daemon {
       onLanded: (repoRoot, branch, sha) => {
         void indexTriggers.onLanded?.(repoRoot, branch, sha);
       },
+      // RUN-227's delivery sink. Fire-and-forget, same shape as `onLanded` above: `deliverEpisode`
+      // enqueues durably before it ever touches the network (its own doc), so this dep can stay
+      // synchronous and return before any I/O settles — `settle` never awaits it.
+      recordEpisode: (episode) => {
+        void deliverEpisode(episode, episodeDeliveryDeps).catch((err) =>
+          this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
+        );
+      },
       // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
@@ -1044,6 +1082,12 @@ export class Daemon {
           // Same shape for parked runs (RUN-30): a human answering while the box is off is the
           // normal case, not the edge one, and nothing else would ever bring that run back.
           void reconcileParked();
+          // Same shape again for RUN-227's pending episodes: a reconnect is precisely "the server
+          // might be reachable now when it was not a moment ago" — the one signal this daemon has
+          // for "worth trying delivery again" short of a fixed-interval timer (discretion 3).
+          void drainPendingEpisodes(episodeDeliveryDeps).catch((err) =>
+            this.log.warn('episode delivery retry on reconnect failed', { err: String(err) }),
+          );
         },
       },
       logger: this.log,

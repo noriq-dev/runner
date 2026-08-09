@@ -146,19 +146,22 @@ const DEFAULT_MAX_RETRY_ATTEMPTS = 5;
  * proves nothing), and `bad-request`/`conflict`/`forbidden`/`not-found` (terminal for the
  * attempt, locked decision 5's own vocabulary).
  */
-const RETRYABLE_REASONS: ReadonlySet<IngestFailureReason> = new Set([
+export const RETRYABLE_REASONS: ReadonlySet<IngestFailureReason> = new Set([
   'http',
   'transport',
   'expired',
   'wrong-scope',
 ]);
 
-/** Internal sentinel — never escapes this module. `uploadGeneration`'s own catch converts it to
- *  `{ok:false, reason:'cancelled'}` rather than letting a caller see a bare thrown error for what
- *  is, on this path, an entirely routine outcome (the coordinator's `cancelAll`, RUN-165's shape). */
-class UploadCancelled extends Error {}
+/** A sentinel converted to `{ok:false, reason:'cancelled'}` by whichever module's own catch sees
+ *  it, rather than letting a caller see a bare thrown error for what is, on this path, an entirely
+ *  routine outcome (the coordinator's `cancelAll`, RUN-165's shape). Exported (RUN-227) so
+ *  `episode-upload.ts` — the identical begin/batch/complete shape over a different purpose, this
+ *  module's own doc comment directs it to follow — shares this instead of a second class no
+ *  `instanceof` check could ever tell apart from this one. */
+export class UploadCancelled extends Error {}
 
-function ensureNotCancelled(signal: AbortSignal): void {
+export function ensureNotCancelled(signal: AbortSignal): void {
   if (signal.aborted) throw new UploadCancelled();
 }
 
@@ -181,7 +184,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-interface RetryCtx {
+export interface RetryCtx {
   signal: AbortSignal;
   baseMs: number;
   maxMs: number;
@@ -190,8 +193,10 @@ interface RetryCtx {
 
 /** Retry a single ingest call with `ws-client.ts`'s own backoff shape, only for the reasons
  *  `RETRYABLE_REASONS` names — everything else (a terminal `IngestError`, or any non-`IngestError`
- *  thrown, which this module has no business interpreting) is rethrown on the first attempt. */
-async function withRetry<T>(step: () => Promise<T>, ctx: RetryCtx): Promise<T> {
+ *  thrown, which this module has no business interpreting) is rethrown on the first attempt.
+ *  Exported (RUN-227) for `episode-upload.ts` to share — see `UploadCancelled`'s doc on why a
+ *  second copy of this would be a second answer to "how does a retry back off". */
+export async function withRetry<T>(step: () => Promise<T>, ctx: RetryCtx): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     ensureNotCancelled(ctx.signal);
     try {

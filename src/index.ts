@@ -548,13 +548,32 @@ export {
   type AcceptanceReport,
 } from './acceptance';
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
-export { buildEpisode, normalizeSeverity, type EpisodeExtra } from './episode';
+export { buildEpisode, deriveEpisodeScopeId, normalizeSeverity, type EpisodeExtra } from './episode';
 export {
   requestSelfSummary,
   SELF_SUMMARY_TIMEOUT_MS,
   SELF_SUMMARY_OUTPUT_CAP,
   type SelfSummaryContext,
 } from './episode-summary';
+export {
+  DEFAULT_PENDING_EPISODE_PATH,
+  DEFAULT_MAX_PENDING,
+  DEFAULT_MAX_PENDING_AGE_HOURS,
+  EpisodePendingStore,
+  filePendingEpisodeStore,
+  trimPending,
+  type PendingEpisode,
+  type PendingEpisodeFileStore,
+} from './episode-pending';
+export {
+  deliverEpisode,
+  drainPendingEpisodes,
+  uploadEpisode,
+  type EpisodeDeliveryDeps,
+  type UploadEpisodeDeps,
+  type UploadEpisodeInput,
+  type UploadEpisodeOutcome,
+} from './episode-upload';
 export {
   checkSteps,
   planWaves,
