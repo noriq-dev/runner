@@ -787,6 +787,12 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       // `parked`/`continuable`/`stateFile` reasoning one layer up.
       indexJournalPath: path.join(tmp, 'index-journal.json'),
       indexStagingRoot: path.join(tmp, 'index-staging'),
+      // RUN-223: same reasoning as `indexJournalPath`/`indexStagingRoot` above — the status store
+      // persists on every mutation and the control server always starts (no config knob) unless a
+      // test overrides it, so both need to be pointed off the operator's own `~/.noriq` for every
+      // test in this suite, not only ones that exercise them directly.
+      indexStatusPath: path.join(tmp, 'index-status.json'),
+      indexControlInfoPath: path.join(tmp, 'index-control.json'),
       createSupervisor: (d) => {
         deps = d;
         report = d.report;

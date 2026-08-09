@@ -4,7 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { IndexJournal, type IndexJournalKey, type JournalStore } from '../src/index-journal';
-import { fileStagingStore, stagingDirFor, stagingId, sweepOrphanedStaging } from '../src/index-stage';
+import {
+  fileStagingStore,
+  forgetMatchingGenerations,
+  stagingDirFor,
+  stagingId,
+  sweepOrphanedStaging,
+} from '../src/index-stage';
 
 // RUN-221 locked decision 6/7/discretion 2: local staging under `~/.noriq/`, keyed by a directory
 // derivable from the journal key alone, swept ONLY on startup.
@@ -172,5 +178,61 @@ describe('sweepOrphanedStaging (real filesystem, startup-only by contract)', () 
     };
     const { removed } = await sweepOrphanedStaging(new IndexJournal(broken), root);
     expect(removed).toEqual([stagingId(KEY())]);
+  });
+});
+
+// RUN-223's `forget-local-journal`: LOCAL-only, and its own signature is the proof — no client, no
+// fetch, nothing that could reach a server. What it must do is clear exactly the entries `match`
+// selects, and their staged bytes, and nothing outside that selection.
+describe('forgetMatchingGenerations (RUN-223)', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'noriq-forget-'));
+  });
+  afterEach(async () => rm(root, { recursive: true, force: true }));
+
+  it('clears the journal entry and staged bytes for every matching key, and nothing else', async () => {
+    const store = fileStagingStore(root);
+    const journalStore = memJournalStore();
+    const journal = new IndexJournal(journalStore);
+
+    const mine = KEY({ generationId: 'gen_mine' });
+    const otherRepo = KEY({ repositoryKey: 'other-repo', generationId: 'gen_other' });
+    const otherServer = KEY({ server: 'https://noriq.other', generationId: 'gen_other_server' });
+
+    for (const key of [mine, otherRepo, otherServer]) {
+      await journal.put(key, { batchesConfirmed: 1, batchCount: 1, staged: true });
+      await store.writeBatch(key, 0, new Uint8Array([1]));
+    }
+
+    const count = await forgetMatchingGenerations(
+      journal,
+      store,
+      (e) => e.server === mine.server && e.repositoryKey === mine.repositoryKey,
+    );
+
+    expect(count).toBe(1);
+    expect(await journal.get(mine)).toBeNull();
+    expect(existsSync(stagingDirFor(mine, root))).toBe(false);
+    // Untouched: a different repository, and a different server — the match predicate's scope is
+    // exactly what the caller asked for, never everything this daemon has ever staged.
+    expect(await journal.get(otherRepo)).not.toBeNull();
+    expect(existsSync(stagingDirFor(otherRepo, root))).toBe(true);
+    expect(await journal.get(otherServer)).not.toBeNull();
+    expect(existsSync(stagingDirFor(otherServer, root))).toBe(true);
+  });
+
+  it('a match with nothing to forget returns 0 and touches nothing', async () => {
+    const journal = new IndexJournal(memJournalStore());
+    const store = fileStagingStore(root);
+    const count = await forgetMatchingGenerations(journal, store, () => true);
+    expect(count).toBe(0);
+  });
+
+  it('this function’s own signature carries no server dependency — the structural proof it cannot reach one', () => {
+    // forgetMatchingGenerations(journal, staging, match) — three parameters, none of them a
+    // NoriqClient or a fetch. TypeScript enforces this at every call site; this test just names it.
+    expect(forgetMatchingGenerations.length).toBe(3);
   });
 });

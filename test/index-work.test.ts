@@ -241,6 +241,13 @@ describe('createIndexWorkStep (RUN-222)', () => {
       journal: memJournal(),
       signal: new AbortController().signal,
     };
-    await expect(step(ctx)).resolves.toBeUndefined();
+    // RUN-223: a successful attempt now reports back what it uploaded (`IndexWorkResult`) — the
+    // coordinator's own status recorder needs it, and this is the wiring-only test that proves
+    // the work step's return value is real rather than the coordinator inventing one.
+    await expect(step(ctx)).resolves.toMatchObject({
+      baseId: 'gitsha',
+      batchesReceived: 1,
+      generationId: expect.any(String),
+    });
   });
 });

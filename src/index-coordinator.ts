@@ -1,6 +1,7 @@
 import type { IndexJournal } from './index-journal';
 import type { ResolvedIndexConfig } from './index-policy';
 import { INDEXER_VERSION, type IndexReconcileOutcome, associationNotice, reconcile } from './index-reconcile';
+import type { IndexJobPhase, IndexStatusEvent } from './index-status';
 import { logger as defaultLogger } from './logger';
 import type { RunnerIndexCursor } from './memory-contract';
 import type { ChangesBetweenResult, IndexSnapshot, VcsBackend } from './vcs/types';
@@ -99,9 +100,24 @@ export interface IndexWorkContext {
   config: ResolvedIndexConfig;
   journal: IndexJournal;
   signal: AbortSignal;
+  /** RUN-223 locked decision 4: the work step is the ONLY code that knows when parsing ends and
+   *  uploading begins, or when the server starts validating `complete()` — a phase inferred from
+   *  elapsed time or a journal side effect would be a guess dressed as a status. Optional so a
+   *  work step (including every existing test double) stays usable with no listener at all;
+   *  absent in production only when `IndexCoordinatorDeps.onStatus` itself was never supplied. */
+  onProgress?: (phase: IndexJobPhase, detail?: string) => void;
 }
 
-export type IndexWorkStep = (ctx: IndexWorkContext) => Promise<void>;
+/** What a successful attempt reports back for `IndexStatusStore`'s `'success'` event (RUN-223) —
+ *  optional so a no-op test work step may keep returning `void`, and the coordinator falls back
+ *  to what it can derive itself (the leased snapshot's own base) when a step reports nothing. */
+export interface IndexWorkResult {
+  generationId: string;
+  baseId: string;
+  batchesReceived: number;
+}
+
+export type IndexWorkStep = (ctx: IndexWorkContext) => Promise<IndexWorkResult> | Promise<void>;
 
 export interface IndexCoordinatorDeps {
   /** The backend this checkout's `repoRoot` speaks through — the same `backendFor.get(root) ??
@@ -126,6 +142,13 @@ export interface IndexCoordinatorDeps {
    *  of "busy" stays in the daemon, not here. Checked before every attempt, including a coalesced
    *  re-run. */
   isRunBusy: () => boolean;
+  /** RUN-223's operator-status hook — optional, and this coordinator's own lifecycle contract is
+   *  byte-identical with or without one. Called at every observable transition of an attempt
+   *  (reconcile decided, a work-step phase, success, failure) so `IndexStatusStore` can build the
+   *  CLI-facing surface without this file taking on a second opinion about what "done" or "failed"
+   *  means — it only reports the same decisions this class already makes. A throwing listener is
+   *  swallowed (logged), the same posture every other best-effort observer in this file takes. */
+  onStatus?: (event: IndexStatusEvent) => void;
   logger?: typeof defaultLogger;
 }
 
@@ -166,6 +189,26 @@ export class IndexCoordinator {
   }
 
   /**
+   * RUN-223's per-repo cancel — a narrower sibling of `cancelAll`, added for the operator control
+   * surface. Locked decision 10: the guard this reaches into stays IN-PROCESS ONLY — this method
+   * aborts the same `AbortController` `cancelAll` already aborts, and adds no lockfile, no
+   * persisted "cancel requested" record, and no new way for a crashed daemon to leave something
+   * behind. Returns `false` (no-op) when nothing is active for this job key — including the
+   * ordinary case where the request raced the job's own completion — never throws. Also drops any
+   * PENDING re-run for this key, the same reasoning `cancelAll` states for its own shutdown: an
+   * operator who asked to cancel a job must not have it resurrected moments later by a re-run flag
+   * a trigger set just before the cancel arrived.
+   */
+  cancelRepo(target: Pick<IndexTarget, 'server' | 'repositoryKey'>): boolean {
+    const key = jobKey(target);
+    this.pending.delete(key);
+    const job = this.active.get(key);
+    if (!job) return false;
+    job.abort.abort();
+    return true;
+  }
+
+  /**
    * Ask this canonical repository to be (re)indexed. Coalesces with whatever is already running
    * for the same job key (locked decision 3): a trigger arriving while a job is active replaces
    * the one pending re-run flag and returns immediately, never starting a second job and never
@@ -199,6 +242,17 @@ export class IndexCoordinator {
     });
     this.active.set(key, { abort, done });
     await done;
+  }
+
+  /** RUN-223: forward one status event to `deps.onStatus`, if any — never lets a throwing listener
+   *  reach into this class's own control flow (see the dep's own doc). */
+  private emitStatus(event: IndexStatusEvent): void {
+    if (!this.deps.onStatus) return;
+    try {
+      this.deps.onStatus(event);
+    } catch (err) {
+      this.log.warn('index status listener threw', { err: String(err) });
+    }
   }
 
   /** One job attempt end to end: priority defer, manifest gate, reconcile, lease, work, release. */
@@ -254,6 +308,11 @@ export class IndexCoordinator {
       indexerVersion: target.indexerVersion ?? INDEXER_VERSION,
       changesBetween,
     });
+    // RUN-223: every reconcile outcome is reported, before the switch below decides whether to
+    // proceed — `reconcileOperatorState` (index-status.ts) is the one place that folds all six
+    // into the operator vocabulary, exhaustively, so this call site owes it nothing but the raw
+    // outcome.
+    this.emitStatus({ type: 'reconcile', repositoryKey: rk, outcome });
 
     // Locked decision 6: only `incremental` and `full` may ever lease a snapshot. Every other
     // outcome logs at its own level and returns here — RUN-213 already decided all six outcomes
@@ -288,7 +347,12 @@ export class IndexCoordinator {
         break; // the only two outcomes that may lease — fall through.
     }
 
-    if (signal.aborted) return; // cancelled between the decision above and the lease below
+    if (signal.aborted) {
+      // Cancelled between the decision above and the lease below — without this the status
+      // surface would be left showing `queued` forever for a job that will never now start.
+      this.emitStatus({ type: 'failure', repositoryKey: rk, detail: 'cancelled before the job could start' });
+      return;
+    }
 
     const lease = await vcs.leaseIndexSnapshot(target.repoRoot);
     if (!lease.ok) {
@@ -308,13 +372,49 @@ export class IndexCoordinator {
 
     const snapshot = lease.snapshot;
     try {
-      if (signal.aborted) return; // cancelled while the lease call was in flight
-      await this.deps.runWork({ target, snapshot, outcome, config, journal: this.deps.journal, signal });
+      if (signal.aborted) {
+        // Cancelled while the lease call was in flight — same reasoning as the abort check above.
+        this.emitStatus({
+          type: 'failure',
+          repositoryKey: rk,
+          detail: 'cancelled while acquiring the snapshot',
+        });
+        return;
+      }
+      const onProgress = this.deps.onStatus
+        ? (phase: IndexJobPhase, detail?: string) =>
+            this.emitStatus({ type: 'phase', repositoryKey: rk, phase, detail })
+        : undefined;
+      const result = await this.deps.runWork({
+        target,
+        snapshot,
+        outcome,
+        config,
+        journal: this.deps.journal,
+        signal,
+        onProgress,
+      });
       this.log.info('index job completed', { repositoryKey: rk, kind: outcome.outcome });
+      // RUN-223: a work step that reports nothing (every existing no-op test double) still gets an
+      // honest `active` transition — the snapshot's own base is the best this class can derive on
+      // its own, and `generationId: 'unknown'` names exactly what it does not know rather than
+      // fabricating one.
+      this.emitStatus({
+        type: 'success',
+        repositoryKey: rk,
+        generationId: result?.generationId ?? 'unknown',
+        baseId: result?.baseId ?? snapshot.baseId,
+        batchesReceived: result?.batchesReceived ?? 0,
+      });
     } catch (err) {
       // A background subsystem's failure is logged, never thrown at whoever called `trigger` —
       // the same posture `orphanSweep`/`owedMergeReconciler` take on their own per-item work.
       this.log.error('index work step failed', { repositoryKey: rk, err: String(err) });
+      this.emitStatus({
+        type: 'failure',
+        repositoryKey: rk,
+        detail: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       // Locked decision 7: EVERY exit path releases — success, no-work, a thrown step, or
       // cancellation, all reach this `finally`. `releaseIndexSnapshot` is idempotent and refuses a

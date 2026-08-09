@@ -102,6 +102,11 @@ export interface UploadGenerationDeps {
    *  contract — called once, early, when the batch set fits under `maxStagedBytes`; never called
    *  otherwise, leaving the caller's own cleanup to release it once this function returns. */
   release: () => Promise<void>;
+  /** RUN-223's `server-validating` phase hook — called exactly once, right before `complete()`,
+   *  the one call that actually asks the server to validate this generation. Optional so every
+   *  existing caller (and every test) is unaffected; never called for a resume that finds the
+   *  server already reports `status: 'complete'` (there is nothing left to validate). */
+  onServerValidating?: () => void;
   signal: AbortSignal;
   /** The token-authorized ingest calls' own transport — defaults to global `fetch`, injectable
    *  for tests exactly like `openIngestUpload`'s own third parameter. */
@@ -321,6 +326,7 @@ export async function uploadGeneration(
     }
 
     ensureNotCancelled(deps.signal);
+    deps.onServerValidating?.();
     const completed = (await withRetry(() => upload.complete(), retry)) as IngestCompleteIndexResult;
 
     if (!completed.validation.ok) {

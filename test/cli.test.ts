@@ -1,10 +1,10 @@
 import { realpathSync } from 'node:fs';
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { invokedDirectly, run } from '../src/cli';
+import { invokedDirectly, renderIndexStatusText, run } from '../src/cli';
 import { VERSION } from '../src/version';
 import { buildIndexRepoFixture } from './fixtures/index-repo-fixtures';
 
@@ -60,6 +60,160 @@ describe('cli', () => {
     const text = out.join('\n');
     expect(text).toContain('index-repo');
     expect(text).toContain('--check-determinism');
+  });
+
+  it('help lists every RUN-223 command', async () => {
+    expect(await run(['help'])).toBe(0);
+    const text = out.join('\n');
+    for (const cmd of [
+      'index-status',
+      'index-reindex',
+      'index-retry',
+      'index-cancel',
+      'index-forget-journal',
+    ]) {
+      expect(text).toContain(cmd);
+    }
+  });
+});
+
+// RUN-223. Every test below is chosen to never touch the operator's real ~/.noriq: the local-only
+// checks (no opt-in, a missing repositoryKey, indexing off) all return before any file under
+// ~/.noriq is read or written, and the "no live daemon" checks only ever READ
+// ~/.noriq/index-control.json (harmless on a box with no runner daemon actually running, which is
+// this suite's own assumption throughout — no other test here starts one either).
+describe('index-status / index-reindex / index-retry / index-cancel / index-forget-journal (RUN-223)', () => {
+  let dir: string;
+
+  async function marker(body: string) {
+    await mkdir(path.join(dir, '.noriq'), { recursive: true });
+    await writeFile(path.join(dir, '.noriq', 'project.toml'), body);
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'noriq-cli-index-status-'));
+  });
+  afterEach(() => rm(dir, { recursive: true, force: true }));
+
+  it('index-status: a repo with no [index] table reports no-opt-in and exits 0 — answered locally', async () => {
+    await marker('key = "ACME"\n');
+    expect(await run(['index-status', '--path', dir])).toBe(0);
+    expect(out.join('\n')).toContain('no-opt-in');
+  });
+
+  it('index-status --json: no-opt-in is the whole (machine-checkable) body', async () => {
+    await marker('key = "ACME"\n');
+    expect(await run(['index-status', '--path', dir, '--json'])).toBe(0);
+    expect(JSON.parse(out.join('\n'))).toEqual({ state: 'no-opt-in' });
+  });
+
+  it('index-status: [index].enabled but no repositoryKey — exit 1, names the missing identity', async () => {
+    await marker('key = "ACME"\n\n[index]\nenabled = true\n');
+    expect(await run(['index-status', '--path', dir, '--server', 'https://noriq.test'])).toBe(1);
+    expect(err.join('\n')).toMatch(/repositoryKey/);
+  });
+
+  it('index-status: enabled + a canonical repositoryKey, no live daemon — exit 0, state unknown, never a synthesized present tense', async () => {
+    await marker('key = "ACME"\nrepositoryKey = "cli-test-repo-run223"\n\n[index]\nenabled = true\n');
+    expect(await run(['index-status', '--path', dir, '--server', 'https://noriq.test'])).toBe(0);
+    const text = out.join('\n');
+    expect(text).toContain('cli-test-repo-run223');
+    expect(text).toMatch(/no live daemon reachable|state: unknown/);
+  });
+
+  it('index-reindex: indexing OFF refuses locally, without ever asking a daemon', async () => {
+    await marker('key = "ACME"\nrepositoryKey = "cli-test-repo-run223"\n');
+    expect(await run(['index-reindex', '--path', dir, '--server', 'https://noriq.test'])).toBe(1);
+    expect(err.join('\n')).toMatch(/OFF/);
+  });
+
+  it('index-retry: same local OFF refusal as index-reindex (locked decision 7 — one function, two names)', async () => {
+    await marker('key = "ACME"\nrepositoryKey = "cli-test-repo-run223"\n');
+    expect(await run(['index-retry', '--path', dir, '--server', 'https://noriq.test'])).toBe(1);
+    expect(err.join('\n')).toMatch(/OFF/);
+  });
+
+  it('index-reindex: enabled, no live daemon — exit 1, plainly names the fix ("noriq-runner start")', async () => {
+    await marker('key = "ACME"\nrepositoryKey = "cli-test-repo-run223"\n\n[index]\nenabled = true\n');
+    expect(await run(['index-reindex', '--path', dir, '--server', 'https://noriq.test'])).toBe(1);
+    expect(err.join('\n')).toMatch(/noriq-runner start/);
+  });
+
+  it('index-cancel: no repositoryKey at all — exit 1, nothing to look up', async () => {
+    await marker('key = "ACME"\n');
+    expect(await run(['index-cancel', '--path', dir])).toBe(1);
+    expect(err.join('\n')).toMatch(/repositoryKey/);
+  });
+
+  it('index-cancel: a repositoryKey but no live daemon — exit 1, says so plainly', async () => {
+    await marker('key = "ACME"\nrepositoryKey = "cli-test-repo-run223"\n');
+    expect(await run(['index-cancel', '--path', dir])).toBe(1);
+    expect(err.join('\n')).toMatch(/nothing to cancel/);
+  });
+
+  it('index-forget-journal: no repositoryKey — exit 1 before touching any local store', async () => {
+    await marker('key = "ACME"\n');
+    expect(await run(['index-forget-journal', '--path', dir])).toBe(1);
+    expect(err.join('\n')).toMatch(/repositoryKey/);
+  });
+});
+
+// RUN-223 round 2: `renderIndexStatusText` pulled out as a pure function precisely so this case
+// (a `requiresUpgrade` record) is testable without a live daemon or a real ~/.noriq snapshot.
+describe('renderIndexStatusText — the requiresUpgrade distinction is visible without reading detail', () => {
+  it('an ordinary failed record renders with no [BLOCKED] marker', () => {
+    const text = renderIndexStatusText({
+      repositoryKey: 'my-repo',
+      server: 'https://noriq.test',
+      source: 'live daemon',
+      record: {
+        repositoryKey: 'my-repo',
+        state: 'failed',
+        stateSince: '2026-08-09T00:00:00.000Z',
+        detail: 'index cursor unavailable — network blip',
+        lastError: { message: 'network blip', at: '2026-08-09T00:00:00.000Z' },
+        lastSuccess: null,
+        indexerVersion: '1',
+        requiresUpgrade: false,
+      },
+      trigger: null,
+    });
+    expect(text).toContain('state: failed');
+    expect(text).not.toContain('BLOCKED');
+  });
+
+  it('a requiresUpgrade record renders an unmistakable marker on the state line itself', () => {
+    const text = renderIndexStatusText({
+      repositoryKey: 'my-repo',
+      server: 'https://noriq.test',
+      source: 'live daemon',
+      record: {
+        repositoryKey: 'my-repo',
+        state: 'failed',
+        stateSince: '2026-08-09T00:00:00.000Z',
+        detail:
+          'UPGRADE REQUIRED — active generation was built by indexer version 2, newer than this daemon’s 1',
+        lastError: { message: 'upgrade required', at: '2026-08-09T00:00:00.000Z' },
+        lastSuccess: null,
+        indexerVersion: '1',
+        requiresUpgrade: true,
+      },
+      trigger: null,
+    });
+    const stateLine = text.split('\n').find((l) => l.startsWith('state:'));
+    expect(stateLine).toContain('BLOCKED');
+    expect(stateLine).toContain('do not retry');
+  });
+
+  it('no observation at all renders "unknown" — never a synthesized present tense', () => {
+    const text = renderIndexStatusText({
+      repositoryKey: 'my-repo',
+      server: 'https://noriq.test',
+      source: 'no live daemon reachable (no-daemon) — showing the last local snapshot, if any',
+      record: null,
+      trigger: null,
+    });
+    expect(text).toContain('state: unknown');
   });
 });
 

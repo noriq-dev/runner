@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { IndexJournal, IndexJournalKey } from './index-journal';
+import type { IndexJournal, IndexJournalEntry, IndexJournalKey } from './index-journal';
 
 /**
  * Local, disposable staging for a generation's encoded batches (RUN-221 locked decision 6): the
@@ -111,4 +111,29 @@ export async function sweepOrphanedStaging(
     removed.push(entry);
   }
   return { removed };
+}
+
+/**
+ * `forget-local-journal` (RUN-223)'s whole implementation — deliberately a small, injectable
+ * library function rather than logic inlined into `cli.ts`'s command handler, the same reason
+ * `sweepOrphanedStaging` above is one: a command that mutates `~/.noriq/` state needs a seam a
+ * test can point at a temp directory, never the operator's own machine.
+ *
+ * Clears every journal entry `match` selects, plus that entry's staged bytes — and NOTHING else.
+ * Locked decision 5, restated at its one call site: this function's own signature is the proof —
+ * it takes no `NoriqClient`, no `fetch`, no server dependency of any kind, so there is no code
+ * path inside it that could reach the server even by accident. Returns the count forgotten, so the
+ * caller (this daemon's CLI) can say precisely what it did rather than a bare "done".
+ */
+export async function forgetMatchingGenerations(
+  journal: Pick<IndexJournal, 'list' | 'forget'>,
+  staging: Pick<StagingStore, 'clear'>,
+  match: (entry: IndexJournalEntry) => boolean,
+): Promise<number> {
+  const entries = (await journal.list()).filter(match);
+  for (const entry of entries) {
+    await journal.forget(entry);
+    await staging.clear(entry);
+  }
+  return entries.length;
 }

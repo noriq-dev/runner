@@ -18,6 +18,11 @@ export const COMMANDS = [
   'start',
   'discover',
   'index-repo',
+  'index-status',
+  'index-reindex',
+  'index-retry',
+  'index-cancel',
+  'index-forget-journal',
   'index-selftest',
   'config',
   'completion',
@@ -44,6 +49,11 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
   auth: ['--server', '--browser', '--device'],
   'init-project': ['--advanced'],
   'index-repo': ['--path', '--force', '--json', '--limit', '--show-content', '--check-determinism'],
+  'index-status': ['--path', '--server', '--json'],
+  'index-reindex': ['--path', '--server'],
+  'index-retry': ['--path', '--server'],
+  'index-cancel': ['--path', '--server'],
+  'index-forget-journal': ['--path', '--server'],
 };
 
 /**

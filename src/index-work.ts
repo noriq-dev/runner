@@ -1,5 +1,5 @@
 import type { NoriqClient } from './client';
-import type { IndexWorkContext, IndexWorkStep } from './index-coordinator';
+import type { IndexWorkContext, IndexWorkResult, IndexWorkStep } from './index-coordinator';
 import { buildIndexAdapterRegistry } from './index-registry';
 import { type StagingStore, fileStagingStore } from './index-stage';
 import { uploadGeneration } from './index-upload';
@@ -76,7 +76,7 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
   const staging = deps.staging ?? fileStagingStore();
   const log = deps.logger ?? defaultLogger;
 
-  return async (ctx: IndexWorkContext): Promise<void> => {
+  return async (ctx: IndexWorkContext): Promise<IndexWorkResult> => {
     const { target, snapshot, config, journal, signal } = ctx;
 
     // Defensive, not reachable in the ordinary path: `reconcile` never yields `incremental`/`full`
@@ -89,6 +89,10 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       );
     }
 
+    // RUN-223 locked decision 4: this is the only code that knows when parsing genuinely starts —
+    // reporting it any earlier (say, from the coordinator, before the snapshot lease) would be a
+    // guess about how long leasing takes rather than an observation of parsing itself.
+    ctx.onProgress?.('parsing');
     const { registry } = buildIndexAdapterRegistry(config);
     const indexed = await runIndexer(
       snapshot.source,
@@ -119,6 +123,12 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       generationId: indexed.manifest.generationId,
     };
 
+    // RUN-223: batching/staging/network calls all live inside `uploadGeneration` below, so
+    // "uploading" starts here, before that call — the only phase this module can time from the
+    // outside (the finer `server-validating` moment lives INSIDE `uploadGeneration`, at its own
+    // `complete()` call, which is why that function takes its own `onServerValidating` hook rather
+    // than this module trying to time it from out here).
+    ctx.onProgress?.('uploading', `${indexed.batches.length} batch(es)`);
     const vcs = deps.vcsFor(target.repoRoot);
     const outcome = await uploadGeneration(
       {
@@ -135,6 +145,7 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
         // `releaseIndexSnapshot`, bound to the snapshot THIS job leased, never a bare method
         // reference — `uploadGeneration` calls it with no arguments.
         release: () => vcs.releaseIndexSnapshot(snapshot),
+        onServerValidating: () => ctx.onProgress?.('server-validating'),
         signal,
         logger: log,
         maxStagedBytes: deps.maxStagedBytes,
@@ -151,5 +162,7 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
             : outcome.detail;
       throw new Error(`index upload did not complete (${outcome.reason}): ${detail}`);
     }
+
+    return { generationId: key.generationId, baseId: key.baseId, batchesReceived: outcome.batchesReceived };
   };
 }
