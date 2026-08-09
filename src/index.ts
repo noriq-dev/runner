@@ -29,13 +29,27 @@ export {
 export { isDeniedIndexPath } from './index-deny';
 export {
   MAX_STATUS_RECORDS,
+  scanIndexSource,
   scanRepoForIndex,
   type IndexFileCandidate,
+  type IndexFileCandidateFull,
+  type IndexFileCandidateMetadata,
   type IndexScanDeps,
   type IndexScanResult,
   type IndexStatusReason,
   type IndexStatusRecord,
 } from './index-scan';
+export {
+  FakeIndexSource,
+  FilesystemIndexSource,
+  type FakeIndexSourceItem,
+  type FakeIndexSourceReadOverrides,
+  type IndexSource,
+  type IndexSourceEntry,
+  type IndexSourceListItem,
+  type IndexSourceReadOutcome,
+  type IndexSourceRefusalReason,
+} from './index-source';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,

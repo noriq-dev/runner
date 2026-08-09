@@ -1,86 +1,102 @@
 import { createHash } from 'node:crypto';
-import type { Dirent } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
-import path from 'node:path';
 import { isDeniedIndexPath } from './index-deny';
 import type { ResolvedIndexConfig } from './index-policy';
-import { openConfined } from './repo-context';
+import { FilesystemIndexSource } from './index-source';
+import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason } from './index-source';
 
 /**
- * Confined file discovery + bounded reads for Project Memory's indexer (RUN-209).
+ * Source-independent POLICY for Project Memory's indexer (RUN-209, split from its enumeration in
+ * RUN-252): include/exclude, the hard sensitive-file deny list, every bound, binary detection, the
+ * content hash, `contentMode`, and the closed status-reason vocabulary. None of it knows or asks
+ * where a candidate's bytes came from — that is `index-source.ts`'s `IndexSource` interface, and
+ * this module consumes exactly two methods off it (`list`, `read`) plus nothing else.
  *
- * This is the boundary a repo's `[index].include`/`.exclude` gets read through, so it is written
- * to be reviewed as a security artifact: read `index-deny.ts` first, then the pipeline below.
+ * This split exists because `index-scan.ts` used to take a filesystem directory directly, so every
+ * backend needing indexing had to MATERIALIZE a full tree before a single byte could be filtered —
+ * fine for git, ruinous for a deliberately-large Perforce depot, and it is why RUN-211 shipped
+ * `unsupported` for both live backends: the capability hole was in this file, not in either
+ * backend. `scanIndexSource` is what any future source runs through; `scanRepoForIndex` is the
+ * thin filesystem wrapper this task is REQUIRED to keep byte-for-byte identical (RUN-209's own
+ * audited security surface, and the evidence behind THREAT-MODEL.md's rows for it) — read
+ * `index-source.ts`'s module doc first for what moved there and why, then this file for what
+ * stayed.
  *
- * **The pipeline, and why the order is fixed** (locked decision 2): for every path this walk
- * reaches, enumerate → include filter → exclude filter → HARD DENY → per-file bounds →
- * `openConfined` → regular-file/binary check → hash + status record. An `include` glob can never
+ * **The pipeline, and why the order is fixed** (locked decision 1, unchanged from RUN-209): for
+ * every entry a source offers, enumerate → include filter → exclude filter → HARD DENY → per-file
+ * bounds → read → regular-file/binary check → hash + status record. An `include` glob can never
  * re-admit a denied path because the deny check runs strictly after it and takes no input that
  * could override it. "Non-overridable" has to be a property of the ORDER, not of a comment saying
- * so — a deny consulted before include is a deny an include can undo.
+ * so — and now also a property of WHO gets asked: a source is never handed the deny list or the
+ * include/exclude globs, so it cannot re-implement this filter even by accident, and the deny list
+ * holds for every source alike rather than only for the ones that remembered it (RUN-158's shape).
  *
- * **Confinement lives in exactly one place.** Every byte this module reads goes through
- * `openConfined` (RUN-151) — open first, then require the re-resolved path inside the re-resolved
- * root AND the same inode as the held descriptor. This file never stats a path and then opens it
- * as the confinement decision: the pre-open checks below (aggregate file/byte/time budgets) read
- * only this walk's OWN counters, never the filesystem, so `openConfined` stays the sole place a
- * path is trusted. The one filesystem call this module makes on a path we do not yet trust is
- * `readdir` on a REAL directory (never a symlinked one — see the walk loop below) purely to learn
- * what is inside it; nothing is read from what it lists until that entry has separately earned an
- * `openConfined` call of its own.
+ * **The hard deny list is directory-aware here, not source-aware.** RUN-209's walk pruned a whole
+ * denied directory (`.git`, `.ssh`, …) to ONE status record by never recursing into it — a
+ * filesystem-walk optimisation this file can no longer perform, because a source's enumeration is
+ * opaque to this layer (locked decision 1: this file never asks a source to skip anything). The
+ * SAME one-record-per-denied-directory outcome is reproduced instead by walking each candidate's
+ * own ANCESTOR path segments against `isDeniedIndexPath` and remembering which ancestor prefixes
+ * were already reported (`classifyDenial` below) — the record count a test asserts is unchanged,
+ * but the WALK cost is not: a source that enumerates a huge denied subtree (a `.git` with
+ * thousands of loose objects) is now fully enumerated before any of it is pruned, where the old
+ * filesystem walk skipped the `readdir` entirely. Accepted: uniform deny enforcement across every
+ * source outranks this one directory-walk shortcut, and nothing measures or asserts the walk cost.
  *
- * **Directories are never candidates and directory symlinks are never followed** (locked decision
- * 8). `readdir`'s `Dirent.isDirectory()` reports the entry's OWN type, never a symlink target's —
- * so the walk only recurses into REAL directories, and a symlink (to a file, a directory, a FIFO,
- * anything) is always treated as a single leaf candidate, never as something to `readdir` again.
- * That single rule is what keeps a directory symlink out of the recursion, in or out of the root,
- * without this file needing its own realpath-based containment check to prune it — `openConfined`
- * already refuses a directory symlink pointing OUTSIDE the root before it even asks whether the
- * target is a file (its containment check runs before its regular-file check), and refuses one
- * pointing INSIDE the root once it discovers the target is not a regular file. Both refusals
- * happen for free at the one place a path is actually opened.
+ * **Determinism is this file's job, not a source's** (locked decision 4). `list()` may yield in any
+ * order — `FakeIndexSource`'s tests deliberately scramble it — so this file drains every entry,
+ * sorts by repository-relative path (plain code-unit comparison, not locale-aware: a sort whose
+ * result depends on ICU data is not reproducible across machines), and only THEN applies bounds.
+ * That ordering choice is what makes `stoppedEarly`'s "prefix of the repo" meaningful across two
+ * runs of the SAME snapshot — an idempotency key built from (project, repo, branch, baseId,
+ * indexer version, batch number) only means anything if two runs split the same tree the same way.
+ * The cost is real: a source's enumeration is drained in FULL before a `maxFiles`/`maxTotalBytes`
+ * bound can stop anything, where the old filesystem-only walk stopped enumerating the moment a
+ * bound tripped. Prioritising a deterministic admitted PREFIX over an early-stopped enumeration is
+ * the trade locked decision 4 asks for, not a shortcut taken here.
  *
  * **This module does no parsing.** It yields file identity, size, a content hash, a status, and —
- * gated by `contentMode` — content: never language detection or entity extraction (Phase 3's job,
- * deliberately deferred so the confinement boundary is reviewable on its own, without tree-sitter
- * in the same diff).
+ * gated by `contentMode` — content: never language detection or entity extraction (Phase 3's job).
  *
  * **`contentMode: 'metadata'` withholds source text, not the read itself** (RUN-209 follow-up,
- * closing the gap RUN-210 documented rather than fixed): the file is still opened through
- * `openConfined`, still bounded and binary-sniffed exactly as `'full'` mode reads it, and the hash
- * still covers the same bytes — citation verification (a later phase) compares hashes, and a hash
- * is a fact about bytes, never the bytes themselves. Only the decoded string is dropped before it
- * ever reaches an `IndexFileCandidate`. Which mode produced a candidate is carried ON the
- * candidate (`contentMode`), not left for a reader to re-derive from the config that made it —
- * `content` is typed `null` on the `'metadata'` branch, so "no content" and "content withheld by
- * policy" cannot be confused the way a bare nullable field would invite.
+ * locked decision 6): the candidate is still read and hashed exactly as `'full'` mode reads it —
+ * citation verification (a later phase) compares hashes, and a hash is a fact about bytes, never
+ * the bytes themselves. Only the decoded string is dropped before it ever reaches an
+ * `IndexFileCandidate`, and which mode produced a candidate is carried ON the candidate
+ * (`contentMode`), not left for a reader to re-derive from the config that made it.
  *
- * **Binary detection is content-based**, never extension-based (locked decision 9): a NUL byte or
- * invalid UTF-8 in a bounded prefix, so a `.ts` file that is actually a binary blob is reported
- * `binary` rather than shipped as source because its name looked textual.
+ * **The content hash is OUR hash, one algorithm for every source** (locked decision 3). SHA-256
+ * over the raw bytes THIS module read, never a source-native digest (Perforce's own `digest`, an
+ * API blob's `sha`) — `IndexSource.digest`'s doc carries the full reasoning: citation verification
+ * compares an indexed hash against a live worktree hashed the same way, and a source's own digest
+ * algorithm is not guaranteed to agree with it.
+ *
+ * **Binary detection is content-based**, never extension-based: a NUL byte or invalid UTF-8 in a
+ * bounded prefix, so a `.ts` file that is actually a binary blob is reported `binary` rather than
+ * shipped as source because its name looked textual.
  *
  * **`[index].enabled` is re-asserted here** (locked decision 10), not only trusted from the
  * caller: `config: null` — which is exactly what `resolveIndexConfig` returns for every OFF or
- * invalid `[index]` — makes this function open nothing at all and return immediately.
+ * invalid `[index]` — makes `scanIndexSource` touch the source at all and return immediately.
  *
- * **What this module deliberately does NOT cover.** It takes `root` as trusted input, exactly as
- * `openConfined`'s own doc note requires: this is never re-derived from a manifest field, an env
- * var, or `process.cwd()`, and it makes no VCS call of its own (RUN-211 supplies a snapshot root
- * through this same parameter later — the seam is left that shape on purpose). It performs no
- * upper-bound clamp on the CONFIG VALUES themselves (`maxFileBytes`, `maxTotalBytes`, …) beyond
- * what `index-policy.ts` already validates — those are committed execution knobs, trusted at the
- * same level `[verify]`'s command already is, and an operator who commits an absurd bound gets the
- * cost of that bound, the same way a huge `[context]` file already costs `defaultDocReader` a
- * bounded-but-real read. An attacker who can already write to the checkout as the operator can
- * hardlink or bind-mount an outside file onto a genuinely in-repo path — `openConfined`'s own
- * comment names this limit and it applies here unchanged: that attacker is already inside the
- * boundary this module defends.
+ * **A source's read refusal maps onto the existing closed status-reason enum** (locked decision
+ * 7), via `mapSourceRefusal` below — never a second vocabulary. `IndexSource`'s own doc names why
+ * its refusal union is deliberately smaller than this one: extend `IndexStatusReason` (and this
+ * mapping, in the same change) only for a genuinely new outcome no existing reason already covers.
+ *
+ * **What this module deliberately does NOT cover.** Confinement — the filesystem source's own
+ * TOCTOU defense — lives entirely in `index-source.ts`'s `FilesystemIndexSource`; this file never
+ * opens a path itself and has no filesystem-specific knowledge at all. Every other source must
+ * state its OWN containment guarantee in its own doc comment (locked decision 2) — this file has
+ * no way to check one, and demanding a uniform mechanism here would be the same cargo-culting
+ * `index-source.ts`'s module doc explains for why `openConfined`'s specific technique does not
+ * generalise.
  */
 
 /** Why a candidate path did not become an indexed file, or why the walk stopped early. Closed —
- *  extend it here, in code, never by a caller inventing a new string (locked decision 6: silence
- *  is never an outcome, so every reason a byte was NOT read has to have a name in this list). */
+ *  extend it here, in code, never by a caller inventing a new string (locked decision 6 [RUN-209
+ *  numbering]: silence is never an outcome, so every reason a byte was NOT read has to have a name
+ *  in this list). A source's own refusal vocabulary (`IndexSourceRefusalReason`) is deliberately
+ *  smaller and maps onto a subset of this one — see `mapSourceRefusal`. */
 export type IndexStatusReason =
   | 'denied'
   | 'excluded'
@@ -106,14 +122,10 @@ interface IndexFileCandidateCommon {
   path: string;
   bytes: number;
   /**
-   * SHA-256 over the RAW bytes (not the decoded string), hex-encoded. Picked once, per the
-   * execution spec's discretion note, and not to be changed casually: later phases (citation
-   * verification) compare these hashes, so a silent algorithm swap would silently invalidate
-   * every citation minted before it. Hashing the raw bytes rather than the decoded string keeps
-   * the digest platform-stable — a decode/re-encode round trip is one more place two platforms
-   * could disagree about a byte that never actually changed. Produced in EVERY `contentMode`,
-   * because a hash is not source text — it is the fact citation verification needs, and
-   * `'metadata'` mode exists to withhold the latter while still allowing the former.
+   * SHA-256 over the RAW bytes (not the decoded string), hex-encoded — see the module doc's
+   * "content hash" note for why this is fixed to one algorithm regardless of source. Produced in
+   * EVERY `contentMode`, because a hash is not source text — it is the fact citation verification
+   * needs, and `'metadata'` mode exists to withhold the latter while still allowing the former.
    */
   contentHash: string;
 }
@@ -142,8 +154,8 @@ export interface IndexScanResult {
   /** Bounded (`MAX_STATUS_RECORDS`) — see `statusOverflow` for what did not fit. */
   statuses: IndexStatusRecord[];
   /** How many additional status records were refused beyond the cap. An unbounded status list is
-   *  the same OOM as an unbounded read, one level up (locked decision 7) — a cap with a visible
-   *  count is bounded AND honest, which a cap alone is not. */
+   *  the same OOM as an unbounded read, one level up (locked decision 7 [RUN-209 numbering]) — a
+   *  cap with a visible count is bounded AND honest, which a cap alone is not. */
   statusOverflow: number;
   /** Files actually opened (successfully or not) — the number `maxFiles` bounds. */
   filesOpened: number;
@@ -156,23 +168,13 @@ export interface IndexScanResult {
   stoppedEarly: boolean;
 }
 
-/** Retained status records before overflow starts being counted instead of stored. A repo that
- *  turns on indexing without excluding a large non-source tree can otherwise refuse thousands of
- *  individual files — directory-level deny pruning (see the walk loop) keeps a whole denied
- *  subtree to ONE record, but `excluded`/`not-included` still accrue per file, so this still needs
- *  its own ceiling. 1000 is generous for an ordinary repo's worth of refusals and still bounded
- *  for a pathological one. */
+/** Retained status records before overflow starts being counted instead of stored. See RUN-209's
+ *  original rationale (still holds): 1000 is generous for an ordinary repo's worth of refusals and
+ *  still bounded for a pathological one. */
 export const MAX_STATUS_RECORDS = 1000;
 
-/** Real directories can never cycle (only a symlink can, and this walk never follows one into a
- *  `readdir`), so this is a courtesy against a pathologically deep tree, not a correctness
- *  requirement — generous enough that no ordinary repo ever reaches it. */
-const MAX_WALK_DEPTH = 64;
-
 /** How much of a candidate's bytes are sniffed for binary content — the same order of magnitude
- *  git's own "contains a NUL in the first 8000 bytes" heuristic uses. A prefix, not the whole
- *  file: a legitimately huge text file should not pay a full-file UTF-8 validation just to answer
- *  a yes/no question the first few KB already answer. */
+ *  git's own "contains a NUL in the first 8000 bytes" heuristic uses. */
 const BINARY_SNIFF_BYTES = 8_000;
 
 export interface IndexScanDeps {
@@ -180,7 +182,7 @@ export interface IndexScanDeps {
   now?: () => number;
 }
 
-interface WalkState {
+interface ScanState {
   candidates: IndexFileCandidate[];
   statuses: IndexStatusRecord[];
   statusOverflow: number;
@@ -191,9 +193,12 @@ interface WalkState {
   stop: boolean;
   includeRe: RegExp[];
   excludeRe: RegExp[];
+  /** Ancestor directory prefixes already reported as `denied` — see the module doc's "hard deny
+   *  list is directory-aware" note. Keyed on the exact prefix string `classifyDenial` computed. */
+  deniedPrefixes: Set<string>;
 }
 
-function pushStatus(state: WalkState, relPath: string, reason: IndexStatusReason, detail?: string): void {
+function pushStatus(state: ScanState, relPath: string, reason: IndexStatusReason, detail?: string): void {
   if (state.statuses.length < MAX_STATUS_RECORDS) {
     state.statuses.push(detail === undefined ? { path: relPath, reason } : { path: relPath, reason, detail });
   } else {
@@ -201,20 +206,12 @@ function pushStatus(state: WalkState, relPath: string, reason: IndexStatusReason
   }
 }
 
-function deadlinePassed(state: WalkState, deadlineMs: number): boolean {
+function deadlinePassed(state: ScanState, deadlineMs: number): boolean {
   return state.now() - state.startedAt >= deadlineMs;
 }
 
 // ---------------------------------------------------------------------------
-// Glob matching (discretion: a small dependency-free matcher).
-//
-// Case-SENSITIVE, unlike index-deny.ts's deliberately case-insensitive match — these are
-// user-authored globs against real filesystem paths, which are case-sensitive on the platforms
-// this daemon targets in practice (Linux). Containment is never decided here: a glob can name
-// anything it likes, including an absolute path or a `..`-laden one, and the worst it can do is
-// match NOTHING, because every candidate this matches against is already a repository-relative
-// path with no leading `/` and no `..` segment — see the walk loop, which builds relative paths
-// by hand rather than resolving them from a glob.
+// Glob matching (discretion: a small dependency-free matcher, unchanged from RUN-209).
 // ---------------------------------------------------------------------------
 
 function globToRegExp(glob: string): RegExp {
@@ -254,12 +251,11 @@ function matchesAny(patterns: RegExp[], relPath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Binary detection (content-based, locked decision 9).
+// Binary detection (content-based, unchanged from RUN-209).
 // ---------------------------------------------------------------------------
 
 /** Drop a trailing UTF-8 sequence that the sniff window cut in the middle of, so a prefix boundary
- *  landing mid-character is never mistaken for invalid encoding — the same "don't let the boundary
- *  lie" concern `repo-context.ts`'s `defaultDocReader` documents for its own byte/character cut. */
+ *  landing mid-character is never mistaken for invalid encoding. */
 function trimIncompleteUtf8Tail(buf: Buffer): Buffer {
   let cut = buf.length;
   let back = 0;
@@ -291,50 +287,100 @@ function looksBinary(buf: Buffer): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded read (mirrors `defaultDocReader`'s "read limit+1 to detect the cut" trick, in bytes
-// rather than characters — there is no multi-byte-character subtlety here because the bound is a
-// byte bound to begin with).
+// The hard deny list, applied ancestor-first so a whole denied directory still collapses to one
+// status record (see the module doc) — the ONLY place `isDeniedIndexPath` is called.
 // ---------------------------------------------------------------------------
 
-async function readBounded(fh: FileHandle, maxBytes: number): Promise<{ buf: Buffer; overLimit: boolean }> {
-  const want = maxBytes + 1;
-  const buf = Buffer.alloc(want);
-  let filled = 0;
-  for (;;) {
-    const { bytesRead } = await fh.read(buf, filled, want - filled, filled);
-    if (bytesRead === 0) break; // genuine EOF
-    filled += bytesRead;
-    if (filled >= want) break;
+type DenyOutcome = { path: string; reason: string } | 'suppressed' | null;
+
+/**
+ * Walk `relPath`'s ANCESTOR segments (never the leaf itself, first pass) against the deny list; the
+ * first denied ancestor is reported ONCE per prefix (`seen` dedupes it for every deeper path under
+ * it), reproducing the old walk's directory-pruning record count without the walk. A leaf that is
+ * itself denied (a basename pattern, an exact tail) with no denied ancestor is checked last and
+ * reported on its own path — those never collide across files, so no dedup applies to them.
+ */
+function classifyDenial(relPath: string, seen: Set<string>): DenyOutcome {
+  const segs = relPath.split('/');
+  let prefix = '';
+  for (let i = 0; i < segs.length - 1; i++) {
+    prefix = prefix ? `${prefix}/${segs[i]}` : segs[i]!;
+    if (seen.has(prefix)) return 'suppressed';
+    const reason = isDeniedIndexPath(prefix);
+    if (reason) {
+      seen.add(prefix);
+      return { path: prefix, reason };
+    }
   }
-  return filled > maxBytes
-    ? { buf: buf.subarray(0, maxBytes), overLimit: true }
-    : { buf: buf.subarray(0, filled), overLimit: false };
+  const reason = isDeniedIndexPath(relPath);
+  return reason ? { path: relPath, reason } : null;
 }
 
-/** Map an `openConfined` refusal to a status reason. The swap-race message (inode identity
- *  mismatch) is folded into `outside-root`: once a descriptor's identity cannot be trusted, this
- *  reader makes no claim about what it would have read, which is exactly what `outside-root`
- *  already means for every other containment refusal here. */
-function classifyOpenError(err: unknown): { reason: IndexStatusReason; detail: string } {
-  const detail = err instanceof Error ? err.message : String(err);
-  if (/outside the repo/.test(detail)) return { reason: 'outside-root', detail };
-  if (/path changed while opening it/.test(detail)) return { reason: 'outside-root', detail };
-  if (/not a regular file/.test(detail)) return { reason: 'not-a-file', detail };
-  return { reason: 'unreadable', detail };
+// ---------------------------------------------------------------------------
+// Mapping a source's small refusal vocabulary onto the one closed status enum (locked decision 7).
+// An exhaustive switch, deliberately with no default: adding a reason to
+// `IndexSourceRefusalReason` without updating this mapping is a compile error, not a silent gap.
+// ---------------------------------------------------------------------------
+
+function mapSourceRefusal(reason: IndexSourceRefusalReason): IndexStatusReason {
+  switch (reason) {
+    case 'outside-root':
+      return 'outside-root';
+    case 'not-a-file':
+      return 'not-a-file';
+    case 'not-found':
+      return 'unreadable';
+    case 'unreadable':
+      return 'unreadable';
+  }
 }
 
-async function evaluateCandidate(
-  absPath: string,
-  relPath: string,
-  root: string,
+// ---------------------------------------------------------------------------
+// Enumeration: drain a source's (possibly unordered) list into a deterministically-sorted array of
+// candidates, recording any enumeration-level refusal directly (locked decision 4).
+// ---------------------------------------------------------------------------
+
+function byPath(a: IndexSourceEntry, b: IndexSourceEntry): number {
+  return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+}
+
+async function collectEntries(
+  source: IndexSource,
   config: ResolvedIndexConfig,
-  state: WalkState,
-): Promise<void> {
-  if (state.stop) return;
+  state: ScanState,
+): Promise<IndexSourceEntry[]> {
+  const entries: IndexSourceEntry[] = [];
+  for await (const item of source.list()) {
+    if (state.stop) break;
+    // The wall-clock circuit breaker also bounds ENUMERATION, not only the per-file pipeline below
+    // — a source whose listing alone is slow (a huge paginated depot) must not be able to outrun
+    // the deadline before a single bound gets a chance to apply.
+    if (deadlinePassed(state, config.readDeadlineMs)) {
+      pushStatus(state, '.', 'deadline-exceeded');
+      state.stop = true;
+      break;
+    }
+    if (item.kind === 'refused') {
+      pushStatus(state, item.path, mapSourceRefusal(item.reason), item.detail);
+      continue;
+    }
+    entries.push(item.entry);
+  }
+  return entries;
+}
 
-  // Wall-clock circuit breaker, checked before spending any more work on this candidate — this is
-  // deliberately OUTSIDE the include/exclude/deny/bounds pipeline decision 2 names: it is a
-  // time-box on the WALK itself, not a per-file admission decision.
+// ---------------------------------------------------------------------------
+// The per-file pipeline: include → exclude → HARD DENY → bounds → read → binary → hash → status.
+// ---------------------------------------------------------------------------
+
+async function evaluateEntry(
+  source: IndexSource,
+  entry: IndexSourceEntry,
+  config: ResolvedIndexConfig,
+  state: ScanState,
+): Promise<void> {
+  const relPath = entry.path;
+
   if (deadlinePassed(state, config.readDeadlineMs)) {
     pushStatus(state, relPath, 'deadline-exceeded');
     state.stop = true;
@@ -349,16 +395,17 @@ async function evaluateCandidate(
     pushStatus(state, relPath, 'excluded');
     return;
   }
-  const denyReason = isDeniedIndexPath(relPath);
-  if (denyReason) {
-    pushStatus(state, relPath, 'denied', denyReason);
+
+  const denial = classifyDenial(relPath, state.deniedPrefixes);
+  if (denial === 'suppressed') return;
+  if (denial) {
+    pushStatus(state, denial.path, 'denied', denial.reason);
     return;
   }
 
-  // Aggregate bounds — read from this walk's OWN counters, never the filesystem, so
-  // `openConfined` below stays the only path-based check in this pipeline (see the module
-  // comment). Once either trips, the WHOLE walk stops: continuing would just re-derive the same
-  // exhausted-budget answer for every remaining file at real filesystem cost.
+  // Aggregate bounds — read from this scan's OWN counters, never a source call. Once either
+  // trips, the WHOLE scan stops: continuing would just re-derive the same exhausted-budget answer
+  // for every remaining entry at real read cost.
   if (state.filesOpened >= config.maxFiles) {
     pushStatus(state, relPath, 'budget-exhausted', `max file count (${config.maxFiles}) reached`);
     state.stop = true;
@@ -370,116 +417,62 @@ async function evaluateCandidate(
     return;
   }
 
-  let fh: FileHandle;
-  try {
-    fh = await openConfined(absPath, root);
-  } catch (err) {
-    const { reason, detail } = classifyOpenError(err);
-    pushStatus(state, relPath, reason, detail);
+  // A source that reports size cheaply lets an oversized file be refused WITHOUT a read at all —
+  // real savings on a source where `read` means a network round trip. A source that cannot (the
+  // filesystem source deliberately does not — see its doc) falls through to the read below, whose
+  // own `overLimit` signal catches it exactly as it always has (proven by the `no size` acceptance
+  // case using `FakeIndexSource`).
+  if (entry.size !== undefined && entry.size > config.maxFileBytes) {
+    pushStatus(
+      state,
+      relPath,
+      'too-large',
+      `exceeds the ${config.maxFileBytes}-byte bound (reported size ${entry.size})`,
+    );
+    return;
+  }
+
+  const outcome = await source.read(relPath, config.maxFileBytes);
+  if (!outcome.ok) {
+    pushStatus(state, relPath, mapSourceRefusal(outcome.reason), outcome.detail);
     return;
   }
   state.filesOpened += 1;
-  try {
-    const { buf, overLimit } = await readBounded(fh, config.maxFileBytes);
-    if (overLimit) {
-      pushStatus(state, relPath, 'too-large', `exceeds the ${config.maxFileBytes}-byte bound`);
-      return;
-    }
-    if (looksBinary(buf)) {
-      pushStatus(state, relPath, 'binary');
-      return;
-    }
-    state.totalBytesRead += buf.length;
-    const contentHash = createHash('sha256').update(buf).digest('hex');
-    state.candidates.push(
-      config.contentMode === 'full'
-        ? {
-            path: relPath,
-            bytes: buf.length,
-            content: buf.toString('utf8'),
-            contentHash,
-            contentMode: 'full',
-          }
-        : { path: relPath, bytes: buf.length, content: null, contentHash, contentMode: 'metadata' },
-    );
-  } catch (err) {
-    // A read failure after a successful open (EIO, the file vanishing mid-read, …) — bounded and
-    // reported, never fatal to the rest of the scan.
-    pushStatus(state, relPath, 'unreadable', err instanceof Error ? err.message : String(err));
-  } finally {
-    await fh.close().catch(() => {});
-  }
-}
-
-async function walk(
-  dirAbs: string,
-  dirRel: string,
-  root: string,
-  config: ResolvedIndexConfig,
-  state: WalkState,
-  depth: number,
-): Promise<void> {
-  if (state.stop || depth > MAX_WALK_DEPTH) return;
-  if (deadlinePassed(state, config.readDeadlineMs)) {
-    pushStatus(state, dirRel || '.', 'deadline-exceeded');
-    state.stop = true;
+  if (outcome.overLimit) {
+    pushStatus(state, relPath, 'too-large', `exceeds the ${config.maxFileBytes}-byte bound`);
     return;
   }
-
-  let entries: Dirent[];
-  try {
-    entries = await readdir(dirAbs, { withFileTypes: true });
-  } catch (err) {
-    pushStatus(state, dirRel || '.', 'unreadable', err instanceof Error ? err.message : String(err));
+  if (looksBinary(outcome.bytes)) {
+    pushStatus(state, relPath, 'binary');
     return;
   }
-  // Stable order so a capped status list and a bounded walk both behave predictably run to run.
-  entries.sort((a, b) => a.name.localeCompare(b.name));
-
-  for (const dirent of entries) {
-    if (state.stop) return;
-    const childAbs = path.join(dirAbs, dirent.name);
-    // Built by hand with `/`, never `path.join`+split — `dirent.name` is always one segment, so
-    // this is POSIX-spelled by construction on every platform, the same reasoning
-    // `repo-context.ts`'s `repoRelative` gives for why the separator cannot be the host's.
-    const childRel = dirRel ? `${dirRel}/${dirent.name}` : dirent.name;
-
-    if (dirent.isDirectory()) {
-      // A REAL directory — `Dirent.isDirectory()` reports the entry's own type, never a symlink
-      // target's, so this branch can only be reached by something `readdir` itself walked into,
-      // never by following a link (locked decision 8's actual mechanism; see the module comment).
-      const denyReason = isDeniedIndexPath(childRel);
-      if (denyReason) {
-        // Prune rather than recurse-and-deny-each-file: nothing under a hard-denied directory can
-        // ever be admitted, so enumerating it just to deny every entry one at a time would only
-        // spend the status-record cap (and real time) on a foregone conclusion.
-        pushStatus(state, childRel, 'denied', denyReason);
-        continue;
-      }
-      await walk(childAbs, childRel, root, config, state, depth + 1);
-      continue;
-    }
-
-    // Anything else — a regular file, or ANY symlink regardless of what it targets — is a single
-    // leaf candidate, never something to `readdir` again. `openConfined` is what actually decides
-    // its fate (outside-root, not-a-file, or admitted).
-    await evaluateCandidate(childAbs, childRel, root, config, state);
-  }
+  state.totalBytesRead += outcome.bytes.length;
+  const contentHash = createHash('sha256').update(outcome.bytes).digest('hex');
+  state.candidates.push(
+    config.contentMode === 'full'
+      ? {
+          path: relPath,
+          bytes: outcome.bytes.length,
+          content: outcome.bytes.toString('utf8'),
+          contentHash,
+          contentMode: 'full',
+        }
+      : { path: relPath, bytes: outcome.bytes.length, content: null, contentHash, contentMode: 'metadata' },
+  );
 }
 
 /**
- * Enumerate `root` under `[index]`'s resolved config, apply include/exclude, the hard deny list,
- * and every bound, and read what survives through `openConfined`.
+ * Scan any `IndexSource` under `[index]`'s resolved config — the source-independent policy engine
+ * every backend runs through. `scanRepoForIndex` below is the filesystem-specific wrapper most
+ * callers want; this is what a future source's own test suite (RUN-254/255) or a fake-source test
+ * in THIS repo calls directly.
  *
- * `root` MUST be the already-acquired snapshot root (locked decision 5) — this never re-derives
- * it from a manifest field, an env var, or `process.cwd()`. `config: null` means indexing is OFF
- * for this repo (`resolveIndexConfig`'s own contract) and this function opens nothing at all —
- * the caller is expected to have already gated on `[index].enabled`, and this is the same gate
- * asserted a second time, in the one place that could otherwise read a byte if that gate were
- * ever bypassed (locked decision 10).
+ * `config: null` means indexing is OFF for this repo and this function never touches `source` at
+ * all — the caller is expected to have already gated on `[index].enabled`, and this is the same
+ * gate asserted a second time (locked decision 10).
  */
-export async function scanRepoForIndex(
-  root: string,
+export async function scanIndexSource(
+  source: IndexSource,
   config: ResolvedIndexConfig | null,
   deps: IndexScanDeps = {},
 ): Promise<IndexScanResult> {
@@ -495,7 +488,7 @@ export async function scanRepoForIndex(
   }
 
   const now = deps.now ?? Date.now;
-  const state: WalkState = {
+  const state: ScanState = {
     candidates: [],
     statuses: [],
     statusOverflow: 0,
@@ -506,9 +499,15 @@ export async function scanRepoForIndex(
     stop: false,
     includeRe: config.include.map(globToRegExp),
     excludeRe: config.exclude.map(globToRegExp),
+    deniedPrefixes: new Set(),
   };
 
-  await walk(root, '', root, config, state, 0);
+  const entries = await collectEntries(source, config, state);
+  entries.sort(byPath);
+  for (const entry of entries) {
+    if (state.stop) break;
+    await evaluateEntry(source, entry, config, state);
+  }
 
   return {
     candidates: state.candidates,
@@ -518,4 +517,29 @@ export async function scanRepoForIndex(
     totalBytesRead: state.totalBytesRead,
     stoppedEarly: state.stop,
   };
+}
+
+/**
+ * Enumerate `root` under `[index]`'s resolved config through the filesystem source, apply
+ * include/exclude, the hard deny list, and every bound, and read what survives through
+ * `openConfined`.
+ *
+ * `root` MUST be the already-acquired snapshot root (locked decision 5) — this never re-derives
+ * it from a manifest field, an env var, or `process.cwd()`. Kept as an exact, byte-for-byte
+ * signature and behaviour over `FilesystemIndexSource` (RUN-252 locked decision 5): this is
+ * RUN-209's audited security surface and its adversarial suite is the evidence for the
+ * THREAT-MODEL.md rows RUN-210 wrote, so a refactor that also moved this surface would make the
+ * diff impossible to review as a refactor.
+ */
+export async function scanRepoForIndex(
+  root: string,
+  config: ResolvedIndexConfig | null,
+  deps: IndexScanDeps = {},
+): Promise<IndexScanResult> {
+  const source: IndexSource = new FilesystemIndexSource(root);
+  try {
+    return await scanIndexSource(source, config, deps);
+  } finally {
+    await source.close?.();
+  }
 }
