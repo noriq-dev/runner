@@ -391,3 +391,41 @@ describe('scanRepoForIndex — include/exclude', () => {
     expect(statusFor(r, 'b.md')?.reason).toBe('not-included');
   });
 });
+
+/**
+ * The ordering contract `index-scan.ts` refuses on, exercised against the shape that actually
+ * broke it (RUN-219). `walkFs` sorted sibling NAMES and recursed inline, which is deterministic but
+ * is not ascending full-path order: a directory contributes a `/` exactly where a sibling
+ * contributes its own next character, and both `-` (0x2D) and `.` (0x2E) sort below `/` (0x2F).
+ * Every fixture-sized tree in this suite happened to avoid the collision, so the violation survived
+ * until a real repository was walked — any `node_modules` holding a `pkg` beside a `pkg-linux-x64`,
+ * or any `foo/` beside a `foo.ts`, trips it.
+ */
+describe('FilesystemIndexSource honours ascending full-path order, not merely name order', () => {
+  it('interleaves a directory with siblings whose names extend it below the separator', async () => {
+    await mkdir(path.join(root, 'a'));
+    await mkdir(path.join(root, 'a-b'));
+    await writeFile(path.join(root, 'a', 'x.ts'), 'export const x = 1;\n');
+    await writeFile(path.join(root, 'a-b', 'y.ts'), 'export const y = 1;\n');
+    await writeFile(path.join(root, 'a.ts'), 'export const z = 1;\n');
+
+    // Reaching a result at all is most of the assertion: `scanIndexSource` REFUSES loudly on an
+    // out-of-order source rather than repairing it, so a regression here throws rather than
+    // returning something subtly wrong.
+    const r = await scanRepoForIndex(root, cfg());
+    const paths = r.candidates.map((c) => c.path);
+    expect(paths).toEqual(['a-b/y.ts', 'a.ts', 'a/x.ts']);
+    expect(paths).toEqual([...paths].sort());
+  });
+
+  it('orders a directory before a sibling file only when the separator says so', async () => {
+    await mkdir(path.join(root, 'src'));
+    await writeFile(path.join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+    await writeFile(path.join(root, 'srcz.ts'), 'export const b = 1;\n');
+
+    // `/` (0x2F) sorts below `z` (0x7A), so here the directory really does come first — the fix is
+    // a separator-aware key, not a blanket "files before directories" rule.
+    const r = await scanRepoForIndex(root, cfg());
+    expect(r.candidates.map((c) => c.path)).toEqual(['src/a.ts', 'srcz.ts']);
+  });
+});

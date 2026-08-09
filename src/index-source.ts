@@ -59,9 +59,12 @@ import { openConfined } from './repo-context';
  * cut of this split read "enumeration is deterministic per source: a stable sort by
  * repository-relative path" as leaving the SORTING to whichever layer wanted it, so
  * `index-scan.ts` drained every entry into an array and sorted it globally — for
- * `FilesystemIndexSource`, which already walks siblings sorted-then-recurse (see `walkFs` below),
- * that re-sort bought determinism the source had already paid for, at the cost of buffering the
- * whole enumeration before a single bound could apply. The obligation belongs to the SOURCE,
+ * `FilesystemIndexSource`, which already walks siblings in sorted order (see `walkFs` below), that
+ * re-sort bought determinism the source had already paid for, at the cost of buffering the whole
+ * enumeration before a single bound could apply. Determinism is all sorted-then-recurse ever bought,
+ * though — ASCENDING FULL-PATH order additionally needs the sort key to carry a directory's
+ * separator, which `walkFs` did not do until RUN-219 walked a real tree and `index-scan.ts`'s
+ * refusal fired; see the comment on that sort for the shape that breaks it. The obligation belongs to the SOURCE,
  * because only the source knows what "cheap" order looks like for it (a depot listing, an API
  * page) and can pay for a sort once instead of the policy layer buffering everything to redo it
  * later. `IndexSource.list`'s own doc below states the requirement and why; `FakeIndexSource`
@@ -282,7 +285,24 @@ async function* walkFs(
     };
     return;
   }
-  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Sorted by the name a child's FULL PATH will be compared on, which for a directory means the
+  // name plus its separator — NOT by the bare name (the RUN-219 fix). Sorting bare names then
+  // recursing inline is deterministic but it is not ascending full-path order, because a directory
+  // contributes a `/` at exactly the position where a sibling contributes its own next character:
+  // with siblings `a/`, `a-b/`, and `a.ts`, bare-name order walks `a/x.ts`, `a-b/y.ts`, `a.ts`
+  // while `comparePaths` wants `a-b/y.ts`, `a.ts`, `a/x.ts` — `-` (0x2D) and `.` (0x2E) both sort
+  // below `/` (0x2F). That is an ordinary repository shape, not a contrived one (any
+  // `node_modules` with a `pkg` beside a `pkg-linux-x64`, any `foo/` beside a `foo.ts`), and the
+  // violation was invisible until RUN-219 became the first caller to walk a real tree: the ORDER
+  // is what `index-scan.ts` refuses loudly on, and every fixture-sized tree happened to avoid the
+  // collision. A symlink keeps the bare key deliberately — `isDirectory()` is false for one
+  // regardless of its target, matching the leaf this walk yields it as below.
+  const sortKey = (d: Dirent): string => (d.isDirectory() ? `${d.name}/` : d.name);
+  entries.sort((a, b) => {
+    const ka = sortKey(a);
+    const kb = sortKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
 
   for (const dirent of entries) {
     const childAbs = path.join(absDir, dirent.name);
