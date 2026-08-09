@@ -27,6 +27,24 @@ export interface VerifyResult {
   timedOut: boolean;
 }
 
+/**
+ * One deterministic command the daemon actually watched run and exit (RUN-225) — never the
+ * command a manifest merely CONFIGURES, which a sitting may have died before reaching. `site`
+ * names which caller ran it: the standalone `verify` stage, the landing pipeline's rebase gate,
+ * or a fix-round re-check inside `reviewWithFeedback`'s loop — the same command can legitimately
+ * run at more than one of these across a sitting. `attempts` folds a hand-back retry loop into one
+ * count rather than one entry per try, because the site plus the FINAL outcome is what a reader
+ * needs; the individual retries are already in the transcript (`recordVerifyOutcome`).
+ */
+export interface CommandObservation {
+  site: 'verify' | 'landing' | 'review-fix';
+  cmd: string;
+  passed: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  attempts: number;
+}
+
 /** Runs a command in a cwd, capturing combined stdout+stderr (tail-capped). */
 export type VerifyExec = (
   cmd: string,

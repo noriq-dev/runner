@@ -1,5 +1,6 @@
 import { renderPrompt } from './prompts';
 import type { AnchorTask } from './supervisor';
+import type { CommandObservation } from './verify';
 
 /**
  * The landing step: a build that cleared the gate is rebased onto the integration
@@ -97,6 +98,11 @@ export interface LandOutcome {
   pushed?: boolean;
   /** Why the push failed, when pushed === false. */
   pushDetail?: string;
+  /** The rebase gate's own observed outcome (RUN-225), when `policy.onlyWhenVerifyPasses` actually
+   *  ran it — absent on a policy that skips the gate, or a landing that never reached it (an
+   *  unresolved conflict). `integrateStage` folds this into the run's `commandObservations` for
+   *  the episode; it carries no output text, only the site/cmd/pass-fail shape. */
+  commandObserved?: CommandObservation;
 }
 
 /**

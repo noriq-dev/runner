@@ -78,6 +78,7 @@ function baseCtx(over: Partial<RunPipeline> = {}): RunPipeline {
     landed: false,
     ledger: [],
     landPolicy: null,
+    commandObservations: [],
     ...over,
   };
 }
@@ -98,7 +99,11 @@ const finding = (over: Partial<LedgerEntry> = {}): LedgerEntry => ({
 
 describe('buildEpisode — the excluded set (RUN-224 locked decision)', () => {
   it('never carries outcome/runKind/agentId/startedAt/finishedAt/sitting, and selfSummary is null', () => {
-    const episode = buildEpisode(baseCtx(), { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
     const keys = new Set(Object.keys(episode));
     for (const excluded of ['outcome', 'runKind', 'agentId', 'startedAt', 'finishedAt', 'sitting']) {
       expect(keys.has(excluded)).toBe(false);
@@ -112,6 +117,7 @@ describe('buildEpisode — across every terminal path', () => {
     const episode = buildEpisode(baseCtx({ landed: true }), {
       filesTouched: ['a.ts'],
       hasRemainingWork: false,
+      steeringHistory: [],
     });
     expect(EffortEpisode.safeParse(episode).success).toBe(true);
     expect(episode.landingOutcome).toBe('landed');
@@ -124,7 +130,7 @@ describe('buildEpisode — across every terminal path', () => {
       ledger: [finding()],
       landPolicy: { branch: 'main' } as never,
     });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true, steeringHistory: [] });
     expect(EffortEpisode.safeParse(episode).success).toBe(true);
     expect(episode.failures).toContain('terminal reason: review');
     expect(episode.findings).toHaveLength(1);
@@ -137,7 +143,7 @@ describe('buildEpisode — across every terminal path', () => {
       exit: { outcome: 'failed', isError: true, reason: 'cancelled', telemetry: zeroTelemetry() },
       driverSucceeded: false,
     });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(EffortEpisode.safeParse(episode).success).toBe(true);
     expect(episode.failures).toContain('terminal reason: cancelled');
   });
@@ -156,7 +162,7 @@ describe('buildEpisode — across every terminal path', () => {
       // ctx.ledger, never ctx.continued.ledger.
       ledger: continued.ledger,
     });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(EffortEpisode.safeParse(episode).success).toBe(true);
     expect(episode.timeline).toHaveLength(2);
     expect(episode.timeline[0]).toEqual({ at: continued.failedAt, label: expect.any(String) });
@@ -181,7 +187,7 @@ describe('buildEpisode — severity normalization', () => {
 
   it('an unrecognized word does not drop the finding — it keeps a default severity', () => {
     const ctx = baseCtx({ ledger: [finding({ severity: 'apocalyptic' })] });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(episode.findings).toHaveLength(1);
     expect(['info', 'low', 'medium', 'high']).toContain(episode.findings[0]?.severity);
     expect(normalizeSeverity('apocalyptic')).toBe('medium');
@@ -193,17 +199,23 @@ describe('buildEpisode — review rounds and findings settle with the run', () =
     const ctx = baseCtx({
       ledger: [finding({ id: 1, round: 1 }), finding({ id: 2, round: 3 })],
     });
-    expect(buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false }).reviewRounds).toBe(3);
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).reviewRounds,
+    ).toBe(3);
   });
 
   it('zero ledger entries reads as zero rounds — the known undercount this decision names', () => {
-    const episode = buildEpisode(baseCtx(), { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
     expect(episode.reviewRounds).toBe(0);
   });
 
   it('a PASSING run reports nothing as standing, even over a contested finding', () => {
     const ctx = baseCtx({ ledger: [finding({ status: 'contested' })] }); // exit.outcome defaults to 'done'
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(episode.remainingWork.some((w) => w.includes('does the wrong thing'))).toBe(false);
     expect(episode.findings[0]?.summary).toMatch(/^\[resolved\]/);
   });
@@ -216,7 +228,7 @@ describe('buildEpisode — review rounds and findings settle with the run', () =
         finding({ id: 2, status: 'contested', claim: 'still wrong' }),
       ],
     });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true, steeringHistory: [] });
     expect(episode.findings.find((f) => f.summary.includes('does the wrong thing'))?.summary).toMatch(
       /^\[resolved\]/,
     );
@@ -240,7 +252,11 @@ describe('buildEpisode — acceptance evidence, when settle computed one', () =>
   };
 
   it('coverage is null when no evidence was computed this sitting (the build-workflow gap)', () => {
-    const episode = buildEpisode(baseCtx(), { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
     expect(episode.acceptanceCoverage).toBeNull();
   });
 
@@ -252,6 +268,7 @@ describe('buildEpisode — acceptance evidence, when settle computed one', () =>
       filesTouched: [],
       hasRemainingWork: false,
       acceptanceEvidence: report,
+      steeringHistory: [],
     });
     expect(episode.acceptanceCoverage).toBe(0.5);
     expect(episode.failures.some((f) => f.includes('does the other thing'))).toBe(true);
@@ -265,6 +282,7 @@ describe('buildEpisode — acceptance evidence, when settle computed one', () =>
       filesTouched: [],
       hasRemainingWork: false,
       acceptanceEvidence: humanReport,
+      steeringHistory: [],
     });
     expect(episode.remainingWork.some((w) => w.includes('does the thing'))).toBe(true);
     expect(episode.failures).toEqual([]);
@@ -274,12 +292,16 @@ describe('buildEpisode — acceptance evidence, when settle computed one', () =>
 describe('buildEpisode — landing outcome', () => {
   it('landed wins outright', () => {
     const ctx = baseCtx({ landed: true, landPolicy: { branch: 'main' } as never });
-    expect(buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false }).landingOutcome).toBe('landed');
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).landingOutcome,
+    ).toBe('landed');
   });
 
   it('a workflow with no land policy never reads pending', () => {
     const ctx = baseCtx({ landPolicy: null });
-    expect(buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true }).landingOutcome).toBe('not_landed');
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: true, steeringHistory: [] }).landingOutcome,
+    ).toBe('not_landed');
   });
 
   it('a landing-capable run that failed outright (no kept work) reads failed', () => {
@@ -287,7 +309,9 @@ describe('buildEpisode — landing outcome', () => {
       landPolicy: { branch: 'main' } as never,
       exit: { outcome: 'failed', isError: true, reason: 'budget', telemetry: zeroTelemetry() },
     });
-    expect(buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false }).landingOutcome).toBe('failed');
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).landingOutcome,
+    ).toBe('failed');
   });
 });
 
@@ -307,21 +331,228 @@ describe('buildEpisode — spend and files are read straight off state settle al
       },
     };
     const ctx = baseCtx({ exit: { outcome: 'done', isError: false, reason: null, telemetry } });
-    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
     expect(episode.costUSD).toBe(1.5);
     expect(episode.tokenUsage['claude-opus']?.outputTokens).toBe(20);
   });
 
   it('filesTouched is exactly what the backend reported — never guessed at when absent', () => {
-    const episode = buildEpisode(baseCtx(), { filesTouched: ['a/b.ts', 'c.ts'], hasRemainingWork: false });
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: ['a/b.ts', 'c.ts'],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
     expect(episode.filesTouched).toEqual(['a/b.ts', 'c.ts']);
   });
 
-  it('commands/testsRun/steeringEvents are empty — RUN-225 territory, not a guess', () => {
-    const episode = buildEpisode(baseCtx(), { filesTouched: [], hasRemainingWork: false });
+  it('commands/testsRun/steeringEvents are empty when this sitting observed none — never a guess', () => {
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
     expect(episode.commands).toEqual([]);
     expect(episode.testsRun).toEqual([]);
     expect(episode.steeringEvents).toEqual([]);
+  });
+
+  it('a file the agent only mentioned in its output is never labelled examined without an observation', () => {
+    // `sessionText` carries whatever the agent said, including a file it merely discussed — the
+    // acceptance criterion this pins: filesTouched comes ONLY from the backend's own report.
+    const ctx = baseCtx({
+      sessionText: 'I also looked at src/unrelated-mentioned-only.ts and left it alone.',
+    });
+    const episode = buildEpisode(ctx, {
+      filesTouched: ['a/b.ts'],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.filesTouched).toEqual(['a/b.ts']);
+    expect(episode.filesTouched).not.toContain('src/unrelated-mentioned-only.ts');
+  });
+});
+
+describe('buildEpisode — commands/testsRun from observed deterministic commands (RUN-225)', () => {
+  it('a run whose sitting never reached the deterministic command records neither', () => {
+    const ctx = baseCtx({ commandObservations: [] });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.commands).toEqual([]);
+    expect(episode.testsRun).toEqual([]);
+  });
+
+  it('an observed command populates BOTH commands and testsRun, tagged with the site that ran it', () => {
+    const ctx = baseCtx({
+      commandObservations: [
+        { site: 'verify', cmd: 'npm run check', passed: true, exitCode: 0, timedOut: false, attempts: 1 },
+      ],
+    });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.commands).toEqual(['[verify] npm run check — passed']);
+    expect(episode.testsRun).toEqual(episode.commands);
+  });
+
+  it('a failing, retried command reports the final outcome and the attempt count, never the output', () => {
+    const ctx = baseCtx({
+      commandObservations: [
+        {
+          site: 'landing',
+          cmd: 'npm run check',
+          passed: false,
+          exitCode: 1,
+          timedOut: false,
+          attempts: 3,
+        },
+      ],
+    });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.commands[0]).toBe('[landing] npm run check — failed (exit 1), 3 attempts');
+  });
+
+  it('a long command string is capped rather than carried whole', () => {
+    const longCmd = `npm run check -- ${'x'.repeat(500)}`;
+    const ctx = baseCtx({
+      commandObservations: [
+        { site: 'verify', cmd: longCmd, passed: true, exitCode: 0, timedOut: false, attempts: 1 },
+      ],
+    });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.commands[0]!.length).toBeLessThan(longCmd.length);
+    expect(episode.commands[0]).toContain('…');
+  });
+
+  it('a review fix round is a distinct entry from the standalone verify/landing sites', () => {
+    const ctx = baseCtx({
+      commandObservations: [
+        { site: 'verify', cmd: 'npm run check', passed: false, exitCode: 1, timedOut: false, attempts: 1 },
+        { site: 'review-fix', cmd: 'npm run check', passed: true, exitCode: 0, timedOut: false, attempts: 1 },
+      ],
+    });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.commands).toHaveLength(2);
+    expect(episode.commands.some((c) => c.startsWith('[review-fix]'))).toBe(true);
+  });
+});
+
+describe("buildEpisode — reviewRounds from the reviewer's own exact count (RUN-225)", () => {
+  it('a first-look clean PASS is distinguishable from a run that never reviewed', () => {
+    const reviewed = baseCtx({ reviewEvidence: { rounds: 1 } });
+    const neverReviewed = baseCtx();
+    expect(
+      buildEpisode(reviewed, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).reviewRounds,
+    ).toBe(1);
+    expect(
+      buildEpisode(neverReviewed, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] })
+        .reviewRounds,
+    ).toBe(0);
+  });
+
+  it('reviewEvidence.rounds wins over the ledger-derived fallback when both are present', () => {
+    const ctx = baseCtx({
+      ledger: [finding({ id: 1, round: 1 })],
+      reviewEvidence: { rounds: 4 },
+    });
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).reviewRounds,
+    ).toBe(4);
+  });
+
+  it("no reviewEvidence at all still falls back to the ledger's highest round (RUN-224 behaviour)", () => {
+    const ctx = baseCtx({ ledger: [finding({ id: 1, round: 1 }), finding({ id: 2, round: 3 })] });
+    expect(
+      buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] }).reviewRounds,
+    ).toBe(3);
+  });
+});
+
+describe('buildEpisode — acceptanceCoverage closes the build-path gap (RUN-225)', () => {
+  const items: AcceptanceItem[] = [
+    { id: 1, kind: 'truth', text: 'does the thing' },
+    { id: 2, kind: 'truth', text: 'does the other thing' },
+  ];
+  const report: AcceptanceReport = {
+    entries: [
+      { id: 1, outcome: 'verified', evidence: 'test.ts:5', item: items[0]! },
+      { id: 2, outcome: 'failed', evidence: 'never called', item: items[1]! },
+    ],
+  };
+
+  it('is non-null on a BUILD run whose reviewer produced acceptance evidence', () => {
+    const ctx = baseCtx({
+      exit: { outcome: 'failed', isError: true, reason: 'review', telemetry: zeroTelemetry() },
+      reviewEvidence: { rounds: 1, acceptance: report },
+    });
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+    expect(episode.acceptanceCoverage).toBe(0.5);
+    expect(episode.failures.some((f) => f.startsWith('[review] acceptance #2 failed'))).toBe(true);
+  });
+
+  it('the verify-actor path still tags its acceptance lines [verify], not [review]', () => {
+    const ctx = baseCtx({
+      exit: { outcome: 'failed', isError: true, reason: 'verify_agent', telemetry: zeroTelemetry() },
+    });
+    const episode = buildEpisode(ctx, {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+      acceptanceEvidence: report,
+    });
+    expect(episode.acceptanceCoverage).toBe(0.5);
+    expect(episode.failures.some((f) => f.startsWith('[verify] acceptance #2 failed'))).toBe(true);
+  });
+});
+
+describe("buildEpisode — steeringEvents from the daemon's own delivery record (RUN-225)", () => {
+  it('a delivered steer and a dropped one are distinguishable', () => {
+    const ctx = baseCtx();
+    const episode = buildEpisode(ctx, {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [
+        {
+          steerId: 's1',
+          runId: 'run_1',
+          delivered: true,
+          via: 'runtime',
+          noticeCursor: 1,
+          detail: null,
+          mode: 'soft',
+        },
+        {
+          steerId: 's2',
+          runId: 'run_1',
+          delivered: false,
+          via: 'dropped',
+          noticeCursor: 2,
+          detail: 'no live run for steer',
+          mode: 'hard',
+        },
+      ],
+    });
+    expect(episode.steeringEvents).toHaveLength(2);
+    expect(episode.steeringEvents[0]).toContain('delivered via runtime');
+    expect(episode.steeringEvents[1]).toContain('not delivered');
+    expect(episode.steeringEvents[1]).toContain('dropped');
+  });
+
+  it('a long delivery detail is capped', () => {
+    const ctx = baseCtx();
+    const episode = buildEpisode(ctx, {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [
+        {
+          steerId: 's1',
+          runId: 'run_1',
+          delivered: false,
+          via: 'fallback',
+          noticeCursor: null,
+          detail: 'x'.repeat(1000),
+          mode: 'soft',
+        },
+      ],
+    });
+    expect(episode.steeringEvents[0]!.length).toBeLessThan(1000);
+    expect(episode.steeringEvents[0]).toContain('…');
   });
 });
 

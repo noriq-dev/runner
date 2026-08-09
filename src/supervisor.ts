@@ -115,11 +115,14 @@ import {
 } from './stages';
 import { authorSpecBlock, buildRunBrief } from './stages/brief';
 import type { ChainWave, StepSummary } from './stages/chain';
+import type { DeliveredSteer } from './steering';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
 import {
+  type CommandObservation,
   type VerifyExec,
+  type VerifyResult,
   type VerifySpec,
   defaultExec,
   runVerify,
@@ -381,6 +384,8 @@ export interface RunSupervisorDeps {
     /** Drop the record once the run is terminal, so a long-lived daemon does not keep one entry
      *  per cancelled run for its whole life. */
     forget?: (runId: string) => void;
+    /** Drain this run's observed steer deliveries (RUN-225) — see `SteeringBridge`'s own doc. */
+    steeringHistory?: (runId: string) => DeliveredSteer[];
   };
   /**
    * How many of a decomposed run's wave steps may overlap (RUN-170): the daemon's own
@@ -1184,6 +1189,9 @@ export class RunSupervisor {
   private stageHost(): StageHost {
     return {
       forgetCancellation: (runId) => this.deps.steering?.forget?.(runId),
+      // No history, never "unknown" (RUN-225): a bridge that cannot answer and a bridge that
+      // answered empty read identically to `settle` — both are "nothing observed this sitting".
+      steeringHistory: (runId) => this.deps.steering?.steeringHistory?.(runId) ?? [],
       abandonOrphanedSignal: (runId) => this.abandonOrphanedSignal(runId),
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
@@ -1559,7 +1567,14 @@ export class RunSupervisor {
     // which is precisely the deterministic command's question. Re-running an agent review inside
     // the repo lock would serialize every other run behind a judgment call that cannot change.
     const rebaseGate = cmdVerify(repo.manifest.verify);
+    // The rebase gate's own observation (RUN-225), attached to whichever `LandOutcome` this call
+    // returns below — undefined unless this block actually runs the command (autoPush-only
+    // policies, or a rebase that never got this far, leave it unset rather than a lie).
+    let commandObserved: CommandObservation | undefined;
     if (policy.onlyWhenVerifyPasses && rebaseGate) {
+      // The sessionless path (no live agent to hand a failure back to) runs the command exactly
+      // once — `attempts: 1` is not a default standing in for a missing observation, it is what
+      // happened.
       const result = ctx.session
         ? await this.verifyWithFeedback({
             run: ctx.run,
@@ -1569,9 +1584,27 @@ export class RunSupervisor {
             tally: ctx.tally,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
-        : await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec });
+        : {
+            ...(await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec })),
+            attempts: 1,
+          };
+      commandObserved = {
+        site: 'landing',
+        cmd: rebaseGate.cmd,
+        passed: result.passed,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        attempts: result.attempts,
+      };
       if (!result.passed) {
-        return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
+        return {
+          landed: false,
+          branch,
+          reason: 'verify',
+          detail: result.output,
+          resolvedByAgent,
+          commandObserved,
+        };
       }
       this.log.info('verify passed on the rebased result', { runId: run.id, branch });
       // A fix the live agent made to pass THIS gate lives only in the working tree, but publish
@@ -1600,7 +1633,15 @@ export class RunSupervisor {
     // opt-in, default false, because it crosses the boundary the rest of the model rests on
     // (RUN-27). A failure here must never fail the run: the diff is on the branch either way,
     // and reporting "failed" would send someone hunting for work that is right there.
-    if (!ctx.policy.autoPush) return { landed: true, branch, sha: ff.sha, resolvedByAgent };
+    if (!ctx.policy.autoPush) {
+      return {
+        landed: true,
+        branch,
+        sha: ff.sha,
+        resolvedByAgent,
+        ...(commandObserved ? { commandObserved } : {}),
+      };
+    }
     const push = await vcs.share(ctx.repo.root, branch);
     if (!push.ok) {
       this.log.warn('landed, but the push failed — the work is on the branch locally', {
@@ -1615,6 +1656,7 @@ export class RunSupervisor {
       sha: ff.sha,
       resolvedByAgent,
       pushed: push.ok,
+      ...(commandObserved ? { commandObserved } : {}),
       ...(push.ok ? {} : { pushDetail: push.detail }),
     };
   }
@@ -1661,13 +1703,17 @@ export class RunSupervisor {
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
-  }) {
+  }): Promise<VerifyResult & { attempts: number }> {
     const transcript = this.transcript(ctx.run.id);
     let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
     this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
+    // How many times THIS call actually ran the command (RUN-225) — the daemon's own observation,
+    // separate from `rounds` below (the CEILING on retries, which a session with nothing left to
+    // fix never exhausts).
+    let attempts = 1;
     // continueWith is absent unless the run was started multiTurn — a run with no live session to
     // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
-    if (result.passed || !ctx.session.continueWith) return result;
+    if (result.passed || !ctx.session.continueWith) return { ...result, attempts };
 
     // The repo's committed bound, else the daemon's K=2 (RUN-94). 0 = a pure gate: the verdict
     // stands and no fix turn is spent — the repo said so, in the commit.
@@ -1700,17 +1746,18 @@ export class RunSupervisor {
       if (!exit || exit.outcome !== 'done') {
         if (exit?.reason)
           this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
-        return result;
+        return { ...result, attempts };
       }
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+      attempts += 1;
       this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
       if (result.passed) {
         this.log.info('verify passed after the agent fixed it', { runId: ctx.run.id, attempt });
-        return result;
+        return { ...result, attempts };
       }
     }
-    return result;
+    return { ...result, attempts };
   }
 
   /**
@@ -1753,7 +1800,10 @@ export class RunSupervisor {
     noriqMcp?: NoriqMcp;
     /** The run's agent identity — what a review-stage park is recorded under (RUN-190). */
     runAgent?: { agentId: string; label: string; token: string };
-  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
+    /** A fix round's own deterministic re-check ran (RUN-225) — reported so the caller can fold it
+     *  into the episode's command evidence; this method has no `RunPipeline` of its own to write. */
+    onCommandObserved?: (o: CommandObservation) => void;
+  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
     const manifestRounds = reviewer?.maxRounds ?? 0;
@@ -1820,25 +1870,31 @@ export class RunSupervisor {
       ledger = buildLedger(ledger, parseFindings(v.findings), [], round);
     };
 
+    // Every ACTUAL reviewer invocation (RUN-225) — distinct from `rounds` below, which counts fix
+    // rounds spent. Incremented at the two call sites of `runReviewer` in this method (the initial
+    // look and each re-review) plus whatever `contestTerminalFindings` adds for its own re-
+    // adjudication, so it reads as the true look count at every return, including a first-look PASS.
+    let looks = 1;
+
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
     record(verdict, 1);
-    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
+    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger, looks };
 
     for (let round = 1; round <= maxRounds; round++) {
       // Only a clear FAIL is a refusal. 'unknown' means NO JUDGMENT — the reviewer was killed,
       // crashed, breached its ceiling, or never wrote a VERDICT line (RUN-72's dogfood: a human
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
-      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
+      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger, looks };
       // An HONOURED structural escalation ends the loop here (RUN-175): the reviewer has diagnosed
       // an invariant with no single enforcement point and evidenced it, so every remaining fix
       // round would buy patched sites while the class survives — the RUN-66 death, foreseen
       // instead of relived. The verdict (escalation riding on it) goes back a FAIL; the review
       // stage reports the diagnosis and its own terminal reason. The findings are already in the
       // ledger (recorded when raised), so a continuation still sees them.
-      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger };
+      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger, looks };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -1889,7 +1945,7 @@ export class RunSupervisor {
       if (!exit || exit.outcome !== 'done') {
         if (exit?.reason)
           this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
-        return { ...verdict, rounds: round, ledger };
+        return { ...verdict, rounds: round, ledger, looks };
       }
       this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
       // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
@@ -1903,12 +1959,23 @@ export class RunSupervisor {
           tally: ctx.tally,
           phase: 'verifying',
         });
+        // A real command the daemon watched exit (RUN-225) — reported whether it passed or not, so
+        // the episode shows the re-check happened even when it is what ends the round below.
+        ctx.onCommandObserved?.({
+          site: 'review-fix',
+          cmd: floorCmd.cmd,
+          passed: floor.passed,
+          exitCode: floor.exitCode,
+          timedOut: floor.timedOut,
+          attempts: floor.attempts,
+        });
         if (!floor.passed) {
           return {
             verdict: 'fail',
             passed: false,
             rounds: round,
             ledger,
+            looks,
             findings: `the fix for the reviewer's findings broke the deterministic check (\`${floorCmd.cmd}\`):\n${floor.output.slice(-4000)}`,
           };
         }
@@ -1917,9 +1984,10 @@ export class RunSupervisor {
       // `baseId...HEAD` actually advances to include it — without this the re-review is a no-op.
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
+      looks += 1;
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       record(verdict, round + 1);
-      if (verdict.passed) return { ...verdict, rounds: round, ledger };
+      if (verdict.passed) return { ...verdict, rounds: round, ledger, looks };
     }
     // RUN-174: one adjudication turn before the run reports a TERMINAL-round FAIL. The terminal
     // round is where the run ENDS, so a finding raised there for the first time was never fixable
@@ -1944,11 +2012,18 @@ export class RunSupervisor {
     if (terminalFindings.length) {
       const contested = await this.contestTerminalFindings(
         { ...ctx, intent },
-        { verdict, findings: terminalFindings, terminalRound: maxRounds + 1, rounds: maxRounds, ledger },
+        {
+          verdict,
+          findings: terminalFindings,
+          terminalRound: maxRounds + 1,
+          rounds: maxRounds,
+          ledger,
+          looks,
+        },
       );
       if (contested) return contested;
     }
-    return { ...verdict, rounds: maxRounds, ledger };
+    return { ...verdict, rounds: maxRounds, ledger, looks };
   }
 
   /**
@@ -2417,10 +2492,18 @@ export class RunSupervisor {
       /** Fix rounds spent (maxRounds) — the `rounds` the caller would have reported. */
       rounds: number;
       ledger: LedgerEntry[];
+      /** Reviewer invocations before this turn (RUN-225) — `stand` reports it unchanged (no
+       *  `runReviewer` call on that path); the re-adjudication path below reports `looks + 1`. */
+      looks: number;
     },
-  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }) | null> {
+  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }) | null> {
     const transcript = this.transcript(ctx.run.id);
-    const stand = (ledger: LedgerEntry[]) => ({ ...args.verdict, rounds: args.rounds, ledger });
+    const stand = (ledger: LedgerEntry[]) => ({
+      ...args.verdict,
+      rounds: args.rounds,
+      ledger,
+      looks: args.looks,
+    });
 
     // Reserve FIRST, before the builder turn: the terminal turn is the run's most likely to find the
     // ceiling already gone (RUN-133, same as resolveConflict). Declining spends nothing where
@@ -2612,7 +2695,7 @@ export class RunSupervisor {
         },
       );
       transcript.milestone('the contest’s fresh look escalated STRUCTURAL — the run fails');
-      return { ...readjudged, rounds: args.rounds, ledger: settled };
+      return { ...readjudged, rounds: args.rounds, ledger: settled, looks: args.looks + 1 };
     }
 
     // The PASS is DAEMON-decided, not taken on the reviewer's word: it clears the run only if the
@@ -2632,7 +2715,7 @@ export class RunSupervisor {
         runId: ctx.run.id,
       });
       transcript.milestone('the contest cleared the terminal findings — the run passes');
-      return { ...readjudged, rounds: args.rounds, ledger: settled };
+      return { ...readjudged, rounds: args.rounds, ledger: settled, looks: args.looks + 1 };
     }
     // The findings stand: the run fails as it does today (the terminal report), but the ledger now
     // carries the builder's pointers and the fresh look — so a human, and a continuation, sees the
@@ -4120,6 +4203,9 @@ export class RunSupervisor {
       ledger: continued?.ledger ?? [],
       // Decided by `verify`, once, at the point the pipeline always decided it.
       landPolicy: null,
+      // Appended to by `verify`/`review`/`integrate` as each reaches its own deterministic command
+      // (RUN-225) — empty by construction, not a guess, for a sitting that never reaches one.
+      commandObservations: [],
     };
 
     const host = this.stageHost();

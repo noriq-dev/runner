@@ -51,6 +51,9 @@ export const integrateStage = async (host: StageHost, ctx: RunPipeline): Promise
       }),
     );
 
+  // The rebase gate's own observation (RUN-225), when this landing attempt actually ran one.
+  if (outcome.commandObserved) ctx.commandObservations.push(outcome.commandObserved);
+
   if (outcome.landed) {
     host.log.info('landed', {
       runId: run.id,

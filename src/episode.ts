@@ -7,7 +7,14 @@
  * workspace's fate. This module is the pure half of that: one function from a settled
  * `RunPipeline` (plus the handful of facts only `settle` itself can answer — see `EpisodeExtra`) to
  * one `EffortEpisode` payload. Assembly only: no upload, no transport, no capability mint (RUN-227,
- * blocked on PLNR-340), no self-summary (RUN-226), no new instrumentation (RUN-225).
+ * blocked on PLNR-340), no self-summary (RUN-226). RUN-225 closed the instrumentation gap this
+ * comment used to name here — `commands`/`testsRun`/`steeringEvents` now source from daemon
+ * OBSERVATIONS (`RunPipeline.commandObservations`, `EpisodeExtra.steeringHistory`), never from
+ * configuration or agent prose, and `reviewRounds`/`acceptanceCoverage` read the reviewer's own
+ * exact figures (`RunPipeline.reviewEvidence`) instead of re-deriving a lower bound. What it did
+ * NOT close, for lack of a cheap observation: which files the agent merely EXAMINED (no driver
+ * reports reads today), and the examined/modified/generated/verified distinction beyond the union
+ * the wire can carry — see `EpisodeExtra.filesTouched`'s own doc.
  *
  * The server builds its OWN skeleton from its `runs` row on every terminal transition and is
  * authoritative for run identity — `outcome`, `runKind`, `agentId`, `startedAt`, `finishedAt`, and
@@ -30,14 +37,33 @@ import { EffortEpisode } from '@noriq-dev/shared';
 import { type AcceptanceReport, failedAcceptance, humanNeededAcceptance } from './acceptance';
 import { type LedgerEntry, effectiveStatus } from './adjudication';
 import type { RunPipeline } from './stages/types';
+import type { DeliveredSteer } from './steering';
+import type { CommandObservation } from './verify';
 
 /** Facts `buildEpisode` needs that are not on `RunPipeline` itself, because they are `settle`'s own
  *  local computations rather than pipeline state — threading them through beats re-deriving them a
  *  second time (or, worse, guessing). */
 export interface EpisodeExtra {
-  /** Paths this sitting's backend can say it touched (`VcsBackend.changedPaths`) — the same call
-   *  `settle` already makes for the continuation record, reused rather than re-run. Empty when the
-   *  backend cannot say (no capability, or the call failed) — never inferred from anything else. */
+  /**
+   * Paths this sitting's backend can say it touched (`VcsBackend.changedPaths`) — the same call
+   * `settle` already makes for the continuation record, reused rather than re-run. Empty when the
+   * backend cannot say (no capability, or the call failed) — never inferred from anything else.
+   *
+   * This is the WHOLE of what rides `EffortEpisode.filesTouched` (RUN-225 measured, did not close):
+   * the acceptance criterion asks for examined/modified/generated/verified as distinct facts, and
+   * the wire carries one flat `RepoPath[]`. What exists to populate it: `changedPaths` is a git
+   * `status`+`diff` UNION with no per-path verb — `worktree.ts` builds a `Set<string>`, discarding
+   * whatever A/M/D code git reported, and `VcsBackend` is deliberately VCS-neutral (Perforce and
+   * Diversion have no equivalent codes to give), so recovering "modified vs newly generated" would
+   * mean widening that interface across three backends — out of this task's scope, not a five-
+   * minute fix skipped. EXAMINED has no signal at all: `drivers/types.ts`'s `DriverCapabilities`
+   * carries no file-read report from any driver, and inventing one the SDK does not offer would be
+   * exactly the guessed field this task's own locked decisions forbid. VERIFIED has no per-file
+   * grain either — verify/review evidence is whole-diff and whole-command (`commands`/`testsRun`/
+   * `reviewRounds` below), never scoped to one path. So `filesTouched` stays what RUN-224 already
+   * made it: authoritative for the modified-or-added union, silent about everything else, on
+   * purpose rather than by oversight.
+   */
   filesTouched: string[];
   /** Whether the workspace still holds unlanded work — `settle`'s own shared answer (the same
    *  boolean its dispose decision reads), so landing state and remaining work here cannot disagree
@@ -48,16 +74,21 @@ export interface EpisodeExtra {
    * `judgeWithAcceptance` call, on a workflow that carries `verifyActor` (the dispatched `verify`
    * workflow). Threaded through because it is state `settle` already has in scope, not re-derived.
    *
-   * Undefined on a `build` run — the overwhelming majority of runs: the inline reviewer
-   * (`stages/review.ts`) computes its OWN `AcceptanceReport` but never carries it onto
-   * `RunPipeline` (`RunPipeline`'s four mutable fields are `exit`/`driverSucceeded`/`landed`/
-   * `ledger` only — see `stages/types.ts`'s own doc on why that set stays small). So
-   * `acceptanceCoverage` and the acceptance-derived `failures`/`remainingWork` entries below are an
-   * honest gap on every build run today, not a zero: closing it means either widening what
-   * `RunPipeline` carries forward from `review`, or a fresh read at settle time, and either is a
-   * REAL follow-up (RUN-225/247 territory) this task does not invent instrumentation to cover.
+   * Undefined on a `build` run: the inline reviewer's OWN acceptance evidence does not travel
+   * through here any more (RUN-225 closed that gap) — `buildEpisode` reads it off
+   * `ctx.reviewEvidence.acceptance` instead, since it is state `review` produced, not `settle`. The
+   * two are mutually exclusive by construction (`workflow.ts`: `verifyActor` and the `review` stage
+   * both key off `wf.produces`, and no built-in workflow sets both), so `buildEpisode` merges them
+   * with a plain `??` rather than choosing.
    */
   acceptanceEvidence?: AcceptanceReport;
+  /**
+   * This sitting's observed steer deliveries (RUN-225) — `host.steeringHistory?.(run.id) ?? []`,
+   * drained once by `settle` (see `SteeringBridge.steeringHistory`'s own doc on why draining, not
+   * merely reading, matters for a long-lived daemon). Empty for a run with no steering bridge wired
+   * — indistinguishable from a wired bridge that saw nothing, both being "nothing observed".
+   */
+  steeringHistory: DeliveredSteer[];
 }
 
 /**
@@ -120,12 +151,24 @@ function findingsOf(ledger: LedgerEntry[], passed: boolean): EpisodeFinding[] {
   });
 }
 
+/** Which actor computed an `AcceptanceReport` this sitting — the inline reviewer or the dispatched
+ *  verify actor, never both (see `EpisodeExtra.acceptanceEvidence`'s doc). Prefixed onto every
+ *  acceptance-derived line below so "which stage produced this" (RUN-225's acceptance criterion)
+ *  is answerable without cross-referencing `landingOutcome`/`reviewRounds` to guess. */
+type AcceptanceSource = 'review' | 'verify';
+
 /** What is still owed when this sitting ends: a kept workspace, any finding still standing (the
  *  same `passed`-aware settlement `findingsOf` uses), and any acceptance criterion the gate could
  *  not settle from a workspace at all. */
-function remainingWorkOf(ctx: RunPipeline, extra: EpisodeExtra, passed: boolean): string[] {
+function remainingWorkOf(
+  ctx: RunPipeline,
+  hasRemainingWork: boolean,
+  passed: boolean,
+  acceptance: AcceptanceReport | undefined,
+  acceptanceSource: AcceptanceSource | undefined,
+): string[] {
   const out: string[] = [];
-  if (extra.hasRemainingWork) out.push('workspace kept — the diff has not reached the integration branch');
+  if (hasRemainingWork) out.push('workspace kept — the diff has not reached the integration branch');
   for (const e of ctx.ledger) {
     if (passed || effectiveStatus(e) === 'fixed') continue;
     const where = e.location ? ` at ${e.location}` : '';
@@ -133,9 +176,9 @@ function remainingWorkOf(ctx: RunPipeline, extra: EpisodeExtra, passed: boolean)
       `${effectiveStatus(e) === 'contested' ? 'contested' : 'unanswered'} finding${where}: ${e.claim}`,
     );
   }
-  if (extra.acceptanceEvidence) {
-    for (const item of humanNeededAcceptance(extra.acceptanceEvidence))
-      out.push(`human decision needed — acceptance #${item.id}: ${item.item.text}`);
+  if (acceptance) {
+    for (const item of humanNeededAcceptance(acceptance))
+      out.push(`[${acceptanceSource}] human decision needed — acceptance #${item.id}: ${item.item.text}`);
   }
   return out;
 }
@@ -143,12 +186,18 @@ function remainingWorkOf(ctx: RunPipeline, extra: EpisodeExtra, passed: boolean)
 /** Why this sitting did not simply succeed, from what `settle` already has: the terminal reason on
  *  `ctx.exit` (set by whichever gate narrowed it — the verify agent, the inline reviewer, a budget
  *  breach) and, when this sitting computed one, its own acceptance evidence's FAILED criteria. */
-function failuresOf(ctx: RunPipeline, acceptance: AcceptanceReport | undefined): string[] {
+function failuresOf(
+  ctx: RunPipeline,
+  acceptance: AcceptanceReport | undefined,
+  acceptanceSource: AcceptanceSource | undefined,
+): string[] {
   const out: string[] = [];
   if (ctx.exit.reason) out.push(`terminal reason: ${ctx.exit.reason}`);
   if (acceptance) {
     for (const e of failedAcceptance(acceptance))
-      out.push(`acceptance #${e.id} failed: ${e.item.text}${e.evidence ? ` — ${e.evidence}` : ''}`);
+      out.push(
+        `[${acceptanceSource}] acceptance #${e.id} failed: ${e.item.text}${e.evidence ? ` — ${e.evidence}` : ''}`,
+      );
   }
   return out;
 }
@@ -190,6 +239,40 @@ function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
   return out;
 }
 
+/** How much of a command string is worth keeping (RUN-225) — the manifest's own committed text,
+ *  not a secret, but nothing bounds how long a repo could write it. */
+const MAX_CMD_CHARS = 200;
+
+/**
+ * Render one observed command as bounded evidence (RUN-225) — never its output. The transcript
+ * already carries the failing tail (`recordVerifyOutcome`), and a verify command's stderr can echo
+ * back a credential from the environment it ran against; the strictest bound that still answers
+ * "did this run, and did it pass" is to carry NONE of it here. `site` is the stage attribution the
+ * acceptance criterion asks for ("Test pass/fail... carry which stage produced them").
+ */
+export function describeCommandObservation(o: CommandObservation): string {
+  const cmd = o.cmd.length > MAX_CMD_CHARS ? `${o.cmd.slice(0, MAX_CMD_CHARS)}…` : o.cmd;
+  const outcome = o.passed ? 'passed' : o.timedOut ? 'timed out' : `failed (exit ${o.exitCode})`;
+  const tries = o.attempts > 1 ? `, ${o.attempts} attempts` : '';
+  return `[${o.site}] ${cmd} — ${outcome}${tries}`;
+}
+
+/**
+ * Render one steer delivery observation (RUN-225) — the daemon's own DELIVERY outcome
+ * (`SteeringBridge.applySteer`'s record), not merely that a steer arrived over the wire. `detail`
+ * is bounded the same way command output is: it can carry an error's `.message`, which is
+ * ordinarily short but not contractually so.
+ */
+const MAX_DETAIL_CHARS = 200;
+export function describeSteeringEvent(d: DeliveredSteer): string {
+  const detail =
+    d.detail && d.detail.length > MAX_DETAIL_CHARS ? `${d.detail.slice(0, MAX_DETAIL_CHARS)}…` : d.detail;
+  const outcome = d.delivered
+    ? `delivered via ${d.via}`
+    : `not delivered (${d.via}${detail ? `: ${detail}` : ''})`;
+  return `steer ${d.steerId} (${d.mode}) — ${outcome}`;
+}
+
 /**
  * Assemble one `EffortEpisode` for this sitting.
  *
@@ -202,6 +285,23 @@ function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
  */
 export function buildEpisode(ctx: RunPipeline, extra: EpisodeExtra): EffortEpisodeType {
   const passed = ctx.exit.outcome === 'done';
+  // The one acceptance report this sitting actually computed, whichever actor computed it (RUN-225:
+  // mutually exclusive by construction — see `EpisodeExtra.acceptanceEvidence`'s doc). `ctx` wins
+  // the `??` because `review` is a state `settle` has already moved past by the time this runs; a
+  // simultaneous verify-actor report cannot exist for the same workflow.
+  const acceptance = ctx.reviewEvidence?.acceptance ?? extra.acceptanceEvidence;
+  const acceptanceSource: AcceptanceSource | undefined = ctx.reviewEvidence?.acceptance
+    ? 'review'
+    : extra.acceptanceEvidence
+      ? 'verify'
+      : undefined;
+  // Every deterministic command this sitting watched exit (RUN-225), rendered once and shared by
+  // BOTH wire fields: the daemon has exactly one opaque, manifest-declared command to observe
+  // (`[verify].cmd`), and this repo's own convention names it "typecheck + lint + test" in one
+  // breath (CLAUDE.md's `npm run check`) — there is no finer signal to split "ran" from "tested"
+  // by. Duplicating the same true observation under both labels the schema offers is not a guess;
+  // inventing a distinct value for either one would be.
+  const commandStrings = ctx.commandObservations.map(describeCommandObservation);
   const candidate: EffortEpisodeType = {
     id: randomUUID(),
     projectId: ctx.run.projectId,
@@ -211,28 +311,25 @@ export function buildEpisode(ctx: RunPipeline, extra: EpisodeExtra): EffortEpiso
     baseId: ctx.worktree.baseId,
     timeline: timelineOf(ctx),
     filesTouched: extra.filesTouched,
-    // RUN-225: no command/test-execution log exists yet to source these from — an honest gap, not
-    // a guess built from the repo's CONFIGURED verify command (which this sitting may never have
-    // reached, or may have reached and failed early).
-    commands: [],
-    testsRun: [],
-    failures: failuresOf(ctx, extra.acceptanceEvidence),
+    commands: commandStrings,
+    testsRun: commandStrings,
+    failures: failuresOf(ctx, acceptance, acceptanceSource),
     findings: findingsOf(ctx.ledger, passed),
-    // The highest round any ledger entry carries (RUN-224 locked decision) — a faithful but LOWER
-    // BOUND on how many reviewer look-backs actually happened: a round that raised no NEW finding
-    // never touches an entry's `round`, so a clean final pass (the common case on a run that
-    // ultimately passes) undercounts by exactly that pass. `reviewWithFeedback`'s own `rounds`
-    // return would be exact, but `RunPipeline` does not carry it (see `EpisodeExtra`'s comment on
-    // why this module does not widen that set) — RUN-225 territory if the undercounting matters
-    // more than the instrumentation it would take to close it.
-    reviewRounds: ctx.ledger.reduce((max, e) => Math.max(max, e.round), 0),
+    // `reviewEvidence.rounds` (RUN-225) is `reviewWithFeedback`'s exact invocation count (`looks`),
+    // set by `review` for every verdict including a clean first-look PASS — closing the ledger's
+    // own undercount (a round that raises no NEW finding never touches an entry's `round`, so a
+    // single-round clean PASS used to read 0, indistinguishable from "never reviewed"). The ledger
+    // fallback stays exactly right for THAT case: no `[verify.agent]`, or a run that never reached
+    // `done` going into `review` — 0 is the true count, not an undercount, when review never ran.
+    reviewRounds: ctx.reviewEvidence?.rounds ?? ctx.ledger.reduce((max, e) => Math.max(max, e.round), 0),
     tokenUsage: ctx.exit.telemetry.modelUsage ?? {},
     costUSD: ctx.exit.telemetry.costUsd,
-    acceptanceCoverage: acceptanceCoverageOf(extra.acceptanceEvidence),
-    // RUN-225: no steering observation exists yet.
-    steeringEvents: [],
+    acceptanceCoverage: acceptanceCoverageOf(acceptance),
+    // The daemon's own delivery record (RUN-225), drained once by `settle` — see
+    // `EpisodeExtra.steeringHistory`'s doc.
+    steeringEvents: extra.steeringHistory.map(describeSteeringEvent),
     landingOutcome: landingOutcomeOf(ctx, extra.hasRemainingWork),
-    remainingWork: remainingWorkOf(ctx, extra, passed),
+    remainingWork: remainingWorkOf(ctx, extra.hasRemainingWork, passed, acceptance, acceptanceSource),
     // RUN-226 owns the agent's own summary; null is the one default `recordEpisode` does NOT
     // overwrite (locked decision), so leaving it null here cannot destroy a later self-summary.
     selfSummary: null,

@@ -133,6 +133,16 @@ export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       tally: ctx.tally,
       phase: 'verifying',
     });
+    // A real command the daemon watched exit (RUN-225) — recorded whatever the outcome, so the
+    // episode shows this sitting reached the floor even on the FAIL path below.
+    ctx.commandObservations.push({
+      site: 'verify',
+      cmd: floorCmd.cmd,
+      passed: result.passed,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      attempts: result.attempts,
+    });
     if (result.passed) {
       host.log.info('deterministic verify passed', { runId: run.id });
     } else {

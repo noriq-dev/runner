@@ -46,8 +46,16 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     verifyRan: !ctx.landPolicy,
     noriqMcp: ctx.noriqMcp,
     runAgent: ctx.runAgent,
+    // A fix round's own floor re-check is a real command this sitting watched exit (RUN-225) —
+    // `reviewWithFeedback` has no `RunPipeline` of its own to write it onto.
+    onCommandObserved: (o) => ctx.commandObservations.push(o),
   });
   ctx.ledger = review.ledger; // the freshest adjudication state, for the continuable record
+  // The reviewer's own EXACT evidence (RUN-225), carried forward for `settle` — whatever the
+  // verdict below, since a FAIL's acceptance gaps and round count are as real as a PASS's. See
+  // `RunPipeline.reviewEvidence`'s own doc for why `looks` (not `rounds`) is what closes the
+  // ledger-derived undercount.
+  ctx.reviewEvidence = { rounds: review.looks, acceptance: review.acceptance };
 
   // The per-criterion record (RUN-145) is posted whatever the verdict, and that is the point of
   // it: on a FAIL it is the most legible part of the report, and on a PASS it is the ONLY place a

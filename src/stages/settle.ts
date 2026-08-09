@@ -225,7 +225,15 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // this point (see the module doc's completeness argument for why the payload matters, and
   // settle's own doc for why nothing here may become a second gate).
   try {
-    const episode = buildEpisode(ctx, { filesTouched: changedPaths, hasRemainingWork, acceptanceEvidence });
+    const episode = buildEpisode(ctx, {
+      filesTouched: changedPaths,
+      hasRemainingWork,
+      acceptanceEvidence,
+      // Drained once, here — the daemon's own steer-delivery record (RUN-225), not the server's
+      // independent view. `steeringHistory` is optional on `StageHost`; a host with none wired
+      // (a test, steering off machine-wide) reads the same as a bridge that observed nothing.
+      steeringHistory: host.steeringHistory?.(run.id) ?? [],
+    });
     host.recordEpisode?.(episode);
   } catch (err) {
     host.log.warn('episode assembly failed — settling anyway', { runId: run.id, err: String(err) });
