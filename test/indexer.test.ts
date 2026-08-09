@@ -13,7 +13,7 @@ import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
 import { FakeIndexSource } from '../src/index-source';
 import type { FakeIndexSourceItem } from '../src/index-source';
-import { runIndexer } from '../src/indexer';
+import { resolveRelativeImport, runIndexer } from '../src/indexer';
 import type { IndexRunTarget } from '../src/indexer';
 
 const cfg = (over: Partial<ResolvedIndexConfig> = {}): ResolvedIndexConfig => ({
@@ -432,6 +432,205 @@ describe('runIndexer — same-file call edges (RUN-216)', () => {
     const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
     expect(rows.some((r) => r.kind === 'edge' && r.type === 'calls')).toBe(false);
     expect(result.inferredEdgesOmitted).toBe(0);
+  });
+});
+
+describe('resolveRelativeImport (RUN-217 locked decisions 2/3)', () => {
+  it('declines a bare specifier immediately, regardless of what the snapshot contains', () => {
+    const paths = new Set(['react.ts', 'src/react.ts']);
+    expect(resolveRelativeImport('src/a.ts', 'react', paths)).toBeNull();
+    expect(resolveRelativeImport('src/a.ts', '@noriq-dev/shared', paths)).toBeNull();
+    expect(resolveRelativeImport('src/a.ts', 'node:fs', paths)).toBeNull();
+  });
+
+  it('resolves a literal, extension-carrying relative specifier directly', () => {
+    const paths = new Set(['src/a.ts', 'src/b.ts']);
+    expect(resolveRelativeImport('src/a.ts', './b.ts', paths)).toBe('src/b.ts');
+  });
+
+  it('resolves an extensionless relative specifier by trying the documented extension list', () => {
+    const paths = new Set(['src/a.ts', 'src/worktree.ts']);
+    expect(resolveRelativeImport('src/a.ts', './worktree', paths)).toBe('src/worktree.ts');
+  });
+
+  it('resolves an extensionless relative specifier against a directory /index file', () => {
+    const paths = new Set(['src/a.ts', 'src/lib/index.ts']);
+    expect(resolveRelativeImport('src/a.ts', './lib', paths)).toBe('src/lib/index.ts');
+  });
+
+  it('declines when no candidate is present in this generation — no stub, no guess', () => {
+    const paths = new Set(['src/a.ts']);
+    expect(resolveRelativeImport('src/a.ts', './missing', paths)).toBeNull();
+  });
+
+  it('declines an extensionless specifier when two candidates are present — ambiguous', () => {
+    const paths = new Set(['src/a.ts', 'src/util.ts', 'src/util.js']);
+    expect(resolveRelativeImport('src/a.ts', './util', paths)).toBeNull();
+  });
+
+  it('declines when both the extensionless directory and an /index file exist for the same target', () => {
+    const paths = new Set(['src/a.ts', 'src/lib.ts', 'src/lib/index.ts']);
+    expect(resolveRelativeImport('src/a.ts', './lib', paths)).toBeNull();
+  });
+
+  it("joins a `../` specifier relative to the IMPORTER's own directory, not the repo root", () => {
+    const paths = new Set(['src/nested/foo.ts', 'src/lib/bar.ts']);
+    expect(resolveRelativeImport('src/nested/foo.ts', '../lib/bar', paths)).toBe('src/lib/bar.ts');
+  });
+
+  it('resolves a same-directory specifier for an importer at the repository root', () => {
+    const paths = new Set(['a.ts', 'b.ts']);
+    expect(resolveRelativeImport('a.ts', './b', paths)).toBe('b.ts');
+  });
+});
+
+describe('runIndexer — imports edges (RUN-217 locked decisions 1/2/3/4)', () => {
+  /** Reports whatever specifiers the test wired up for each path — proves the wiring end to end
+   *  without depending on RUN-216's real tree-sitter adapter (already covered in its own suite). */
+  const importAdapter = (importsByPath: Record<string, string[]>): IndexParserAdapter => ({
+    id: 'fake-imports',
+    version: '1',
+    canParse: () => true,
+    parse: async (input: AdapterParseInput): Promise<AdapterParseResult> => ({
+      symbols: [],
+      diagnostics: [],
+      imports: (importsByPath[input.path] ?? []).map((specifier) => ({ specifier })),
+    }),
+  });
+
+  function importEdges(result: Awaited<ReturnType<typeof runIndexer>>) {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .filter((r) => r.kind === 'edge' && r.type === 'imports');
+  }
+
+  function fileUriFor(result: Awaited<ReturnType<typeof runIndexer>>, path: string): unknown {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .find((r) => r.kind === 'node' && r.type === 'file' && String(r.uri).endsWith(`/${path}`))?.uri;
+  }
+
+  it('wires a resolved relative specifier into a real imports edge between the two file URIs', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'x' },
+        { kind: 'file', path: 'src/b.ts', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./b'] })) },
+    );
+    expect(importEdges(result)).toEqual([
+      {
+        kind: 'edge',
+        type: 'imports',
+        from: fileUriFor(result, 'src/a.ts'),
+        to: fileUriFor(result, 'src/b.ts'),
+      },
+    ]);
+  });
+
+  it('resolves an import whose target sorts, and is therefore processed, AFTER the importer', async () => {
+    // FakeIndexSource enumerates in sorted path order, so 'src/a.ts' is scanned strictly before
+    // 'src/z.ts' — this is the exact case a single-pass (candidate-loop-only) resolver would miss
+    // (RUN-217 locked decision 2), since 'src/z.ts' is not yet in `currentPaths` when 'src/a.ts'
+    // is processed.
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'x' },
+        { kind: 'file', path: 'src/z.ts', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./z'] })) },
+    );
+    expect(importEdges(result)).toEqual([
+      {
+        kind: 'edge',
+        type: 'imports',
+        from: fileUriFor(result, 'src/a.ts'),
+        to: fileUriFor(result, 'src/z.ts'),
+      },
+    ]);
+  });
+
+  it('declines a bare specifier — no edge to a node that does not exist in this graph', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['react'] })) },
+    );
+    expect(importEdges(result)).toEqual([]);
+  });
+
+  it('declines a relative specifier that resolves to nothing this generation actually indexed', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./missing'] })) },
+    );
+    expect(importEdges(result)).toEqual([]);
+  });
+
+  it('declines an ambiguous extensionless specifier — two candidates present in the snapshot', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'x' },
+        { kind: 'file', path: 'src/util.ts', content: 'x' },
+        { kind: 'file', path: 'src/util.js', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./util'] })) },
+    );
+    expect(importEdges(result)).toEqual([]);
+  });
+
+  it('targets the imported FILE entity, never a symbol inside it — the edge URI has no # fragment', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'x' },
+        { kind: 'file', path: 'src/b.ts', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./b'] })) },
+    );
+    const edges = importEdges(result);
+    expect(edges).toHaveLength(1);
+    const edge = edges[0] as { to: string };
+    expect(edge.to.includes('#')).toBe(false);
+  });
+
+  it('collapses two specifiers from the same file resolving to the same target into one edge', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'src/a.ts', content: 'x' },
+        { kind: 'file', path: 'src/b.ts', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./b', './b.ts'] })) },
+    );
+    expect(importEdges(result)).toHaveLength(1);
+  });
+
+  it('produces a byte-identical result across two runs with import edges present', async () => {
+    const run = () =>
+      runIndexer(
+        new FakeIndexSource([
+          { kind: 'file', path: 'src/a.ts', content: 'x' },
+          { kind: 'file', path: 'src/b.ts', content: 'x' },
+        ]),
+        cfg(),
+        target(),
+        { adapters: new IndexAdapterRegistry().register(importAdapter({ 'src/a.ts': ['./b'] })) },
+      );
+    const first = await run();
+    const second = await run();
+    expect(first.manifest.contentHash).toBe(second.manifest.contentHash);
   });
 });
 

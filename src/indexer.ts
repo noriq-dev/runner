@@ -1,3 +1,4 @@
+import { posix as posixPath } from 'node:path';
 import type { IndexGenerationManifest } from '@noriq-dev/shared';
 import { type IndexAdapterRegistry, createDefaultAdapterRegistry } from './index-adapters';
 import {
@@ -59,7 +60,66 @@ import type { IndexSource } from './index-source';
  * source text, not the read" posture (`index-scan.ts`'s module doc) carrying through unchanged:
  * `contentMode: 'metadata'` costs symbol extraction the same way it costs the file's own stored
  * content, for the same reason.
+ *
+ * **`imports` edges are resolved SNAPSHOT-LOCAL and TWO-PASS** (RUN-217 locked decision 2): an
+ * adapter reports `ParsedImport.specifier` as a literal string with no idea what else this
+ * generation indexed (`index-adapters.ts`'s own "one file at a time" constraint), so resolving it
+ * to a real file entity cannot happen inside the candidate loop above — a file importing a sibling
+ * that has not been scanned yet would resolve to nothing, purely by iteration order, which is
+ * exactly the kind of order-dependent bug the rest of this indexer works hard NOT to have. Instead
+ * every `(importerPath, specifier)` pair this loop sees is collected into `pendingImports` and
+ * resolved in a SECOND pass once `currentPaths` — the loop's own running list — is complete, against
+ * the exact same set of paths a `declares`/`calls` edge above was minted against. `resolveRelativeImport`
+ * is the resolution function itself; see its own doc for the specifier grammar and the fixed
+ * candidate order.
  */
+
+/**
+ * Extensions tried, in this fixed order, when a relative specifier names no extension (RUN-217
+ * locked decision 3) — this repo's own convention (`./worktree` resolving to `src/worktree.ts`) is
+ * exactly the case a resolver that only handled explicit extensions would miss on the very first
+ * repository it runs against, while still passing every test written against explicit-extension
+ * fixtures.
+ */
+const RELATIVE_IMPORT_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'] as const;
+
+/**
+ * Resolve one `ParsedImport.specifier` (as reported by `importerPath`'s own adapter) against
+ * `currentPaths` — the exact set of repo-relative paths THIS generation's scan actually produced,
+ * never a filesystem stat and never Node's or TypeScript's own module-resolution algorithm (both
+ * would happily resolve to a `node_modules` file this indexer never scanned, minting an edge to a
+ * node that does not exist in this graph — locked decision 2's whole point).
+ *
+ * A specifier not starting with `.` is BARE (`react`, `@noriq-dev/shared`, `node:fs`) and declines
+ * immediately, with no candidate generated at all: this indexer has no package registry or
+ * `node_modules` resolution to consult, so a bare specifier resolves to no node in this graph by
+ * definition, not by a failed lookup.
+ *
+ * A relative specifier is tried, in the fixed order locked decision 3 names, as: the literal
+ * joined path, then each of `RELATIVE_IMPORT_EXTENSIONS` appended, then `/index` plus each of the
+ * same list. If MORE THAN ONE of those candidates is present in `currentPaths`, the specifier is
+ * ambiguous and declines — may-miss-never-invent: an edge naming one of two equally plausible
+ * targets is worse than no edge. Joining and normalizing always use POSIX semantics (`path.posix`)
+ * regardless of the host OS this daemon runs on: `importerPath` already arrives forward-slash
+ * (`index-entity.ts`'s `normalizeRepoPath`), and joining with the platform separator would
+ * silently misresolve on Windows the same way that function exists to prevent one layer up.
+ */
+export function resolveRelativeImport(
+  importerPath: string,
+  specifier: string,
+  currentPaths: ReadonlySet<string>,
+): string | null {
+  if (!specifier.startsWith('.')) return null;
+
+  const joined = posixPath.normalize(posixPath.join(posixPath.dirname(importerPath), specifier));
+
+  const candidates = [joined];
+  for (const ext of RELATIVE_IMPORT_EXTENSIONS) candidates.push(`${joined}${ext}`);
+  for (const ext of RELATIVE_IMPORT_EXTENSIONS) candidates.push(`${joined}/index${ext}`);
+
+  const present = new Set(candidates.filter((c) => currentPaths.has(c)));
+  return present.size === 1 ? [...present].at(0)! : null;
+}
 
 export interface IndexRunTarget {
   /** The server-resolved Noriq project id — required here (unlike `IndexTarget.projectId` in
@@ -142,6 +202,9 @@ export async function runIndexer(
   const diagnostics = new DiagnosticsCollector();
   const parserVersions: Record<string, string> = {};
   const currentPaths: string[] = [];
+  // Collected during the loop, resolved AFTER it — see this module's own doc on why `imports`
+  // cannot resolve inside the candidate loop itself (RUN-217 locked decision 2).
+  const pendingImports: Array<{ importerPath: string; specifier: string }> = [];
   let inferredEdgesOmitted = 0;
 
   for (const candidate of scanResult.candidates) {
@@ -219,6 +282,10 @@ export async function runIndexer(
       if (from && to) records.push({ kind: 'edge', type: 'calls', from, to });
     }
 
+    for (const imp of parsed.imports ?? []) {
+      pendingImports.push({ importerPath: path, specifier: imp.specifier });
+    }
+
     for (const diagnostic of parsed.diagnostics) {
       diagnostics.push({
         path,
@@ -227,6 +294,26 @@ export async function runIndexer(
         source: `${adapter.id}@${adapter.version}`,
       });
     }
+  }
+
+  // Second pass (RUN-217 locked decision 2): resolve every pending import now that `currentPaths`
+  // — the complete set this generation actually indexed — is finished, never against a
+  // partially-built list a candidate loop order could make order-dependent. `imports` targets the
+  // imported FILE entity, never a symbol inside it (locked decision 4); a URI is deterministic in
+  // the resolved path alone (`buildFileEntityUri`), so no separate dedup key is minted here —
+  // `seenImportEdges` collapses two specifiers from the same file resolving to the same target
+  // (e.g. two separate `require()`/`import` statements naming the same sibling) into one edge.
+  const currentPathSet = new Set(currentPaths);
+  const seenImportEdges = new Set<string>();
+  for (const { importerPath, specifier } of pendingImports) {
+    const resolvedPath = resolveRelativeImport(importerPath, specifier, currentPathSet);
+    if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
+    const from = buildFileEntityUri(scope, importerPath);
+    const to = buildFileEntityUri(scope, resolvedPath);
+    const key = `${from}\u0000${to}`;
+    if (seenImportEdges.has(key)) continue;
+    seenImportEdges.add(key);
+    records.push({ kind: 'edge', type: 'imports', from, to });
   }
 
   const deletions = computeDeletions(currentPaths, deps.previousFilePaths);

@@ -13,14 +13,27 @@ import {
 import { type GrammarId, TreeSitterRuntime, grammarIdForPath } from './treesitter-runtime';
 
 /**
- * The tree-sitter `IndexParserAdapter` for TypeScript/JavaScript/TSX (RUN-216). Extraction rules
- * themselves are RUN-217's job (deferred) — this ships enough to prove a real grammar parses real
- * source into `index-adapters.ts`'s flat shape, and that a relationship this adapter cannot back
- * with certainty is DECLINED rather than guessed (locked decision 6). What is real here: top-level
- * and nested function/class/method/interface/type/enum declarations, `describe`/`it`/`test` test
- * blocks, static import specifiers, and same-file call resolution with confidence (locked
- * decision 7) — everything past that (cross-file imports, dynamic dispatch, JSX-aware symbol
- * shapes) stays undone rather than approximated.
+ * The tree-sitter `IndexParserAdapter` for TypeScript/JavaScript/TSX (RUN-216 shipped the seam;
+ * RUN-217 is the real extraction below). What is real here: top-level and nested
+ * function/class/method/interface/type/enum/namespace declarations, TS overload signatures
+ * (`function_signature`/`method_signature`/`abstract_method_signature` — each gets its OWN entity,
+ * locked decision 8), `describe`/`it`/`test` test blocks, static import specifiers (`import`,
+ * re-export `export … from`, and CommonJS `require('literal')` on identical terms — discretion:
+ * CommonJS earns its own arm because a repo mixing `require` and `import` should not lose half its
+ * dependency graph), a CommonJS `exports.NAME =`/`module.exports.NAME = <function>` assignment
+ * treated as a declaration the same way a function-valued `const NAME = …` already is, and
+ * same-file call resolution with confidence (locked decision 7).
+ *
+ * **Declined, deliberately** (discretion — "a shape you cannot identify without type information
+ * should be DECLINED, and a comment saying why beats a heuristic that is right most of the time"):
+ * route/tool declarations (`app.get('/path', …)`, a `@Get('/path')` decorator, an RPC/tool
+ * registration call) get no arm at all — which HTTP verb, which decorator name, which call shape
+ * means "this is a route" is framework convention, not syntax a generic TS/JS grammar can see, and
+ * this very repo has no such framework to measure against; a wrong guess here is worse than the
+ * missing coverage. An anonymous `export default (...)`/`export default function(){}` also gets no
+ * symbol — there is no name to hang an identity on, and inventing one (`'default'`) would not
+ * survive the file gaining a second anonymous default export elsewhere in a refactor. Neither is a
+ * TODO — see the specific `case`/absence below for where each decision actually lives.
  *
  * **Isolation is TWO-LAYERED, deliberately redundant** (locked decision 5): `parse()` below wraps
  * its own tree-walk in try/catch and turns any throw into a single bounded diagnostic rather than
@@ -57,6 +70,14 @@ const ADAPTER_VERSION = '1';
 
 const TEST_CALL_NAMES = new Set(['it', 'test']);
 const DESCRIBE_CALL_NAME = 'describe';
+/** `require('literal')` is a `call_expression`, not an `import_statement` — it needs its own arm
+ *  to join `state.imports` at all (discretion: CommonJS "earns an arm" the same way a dynamic
+ *  `import(expr)` never does, because a literal argument here is exactly as readable-without-
+ *  execution as a static `import` specifier). Recognised ONLY as a bare call to the literal
+ *  identifier `require` — `require.resolve(...)`, a shadowed local named `require`, or any other
+ *  spelling is out of scope for the same reason a shadowed `it`/`describe` would be: this adapter
+ *  has no scope analysis, only syntax. */
+const REQUIRE_CALL_NAME = 'require';
 
 // ---------------------------------------------------------------------------
 // Pass 1: walk the tree once, collecting declarations (in stable order) and raw call sites.
@@ -105,6 +126,12 @@ function literalStringValue(node: Node | null): string | null {
   return null;
 }
 
+/** `node.startPosition`/`endPosition` are tree-sitter's own 0-based rows — converted to the
+ *  1-based, inclusive-both-ends spelling `index-adapters.ts`'s `SymbolRange` documents (the
+ *  spelling a human reads in an editor/diff). Every symbol this adapter emits gets one: unlike
+ *  RUN-218's non-tree-sitter adapters, a tree-sitter parse always knows a node's position, so there
+ *  is no "no defensible span" case here to decline. Adding this field leaves `symbolPath` — the
+ *  only thing a URI is built from (locked decision 9) — completely untouched. */
 function pushSymbol(
   out: ParsedSymbol[],
   path: string[],
@@ -112,21 +139,73 @@ function pushSymbol(
   node: Node,
   nodeType: ParsedSymbol['nodeType'] = 'symbol',
 ): void {
-  out.push({ symbolPath: path, nodeType, label, content: node.text });
+  out.push({
+    symbolPath: path,
+    nodeType,
+    label,
+    content: node.text,
+    range: { startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1 },
+  });
 }
 
-/** Declarator name for `const NAME = <arrow function or function expression>` — the common
- *  JS/TS "function stored in a variable" shape, alongside real `function_declaration`s. */
+/** Declarator name for `const NAME = <arrow function, function expression, or generator function
+ *  expression>` — the common JS/TS "function stored in a variable" shape, alongside real
+ *  `function_declaration`s. `generator_function` is the grammar's node type for a `function*` VALUE
+ *  (as opposed to `generator_function_declaration`, a statement) — measured, not assumed. */
 function functionValuedDeclaratorName(declarator: Node): string | null {
   const value = declarator.childForFieldName('value');
-  if (!value || (value.type !== 'arrow_function' && value.type !== 'function_expression')) return null;
+  if (
+    !value ||
+    (value.type !== 'arrow_function' &&
+      value.type !== 'function_expression' &&
+      value.type !== 'generator_function')
+  ) {
+    return null;
+  }
   const name = declarator.childForFieldName('name');
   return name && name.type === 'identifier' ? name.text : null;
 }
 
+/**
+ * `exports.NAME = <fn>` or `module.exports.NAME = <fn>` — CommonJS's own way of spelling the
+ * function-valued declarator shape above. Returns `NAME` only for exactly those two receiver
+ * shapes (a bare `exports` identifier, or `module.exports` as the inner member expression) so a
+ * plain `foo.bar = function(){}` assignment on some unrelated object never gets mistaken for an
+ * export. `module.exports = <fn>` (the WHOLE module is one function) is deliberately not matched
+ * here — that is this file's anonymous-default-export case one level down (discretion: same
+ * "nothing to hang identity on" reasoning), and returning `'exports'`/`'default'` for it would
+ * invent a name the source never wrote.
+ */
+function commonJsExportName(assignment: Node): string | null {
+  const left = assignment.childForFieldName('left');
+  if (!left || left.type !== 'member_expression') return null;
+  const property = left.childForFieldName('property');
+  if (!property || property.type !== 'property_identifier') return null;
+
+  const object = left.childForFieldName('object');
+  if (object?.type === 'identifier' && object.text === 'exports') return property.text;
+  if (object?.type === 'member_expression') {
+    const innerObject = object.childForFieldName('object');
+    const innerProperty = object.childForFieldName('property');
+    if (
+      innerObject?.type === 'identifier' &&
+      innerObject.text === 'module' &&
+      innerProperty?.type === 'property_identifier' &&
+      innerProperty.text === 'exports'
+    ) {
+      return property.text;
+    }
+  }
+  return null;
+}
+
 function walk(node: Node, ctx: WalkCtx, state: WalkState): void {
   switch (node.type) {
-    case 'function_declaration': {
+    // `generator_function_declaration` is `function* NAME(){}` as a STATEMENT (as opposed to
+    // `generator_function`, the expression form `functionValuedDeclaratorName` matches below) —
+    // same shape as an ordinary function declaration in every way this adapter cares about.
+    case 'function_declaration':
+    case 'generator_function_declaration': {
       const name = node.childForFieldName('name');
       if (name) {
         const path = [...(ctx.path ?? []), name.text];
@@ -136,7 +215,12 @@ function walk(node: Node, ctx: WalkCtx, state: WalkState): void {
       }
       break;
     }
-    case 'class_declaration': {
+    // `abstract_class_declaration` is a class carrying the `abstract` modifier — a distinct
+    // grammar node from `class_declaration`, not a flag on it (measured), but identical for
+    // extraction: its own methods may be `method_definition` (concrete) or
+    // `abstract_method_signature` (declared, no body) — both handled below.
+    case 'class_declaration':
+    case 'abstract_class_declaration': {
       const name = node.childForFieldName('name');
       if (name) {
         const path = [...(ctx.path ?? []), name.text];
@@ -156,11 +240,65 @@ function walk(node: Node, ctx: WalkCtx, state: WalkState): void {
       }
       break;
     }
-    case 'interface_declaration':
+    // A TS overload GROUP — `function foo(a: string): void;` repeated with different parameter
+    // types, then one implementation signature — is N+1 separate `function_signature` /
+    // `function_declaration` nodes sharing one name (locked decision 8: each becomes its OWN
+    // symbol entity here; `dedupeSymbolPaths` one layer up in `index-entity.ts` is what
+    // disambiguates the repeated `symbolPath` into distinct URIs, never this file). An ambient
+    // `declare function foo(): void;` parses the same way (see `parse errors/ambient` coverage) —
+    // no body to recurse into either way, so this case never needs to update `ctx.path`.
+    case 'function_signature': {
+      const name = node.childForFieldName('name');
+      if (name) pushSymbol(state.symbols, [...(ctx.path ?? []), name.text], name.text, node);
+      break;
+    }
+    // The interface-body/abstract-class-body halves of the same overload story:
+    // `method_signature` (an interface member, or a non-abstract overload signature inside a
+    // class body) and `abstract_method_signature` (`abstract render(): void;`) both declare
+    // without a body. Requires `ctx.path` the same way `method_definition` does — a signature
+    // with nothing enclosing it is not attributable to anything.
+    case 'method_signature':
+    case 'abstract_method_signature': {
+      const name = node.childForFieldName('name');
+      if (name && ctx.path) pushSymbol(state.symbols, [...ctx.path, name.text], name.text, node);
+      break;
+    }
+    // Unlike the group above, `interface_declaration` DOES nest its own path — a `method_signature`
+    // inside its body must attribute to the interface, the same way a class's methods attribute to
+    // the class.
+    case 'interface_declaration': {
+      const name = node.childForFieldName('name');
+      if (name) {
+        const path = [...(ctx.path ?? []), name.text];
+        pushSymbol(state.symbols, path, name.text, node);
+        walkChildren(node, { ...ctx, path }, state);
+        return;
+      }
+      break;
+    }
+    // `type_alias_declaration`/`enum_declaration` never nest a path here: a type alias's own shape
+    // (a function type, a mapped type, a union) has no declaration inside it this adapter
+    // recognises, and an enum's members are values, not declarations.
     case 'type_alias_declaration':
     case 'enum_declaration': {
       const name = node.childForFieldName('name');
       if (name) pushSymbol(state.symbols, [...(ctx.path ?? []), name.text], name.text, node);
+      break;
+    }
+    // `namespace Foo { … }` / `namespace A.B { … }` (parsed as `internal_module`, wrapped in an
+    // `expression_statement` the default case below already walks through unchanged). A dotted
+    // name (`nested_identifier`, `A.B`) is kept as ONE path segment via its own full `.text` rather
+    // than split into `['A','B']` — splitting would make `namespace A.B` indistinguishable from a
+    // namespace `A` nesting a namespace `B`, which is not what the source wrote.
+    case 'internal_module': {
+      const name = node.childForFieldName('name');
+      const body = node.childForFieldName('body');
+      if (name && body) {
+        const path = [...(ctx.path ?? []), name.text];
+        pushSymbol(state.symbols, path, name.text, node);
+        walkChildren(body, { ...ctx, path }, state);
+        return;
+      }
       break;
     }
     case 'variable_declarator': {
@@ -170,6 +308,24 @@ function walk(node: Node, ctx: WalkCtx, state: WalkState): void {
         pushSymbol(state.symbols, path, fnName, node);
         const value = node.childForFieldName('value');
         if (value) walkChildren(value, { ...ctx, path }, state);
+        return;
+      }
+      break;
+    }
+    // CommonJS's own function-valued-declaration shape — see `commonJsExportName`'s own doc for
+    // exactly which receivers qualify and which are deliberately left as a plain assignment
+    // (`module.exports = …` alone, an anonymous default export in every way that matters here).
+    case 'assignment_expression': {
+      const exportName = commonJsExportName(node);
+      const value = node.childForFieldName('right');
+      const isFunctionValued =
+        value?.type === 'function_expression' ||
+        value?.type === 'arrow_function' ||
+        value?.type === 'generator_function';
+      if (exportName && value && isFunctionValued) {
+        const path = [...(ctx.path ?? []), exportName];
+        pushSymbol(state.symbols, path, exportName, node);
+        walkChildren(value, { ...ctx, path }, state);
         return;
       }
       break;
@@ -206,6 +362,17 @@ function recordCallSite(node: Node, ctx: WalkCtx, state: WalkState): void {
   if (callee?.type === 'identifier' && args) {
     const first = args.namedChildren[0] ?? null;
     const label = literalStringValue(first ?? null);
+    if (callee.text === REQUIRE_CALL_NAME) {
+      // A literal `require('x')` is exactly as readable-without-execution as a static `import`
+      // specifier — join `state.imports` on identical terms (`REQUIRE_CALL_NAME`'s own doc).
+      // `require(someExpr)` (label === null) is declined the same way a computed dynamic
+      // `import(expr)` already is — by omission, never with a placeholder — and either way this is
+      // never treated as an ordinary same-file call site: `require` is never a symbol this file
+      // declares, so it would only decline there too, but routing it through `calls` at all would
+      // blur "an import dependency" with "a same-file call", which are different edges on the wire.
+      if (label !== null) state.imports.push({ specifier: label });
+      return;
+    }
     if (callee.text === DESCRIBE_CALL_NAME && label !== null) {
       const describePath = [...ctx.describePath, label];
       const callback = args.namedChildren[1] ?? null;
@@ -323,6 +490,11 @@ export function createTreeSitterAdapter(grammar: GrammarId, runtime: TreeSitterR
   return {
     id: `tree-sitter-${grammar}`,
     version: ADAPTER_VERSION,
+    // (RUN-217 locked decision 7) tsx/jsx are TypeScript's and JavaScript's own syntax, not
+    // separate POLICY languages — all three grammars declare the same two-entry list regardless of
+    // which one actually parses a given file. `[index].languages` gating itself is RUN-219's job;
+    // this only makes the field a true statement about what these adapters serve.
+    languages: ['typescript', 'javascript'],
     canParse: (path) => grammarIdForPath(path) === grammar,
     parse: (input: AdapterParseInput): Promise<AdapterParseResult> => parseFile(grammar, runtime, input),
   };
