@@ -91,9 +91,9 @@ server, or you configured by hand.
 
 The daemon dials the Noriq server with **your OAuth token**. Model credentials and git/forge
 credentials never leave the box — nothing changes that. (One other thing can cross, and only if
-you turn it on per repo: a committed `[index].enabled = true` lets this daemon read — and, once a
-later phase ships the transport, send — a bounded slice of that repo's own source. Never a
-credential. See [Repository intelligence](#repository-intelligence-index--off-by-default) below
+you turn it on per repo: a committed `[index].enabled = true` lets this daemon read — and, once
+something actually calls the upload, send — a bounded slice of that repo's own source. Never a
+credential. Nothing calls it yet; today the only thing that indexes is you typing `index-repo`. See [Repository intelligence](#repository-intelligence-index--off-by-default) below
 and [`THREAT-MODEL.md`](THREAT-MODEL.md).) One command gets your token:
 
 ```bash
@@ -329,14 +329,27 @@ Two things worth knowing before you opt in:
 - **No implicit exclusions.** Unlike repo discovery, the indexer does not skip
   `node_modules`/`dist`/`.git` on its own — write `[index].exclude` yourself, or a repo that opts
   in without one gets everything not caught by the size/time caps, which is not the same as a
-  sensible default.
+  sensible default. For scale: indexing this repo's own root without an exclude reaches 6943 files,
+  against roughly a hundred you would call its source.
 - **Source structure and excerpts are business-sensitive even where they hold no credential** —
   treat this as a data-classification decision, not only a security one.
 
-As shipped, this is the read-and-confine half only: nothing in this daemon yet transmits an index
-anywhere (the upload transport is a later, unbuilt phase). The full trade — what's enforced today,
-what's designed but not yet built, and every residual risk — is in
-[`THREAT-MODEL.md`](THREAT-MODEL.md), under "Repository intelligence upload (`[index]`)".
+You can see exactly what an index would contain, without a server and without uploading anything:
+
+```bash
+noriq-runner index-repo                 # summary: files, entities, edges, diagnostics
+noriq-runner index-repo --json          # the same, machine-readable
+noriq-runner index-repo --check-determinism   # index twice, compare canonical output
+```
+
+It refuses without `[index].enabled` unless you pass `--force`, and it cannot transmit anything —
+the upload client is not reachable from its code at all.
+
+As shipped, the read half is complete and nothing calls the write half: this daemon indexes only
+when an operator types the command above, never on its own schedule, and no index has a path to the
+server yet. The full trade — what's enforced today, what's designed but not yet built, and every
+residual risk — is in [`THREAT-MODEL.md`](THREAT-MODEL.md), under "Repository intelligence upload
+(`[index]`)".
 
 ## Security model
 

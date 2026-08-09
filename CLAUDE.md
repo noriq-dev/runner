@@ -440,12 +440,19 @@ and should be updated alongside any change here.
   one explicit, committed exception.** `sanitizedAgentEnv` strips the agent's env; `src/index-deny.ts`
   `isDeniedIndexPath` is a second, independent, non-overridable floor under the one thing that CAN
   cross now: on a repo's own `[index].enabled = true`, this daemon reads a bounded, deny-filtered,
-  confined slice of that repo's own SOURCE (never a credential) for Project Memory. As landed
-  (RUN-207…209) this is the read/confinement half only — nothing in the daemon's own pipeline calls
-  the scanner yet, and no transport exists to ship its output anywhere. "Only the OAuth token
-  crosses the wire" was the pre-RUN-207 shorthand for this line; it is narrower now, not false, and
-  THREAT-MODEL.md's "Repository intelligence upload (`[index]`)" section states the boundary —
-  don't restate it more strongly than that there.
+  confined slice of that repo's own SOURCE (never a credential) for Project Memory. `index-redact.ts`
+  is a THIRD floor at a different grain (RUN-218) — the deny list decides whether a path may be
+  read, that decides whether an extracted config VALUE may become searchable text, and the direction
+  of caution inverts there: unsure means withhold. As of Phase 3 the READ half is complete and the
+  WRITE half has no caller — scanner, extraction, batching and an ingest client all exist and
+  `index-repo` runs the chain locally, but nothing in `daemon.ts`/`supervisor.ts` invokes any of it
+  and `index-repo` cannot upload by construction. Two things it does NOT cover, both measured rather
+  than assumed: a `full`-mode file entity carries RAW source text with no redaction pass, so a token
+  hardcoded in `src/foo.ts` is in the payload (the value floor only sees what an adapter extracted);
+  and there is still no default `[index].exclude`, so a first opt-in walks `node_modules` — 6943
+  files on this repo. "Only the OAuth token crosses the wire" was the pre-RUN-207 shorthand for this
+  line; it is narrower now, not false, and THREAT-MODEL.md's "Repository intelligence upload
+  (`[index]`)" section states the boundary — don't restate it more strongly than that there.
 - **The verify agent executes but never edits** — authorship separation is the point of the gate.
   Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
   `write = false` for any non-producing workflow at every permission site, so no manifest — built-in
