@@ -2672,6 +2672,15 @@ export class RunSupervisor {
     // the one the builder was answering by. The entry is also the VISIBILITY check: the
     // adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
     // fold (the cap) is not evidence and stands.
+    //
+    // This is also why the overflow-vs-candidacy bug (RUN-189) was a fold bug, not a candidacy
+    // bug: `e` here is whatever `buildLedger` wrote for THIS finding at THIS round, so candidacy
+    // can only ever require what the entry holds. An overflow that kept the held set whole and
+    // dropped the terminal round's own enumeration made `subs` here the OLD claims, not the ones
+    // the terminal reviewer actually raised — a contest of stale claims then read as answering a
+    // finding nobody had re-examined. `buildLedger`'s overflow branch now never drops this round's
+    // own raised claims for the cap (oldest-held goes first instead), so `subs` here is guaranteed
+    // to contain every current terminal sub-claim; this site needed no change beyond that guarantee.
     const answerablyContested = (f: Finding) => {
       const e = reconciledEntry(answered, f, args.terminalRound);
       if (!e) return false;

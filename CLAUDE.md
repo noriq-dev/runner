@@ -143,82 +143,73 @@ parse: the fold preserves held claims when a re-raise drops the letters (a fresh
 paraphrases by construction) — and when it repeats only SOME of them, unioning in the claims its
 wording does not cover, because a narrowed re-raise replacing the set wholesale was the same
 escape one fold up. Only a claim the re-raise abandoned AND the builder had rebutted is dropped —
-settled by both sides — and the union never slices: past the entry's cap (twice one round's
-enumeration cap) the held set stands whole and the new enumeration is the thing dropped,
-all-or-nothing again, with this turn's answers still landed on it by wording. Carried answers
+settled by both sides — and the union past the entry's cap (twice one round's enumeration cap)
+SLICES, but only on the HELD side, oldest-held first (RUN-189): this round's own raised claims are
+never what the cap discards, with this turn's answers still landed on the surviving positions by
+wording. A held-only credit landing on a position the slice then drops is lost with the entry —
+a MISS, the same direction every cap in this ledger already prices, never an invention — which is
+the fix for the overflow-vs-candidacy bug: an entry that kept the held set whole and dropped the
+terminal round's own enumeration let candidacy read a record whose CURRENT claims it had never
+seen, so a contest of stale claims cleared a finding nobody had re-examined. Carried answers
 match a re-raised sub-claim by its WORDING, and a truncated (ellipsis-capped) claim never matches
 — two distinct over-cap claims share it — the may-miss-never-invent order of harms, one level
 down. The held record itself transfers across a re-raise only on a match that cannot be an
-invention — the parent claim's full wording, or a shared requirement at a specific location: the
-60-char prose prefix still names the ENTRY (legacy identity, unchanged) but cannot hand contested
-letters to a claim that diverges past it, which is prefix aliasing at parent grain buying a fresh
-look on contests nobody made. Instances of one root cause never become letters — they stay evidence inside one claim, or
+invention — the parent claim's full wording, a shared requirement at a specific location, or a
+held SUB-CLAIM re-listed verbatim one grain down (RUN-189, the parent-rephrase bug: the first two
+rules both refuse a parent reworded past its identity with no requirement shared, which used to
+drop a held UNANSWERED sibling the re-raise never mentioned — exactly the original escape,
+reopened in the one corner the parent-grain rules do not reach). The 60-char prose prefix still
+names the ENTRY (legacy identity, unchanged) but cannot hand contested letters to a claim that
+diverges past it, which is prefix aliasing at parent grain buying a fresh look on contests nobody
+made. Instances of one root cause never become letters — they stay evidence inside one claim, or
 the letters are the instance-enumeration the collapse rule bought out. The format is optional and
 positionally additive like the requirement bracket, so everything written before it parses
 byte-identically; a persisted ledger predating sub-claims loads as single-claim entries, and one
 persisted by the letter-era shape loads claim-keyed with its stored letters ignored. The
 enumeration invariant — no separately-answerable claim escapes its own answer — has exactly ONE
 enforcement point, the parse-time classifier (RUN-90's chokepoint rule applied to the format
-itself), and the rule validity RESTS on is the COMPLETENESS CERTIFICATE, not any shape: an
-enumerating FINDING line ends its claim with `[sub-claims: <n>]`, and the letters are kept only
-when exactly n strict in-sequence lines parse. Shape nets can only void what they can SEE, and a
-mangled line can compose decoration, spacing and separator loss into plain English (`(b) FINDING
-1 b — claim B` is invisible to any rule that spares prose — the composition class every rewrite
-of the nets leaked at); the certificate voids by ABSENCE instead, since a line that mangles into
-ANYTHING is simply not counted, and no certificate — or a mutated one, which fails to parse as
-one — keeps no letters at all, the same safe degradation. What the certificate cannot see is a
-STALE count — one that excludes a mangled sibling by fiat rather than by absence, a mundane slip
-rather than incoherence — and POSITION closes that: the enumeration is a contiguous BLOCK
-directly under the FINDING line, and the finding's ZONE — from the block's end to the next
-structural line (the next numbered FINDING, ESCALATE/ACCEPTANCE/VERDICT, or the end of the
-report) — must hold nothing but blank lines, so a sibling written into its own finding's
-territory voids the whole whatever it mangled into, and a blank line cannot detach it. Within a
-finding's territory every content line is recorded, structural, or a voider — there is nowhere
-left for an unrecorded claim to sit — so narration lives above the findings or below the
-structural lines, and prose that strays into a zone costs the enumeration (dull), never keeps a
-subset. Claim identity also survives its own display cap: the display keeps the legacy
-bare-ellipsis cap, byte-identical, and an over-cap claim stores its FULL normalized text in a
-separate identity field beside it — whole at ANY length, never hashed, truncated, or bounded (a
-truncated identity aliases every claim sharing its prefix, a 32-bit fingerprint is trivially
-collided into merging two claims — this run's own terminal round mined the collision that killed
-the fingerprint edition — and a length bound is a cliff where an exact letterless re-raise LOSES
-its partly answered record, which the round after mined at bound+1; the count and display caps
-are what keep the ledger distilled, and identity is the one field whose job is losslessness) —
-so a verbatim re-raise of a long claim recognises its held record, two distinct long claims can
-never alias, and only a record the bare-ellipsis era persisted still refuses to match: the
-visible duplicate row it always was. The parse chokepoint also owns the LINE SHAPE it
-classifies — line endings are normalized before any anchor runs, because a CRLF report's
-findings still parsed while its every enumeration silently voided on the `\r` the anchors
-refuse — and the persisted-record reader applies the same all-or-nothing grain at the other
-boundary where sub-claim state is born: a malformed entry or an over-long list voids whole to
-the single-claim entry, never to the well-formed subset a partial contest could clear around,
-while fields inside a well-formed entry degrade toward STANDING, the direction that cannot
-clear. What
-remains around those rules is hygiene, not
-the invariant: the HEAD net (any line whose first letters are `FINDING <n>` — markdown decoration
-is a letterless prefix), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration can wear
-letters, and a colon hard by the number is label-intent where a colon further on is sentence
-structure), the LABELLED TOKEN net (word-material glued to the number, colon or no colon,
-voids everywhere but the finding's OWN block lines, the only places a lettered token is format
-rather than mutation), and the SPACED LABEL net (a LONE letter adrift of its number across pure
-punctuation — the composition that wears decoration, drops the colon and un-glues the letter all
-at once, which is how a sibling written below a structural line sat outside every zone; a
-following letter makes it an ordinary word, so mention survives, and the lone single-letter word
-is the priced cost). A letter that survives only as line decoration (`(b) FINDING 1 — …`) is
-attributable by nothing but position — it is byte-for-byte how narration quotes the record — so
-inside a finding's territory it voids by zone and outside one it is the unattributable residual
-the certificate also excluded from its count. There is deliberately no
-in-range sparing left: a recorded letter can be WORN by a distinct unrecorded claim, and a stale
-certificate that counts only the strict line then blesses the kept subset — so reports narrate a
-sub-claim as `(a)`, the form every render uses, never as a bare `FINDING 1a` token. A
-mid-sentence mention with no colon beside it and no label on the number stays harmless prose,
-since reports narrate their findings by number and voiding on mention would kill every
-enumeration in a report that explains itself. Fold, render, and candidacy consume the canonical
-set and carry no shape detection or degradation rules of their own — the class dies where the
-data is born, or it does not die. The terminal report's own shape is not a second gate either: candidacy asks the
-reconciled entry — every sub-claim contested and visible, or the finding stands — and the
-per-letter contests reach it through the contest application, so a letterless re-raise answered
-through the record's letters clears without a bare response beside it.
+itself), and its judgment is GRAMMAR-OR-PROSE (settled after six sittings of RUN-180's own
+gestation, executed RUN-189): a line either matches the strict `FINDING <n><letter>: <claim>`
+shape or it is prose, full stop — the parser never tries to RECOGNISE a mangled line as an
+intended sub-claim, because intent-recognition over arbitrary mangled text is not decidable. The
+killed sitting spent seven sittings and ~$200 growing four generations of shape nets (a decoration
+prefix, a near-colon token, a glued label, a spaced label) plus zone/boundary detection around the
+enumeration block, and every edition leaked at the next composed mutation — the exact
+instance-patching loop RUN-90's chokepoint rule forbids. They are DELETED, not kept as
+belt-and-braces: a fifth net would repeat the same mistake. The one thing left to judge is the
+COMPLETENESS CERTIFICATE: an enumerating FINDING line ends its claim with `[sub-claims: <n>]`, and
+the letters are kept only when exactly n strict lines parse, a, b, c… in report order, no
+duplicate claim, within MAX_SUBCLAIMS. The certificate voids by ABSENCE — a line that mangles into
+anything, including a shape indistinguishable from English, is simply not counted, so the count
+falls short and the whole enumeration degrades to the single-claim finding it always was. No
+certificate → no enumeration; a mutated certificate fails to parse as one and lands in the same
+place. The one thing grammar-or-prose does NOT catch, by decision: a DOUBLE FAULT — a mangled
+sibling AND a certificate whose count happens to exclude it by that same single error (a stale
+count, never revised after the line was mangled). This is bounded, not silently unsafe: findings
+stand by default, an unrecorded claim can never be CLEARED, and the re-adjudicating reviewer still
+reads the report TEXT, where the mangled line sits in plain view as prose. Claim identity also
+survives its own display cap: the display keeps the legacy bare-ellipsis cap, byte-identical, and
+an over-cap claim stores its FULL normalized text in a separate identity field beside it — whole
+at ANY length, never hashed, truncated, or bounded (a truncated identity aliases every claim
+sharing its prefix, a 32-bit fingerprint is trivially collided into merging two claims — this
+run's own terminal round mined the collision that killed the fingerprint edition — and a length
+bound is a cliff where an exact letterless re-raise LOSES its partly answered record, which the
+round after mined at bound+1; the count and display caps are what keep the ledger distilled, and
+identity is the one field whose job is losslessness) — so a verbatim re-raise of a long claim
+recognises its held record, two distinct long claims can never alias, and only a record the
+bare-ellipsis era persisted still refuses to match: the visible duplicate row it always was. The
+parse chokepoint also owns the LINE SHAPE it classifies — line endings are normalized before any
+anchor runs, because a CRLF report's findings still parsed while its every enumeration silently
+voided on the `\r` the anchors refuse — and the persisted-record reader applies the same
+all-or-nothing grain at the other boundary where sub-claim state is born: a malformed entry or an
+over-long list voids whole to the single-claim entry, never to the well-formed subset a partial
+contest could clear around, while fields inside a well-formed entry degrade toward STANDING, the
+direction that cannot clear. Fold, render, and candidacy consume the canonical set the classifier
+emits and carry no shape detection or degradation rules of their own — the class dies where the
+data is born, or it does not die. The terminal report's own shape is not a second gate either:
+candidacy asks the reconciled entry — every sub-claim contested and visible, or the finding
+stands — and the per-letter contests reach it through the contest application, so a letterless
+re-raise answered through the record's letters clears without a bare response beside it.
 Findings reach the agent and, when they are contradictions rather
 than gaps, the run transcript. They are never fatal: a spec is orientation, not part of the
 security floor, so a stale path must not become a tripwire — and the rendered block says out loud

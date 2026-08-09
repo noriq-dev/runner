@@ -4763,11 +4763,12 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(entry?.subclaims).toEqual([]);
   });
 
-  // The record's letters are what the contest resolves against — even where the terminal report's
-  // own lettering diverges, which is exactly the overflow path: the fold keeps the held set whole
-  // and drops the report's enumeration, so the record shows letters for claims the report never
-  // lettered. Answering those letters must credit the displayed claims, not be discarded against
-  // the dropped enumeration (the prompt calls the record authoritative; the code must agree).
+  // RUN-189: the overflow-vs-candidacy fix, at the gate surface. The fold used to keep the held
+  // set whole and drop the terminal round's OWN enumeration, so candidacy read a record that had
+  // never seen the claims the terminal reviewer actually raised — a builder could clear an
+  // overflowed finding by contesting old claims the terminal round never looked at again. Now the
+  // terminal round's own claims are never what the cap drops: the record shows them at its front,
+  // and it is the OLDEST held claims (round one's) that make room by dropping instead.
   it('contesting an overflowed record by its displayed letters earns the fresh look', async () => {
     const h = harness({ manifest: REVIEWED(2), verifyResults: [true, true, true] });
     const finding = (tag: string) =>
@@ -4779,8 +4780,8 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.continueTexts = [
       '', // fix turn 1: no structured response — every letter stays unanswered
       '', // fix turn 2: same
-      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight HELD claims
-      // (rounds one and two), the terminal enumeration having been dropped by the overflow.
+      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight claims the
+      // overflow fold kept — the terminal round's own four, then round two's four.
       ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
         .map((l) => `FINDING 1${l}: CONTESTED src/${l}.ts:1 — the record claim does not hold`)
         .join('\n'),
@@ -4793,20 +4794,19 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // round 1: four letters
     await onReviewTurn(h, 3);
     h.claude.emitText(finding('two'));
-    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight
+    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight, at the cap
     await onReviewTurn(h, 4);
-    h.claude.emitText(finding('three')); // terminal: four claims the union cannot hold → dropped
+    h.claude.emitText(finding('three')); // terminal: overflow — round 1's claims drop, never these
     h.claude.complete('done');
     await onReviewTurn(h, 5); // every displayed letter contested → the fresh look IS spawned
-    // The answers landed on the record's claims — none discarded against the dropped enumeration:
-    // the adjudicator's PRIOR ADJUDICATIONS shows each held claim with the letter's own pointer,
-    // including the positions past the terminal report's four lines.
+    // The answers landed on the record's claims: the terminal round's own four lead the record,
+    // round two's four fill the rest, and round one's — the oldest — are gone entirely.
     const readjudged = h.claude.starts[4]!.prompt;
-    expect(readjudged).toMatch(/\(a\) two claim 1/); // the record's order: round 2's union
+    expect(readjudged).toMatch(/\(a\) three claim 1/); // this round's own claim leads the record
     expect(readjudged).toContain('CONTESTED (src/a.ts:1)');
-    expect(readjudged).toMatch(/\(e\) one claim 1/); // …and the held tail the report never lettered
+    expect(readjudged).toMatch(/\(e\) two claim 1/); // round two's claims fill the rest
     expect(readjudged).toContain('CONTESTED (src/e.ts:1)');
-    expect(readjudged).not.toContain('three claim'); // the dropped enumeration is not the record
+    expect(readjudged).not.toMatch(/\bone claim \d/); // round one's — the oldest — were dropped, not this round's
     h.claude.emitText('Every pointer holds.\nVERDICT: PASS');
     h.claude.complete('done');
     const exit = await done;

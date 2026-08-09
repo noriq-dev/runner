@@ -256,8 +256,11 @@ const MAX_SUBCLAIMS = 4;
 /** What one round may ENUMERATE is MAX_SUBCLAIMS; what an entry may ACCUMULATE is this — a
  *  re-raise that repeats only some held letters must not DROP the rest (see buildLedger), so the
  *  reconciled set can outgrow one round's cap. Still a hard cap ("never a transcript by another
- *  name"), and like MAX_SUBCLAIMS it never slices: a union it cannot hold keeps the HELD set
- *  whole and drops the new enumeration, because a kept subset is the escape (RUN-148 shape). */
+ *  name"). Unlike MAX_SUBCLAIMS it is allowed to slice, but only the HELD side, oldest first
+ *  (RUN-189): the claims THIS round's own report raised are never what the cap discards — an
+ *  overflowing terminal round used to drop its own new enumeration and keep the held set whole,
+ *  which let candidacy clear a finding whose current claims were never even in the record. See
+ *  buildLedger's overflow branch. */
 const MAX_LEDGER_SUBCLAIMS = 8;
 /** More entries than this and the run is not converging — carry the most recent and move on. */
 const MAX_ENTRIES = 24;
@@ -325,143 +328,41 @@ const FINDING_RE =
 // well-formed half of a bad enumeration would let a finding clear on the letters that parsed
 // while a malformed sibling was never even entered, the exact escape this format exists to close.
 //
-// Two rules close that escape together, and neither is a shape rule.
+// GRAMMAR-OR-PROSE (settled after six sittings of RUN-180's own gestation, executed RUN-189): a
+// line either matches the strict sub-claim shape below or it is prose — full stop. Earlier
+// editions tried to RECOGNISE a mangled line as an intended sub-claim and grew four generations
+// of shape nets (a decoration prefix, a near-colon token, a glued label, a spaced label) plus
+// zone/boundary detection around the enumeration block; every edition leaked at the next composed
+// mutation, because intent-recognition over arbitrary mangled text is not decidable — three
+// sittings of adversarial probes each found the newest net's blind spot, the exact instance-
+// patching loop RUN-90's chokepoint rule forbids. They are DELETED rather than kept as
+// belt-and-braces: a fifth net repeats the same $200, seven-sitting mistake.
 //
-// The COMPLETENESS DECLARATION: a FINDING line that enumerates must end its claim with
-// `[sub-claims: <n>]`, and the enumeration is kept only when EXACTLY n strict lettered lines
-// arrive. Shape nets (below) can only void what they can SEE, and a mangled line can compose
-// decoration, spacing, and separator loss into a shape indistinguishable from English — `(b)
-// FINDING 1 b — claim B` is invisible to every net that spares prose, and each review round of
-// this run's own gestation found another such composition. The declaration voids by ABSENCE
-// instead: a line that mangles into ANY shape whatsoever — visible or not — subtracts from the
-// strict count, mismatches the certificate, and the whole enumeration degrades to the
-// single-claim finding. No declaration → no enumeration (letters without a certificate are never
-// kept); a mangled declaration fails to parse as one and lands in the same place.
+// The one thing left to judge is the COMPLETENESS CERTIFICATE: a FINDING line that enumerates
+// ends its claim with `[sub-claims: <n>]`, and the letters are kept only when exactly n strict
+// `FINDING <n><letter>: <claim>` lines parse — lettered a, b, c… in report order (a letter is
+// pure position, never state — the structural settlement), naming no claim twice, within
+// MAX_SUBCLAIMS. The certificate voids by ABSENCE: a line that mangles into anything — including
+// a shape indistinguishable from English — is simply not counted, so the count falls short and
+// the whole enumeration degrades to the single-claim finding it always was. No certificate → no
+// enumeration; a mutated certificate fails to parse as one and lands in the same place. Never an
+// error, and never a kept subset a partial contest could clear around.
 //
-// The EMPTY ZONE: the declaration alone cannot see a STALE count — `[sub-claims: 1]` over a
-// strict (a) and a mangled (b) certifies the subset as complete, because the count excludes the
-// mangled line by fiat rather than by absence, and a stale count is a mundane authorial slip, not
-// incoherence. What the count cannot prove, POSITION can: a sibling is written into its own
-// finding's territory. The enumeration is a BLOCK — the contiguous run of strict lettered lines
-// starting DIRECTLY under the FINDING line (the format's own words) — and the finding's ZONE,
-// from the block's end down to the next structural line (the next numbered FINDING line,
-// ESCALATE / ACCEPTANCE / VERDICT, or the end of the report), must hold NOTHING but blank lines.
-// Any other line in the zone voids the whole enumeration, whatever it mangled into — it is either
-// a sibling the block did not admit or prose indistinguishable from one, and a blank line cannot
-// detach a sibling from its list (the previous edition accepted a blank as closing the block, and
-// the probe put the mangled sibling right after one). Exhaustiveness is the point: within a
-// finding's own territory every content line is recorded, structural, or a voider, so there is
-// nowhere left for an unrecorded claim to sit. Narration therefore lives ABOVE the findings or
-// below the structural lines — where the nets still police lettered tokens — never inside a
-// finding's zone; the prompt says so, and the degradation for prose that strays in is the lost
-// (single-claim) enumeration, never a kept subset. What no rule can attribute is a sibling
-// written outside every zone bearing no LABEL — a letter is attributed by ADJACENCY to the
-// number, glued or across pure punctuation (nets three and four), because a letter that only
-// decorates the line (`(b) FINDING 1 — …`) is byte-for-byte how narration quotes the record —
-// `(b)` is the form every render uses — and voiding it would void every report that quotes its
-// own record beside a finding number. Such a line inside any finding's TERRITORY still voids by
-// position; outside one it is unattributable text the author also excluded from the count.
-//
-// The shape nets below remain as hygiene AROUND that rule — they void visible label mutations
-// early and keep narration harmless — but validity never rests on them. Detection by shape is
-// enumerating the shapes a model might malform a letter into, and every edition of that list
-// leaked at its next edge: single-letter matching missed `1aa`, letters-hard-against-the-number
-// missed the spaced `1 b:`, a separator allowlist missed the parenthesized `1(b):`, a junk class
-// with a `\b` missed `1b_:` and `1b2:`, the colon window missed the swallowed colon — each time
-// the unseen sibling left the valid letters standing as the "complete" enumeration until the
-// declaration made unseen mean uncounted. A line is CLASSIFIED exactly once (see parseFindings)
-// when either structural net sees it, and then it is one of three things: the numbered FINDING
-// line itself, the strict sub-claim shape — lettered a, b, c… in report order, naming a claim no
-// sibling already names — or, everything else, a voider of that finding's whole enumeration. The
-// in-order rule is what makes a letter pure position (the settlement: identity is claim text; a
-// letter is a positional label of the report it appeared in, never state), and the
-// no-duplicate-claim rule keeps that identity unambiguous inside one enumeration — two letters
-// naming one claim is not separately answerable, so it is an intended-but-invalid enumeration
-// like any other.
-//
-// Net one — the HEAD: any line whose FIRST LETTERS are `FINDING <n>`. The prefix may be ANY run
-// of non-letter characters, because markdown decoration is exactly that — `- FINDING 1b:`,
-// `> FINDING 1b:`, `**FINDING 1b:**`, `2. FINDING 1b:` are each a lettered-INTENT line a
-// whitespace-only anchor could not see, and an unseen sibling leaves the valid letters standing
-// as the "complete" enumeration (the kept-subset escape through the anchor itself).
-//
-// Net two — the NEAR-COLON TOKEN: `FINDING <n>` followed by a colon within a few characters,
-// ANYWHERE in the line. This is what catches decoration that wears letters — `(b) FINDING 1b:`
-// slips the head net because its prefix contains a letter, and any list-marker vocabulary
-// (`(b)`, `ii.`, `Note:`) is an enumerable set that would leak at its next member. A colon hard
-// by the token is label-intent; a colon further on is sentence structure. The window also covers
-// a mutated label under the decoration (`(b) FINDING 1 b:`, `(b) FINDING 1(b):`), so the two
-// escapes do not compose within it.
-//
-// Net three — the LABELLED TOKEN: word-material glued to the number (`FINDING 1b`, `1aa`,
-// `1b2`, `1b_`) is a label whether or not a colon survived the decoration — `(b) FINDING 1b —
-// second claim` slips the head net (lettered prefix) AND net two (the dash swallowed the colon),
-// and was the escape the first two nets left standing. So after the lines are classified, any
-// labelled token voids its finding's enumeration unless it sits on one of that finding's OWN
-// lines — its numbered FINDING line or an accepted strict sub-claim line, the only places a
-// lettered token is the format rather than a mutation of it. There is deliberately NO in-range
-// sparing: an earlier edition spared a single letter the enumeration records, on the theory that
-// it could hide only a duplicate of a recorded claim — refuted, because a DISTINCT claim can wear
-// a recorded letter (`FINDING 1a: first` + `(b) FINDING 1a — distinct second`), and a certificate
-// that counts only the strict line then blesses the kept subset. A worn letter and a narrated one
-// are prose-indistinguishable, so both void; reports narrate a sub-claim as `(a)` (the form every
-// render uses) or by its claim text, never as a bare `FINDING 1a` token.
-//
-// Net four — the SPACED LABEL: a LONE letter adrift of its number across pure punctuation and
-// space (`FINDING 1 b —`, `(b) FINDING 1 b — hidden claim`, `FINDING 1 (b) —`) is the same
-// label-intent with one more mutation composed in, and slips all three nets at once — decoration
-// letters defeat the head net, a swallowed colon defeats net two, the space defeats the glued
-// token — while a placement past a structural line puts it outside every zone: exactly the
-// composition this task's own gate mined. A lone letter is the tell, because `a, b, c…` is what
-// the format is made of; a FOLLOWING letter makes it an ordinary word and the line a mention, so
-// narration survives. The window admits no alphanumerics, so a longer finding number can never
-// be split into number + label, and letters can never bridge out of a real word.
-//
-// The boundary's other side is equally deliberate: a MID-SENTENCE mention (`…described in
-// FINDING 1.`, `see FINDING 1 for the full chain: …`) has words before the token, no colon
-// beside it and no lone letter by the number, and never voids — reports narrate their findings by
-// number, so voiding on mention would kill every enumeration in any report that explains itself.
-// The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is the one format-legal shape net two
-// would see, and is exempted by its exact prefix.
-//
-// The deliberate cost is prose at line start or with a colon by the number — `FINDING 1 rests…`,
-// `as FINDING 1: the gate…` — lettered narration anywhere, and one edge wider since net four:
-// a lone single-letter WORD right after the number (`…FINDING 1 a subtle leak…`) reads as a
-// label and voids. Each costs finding 1's enumeration, degrading it to the single-claim finding
-// it always was — which is current behaviour, and always a correct way to record it (the RUN-148
-// steps rule: a decomposition that cannot be run soundly is dropped, never half-run). A lost
-// enumeration is a duller report; a kept subset is the escape. Legacy reports are untouched by
-// construction: their only classified lines are the numbered finding lines themselves (skipped
-// as such) and prose, which voids an enumeration no legacy finding has — and nets three and four
-// only ever void, so a report that enumerated nothing has nothing they can touch.
-const HEAD_LINE_RE = /^[^a-zA-Z\n]*FINDING[ \t]+(\d+)/i;
-const NEAR_COLON_TOKEN_RE = /\bFINDING[ \t]+(\d+)[^:\n]{0,8}:/gi;
-/** The label must START with a non-digit word character: `\d+` backtracking must not be able to
- *  split a longer NUMBER (`FINDING 12`) into `1` + label `2` and void finding 1 on a mention of
- *  finding 12. */
-const LABELLED_TOKEN_RE = /\bFINDING[ \t]+(\d+)([a-z_]\w*)/gi;
-/** Net four's shape: the gap admits ONLY non-alphanumerics (so a longer number cannot be split
- *  into number + label, and a letter cannot bridge out of a word) and is deliberately unbounded —
- *  a length window would just be the next minable edge, and a pure punctuation run of any length
- *  carries no words. The letter must be LONE — a following letter is an ordinary word, i.e.
- *  mention. */
-const SPACED_LABEL_RE = /\bFINDING[ \t]+(\d+)[^a-zA-Z0-9\n]+([a-z])(?![a-zA-Z])/gi;
-const ESCALATE_LINE_RE = /^[ \t]*ESCALATE[ \t]+STRUCTURAL[ \t]+FINDING\b/i;
-/** FINDING_RE's shape, single-line and stateless, for classifying one already-extracted line. */
-const FINDING_LINE_RE = new RegExp(FINDING_RE.source, 'i');
+// STATED LIMITATION, out of scope by decision, not an oversight: a DOUBLE FAULT by the same
+// author — a mangled sibling AND a certificate whose count happens to exclude it by that SAME
+// single error (a stale count, never revised after the line was mangled) — parses as the
+// well-formed subset alone. This is bounded, not silently unsafe: findings stand by default, an
+// unrecorded claim can never be CLEARED (candidacy only clears a recorded, contested claim), and
+// the re-adjudicating reviewer still reads the report TEXT, where the mangled line sits in plain
+// view as prose. A probe demonstrating a mangled shape escaping is answering this settled
+// decision unless it ALSO makes the certificate match by that same error — and even then the fix
+// is a correct count on the next round, never a fifth net.
 const SUBCLAIM_SHAPE_RE = /^[ \t]*FINDING[ \t]+(\d+)([a-z])[ \t]*:[ \t]+(.+?)[ \t]*$/i;
-/** The completeness declaration, at the very end of the FINDING line's claim. Strict on purpose:
+/** The completeness certificate, at the very end of the FINDING line's claim. Strict on purpose:
  *  a mutated declaration is claim text, the finding then has no certificate, and its letters are
  *  not kept — the same safe degradation as every other malformation. Stripped from the stored
  *  claim, so the ledger, the prose key, and every render carry the claim alone. */
 const SUBCLAIM_DECL_RE = /[ \t]*\[[ \t]*sub-claims:[ \t]*(\d{1,2})[ \t]*\]$/i;
-/** The report's structural lines: what ends a finding's ZONE besides the next numbered FINDING
- *  line or the end of the report. An allowlist that can only be too SMALL — an unrecognised
- *  structural line reads as zone content and voids the enumeration, the safe side — and a mangled
- *  sibling cannot wear these shapes without its lettered token tripping the nets that still scan
- *  every line. */
-const ACCEPTANCE_LINE_RE = /^[ \t]*ACCEPTANCE[ \t]+\d+[ \t]*:/i;
-const VERDICT_LINE_RE = /^[ \t]*VERDICT[ \t]*:/i;
 
 /**
  * Split a requirement bracket into ids, on commas and semicolons ONLY.
@@ -573,107 +474,47 @@ export function parseFindings(input: string): Finding[] {
     if (key !== undefined) f.claimKey = key;
     out.push(f);
   }
-  // Second pass (RUN-180): read each certified finding's enumeration as a BLOCK — the contiguous
-  // run of strict lettered lines DIRECTLY under its FINDING line — and demand an EMPTY ZONE below
-  // it. This is the ONE enforcement point of the enumeration invariant (the structural
-  // settlement), and it is all-or-nothing per finding: the letters must run a, b, c… (a letter is
-  // pure position), name no claim twice, fit the cap, match the certificate EXACTLY, and the
-  // finding's zone — from the block's end to the next structural line — must hold nothing but
-  // blank lines. One violation voids the WHOLE enumeration (`null` below) and the finding stays
-  // the single answerable claim it always was. Never an error, and never a kept subset a partial
-  // contest could clear: position proves what the certificate cannot (a stale count excludes a
-  // sibling by fiat, but the sibling still sits in the finding's own territory, where any content
-  // line voids — a blank line cannot detach it), and the certificate proves what position cannot
-  // (a line mangled clean away is simply not counted). Fold, render, and candidacy consume the
-  // canonical set this pass emits and carry no shape judgment of their own — the class dies where
-  // the data is born.
+  // Second pass (settled RUN-180, executed RUN-189): collect each finding's enumeration under
+  // GRAMMAR-OR-PROSE — the ONE enforcement point of the enumeration invariant (the structural
+  // settlement), and its judgment is grammar + certificate count, nothing else. A line matching
+  // the strict sub-claim shape IS a sub-claim line of the finding its number names, wherever it
+  // sits in the report; every other line is prose by contract (see the limitation stated above) —
+  // no intent detection, no shape nets, no zone/boundary rules. All-or-nothing per finding: the
+  // letters must run a, b, c… in report order (a letter is pure position), name no claim twice,
+  // fit the cap, and match the certificate EXACTLY. One violation voids the WHOLE enumeration and
+  // the finding stays the single answerable claim it always was — never an error, and never a
+  // kept subset a partial contest could clear. Fold, render, and candidacy consume the canonical
+  // set this pass emits and carry no shape judgment of their own — the class dies where the data
+  // is born.
   const byId = new Map(out.map((f) => [f.id, f]));
-  const lines = text.split('\n');
-  const headAt = new Map<number, number>();
-  lines.forEach((line, li) => {
-    const m = FINDING_LINE_RE.exec(line);
-    if (m) {
-      const id = Number(m[1]);
-      if (byId.has(id) && !headAt.has(id)) headAt.set(id, li);
+  const enumerated = new Map<number, string[]>();
+  const voided = new Set<number>();
+  for (const line of text.split('\n')) {
+    const m = SUBCLAIM_SHAPE_RE.exec(line);
+    if (!m) continue; // prose, by contract — whatever it may have been meant as
+    const id = Number(m[1]);
+    // A lettered line naming no numbered finding records nothing and voids nothing: there is no
+    // finding to degrade, so there is nothing a kept subset could ever clear.
+    if (!byId.has(id) || voided.has(id)) continue;
+    const claim = m[3]!; // RAW — identity is exact in hand; the fold caps what the ledger stores
+    const held = enumerated.get(id) ?? [];
+    if (
+      m[2]!.toLowerCase() !== subclaimLetter(held.length) || // letters are position: a, b, c…, no gaps, no repeats
+      held.length >= MAX_SUBCLAIMS ||
+      held.some((c) => subKey(c) === subKey(claim)) // one claim, one identity — compared whole, uncapped
+    ) {
+      voided.add(id);
+      continue;
     }
-  });
-  // A hard structural line ends a finding's zone; everything below it is another line's territory,
-  // where the global nets still police any recognisable trace of this finding's format.
-  const isStructural = (line: string): boolean =>
-    FINDING_LINE_RE.test(line) ||
-    ESCALATE_LINE_RE.test(line) ||
-    ACCEPTANCE_LINE_RE.test(line) ||
-    VERDICT_LINE_RE.test(line);
-  const zoneClosed = (from: number): boolean => {
-    for (let zi = from; zi < lines.length; zi++) {
-      const zline = lines[zi]!;
-      if (isStructural(zline)) return true;
-      if (!/^[ \t]*$/.test(zline)) return false; // content in the zone — a sibling or its twin
-    }
-    return true; // the report ended — the zone is empty
-  };
-  const pending = new Map<number, string[] | null>();
-  // A finding's block lines are the only place a lettered token of that finding is format rather
-  // than mutation, so they are the only lines the nets below spare. Keyed per (line, id): finding
-  // 2's strict line quoting a `FINDING 1a` token is still narration ABOUT 1, and voids 1's
-  // enumeration like any other line.
-  const ownLines = new Set<string>();
-  for (const [id, count] of declared) {
-    const head = headAt.get(id);
-    if (head === undefined) continue; // unreachable in practice: the certificate came off a parsed line
-    const held: string[] = [];
-    let valid = true;
-    let li = head + 1;
-    for (; li < lines.length; li++) {
-      const shaped = SUBCLAIM_SHAPE_RE.exec(lines[li]!);
-      if (!shaped || Number(shaped[1]) !== id) break; // the block ends at the first non-strict line
-      const letter = shaped[2]!.toLowerCase();
-      const claim = shaped[3]!; // RAW — identity is exact in hand; the fold caps what the ledger stores
-      if (
-        letter !== subclaimLetter(held.length) || // letters are position: a, b, c…, no gaps, no repeats
-        held.length >= MAX_SUBCLAIMS ||
-        held.some((c) => subKey(c) === subKey(claim)) // one claim, one identity — compared whole, uncapped
-      ) {
-        valid = false;
-        break;
-      }
-      ownLines.add(`${li}:${id}`);
-      held.push(claim);
-    }
-    valid = valid && held.length === count && zoneClosed(li);
-    pending.set(id, valid && held.length ? held : null);
+    held.push(claim);
+    enumerated.set(id, held);
   }
-  // The label nets, per line, after the blocks are read (which lines are a finding's own is only
-  // known then): the HEAD net (first letters are `FINDING <n>` — letterless markdown decoration
-  // included), the NEAR-COLON TOKEN net (`FINDING <n>…:` anywhere — decoration wearing letters
-  // included), the LABELLED TOKEN net (word-material glued to the number, colon or not), and the
-  // SPACED LABEL net (a lone letter adrift of its number across pure punctuation — the composed
-  // shape that slips the other three and, past a structural line, every zone). A hit
-  // off the finding's own lines voids its enumeration: an intended sub-claim the block did not
-  // admit, a mutation of one, or narration wearing the same shape — indistinguishable by
-  // construction, so all void, with no in-range sparing (a recorded letter can be WORN by a
-  // distinct unrecorded claim). These catch what the block cannot see: a lettered-intent line
-  // ABOVE the head line, a stray letter after the block's own boundary, a mangled next-finding
-  // head. The numbered FINDING line is exempt for its OWN id wherever it appears — a claim ABOUT
-  // the format quotes its own letters — and a line naming a finding nobody numbered is ignored,
-  // there being no finding to degrade. Nothing recorded → nothing a subset could clear → nothing
-  // to void.
-  lines.forEach((line, li) => {
-    if (ESCALATE_LINE_RE.test(line)) return; // the format's own escalation line; letters nothing, voids nothing
-    const ids = new Set<number>();
-    const head = HEAD_LINE_RE.exec(line);
-    if (head) ids.add(Number(head[1]));
-    for (const t of line.matchAll(NEAR_COLON_TOKEN_RE)) ids.add(Number(t[1]));
-    for (const t of line.matchAll(LABELLED_TOKEN_RE)) ids.add(Number(t[1]));
-    for (const t of line.matchAll(SPACED_LABEL_RE)) ids.add(Number(t[1]));
-    for (const id of ids) {
-      if (ownLines.has(`${li}:${id}`)) continue;
-      const asFinding = FINDING_LINE_RE.exec(line);
-      if (asFinding && Number(asFinding[1]) === id) continue; // a numbered FINDING line — pass 1's subject
-      if (pending.get(id)?.length) pending.set(id, null);
-    }
-  });
-  for (const [id, subs] of pending) if (subs) byId.get(id)!.subclaims = subs;
+  for (const [id, count] of declared) {
+    const claims = enumerated.get(id) ?? [];
+    // The certificate is the validity the letters rest on: kept only when exactly the declared
+    // number of strict lines parsed — a mangled line is not counted, so the mismatch voids.
+    if (!voided.has(id) && claims.length > 0 && claims.length === count) byId.get(id)!.subclaims = claims;
+  }
   return out;
 }
 
@@ -831,9 +672,13 @@ export function buildLedger(
   //   - coverage is the claim's full wording (the carry key), so a reworded survivor rides as a
   //     duplicate row rather than being merged away — may MISS, never INVENT — and a claim with
   //     no identity never counts as covering, for the aliasing reason carriedFrom refuses it.
-  // A union past MAX_LEDGER_SUBCLAIMS keeps the HELD set whole and drops the new enumeration —
-  // all-or-nothing, never a sliced subset — with this turn's answers still landed on it by
-  // wording, because the builder may be answering in the very fold that overflows.
+  // A union past MAX_LEDGER_SUBCLAIMS slices, but only on the HELD side, oldest first (RUN-189):
+  // this round's own raised claims (`mapped`) are never what the cap drops — an entry that kept
+  // the held set whole and dropped the new enumeration used to let a terminal round's own current
+  // claims go unrecorded, so candidacy read an entry that had never seen them. `extras` is already
+  // ordered newest-first (this round's mapped claims lead every fold, so the tail is whatever has
+  // ridden unchanged the longest), so the slice keeps the front and drops the tail — a MISS, not
+  // an invention, and the same direction MAX_ENTRIES already prunes in.
   //
   // RESPONSE letters are resolved HERE, at the fold boundary, into claim text — the only identity
   // the ledger stores. A letter names a line the builder was SHOWN: this report's lettered lines
@@ -888,37 +733,50 @@ export function buildLedger(
     });
     const union = [...mapped, ...extras];
     if (union.length <= MAX_LEDGER_SUBCLAIMS) return union;
-    // Overflow: the held set stands whole — and this turn's answers to re-listed claims land on it
-    // by wording, so standing whole does not cost a valid current adjudication.
-    const landed = new Map<string, FindingResponse>();
-    f.subclaims.forEach((raw, i) => {
-      const rs = responseAt(i);
-      if (rs) landed.set(subKey(raw), rs);
-    });
-    return creditedHeld.map((h) => {
-      const k = identityOf(h.claim, h.key);
-      return landAnswer(h, k !== null ? landed.get(k) : undefined);
-    });
+    // Overflow (RUN-189): `mapped` — this round's own enumeration — is never sliced; `extras`
+    // fills whatever room is left, oldest-held dropped from the tail first. `mapped.length` is
+    // bounded by MAX_SUBCLAIMS (4), always well under the cap (8), so room is never negative. A
+    // credit this turn landed on a position the slice then drops is lost with the entry it was
+    // answering — the same MISS every cap in this ledger already prices (MAX_ENTRIES prunes whole
+    // entries the identical way) — never an invented survival for a claim past the cap.
+    const room = Math.max(0, MAX_LEDGER_SUBCLAIMS - mapped.length);
+    return [...mapped, ...extras.slice(0, room)];
   };
   // Held sub-claim state transfers only across a match that cannot be an INVENTION (RUN-180).
   // matchIndex's prose rule keys on a 60-char prefix — kept byte-identical for ENTRY identity,
   // the pre-RUN-147 world — but two long claims that diverge past the prefix can be two REAL
   // findings, and carrying one's contested letters onto the other let a terminal finding reach
   // the fresh look on contests nobody made about it: the prefix-aliasing escape at parent grain,
-  // the same one `carriedFrom` refuses one level down. So the sub-claim record rides only the
-  // claim's FULL wording (the identity stored beside a cut display — claimKey; a record with
-  // none, the ellipsis era's, never matches) or the rule-2 bar,
-  // a shared requirement id at a specific location, because an id is not wording — the SAME two
-  // trustworthy matches the entry-level ledger has always used, deliberately: rule 2 is what
-  // keeps a paraphrased letterless re-raise from losing its half-answered record (the RUN-174
-  // protection — a fresh reviewer paraphrases by construction, and demanding identical wording
-  // here would re-open that escape for every reworded finding). The cost of
-  // refusing is the held record dropping with the replaced claim — a MISS, visible as the entry's
-  // own claim change and answerable again; carrying would INVENT, the forbidden order of harms.
+  // the same one `carriedFrom` refuses one level down. So the sub-claim record rides only a match
+  // that cannot be a guess about wording:
+  //   1. the parent claim's FULL wording (the identity stored beside a cut display — claimKey; a
+  //      record with none, the ellipsis era's, never matches), or
+  //   2. the rule-2 bar, a shared requirement id at a specific location, because an id is not
+  //      wording — what keeps a paraphrased letterless re-raise from losing its half-answered
+  //      record (the RUN-174 protection: a fresh reviewer paraphrases by construction, and
+  //      demanding identical parent wording alone would re-open that escape), or
+  //   3. a held SUB-CLAIM re-listed verbatim (RUN-189) — full wording, one grain down. A re-raise
+  //      that rephrases the parent past the prefix but repeats a held claim word for word is
+  //      asserting that claim, and refusing the carry there dropped the held UNANSWERED sibling
+  //      exactly when the terminal round enumerated the claim it cared about: `(a) unanswered,
+  //      (b) contested` became just `(b) contested` on a parent rephrase — the original RUN-180
+  //      escape reopened in a corner rules 1 and 2 do not reach. The match is exact claim text,
+  //      whole and uncapped — it cannot invent — and what rides on it can only raise the bar:
+  //      unanswered/FIXED held claims come back standing, answers still land only on wording
+  //      matches (`carriedFrom`).
+  // The cost of refusing all three is the held record dropping with the replaced claim — a MISS,
+  // visible as the entry's own claim change and answerable again; carrying on a weaker match
+  // would INVENT, the forbidden order of harms.
   const trustedCarry = (e: LedgerEntry, f: Finding): boolean => {
     const k = identityOf(f.claim, f.claimKey);
     if (k !== null && identityOf(e.claim, e.claimKey) === k) return true;
-    return f.location.trim().length > 0 && shareRequirement(reqsOf(e), f.requirements);
+    if (f.location.trim().length > 0 && shareRequirement(reqsOf(e), f.requirements)) return true;
+    const held = new Set(
+      subclaimsOf(e)
+        .map((s) => identityOf(s.claim, s.key))
+        .filter((x): x is string => x !== null),
+    );
+    return f.subclaims.some((raw) => held.has(subKey(raw)));
   };
   const result = [...prior];
   for (const f of findings) {
