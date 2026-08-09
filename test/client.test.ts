@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NoriqClient } from '../src/client';
+import { NoriqClient, NoriqHttpError } from '../src/client';
 
 interface Captured {
   url: string;
@@ -88,6 +88,89 @@ describe('NoriqClient', () => {
       fetchImpl: fakeFetch(404, { error: 'runner not found' }, []),
     });
     await expect(client.heartbeat('rnr_x', { freeSlots: 0 })).rejects.toThrow(/404.*runner not found/);
+  });
+
+  // RUN-220: a bare Error string forced every caller to regex .message for the status. The
+  // ingest client needs to tell a 503 (permanent) apart from a 404/403 (re-mint or give up) —
+  // NoriqHttpError carries the real status/body alongside the pre-existing message format.
+  it('a non-2xx response is a NoriqHttpError carrying the real status and body', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(503, { error: 'ingest capabilities are not enabled' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.heartbeat('rnr_x', { freeSlots: 0 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    const err = caught as NoriqHttpError;
+    expect(err.status).toBe(503);
+    expect(err.body).toContain('ingest capabilities are not enabled');
+  });
+});
+
+// RUN-220: minting under the daemon's own OAuth identity, via this same authenticated client
+// (locked decision 7) — the ONLY thing this client does with an ingest capability. The five
+// token-authorized upload calls themselves live in ingest-client.ts and are exercised there.
+describe('mintIngestCapability (RUN-220)', () => {
+  const INPUT = {
+    projectId: 'prj_1',
+    repositoryKey: 'my-repo',
+    purpose: 'index' as const,
+    scopeId: 'gen_1',
+    runnerId: 'rnr_1',
+  };
+
+  it('POSTs with a bearer token and unwraps the grant', async () => {
+    const captured: Captured[] = [];
+    const grant = { token: 'ing_abc', maxBytes: 8 * 1024 * 1024, expiresAt: '2026-08-08T00:15:00.000Z' };
+    const client = new NoriqClient({
+      server: 'https://noriq.example',
+      token: 'tok123',
+      fetchImpl: fakeFetch(200, grant, captured),
+    });
+    expect(await client.mintIngestCapability(INPUT)).toEqual(grant);
+    expect(captured[0]).toMatchObject({
+      url: 'https://noriq.example/api/runner-ingest/capability',
+      method: 'POST',
+      auth: 'Bearer tok123',
+      body: INPUT,
+    });
+  });
+
+  it('a 503 (ingest not enabled on this server) surfaces as a distinguishable status', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(503, { error: 'ingest capabilities are not enabled' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.mintIngestCapability(INPUT);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    expect((caught as NoriqHttpError).status).toBe(503);
+  });
+
+  it('a 404 (unresolvable repository key) is distinguishable from the 503 above', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'no repository registered for key "my-repo" in this project' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.mintIngestCapability(INPUT);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    expect((caught as NoriqHttpError).status).toBe(404);
   });
 });
 

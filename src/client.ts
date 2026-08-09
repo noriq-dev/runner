@@ -173,6 +173,50 @@ export interface NoriqClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * A non-2xx response from `request()`, carrying the real status/body rather than only a
+ * formatted message. Added for RUN-220: `mintIngestCapability`'s caller (`ingest-client.ts`)
+ * must tell a 503 (ingest not enabled — permanent, per this repo's own locked decision) apart
+ * from a 404 (unresolvable repository key) apart from a 403 (runner outside this connection's
+ * authorized projects) — a bare `Error` string would force it to regex the message. `.message`
+ * keeps the exact pre-existing format (`${method} ${pathname} → ${status}: ${body}`), so this is
+ * additive: every caller that only ever read `.message` is unaffected.
+ */
+export class NoriqHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(message);
+    this.name = 'NoriqHttpError';
+  }
+}
+
+/** A capability minted by `POST /api/runner-ingest/capability` (RUN-220, PLNR-260 §8) — the
+ *  bearer for exactly the five `/api/memory-ingest/:token/*` calls `ingest-client.ts` makes for
+ *  ONE (purpose, scopeId). `maxBytes` is the server's clamp, not this repo's guess at one (locked
+ *  decision 4) — the caller must refuse an oversized batch locally against THIS number. */
+export interface IngestCapabilityGrant {
+  token: string;
+  maxBytes: number;
+  expiresAt: string;
+}
+
+/** The mint request body — one (purpose, scopeId) per capability (locked decision 7: never mint
+ *  broad and reuse across generations). `scopeId` is an `IndexGenerationManifest.generationId`
+ *  for `purpose: 'index'`, or a caller-chosen episode upload id for `purpose: 'episode'`. */
+export interface MintIngestCapabilityInput {
+  projectId: string;
+  repositoryKey: string;
+  purpose: 'index' | 'episode';
+  scopeId: string;
+  runnerId: string;
+  /** Optional per-batch ceiling request — the server clamps it to its own `MAX_INGEST_BATCH_BYTES`
+   *  regardless, so this only ever narrows, never widens, what the mint response allows. */
+  maxBytes?: number;
+}
+
 /** Thin REST client for the Noriq control plane. The daemon authenticates with the
  *  user's OAuth token (the only secret that crosses the wire). */
 export class NoriqClient {
@@ -202,8 +246,29 @@ export class NoriqClient {
       return this.request(method, pathname, body, false);
     }
     const text = await res.text();
-    if (!res.ok) throw new Error(`${method} ${pathname} → ${res.status}: ${text.slice(0, 500)}`);
+    if (!res.ok)
+      throw new NoriqHttpError(
+        `${method} ${pathname} → ${res.status}: ${text.slice(0, 500)}`,
+        res.status,
+        text,
+      );
     return text ? JSON.parse(text) : {};
+  }
+
+  /** This client's server base URL, trailing slash trimmed — exposed for RUN-220's ingest client,
+   *  which builds its own request URLs directly: the five `/api/memory-ingest/:token/*` calls are
+   *  authorized by the TOKEN IN THE PATH, never by this client's Bearer header, so they cannot go
+   *  through `request()` above. */
+  get baseUrl(): string {
+    return this.base;
+  }
+
+  /** This client's injected fetch — exposed for the same reason as `baseUrl`: RUN-220's ingest
+   *  client is a separate, unauthenticated-by-header transport and needs its own fetch to fake in
+   *  tests without re-plumbing a second `fetchImpl` through every call site that already has one
+   *  of these. */
+  get httpFetch(): typeof fetch {
+    return this.fetchImpl;
   }
 
   /** Register (or re-register, if reg.runnerId is set) this runner. */
@@ -514,5 +579,24 @@ export class NoriqClient {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Mint a short-lived, single-purpose ingest capability (RUN-220, PLNR-260 §8) — under the
+   * DAEMON's own OAuth identity, via this same authenticated client (locked decision 7), scoped
+   * to exactly the one (purpose, scopeId) `input` names. This is the ONLY thing this client does
+   * with the capability: it hands back the grant and never touches the five token-authorized
+   * routes itself — those live in `ingest-client.ts`, which authorizes with the token alone (no
+   * Bearer, no cookie), a different trust shape from every other call on this class.
+   *
+   * Throws `NoriqHttpError` on any non-2xx — notably 503 when this server has no
+   * `ATTACHMENT_UPLOAD_SECRET`/`ADMIN_TOKEN` configured (ingest not enabled at all: a runner
+   * ahead of its server must treat this as permanent, never retry it into a hot loop), 404 for a
+   * repository key this project has not registered, and 403 when the runner is outside this
+   * connection's authorized projects. `ingest-client.ts` classifies `.status` into the
+   * caller-facing `IngestError` taxonomy; this method stays a thin, honest wire call.
+   */
+  async mintIngestCapability(input: MintIngestCapabilityInput): Promise<IngestCapabilityGrant> {
+    return (await this.request('POST', '/api/runner-ingest/capability', input)) as IngestCapabilityGrant;
   }
 }
