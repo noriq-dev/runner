@@ -449,8 +449,13 @@ and should be updated alongside any change here.
   and `index-repo` cannot upload by construction. Two things it does NOT cover, both measured rather
   than assumed: a `full`-mode file entity carries RAW source text with no redaction pass, so a token
   hardcoded in `src/foo.ts` is in the payload (the value floor only sees what an adapter extracted);
-  and there is still no default `[index].exclude`, so a first opt-in walks `node_modules` — 6943
-  files on this repo. "Only the OAuth token crosses the wire" was the pre-RUN-207 shorthand for this
+  and there is no default `[index].exclude`, so committed generated content (a vendored dependency,
+  a checked-in `dist/`, a lockfile) is indexed like source. What that does NOT mean, measured rather
+  than assumed: the daemon's own path never walks `node_modules`, because `leaseIndexSnapshot` mints
+  a DETACHED WORKTREE holding only tracked files — 243 files on this repo, against 6943 for
+  `index-repo --path .` pointed at a live working directory. Perforce reads the depot and Diversion
+  its API, so all three backends are tracked-only by construction; only the operator debug command
+  can see an untracked tree at all. "Only the OAuth token crosses the wire" was the pre-RUN-207 shorthand for this
   line; it is narrower now, not false, and THREAT-MODEL.md's "Repository intelligence upload
   (`[index]`)" section states the boundary — don't restate it more strongly than that there.
 - **The verify agent executes but never edits** — authorship separation is the point of the gate.

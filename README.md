@@ -329,8 +329,11 @@ Two things worth knowing before you opt in:
 - **No implicit exclusions.** Unlike repo discovery, the indexer does not skip
   `node_modules`/`dist`/`.git` on its own — write `[index].exclude` yourself, or a repo that opts
   in without one gets everything not caught by the size/time caps, which is not the same as a
-  sensible default. For scale: indexing this repo's own root without an exclude reaches 6943 files,
-  against roughly a hundred you would call its source.
+  sensible default — though what this actually reaches is narrower than it sounds, because the
+  daemon indexes a clean snapshot of *tracked* files (243 on this repo), never your working
+  directory's `node_modules`. What it does index is anything you have COMMITTED, generated or not:
+  a vendored dependency, a checked-in `dist/`, a lockfile. Note `index-repo --path .` below points
+  at your live directory instead, so it will report far more (6943 here) than the daemon would.
 - **Source structure and excerpts are business-sensitive even where they hold no credential** —
   treat this as a data-classification decision, not only a security one.
 

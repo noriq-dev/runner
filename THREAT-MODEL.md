@@ -264,12 +264,16 @@ path. **They do not land a caller for it or a transport.**
   built-in `node_modules`/`dist`/`.git`-shaped exclusions beyond the hard deny list — a repo that
   enables indexing without writing `[index].exclude` itself walks everything, bounded only by the
   size/count/time caps and not by any sensible default. This is a real sharp edge for a first
-  opt-in and is called out in the README. **Now measured rather than predicted (RUN-219):**
-  `index-repo` on this repository's own root indexes 6943 files and 103487 entities, against the
-  roughly one hundred files a developer would call "this repo's source" — the rest is
-  `node_modules`. That was free while nothing uploaded; it stops being free in Phase 4, and it is a
-  policy-defaults decision (a wrong default silently drops files a repo wanted indexed) rather than
-  a bug to patch quietly.
+  opt-in and is called out in the README. **Measured, and smaller than it first looked (RUN-219,
+  corrected):** `index-repo --path .` against a live working directory reaches 6943 files and 103487
+  entities, almost all of it `node_modules` — but that is the operator DEBUG path, not the daemon's.
+  The daemon leases an index snapshot, and all three backends are tracked-only by construction: git
+  mints a DETACHED WORKTREE (tracked files at that commit — 243 files and 8110 entities on this
+  repo), Perforce reads the depot, Diversion its API. None of them can see an untracked or ignored
+  file at all. So what remains is narrower and is NOT addressed by any ignore rule, because these
+  files are not ignored — they are committed: a vendored dependency, a checked-in `dist/`, a
+  lockfile, a generated client. That is a policy-defaults decision (a wrong default silently drops
+  files a repo wanted indexed) rather than a bug to patch quietly — RUN-256.
 - **Binary sniffing reads a bounded 8000-byte prefix.** A file that only turns binary after that
   point (rare, but possible for a text format with a late-appended binary trailer) is classified as
   text and its full content is read as a candidate.
