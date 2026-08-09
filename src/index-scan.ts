@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { isDeniedIndexPath } from './index-deny';
 import type { ResolvedIndexConfig } from './index-policy';
-import { FilesystemIndexSource } from './index-source';
-import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason } from './index-source';
+import { FilesystemIndexSource, comparePaths } from './index-source';
+import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason, ShouldDescend } from './index-source';
 
 /**
  * Source-independent POLICY for Project Memory's indexer (RUN-209, split from its enumeration in
@@ -30,29 +30,36 @@ import type { IndexSource, IndexSourceEntry, IndexSourceRefusalReason } from './
  * include/exclude globs, so it cannot re-implement this filter even by accident, and the deny list
  * holds for every source alike rather than only for the ones that remembered it (RUN-158's shape).
  *
- * **The hard deny list is directory-aware here, not source-aware.** RUN-209's walk pruned a whole
- * denied directory (`.git`, `.ssh`, …) to ONE status record by never recursing into it — a
- * filesystem-walk optimisation this file can no longer perform, because a source's enumeration is
- * opaque to this layer (locked decision 1: this file never asks a source to skip anything). The
- * SAME one-record-per-denied-directory outcome is reproduced instead by walking each candidate's
- * own ANCESTOR path segments against `isDeniedIndexPath` and remembering which ancestor prefixes
- * were already reported (`classifyDenial` below) — the record count a test asserts is unchanged,
- * but the WALK cost is not: a source that enumerates a huge denied subtree (a `.git` with
- * thousands of loose objects) is now fully enumerated before any of it is pruned, where the old
- * filesystem walk skipped the `readdir` entirely. Accepted: uniform deny enforcement across every
- * source outranks this one directory-walk shortcut, and nothing measures or asserts the walk cost.
+ * **The hard deny list stays directory-aware via a predicate, not directory-blind** (RUN-252
+ * follow-up, closing a regression the first cut of this split shipped with). That first cut read
+ * locked decision 1 ("a source never consults the deny list") as meaning a source cannot be told
+ * ANYTHING about denial — so it enumerated a whole denied directory (`.git`, `.ssh`, …) in full
+ * just to collapse it to one status record afterwards, paying a real `readdir` of potentially
+ * thousands of loose objects on every index to produce a record that says "denied". The decision's
+ * actual purpose is narrower: the deny list must live in exactly one place, so no source can
+ * WEAKEN it — not that a source may not be handed a yes/no it cannot itself interpret. So
+ * `makeShouldDescend` below builds a `ShouldDescend` predicate (`index-source.ts`) closed over
+ * this scan's own state and hands it to `source.list()`: a source that calls it never `readdir`s
+ * a denied directory at all, and the predicate itself pushes the one collapsed status record —
+ * `isDeniedIndexPath` is still called from nowhere but this file, the deny list still takes no
+ * override input, and a source that ignores the predicate is no less safe, only slower:
+ * `classifyDenial` below still catches every file such a source enumerates anyway, one at a time,
+ * exactly as it always did (defence in depth).
  *
- * **Determinism is this file's job, not a source's** (locked decision 4). `list()` may yield in any
- * order — `FakeIndexSource`'s tests deliberately scramble it — so this file drains every entry,
- * sorts by repository-relative path (plain code-unit comparison, not locale-aware: a sort whose
- * result depends on ICU data is not reproducible across machines), and only THEN applies bounds.
- * That ordering choice is what makes `stoppedEarly`'s "prefix of the repo" meaningful across two
- * runs of the SAME snapshot — an idempotency key built from (project, repo, branch, baseId,
- * indexer version, batch number) only means anything if two runs split the same tree the same way.
- * The cost is real: a source's enumeration is drained in FULL before a `maxFiles`/`maxTotalBytes`
- * bound can stop anything, where the old filesystem-only walk stopped enumerating the moment a
- * bound tripped. Prioritising a deterministic admitted PREFIX over an early-stopped enumeration is
- * the trade locked decision 4 asks for, not a shortcut taken here.
+ * **Determinism is the SOURCE's job now, not this file's** (locked decision 4, restated — RUN-252
+ * follow-up). The first cut drained `list()`'s entire output into an array and sorted it globally
+ * before applying any bound — for `FilesystemIndexSource`, which already walks siblings
+ * sorted-then-recurses, that re-sort bought nothing but cost everything: a source's enumeration
+ * was drained in FULL before `maxFiles`/`maxTotalBytes`/the deadline could stop anything, where the
+ * pre-split filesystem walk stopped the moment a bound tripped, and a monorepo's whole path+size
+ * metadata sat buffered in memory for no reason. `IndexSource.list`'s doc now states the ordering
+ * requirement as part of the CONTRACT, and this file trusts it: `runPipeline` below streams
+ * `list()`'s output and applies every bound as it arrives, so `maxFiles`/`maxTotalBytes`/the
+ * deadline stop enumeration itself, not just further processing of an already-complete list. A
+ * source that breaks the contract is refused LOUDLY rather than silently re-sorted — silently
+ * re-sorting broken input is exactly what hid the redundant global sort in the first place, so
+ * `runPipeline` throws the moment two consecutive paths are not in ascending order, naming it as a
+ * bug in that source rather than repairing it and letting the cost keep hiding.
  *
  * **This module does no parsing.** It yields file identity, size, a content hash, a status, and —
  * gated by `contentMode` — content: never language detection or entity extraction (Phase 3's job).
@@ -287,8 +294,10 @@ function looksBinary(buf: Buffer): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The hard deny list, applied ancestor-first so a whole denied directory still collapses to one
-// status record (see the module doc) — the ONLY place `isDeniedIndexPath` is called.
+// The hard deny list — the ONLY place `isDeniedIndexPath` is called, from two spots: the
+// `shouldDescend` predicate below (a source that calls it skips a denied directory's `readdir`
+// entirely) and `classifyDenial` (the unchanged per-file fallback for a source that does not).
+// Both collapse a whole denied directory to one status record; see the module doc.
 // ---------------------------------------------------------------------------
 
 type DenyOutcome = { path: string; reason: string } | 'suppressed' | null;
@@ -316,6 +325,29 @@ function classifyDenial(relPath: string, seen: Set<string>): DenyOutcome {
   return reason ? { path: relPath, reason } : null;
 }
 
+/**
+ * Build the `ShouldDescend` predicate (`index-source.ts`) handed to `source.list()` — the RUN-252
+ * follow-up fix for the enumeration-cost regression the module doc describes. Shares
+ * `state.deniedPrefixes` with `classifyDenial` above ON PURPOSE: whichever path reaches a denied
+ * ancestor first — this predicate during enumeration for a source that calls it, or
+ * `classifyDenial` during per-file evaluation for a source that never does — records it exactly
+ * once, and the other path's `seen`/`deniedPrefixes` check is what stops a second report for the
+ * same prefix. A source that calls this and is told `false` never `readdir`s the directory at
+ * all; a source that ignores this parameter entirely simply never calls it, and every file it
+ * enumerates anyway still meets `classifyDenial`'s unchanged per-file check — the predicate is
+ * pure walk-cost recovery, never a second place the deny decision itself is made.
+ */
+function makeShouldDescend(state: ScanState): ShouldDescend {
+  return (relDirPath: string): boolean => {
+    if (state.deniedPrefixes.has(relDirPath)) return false;
+    const reason = isDeniedIndexPath(relDirPath);
+    if (reason === null) return true;
+    state.deniedPrefixes.add(relDirPath);
+    pushStatus(state, relDirPath, 'denied', reason);
+    return false;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Mapping a source's small refusal vocabulary onto the one closed status enum (locked decision 7).
 // An exhaustive switch, deliberately with no default: adding a reason to
@@ -336,22 +368,28 @@ function mapSourceRefusal(reason: IndexSourceRefusalReason): IndexStatusReason {
 }
 
 // ---------------------------------------------------------------------------
-// Enumeration: drain a source's (possibly unordered) list into a deterministically-sorted array of
-// candidates, recording any enumeration-level refusal directly (locked decision 4).
+// Enumeration: STREAM a source's list() straight into the per-file pipeline (RUN-252 follow-up —
+// no drain, no global re-sort), trusting `IndexSource.list`'s ordering contract and checking it as
+// entries arrive rather than re-establishing it.
 // ---------------------------------------------------------------------------
 
-function byPath(a: IndexSourceEntry, b: IndexSourceEntry): number {
-  return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
-}
-
-async function collectEntries(
+/**
+ * Drive one source end to end: enumerate, evaluate each surviving entry, and stop the moment a
+ * bound trips. Because `evaluateEntry` sets `state.stop` from INSIDE this same loop (rather than
+ * after a separate array is fully built), breaking here also stops pulling from `source.list()` —
+ * an async generator's `.return()` fires on an early `break` out of `for await`, so a source like
+ * `FilesystemIndexSource` never `readdir`s the directories it had not reached yet. That is the
+ * whole fix: `maxFiles`/`maxTotalBytes`/the deadline now bound ENUMERATION, not just how much of
+ * an already-complete list gets processed.
+ */
+async function runPipeline(
   source: IndexSource,
   config: ResolvedIndexConfig,
   state: ScanState,
-): Promise<IndexSourceEntry[]> {
-  const entries: IndexSourceEntry[] = [];
-  for await (const item of source.list()) {
-    if (state.stop) break;
+): Promise<void> {
+  const shouldDescend = makeShouldDescend(state);
+  let lastPath: string | null = null;
+  for await (const item of source.list(shouldDescend)) {
     // The wall-clock circuit breaker also bounds ENUMERATION, not only the per-file pipeline below
     // — a source whose listing alone is slow (a huge paginated depot) must not be able to outrun
     // the deadline before a single bound gets a chance to apply.
@@ -364,9 +402,25 @@ async function collectEntries(
       pushStatus(state, item.path, mapSourceRefusal(item.reason), item.detail);
       continue;
     }
-    entries.push(item.entry);
+    const entry = item.entry;
+    if (lastPath !== null && comparePaths(entry.path, lastPath) <= 0) {
+      // Refuse loudly rather than silently re-sort. A silent re-sort here is exactly the shape
+      // that hid the original drain-and-sort regression: an out-of-order source would degrade
+      // straight back to "buffer everything, then bound" with nothing in the result to show it.
+      // Naming this as the SOURCE's bug (never built here — `FilesystemIndexSource` and
+      // `FakeIndexSource`'s default mode both honour the contract) is deliberate: `stoppedEarly`
+      // only means "a prefix of the repo" if the prefix is the same one across runs, and that
+      // stops being true the moment enumeration order stops being deterministic.
+      const contractDoc = 'see the IndexSource.list doc in index-source.ts';
+      throw new Error(
+        `IndexSource "${source.kind}" violated its ordering contract: "${entry.path}" did not sort ` +
+          `strictly after "${lastPath}" (${contractDoc}).`,
+      );
+    }
+    lastPath = entry.path;
+    await evaluateEntry(source, entry, config, state);
+    if (state.stop) break;
   }
-  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,12 +556,7 @@ export async function scanIndexSource(
     deniedPrefixes: new Set(),
   };
 
-  const entries = await collectEntries(source, config, state);
-  entries.sort(byPath);
-  for (const entry of entries) {
-    if (state.stop) break;
-    await evaluateEntry(source, entry, config, state);
-  }
+  await runPipeline(source, config, state);
 
   return {
     candidates: state.candidates,

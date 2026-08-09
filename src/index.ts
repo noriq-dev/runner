@@ -42,6 +42,7 @@ export {
 export {
   FakeIndexSource,
   FilesystemIndexSource,
+  comparePaths,
   type FakeIndexSourceItem,
   type FakeIndexSourceReadOverrides,
   type IndexSource,
@@ -49,6 +50,7 @@ export {
   type IndexSourceListItem,
   type IndexSourceReadOutcome,
   type IndexSourceRefusalReason,
+  type ShouldDescend,
 } from './index-source';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {

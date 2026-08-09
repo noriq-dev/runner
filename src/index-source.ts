@@ -22,8 +22,8 @@ import { openConfined } from './repo-context';
  * **What is deliberately NOT here.** Every filtering and bounding decision — include/exclude, the
  * hard sensitive-file deny list, every size/count/time bound, binary detection, the content hash,
  * `contentMode`, and the closed `IndexStatusReason` vocabulary — stays in `index-scan.ts`. A source
- * enumerates and reads; it is never asked whether a path is wanted, and it can never answer that
- * question even if it tried, because it is never handed the deny list or a manifest's
+ * enumerates and reads; it is never asked to make a filtering DECISION on a file, and it can never
+ * answer that question even if it tried, because it is never handed the deny list or a manifest's
  * include/exclude globs to consult. RUN-209's whole point was making "non-overridable" a property
  * of the WALK'S ORDER rather than of a comment saying so — a source that filtered would be a
  * second policy, and the deny list would hold only for the sources that remembered it, which is
@@ -31,6 +31,17 @@ import { openConfined } from './repo-context';
  * for one member). So this file has no import of `index-deny.ts` or `index-policy.ts`, and that
  * absence is load-bearing, not incidental — it is the thing that makes "a source cannot filter"
  * true by construction rather than by discipline.
+ *
+ * **`list()`'s `shouldDescend` is not an exception to that** (RUN-252 follow-up, closing an
+ * enumeration-cost regression this file's first cut shipped with — see `index-scan.ts`'s module
+ * doc for the full accounting). It is an opaque yes/no the POLICY layer hands the source for one
+ * directory at a time; this file never sees a reason, a deny-list entry, or a glob through it,
+ * only a boolean answer to "descend into this or not". A source that calls it prunes for free what
+ * `index-scan.ts` would otherwise enumerate in full just to collapse to one status record after
+ * the fact (a `.git` with thousands of loose objects, paid on every index). A source that ignores
+ * the predicate entirely widens nothing: every file it enumerates anyway still meets the SAME
+ * per-file deny check `index-scan.ts` always ran, so the floor holds either way — the predicate
+ * buys back the walk cost, never the security property.
  *
  * **Confinement is a per-source guarantee, not a per-interface one** (locked decision 2).
  * `FilesystemIndexSource` below is `openConfined`'s existing contract, completely unchanged: open
@@ -44,11 +55,19 @@ import { openConfined } from './repo-context';
  * by whatever mechanism actually fits that source's own trust model, stated in its own doc comment
  * — RUN-254/255 (deferred) inherit that obligation, not this file's specific mechanism.
  *
- * **Ordering is not this file's job either** (locked decision 4). `list()` yields entries in
- * whatever order is cheapest for the source to produce; `FakeIndexSource` below deliberately does
- * NOT sort, so a test using it proves the POLICY layer is what makes enumeration deterministic —
- * a source that pre-sorted would be indistinguishable, in the one test that matters, from a policy
- * that forgot to.
+ * **Ordering IS this file's job now** (locked decision 4, restated — RUN-252 follow-up). The first
+ * cut of this split read "enumeration is deterministic per source: a stable sort by
+ * repository-relative path" as leaving the SORTING to whichever layer wanted it, so
+ * `index-scan.ts` drained every entry into an array and sorted it globally — for
+ * `FilesystemIndexSource`, which already walks siblings sorted-then-recurse (see `walkFs` below),
+ * that re-sort bought determinism the source had already paid for, at the cost of buffering the
+ * whole enumeration before a single bound could apply. The obligation belongs to the SOURCE,
+ * because only the source knows what "cheap" order looks like for it (a depot listing, an API
+ * page) and can pay for a sort once instead of the policy layer buffering everything to redo it
+ * later. `IndexSource.list`'s own doc below states the requirement and why; `FakeIndexSource`
+ * yields sorted by default so a policy-layer test exercises the REAL contract, with an explicit
+ * opt-out to play a source that breaks it — see `index-scan.ts`'s module doc for how a broken
+ * contract is detected rather than silently repaired.
  */
 
 /**
@@ -113,6 +132,16 @@ export type IndexSourceListItem =
   | { kind: 'refused'; path: string; reason: IndexSourceRefusalReason; detail?: string };
 
 /**
+ * Whether a source should descend into one directory during `list()` — the POLICY layer's own
+ * judgement, handed down as a plain boolean function so the source never has to know WHY (RUN-252
+ * follow-up; see the module doc's "not an exception" note). `relDirPath` is repository-relative
+ * and POSIX-separated, the same spelling every other path crossing this seam uses. A source that
+ * calls this and gets `false` owes the policy layer no record for what it skipped — the caller
+ * that answered `false` already knows, and has done its own bookkeeping before answering.
+ */
+export type ShouldDescend = (relDirPath: string) => boolean;
+
+/**
  * One source of files for the indexer (RUN-252). `FilesystemIndexSource` is the only production
  * implementation this task ships; RUN-254 (Perforce) and RUN-255 (Diversion) are deferred but this
  * is the shape they implement against.
@@ -121,18 +150,37 @@ export type IndexSourceListItem =
  * decision 8): `list()` is an async iterable so a source may enumerate a monorepo lazily (a
  * paginated API call, a streamed `p4 files` output), and `read()` is per-path so no source is ever
  * asked to buffer more than one file's content at a time. The POLICY layer (`index-scan.ts`)
- * chooses to buffer the (small) path+size metadata it drains from `list()` in order to sort it —
- * that is a policy-side memory cost paid once for determinism, not an obligation this interface
- * places on the source.
+ * streams `list()`'s output rather than buffering and re-sorting it (RUN-252 follow-up) — see
+ * `list`'s own doc for the ordering contract that makes streaming safe.
  */
 export interface IndexSource {
   /** Which source this is — for logs, never branched on by the policy layer (the same posture
    *  `VcsBackend.kind` holds: informational, not a dispatch key). */
   readonly kind: string;
 
-  /** Enumerate every file this source can see, in any order — see the module doc for why sorting
-   *  is deliberately not this method's job. */
-  list(): AsyncIterable<IndexSourceListItem>;
+  /**
+   * Enumerate every file this source can see.
+   *
+   * MUST yield in a deterministic, stable order for a given base — repository-relative path,
+   * plain code-unit comparison, never locale-aware (a sort whose result depends on ICU data is
+   * not reproducible across machines). This is not a courtesy: the policy layer (`index-scan.ts`)
+   * streams this output and applies `maxFiles`/`maxTotalBytes`/the deadline AS IT ARRIVES instead
+   * of draining and re-sorting first (RUN-252 follow-up, locked decision 4 restated), so a source
+   * that reorders the same tree between two runs would make `stoppedEarly`'s "prefix of the repo"
+   * mean a DIFFERENT prefix each time. That matters beyond one run: the idempotency key a batch is
+   * split under is (project, repo, branch, baseId, indexer version, batch number) — two runs of
+   * the SAME snapshot only split the same tree into the same batches if enumeration order is
+   * stable. `FilesystemIndexSource` below meets this by walking siblings sorted-then-recursing;
+   * a future backend (RUN-254/255) meets it however fits its own listing call (many APIs, and
+   * `p4 files`, already return path-sorted output for free — measured, not assumed).
+   *
+   * `shouldDescend`, when supplied, is an opaque yes/no for one directory at a time — see
+   * `ShouldDescend`'s doc. Calling it before recursing into a directory is how a source avoids
+   * enumerating a subtree the policy layer would only collapse to one status record afterwards;
+   * ignoring it changes nothing about which files are ultimately admitted, only how much walk time
+   * it costs to reach the same per-file deny check.
+   */
+  list(shouldDescend?: ShouldDescend): AsyncIterable<IndexSourceListItem>;
 
   /**
    * Read one file's bytes, stopping after `maxBytes` (+1, to detect a cut without buffering an
@@ -201,14 +249,25 @@ function classifyOpenError(err: unknown): { reason: IndexSourceRefusalReason; de
  * symlink pointing outside the root, and refuses one pointing inside once it discovers the target
  * is not a regular file. Both refusals happen for free at the one place a path is actually opened.
  *
- * Sorted by plain code-unit comparison, not `localeCompare` (a deliberate change from the walk this
- * replaces): a sibling order that depends on ICU locale data is not deterministic ACROSS machines,
- * which is exactly what locked decision 4 rules out. It happens to make no difference to any
- * existing candidate here — file names in these tests are plain ASCII — and the POLICY layer
- * re-sorts every entry globally regardless, so this ordering only affects which subtree gets
- * enumerated first, never which files are ultimately admitted.
+ * Sorted by plain code-unit comparison, not `localeCompare`: a sibling order that depends on ICU
+ * locale data is not deterministic ACROSS machines, which is exactly what `IndexSource.list`'s
+ * doc requires. This is no longer a courtesy the policy layer re-derives for us — `index-scan.ts`
+ * streams this output directly and relies on it being genuinely sorted (RUN-252 follow-up), so an
+ * ordering bug here would be a contract violation the policy layer refuses loudly rather than
+ * masks.
+ *
+ * `shouldDescend`, when supplied, is consulted before EVERY recursion, never before yielding a
+ * leaf — pruning is a directory-level decision (see `ShouldDescend`'s doc). A denied directory is
+ * never `readdir`'d at all: the caller already knows and has recorded whatever it needed to
+ * before answering `false`, which is the whole point (the regression this closes paid for a full
+ * `readdir` of a `.git` with thousands of loose objects just to throw the result away afterwards).
  */
-async function* walkFs(absDir: string, relDir: string, depth: number): AsyncGenerator<IndexSourceListItem> {
+async function* walkFs(
+  absDir: string,
+  relDir: string,
+  depth: number,
+  shouldDescend?: ShouldDescend,
+): AsyncGenerator<IndexSourceListItem> {
   if (depth > MAX_WALK_DEPTH) return;
 
   let entries: Dirent[];
@@ -233,7 +292,8 @@ async function* walkFs(absDir: string, relDir: string, depth: number): AsyncGene
     const childRel = relDir ? `${relDir}/${dirent.name}` : dirent.name;
 
     if (dirent.isDirectory()) {
-      yield* walkFs(childAbs, childRel, depth + 1);
+      if (shouldDescend && !shouldDescend(childRel)) continue; // pruned — no readdir, no yield.
+      yield* walkFs(childAbs, childRel, depth + 1, shouldDescend);
     } else {
       // Anything else — a regular file, or ANY symlink regardless of what it targets — is a
       // single leaf candidate. `read()` is what actually decides its fate. No size is offered:
@@ -254,8 +314,8 @@ export class FilesystemIndexSource implements IndexSource {
 
   constructor(private readonly root: string) {}
 
-  list(): AsyncIterable<IndexSourceListItem> {
-    return walkFs(this.root, '', 0);
+  list(shouldDescend?: ShouldDescend): AsyncIterable<IndexSourceListItem> {
+    return walkFs(this.root, '', 0, shouldDescend);
   }
 
   async read(relPath: string, maxBytes: number): Promise<IndexSourceReadOutcome> {
@@ -305,9 +365,12 @@ export type FakeIndexSourceReadOverrides = Record<
  * is genuinely source-independent (RUN-252's central acceptance claim) rather than merely
  * refactored around one.
  *
- * `list()` yields items in exactly the order they were constructed with — DELIBERATELY never
- * sorted, so a test can hand this scrambled paths and assert the POLICY layer is what produces a
- * stable order, not this source doing the policy's job for it.
+ * `list()` yields sorted by path BY DEFAULT — a well-behaved source, meeting `IndexSource.list`'s
+ * ordering contract exactly as `FilesystemIndexSource` does — so a policy-layer test using the
+ * default constructor exercises the REAL contract rather than the scramble-then-re-sort shape that
+ * hid the RUN-252 drain-and-sort regression in the first place. Pass `{ scrambled: true }` to play
+ * a source that BREAKS the contract instead, for the one test that needs to exercise
+ * `index-scan.ts`'s out-of-order handling.
  */
 export class FakeIndexSource implements IndexSource {
   readonly kind = 'fake';
@@ -315,14 +378,23 @@ export class FakeIndexSource implements IndexSource {
   constructor(
     private readonly items: FakeIndexSourceItem[],
     private readonly readOverrides: FakeIndexSourceReadOverrides = {},
+    private readonly options: { scrambled?: boolean } = {},
   ) {}
 
-  async *list(): AsyncIterable<IndexSourceListItem> {
-    for (const item of this.items) {
+  async *list(shouldDescend?: ShouldDescend): AsyncIterable<IndexSourceListItem> {
+    const ordered = this.options.scrambled
+      ? this.items
+      : [...this.items].sort((a, b) => comparePaths(a.path, b.path));
+    for (const item of ordered) {
       if (item.kind === 'refused') {
         yield { kind: 'refused', path: item.path, reason: item.reason, detail: item.detail };
         continue;
       }
+      // No real directories to prune here, so this source honours `shouldDescend` by checking
+      // every ANCESTOR segment of the candidate itself (see `passesShouldDescend`) — the same
+      // outcome `FilesystemIndexSource` gets from never `readdir`-ing a denied directory, without
+      // this source needing to model directories as first-class entries at all.
+      if (shouldDescend && !passesShouldDescend(item.path, shouldDescend)) continue;
       const size = item.size === null ? undefined : (item.size ?? byteLength(item.content));
       yield { kind: 'file', entry: { path: item.path, size } };
     }
@@ -345,4 +417,30 @@ export class FakeIndexSource implements IndexSource {
 
 function byteLength(content: string | Buffer): number {
   return Buffer.isBuffer(content) ? content.length : Buffer.byteLength(content, 'utf8');
+}
+
+/**
+ * Plain code-unit path comparison — never locale-aware, the same reasoning `walkFs`'s sibling sort
+ * gives (see its doc). Exported so `index-scan.ts` checks a source's actual output against the
+ * SAME comparator this file uses to produce it, rather than restating the rule and risking the two
+ * drifting apart.
+ */
+export function comparePaths(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Mirrors `FilesystemIndexSource`'s own directory-level pruning (see `walkFs`) for a source with
+ * no real directories of its own: checked ANCESTOR-first, so the first denied prefix stops the
+ * check immediately — exactly as a real walk never `readdir`s past it — rather than asking about
+ * every deeper segment too.
+ */
+function passesShouldDescend(relPath: string, shouldDescend: ShouldDescend): boolean {
+  const segs = relPath.split('/');
+  let prefix = '';
+  for (let i = 0; i < segs.length - 1; i++) {
+    prefix = prefix ? `${prefix}/${segs[i]}` : segs[i]!;
+    if (!shouldDescend(prefix)) return false;
+  }
+  return true;
 }

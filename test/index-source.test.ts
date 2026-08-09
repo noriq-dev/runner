@@ -6,7 +6,7 @@ import { INDEX_LANGUAGES } from '../src/index-policy';
 import { MAX_STATUS_RECORDS, scanIndexSource } from '../src/index-scan';
 import type { IndexScanResult } from '../src/index-scan';
 import { FakeIndexSource } from '../src/index-source';
-import type { FakeIndexSourceItem } from '../src/index-source';
+import type { FakeIndexSourceItem, IndexSource, IndexSourceReadOutcome } from '../src/index-source';
 
 /** Same generous-bounds-by-default convention `test/index-scan.test.ts` uses. */
 const cfg = (over: Partial<ResolvedIndexConfig> = {}): ResolvedIndexConfig => ({
@@ -94,21 +94,73 @@ describe('scanIndexSource — the policy layer inherits every rule, implementing
     expect(statusFor(r, 'a.test.ts')?.reason).toBe('excluded');
   });
 
-  it('produces the same candidate order for scrambled and sorted enumeration', async () => {
+  it('trusts a well-behaved (default) source order rather than re-deriving it', async () => {
+    // Construction order is deliberately not path order — `FakeIndexSource`'s default mode sorts
+    // it on the way out, exactly like `FilesystemIndexSource`, so this proves the SOURCE produced
+    // the deterministic order, not that the policy layer re-sorted a scramble (the RUN-252
+    // regression this follow-up removes: a global re-sort would pass this exact assertion too,
+    // which is why the counting-source test below is what actually distinguishes the two).
     const files: FakeIndexSourceItem[] = [
       { kind: 'file', path: 'z.ts', content: 'z' },
       { kind: 'file', path: 'a.ts', content: 'a' },
       { kind: 'file', path: 'm/b.ts', content: 'b' },
       { kind: 'file', path: 'm.ts', content: 'm' },
     ];
-    const scrambled = new FakeIndexSource(files);
-    const sorted = new FakeIndexSource([...files].sort((a, b) => (a.path < b.path ? -1 : 1)));
-    const r1 = await scanIndexSource(scrambled, cfg());
-    const r2 = await scanIndexSource(sorted, cfg());
-    expect(r1.candidates.map((c) => c.path)).toEqual(r2.candidates.map((c) => c.path));
-    // And the order is genuinely the deterministic sort, not just "the two runs agree with
-    // each other" by coincidence of a stable-but-arbitrary source order.
-    expect(r1.candidates.map((c) => c.path)).toEqual(['a.ts', 'm.ts', 'm/b.ts', 'z.ts']);
+    const source = new FakeIndexSource(files);
+    const r = await scanIndexSource(source, cfg());
+    expect(r.candidates.map((c) => c.path)).toEqual(['a.ts', 'm.ts', 'm/b.ts', 'z.ts']);
+  });
+
+  it('refuses loudly rather than silently re-sorting a source that breaks the ordering contract', async () => {
+    const files: FakeIndexSourceItem[] = [
+      { kind: 'file', path: 'z.ts', content: 'z' },
+      { kind: 'file', path: 'a.ts', content: 'a' }, // out of order relative to z.ts
+    ];
+    // `{ scrambled: true }` is the deliberately-misbehaving mode (see FakeIndexSource's doc) —
+    // the one thing a well-behaved fake never does by default.
+    const source = new FakeIndexSource(files, {}, { scrambled: true });
+    await expect(scanIndexSource(source, cfg())).rejects.toThrow(/ordering contract/);
+  });
+
+  it('never calls read() for a path pruned by shouldDescend — the point of the predicate', async () => {
+    let reads = 0;
+    const source = new FakeIndexSource([
+      { kind: 'file', path: '.git/HEAD', content: 'ref: refs/heads/main' },
+      { kind: 'file', path: '.git/objects/pack', content: 'binary-ish' },
+      { kind: 'file', path: 'ok.ts', content: 'export {};' },
+    ]);
+    const originalRead = source.read.bind(source);
+    source.read = async (p, n) => {
+      reads += 1;
+      return originalRead(p, n);
+    };
+    const r = await scanIndexSource(source, cfg());
+    expect(reads).toBe(1); // ok.ts only — neither .git file was ever read.
+    expect(byPath(r, 'ok.ts')).toBeDefined();
+  });
+
+  it('stops enumerating a 1000-file source the moment maxFiles bites, not after draining it', async () => {
+    let yielded = 0;
+    const total = 1000;
+    const countingSource: IndexSource = {
+      kind: 'counting',
+      async *list() {
+        for (let i = 0; i < total; i++) {
+          yielded += 1;
+          // Zero-padded so construction order already satisfies the ordering contract.
+          yield { kind: 'file', entry: { path: `f${String(i).padStart(5, '0')}.ts` } } as const;
+        }
+      },
+      async read(): Promise<IndexSourceReadOutcome> {
+        return { ok: true, bytes: Buffer.from('x'), overLimit: false };
+      },
+    };
+    const r = await scanIndexSource(countingSource, cfg({ maxFiles: 3 }));
+    expect(r.filesOpened).toBe(3);
+    expect(r.stoppedEarly).toBe(true);
+    // The proof: the source itself never produced anywhere near 1000 entries. A drain-and-sort
+    // policy layer would have pulled every single one before this bound got a chance to apply.
+    expect(yielded).toBeLessThan(10);
   });
 
   it('enforces the per-file byte bound even when the source reports no size at all', async () => {
