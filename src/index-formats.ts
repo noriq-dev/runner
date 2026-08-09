@@ -133,21 +133,29 @@ function primitiveToText(value: unknown): string {
 }
 
 /**
- * An empty or whitespace-only key names nothing, so it gets no entity (declines by omission, the
- * posture every adapter here takes). Found the hard way on the first real upload this daemon ever
- * attempted: npm's own lockfile v2/v3 format keys the ROOT package as the empty string —
- * `"packages": { "": {…}, "node_modules/foo": {…} }` — which produced one symbol with `label: ""`
- * out of 6454 rows, and the server rejected the whole BATCH (`409 staged node row missing label`),
- * failing the entire generation. `MemoryNode.label` in the vendored contract is `z.string().min(1)`,
- * so an empty label was never sendable; nothing local checked. `indexer.ts` carries the floor that
- * catches any other route to the same shape — this is the root cause, that is the backstop.
+ * An empty or whitespace-only key names nothing, so it gets no entity AND no subtree (declines by
+ * omission, the posture every adapter here takes). Found the hard way on the first real upload this
+ * daemon ever attempted: npm's own lockfile v2/v3 format keys the ROOT package as the empty
+ * string — `"packages": { "": {…}, "node_modules/foo": {…} }` — which produced one symbol with
+ * `label: ""` out of 6454 rows, and the server rejected the whole BATCH (`409 staged node row
+ * missing label`), failing the entire generation. `MemoryNode.label` in the vendored contract is
+ * `z.string().min(1)`, so an empty label was never sendable; nothing local checked.
+ *
+ * The check belongs at the top of `walkConfigValue` — the one place a key ARRIVES — and not at the
+ * emit sites, which is where the first version of this fix put it and was wrong three ways: the
+ * primitive-array branch pushes a symbol directly without going through `pushLeaf`, and a declined
+ * SECTION still recursed, so `{"": {"name": …}}` emitted a properly-labelled `name` whose
+ * `symbolPath` carried the empty segment and whose `declares` edge pointed at a parent that was
+ * never sent. Identity here IS the path, so an unnameable key makes its whole subtree
+ * unaddressable — dropping it loses nothing that could have been cited. `indexer.ts` carries the
+ * floor that catches any other adapter reaching the same shape: this is the root cause, that is the
+ * backstop.
  */
 function isNameableKey(key: string): boolean {
   return key.trim().length > 0;
 }
 
 function pushLeaf(state: WalkState, path: string[], key: string, value: unknown): void {
-  if (!isNameableKey(key)) return;
   if (state.entityCount >= MAX_ENTITIES_PER_FILE) {
     state.hitEntityCap = true;
     return;
@@ -164,7 +172,6 @@ function pushLeaf(state: WalkState, path: string[], key: string, value: unknown)
 }
 
 function pushSection(state: WalkState, path: string[], key: string): void {
-  if (!isNameableKey(key)) return; // see `isNameableKey` — npm's lockfile roots a package at `""`.
   if (state.entityCount >= MAX_ENTITIES_PER_FILE) {
     state.hitEntityCap = true;
     return;
@@ -194,6 +201,9 @@ function arrayContent(key: string, items: unknown[]): string | null {
 }
 
 function walkConfigValue(state: WalkState, value: unknown, path: string[], key: string, depth: number): void {
+  // Before any branch and before any recursion — see `isNameableKey`. This is the only place a key
+  // arrives, so it is the only place that can decline one without leaving a route open.
+  if (!isNameableKey(key)) return;
   if (state.entityCount >= MAX_ENTITIES_PER_FILE) {
     state.hitEntityCap = true;
     return;

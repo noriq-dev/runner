@@ -493,6 +493,54 @@ describe('runIndexer — adapter throw isolation (RUN-216)', () => {
   });
 });
 
+// The adapters this repo ships decline an unnameable key at their own source, so this floor exists
+// for the NEXT adapter — one unlabelled row out of 6454 made the server reject a whole batch and
+// fail an entire generation on the first real upload, because `MemoryNode.label` is min(1) in the
+// vendored contract and nothing local checked.
+describe('runIndexer — an unlabelled symbol never reaches the wire', () => {
+  const labelAdapter = (label: string): IndexParserAdapter => ({
+    id: 'fake-unlabelled',
+    version: '1',
+    canParse: (path) => path.endsWith('.ts'),
+    parse: async () => ({
+      symbols: [
+        { symbolPath: ['bad'], nodeType: 'symbol', label, content: null },
+        { symbolPath: ['good'], nodeType: 'symbol', label: 'good', content: null },
+      ],
+      diagnostics: [],
+    }),
+  });
+
+  const run = (label: string) =>
+    runIndexer(new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(labelAdapter(label)),
+    });
+
+  it('drops the row, counts it, and keeps every labelled sibling', async () => {
+    const result = await run('');
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const nodes = rows.filter((r) => r.kind === 'node');
+    expect(nodes.every((n) => String(n.label).trim().length > 0)).toBe(true);
+    expect(nodes.some((n) => String(n.uri).endsWith('#good'))).toBe(true);
+    expect(nodes.some((n) => String(n.uri).endsWith('#bad'))).toBe(false);
+    expect(result.unlabelledSymbolsDropped).toBe(1);
+  });
+
+  it('takes the dropped symbol’s declares edge with it — an edge to a node nobody sent is an edge to nothing', async () => {
+    const result = await run('   ');
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const declares = rows.filter((r) => r.kind === 'edge' && r.type === 'declares');
+    expect(declares.some((e) => String(e.to).endsWith('#bad'))).toBe(false);
+    expect(declares.some((e) => String(e.to).endsWith('#good'))).toBe(true);
+    expect(result.unlabelledSymbolsDropped).toBe(1);
+  });
+
+  it('reports zero when every adapter behaves', async () => {
+    const result = await run('bad');
+    expect(result.unlabelledSymbolsDropped).toBe(0);
+  });
+});
+
 describe('runIndexer — same-file call edges (RUN-216)', () => {
   const callAdapter = (calls: ParsedCall[]): IndexParserAdapter => ({
     id: 'fake-calls',

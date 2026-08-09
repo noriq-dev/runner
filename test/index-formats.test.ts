@@ -145,6 +145,49 @@ describe('JSON adapter', () => {
     expect(result.symbols.length).toBeLessThanOrEqual(500);
     expect(result.diagnostics.some((d) => /more than 500 entities/.test(d.message))).toBe(true);
   });
+
+  // npm's own lockfile v2/v3 keys the ROOT package as the empty string, so this is not a synthetic
+  // edge: it is what `package-lock.json` looks like in every repo that has one. An unlabelled row
+  // is unsendable (`MemoryNode.label` is `z.string().min(1)`) and cost a whole generation a 409
+  // before this declined it — and the SIBLINGS must survive, since dropping the file wholesale
+  // would lose the dependency tree that is the only reason to index a lockfile at all.
+  it('declines a key that names nothing, keeping its siblings — npm roots a package at ""', async () => {
+    const result = await jsonAdapter.parse({
+      path: 'package-lock.json',
+      content: '{"packages": {"": {"name": "runner"}, "node_modules/zod": {"version": "3.0.0"}}}',
+    });
+    expect(result.diagnostics).toEqual([]);
+    expect(result.symbols.every((s) => s.label.trim().length > 0)).toBe(true);
+    expect(result.symbols.some((s) => s.symbolPath.includes(''))).toBe(false);
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['packages', 'node_modules/zod', 'version'], content: '3.0.0' }),
+    );
+  });
+
+  it('declines a whitespace-only key the same way', async () => {
+    const result = await jsonAdapter.parse({ path: 'a.json', content: '{" ": 1, "real": 2}' });
+    expect(result.symbols.map((s) => s.label)).toEqual(['real']);
+  });
+
+  // The three routes the first version of this fix left open — it guarded the two emit helpers,
+  // which is not where a key arrives.
+  it('declines an unnameable key whose value is an array (a route that bypasses pushLeaf)', async () => {
+    const result = await jsonAdapter.parse({ path: 'a.json', content: '{"": [1, 2], "real": 3}' });
+    expect(result.symbols.map((s) => s.label)).toEqual(['real']);
+  });
+
+  it('never descends into an unnameable section — the subtree is unaddressable, not merely unlabelled', async () => {
+    const result = await jsonAdapter.parse({
+      path: 'a.json',
+      content: '{"": {"name": "runner", "deep": {"k": "v"}}, "real": 1}',
+    });
+    expect(result.symbols.map((s) => s.symbolPath)).toEqual([['real']]);
+  });
+
+  it('declines an unnameable key holding an array of TABLES (the array-of-objects route)', async () => {
+    const result = await jsonAdapter.parse({ path: 'a.json', content: '{"": [{"k": "v"}], "real": 1}' });
+    expect(result.symbols.map((s) => s.symbolPath)).toEqual([['real']]);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -121,6 +121,7 @@ export interface IndexDebugReport {
   scanStatuses: { total: number; overflow: number; byReason: Record<string, number> };
   parserVersions: Record<string, string>;
   inferredEdgesOmitted: number;
+  unlabelledSymbolsDropped: number;
   stoppedEarly: boolean;
   entities: BoundedList<EntityView>;
   edges: BoundedList<EdgeView>;
@@ -210,6 +211,7 @@ export function buildDebugReport(result: IndexerResult, options: BuildDebugRepor
     },
     parserVersions: { ...result.parserVersions },
     inferredEdgesOmitted: result.inferredEdgesOmitted,
+    unlabelledSymbolsDropped: result.unlabelledSymbolsDropped,
     stoppedEarly: result.stoppedEarly,
     entities: {
       shown: boundedNodes.shown.map((n) => entityView(n, showContent)),
@@ -246,6 +248,14 @@ export function renderDebugReport(report: IndexDebugReport): string {
   }
   lines.push('');
   lines.push(`entities: ${formatCounts(report.entityCounts)}`);
+  // Only when non-zero, and worded as a defect rather than a statistic: an inferred edge omitted
+  // from the wire is normal and expected, an unlabelled row is always an adapter emitting something
+  // the contract cannot carry. A zero here would be noise on every healthy run.
+  if (report.unlabelledSymbolsDropped > 0) {
+    lines.push(
+      `  NOTE: ${report.unlabelledSymbolsDropped} symbol(s) had an empty label and were dropped before the wire — an adapter emitted a row the contract cannot carry (label is min(1))`,
+    );
+  }
   lines.push(
     `edges: ${formatCounts(report.edgeCounts)} (inferred, omitted from the wire: ${report.inferredEdgesOmitted})`,
   );
