@@ -92,8 +92,18 @@ describe('index-status / index-reindex / index-retry / index-cancel / index-forg
 
   beforeEach(async () => {
     dir = await mkdtemp(path.join(os.tmpdir(), 'noriq-cli-index-status-'));
+    // Point the control-info lookup at a path inside THIS test's temp dir. Without it these tests
+    // read the operator's real `~/.noriq/index-control.json`, so every "no live daemon" case here
+    // passed or failed depending on whether a daemon happened to be running on the machine — which
+    // is exactly how it was caught: they broke the first time this repo's own daemon was started
+    // for a live index. A control file that does not exist is what "no daemon" means, so pointing
+    // at a nonexistent path inside the temp dir IS the no-daemon fixture.
+    process.env.NORIQ_INDEX_CONTROL_PATH = path.join(dir, 'index-control.json');
   });
-  afterEach(() => rm(dir, { recursive: true, force: true }));
+  afterEach(async () => {
+    process.env.NORIQ_INDEX_CONTROL_PATH = undefined;
+    await rm(dir, { recursive: true, force: true });
+  });
 
   it('index-status: a repo with no [index] table reports no-opt-in and exits 0 — answered locally', async () => {
     await marker('key = "ACME"\n');

@@ -206,6 +206,13 @@ export interface IndexerResult {
    *  7 forbids. Counted rather than silently dropped so "an inferred edge is distinguishable from a
    *  resolved one" is an observable property of a run, not only of one adapter's own unit tests. */
   inferredEdgesOmitted: number;
+  /** Symbols an adapter emitted with an empty/whitespace-only `label`, dropped before the wire
+   *  because `MemoryNode.label` in the vendored contract is `z.string().min(1)` — see the comment
+   *  at the drop site. Counted rather than silently discarded for the same reason
+   *  `inferredEdgesOmitted` is: a row this daemon chose not to send is a fact about the generation,
+   *  and one unlabelled row used to fail an ENTIRE generation with a server-side 409. Expected to
+   *  be 0 on almost every repo; a non-zero value names an adapter worth looking at. */
+  unlabelledSymbolsDropped: number;
 }
 
 /** Scan `source` under `config` and produce a complete, ready-to-upload generation. */
@@ -230,6 +237,7 @@ export async function runIndexer(
   // cannot resolve inside the candidate loop itself (RUN-217 locked decision 2).
   const pendingImports: Array<{ importerPath: string; specifier: string }> = [];
   let inferredEdgesOmitted = 0;
+  let unlabelledSymbolsDropped = 0;
 
   for (const candidate of scanResult.candidates) {
     const path = normalizeRepoPath(candidate.path);
@@ -294,6 +302,21 @@ export async function runIndexer(
     // `index-adapters.ts`'s contract — back to the real entity this loop already minted for it.
     const uriByRawSymbolPath = new Map<string, string>();
     parsed.symbols.forEach((symbol, i) => {
+      // The wire contract requires a non-empty label (`MemoryNode.label` is `z.string().min(1)` in
+      // the vendored slice), and nothing local used to check it — so ONE unlabelled row out of 6454
+      // made the server reject the whole BATCH (`409 staged node row missing label`) and fail the
+      // entire generation, on the first real upload this daemon ever attempted. The adapter that
+      // produced it now declines the shape at its source (`index-formats.ts`'s `isNameableKey`:
+      // npm's lockfile keys its root package as `""`), and this is the BACKSTOP for every other
+      // route to the same row — a node minted here reaches the wire, so this is the last place it
+      // can be refused locally rather than 409'd after a round trip. Dropped, never relabelled: a
+      // synthesized name would invent an identity the source never had. Counted so a silent drop is
+      // still a visible one, and its `declares` edge is skipped with it — an edge to a node that
+      // was never sent is an edge to nothing (`imports` resolution's own rule, one layer down).
+      if (!symbol.label.trim()) {
+        unlabelledSymbolsDropped += 1;
+        return;
+      }
       const symbolPath = dedupedPaths[i] ?? symbol.symbolPath;
       const symbolUri = buildSymbolEntityUri(scope, path, symbolPath, symbol.nodeType);
       uriByRawSymbolPath.set(JSON.stringify(symbol.symbolPath), symbolUri);
@@ -396,5 +419,6 @@ export async function runIndexer(
     stoppedEarly: scanResult.stoppedEarly,
     parserVersions,
     inferredEdgesOmitted,
+    unlabelledSymbolsDropped,
   };
 }

@@ -76,6 +76,25 @@ export interface IndexControlInfo {
 
 export const DEFAULT_CONTROL_INFO_PATH = path.join(os.homedir(), '.noriq', 'index-control.json');
 
+/**
+ * Where a CLI-side caller looks for the discovery file when it was given no explicit path. Read at
+ * CALL time, never captured at module load, so an override actually takes effect for a caller that
+ * cannot pass `infoPath` through — which is every `cli.ts` command, by design: an operator types
+ * `index-status`, not a file path.
+ *
+ * `NORIQ_INDEX_CONTROL_PATH` exists because without it this family of commands is not TESTABLE and
+ * not isolable. The CLI tests run in-process and reached the operator's REAL `~/.noriq`, so two of
+ * them ("no live daemon" cases) passed or failed depending on whether a daemon happened to be
+ * running on the machine — they failed the moment this repo's own daemon was started for the first
+ * live index, which is how this was found rather than by inspection. Same defect the RUN-222
+ * journal/staging paths already had to fix, one file over; same fix, at the one boundary a CLI
+ * command can actually be pointed somewhere else. Also genuinely useful outside tests: a second
+ * daemon, or a non-default home.
+ */
+export function resolveControlInfoPath(explicit?: string): string {
+  return explicit ?? process.env.NORIQ_INDEX_CONTROL_PATH ?? DEFAULT_CONTROL_INFO_PATH;
+}
+
 /** The header every request must carry the token in — never a body field or query param (both are
  *  things a cross-origin "simple" request, or a shell command with the URL in its own history/logs,
  *  can carry; a custom header is the one thing a browser will not attach without a CORS preflight
@@ -263,11 +282,9 @@ export class IndexControlServer {
 // control with no daemon running says so plainly").
 // ---------------------------------------------------------------------------
 
-export async function readControlInfo(
-  infoPath: string = DEFAULT_CONTROL_INFO_PATH,
-): Promise<IndexControlInfo | null> {
+export async function readControlInfo(infoPath?: string): Promise<IndexControlInfo | null> {
   try {
-    const parsed: unknown = JSON.parse(await readFile(infoPath, 'utf8'));
+    const parsed: unknown = JSON.parse(await readFile(resolveControlInfoPath(infoPath), 'utf8'));
     if (typeof parsed !== 'object' || parsed === null) return null;
     const { pid, port, startedAt, token } = parsed as Partial<IndexControlInfo>;
     if (

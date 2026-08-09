@@ -132,7 +132,22 @@ function primitiveToText(value: unknown): string {
   return String(value);
 }
 
+/**
+ * An empty or whitespace-only key names nothing, so it gets no entity (declines by omission, the
+ * posture every adapter here takes). Found the hard way on the first real upload this daemon ever
+ * attempted: npm's own lockfile v2/v3 format keys the ROOT package as the empty string —
+ * `"packages": { "": {…}, "node_modules/foo": {…} }` — which produced one symbol with `label: ""`
+ * out of 6454 rows, and the server rejected the whole BATCH (`409 staged node row missing label`),
+ * failing the entire generation. `MemoryNode.label` in the vendored contract is `z.string().min(1)`,
+ * so an empty label was never sendable; nothing local checked. `indexer.ts` carries the floor that
+ * catches any other route to the same shape — this is the root cause, that is the backstop.
+ */
+function isNameableKey(key: string): boolean {
+  return key.trim().length > 0;
+}
+
 function pushLeaf(state: WalkState, path: string[], key: string, value: unknown): void {
+  if (!isNameableKey(key)) return;
   if (state.entityCount >= MAX_ENTITIES_PER_FILE) {
     state.hitEntityCap = true;
     return;
@@ -149,6 +164,7 @@ function pushLeaf(state: WalkState, path: string[], key: string, value: unknown)
 }
 
 function pushSection(state: WalkState, path: string[], key: string): void {
+  if (!isNameableKey(key)) return; // see `isNameableKey` — npm's lockfile roots a package at `""`.
   if (state.entityCount >= MAX_ENTITIES_PER_FILE) {
     state.hitEntityCap = true;
     return;
