@@ -1006,7 +1006,7 @@ export interface RequirementReport {
  *  the whole unanswered — an answer in halves must not settle the finding, and a bare
  *  whole-finding response never overrides the letters (crediting it to them is the escape).
  *  An entry without sub-claims keeps its recorded status: the whole pre-RUN-180 world. */
-const effectiveStatus = (e: LedgerEntry): FindingStatus | 'unanswered' => {
+export const effectiveStatus = (e: LedgerEntry): FindingStatus | 'unanswered' => {
   const subs = subclaimsOf(e);
   if (!subs.length) return e.status;
   if (subs.some((s) => s.status === 'unanswered')) return 'unanswered';

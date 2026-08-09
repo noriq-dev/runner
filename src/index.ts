@@ -268,6 +268,7 @@ export {
   parseFindingResponses,
   applyContestResponses,
   buildLedger,
+  effectiveStatus,
   reconciledEntry,
   renderContestRecord,
   renderLedger,
@@ -547,6 +548,7 @@ export {
   type AcceptanceReport,
 } from './acceptance';
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
+export { buildEpisode, normalizeSeverity, type EpisodeExtra } from './episode';
 export {
   checkSteps,
   planWaves,

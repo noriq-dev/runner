@@ -12,7 +12,14 @@
  * commit, and the ticket is explicit that this is a move.
  */
 
-import type { LandPolicy, PermissionProfile, Run, RunBudget, RunPhase } from '@noriq-dev/shared';
+import type {
+  EffortEpisode,
+  LandPolicy,
+  PermissionProfile,
+  Run,
+  RunBudget,
+  RunPhase,
+} from '@noriq-dev/shared';
 import type { AcceptanceItem } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
@@ -125,6 +132,14 @@ export interface StageHost {
    * prove here).
    */
   onLanded?(repo: ResolvedRepo, branch: string, sha: string): void;
+  /**
+   * Hand a freshly assembled effort episode (RUN-224) to whatever wants it. Absent = no sink wired
+   * — every host today: delivery (RUN-227) is blocked on PLNR-340 and is not this task's to build.
+   * The seam exists so a later delivery layer attaches HERE without reshaping `settleStage` or
+   * `buildEpisode` — the same discipline `onLanded` above already established for a trigger nobody
+   * had written yet.
+   */
+  recordEpisode?(episode: EffortEpisode): void;
 }
 
 /**
