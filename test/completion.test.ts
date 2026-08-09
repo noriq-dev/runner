@@ -63,6 +63,17 @@ describe('completionCandidates', () => {
     expect(out).toContain('--help');
     expect(out).toContain('--config');
   });
+
+  it('offers index-repo’s own flags once it is chosen, and signals file completion for --path', () => {
+    const out = completionCandidates(['index-repo', '--']);
+    expect(out).toContain('--force');
+    expect(out).toContain('--json');
+    expect(out).toContain('--limit');
+    expect(out).toContain('--show-content');
+    expect(out).toContain('--check-determinism');
+    expect(completionCandidates(['index-repo', '--path', ''])).toEqual([FILE_SENTINEL]);
+    expect(completionCandidates(['index-repo', '--limit', ''])).toEqual([]);
+  });
 });
 
 describe('completionScript', () => {

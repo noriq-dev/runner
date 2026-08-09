@@ -163,6 +163,14 @@ export interface IndexerDeps {
 export interface IndexerResult {
   manifest: IndexGenerationManifest;
   batches: EncodedBatch[];
+  /** The exact records `batches` were encoded from, already in final sorted order
+   *  (`sortRecords`) — informational, for a caller that wants entity/edge detail without
+   *  decompressing `batches` back out (RUN-219's debug CLI is the first, and the reason this
+   *  field exists at all: it has no server or network path of its own, only local inspection).
+   *  Never an alternate source of truth for `manifest.contentHash` or a batch's own bytes — those
+   *  are computed from `sorted` before this field is even assigned, so a caller that wants the
+   *  CANONICAL fact reads `manifest`/`batches`, never re-derives it by re-hashing this array. */
+  records: readonly IndexRecord[];
   diagnostics: readonly IndexDiagnostic[];
   diagnosticsOverflow: number;
   scanStatuses: readonly IndexStatusRecord[];
@@ -263,6 +271,10 @@ export async function runIndexer(
         type: symbol.nodeType,
         label: symbol.label,
         content: symbol.content,
+        // Inert on the wire (`index-entity.ts`'s own doc on `EntityRecord.range`) — carried
+        // through only so `IndexerResult.records` below has it for a caller that wants the range,
+        // never so it can leak into `contentHash`/a batch's bytes.
+        range: symbol.range,
       });
       records.push({ kind: 'edge', type: 'declares', from: fileUri, to: symbolUri });
     });
@@ -344,6 +356,7 @@ export async function runIndexer(
   return {
     manifest,
     batches,
+    records: sorted,
     diagnostics: diagnostics.diagnostics,
     diagnosticsOverflow: diagnostics.overflow,
     scanStatuses: scanResult.statuses,

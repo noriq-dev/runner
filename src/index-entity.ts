@@ -1,5 +1,6 @@
 import type { MemoryEdgeType, MemoryNodeType } from '@noriq-dev/shared';
 import { buildEntityUri } from '@noriq-dev/shared';
+import type { SymbolRange } from './index-adapters';
 import { comparePaths } from './index-source';
 
 /**
@@ -216,6 +217,15 @@ export interface EntityRecord {
   /** `null` in `contentMode: 'metadata'`, or for an entity kind that never carries source text —
    *  never a decision this file makes, only a value the caller (`indexer.ts`) passes through. */
   content: string | null;
+  /** Carried straight through from `ParsedSymbol.range` (`index-adapters.ts`) when the adapter
+   *  reported one — absent for a `file` entity (no line-span concept) or a symbol an adapter
+   *  declined to place. **Inert on the wire by construction**: `index-batch.ts`'s `toStagedRow`
+   *  builds a `StagedNodeRow` literal naming exactly `{kind,uri,type,label,content}`, so this field
+   *  is never read into a hashed/uploaded row — adding it here cannot move `contentHash` or a
+   *  batch's bytes by one bit. It exists purely for a caller that wants the record IN MEMORY, not
+   *  round-tripped through the wire shape — RUN-219's debug CLI is the first (see
+   *  `index-adapters.ts`'s own `SymbolRange` doc, which named this exact caller before it existed). */
+  range?: SymbolRange;
 }
 
 export interface EdgeRecord {

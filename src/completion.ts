@@ -17,6 +17,7 @@ export const COMMANDS = [
   'auth',
   'start',
   'discover',
+  'index-repo',
   'index-selftest',
   'config',
   'completion',
@@ -25,7 +26,7 @@ export const COMMANDS = [
 ] as const;
 
 /** Flags that consume the next argv token as their value — skipped when scanning for the command. */
-const VALUE_FLAGS = new Set(['--config', '--log-level', '--server']);
+const VALUE_FLAGS = new Set(['--config', '--log-level', '--server', '--path', '--limit']);
 
 /** Enum-valued flags: the shell should offer these completions after the flag. */
 const FLAG_VALUES: Record<string, readonly string[]> = {
@@ -42,6 +43,7 @@ const GLOBAL_FLAGS = ['--config', '--log-level'];
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
   auth: ['--server', '--browser', '--device'],
   'init-project': ['--advanced'],
+  'index-repo': ['--path', '--force', '--json', '--limit', '--show-content', '--check-determinism'],
 };
 
 /**
@@ -65,8 +67,9 @@ export function completionCandidates(words: string[]): string[] {
   // A value-consuming flag immediately before the cursor: complete its value, not a new token.
   const enumValues = FLAG_VALUES[prev];
   if (enumValues) return filter(enumValues, current);
-  if (prev === '--config') return [FILE_SENTINEL];
+  if (prev === '--config' || prev === '--path') return [FILE_SENTINEL];
   if (prev === '--server') return []; // a URL — nothing we can offer
+  if (prev === '--limit') return []; // a number — nothing we can offer
 
   const command = findCommand(prior);
   const candidates = command

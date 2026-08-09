@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invokedDirectly, run } from '../src/cli';
 import { VERSION } from '../src/version';
+import { buildIndexRepoFixture } from './fixtures/index-repo-fixtures';
 
 let out: string[];
 let err: string[];
@@ -52,6 +53,66 @@ describe('cli', () => {
     });
     expect(report.grammars).toHaveLength(3);
     for (const g of report.grammars) expect(g.passed).toBe(true);
+  });
+
+  it('help lists index-repo and its options', async () => {
+    expect(await run(['help'])).toBe(0);
+    const text = out.join('\n');
+    expect(text).toContain('index-repo');
+    expect(text).toContain('--check-determinism');
+  });
+});
+
+describe('index-repo (RUN-219)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'noriq-cli-index-repo-'));
+    await buildIndexRepoFixture(dir);
+  });
+  afterEach(() => rm(dir, { recursive: true, force: true }));
+
+  it('refuses without [index].enabled and without --force — exit 1, names the flag', async () => {
+    expect(await run(['index-repo', '--path', dir])).toBe(1);
+    expect(err.join('\n')).toMatch(/--force/);
+  });
+
+  it('--force indexes a repo with no manifest at all, prints a summary, and exits 0', async () => {
+    expect(await run(['index-repo', '--path', dir, '--force'])).toBe(0);
+    const text = out.join('\n');
+    expect(text).toContain('index-repo');
+    expect(text).toContain('entities');
+    expect(err.join('\n')).toMatch(/--force stepped past/);
+  });
+
+  it('--force --json prints a parseable, bounded report', async () => {
+    expect(await run(['index-repo', '--path', dir, '--force', '--json', '--limit', '2'])).toBe(0);
+    const report = JSON.parse(out.join('\n'));
+    expect(report.entities.shown.length).toBeLessThanOrEqual(2);
+    expect(typeof report.generation.generationId).toBe('string');
+    expect(report.configSource).toBe('forced-default');
+  });
+
+  it('--check-determinism reports PASS for an unchanged fixture tree', async () => {
+    expect(await run(['index-repo', '--path', dir, '--force', '--check-determinism'])).toBe(0);
+    expect(out.join('\n')).toMatch(/PASS/);
+  });
+
+  it('--check-determinism --json is machine-parseable', async () => {
+    expect(await run(['index-repo', '--path', dir, '--force', '--check-determinism', '--json'])).toBe(0);
+    const check = JSON.parse(out.join('\n'));
+    expect(check).toEqual({ ok: true, mismatches: [] });
+  });
+
+  it('a real secret-shaped value never reaches stdout under --show-content', async () => {
+    const secret = 'ghp_ThisIsAFakeButShapedGithubToken0123456';
+    await writeFile(path.join(dir, 'secret.ts'), `export function leaky() { return "${secret}"; }\n`);
+    expect(await run(['index-repo', '--path', dir, '--force', '--show-content', '--limit', '1000'])).toBe(0);
+    expect(out.join('\n')).not.toContain(secret);
+  });
+
+  it('an unknown --limit value is a usage error (exit 2)', async () => {
+    expect(await run(['index-repo', '--path', dir, '--force', '--limit', 'nope'])).toBe(2);
   });
 });
 

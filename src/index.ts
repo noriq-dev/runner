@@ -99,6 +99,36 @@ export {
   createTreeSitterAdapter,
   createTreeSitterAdapterRegistry,
 } from './index-treesitter';
+// The `[index].languages` gate (RUN-219) — the ONE place that filters an adapter into (or out of)
+// a registry by policy; `index-repo` and `index-selftest` both build their registry through this,
+// so they cannot silently disagree about which adapters exist.
+export { buildIndexAdapterRegistry, type BuiltIndexAdapterRegistry } from './index-registry';
+// The local debug CLI's own pure report/render/determinism layer (RUN-219) — see `index-repo.ts`
+// for the orchestrator that actually calls `runIndexer` and hands this module the result.
+export {
+  DEFAULT_DEBUG_LIMIT,
+  DEBUG_CONTENT_PREVIEW_CHARS,
+  bounded,
+  buildDebugReport,
+  compareGenerations,
+  displaySafeContent,
+  renderDebugReport,
+  type BoundedList,
+  type BuildDebugReportOptions,
+  type DeterminismCheck,
+  type EdgeView,
+  type EntityView,
+  type IndexDebugReport,
+} from './index-debug';
+export {
+  buildIndexRepoReport,
+  checkIndexRepoDeterminism,
+  resolveIndexRepoConfig,
+  runIndexRepo,
+  type IndexRepoConfigSource,
+  type IndexRepoOptions,
+  type IndexRepoRun,
+} from './index-repo';
 export {
   MAX_INGEST_BATCH_BYTES,
   assembleManifest,
