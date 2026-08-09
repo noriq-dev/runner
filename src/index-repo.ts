@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process';
+import type { Dirent } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { loadIndexConfig, loadManifest } from './discovery';
 import { DEFAULT_DEBUG_LIMIT, buildDebugReport, compareGenerations } from './index-debug';
@@ -10,6 +13,10 @@ import { FilesystemIndexSource } from './index-source';
 import type { IndexSource } from './index-source';
 import { runIndexer } from './indexer';
 import type { IndexRunTarget, IndexerResult } from './indexer';
+import { GitBackend } from './vcs/git';
+import { PerforceBackend } from './vcs/perforce';
+import type { VcsBackend } from './vcs/types';
+import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 
 /**
  * The orchestrator behind `noriq-runner index-repo` (RUN-219) — resolve config, build the language-
@@ -34,6 +41,20 @@ import type { IndexRunTarget, IndexerResult } from './indexer';
  * touches a remote), `runIndexer`'s own doc already establishes it makes no network or model calls,
  * and nothing else in this file talks to a socket. `IndexRunTarget`'s identity fields are locally
  * synthesized, never resolved against Noriq — this command has no server to resolve them against.
+ * The VCS backend construction added for `buildVcsIgnoredPredicate` (RUN-256) does not change this:
+ * only git and Perforce are ever routed to from here (`backendFor`'s own doc says why Diversion is
+ * not), and both backends' `queryIgnored` is a LOCAL process (`git check-ignore`, `p4 ignores -i` —
+ * both measured to need no server connection at all) — never a network call.
+ *
+ * **Why this file, and not the daemon's snapshot path, asks a `VcsBackend` what it ignores**
+ * (RUN-256). `leaseIndexSnapshot` only ever hands back TRACKED content (git: a detached worktree;
+ * Perforce/Diversion: depot/API reads) — a VCS's own ignore rules have nothing left to drop
+ * there, so wiring `queryIgnored` into that path would be dead code dressed as a safeguard (RUN-256
+ * locked decision 6). This command is different: it walks a LIVE filesystem
+ * (`FilesystemIndexSource` over `options.root` directly), which sees exactly what an agent's own
+ * worktree would — including everything a gitignore-shaped rule would otherwise leave in a debug
+ * listing that a real dispatch would never index. `buildVcsIgnoredPredicate` below is the one
+ * caller of `VcsBackend.queryIgnored` in this file's whole reachable graph.
  */
 
 export interface IndexRepoOptions {
@@ -104,6 +125,106 @@ function gitRevParse(root: string, args: string[]): string | null {
 }
 
 /**
+ * Route `root` to a real `VcsBackend` instance (RUN-256) — a CHEAP, LOCAL-ONLY version of
+ * `detectVcs`'s own precedence (`vcs/detect.ts`), deliberately NOT a call to that function:
+ * `detectVcs`'s Diversion arm spawns `dv repo` whenever NEITHER `.git` nor `.p4config` is present
+ * at the root, and that is exactly the shape of a plain scratch directory with no VCS at all —
+ * this command's own fixtures included. Paying that spawn to detect a backend whose
+ * `queryIgnored` always answers `unknown` regardless (`diversion.ts`'s own doc: no measured local
+ * ignore-check primitive exists) would trade this file's "zero network, zero model calls" posture
+ * for a guaranteed no-op, so Diversion is never routed to here — `null` (no VCS-ignore filtering
+ * attempted at all) is the honest, and cheaper, answer for a root neither marker names. The
+ * `.git`/`.p4config` check itself duplicates `detect.ts`'s own convention rather than importing
+ * it, on purpose: importing `detect.ts` here would still make Diversion's arm reachable from this
+ * file's graph for no benefit, and the convention is two `existsSync` checks, not logic worth a
+ * shared abstraction.
+ */
+function backendFor(root: string): VcsBackend | null {
+  if (existsSync(path.join(root, '.git'))) {
+    return new GitBackend(new WorktreeManager({ baseDir: DEFAULT_WORKTREES_DIR }));
+  }
+  if (existsSync(path.join(root, '.p4config'))) return new PerforceBackend({});
+  return null;
+}
+
+/** Injectable for `buildVcsIgnoredPredicate`'s own tests — a fake that FAILS when asked to
+ *  `readdir` a directory the predicate should already have pruned is exactly the "never
+ *  `readdir`'d" acceptance line (RUN-256), and this is the one seam that makes such a fake
+ *  possible without touching the real filesystem. */
+export type VcsIgnoreWalkDeps = {
+  readdir?: (absDir: string) => Promise<Dirent[]>;
+};
+
+/**
+ * Batch-build a synchronous VCS-ignore predicate for the debug walk (RUN-256) — the one bridge
+ * between `VcsBackend.queryIgnored` (async, and answered per BATCH, never per single path) and
+ * `index-scan.ts`'s `IndexScanDeps.vcsIgnored` (synchronous, called once per candidate as
+ * `scanRepoForIndex`'s own streaming walk reaches it). The bridge has to run to completion BEFORE
+ * that walk starts: `ShouldDescend`'s contract there is synchronous, and a real ignore check (a
+ * subprocess) is not.
+ *
+ * Mirrors `walkFs`'s own directory-pruning shape (readdir a level, decide, recurse only into
+ * survivors) as a SEPARATE walk, deliberately: this is the one place allowed to ask a `VcsBackend`
+ * "what does your own mechanism ignore" (locked decision 1 keeps that question out of
+ * `index-scan.ts`/`index-source.ts` entirely), so it cannot be folded into the real scan's own
+ * walk without leaking VCS vocabulary across that boundary. The cost is real but bounded: the
+ * SURVIVING (non-ignored) tree gets `readdir`'d twice — once here, once by the real scan — while
+ * the EXPENSIVE subtree (`node_modules`-shaped) is `readdir`'d by NEITHER walk, which is the
+ * whole point (RUN-256's measured 243-vs-6943 gap is a directory-pruning problem, not a
+ * double-readdir-of-the-surviving-tree one).
+ *
+ * One `queryIgnored` call per directory LISTING, covering every sibling — files and
+ * subdirectories together — in the SAME call (locked decision 2's "batch the query"): a directory
+ * with hundreds of entries costs one round trip, not one per entry. A directory or file the
+ * backend reports ignored is recorded and never descended/visited further; every survivor is
+ * walked deeper.
+ *
+ * Returns `null` when the backend answers `unknown` at any point (locked decision 3: never
+ * guessed — the caller proceeds with no VCS-ignore filtering at all, exactly today's behaviour)
+ * or when `root` itself cannot be listed at all.
+ */
+export async function buildVcsIgnoredPredicate(
+  backend: Pick<VcsBackend, 'queryIgnored'>,
+  root: string,
+  deps: VcsIgnoreWalkDeps = {},
+): Promise<((relPath: string) => boolean) | null> {
+  const readDir = deps.readdir ?? ((absDir: string) => readdir(absDir, { withFileTypes: true }));
+  const ignored = new Set<string>();
+
+  async function walk(absDir: string, relDir: string): Promise<boolean> {
+    let entries: Dirent[];
+    try {
+      entries = await readDir(absDir);
+    } catch {
+      return true; // unreadable — the real scan will hit this itself and record it there
+    }
+    if (entries.length === 0) return true;
+
+    const relPaths = entries.map((e) => (relDir ? `${relDir}/${e.name}` : e.name));
+    const result = await backend.queryIgnored(root, relPaths);
+    if (!result.ok) return false; // unknown — abandon the whole predicate (locked decision 3)
+
+    const toDescend: Array<{ abs: string; rel: string }> = [];
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      const rel = relPaths[i]!;
+      if (result.ignored.has(rel)) {
+        ignored.add(rel); // never descended, whether a file or a directory
+        continue;
+      }
+      if (entry.isDirectory()) toDescend.push({ abs: path.join(absDir, entry.name), rel });
+    }
+    for (const d of toDescend) {
+      if (!(await walk(d.abs, d.rel))) return false;
+    }
+    return true;
+  }
+
+  const complete = await walk(root, '');
+  return complete ? (relPath: string) => ignored.has(relPath) : null;
+}
+
+/**
  * One local index pass over `options.root`: resolve config, build the adapter registry FOR THAT
  * CONFIG (the language gate — `index-registry.ts`), scan the real filesystem, run the real
  * `runIndexer`. Returns `null` exactly when `resolveIndexRepoConfig` refused (indexing is off and
@@ -129,9 +250,17 @@ export async function runIndexRepo(options: IndexRepoOptions): Promise<IndexRepo
 
   const source: IndexSource = new FilesystemIndexSource(root);
   const { registry } = buildIndexAdapterRegistry(resolved.config);
+  // RUN-256: match the debug listing to what a real dispatch would ever index — a detached
+  // snapshot worktree holds tracked files only, and this live filesystem walk otherwise reports
+  // every VCS-ignored path (node_modules and kin) right alongside them. `null` (backend answered
+  // `unknown`, or nothing to check) means no filtering at all — exactly this command's prior
+  // behaviour, never a guess.
+  const vcs = backendFor(root);
+  const vcsIgnored = vcs ? ((await buildVcsIgnoredPredicate(vcs, root)) ?? undefined) : undefined;
   const result = await runIndexer(source, resolved.config, target, {
     adapters: registry,
     now: options.now,
+    scan: { now: options.now, vcsIgnored },
   });
   await source.close?.();
 

@@ -5,7 +5,7 @@ import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { ChangesBetweenResult } from './vcs/types';
+import type { ChangesBetweenResult, IgnoreQueryResult } from './vcs/types';
 
 const execFileP = promisify(execFile);
 
@@ -36,12 +36,41 @@ export function comparableWorktreePath(p: string): string {
 /** Where per-Run worktrees are created (outside any repo). */
 export const DEFAULT_WORKTREES_DIR = path.join(os.homedir(), '.noriq', 'worktrees');
 
-/** Runs a git subcommand in a repo. Injectable so the lifecycle is testable. */
-export type GitRunner = (args: string[], cwd: string) => Promise<{ stdout: string; stderr: string }>;
+/**
+ * Runs a git subcommand in a repo. Injectable so the lifecycle is testable.
+ *
+ * `stdin`, optional and additive (RUN-256): every existing call site omits it and behaves exactly
+ * as before (closing an unused stdin harms nothing — no other subcommand this file runs reads
+ * one). Added for `checkIgnored`'s `git check-ignore --stdin`, the one caller that needs it —
+ * `-z` (NUL-delimited, the same safety `changedPaths` already trusts for an exotic filename)
+ * measures as refusing outright in positional-argument mode ("fatal: -z only makes sense with
+ * --stdin"), so stdin is not a style choice here, it is what makes the NUL-safe form reachable.
+ */
+export type GitRunner = (
+  args: string[],
+  cwd: string,
+  stdin?: string,
+) => Promise<{ stdout: string; stderr: string }>;
 
-export const defaultGit: GitRunner = async (args, cwd) => {
-  const { stdout, stderr } = await execFileP('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
-  return { stdout, stderr };
+export const defaultGit: GitRunner = (args, cwd, stdin) => {
+  const promise = execFileP('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
+  // `util.promisify(execFile)`'s returned promise exposes the live child via `.child` (Node's own
+  // documented behaviour) — writing to its stdin before awaiting is what lets this stay on
+  // `execFile` (unchanged buffering/encoding/error-shape for every other call site) rather than
+  // moving the whole runner to `spawn` just to support the one caller that needs stdin.
+  //
+  // Every OTHER subcommand this file runs never reads stdin at all, and measured live (not
+  // assumed): git can close its end of that pipe before this line's `.end()` call reaches it,
+  // which surfaces as an EPIPE `'error'` event on the stream — an UNHANDLED one, since nothing
+  // else here listens for it, which crashed the process outright. A closed pipe on a write nobody
+  // was going to read is not a failure of the command that already ran; the handler below is what
+  // keeps this call the same no-op it always was for every caller that never passes `stdin`.
+  const childStdin = promise.child.stdin;
+  if (childStdin) {
+    childStdin.on('error', () => {});
+    childStdin.end(stdin ?? '');
+  }
+  return promise;
 };
 
 /**
@@ -531,6 +560,44 @@ export class WorktreeManager {
     }
 
     return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * `git check-ignore --stdin -z` (RUN-256) — git's half of `VcsBackend.queryIgnored`, batched:
+   * every candidate in `paths` in ONE call, never one process per path (`vcs/types.ts`'s own doc
+   * on that method states why: locked decision 2, "batch the query"). Chosen over parsing git's
+   * own ignore file here: nested ignore files, `!` negation, precedence, and `core.excludesFile` are
+   * all real and all easy to get subtly wrong, and this is the same "shell to the tool that
+   * defines the semantics" discipline `changesBetween` above already applies to git's own diff
+   * output.
+   *
+   * Git's exit code for this command is NOT the ordinary 0-success/nonzero-failure convention —
+   * measured directly (not assumed): **0 means "at least one of the given paths is ignored", 1
+   * means "none of them are"** (a real, distinct ANSWER, never an error), and only something else
+   * (129 for a bad flag, measured; git's own docs name 128 for a fatal error) is an actual
+   * failure. `this.git` rejects on any nonzero exit (this file's own convention throughout), so
+   * this method catches the rejection and reads the numeric exit code off it: exactly `1` folds
+   * into the empty-set answer, anything else answers `unknown` (never guessed — RUN-256 locked
+   * decision 3) rather than treating an unreadable answer as "nothing is ignored".
+   */
+  async checkIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
+    if (paths.length === 0) return { ok: true, ignored: new Set() };
+    try {
+      const { stdout } = await this.git(
+        ['check-ignore', '--stdin', '-z'],
+        repoRoot,
+        paths.map((p) => `${p}\0`).join(''),
+      );
+      return { ok: true, ignored: new Set(stdout.split('\0').filter(Boolean)) };
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      if (code === 1) return { ok: true, ignored: new Set() };
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `git check-ignore failed in ${repoRoot}: ${(err as Error).message}`,
+      };
+    }
   }
 
   /** Tear down a worktree + delete its (never-pushed) branch. Safe to call twice. */

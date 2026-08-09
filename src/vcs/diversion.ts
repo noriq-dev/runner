@@ -8,6 +8,7 @@ import { DiversionIndexSource, decodeObjectStatus, isDirectoryMode } from './div
 import type { LockDelegate } from './git';
 import type {
   ChangesBetweenResult,
+  IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,
@@ -744,6 +745,29 @@ export class DiversionBackend implements VcsBackend {
       };
     }
     return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * Always `unknown`, REASONED rather than measured (RUN-256): `dv --help`'s full command list
+   * (checked directly against a live `dv` install) has nothing shaped like `check-ignore`/`p4
+   * ignores` — the closest is `dv clean` ("Remove ignored/untracked files from the workspace"),
+   * which ACTS rather than reports and offers no dry-run/query flag to observe what it would
+   * remove without removing it. Building a `.dvignore`-plus-`.gitignore` dialect parser ourselves
+   * to fill that gap is exactly what this task's own git-side decision argues against doing for
+   * GIT'S OWN dialect (`git.ts`'s `queryIgnored` doc): shelling to the tool that defines the
+   * semantics beats reimplementing it, and no such tool exists here to shell to. `.dvignore`'s
+   * NAME never appears outside this backend (the seam's own floor), and this method never reads
+   * one — it states a fact about Diversion, the same posture `openReview` already takes here.
+   */
+  async queryIgnored(_repoRoot: string, _paths: string[]): Promise<IgnoreQueryResult> {
+    return {
+      ok: false,
+      reason: 'unknown',
+      detail:
+        'Diversion has no measured local ignore-check primitive (`dv --help` names none, and ' +
+        '`dv clean` only acts, it does not report) — .dvignore/.gitignore semantics are not ' +
+        'reimplemented here',
+    };
   }
 
   /**

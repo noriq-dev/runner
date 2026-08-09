@@ -53,6 +53,7 @@ function recorder() {
     createIndexSnapshot: record('createIndexSnapshot', snapshotHandle),
     removeIndexSnapshot: record('removeIndexSnapshot', undefined),
     changesBetween: record('changesBetween', { ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] }),
+    checkIgnored: record('checkIgnored', { ok: true, ignored: new Set(['node_modules']) } as const),
   };
   return { ops, calls };
 }
@@ -278,6 +279,17 @@ describe('GitBackend — changesBetween (RUN-212)', () => {
     const res = await new GitBackend(ops).changesBetween('/repo', 'sha-from', 'sha-to');
     expect(res).toEqual({ ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] });
     expect(calls).toEqual([{ method: 'changesBetween', args: ['/repo', 'sha-from', 'sha-to'] }]);
+  });
+});
+
+// RUN-256: same pure pass-through discipline as changesBetween one verb over — worktree.test.ts
+// owns the real `git check-ignore` behaviour, this only pins the delegation.
+describe('GitBackend — queryIgnored (RUN-256)', () => {
+  it('passes repoRoot/paths straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).queryIgnored('/repo', ['node_modules', 'src']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules']) });
+    expect(calls).toEqual([{ method: 'checkIgnored', args: ['/repo', ['node_modules', 'src']] }]);
   });
 });
 

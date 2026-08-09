@@ -366,6 +366,20 @@ describe('DiversionBackend — the rest of the surface', () => {
     expect(calls).toEqual([]); // no network call is part of the contract, not an accident
   });
 
+  it('queryIgnored is always unknown, reasoned rather than measured (RUN-256): zero calls', async () => {
+    // No `dv check-ignore`/equivalent exists (spot-checked against a live `dv --help`) — the
+    // honest answer is a refusal, and stating it must not act on the server, same discipline
+    // `openReview` above already pins.
+    const { backend, calls } = fakes({});
+    const res = await backend.queryIgnored('/repo', ['node_modules', 'src/a.ts']);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('unknown');
+      expect(res.detail).toMatch(/dv --help/);
+    }
+    expect(calls).toEqual([]);
+  });
+
   it('hasWork: uncommitted changes count, and so do commits past the lease base', async () => {
     const dirty = fakes({ status: 'Total modified paths: 1\nNew:\n\t a.txt\nModified:\n\t b.txt\n' });
     const ws1 = await dirty.backend.lease('/repo', 'run_1');

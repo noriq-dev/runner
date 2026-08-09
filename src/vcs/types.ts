@@ -177,6 +177,25 @@ export type ChangesBetweenResult =
   | { ok: true; changed: string[]; deleted: string[] }
   | { ok: false; reason: 'full-index-required'; detail: string };
 
+/**
+ * The outcome of `VcsBackend.queryIgnored` (RUN-256) — an outcome union, never a bare `Set`, for
+ * the same reason `IndexSnapshotResult`/`ChangesBetweenResult` are: "these paths are ignored" and
+ * "I cannot tell" are the same SHAPE (a boolean-ish answer) and opposite MEANINGS, and the wrong
+ * one is silent — a caller that cannot distinguish them either drops files a repo expected indexed
+ * (guessing "not ignored") or filters files a repo never asked to exclude (guessing "ignored").
+ * May-miss-never-invent, `ChangesBetweenResult`'s rule one verb over: `{ok:false}` is the only
+ * honest answer when a backend cannot determine ignore status, and the caller (the debug walk,
+ * `index-repo.ts` — RUN-256 locked decision 6, never the daemon's snapshot path) proceeds exactly
+ * as it did before this method existed: unfiltered, never guessing.
+ *
+ * `{ok:true}` with an EMPTY set is a real, distinct answer (none of the queried paths are
+ * ignored), not a stand-in for "could not tell" — same discipline `ChangesBetweenResult`'s own doc
+ * states for its own empty-list arm.
+ */
+export type IgnoreQueryResult =
+  | { ok: true; ignored: Set<string> }
+  | { ok: false; reason: 'unknown'; detail?: string };
+
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
@@ -513,6 +532,37 @@ export interface VcsBackend {
    * count on Windows — `comparableWorktreePath`'s exact concern, one layer up.
    */
   changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult>;
+
+  /**
+   * Which of `paths` does THIS backend's own ignore mechanism drop (RUN-256)? For the DEBUG walk
+   * only (`index-repo.ts`) — never for an agent, and never for the daemon's snapshot path: a
+   * leased index snapshot only ever holds TRACKED files by construction (git: a detached
+   * worktree; Perforce/Diversion: depot/API reads), so a VCS's ignore rules have nothing left to
+   * drop there. The debug walk is different — it enumerates a LIVE filesystem via
+   * `FilesystemIndexSource`, which sees exactly what an agent's own worktree would (including
+   * everything `.gitignore`-shaped a snapshot never materializes), so a debug listing that never
+   * asks this question misrepresents the pipeline by the margin RUN-256 measured (243 tracked
+   * files vs. 6943 on disk, on this repo) — the very thing an operator would use to decide whether
+   * to opt in at all.
+   *
+   * `paths` are candidate repository-relative, POSIX-separated paths — a batch, not one call per
+   * path (locked decision 2: "batch the query"). Deliberately unopinionated about batch size or
+   * shape (a directory listing's siblings, files and subdirectories together, is what the one
+   * caller sends): the seam states the outcome, not how many round trips buy it, and each backend
+   * picks the batching its own underlying tool actually supports (git: `check-ignore --stdin`,
+   * one call per path is not the contract here; Perforce: `p4 ignores -i` accepts many path
+   * arguments in one call; both measured, not assumed — see `git.ts`'s/`worktree.ts`'s and
+   * `perforce.ts`'s own docs for what was found and how the exit-code/output conventions read).
+   *
+   * REQUIRED, not optional — `openReview`'s precedent, stated in its own doc, applies verbatim: an
+   * omitted method reads as "nobody thought about this backend", a present method that answers
+   * `{ok:false, reason:'unknown'}` records that it WAS considered and says why (Diversion: no
+   * measured local ignore-check primitive at all — `diversion.ts`'s own doc names what was
+   * checked). `IgnoreQueryResult`'s own doc carries the outcome contract; never throws for an
+   * ordinary "cannot tell" — a caller that cannot filter still has to finish the walk unfiltered,
+   * not crash a debug command over it.
+   */
+  queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

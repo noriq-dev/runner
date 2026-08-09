@@ -251,6 +251,48 @@ describe('scanRepoForIndex — symlinks, traversal, and the deny list', () => {
   });
 });
 
+// RUN-256: `IndexScanDeps.vcsIgnored` — the additive, caller-supplied signal a VCS backend's own
+// ignore rules feed in from OUTSIDE this module (`index-repo.ts` is the one real caller; here it
+// is a plain fake, proving this module never has to know a VCS exists to honour the contract).
+describe('scanRepoForIndex — vcsIgnored (RUN-256)', () => {
+  it('prunes an ignored DIRECTORY the same way `denied` does: one status record, never enumerated', async () => {
+    await mkdir(path.join(root, 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(path.join(root, 'node_modules', 'pkg', 'index.js'), 'module.exports = {};');
+    await writeFile(path.join(root, 'ok.ts'), 'export {};');
+    const r = await scanRepoForIndex(root, cfg(), { vcsIgnored: (p) => p === 'node_modules' });
+    expect(byPath(r, 'ok.ts')?.content).toBe('export {};');
+    expect(r.statuses.filter((s) => s.path.startsWith('node_modules'))).toEqual([
+      { path: 'node_modules', reason: 'vcs-ignored' },
+    ]);
+  });
+
+  it('a leaf file dropped by the predicate carries `vcs-ignored`, distinct from `excluded`/`denied`', async () => {
+    await writeFile(path.join(root, 'debug.log'), 'noise');
+    await writeFile(path.join(root, 'kept.ts'), 'export {};');
+    const r = await scanRepoForIndex(root, cfg({ exclude: ['**/*.tmp'] }), {
+      vcsIgnored: (p) => p === 'debug.log',
+    });
+    expect(byPath(r, 'debug.log')).toBeUndefined();
+    expect(statusFor(r, 'debug.log')).toEqual({ path: 'debug.log', reason: 'vcs-ignored' });
+    expect(byPath(r, 'kept.ts')?.content).toBe('export {};');
+  });
+
+  it('a path both hard-denied AND vcs-ignored is recorded `denied` — the security floor wins', async () => {
+    await writeFile(path.join(root, '.env'), 'SECRET=1');
+    const r = await scanRepoForIndex(root, cfg(), { vcsIgnored: (p) => p === '.env' });
+    expect(statusFor(r, '.env')?.reason).toBe('denied');
+  });
+
+  it('with no vcsIgnored supplied at all, behaviour is byte-for-byte what it always was', async () => {
+    await mkdir(path.join(root, 'node_modules'), { recursive: true });
+    await writeFile(path.join(root, 'node_modules', 'x.js'), 'x');
+    await writeFile(path.join(root, 'ok.ts'), 'export {};');
+    const r = await scanRepoForIndex(root, cfg());
+    expect(byPath(r, 'node_modules/x.js')?.content).toBe('x');
+    expect(r.statuses.some((s) => s.reason === 'vcs-ignored')).toBe(false);
+  });
+});
+
 describe('scanRepoForIndex — not-a-file and unreadable', () => {
   it.skipIf(process.platform === 'win32')(
     'refuses a committed FIFO as not-a-file and keeps scanning the rest',

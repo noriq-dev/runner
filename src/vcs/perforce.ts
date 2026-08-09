@@ -11,6 +11,7 @@ import {
 } from './perforce-index-source';
 import type {
   ChangesBetweenResult,
+  IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,
@@ -895,6 +896,49 @@ export class PerforceBackend implements VcsBackend {
     }
 
     return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * `p4 ignores -i` (RUN-256) — measured against the rig to be a PURELY LOCAL, pattern-only check:
+   * it still answers correctly with `P4PORT` unset entirely (measured), because it walks up from
+   * each given path looking for `.p4ignore` files (P4IGNORE's default name, honored even with the
+   * env var itself unset — also measured) and never touches a server or a depot. That is a
+   * *stronger* answer than `leaseIndexSnapshot`'s own doc worries about for P4IGNORE (a
+   * client-side concept the depot-read snapshot path has no client to evaluate against): this
+   * method is never called from that path — only the DEBUG WALK calls it, over a live local
+   * directory `p4 ignores` can read directly, client or no client.
+   *
+   * Batched (measured to accept many path arguments in one call and answer for all of them, no
+   * `--stdin`/`-x -` support found — `p4 -x - ignores -i` measured to refuse with "At least one
+   * file path must provided", so paths ride as ordinary arguments instead). p4's own exit code is
+   * NOT the signal here (measured: exit 0 whether zero, some, or all of the given paths are
+   * ignored — only a genuine usage error, e.g. a bad flag or an empty path list, exits nonzero) —
+   * the OUTPUT is the answer: one line per path that IS ignored, `<absolute-path> ignored`
+   * (measured, non-`-v` mode — a path this command does NOT consider ignored produces no line at
+   * all, so the ignored subset is read by presence, never by parsing a "not ignored" line).
+   * Every returned path comes back ABSOLUTIZED even when given relative (measured) —
+   * `path.relative` undoes that here so the returned set matches the repo-relative, `/`-spelled
+   * contract this seam promises everywhere else (`ChangesBetweenResult`'s doc states the same
+   * requirement one method over).
+   */
+  async queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
+    if (paths.length === 0) return { ok: true, ignored: new Set() };
+    try {
+      const { stdout } = await this.p4(['ignores', '-i', ...paths], repoRoot);
+      const ignored = new Set<string>();
+      for (const line of stdout.split('\n')) {
+        const m = line.match(/^(.*) ignored$/);
+        if (!m?.[1]) continue;
+        ignored.add(path.relative(repoRoot, m[1]).split(path.sep).join('/'));
+      }
+      return { ok: true, ignored };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `p4 ignores failed in ${repoRoot}: ${(err as Error).message}`,
+      };
+    }
   }
 
   /**

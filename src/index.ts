@@ -122,12 +122,14 @@ export {
 } from './index-debug';
 export {
   buildIndexRepoReport,
+  buildVcsIgnoredPredicate,
   checkIndexRepoDeterminism,
   resolveIndexRepoConfig,
   runIndexRepo,
   type IndexRepoConfigSource,
   type IndexRepoOptions,
   type IndexRepoRun,
+  type VcsIgnoreWalkDeps,
 } from './index-repo';
 export {
   MAX_INGEST_BATCH_BYTES,
@@ -566,6 +568,7 @@ export {
 } from './verify-reviewer';
 export type {
   ChangesBetweenResult,
+  IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
   IntegrateResult,

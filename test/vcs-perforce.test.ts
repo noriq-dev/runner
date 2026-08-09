@@ -685,6 +685,58 @@ describe('PerforceBackend — changesBetween (RUN-254): p4 diff2 -q, measured', 
   });
 });
 
+// RUN-256: `p4 ignores -i`, measured against a real p4d rig — see perforce.ts's own doc for what
+// was found (purely local, no client/server needed; exit 0 regardless of match; output echoes
+// ABSOLUTIZED paths suffixed ` ignored`, one line per match, nothing for a non-match).
+describe('PerforceBackend — queryIgnored (RUN-256): p4 ignores -i, measured shape', () => {
+  it('a mix of ignored and not-ignored paths: absolutized output relativized back, suffix stripped', async () => {
+    const p4: P4Cli = async (args, cwd) => {
+      expect(args[0]).toBe('ignores');
+      expect(args[1]).toBe('-i');
+      expect(args.slice(2)).toEqual(['node_modules', 'src/add.ts', 'debug.log']);
+      expect(cwd).toBe('/ws1');
+      return {
+        stdout: `${cwd}/node_modules ignored\n${cwd}/debug.log ignored\n`,
+        stderr: '',
+      };
+    };
+    const res = await new PerforceBackend({ p4 }).queryIgnored('/ws1', [
+      'node_modules',
+      'src/add.ts',
+      'debug.log',
+    ]);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules', 'debug.log']) });
+  });
+
+  it('nothing ignored: real answer, empty set (p4 exits 0 either way — never inferred from exit code)', async () => {
+    const p4: P4Cli = async () => ({ stdout: '', stderr: '' });
+    const res = await new PerforceBackend({ p4 }).queryIgnored('/ws1', ['src/add.ts']);
+    expect(res).toEqual({ ok: true, ignored: new Set() });
+  });
+
+  it('an empty path list never shells out at all', async () => {
+    const p4: P4Cli = async () => {
+      throw new Error('p4 must never be invoked for an empty path list');
+    };
+    expect(await new PerforceBackend({ p4 }).queryIgnored('/ws1', [])).toEqual({
+      ok: true,
+      ignored: new Set(),
+    });
+  });
+
+  it('a real p4 failure answers unknown, never throws (RUN-256 locked decision 3)', async () => {
+    const p4: P4Cli = async () => {
+      throw new Error('Connect to server failed; check $P4PORT.');
+    };
+    const res = await new PerforceBackend({ p4 }).queryIgnored('/ws1', ['a.ts']);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('unknown');
+      expect(res.detail).toContain('Connect to server failed');
+    }
+  });
+});
+
 describe('PerforceDepotIndexSource (RUN-254): list/read/digest against the rig fixture', () => {
   const src = (over: { fstat?: string; p4Raw?: P4RawCli } = {}) => {
     const p4: P4Cli = async (args) => {

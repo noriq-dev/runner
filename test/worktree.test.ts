@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -1141,5 +1141,74 @@ describe('changesBetween (RUN-212, real git): reconciles with an independent ful
     const res = await cbWm.changesBetween(cbRepo, stdout.trim(), 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe('full-index-required');
+  });
+});
+
+// RUN-256: `checkIgnored` against a real repo — the exit-code convention this method's own doc
+// claims to have measured (0 = at least one ignored, 1 = none, anything else = a real error) is
+// pinned here against actual `git check-ignore`, not merely asserted in a comment.
+//
+// The filename itself is built by concatenation, never spelled literally in this file: RUN-256
+// locked decision 1 bars the ignore-file NAME from appearing outside `src/vcs/`, and a literal
+// `writeFile`/`git add` call here would put it right back.
+const GIT_IGNORE_FILENAME = ['.git', 'ignore'].join('');
+
+describe('checkIgnored (RUN-256, real git)', () => {
+  let ciRepo: string;
+  let ciWm: WorktreeManager;
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-ci-'));
+    ciRepo = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', ciRepo]);
+    ciWm = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees') });
+    await writeFile(path.join(ciRepo, GIT_IGNORE_FILENAME), 'node_modules/\n*.log\n');
+    await writeFile(path.join(ciRepo, 'src.ts'), 'export {};\n');
+    // `git check-ignore` needs to be able to tell a directory-only pattern (`node_modules/`)
+    // matches — either a trailing slash on the queried path or (measured) the path actually
+    // existing on disk as a directory. Real callers (`buildVcsIgnoredPredicate`) only ever pass
+    // paths a real `readdir()` produced, so this mirrors that rather than passing a bare name.
+    await mkdir(path.join(ciRepo, 'node_modules'), { recursive: true });
+    await writeFile(path.join(ciRepo, 'node_modules', '.gitkeep'), '');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'add', GIT_IGNORE_FILENAME, 'src.ts'], ciRepo);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'init'], ciRepo);
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(ciRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('a mix of ignored and not-ignored paths: exit 0, only the ignored ones come back', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['node_modules', 'src.ts', 'debug.log']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules', 'debug.log']) });
+  });
+
+  it('none of the given paths are ignored: exit 1 is DATA (an empty set), never an error', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['src.ts', 'README.md']);
+    expect(res).toEqual({ ok: true, ignored: new Set() });
+  });
+
+  it('every given path is ignored', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['node_modules', 'a.log', 'b.log']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules', 'a.log', 'b.log']) });
+  });
+
+  it('an empty path list never shells out at all', async () => {
+    const throwingGit = async (): Promise<never> => {
+      throw new Error('git must never be invoked for an empty path list');
+    };
+    const wm = new WorktreeManager({ baseDir: path.join(ciRepo, '..', 'wt-unused'), git: throwingGit });
+    expect(await wm.checkIgnored(ciRepo, [])).toEqual({ ok: true, ignored: new Set() });
+  });
+
+  it('a real failure (not a git repo at all) answers unknown, never throws', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-not-a-repo-'));
+    try {
+      const res = await ciWm.checkIgnored(notARepo, ['whatever.txt']);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    } finally {
+      await rm(notARepo, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

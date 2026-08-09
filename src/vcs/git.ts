@@ -4,6 +4,7 @@ import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
 import type {
   ChangesBetweenResult,
+  IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
   LeaseOptions,
@@ -39,6 +40,7 @@ export type GitOps = Pick<
   | 'createIndexSnapshot'
   | 'removeIndexSnapshot'
   | 'changesBetween'
+  | 'checkIgnored'
 >;
 
 /**
@@ -114,6 +116,7 @@ function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLoca
  *   leaseIndexSnapshot → createIndexSnapshot · releaseIndexSnapshot → removeIndexSnapshot
  *   changesBetween → changesBetween (RUN-212, same name both sides — no wrapping needed, the
  *     result shape is `ChangesBetweenResult` on both ends of the delegation)
+ *   queryIgnored → checkIgnored (RUN-256, same reasoning: `IgnoreQueryResult` on both ends)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
@@ -277,6 +280,14 @@ export class GitBackend implements VcsBackend {
    *  `from`/`to` — they are opaque commit ids, and git is the one place allowed to know that. */
   changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
     return this.git.changesBetween(repoRoot, from, to);
+  }
+
+  /** Pure pass-through (RUN-256), `changesBetween`'s exact posture one verb over:
+   *  `WorktreeManager.checkIgnored` already speaks `IgnoreQueryResult` and git is the one place
+   *  allowed to know `.gitignore` exists at all — see `worktree.ts`'s own doc for the measured
+   *  exit-code convention this wraps. */
+  queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
+    return this.git.checkIgnored(repoRoot, paths);
   }
 
   /**

@@ -114,7 +114,14 @@ export type IndexStatusReason =
   | 'outside-root'
   | 'not-a-file'
   | 'budget-exhausted'
-  | 'deadline-exceeded';
+  | 'deadline-exceeded'
+  /** Dropped by a VCS's OWN ignore rules (RUN-256), never `excluded` — a repo's `[index].exclude`
+   *  is something an operator wrote for this indexer specifically; this is a fact the repo's own
+   *  source control already asserted (a gitignore-style rule and kin) that `index-repo.ts`'s debug walk
+   *  additionally consults so its listing matches what the daemon would ever see tracked. Distinct
+   *  on purpose: a caller reading the breakdown should be able to tell "I excluded this" from
+   *  "your own VCS already ignores this" without re-deriving it from `detail` text. */
+  | 'vcs-ignored';
 
 export interface IndexStatusRecord {
   /** Repository-relative, POSIX-separated — the same spelling `index-deny.ts` matches against. */
@@ -187,6 +194,18 @@ const BINARY_SNIFF_BYTES = 8_000;
 export interface IndexScanDeps {
   /** Injected so a deadline test never has to actually sleep. Defaults to the real clock. */
   now?: () => number;
+  /**
+   * An extra prune/skip signal from OUTSIDE this module's own policy (RUN-256) — additive to,
+   * never a replacement for, the hard deny list or `[index].exclude`. Applied to a directory
+   * (folded into `ShouldDescend`'s own prune — an ignored directory is never `readdir`'d, exactly
+   * `denied`'s existing shape) AND to an individual file (checked in the per-file pipeline, right
+   * after `denied`, before any bound). This module has no idea WHY a path answers `true` here —
+   * the same "opaque yes/no" contract `ShouldDescend` itself already carries — so it never imports
+   * an ignore-file name or a VCS type: `index-repo.ts` is the one caller that builds one today,
+   * from a `VcsBackend`'s own ignore rules, and a second caller plugs in the exact same way
+   * without this module changing.
+   */
+  vcsIgnored?: (relPath: string) => boolean;
 }
 
 interface ScanState {
@@ -203,6 +222,11 @@ interface ScanState {
   /** Ancestor directory prefixes already reported as `denied` — see the module doc's "hard deny
    *  list is directory-aware" note. Keyed on the exact prefix string `classifyDenial` computed. */
   deniedPrefixes: Set<string>;
+  /** Same dedup shape as `deniedPrefixes`, kept SEPARATE (RUN-256): a prefix already recorded
+   *  `vcs-ignored` must never be mistaken for a `denied` one by `classifyDenial`'s own suppression
+   *  logic, which reads `deniedPrefixes` specifically. */
+  vcsIgnoredPrefixes: Set<string>;
+  vcsIgnored?: (relPath: string) => boolean;
 }
 
 function pushStatus(state: ScanState, relPath: string, reason: IndexStatusReason, detail?: string): void {
@@ -339,12 +363,22 @@ function classifyDenial(relPath: string, seen: Set<string>): DenyOutcome {
  */
 function makeShouldDescend(state: ScanState): ShouldDescend {
   return (relDirPath: string): boolean => {
-    if (state.deniedPrefixes.has(relDirPath)) return false;
+    if (state.deniedPrefixes.has(relDirPath) || state.vcsIgnoredPrefixes.has(relDirPath)) return false;
     const reason = isDeniedIndexPath(relDirPath);
-    if (reason === null) return true;
-    state.deniedPrefixes.add(relDirPath);
-    pushStatus(state, relDirPath, 'denied', reason);
-    return false;
+    if (reason !== null) {
+      state.deniedPrefixes.add(relDirPath);
+      pushStatus(state, relDirPath, 'denied', reason);
+      return false;
+    }
+    // Checked AFTER the hard deny list, never before: `denied` is the non-overridable security
+    // floor (module doc, locked decision 1) and this is an additive, caller-supplied layer — if a
+    // path is both, `denied` is what gets recorded (RUN-256).
+    if (state.vcsIgnored?.(relDirPath)) {
+      state.vcsIgnoredPrefixes.add(relDirPath);
+      pushStatus(state, relDirPath, 'vcs-ignored');
+      return false;
+    }
+    return true;
   };
 }
 
@@ -457,6 +491,16 @@ async function evaluateEntry(
     return;
   }
 
+  // Additive, caller-supplied skip signal (RUN-256) — checked after `denied` for the same
+  // precedence reason `makeShouldDescend` gives above. A file under an already-pruned `denied` OR
+  // `vcs-ignored` DIRECTORY never reaches here at all (the source never yielded it); this is for a
+  // file whose PARENT directory survived but the file itself did not (a leaf gitignore-style
+  // pattern with no directory-level match).
+  if (state.vcsIgnored?.(relPath)) {
+    pushStatus(state, relPath, 'vcs-ignored');
+    return;
+  }
+
   // Aggregate bounds — read from this scan's OWN counters, never a source call. Once either
   // trips, the WHOLE scan stops: continuing would just re-derive the same exhausted-budget answer
   // for every remaining entry at real read cost.
@@ -554,6 +598,8 @@ export async function scanIndexSource(
     includeRe: config.include.map(globToRegExp),
     excludeRe: config.exclude.map(globToRegExp),
     deniedPrefixes: new Set(),
+    vcsIgnoredPrefixes: new Set(),
+    vcsIgnored: deps.vcsIgnored,
   };
 
   await runPipeline(source, config, state);
