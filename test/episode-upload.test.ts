@@ -1,3 +1,4 @@
+import { gunzipSync } from 'node:zlib';
 import type { EffortEpisode as EffortEpisodeType } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { NoriqClient } from '../src/client';
@@ -13,6 +14,7 @@ import {
   type UploadEpisodeInput,
   deliverEpisode,
   drainPendingEpisodes,
+  toEnrichmentPayload,
   uploadEpisode,
 } from '../src/episode-upload';
 
@@ -62,14 +64,14 @@ function router(handlers: {
   batch?: (n: number) => Response;
   complete?: () => Response;
 }) {
-  const calls: { url: string; method: string }[] = [];
+  const calls: { url: string; method: string; body?: RequestInit['body'] }[] = [];
   const mintFetch = (async (url: string | URL, init?: RequestInit) => {
-    calls.push({ url: String(url), method: init?.method ?? 'GET' });
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body });
     return (handlers.mint ?? (() => new Response(JSON.stringify(GRANT), { status: 200 })))();
   }) as typeof fetch;
   const ingestFetch = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
-    calls.push({ url: u, method: init?.method ?? 'GET' });
+    calls.push({ url: u, method: init?.method ?? 'GET', body: init?.body });
     if (u.endsWith('/begin')) return (handlers.begin ?? (() => new Response('{}', { status: 200 })))();
     if (u.endsWith('/complete')) {
       return (
@@ -91,6 +93,17 @@ function router(handlers: {
     return new Response('{}', { status: 200 });
   }) as typeof fetch;
   return { mintFetch, ingestFetch, calls };
+}
+
+/** Decode the gzipped JSON body PUT to `/batch/0` — the exact bytes `ingest-client.ts`'s
+ *  `putBatch` sends verbatim (locked decision 3: never re-serialized past this point), so
+ *  decoding it back is the only way to assert what actually crossed the wire rather than what a
+ *  unit test on `toEnrichmentPayload` alone would merely imply. */
+function decodeBatchBody(calls: { url: string; method: string; body?: RequestInit['body'] }[]): unknown {
+  const call = calls.find((c) => c.url.endsWith('/batch/0'));
+  if (!call?.body) throw new Error('no /batch/0 call captured');
+  const bytes = call.body as Uint8Array;
+  return JSON.parse(gunzipSync(Buffer.from(bytes)).toString('utf8'));
 }
 
 function makeDeps(
@@ -126,6 +139,61 @@ describe('uploadEpisode (RUN-227)', () => {
     expect(calls.some((c) => c.url.endsWith('/begin'))).toBe(true);
     expect(calls.some((c) => c.url.endsWith('/batch/0'))).toBe(true);
     expect(calls.some((c) => c.url.endsWith('/complete'))).toBe(true);
+  });
+
+  it('RUN-264: the actual wire body sent to /batch/0 is the narrowed enrichment payload, not the full local record', async () => {
+    const { mintFetch, ingestFetch, calls } = router({});
+    const deps = makeDeps({}, { mintFetch, ingestFetch });
+    const ep = episode({
+      taskId: 'task_1', // server-owned — must not ship
+      timeline: [{ at: '2026-08-08T00:00:00.000Z', label: 'queued' }], // server-owned — must not ship
+      costUSD: 12.5, // server-owned — must not ship
+      filesTouched: ['src/a.ts'],
+      commands: ['npm run check — passed'],
+      testsRun: ['npm run check — passed'],
+      failures: ['terminal reason: budget exceeded'],
+      findings: [{ summary: '[resolved] a finding', severity: 'low' }],
+      selfSummary: {
+        approachSummary: 'did the thing',
+        rejectedHypotheses: [],
+        durableLearnings: [],
+        unresolvedQuestions: [],
+      },
+    });
+    const input: UploadEpisodeInput = { scopeId: 'epi_scope_1', mint: MINT_INPUT, episode: ep };
+
+    await uploadEpisode(input, deps);
+
+    expect(decodeBatchBody(calls)).toEqual(toEnrichmentPayload(ep));
+    expect(decodeBatchBody(calls)).toEqual({
+      runId: 'run_1',
+      filesTouched: ['src/a.ts'],
+      commands: ['npm run check — passed'],
+      testsRun: ['npm run check — passed'],
+      failures: ['terminal reason: budget exceeded'],
+      findings: [{ summary: '[resolved] a finding', severity: 'low' }],
+      selfSummary: ep.selfSummary,
+    });
+    // Every server-owned key from the full local record is absent, not merely empty.
+    const body = decodeBatchBody(calls) as Record<string, unknown>;
+    for (const key of [
+      'id',
+      'projectId',
+      'taskId',
+      'repositoryKey',
+      'baseId',
+      'timeline',
+      'reviewRounds',
+      'tokenUsage',
+      'costUSD',
+      'acceptanceCoverage',
+      'steeringEvents',
+      'landingOutcome',
+      'remainingWork',
+      'createdAt',
+    ]) {
+      expect(Object.prototype.hasOwnProperty.call(body, key)).toBe(false);
+    }
   });
 
   it('the skipped-row trap: HTTP 200 with recorded:0 is a FAILURE to record, never a delivered episode', async () => {
@@ -345,5 +413,107 @@ describe('drainPendingEpisodes (RUN-227)', () => {
     expect(result).toEqual({ delivered: 1, remaining: 1 });
     const survivors = await pending.list();
     expect(survivors.map((e) => e.scopeId)).toEqual(['epi_b']);
+  });
+});
+
+describe('toEnrichmentPayload (RUN-264)', () => {
+  it('an episode with nothing observed projects to exactly {runId} — every enrichment field absent', () => {
+    const payload = toEnrichmentPayload(episode());
+
+    expect(payload).toEqual({ runId: 'run_1' });
+    expect(Object.keys(payload)).toEqual(['runId']);
+  });
+
+  it('the request body contains only the accepted keys — pinned by the exact key set, never a superset', () => {
+    const payload = toEnrichmentPayload(
+      episode({
+        filesTouched: ['a.ts'],
+        commands: ['cmd'],
+        testsRun: ['cmd'],
+        failures: ['f'],
+        findings: [{ summary: 's', severity: 'low' }],
+        selfSummary: {
+          approachSummary: 'x',
+          rejectedHypotheses: [],
+          durableLearnings: [],
+          unresolvedQuestions: [],
+        },
+      }),
+    );
+
+    expect(new Set(Object.keys(payload))).toEqual(
+      new Set(['runId', 'filesTouched', 'commands', 'testsRun', 'failures', 'findings', 'selfSummary']),
+    );
+  });
+
+  // One test per enrichment field (RUN-264 acceptance): an unobserved field is ABSENT from the
+  // payload, never sent as `[]` — the inversion this task exists for. `writeMode: 'enrichment'`
+  // merges as `provided ?? existing`, so an empty array would REPLACE whatever the server already
+  // has; omitting the key PRESERVES it instead.
+  it('filesTouched: empty (ambiguous — "touched nothing" vs "backend could not say") is OMITTED, not []', () => {
+    const payload = toEnrichmentPayload(episode({ filesTouched: [] }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'filesTouched')).toBe(false);
+  });
+
+  it('commands: empty (no command execution was observed) is OMITTED, not []', () => {
+    const payload = toEnrichmentPayload(episode({ commands: [] }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'commands')).toBe(false);
+  });
+
+  it('testsRun: empty (same source as commands) is OMITTED, not []', () => {
+    const payload = toEnrichmentPayload(episode({ testsRun: [] }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'testsRun')).toBe(false);
+  });
+
+  it('failures: empty is OMITTED, not [] — an empty ledger cannot be told apart from "review never ran"', () => {
+    const payload = toEnrichmentPayload(episode({ failures: [] }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'failures')).toBe(false);
+  });
+
+  it('findings: empty is OMITTED, not [] — same ambiguity as failures', () => {
+    const payload = toEnrichmentPayload(episode({ findings: [] }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'findings')).toBe(false);
+  });
+
+  it('selfSummary: null is OMITTED, not sent as an explicit null', () => {
+    const payload = toEnrichmentPayload(episode({ selfSummary: null }));
+    expect(Object.prototype.hasOwnProperty.call(payload, 'selfSummary')).toBe(false);
+  });
+
+  // A field the daemon DID observe is present, even when its observed value happens to be the
+  // single non-empty entry — proving the omission is conditional on emptiness, not a blanket drop.
+  it('a field with a real, non-empty observation is present and carries its exact value', () => {
+    const payload = toEnrichmentPayload(
+      episode({
+        filesTouched: ['src/a.ts'],
+        commands: ['npm run check — passed'],
+        testsRun: ['npm run check — passed'],
+        failures: ['terminal reason: budget exceeded'],
+        findings: [{ summary: '[resolved] x', severity: 'high' }],
+        selfSummary: {
+          approachSummary: 'y',
+          rejectedHypotheses: [],
+          durableLearnings: [],
+          unresolvedQuestions: [],
+        },
+      }),
+    );
+
+    expect(payload.filesTouched).toEqual(['src/a.ts']);
+    expect(payload.commands).toEqual(['npm run check — passed']);
+    expect(payload.testsRun).toEqual(['npm run check — passed']);
+    expect(payload.failures).toEqual(['terminal reason: budget exceeded']);
+    expect(payload.findings).toEqual([{ summary: '[resolved] x', severity: 'high' }]);
+    expect(payload.selfSummary).toEqual({
+      approachSummary: 'y',
+      rejectedHypotheses: [],
+      durableLearnings: [],
+      unresolvedQuestions: [],
+    });
+  });
+
+  it('runId always ships — the one field the enrichment shape requires, never optional', () => {
+    const payload = toEnrichmentPayload(episode({ runId: 'run_xyz' }));
+    expect(payload.runId).toBe('run_xyz');
   });
 });

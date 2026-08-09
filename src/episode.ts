@@ -27,11 +27,26 @@
  * The server builds its OWN skeleton from its `runs` row on every terminal transition and is
  * authoritative for run identity — `outcome`, `runKind`, `agentId`, `startedAt`, `finishedAt`, and
  * `sitting` are deliberately never assembled here; a daemon-forged copy of those fields is exactly
- * the trust boundary the split exists to hold (planar `apps/api/src/memory/episodes.ts`). Everything
- * ELSE `EffortEpisode` carries is assembled COMPLETE: `ProjectMemory.recordEpisode` is last-writer-
- * wins per field (except `selfSummary`/`id`/`createdAt`), so a default left in place here would
- * ERASE what the server already knew rather than leaving it alone — completeness is the property
- * this module is judged on, not the absence of wrong values.
+ * the trust boundary the split exists to hold (planar `apps/api/src/memory/episodes.ts`).
+ *
+ * Everything else `EffortEpisode` carries is still assembled COMPLETE here — `buildEpisode` stays a
+ * pure, total function of `RunPipeline`, and the full record remains this daemon's own local log
+ * (see `timelineOf`'s own doc on why `timeline`/`agentStartedAt` are worth keeping even though they
+ * never ship). What changed under PLNR-340 (planar `1af483d`, RUN-264) is what SHIPS, not what is
+ * assembled: a daemon upload is now a PARTIAL enrichment —
+ * `UPLOADED_EPISODE_SHAPE = EffortEpisode.pick({ runId, filesTouched, commands, testsRun, failures,
+ * findings, selfSummary }).partial().extend({ runId })` (`apps/api/src/do/ProjectMemory.ts`) — and
+ * every OTHER key, including `timeline`/`reviewRounds`/`tokenUsage`/`costUSD`/`acceptanceCoverage`/
+ * `steeringEvents`/`landingOutcome`/`remainingWork`/`taskId`/`repositoryKey`/`baseId`, is STRIPPED
+ * server-side. RUN-224's original rule — "a field left at its default ERASES what the server
+ * already knew, so completeness is what this module is judged on" — is now FALSE for every stripped
+ * field: none of them reach the server at all, so no value assembled here, default or otherwise,
+ * can erase anything server-side. For the six fields still accepted, the rule is the INVERSE:
+ * under `writeMode: 'enrichment'` the server merges as `provided ?? existing`, so OMITTING one of
+ * them PRESERVES what is already stored while sending `[]` REPLACES it with empty — an empty array
+ * is a positive assertion, not "nothing to report". That narrowing and omission happens at the
+ * upload boundary (`src/episode-upload.ts`'s `toEnrichmentPayload`), never here: this module stays
+ * the complete assembler and knows nothing about which subset crosses the wire.
  */
 
 import { createHash, randomUUID } from 'node:crypto';

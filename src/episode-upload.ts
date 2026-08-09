@@ -45,10 +45,85 @@ export interface UploadEpisodeInput {
   /** `MintIngestCapabilityInput` minus `purpose`/`scopeId` — this module supplies both itself,
    *  mirroring `UploadGenerationInput.mint`'s own doc. */
   mint: Omit<MintIngestCapabilityInput, 'purpose' | 'scopeId'>;
-  /** The exact, already-assembled payload — never rebuilt here. Locked decision 8: a retry sends
-   *  this SAME object, timestamps and all, so a later attempt cannot re-stamp what `settle` already
-   *  recorded. */
+  /** The exact, already-assembled LOCAL record — never rebuilt here. Locked decision 8: a retry
+   *  sends the SAME object, timestamps and all, so a later attempt cannot re-stamp what `settle`
+   *  already recorded. This is the full `EffortEpisode` (RUN-224's complete local log, see
+   *  `episode.ts`'s module doc); only `toEnrichmentPayload` below — applied fresh on every send,
+   *  including every retry — decides what actually leaves the box, so the retry-determinism
+   *  property holds at the wire subset too: the same object always projects to the same payload. */
   episode: EffortEpisodeType;
+}
+
+/**
+ * The subset of an assembled `EffortEpisode` PLNR-340's server contract accepts (RUN-264) —
+ * `UPLOADED_EPISODE_SHAPE` in planar `apps/api/src/do/ProjectMemory.ts` (commit `1af483d`) picks
+ * exactly these six keys, all optional but `runId`, and STRIPS every other one: `id`/`projectId`/
+ * `createdAt` because the server mints/owns them, and everything else (`timeline`, `reviewRounds`,
+ * `tokenUsage`, `costUSD`, `acceptanceCoverage`, `steeringEvents`, `landingOutcome`,
+ * `remainingWork`, `taskId`, `repositoryKey`, `baseId`) because D1 owns identity, lifecycle, cost,
+ * and review evidence and a daemon must not be able to forge them.
+ */
+export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
+  Partial<
+    Pick<
+      EffortEpisodeType,
+      'filesTouched' | 'commands' | 'testsRun' | 'failures' | 'findings' | 'selfSummary'
+    >
+  >;
+
+/**
+ * Project the full local record down to exactly what the wire contract accepts, and OMIT whatever
+ * this sitting did not actually observe (RUN-264 locked decision 2) rather than empty-filling it.
+ * `writeMode: 'enrichment'` merges as `provided ?? existing`: omitting a key PRESERVES what the
+ * server already has, while shipping `[]` REPLACES it with empty — the exact inverse of RUN-224's
+ * old "a default erases" rule, which this projection retires. Narrowed to exactly the accepted
+ * keys rather than forwarded whole (RUN-264 discretion 3): the server strips the rest either way,
+ * so keeping them buys nothing, and shipping server-owned fields like `costUSD`/`reviewRounds`
+ * alongside the real ones reads as "this is being reported" when it is inert — precisely the
+ * "looks like a feature, does nothing" defect this task exists to fix.
+ *
+ * Per field, whether an empty array is safe to send as a genuine "observed: nothing" fact rather
+ * than an unproven guess:
+ *
+ *   - `commands`/`testsRun` (same source, `ctx.commandObservations` — see `buildEpisode`'s own
+ *     comment): empty ALWAYS means no command execution was observed. There is no such thing as
+ *     "observing the running of zero commands" — a command either ran and was watched exit, or
+ *     nothing happened — so omitting here is not a guess made under uncertainty, it is the only
+ *     honest reading of an empty array.
+ *   - `filesTouched` (`VcsBackend.changedPaths`): `EpisodeExtra.filesTouched`'s own doc in
+ *     `episode.ts` states empty is genuinely AMBIGUOUS — "touched nothing" and "the backend
+ *     couldn't say" produce the identical `[]`, and the module that assembles it says so itself.
+ *     Given a documented inability to tell those apart, this picks the side that can never
+ *     destroy real stored data: omit.
+ *   - `failures`/`findings` (`ctx.exit.reason`/`ctx.ledger`): a clean sitting CAN legitimately
+ *     produce zero of either, but `ctx.ledger` also starts at `[]` on a fresh run and is only
+ *     overwritten if the `review` stage actually ran (`stages/review.ts`'s `ctx.ledger =
+ *     review.ledger`) — so an empty ledger cannot be told apart from "review never reached this
+ *     sitting" any more reliably than `filesTouched` can. Rather than draw a line between two
+ *     array fields on a guarantee this module cannot actually prove, the same omission rule
+ *     applies to all five: the cost is never worse than a missed "confirmed zero", and it closes
+ *     off the exact data-loss path PLNR-340 exists to guard should this module ever be asked to
+ *     enrich one sitting twice.
+ *
+ * `selfSummary` gets the same omit-when-empty treatment, for a related but distinct reason: `null`
+ * (what `extra.selfSummary` already means by "nothing to report", see `buildEpisode`) and an
+ * omitted key produce IDENTICAL server behaviour. `recordEpisode` resolves
+ * `providedSelfSummary ?? existingBody.selfSummary ?? null`, and an explicit wire `null` parses to
+ * the same `providedSelfSummary === null` an absent key does — so sending `selfSummary: null`
+ * explicitly would ALSO have been safe (checked against the planar diff, not assumed): neither
+ * form can erase a prior sitting's summary. Omitted here anyway so every enrichment field follows
+ * one rule, rather than a selfSummary-shaped exception a future reader has to re-derive from the
+ * server source to trust.
+ */
+export function toEnrichmentPayload(episode: EffortEpisodeType): EpisodeEnrichmentPayload {
+  const payload: EpisodeEnrichmentPayload = { runId: episode.runId };
+  if (episode.filesTouched.length > 0) payload.filesTouched = episode.filesTouched;
+  if (episode.commands.length > 0) payload.commands = episode.commands;
+  if (episode.testsRun.length > 0) payload.testsRun = episode.testsRun;
+  if (episode.failures.length > 0) payload.failures = episode.failures;
+  if (episode.findings.length > 0) payload.findings = episode.findings;
+  if (episode.selfSummary) payload.selfSummary = episode.selfSummary;
+  return payload;
 }
 
 export interface UploadEpisodeDeps {
@@ -119,7 +194,7 @@ export async function uploadEpisode(
       }
       throw err;
     }
-    const bytes = compressBatch(JSON.stringify(input.episode));
+    const bytes = compressBatch(JSON.stringify(toEnrichmentPayload(input.episode)));
     await withRetry(() => upload.putBatch(0, bytes), retry);
     ensureNotCancelled(signal);
     const completed = (await withRetry(() => upload.complete(), retry)) as IngestCompleteEpisodeResult;
