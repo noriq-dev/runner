@@ -20,6 +20,7 @@ import type {
 import { zeroTelemetry } from '../src/drivers/types';
 import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
+import { renderPrompt } from '../src/prompts';
 import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
 import { LOCK_RELEASE_TIMEOUT_MS } from '../src/stages/settle';
@@ -48,8 +49,17 @@ class FakeDriver implements AgentDriver {
   sessionId: string | null = 'sess-fake';
   /** Every start(), in order. A resumed run must reuse the session, not open a fresh one. */
   starts: DriverStartOptions[] = [];
-  /** Turns handed back by the supervisor (RUN-29's verify feedback loop). */
+  /** Turns handed back by the supervisor (RUN-29's verify feedback loop) — fix rounds, reviewer
+   *  feedback, and contest turns ONLY. The settle-time self-summary request (RUN-226) also goes
+   *  through `continueWith`, but it is a distinct, unscripted turn (see `selfSummaries` below) that
+   *  must not silently consume a fix round's queued outcome/text/tokens or count toward a test's
+   *  "no fix turns ran" assertion — it always runs, whenever budget and `continueWith` allow it. */
   continuations: string[] = [];
+  /** Every settle-time self-summary request this driver received, verbatim (RUN-226) — kept apart
+   *  from `continuations` for the reason above. Scripted separately from the shift-based queues:
+   *  this never touches `continueOutcomes`/`continueTexts`/`continueTokens`, so a fix-round test
+   *  that never anticipated this call is unaffected by it. */
+  selfSummaries: string[] = [];
   /** Outcome of each continueWith, in order. Defaults to 'done' — the agent fixed it. */
   continueOutcomes: Array<'done' | 'failed'> = [];
   /** Text the agent "emits" during each continueWith, in order — models the real driver
@@ -108,6 +118,13 @@ class FakeDriver implements AgentDriver {
       // it sees exactly what a scope run sees — no loop.
       continueWith: opts.multiTurn
         ? async (text: string): Promise<DriverExit> => {
+            // The settle-time self-summary request (RUN-226) is not a fix round: it always fires
+            // (whenever budget/continueWith allow it), so it must not consume a fix round's scripted
+            // outcome/text/tokens or count toward `continuations` — see `selfSummaries`' own doc.
+            if (text === renderPrompt('self-summary')) {
+              this.selfSummaries.push(text);
+              return { outcome: 'done', isError: false, reason: null, telemetry: zeroTelemetry() };
+            }
             this.continuations.push(text);
             // Stream this fix turn's output the way the real driver does, so anything reading
             // the session text (the ledger's RESPONSE-block capture) sees it. Emit to THIS

@@ -23,6 +23,7 @@ import {
 } from '../acceptance';
 import { totalTokens } from '../drivers/budget';
 import { buildEpisode } from '../episode';
+import { requestSelfSummary } from '../episode-summary';
 import { clearSetupMarker } from '../setup';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
@@ -63,6 +64,28 @@ export async function withTimeout(p: Promise<unknown>, ms: number, onTimeout: ()
 
 export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
   const { run, repo, worktree, workflow: wf } = ctx;
+
+  // The optional agent self-summary (RUN-226) — requested FIRST, ahead of everything else in this
+  // stage, because `continueWith` is the only mechanism the acceptance permits (no out-of-band
+  // model call) and it is only reachable while the session below is still open. Asked without
+  // knowing the final outcome — the verify-actor gate a few lines down can still flip `done` to
+  // `failed` — so the prompt (`prompts/self-summary.md`) asks for an account of the agent's OWN
+  // WORK, never the verdict, and this cannot itself become one: nothing below reads its result for
+  // anything but `buildEpisode`'s `selfSummary`. Enrichment only — the try/catch mirrors
+  // `buildEpisode`'s own below, so a throw here costs the summary, never the run.
+  const selfSummary = await requestSelfSummary({
+    session: ctx.session,
+    ...(ctx.getSessionText ? { getSessionText: ctx.getSessionText } : {}),
+    tally: ctx.tally,
+    milestone: (text) => host.transcript(run.id).milestone(text),
+    warn: (message, details) => host.log.warn(message, { runId: run.id, ...details }),
+  }).catch((err) => {
+    host.log.warn('self-summary request failed — settling without one', {
+      runId: run.id,
+      err: String(err),
+    });
+    return null;
+  });
 
   // Every gate that could hand work back has now run, so the session has no more work to do. It
   // MUST be closed explicitly: a multiTurn run deliberately does not self-close on its first result
@@ -233,6 +256,7 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       // independent view. `steeringHistory` is optional on `StageHost`; a host with none wired
       // (a test, steering off machine-wide) reads the same as a bridge that observed nothing.
       steeringHistory: host.steeringHistory?.(run.id) ?? [],
+      selfSummary,
     });
     host.recordEpisode?.(episode);
   } catch (err) {

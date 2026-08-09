@@ -550,6 +550,12 @@ export {
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
 export { buildEpisode, normalizeSeverity, type EpisodeExtra } from './episode';
 export {
+  requestSelfSummary,
+  SELF_SUMMARY_TIMEOUT_MS,
+  SELF_SUMMARY_OUTPUT_CAP,
+  type SelfSummaryContext,
+} from './episode-summary';
+export {
   checkSteps,
   planWaves,
   renderSteps,

@@ -7,7 +7,11 @@
  * workspace's fate. This module is the pure half of that: one function from a settled
  * `RunPipeline` (plus the handful of facts only `settle` itself can answer — see `EpisodeExtra`) to
  * one `EffortEpisode` payload. Assembly only: no upload, no transport, no capability mint (RUN-227,
- * blocked on PLNR-340), no self-summary (RUN-226). RUN-225 closed the instrumentation gap this
+ * blocked on PLNR-340). `selfSummary` (RUN-226) is the one field this module does not derive from
+ * `ctx` at all — requesting, bounding and validating it means talking to a live session, which is
+ * exactly what this module's purity rules out, so `episode-summary.ts`'s `requestSelfSummary` does
+ * that work and hands the settled value (or null) in through `extra`, same as everything else this
+ * module cannot compute itself. RUN-225 closed the instrumentation gap this
  * comment used to name here — `commands`/`testsRun`/`steeringEvents` now source from daemon
  * OBSERVATIONS (`RunPipeline.commandObservations`, `EpisodeExtra.steeringHistory`), never from
  * configuration or agent prose, and `reviewRounds`/`acceptanceCoverage` read the reviewer's own
@@ -31,6 +35,7 @@ import type {
   EffortEpisode as EffortEpisodeType,
   EpisodeFinding,
   EpisodeLandingOutcome,
+  EpisodeSelfSummary,
   EpisodeTimelineEntry,
 } from '@noriq-dev/shared';
 import { EffortEpisode } from '@noriq-dev/shared';
@@ -89,6 +94,14 @@ export interface EpisodeExtra {
    * — indistinguishable from a wired bridge that saw nothing, both being "nothing observed".
    */
   steeringHistory: DeliveredSteer[];
+  /**
+   * The validated agent self-summary (RUN-226), or null when nothing was requested, budget ran out,
+   * the turn timed out, or the reply failed strict validation — `episode-summary.ts`'s
+   * `requestSelfSummary` collapses every one of those to the same null so this module never has to
+   * tell them apart. Optional on the interface (a fixture, or a future caller with nothing to ask)
+   * and reads as null when absent, exactly as "nothing to report" already means elsewhere here.
+   */
+  selfSummary?: EpisodeSelfSummary | null;
 }
 
 /**
@@ -330,9 +343,12 @@ export function buildEpisode(ctx: RunPipeline, extra: EpisodeExtra): EffortEpiso
     steeringEvents: extra.steeringHistory.map(describeSteeringEvent),
     landingOutcome: landingOutcomeOf(ctx, extra.hasRemainingWork),
     remainingWork: remainingWorkOf(ctx, extra.hasRemainingWork, passed, acceptance, acceptanceSource),
-    // RUN-226 owns the agent's own summary; null is the one default `recordEpisode` does NOT
-    // overwrite (locked decision), so leaving it null here cannot destroy a later self-summary.
-    selfSummary: null,
+    // `extra.selfSummary` (RUN-226), already requested/bounded/validated by the caller — this
+    // module stays pure and never talks to the session itself. Null is the one default
+    // `recordEpisode` does NOT overwrite (locked decision), so a sitting that could not get one —
+    // no live session, no budget, a timeout, a malformed reply — leaves null here and cannot
+    // destroy a self-summary a PRIOR sitting already stored.
+    selfSummary: extra.selfSummary ?? null,
     createdAt: new Date().toISOString(),
   };
   // Validated, not merely typed: a schema mismatch (a malformed path, an out-of-range number) fails

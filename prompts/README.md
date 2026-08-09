@@ -21,6 +21,7 @@ call site — these files are the literal text an agent reads, so they cannot ca
 | `verify-feedback.md` | `verify.ts` `verifyFeedbackPrompt` | the builder, after the verify cmd failed |
 | `conflict.md` | `land.ts` `assembleConflictPrompt` | the builder, mid-rebase conflict |
 | `resume.md` | `parked.ts` `resumePrompt` / `continuationResumePrompt` | a parked agent being resumed — session restore (RUN-30) or continuation (RUN-199) |
+| `self-summary.md` | `episode-summary.ts` `requestSelfSummary` | the live session, once, at the top of `settle` — the optional agent self-summary (RUN-226) |
 
 ## Syntax
 
