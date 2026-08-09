@@ -555,3 +555,121 @@ describe('getIndexCursor (RUN-213)', () => {
     expect(cursor).toBeNull();
   });
 });
+
+describe('getContextPack (RUN-228)', () => {
+  const VALID_PACK = {
+    taskId: 'task_1',
+    projectId: 'prj_1',
+    generatedAt: '2026-08-09T00:00:00.000Z',
+    charBudget: 4000,
+    charsUsed: 100,
+    taskFacts: {
+      taskId: 'task_1',
+      key: 'RUN-1',
+      title: 't',
+      body: null,
+      status: 'todo',
+      priority: 2,
+      claimedBy: null,
+      claimExpiresAt: null,
+      openComments: [],
+      executionSpec: null,
+      executionSpecUnreadable: false,
+    },
+    sections: [],
+  };
+
+  // Same shape as `getIndexCursor`'s own precedent above (locked decision this task cites): ONE
+  // parser, every failure collapsing to `null` rather than three call sites the caller has to
+  // keep in sync with a server that can fail in new ways this daemon has never seen.
+
+  it('POSTs the identity fields to the runner-memory route and parses a valid pack', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_PACK, captured),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+      baseId: 'sha123',
+      branch: 'main',
+      role: 'build',
+    });
+    // `toMatchObject`, not `toEqual`: the schema fills in defaults (role, mode, the various
+    // empty-array fields) that a minimal wire payload never sends — the point of this assertion
+    // is that the fields VALID_PACK DOES carry survived the parse, not that no default fired.
+    expect(pack).toMatchObject(VALID_PACK);
+    expect(captured[0]).toMatchObject({
+      url: 'https://a.b/api/runner-memory/context',
+      method: 'POST',
+      body: {
+        projectId: 'prj_1',
+        runnerId: 'rnr_1',
+        taskId: 'task_1',
+        repositoryKey: 'my-repo',
+        baseId: 'sha123',
+        branch: 'main',
+        role: 'build',
+      },
+    });
+  });
+
+  it('a route absent on an old server (404) is a null pack, never a thrown error', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'not found' }, []),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('a body that does not parse as ContextPack is a null pack, not a hand-read partial', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      // missing every required field
+      fetchImpl: fakeFetch(200, { ok: true }, []),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('a network error is a null pack', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: (async () => {
+        throw new Error('ECONNREFUSED');
+      }) as typeof fetch,
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('optional fields absent from the caller are absent from the wire body, never sent as null', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_PACK, captured),
+    });
+    await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+    expect(captured[0]?.body).toEqual({ projectId: 'prj_1', runnerId: 'rnr_1', taskId: 'task_1' });
+  });
+});

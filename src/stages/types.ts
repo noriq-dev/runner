@@ -22,6 +22,7 @@ import type {
 } from '@noriq-dev/shared';
 import type { AcceptanceItem, AcceptanceReport } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
+import type { ContextPackRetrieval } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverExit, DriverSession, NoriqMcp } from '../drivers/types';
 import type { LandOutcome } from '../land';
@@ -205,6 +206,16 @@ export interface RunPipeline {
   /** The requirement ids this work is traceable to (RUN-147) — what a finding may name, and what
    *  the run reports against when it ends. Empty when the spec names none. */
   readonly requirements: string[];
+  /**
+   * RUN-228's retrieved task context pack, carried forward from `prepare` UNCHANGED — the seam
+   * RUN-229 (worktree citation verification) and RUN-230/231 (the bounded quoted-evidence
+   * renderer) attach to. Untrusted server text until both have run: no stage between here and
+   * those may fold `.pack` into any prompt (this task's own locked decision). Absent on a
+   * RESUMED run — `resume` has no `prepare` (this file's own doc: a parked run restores its
+   * state rather than re-preparing), so nothing here fetched one; RUN-229/230 read this as
+   * "nothing to verify or render", the same posture an unopted-in repo already produces.
+   */
+  readonly contextPack?: ContextPackRetrieval;
 
   // ── the four a stage may move ────────────────────────────────────────────────
   /** The run's fate so far. A gate narrows it; nothing ever widens it back to done. */

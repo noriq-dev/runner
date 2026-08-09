@@ -2,7 +2,6 @@ import type {
   AuthorityLevel,
   BaseId,
   BranchRef,
-  ContextPack,
   ContextPackCitation,
   ContextPackEpisodeExcerpt,
   ContextPackExcerpt,
@@ -28,7 +27,7 @@ import type {
   RunnerStagedGeneration,
   VerificationState,
 } from '@noriq-dev/shared';
-import { RepositoryKey, RunnerIndexCursor } from '@noriq-dev/shared';
+import { ContextPack, RepositoryKey, RunnerIndexCursor } from '@noriq-dev/shared';
 
 // ---------------------------------------------------------------------------
 // The runner's single import surface for the Project Memory slice (RUN-207).
@@ -83,9 +82,13 @@ export type {
   EpisodeLandingOutcome,
 };
 
-// Context packs (§10).
+// Context packs (§10). `ContextPack` is re-exported as a VALUE for the same reason
+// `RepositoryKey`/`RunnerIndexCursor` are: it is the ONLY parser `client.ts`'s `getContextPack`
+// runs over `POST /api/runner-memory/context`'s response body (RUN-228 locked decision — "validated
+// against the vendored schema"), so no second, independently-typed reading of the same wire shape
+// can drift from it.
+export { ContextPack };
 export type {
-  ContextPack,
   ContextPackRole,
   ContextPackMode,
   ContextPackTaskFacts,

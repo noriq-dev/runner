@@ -959,6 +959,10 @@ export class Daemon {
       // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
       // feature that has never run.
       saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+      // RUN-228's task context pack fetch — bound with this daemon's own registration id, the same
+      // closure shape `getCursor` above already uses for `getIndexCursor`. `context-pack.ts` is
+      // what adds the timeout and decides what an omission means; this is the thin wire binding.
+      getContextPack: (input) => client.getContextPack(runner.id, input),
       // Background indexing's landing/publish trigger site (RUN-222). Fire-and-forget: `onLanded`
       // itself never throws (it catches everything internally) and this daemon never awaits it.
       onLanded: (repoRoot, branch, sha) => {

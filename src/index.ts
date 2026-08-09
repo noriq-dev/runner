@@ -664,11 +664,11 @@ export {
 export * from './repo-intel';
 export {
   RepositoryKey,
+  ContextPack,
   parseRepositoryKey,
   type AuthorityLevel,
   type BaseId,
   type BranchRef,
-  type ContextPack,
   type ContextPackCitation,
   type ContextPackEpisodeExcerpt,
   type ContextPackExcerpt,
@@ -698,3 +698,13 @@ export {
   type RunnerIndexGeneration,
   type RunnerStagedGeneration,
 } from './memory-contract';
+export {
+  CONTEXT_PACK_TIMEOUT_MS,
+  retrieveContextPack,
+  summarizeContextPackRetrieval,
+  type ContextPackFetcher,
+  type ContextPackInquiry,
+  type ContextPackOmission,
+  type ContextPackRequest,
+  type ContextPackRetrieval,
+} from './context-pack';

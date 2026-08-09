@@ -41,6 +41,7 @@ import {
   tryParseCoordinate,
 } from './agent-coordinate';
 import type { ParkState, RunAgent, SpinOffProvenance } from './client';
+import type { ContextPackFetcher, ContextPackRetrieval } from './context-pack';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
@@ -418,6 +419,11 @@ export interface RunSupervisorDeps {
   setupMarkerDir?: string;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
   postComment?: (projectId: string, taskId: string, body: string) => void;
+  /** RUN-228's task context pack fetch (→ `NoriqClient.getContextPack`, bound with this daemon's
+   *  own `runnerId` — the same closure shape `getIndexCursor`'s own dep, `getCursor`, already
+   *  uses in `daemon.ts`). Omitted → retrieval never runs, which `context-pack.ts` treats as one
+   *  more degradation path a run proceeds through exactly as it did before this existed. */
+  getContextPack?: ContextPackFetcher;
   logger?: typeof defaultLogger;
 }
 
@@ -3551,6 +3557,7 @@ export class RunSupervisor {
       tail: outcome.tail,
       continued: prepared.continued,
       executedSpec,
+      contextPack: prepared.contextPack,
     });
   }
 
@@ -4111,6 +4118,7 @@ export class RunSupervisor {
       lockEnforcerFor: (repo, run, worktree, kind, token) =>
         this.lockEnforcerFor(repo, run, worktree, kind, token),
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
+      ...(this.deps.getContextPack ? { getContextPack: this.deps.getContextPack } : {}),
       context: {
         ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
         ...(this.deps.specPathProbe ? { specProbe: this.deps.specPathProbe } : {}),
@@ -4169,6 +4177,9 @@ export class RunSupervisor {
     /** The spec this run was actually briefed with — prepare's, or the one the `plan` stage
      *  synthesized (RUN-145). What the gate answers its acceptance criteria against. */
     executedSpec?: CheckedExecutionSpec | null;
+    /** RUN-228's retrieval, carried from `PreparedRun.contextPack` — absent on the `resume` call
+     *  site, which has no `prepare` and therefore never fetched one (RunPipeline's own doc). */
+    contextPack?: ContextPackRetrieval;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
@@ -4205,6 +4216,7 @@ export class RunSupervisor {
       acceptance: enumerateAcceptance(ctx.executedSpec?.spec),
       acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
       requirements: ctx.executedSpec?.spec.requirementIds ?? [],
+      ...(ctx.contextPack ? { contextPack: ctx.contextPack } : {}),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
       // the human even if verify then fails).

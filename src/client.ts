@@ -1,5 +1,5 @@
 import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
-import { RunnerIndexCursor } from './memory-contract';
+import { ContextPack, type ContextPackRole, RunnerIndexCursor } from './memory-contract';
 import type { RunnerRegistration } from './registration';
 import { VERSION } from './version';
 
@@ -575,6 +575,56 @@ export class NoriqClient {
         checkoutId: input.checkoutId,
       });
       const parsed = RunnerIndexCursor.safeParse(out);
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch RUN-228's task context pack (`POST /api/runner-memory/context`, agentAuth) — the
+   * agentAuth twin of the dashboard's userAuth `POST /api/projects/:pid/memory/context`: same
+   * assembler, same shape, `role` defaulting server-side to 'build' rather than the browser
+   * route's 'human' (a runner is never a browser, and 'human' would reweight section budgets
+   * toward the wrong reader — this daemon's own caller always passes one explicitly anyway).
+   *
+   * Same locked-decision shape as `getIndexCursor` above, deliberately: ONE parser (the vendored
+   * `ContextPack` schema, re-exported as a value by `memory-contract.ts` for exactly this), and
+   * every failure — network error, non-2xx (including a 404 from an old server that has not
+   * grown this route), or a body that fails the schema — collapses to `null` rather than three
+   * call sites the daemon's caller (`context-pack.ts`) would otherwise have to keep in sync with
+   * a server that can fail in new ways this repo has never seen. `context-pack.ts` is the layer
+   * that adds a TIMEOUT around this call and decides what an omission means for a run; this
+   * method stays an honest wire call.
+   *
+   * `repositoryKey`/`branch`/`baseId`/`role`/`budgetTokens` are all optional on the wire — this
+   * method does not itself refuse a request missing one; `context-pack.ts` is what enforces "skip
+   * without a repositoryKey" (locked decision) before this is ever called.
+   */
+  async getContextPack(
+    runnerId: string,
+    input: {
+      projectId: string;
+      taskId: string;
+      repositoryKey?: string | null;
+      branch?: string | null;
+      baseId?: string | null;
+      role?: ContextPackRole;
+      budgetTokens?: number;
+    },
+  ): Promise<ContextPack | null> {
+    try {
+      const out = await this.request('POST', '/api/runner-memory/context', {
+        projectId: input.projectId,
+        runnerId,
+        taskId: input.taskId,
+        ...(input.repositoryKey ? { repositoryKey: input.repositoryKey } : {}),
+        ...(input.branch ? { branch: input.branch } : {}),
+        ...(input.baseId ? { baseId: input.baseId } : {}),
+        ...(input.role ? { role: input.role } : {}),
+        ...(input.budgetTokens !== undefined ? { budgetTokens: input.budgetTokens } : {}),
+      });
+      const parsed = ContextPack.safeParse(out);
       return parsed.success ? parsed.data : null;
     } catch {
       return null;

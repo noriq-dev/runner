@@ -29,6 +29,12 @@ import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
 import type { RunAgent } from '../client';
+import {
+  type ContextPackFetcher,
+  type ContextPackRetrieval,
+  retrieveContextPack,
+  summarizeContextPackRetrieval,
+} from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
@@ -100,6 +106,10 @@ export interface PrepareHost {
   ): LockEnforcer | undefined;
   /** The run's effective ceiling: the dispatch's, else the machine default. Null = unbounded. */
   runBudget(run: Run): RunBudget | null;
+  /** RUN-228's task context pack fetch (`NoriqClient.getContextPack`, bound with this daemon's
+   *  own `runnerId`). Absent → retrieval is not wired at all, which `context-pack.ts` treats
+   *  identically to every other degradation: preparation proceeds exactly as it does today. */
+  getContextPack?: ContextPackFetcher;
   /** How `[context]` paths are probed and read (RUN-128/129) — injected so tests touch no disk. */
   readonly context: {
     probe?: PathProbe;
@@ -137,6 +147,15 @@ export interface PreparedRun {
    *  a consumer that needs the spec the run actually executed under takes the plan stage's answer
    *  rather than this — this is the starting point, not the outcome (RUN-145). */
   checkedSpec: CheckedExecutionSpec | null;
+  /**
+   * RUN-228's retrieved task context pack, plus its own retrieval metadata — fetched during THIS
+   * stage (locked decision: "the call site is retrieval happens during preparation, alongside the
+   * other acquisitions"), held here UNCHANGED for RUN-229 (worktree citation verification) and
+   * RUN-230/231 (the bounded quoted-evidence renderer) to attach to. FETCH AND RECORD ONLY: this
+   * task's own acceptance is that `.pack` reaches no agent prompt anywhere — `buildPrompt` below
+   * never reads this field, and neither may anything added after it until those tasks land.
+   */
+  contextPack: ContextPackRetrieval;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -343,6 +362,36 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const setupNote = setupBriefNote(setup);
   const milestone = setupMilestone(setup);
   if (milestone) host.transcript(run.id).milestone(milestone);
+
+  // RUN-228: fetch the task's context pack now — the worktree (its `baseId`) and the anchor's
+  // task id are both already in hand, and nothing below this line depends on the result (FETCH
+  // AND RECORD ONLY is this task's own locked decision; `.pack` reaches no prompt in this file).
+  // Sequential rather than raced against `runSetup` above: this whole function is a deliberately
+  // ordered list of what each step costs and unwinds (see the file's own top-of-file doc), and
+  // retrieval carries its own short, bounded timeout regardless of where it sits — there is no
+  // latency case here that the existing sequencing does not already tolerate just as well.
+  const contextPack = await retrieveContextPack(host.getContextPack, {
+    projectId: run.projectId,
+    taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    // The CANONICAL identity (locked decision), never `repo.id`/the local `repo_<sha>` checkout
+    // id this daemon mints for itself — that id means nothing on the server.
+    repositoryKey: repo.manifest.repositoryKey,
+    // The leased workspace's own base — the opaque revision id in the backend's id-space,
+    // matching what indexing itself was taken from.
+    baseId: worktree.baseId,
+    // The repo's target/integration branch — deliberately NEVER `worktree.workRef` (the run's own
+    // throwaway `noriq/run/<id>` branch): see `ContextPackInquiry.branch`'s own doc for why that
+    // field must not become an operand here.
+    branch: repo.manifest.defaultBranch,
+    role: kind,
+  });
+  // Only when something was actually ASKED (locked decision: record omissions, not just
+  // successes) — the common case today is a repo with no `repositoryKey` at all, and a transcript
+  // line on every one of those runs would be noise nobody asked for (`summarizeContextPackRetrieval`'s
+  // own doc: the same "no note on nothing to bootstrap" posture `setupBriefNote` already takes).
+  if (contextPack.attempted) {
+    host.transcript(run.id).milestone(summarizeContextPackRetrieval(contextPack));
+  }
 
   // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
   // a lookup failure degrades to the bare id rather than sinking the run.
@@ -575,6 +624,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     rebuildPrompt: (checked, extra = '') =>
       buildPrompt(`${renderExecutionSpec(checked)}${extra}${setupNote}`, checked?.spec ?? null),
     checkedSpec,
+    contextPack,
     repo,
     driver,
     workflow: wf,
