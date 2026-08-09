@@ -164,7 +164,11 @@ describe('IndexStatusStore', () => {
     expect(store.get('my-repo')?.state).toBe('server-validating');
   });
 
-  it('a success event records active + lastSuccess, and keeps a prior lastError as history', () => {
+  // RUN-260: a successful upload is staged/sealed/validated, never active — activation is
+  // `userAuth` + `requireAdmin` and this daemon can never call it. The old code reported `active`
+  // here unconditionally; measured on a real dogfood ingest, the server disagreed (`status:
+  // staged`, `activeGeneration: None`) and `search_project_memory` returned zero results.
+  it('a success event records staged (never active) + lastSuccess, and keeps a prior lastError as history', () => {
     const store = new IndexStatusStore({ now: () => 3000, logger: quiet });
     store.record({ type: 'failure', repositoryKey: 'my-repo', detail: 'earlier attempt broke' });
     store.record({
@@ -175,7 +179,9 @@ describe('IndexStatusStore', () => {
       batchesReceived: 4,
     });
     const rec = store.get('my-repo');
-    expect(rec?.state).toBe('active');
+    expect(rec?.state).toBe('staged');
+    expect(rec?.state).not.toBe('active');
+    expect(rec?.detail).toMatch(/admin/i);
     expect(rec?.lastSuccess).toEqual({
       at: new Date(3000).toISOString(),
       generationId: 'gen_1',
@@ -184,6 +190,69 @@ describe('IndexStatusStore', () => {
     });
     // History, not amnesia: a fresh success does not erase what the last error WAS.
     expect(rec?.lastError?.message).toBe('earlier attempt broke');
+  });
+
+  // RUN-260: `active` may be reported ONLY from server evidence — the cursor's own
+  // `activeGeneration`, threaded on the reconcile event as `activeGenerationId`. `'unchanged'` is
+  // the one reconcile outcome that, by `reconcile`'s own contract, only fires while the cursor's
+  // active generation matches this checkout's current base/version and is not stale — that is the
+  // evidence, so this is the one arm that promotes.
+  describe('active is reported only from reconcile evidence, never from success alone', () => {
+    it('an unchanged reconcile carrying activeGenerationId promotes straight to active', () => {
+      const store = new IndexStatusStore({ now: () => 7000, logger: quiet });
+      store.record({
+        type: 'reconcile',
+        repositoryKey: 'my-repo',
+        outcome: { outcome: 'unchanged' },
+        activeGenerationId: 'gen_42',
+      });
+      const rec = store.get('my-repo');
+      expect(rec?.state).toBe('active');
+      expect(rec?.detail).toContain('gen_42');
+    });
+
+    it('an unchanged reconcile with no activeGenerationId does NOT promote to active', () => {
+      const store = new IndexStatusStore({ now: () => 7000, logger: quiet });
+      store.record({
+        type: 'reconcile',
+        repositoryKey: 'my-repo',
+        outcome: { outcome: 'unchanged' },
+      });
+      expect(store.get('my-repo')?.state).not.toBe('active');
+    });
+
+    it('a staged record is promoted to active by the NEXT reconcile confirming activation, not by the upload itself', () => {
+      const store = new IndexStatusStore({ now: () => 8000, logger: quiet });
+      store.record({
+        type: 'success',
+        repositoryKey: 'my-repo',
+        generationId: 'gen_9',
+        baseId: 'base-9',
+        batchesReceived: 2,
+      });
+      expect(store.get('my-repo')?.state).toBe('staged');
+
+      store.record({
+        type: 'reconcile',
+        repositoryKey: 'my-repo',
+        outcome: { outcome: 'unchanged' },
+        activeGenerationId: 'gen_9',
+      });
+      expect(store.get('my-repo')?.state).toBe('active');
+      // lastSuccess survives the transition — it is history, not overwritten by a reconcile.
+      expect(store.get('my-repo')?.lastSuccess?.generationId).toBe('gen_9');
+    });
+
+    it('a full/incremental reconcile never promotes to active, even with activeGenerationId set', () => {
+      const store = new IndexStatusStore({ now: () => 9000, logger: quiet });
+      store.record({
+        type: 'reconcile',
+        repositoryKey: 'my-repo',
+        outcome: { outcome: 'full', reason: 'active generation older than ours', resumeCandidate: null },
+        activeGenerationId: 'gen_1',
+      });
+      expect(store.get('my-repo')?.state).toBe('queued');
+    });
   });
 
   it('a failure event records failed + lastError, and keeps a prior lastSuccess as history', () => {

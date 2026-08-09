@@ -225,6 +225,63 @@ describe('renderIndexStatusText — the requiresUpgrade distinction is visible w
     });
     expect(text).toContain('state: unknown');
   });
+
+  // RUN-260: `staged` (uploaded, sealed, validated — awaiting an admin) must not read as a runner
+  // failure on the state line itself, the same "unmistakable without parsing detail" bar
+  // `requiresUpgrade` already clears for `incompatible-version`.
+  it('a staged record renders an admin-activation marker on the state line, distinct from BLOCKED', () => {
+    const text = renderIndexStatusText({
+      repositoryKey: 'my-repo',
+      server: 'https://noriq.test',
+      source: 'live daemon',
+      record: {
+        repositoryKey: 'my-repo',
+        state: 'staged',
+        stateSince: '2026-08-09T00:00:00.000Z',
+        detail: 'uploaded, sealed and validated — awaiting activation.',
+        lastError: null,
+        lastSuccess: {
+          at: '2026-08-09T00:00:00.000Z',
+          generationId: 'gen_1',
+          baseId: 'b1',
+          batchesReceived: 2,
+        },
+        indexerVersion: '1',
+        requiresUpgrade: false,
+      },
+      trigger: null,
+    });
+    const stateLine = text.split('\n').find((l) => l.startsWith('state:'));
+    expect(stateLine).toContain('staged');
+    expect(stateLine).toMatch(/admin/i);
+    expect(stateLine).not.toContain('BLOCKED');
+  });
+
+  it('an active record (post-promotion) renders no marker at all', () => {
+    const text = renderIndexStatusText({
+      repositoryKey: 'my-repo',
+      server: 'https://noriq.test',
+      source: 'live daemon',
+      record: {
+        repositoryKey: 'my-repo',
+        state: 'active',
+        stateSince: '2026-08-09T00:00:00.000Z',
+        detail: 'server confirms this base is active (generation gen_1)',
+        lastError: null,
+        lastSuccess: {
+          at: '2026-08-09T00:00:00.000Z',
+          generationId: 'gen_1',
+          baseId: 'b1',
+          batchesReceived: 2,
+        },
+        indexerVersion: '1',
+        requiresUpgrade: false,
+      },
+      trigger: null,
+    });
+    const stateLine = text.split('\n').find((l) => l.startsWith('state:'));
+    expect(stateLine).toBe('state: active');
+  });
 });
 
 describe('index-repo (RUN-219)', () => {

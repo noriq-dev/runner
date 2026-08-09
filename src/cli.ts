@@ -473,8 +473,17 @@ export function renderIndexStatusText(info: {
     // Unmistakable without reading `detail` closely (locked decision, RUN-223 round 2): every
     // OTHER `failed` invites a retry, this one means retrying is pointless until the daemon
     // itself is upgraded — printed on the state line itself, not left to a prose scan.
+    //
+    // `'staged'` (RUN-260) gets the same unmistakable-on-the-state-line treatment, keyed off the
+    // state itself rather than a second boolean — unlike `requiresUpgrade`, which disambiguates
+    // WITHIN the shared `'failed'` bucket, `'staged'` is its own named state produced by nothing
+    // else, so there is no ambiguity a flag would resolve. Every OTHER non-terminal state here
+    // invites a retry; this one names a human/admin step so an operator does not retry an upload
+    // that already succeeded.
     lines.push(
-      `state: ${record.state}${record.requiresUpgrade ? ' [BLOCKED — upgrade this daemon, do not retry]' : ''}`,
+      `state: ${record.state}` +
+        `${record.requiresUpgrade ? ' [BLOCKED — upgrade this daemon, do not retry]' : ''}` +
+        `${record.state === 'staged' ? ' [awaiting admin activation — not a runner failure, do not retry]' : ''}`,
       `since: ${record.stateSince}`,
     );
     if (record.detail) lines.push(`detail: ${record.detail}`);

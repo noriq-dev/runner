@@ -311,8 +311,16 @@ export class IndexCoordinator {
     // RUN-223: every reconcile outcome is reported, before the switch below decides whether to
     // proceed — `reconcileOperatorState` (index-status.ts) is the one place that folds all six
     // into the operator vocabulary, exhaustively, so this call site owes it nothing but the raw
-    // outcome.
-    this.emitStatus({ type: 'reconcile', repositoryKey: rk, outcome });
+    // outcome. RUN-260: `activeGenerationId` rides along too — the cursor's own
+    // `activeGeneration.id`, straight from the fetch above, no second call. It is the ONLY
+    // evidence `index-status.ts` may ever promote a record to `'active'` from; this coordinator
+    // does not decide what it means, only that it is real.
+    this.emitStatus({
+      type: 'reconcile',
+      repositoryKey: rk,
+      outcome,
+      activeGenerationId: cursor?.activeGeneration?.id ?? null,
+    });
 
     // Locked decision 6: only `incremental` and `full` may ever lease a snapshot. Every other
     // outcome logs at its own level and returns here — RUN-213 already decided all six outcomes

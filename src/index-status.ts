@@ -25,11 +25,53 @@ import { logger as defaultLogger } from './logger';
  * `unavailable` and `incompatible-version` both fold into `'failed'` — deliberately, and unlike
  * every other arm this is a real judgement call, not a free choice among equivalent names: from
  * this daemon's own reconcile loop, "the cursor could not be fetched" and "the batch upload was
- * rejected by the server" are both "this attempt did not proceed for a reason", and the acceptance
- * vocabulary names exactly nine states, not eleven. The DETAIL field is what keeps this honest —
- * it always carries the real reason text, so an operator reading `failed` is never left guessing
- * whether that means "network blip" or "validation rejected" or "an older daemon would have
- * downgraded the index".
+ * rejected by the server" are both "this attempt did not proceed for a reason". The DETAIL field
+ * is what keeps this honest — it always carries the real reason text, so an operator reading
+ * `failed` is never left guessing whether that means "network blip" or "validation rejected" or
+ * "an older daemon would have downgraded the index".
+ *
+ * **`'staged'` (RUN-260) is a tenth state, added deliberately over an otherwise-closed vocabulary**
+ * — a successful upload does NOT mean the generation is serving search. `POST
+ * .../generations/:id/activate` is `userAuth` + `requireAdmin`; this daemon authenticates as an
+ * agent and can never call it, so a `success` event can only ever mean "uploaded, sealed and
+ * validated — awaiting an admin". Measured on the first real dogfood ingest: the old code reported
+ * `active` here while the server's cursor still had `activeGeneration: None` and the generation
+ * was not projected into `nodes`/`edges` at all — `search_project_memory` returned zero results
+ * while the operator was told everything was fine. Reusing `server-validating` would be wrong (that
+ * means validation is IN FLIGHT; this means it finished and passed). The name `'staged'` is not
+ * invented — it is the server's own `RunnerIndexGeneration.status` value for exactly this
+ * condition (`vendor/noriq-shared/src/memory.ts`), so the operator vocabulary keeps mapping onto
+ * machinery that already exists rather than growing a parallel one.
+ *
+ * **`active` is reported only from evidence the server supplied, never from a local `success`.**
+ * The only outcome `reconcile` (`index-reconcile.ts`) can return while an ACTIVE generation
+ * demonstrably matches this checkout is `'unchanged'` — by construction it requires a non-null
+ * `cursor.activeGeneration`, the same `indexerVersion`, the same `baseId` as this checkout's
+ * current one, and `!cursor.stale`. That is precisely "the cursor's own `activeGeneration` matches
+ * what is on disk right now", so `IndexStatusStore.record` promotes an `'unchanged'` reconcile to
+ * `'active'` rather than leaving it at the vaguer `'unchanged'` — the state a repo that is fully
+ * live and current should report is `active`, not a word that only describes how the daemon
+ * noticed. This promotion is deliberately NOT narrowed to "the generation THIS daemon itself
+ * uploaded" (matched by `generationId`): a fresh daemon whose own `lastSuccess` is empty (restart,
+ * or a different checkout of the same canonical repository did the uploading) can reconcile
+ * straight to `'unchanged'`, and the server's evidence is exactly as strong in that case — the
+ * active generation genuinely reflects this exact base. Requiring a `generationId` match would
+ * make a perfectly live repository report short of `active` for a reason that has nothing to do
+ * with whether its memory is actually current. The evidence is threaded explicitly rather than
+ * inferred implicitly: `IndexStatusEvent`'s `'reconcile'` arm carries `activeGenerationId`, read
+ * straight off the cursor `index-coordinator.ts` already fetched for this attempt (no new network
+ * call) — so the promotion is provably keyed to what the server said, not to an invariant of
+ * `reconcile`'s current implementation that could silently drift later.
+ *
+ * **No `requiresUpgrade`-shaped boolean for `'staged'`.** `requiresUpgrade` exists to disambiguate
+ * *within* the shared `'failed'` bucket, where `incompatible-version` and an ordinary network blip
+ * would otherwise be indistinguishable without parsing `detail`. `'staged'` has no such collision —
+ * it is its own named state, produced by nothing else, so `record.state === 'staged'` already gives
+ * any caller the identical one-line certainty a boolean would, and a redundant field would be
+ * exactly the kind of "reads as a feature, does nothing new" surface this module exists to avoid.
+ * What the acceptance actually requires — the CLI's state line saying activation is a human/admin
+ * step — is satisfied by branching the render on `state === 'staged'` directly (`cli.ts`), the same
+ * way the `'incompatible-version'` BLOCKED marker branches on `requiresUpgrade` today.
  *
  * **`incompatible-version` is not an ordinary `failed`, and that must be visible without reading
  * `detail` closely.** Every other `failed` invites a retry (a network blip, a rejected validation);
@@ -46,10 +88,15 @@ import { logger as defaultLogger } from './logger';
  * an attempt happen, which only a live (or previously live) daemon process can have done.
  */
 
-/** The closed, nine-value operator vocabulary the acceptance names exactly. `no-opt-in` is never
- *  produced by `IndexStatusStore` itself (see the module doc) — it is here so callers that render
- *  a merged view (CLI, the control server's `/status`) have one type to hold every state a repo
- *  can be in. */
+/** The closed, ten-value operator vocabulary — nine from the original RUN-223 acceptance plus
+ *  `'staged'` (RUN-260, see the module doc). `no-opt-in` is never produced by `IndexStatusStore`
+ *  itself (see the module doc) — it is here so callers that render a merged view (CLI, the control
+ *  server's `/status`) have one type to hold every state a repo can be in. `'unchanged'` is kept in
+ *  this closed set for the same reason `no-opt-in` is: a persisted snapshot written by an older
+ *  daemon binary (before RUN-260's promotion) may still hold it, and `isRecordShape` below must
+ *  keep reading that file as valid rather than discarding it as corrupt — `record` below no longer
+ *  assigns it to a live record's `state` going forward (see the module doc's `'active'` promotion;
+ *  `reconcileOperatorState` itself still names it, unweakened, for the reason its own doc gives). */
 export const OPERATOR_INDEX_STATES = [
   'no-opt-in',
   'unchanged',
@@ -57,6 +104,7 @@ export const OPERATOR_INDEX_STATES = [
   'parsing',
   'uploading',
   'server-validating',
+  'staged',
   'active',
   'failed',
   'association-conflict',
@@ -72,6 +120,13 @@ export type IndexJobPhase = 'parsing' | 'uploading' | 'server-validating';
  * module doc) — `incremental`/`full` both become `'queued'`: the job has been accepted and is
  * about to run, and which of the two it is stays visible in `detail` (`reconcileDetail` below)
  * rather than doubling the state count for a distinction only the code needs.
+ *
+ * Still maps `'unchanged'` to `'unchanged'` (RUN-260 does not touch this function's pinned
+ * mapping — see the locked decision to keep this switch unweakened). The `'unchanged'` →
+ * `'active'` promotion is real, but it needs the fetched cursor's own `activeGeneration`, which
+ * this function's signature (an outcome DISCRIMINANT, not the outcome or the cursor) deliberately
+ * cannot see — that decision belongs to `IndexStatusStore.record`, the one place `IndexStatusEvent`
+ * carries that evidence (see the module doc).
  */
 export function reconcileOperatorState(outcome: IndexReconcileOutcome['outcome']): OperatorIndexState {
   switch (outcome) {
@@ -109,9 +164,21 @@ function reconcileDetail(outcome: IndexReconcileOutcome): string | null {
 
 /** What the coordinator/work step actually observe, fed to `IndexStatusStore.record` (locked
  *  decision 3/4's single injection point — see `index-coordinator.ts`'s `onStatus` dep and
- *  `index-work.ts`'s `IndexWorkContext.onProgress`). */
+ *  `index-work.ts`'s `IndexWorkContext.onProgress`).
+ *
+ *  `reconcile`'s `activeGenerationId` (RUN-260) is the server's `cursor.activeGeneration?.id` at
+ *  the moment this attempt reconciled, threaded straight through by `index-coordinator.ts` from
+ *  the cursor it already fetched to decide the outcome — never re-derived here, never a second
+ *  network call. Optional so older callers/tests that never touch activation status keep
+ *  compiling; absent (or `null`) simply means "this reconcile is not evidence of activation",
+ *  which is true for every outcome except `'unchanged'` (see the module doc). */
 export type IndexStatusEvent =
-  | { type: 'reconcile'; repositoryKey: string; outcome: IndexReconcileOutcome }
+  | {
+      type: 'reconcile';
+      repositoryKey: string;
+      outcome: IndexReconcileOutcome;
+      activeGenerationId?: string | null;
+    }
   | { type: 'phase'; repositoryKey: string; phase: IndexJobPhase; detail?: string }
   | { type: 'success'; repositoryKey: string; generationId: string; baseId: string; batchesReceived: number }
   | { type: 'failure'; repositoryKey: string; detail: string };
@@ -186,8 +253,19 @@ export class IndexStatusStore {
     let next: IndexStatusRecord;
     switch (event.type) {
       case 'reconcile': {
-        const state = reconcileOperatorState(event.outcome.outcome);
-        const detail = reconcileDetail(event.outcome);
+        const folded = reconcileOperatorState(event.outcome.outcome);
+        // RUN-260: the ONLY promotion to `'active'` in this whole store, and it is evidence-gated
+        // — `'unchanged'` is the one outcome `reconcile` returns while the cursor's own
+        // `activeGeneration` demonstrably matches this checkout's current base/version and is not
+        // stale (see the module doc). `activeGenerationId` is asserted rather than trusted blindly
+        // (defensive: `folded === 'unchanged'` already implies it by `reconcile`'s own contract,
+        // but a caller that forgot to thread it must not silently promote on nothing).
+        const state: OperatorIndexState =
+          folded === 'unchanged' && event.activeGenerationId ? 'active' : folded;
+        const detail =
+          state === 'active'
+            ? `server confirms this base is active (generation ${event.activeGenerationId})`
+            : reconcileDetail(event.outcome);
         next = {
           ...base,
           state,
@@ -211,11 +289,19 @@ export class IndexStatusStore {
         };
         break;
       case 'success':
+        // RUN-260: a successful upload means uploaded, sealed and validated — never `'active'`.
+        // Activation is `POST .../generations/:id/activate`, `userAuth` + `requireAdmin`; this
+        // daemon authenticates as an agent and can never reach that route, so this event alone can
+        // never be evidence of activation (see the module doc). The next reconcile that observes
+        // the server's own `activeGeneration` matching this checkout is what may promote it.
         next = {
           ...base,
-          state: 'active',
+          state: 'staged',
           stateSince: nowIso,
-          detail: null,
+          detail:
+            'uploaded, sealed and validated — awaiting activation. Activation is an admin/human ' +
+            'step this daemon cannot perform; this is not a runner failure and will not resolve ' +
+            'itself with a retry.',
           lastSuccess: {
             at: nowIso,
             generationId: event.generationId,
