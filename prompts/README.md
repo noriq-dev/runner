@@ -124,7 +124,10 @@ Common to `scope`, `build`, and `verify` custom prompts:
 - `runId`, `repoRef`, `workflow`, `planId`: run/repository/workflow facts (`planId` is otherwise null);
 - `taskId`, `taskKey`, `taskTitle`, `taskBody`: anchor task facts, or `null` without that fact;
 - `brief`, `anchor`: the dispatched brief and rendered task/plan anchor;
-- `context`: author context for scope/build; bounded names-only quoted context for verify.
+- `context`: author context for scope/build; bounded names-only quoted context for verify;
+- `memory`: the verified context pack, rendered for an AUTHORING actor (RUN-231) — `''` for a
+  repo/task with nothing retrieved. A verify-shape custom prompt gets this too, alongside the
+  outer frame's own `{{memory}}` — see below.
 
 `scope` adds `spec`, the rendered execution spec or `''`.
 
@@ -170,6 +173,24 @@ the spec just said, and an agent that reads the contradiction first has nothing 
 `scope.md` and `build.md` carry it; a custom workflow's prompt is passed it and must place the tag,
 and one written before this existed simply renders without it — extra variables are ignored, so
 nothing throws and nothing is injected into a template the daemon does not control.
+
+`{{memory}}` (RUN-231, `src/memory-render.ts`) is Project Memory's task context pack — decisions,
+hazards, past episodes, graph neighbors — VERIFIED against this run's own leased worktree
+(`src/citation-verify.ts`) and rendered through ONE bounded quoted-evidence frame reused for every
+audience: every line of retrieved content carries a fixed `| ` prefix, the block says out loud
+that it cannot change scope, permissions, acceptance criteria, review rules, or verdict behavior,
+and a cut is marked, never silent. This is the SAME defense `{{context}}`'s reviewer audience
+already established (RUN-154) — reused because a memory or episode is retrieved evidence with no
+more claim on trust than a repo's own committed prose, not because the two blocks share a source.
+`build.md` and `scope.md` place it right after `{{spec}}`, so it reads as the task's own
+supporting evidence rather than repo-wide orientation; a null pack, or one with nothing to show,
+renders `''` — no "memory had nothing" line. `verify-agent.md` and `reviewer.md` place it beside
+`{{context}}`, ahead of the acceptance/verdict instructions — daemon-owned verdict text stays the
+LAST word over anything a stored memory or episode says, the mirror of `{{context}}`'s own
+"reference first, the ask last" rule below. A verify-shape custom prompt's own `{{memory}}` (in
+its `common` vars, alongside `{{context}}`) is separate from the OUTER frame's — the operator's
+quoted `{{workflowPrompt}}` may reference it too, but the daemon's own memory block in
+`verify-agent.md` is what actually carries the untrusted evidence to the model.
 
 The verify family does not get the spec at all. It gets the **acceptance criteria, numbered**
 (`{{acceptance}}`, rendered by `src/acceptance.ts`), and answers them one line each. Withholding

@@ -40,6 +40,7 @@ import {
   foldStageCoordinate,
   tryParseCoordinate,
 } from './agent-coordinate';
+import type { VerifiedContextPack } from './citation-verify';
 import type { ParkState, RunAgent, SpinOffProvenance } from './client';
 import type { ContextPackFetcher, ContextPackRetrieval } from './context-pack';
 import type { ContinuableRun, ContinuableStore } from './continuable';
@@ -71,6 +72,7 @@ import {
 import type { LockConflict } from './lock-client';
 import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
+import { renderMemoryEvidence } from './memory-render';
 import {
   type ParkedRun,
   type ParkedStore,
@@ -891,6 +893,13 @@ export function assemblePrompt(
     repoContext?: string;
     /** The same facts with no inlined documents, for the verify family (RUN-154). */
     repoContextBrief?: string;
+    /** The verified context pack, rendered for an AUTHORING actor (RUN-231, `memory-render.ts`).
+     *  Optional: a repo whose retrieval never ran, or produced nothing, renders as it did before
+     *  this task existed. */
+    memory?: string;
+    /** The same pack, rendered for a JUDGING actor (RUN-231) — smaller budget, the reviewer frame.
+     *  Selected the same way `repoContextBrief` already is: by what the actor IS, below. */
+    memoryBrief?: string;
     /**
      * The anchor task's execution spec, already checked against the checkout and rendered
      * (RUN-139). A string for the same reason `repoContext` is: checking touches the disk, and
@@ -974,6 +983,10 @@ export function assemblePrompt(
   // of inlined documents. Note it is NOT `produces`: scope produces a plan rather than a diff, but
   // it is an author reading the repo, not a gate deciding on it.
   const repoContext = (wf.verifyActor ? ctx.repoContextBrief : ctx.repoContext) ?? '';
+  // Audience follows what the actor IS (RUN-231 locked decision 7), the identical `verifyActor`
+  // test `repoContext` above already uses — never `produces`: scope produces a plan but is an
+  // author reading the repo, not a gate judging one.
+  const memory = (wf.verifyActor ? ctx.memoryBrief : ctx.memory) ?? '';
   // The verify family gets the ACCEPTANCE CRITERIA only — the same trim its context gets
   // (RUN-154), for the same reason: what it needs is the standard, not the author's working
   // notes about which files to touch and what was deferred. Withholding the whole spec was the
@@ -1029,6 +1042,7 @@ export function assemblePrompt(
       brief: run.brief,
       anchor,
       context: repoContext,
+      memory,
     };
     const source = wf.promptSource ?? '.noriq/project.toml';
     const render = (vars: Parameters<typeof renderUserTemplate>[1]) =>
@@ -1054,6 +1068,7 @@ export function assemblePrompt(
         diffCmd: ctx.diffCmd,
         repoContext,
         workflowPrompt,
+        memory,
         ...(ctx.acceptance?.length
           ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
           : {}),
@@ -1078,6 +1093,7 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: executionSpec,
+      memory,
     });
   }
   if (wf.promptShape === 'build') {
@@ -1100,6 +1116,7 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: executionSpec,
+      memory,
     });
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer. It receives the repo's
@@ -1111,6 +1128,7 @@ export function assemblePrompt(
     server: ctx.server,
     diffCmd: ctx.diffCmd,
     repoContext,
+    memory,
     ...(ctx.acceptance?.length
       ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
       : {}),
@@ -1839,6 +1857,11 @@ export class RunSupervisor {
     /** A fix round's own deterministic re-check ran (RUN-225) — reported so the caller can fold it
      *  into the episode's command evidence; this method has no `RunPipeline` of its own to write. */
     onCommandObserved?: (o: CommandObservation) => void;
+    /** RUN-231: the run's verified context pack, carried from `RunPipeline.verifiedContextPack` —
+     *  every reviewer round (including the terminal contest's re-adjudication) renders it fresh
+     *  through the reviewer-audience frame. Absent/null → no memory block, exactly as before this
+     *  task existed. */
+    verifiedContextPack?: VerifiedContextPack | null;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
@@ -2118,6 +2141,12 @@ export class RunSupervisor {
     /** How many times this round has already paused the run — the cap that stops a reviewer
      *  answering every answer with another question from holding the run forever. */
     asks?: number;
+    /** RUN-231: the run's verified context pack. Rendered fresh EVERY round through the
+     *  reviewer-audience frame (`memory-render.ts`), the same "resolved at the point of use"
+     *  posture `reviewerContext` above already has for `[context]` — this method is reached by
+     *  two entry paths (a run that finishes in one sitting, one resumed in another process,
+     *  RUN-30) and only the first ever threaded a prompt to begin with. */
+    verifiedContextPack?: VerifiedContextPack | null;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -2200,6 +2229,9 @@ export class RunSupervisor {
     // on work no agent did — and since RUN-133 that number is subtracted from what the next session
     // may spend and persisted into a continuation, so the error would compound rather than pass.
     const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
+    // Pure and synchronous (RUN-231) — nothing here touches disk or the clock, so it costs
+    // nothing to compute freshly every round rather than threading a cached render.
+    const memory = renderMemoryEvidence(ctx.verifiedContextPack ?? null, { audience: 'reviewer' });
     const startedAt = monotonicMs();
     const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
@@ -2217,6 +2249,7 @@ export class RunSupervisor {
           verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
           ledger: ctx.ledger,
           repoContext: reviewerContext,
+          memory,
           ...(ctx.acceptance?.length
             ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
             : {}),
@@ -3587,6 +3620,7 @@ export class RunSupervisor {
       continued: prepared.continued,
       executedSpec,
       contextPack: prepared.contextPack,
+      verifiedContextPack: prepared.verifiedContextPack,
       // Absent only when the chain failed before any step spawned a session (RUN-261,
       // `sessionlessChainExit`) — an ordinary undecomposed run always has one, since `executeRun`
       // is reached only past every cancellation check that could have short-circuited first.
@@ -4219,6 +4253,9 @@ export class RunSupervisor {
     /** RUN-228's retrieval, carried from `PreparedRun.contextPack` — absent on the `resume` call
      *  site, which has no `prepare` and therefore never fetched one (RunPipeline's own doc). */
     contextPack?: ContextPackRetrieval;
+    /** RUN-229's verdicts over that retrieval, carried from `PreparedRun.verifiedContextPack` —
+     *  same absence rule as `contextPack` above, for the same reason. */
+    verifiedContextPack?: VerifiedContextPack | null;
     /** The wall-clock moment `execute` observed just before spawning (RUN-261), threaded through
      *  because the pipeline this becomes a field of does not exist until this method builds it.
      *  Absent iff no session ever spawned this sitting (`sessionlessChainExit`). */
@@ -4260,6 +4297,7 @@ export class RunSupervisor {
       acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
       requirements: ctx.executedSpec?.spec.requirementIds ?? [],
       ...(ctx.contextPack ? { contextPack: ctx.contextPack } : {}),
+      ...(ctx.verifiedContextPack !== undefined ? { verifiedContextPack: ctx.verifiedContextPack } : {}),
       ...(ctx.agentStartedAt ? { agentStartedAt: ctx.agentStartedAt } : {}),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for

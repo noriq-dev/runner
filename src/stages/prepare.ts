@@ -624,6 +624,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     kind,
     ...(workflow ? { workflow } : {}),
     ...(diffCmd ? { diffCmd } : {}),
+    verifiedContextPack,
   });
 
   // Findings go to the RUN'S TRANSCRIPT, not only to daemon stderr — which is what makes the two

@@ -39,6 +39,7 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     acceptance: ctx.acceptance,
     acceptanceOverflow: ctx.acceptanceOverflow,
     requirements: ctx.requirements,
+    verifiedContextPack: ctx.verifiedContextPack ?? null,
     // The deterministic floor runs HERE only when this run is not landing; a landing run verifies
     // the REBASED result instead, after this review (RUN-19, `stages/verify.ts`). Telling the
     // reviewer a command "already passed" when it has not yet run is a false premise handed to a

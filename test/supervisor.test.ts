@@ -949,6 +949,94 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
   });
 });
 
+// RUN-231: `assemblePrompt` picks between the two pre-rendered memory blocks by `wf.verifyActor`
+// — the identical test `repoContext`/`repoContextBrief` already use — never by re-deriving
+// anything from the pack itself (that walk is `memory-render.ts`'s alone; this file only proves
+// the SELECTION is wired to the right places).
+describe('the memory evidence block reaches the brief (RUN-231)', () => {
+  it('build gets the AUTHOR rendering, after the brief and spec (build.md places {{memory}} last)', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+    // `{{spec}}{{memory}}` at the end of the brief line, ahead of the daemon's own "Done means"
+    // checklist — evidence read after the ask, the daemon's own words last.
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('AUTHOR-MEMORY-BLOCK'));
+    expect(p.indexOf('AUTHOR-MEMORY-BLOCK')).toBeLessThan(p.indexOf('Done means'));
+  });
+
+  it('scope gets the AUTHOR rendering too — it is a reader of the repo, not a gate over it', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  it('a dispatched verify run gets the REVIEWER rendering — `verifyActor`, not `produces`', () => {
+    const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+  });
+
+  it('renders exactly as before when neither block is supplied', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  // A custom workflow's own template is passed `{{memory}}` in its `common` vars, the same way it
+  // already receives `{{context}}` — README's own documented list, widened by this task.
+  it("a custom build prompt's own template can place {{memory}}", () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.build,
+      id: 'hotfix',
+      promptRef: '{{brief}}{{memory}}',
+      promptSource: '/repo/.noriq/workflows/hotfix.toml',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'build', brief: 'repair it' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+    });
+    expect(p).toBe('repair it\n\nAUTHOR-MEMORY-BLOCK');
+  });
+
+  // A custom verify prompt's outer frame (assembleVerifyPrompt) gets `{{memory}}` too, distinct
+  // from the quoted-and-separately-framed `{{workflowPrompt}}` an operator's own template renders.
+  it('a custom verify prompt still gets the daemon-owned memory block in the outer frame', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.verify,
+      id: 'security',
+      promptRef: 'focus={{brief}}',
+      promptSource: '/repo/.noriq/workflows/security.md',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'verify', brief: 'audit auth' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+  });
+});
+
 describe('the build brief states its own definition of done (RUN-127)', () => {
   const build = (over: Partial<ProjectManifest> = {}) =>
     assemblePrompt(makeRun({ kind: 'build' }), manifest(over), {

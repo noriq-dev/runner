@@ -694,13 +694,16 @@ export {
   type BaseId,
   type BranchRef,
   type ContextPackCitation,
+  type ContextPackCoverage,
   type ContextPackEpisodeExcerpt,
   type ContextPackExcerpt,
+  type ContextPackGraphEntity,
   type ContextPackMemoryExcerpt,
   type ContextPackMode,
   type ContextPackNotice,
   type ContextPackRole,
   type ContextPackSection,
+  type ContextPackSectionId,
   type ContextPackTaskFacts,
   type EffortEpisode,
   type EpisodeFinding,
@@ -745,3 +748,9 @@ export {
   type VerifiedContextPackExcerpt,
   type VerifiedContextPackSection,
 } from './citation-verify';
+export {
+  MEMORY_AUTHOR_MAX_CHARS,
+  MEMORY_REVIEWER_MAX_CHARS,
+  renderMemoryEvidence,
+  type MemoryAudience,
+} from './memory-render';

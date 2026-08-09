@@ -43,7 +43,7 @@ The STRUCTURAL sentence has a machine-readable form, and it ends the run. When �
   ESCALATE STRUCTURAL FINDING <n>: <the promise that leaks, and why no single existing check can hold it> — <file:line>, <file:line>, <file:line>
 The daemon acts on this line: it stops spending fix rounds, reports your diagnosis as the run's cause, and surfaces it for a human to re-dispatch the task around a chokepoint. That converts a run that might still have converged into one that has already failed, so emit it only when you can SHOW convergence is impossible — never because a problem feels systemic, and never to add weight to an ordinary FAIL. The daemon demotes the line to an ordinary FAIL unless <n> names a numbered FINDING in this report, at least three distinct file:line instances spanning more than one file are cited on that finding or on this line, and the line names the broken promise in a sentence — a word beside citations names nothing; an unevidenced escalation is ignored, exactly as an unevidenced VERIFIED is recorded unverified. A BOUNDED class is never an escalation: if you can enumerate the leak points, list them and let the builder close them.
 
-{{context}}{{#acceptance}}
+{{context}}{{memory}}{{#acceptance}}
 
 ACCEPTANCE CRITERIA — the definition of done this work was commissioned with, before it started. Judge against these as well as your own reading: they are the author's floor, not a limit on what you may raise, and a criterion the author never wrote is not excused by its absence from this list.
 {{acceptance}}

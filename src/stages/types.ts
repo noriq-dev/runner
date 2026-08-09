@@ -22,6 +22,7 @@ import type {
 } from '@noriq-dev/shared';
 import type { AcceptanceItem, AcceptanceReport } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
+import type { VerifiedContextPack } from '../citation-verify';
 import type { ContextPackRetrieval } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverExit, DriverSession, NoriqMcp } from '../drivers/types';
@@ -122,6 +123,9 @@ export interface StageHost {
      *  vanish with the round's own local state. Optional: a caller with no episode to build (a
      *  test, a future actor that does not care) simply does not get told. */
     onCommandObserved?: (o: CommandObservation) => void;
+    /** RUN-231: the run's verified context pack — rendered fresh every round through the
+     *  reviewer-audience quoted-evidence frame. Absent/null → no memory block. */
+    verifiedContextPack?: VerifiedContextPack | null;
   }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {
@@ -216,6 +220,15 @@ export interface RunPipeline {
    * "nothing to verify or render", the same posture an unopted-in repo already produces.
    */
   readonly contextPack?: ContextPackRetrieval;
+  /**
+   * RUN-231's other half: `contextPack.pack`'s citations, verified against THIS run's own leased
+   * worktree (`citation-verify.ts`), carried forward from `prepare` UNCHANGED — the seam this
+   * task's own renderer (`memory-render.ts`) attaches to. Same absence rule as `contextPack`
+   * above: absent on a RESUMED run (`resume` has no `prepare`, so nothing here verified one),
+   * and `null` (present but empty) whenever there was no pack to verify or verification itself
+   * failed — `renderMemoryEvidence(null, …)` reads either as "nothing to render", never a defect.
+   */
+  readonly verifiedContextPack?: VerifiedContextPack | null;
   /**
    * The wall-clock moment observed immediately before the agent actually spawned (RUN-261) — an
    * ISO datetime, threaded from `stages/execute.ts`'s own capture through `afterDriver`'s `ctx`

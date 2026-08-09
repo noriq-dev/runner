@@ -16,11 +16,12 @@ import type { Workspace } from '../src/vcs/types';
 import { type VerificationReportWire, evidenceHash } from '../src/verification-report';
 
 // RUN-228: fetch a task context pack during preparation, bounded and always-degrading, and
-// record what happened. FETCH AND RECORD ONLY — the pack must never reach an agent prompt in
-// this task (RUN-229 verifies its citations against the worktree; RUN-230/231 render it). Two
-// layers of test: `retrieveContextPack`/`summarizeContextPackRetrieval` in isolation (the DI
-// seam a fake fetcher exercises directly), and `prepareRun` end to end (the request this daemon
-// actually sends, and the proof nothing from the pack reaches the prompt).
+// record what happened. FETCH AND RECORD ONLY WAS this task's own boundary — RUN-229 verifies a
+// pack's citations against the worktree, and RUN-231 (`memory-render.ts`) is the renderer that
+// finally opens the gate this task deliberately left shut. Two layers of test:
+// `retrieveContextPack`/`summarizeContextPackRetrieval` in isolation (the DI seam a fake fetcher
+// exercises directly), and `prepareRun` end to end (the request this daemon actually sends, and
+// — since RUN-231 — where the pack's content now DOES surface, quoted, and where it still does not).
 
 const MARKER = 'ACME-DISTINCTIVE-EXCERPT-TEXT-DO-NOT-LEAK';
 
@@ -430,18 +431,6 @@ const EMPTY_SPEC = {
   steps: [],
 };
 
-/** Every prompt surface `prepareRun` hands back, concatenated — the whole surface the acceptance's
- *  "no agent prompt anywhere" line has to hold across. */
-function allPrompts(out: Extract<Awaited<ReturnType<typeof prepareRun>>, { ok: true }>): string {
-  return [
-    out.start.prompt,
-    out.plannerPrompt,
-    out.mapperPrompt({ spec: EMPTY_SPEC, findings: [] }),
-    out.checkerPrompt(EMPTY_SPEC, ''),
-    out.rebuildPrompt(null),
-  ].join('\n');
-}
-
 describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipeline", () => {
   it('the request carries the CANONICAL repositoryKey and the LEASED baseId, never the local checkout id', async () => {
     let captured: ContextPackRequest | undefined;
@@ -463,15 +452,40 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
     expect(captured?.role).toBe('build'); // the effective kind
   });
 
-  it('a retrieved pack never reaches any assembled prompt — a grep across every prompt surface', async () => {
+  // RUN-231 is the gate this task's own doc comment named and left shut: the pack now DOES reach
+  // the BUILD prompt (this run's `start.prompt`, and `rebuildPrompt` — which renders the same
+  // shape), always through `memory-render.ts`'s quoted frame, never as a bare, unprefixed line.
+  // The pre-execution actors (planner/pattern-mapper/plan-checker) were deliberately left out of
+  // the wiring — they read `{{memory}}` nowhere in their templates — so the marker must still be
+  // absent from those three surfaces specifically.
+  it("a retrieved, verified pack reaches the BUILD prompt through the quoted frame — never the pre-execution actors'", async () => {
     const getContextPack: ContextPackFetcher = async () => validPack();
     const { host, milestones } = harness({ getContextPack });
     const out = await prepareRun(host, makeRun());
     expect(out.ok).toBe(true);
     if (!out.ok) return;
     expect(out.contextPack.pack).not.toBeNull(); // the fetch DID succeed — a real retrieval to check
-    expect(allPrompts(out)).not.toContain(MARKER);
-    expect(allPrompts(out)).not.toContain('active_decisions');
+    expect(out.verifiedContextPack).not.toBeNull(); // RUN-229 verified it (no citations to check)
+
+    expect(out.start.prompt).toContain(MARKER);
+    expect(out.start.prompt).toContain('QUOTED FROM PROJECT MEMORY');
+    // Every line carrying the marker is QUOTED — the structural prefix, not merely present
+    // somewhere in a much longer prompt.
+    const markerLines = out.start.prompt.split('\n').filter((l) => l.includes(MARKER));
+    expect(markerLines.length).toBeGreaterThan(0);
+    for (const l of markerLines) expect(l.startsWith('| ')).toBe(true);
+
+    // `rebuildPrompt` renders the same BUILD shape (no `shape` override), so it carries the block
+    // too — this is the "plan an unplanned task" resume path, not a second, forgotten call site.
+    expect(out.rebuildPrompt(null)).toContain(MARKER);
+
+    // The pre-execution actors were not wired (README's own list is build/scope/verify-agent/
+    // reviewer only) — their templates have no `{{memory}}` tag, so nothing here is unused, only
+    // unreferenced.
+    expect(out.plannerPrompt).not.toContain(MARKER);
+    expect(out.mapperPrompt({ spec: EMPTY_SPEC, findings: [] })).not.toContain(MARKER);
+    expect(out.checkerPrompt(EMPTY_SPEC, '')).not.toContain(MARKER);
+
     // Recorded (locked decision), but still bounded — the transcript line itself must not be how
     // the marker leaks.
     const line = milestones.find((m) => m.includes('context pack'));

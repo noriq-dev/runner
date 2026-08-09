@@ -21,6 +21,7 @@
 
 import type { ExecutionSpec, Run, RunKind } from '@noriq-dev/shared';
 import { acceptanceOverflow, enumerateAcceptance } from '../acceptance';
+import type { VerifiedContextPack } from '../citation-verify';
 import type { RunAgent } from '../client';
 import {
   type CheckedExecutionSpec,
@@ -30,6 +31,7 @@ import {
 } from '../execution-spec';
 import type { SpecPathProbe } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
+import { renderMemoryEvidence } from '../memory-render';
 import { type DocReader, type PathProbe, loadRepoContext, renderRepoContext } from '../repo-context';
 import { type AnchorTask, type ResolvedRepo, assemblePrompt } from '../supervisor';
 import type { Workspace } from '../vcs/types';
@@ -60,6 +62,9 @@ export interface BriefInputs {
   kind: RunKind;
   workflow?: Workflow | undefined;
   diffCmd?: string | undefined;
+  /** RUN-231: the run's verified context pack — absent on a resume that never fetched one (see
+   *  `RunPipeline.verifiedContextPack`'s own doc). `undefined` and `null` both render `''`. */
+  verifiedContextPack?: VerifiedContextPack | null;
 }
 
 export interface BuiltBrief {
@@ -134,6 +139,14 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
       })
     : null;
 
+  // RUN-231: one walk of the SAME pack, two renderings — the `repoContext`/`repoContextBrief`
+  // precedent immediately above, not a second traversal. `input.verifiedContextPack` is `undefined`
+  // on a resume that never fetched a pack (`RunPipeline`'s own doc); `renderMemoryEvidence` reads
+  // `undefined` and `null` identically, both rendering `''`.
+  const pack = input.verifiedContextPack ?? null;
+  const memory = renderMemoryEvidence(pack, { audience: 'author' });
+  const memoryBrief = renderMemoryEvidence(pack, { audience: 'reviewer' });
+
   const buildPrompt = ((specBlock, forVerify, shape, ledger) =>
     assemblePrompt(run, repo.manifest, {
       agent: runAgent,
@@ -144,6 +157,8 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
       // Rendered from the SAME resolved facts, not a second walk of the disk — only the inlined
       // documents differ (RUN-154).
       repoContextBrief: renderRepoContext(repoCtx.resolved, undefined, { audience: 'reviewer' }),
+      memory,
+      memoryBrief,
       executionSpec: specBlock,
       // The definition of done, NUMBERED, for the actor that judges (RUN-139/145).
       acceptance: enumerateAcceptance(forVerify),

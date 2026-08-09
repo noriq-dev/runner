@@ -6,7 +6,7 @@ Read the code before you change it and prefer the repo's existing patterns over 
 The full check (`{{verifyCmd}}`) is run for you after you finish, and its output comes back to you if it fails — so don't spend a turn on it. Run individual tests while you work if they help.{{/verifyCmd}}{{#reviewer}}
 An independent reviewer agent then examines your diff against the task intent; its report comes back to you if it finds problems.{{/reviewer}}{{context}}
 
-Brief: {{brief}}{{anchor}}{{spec}}
+Brief: {{brief}}{{anchor}}{{spec}}{{memory}}
 
 Done means all of these, not just the first:
 - the brief's intent is actually implemented — no stub, no TODO standing in for the work, no branch left unreachable;
