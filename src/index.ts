@@ -80,11 +80,25 @@ export {
   createDefaultAdapterRegistry,
   type AdapterParseInput,
   type AdapterParseResult,
+  type EdgeConfidence,
   type IndexParserAdapter,
+  type ParsedCall,
   type ParsedDiagnostic,
+  type ParsedImport,
   type ParsedSymbol,
   type SymbolNodeType,
 } from './index-adapters';
+export {
+  TreeSitterRuntime,
+  grammarIdForPath,
+  loadGrammarBytes,
+  type GrammarId,
+  type TreeSitterRuntimeStats,
+} from './treesitter-runtime';
+export {
+  createTreeSitterAdapter,
+  createTreeSitterAdapterRegistry,
+} from './index-treesitter';
 export {
   MAX_INGEST_BATCH_BYTES,
   assembleManifest,

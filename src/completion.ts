@@ -17,6 +17,7 @@ export const COMMANDS = [
   'auth',
   'start',
   'discover',
+  'index-selftest',
   'config',
   'completion',
   'version',

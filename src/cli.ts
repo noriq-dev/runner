@@ -7,10 +7,12 @@ import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
 import { DEFAULT_CREDENTIALS_PATH } from './credentials';
 import { Daemon } from './daemon';
 import { discoverRepos } from './discovery';
+import { createTreeSitterAdapter } from './index-treesitter';
 import { runInit } from './init';
 import { runInitProject } from './init-project';
 import { logger, setLogLevel } from './logger';
 import { TokenSource } from './token';
+import { type GrammarId, TreeSitterRuntime } from './treesitter-runtime';
 import { checkForUpdate, updateAdvice } from './update';
 import { VERSION } from './version';
 
@@ -26,6 +28,7 @@ Commands:
   auth             Authorize this machine with Noriq and store its token
   start            Discover repos, register with Noriq, and supervise dispatched runs
   discover         Scan roots for .noriq/project.toml markers and list found repos
+  index-selftest   Parse a snippet through every bundled tree-sitter grammar (packaging smoke test)
   config           Load, validate, and print the resolved machine config
   completion       Print a shell completion script (bash | zsh) — see below
   version          Print the version
@@ -175,6 +178,55 @@ async function cmdDiscover(configPath?: string): Promise<void> {
   );
 }
 
+/**
+ * `index-selftest` (RUN-216): parse a trivial snippet through every bundled tree-sitter grammar
+ * and report pass/fail per grammar. This is the packaging proof itself, not a demo — RUN-216's own
+ * locked decision 4 requires proving the grammar `.wasm` resolves from the INSTALLED/bundled
+ * package by actually EXECUTING `dist/cli.js`, not by trusting a passing `vitest` run (tsx/vitest
+ * read `node_modules` directly, so both stay green even when the bundle's own asset resolution is
+ * broken — the exact failure shape `__RUNNER_PROMPTS__` already exists to avoid, one layer up).
+ * Also the reason this command exists at all rather than staying test-only code: without a reachable
+ * call site in `cli.ts`'s own import graph, esbuild's dead-code elimination drops the whole
+ * tree-sitter module tree from `dist/cli.js` — including the `define`-inlined grammar bytes — since
+ * nothing shipped in the binary today calls `runIndexer` (RUN-217+'s coordinator wiring is what
+ * will do that; this command is what lets THIS task prove its own packaging before that wiring
+ * exists). Exits non-zero if any grammar fails to load or mis-parses its own snippet — the shape a
+ * platform-specific CI job (locked acceptance: "works on Linux, macOS, and Windows CI") runs after
+ * `npm run build` to catch a packaging regression before it reaches an install.
+ */
+async function cmdIndexSelftest(): Promise<number> {
+  const runtime = new TreeSitterRuntime();
+
+  const probes: Record<GrammarId, { path: string; content: string; expect: string }> = {
+    typescript: {
+      path: 'a.ts',
+      content: 'export function add(a: number): number { return a; }',
+      expect: 'add',
+    },
+    javascript: { path: 'a.js', content: 'function add(a) { return a; }', expect: 'add' },
+    tsx: { path: 'a.tsx', content: 'export function App() { return <div>{1}</div>; }', expect: 'App' },
+  };
+
+  let ok = true;
+  const report: Array<Record<string, unknown>> = [];
+  for (const [id, probe] of Object.entries(probes) as Array<[GrammarId, (typeof probes)[GrammarId]]>) {
+    const adapter = createTreeSitterAdapter(id, runtime);
+    try {
+      const result = await adapter.parse({ path: probe.path, content: probe.content });
+      const found = result.symbols.some((s) => s.symbolPath.includes(probe.expect));
+      const passed = found && result.diagnostics.every((d) => d.severity !== 'error');
+      ok = ok && passed;
+      report.push({ grammar: id, adapterId: adapter.id, version: adapter.version, passed });
+    } catch (err) {
+      ok = false;
+      report.push({ grammar: id, passed: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  console.log(JSON.stringify({ ok, runtime: runtime.stats, grammars: report }, null, 2));
+  return ok ? 0 : 1;
+}
+
 async function cmdStart(configPath?: string): Promise<void> {
   const { config } = await loadRunnerConfig(configPath ?? DEFAULT_CONFIG_PATH);
   logger.info('runner starting', {
@@ -268,6 +320,8 @@ export async function run(argv: string[]): Promise<number> {
       case 'discover':
         await cmdDiscover(args.configPath);
         return 0;
+      case 'index-selftest':
+        return await cmdIndexSelftest();
       case 'start':
         await cmdStart(args.configPath);
         return 0;

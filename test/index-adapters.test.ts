@@ -10,7 +10,7 @@ const tsAdapter: IndexParserAdapter = {
   id: 'fake-ts',
   version: '1',
   canParse: (path) => path.endsWith('.ts'),
-  parse: () => ({ symbols: [], diagnostics: [] }),
+  parse: async () => ({ symbols: [], diagnostics: [] }),
 };
 
 describe('IndexAdapterRegistry', () => {
@@ -40,9 +40,9 @@ describe('IndexAdapterRegistry', () => {
 });
 
 describe('NOOP_ADAPTER', () => {
-  it('claims every path and extracts nothing', () => {
+  it('claims every path and extracts nothing', async () => {
     expect(NOOP_ADAPTER.canParse('anything.whatsoever')).toBe(true);
-    expect(NOOP_ADAPTER.parse({ path: 'a.ts', content: 'whatever' })).toEqual({
+    await expect(NOOP_ADAPTER.parse({ path: 'a.ts', content: 'whatever' })).resolves.toEqual({
       symbols: [],
       diagnostics: [],
     });

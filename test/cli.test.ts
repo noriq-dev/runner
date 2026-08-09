@@ -41,6 +41,18 @@ describe('cli', () => {
     expect(await run(['start', '--config', '/no/such/runner.toml'])).toBe(1);
     expect(err.join('\n')).toMatch(/no runner config/);
   });
+
+  it('index-selftest parses a snippet through every grammar and exits 0 (RUN-216)', async () => {
+    expect(await run(['index-selftest'])).toBe(0);
+    const report = JSON.parse(out.join('\n'));
+    expect(report.ok).toBe(true);
+    expect(report.runtime).toEqual({
+      initCount: 1,
+      grammarLoadCounts: { typescript: 1, javascript: 1, tsx: 1 },
+    });
+    expect(report.grammars).toHaveLength(3);
+    for (const g of report.grammars) expect(g.passed).toBe(true);
+  });
 });
 
 // Every test above calls run() directly — which is precisely why v0.2.0 shipped a binary that

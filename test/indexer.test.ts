@@ -1,7 +1,12 @@
 import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { IndexAdapterRegistry } from '../src/index-adapters';
-import type { AdapterParseInput, AdapterParseResult, IndexParserAdapter } from '../src/index-adapters';
+import type {
+  AdapterParseInput,
+  AdapterParseResult,
+  IndexParserAdapter,
+  ParsedCall,
+} from '../src/index-adapters';
 import { MAX_INGEST_BATCH_BYTES } from '../src/index-batch';
 import { MAX_PARSE_DIAGNOSTICS } from '../src/index-entity';
 import { INDEX_LANGUAGES } from '../src/index-policy';
@@ -42,7 +47,7 @@ const fakeFunctionAdapter: IndexParserAdapter = {
   id: 'fake-fn',
   version: '1',
   canParse: (path) => path.endsWith('.ts'),
-  parse: (input: AdapterParseInput): AdapterParseResult => {
+  parse: async (input: AdapterParseInput): Promise<AdapterParseResult> => {
     const symbols: AdapterParseResult['symbols'] = [];
     for (const m of input.content.matchAll(/function (\w+)\(/g)) {
       symbols.push({ symbolPath: [m[1]!], nodeType: 'symbol', label: m[1]!, content: null });
@@ -256,7 +261,7 @@ describe('runIndexer — diagnostics', () => {
       id: 'fake-fn',
       version: '1',
       canParse: (path) => path.endsWith('.ts'),
-      parse: () => ({
+      parse: async () => ({
         symbols: [{ symbolPath: ['foo'], nodeType: 'symbol', label: 'foo', content: null }],
         diagnostics: Array.from({ length: MAX_PARSE_DIAGNOSTICS + 10 }, () => ({
           message: 'injected parse failure',
@@ -266,7 +271,7 @@ describe('runIndexer — diagnostics', () => {
     };
     const withoutNoise: IndexParserAdapter = {
       ...withNoise,
-      parse: () => ({
+      parse: async () => ({
         symbols: [{ symbolPath: ['foo'], nodeType: 'symbol', label: 'foo', content: null }],
         diagnostics: [],
       }),
@@ -314,6 +319,119 @@ describe('runIndexer — parser versions', () => {
       adapters: registry(),
     });
     expect(result.parserVersions).toEqual({ 'fake-fn': '1' });
+  });
+});
+
+describe('runIndexer — adapter throw isolation (RUN-216)', () => {
+  it('a throwing adapter costs only its own file — the file entity survives and every other file is intact', async () => {
+    const throwing: IndexParserAdapter = {
+      id: 'throws',
+      version: '1',
+      canParse: (path) => path.endsWith('.ts'),
+      parse: async () => {
+        throw new Error('boom — a WASM trap or an adapter bug, not an ordinary syntax error');
+      },
+    };
+    const result = await runIndexer(new FakeIndexSource(fixture()), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(throwing),
+    });
+
+    // Every file still gets its own `file` entity (indexer.ts pushes it BEFORE calling parse) —
+    // no symbols, because the only registered adapter threw on every .ts file.
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const fileRows = rows.filter((r) => r.kind === 'node' && r.type === 'file');
+    expect(fileRows).toHaveLength(3); // a.ts, b.ts, README.md — README isn't claimed by `throwing`.
+
+    // One bounded diagnostic per throwing file, naming the adapter, never a thrown exception.
+    expect(result.diagnostics).toHaveLength(2); // src/a.ts and src/b.ts both match `throwing`.
+    for (const d of result.diagnostics) {
+      expect(d.severity).toBe('error');
+      expect(d.message).toContain('threw while parsing');
+      expect(d.source).toBe('throws@1');
+    }
+    expect(result.parserVersions).toEqual({ throws: '1' });
+  });
+
+  it('a rejected parse() promise is isolated the same way a thrown one is', async () => {
+    const rejecting: IndexParserAdapter = {
+      id: 'rejects',
+      version: '1',
+      canParse: (path) => path.endsWith('.ts'),
+      parse: () => Promise.reject(new Error('async boom')),
+    };
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'function f(){}' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(rejecting) },
+    );
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]?.message).toContain('async boom');
+  });
+});
+
+describe('runIndexer — same-file call edges (RUN-216)', () => {
+  const callAdapter = (calls: ParsedCall[]): IndexParserAdapter => ({
+    id: 'fake-calls',
+    version: '1',
+    canParse: (path) => path.endsWith('.ts'),
+    parse: async () => ({
+      symbols: [
+        { symbolPath: ['add'], nodeType: 'symbol', label: 'add', content: null },
+        { symbolPath: ['helper'], nodeType: 'symbol', label: 'helper', content: null },
+      ],
+      diagnostics: [],
+      calls,
+    }),
+  });
+
+  it('wires a "resolved" call into a real calls edge between the two symbol URIs', async () => {
+    const adapter = callAdapter([
+      { fromSymbolPath: ['add'], toSymbolPath: ['helper'], confidence: 'resolved' },
+    ]);
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(adapter) },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    const edge = rows.find((r) => r.kind === 'edge' && r.type === 'calls');
+    expect(edge).toBeDefined();
+    const addUri = rows.find((r) => r.kind === 'node' && String(r.uri).endsWith('#add'))?.uri;
+    const helperUri = rows.find((r) => r.kind === 'node' && String(r.uri).endsWith('#helper'))?.uri;
+    expect(edge).toMatchObject({ from: addUri, to: helperUri });
+    expect(result.inferredEdgesOmitted).toBe(0);
+  });
+
+  it('never places an "inferred" call on the wire, but counts it as omitted', async () => {
+    const adapter = callAdapter([
+      { fromSymbolPath: ['add'], toSymbolPath: ['helper'], confidence: 'inferred' },
+    ]);
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(adapter) },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    expect(rows.some((r) => r.kind === 'edge' && r.type === 'calls')).toBe(false);
+    expect(result.inferredEdgesOmitted).toBe(1);
+  });
+
+  it('drops a call naming a symbolPath this same parse() never declared — never a fabricated target', async () => {
+    const adapter = callAdapter([
+      { fromSymbolPath: ['add'], toSymbolPath: ['nonexistent'], confidence: 'resolved' },
+    ]);
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'src/a.ts', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(adapter) },
+    );
+    const rows = result.batches.flatMap((b) => decodeBatchRows(b.compressed));
+    expect(rows.some((r) => r.kind === 'edge' && r.type === 'calls')).toBe(false);
+    expect(result.inferredEdgesOmitted).toBe(0);
   });
 });
 

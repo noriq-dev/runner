@@ -14,6 +14,15 @@ import type { MemoryNodeType } from '@noriq-dev/shared';
  * internal representation across this boundary, so `indexer.ts` never has to know which kind of
  * adapter it is holding.
  *
+ * **`parse` returns a `Promise`** — amended by RUN-216, which is the reason this was not settled as
+ * plain synchronous code the way this paragraph originally read. `WebAssembly.instantiate` (what
+ * `Parser.init()`/`Language.load` compile onto) is unavoidably async in JS; there is no synchronous
+ * escape hatch that stays inside RUN-216's locked WASM-only packaging decision. This changes
+ * nothing about the "zero model tokens" property below — the awaited work is a one-shot, in-process
+ * WASM compile, not a network round trip or a partial/streamed result — so a caller still gets
+ * back one complete `AdapterParseResult` or nothing, exactly as before, just awaited on the way.
+ * `NOOP_ADAPTER` returns a resolved `Promise` for the same reason every implementation must now.
+ *
  * **An adapter only ever sees ONE file's decoded text** — no cross-file knowledge, no import
  * resolution, no project-wide symbol table. `indexer.ts` calls `parse` once per candidate; edges
  * beyond a file's own `declares` (file → its symbols) are a later phase's job once cross-file
@@ -24,9 +33,10 @@ import type { MemoryNodeType } from '@noriq-dev/shared';
  * **Zero model tokens** (locked decision 10, restated for this seam specifically): every adapter
  * `indexer.ts` will ever call — this task's `NOOP_ADAPTER`, RUN-216/218's real ones — is
  * deterministic code operating on bytes already in memory. Nothing in this interface's shape makes
- * room for an LLM call (no prompt, no async streaming, no partial/interruptible result), which is
- * deliberate: a parser adapter that needed a network round trip would defeat the whole point of a
- * token-free pass that can run on every base movement.
+ * room for an LLM call (no prompt, no partial/interruptible result, no network round trip), which
+ * is deliberate: a parser adapter that needed one would defeat the whole point of a token-free pass
+ * that can run on every base movement. `Promise`-returning is not an exception to this — see the
+ * note above `parse`'s own signature.
  *
  * **Adapters are consulted content-mode gated, by the CALLER, not by this file** — `indexer.ts`
  * only invokes `parse` for a candidate whose content survived (`contentMode: 'full'`); a
@@ -64,6 +74,45 @@ export interface ParsedDiagnostic {
   severity: 'error' | 'warning';
 }
 
+/**
+ * Whether an adapter is stating a fact it can prove from what it saw, or a fact it believes but
+ * cannot fully back (RUN-216 locked decision 7). Spelled as two plain words rather than a score so
+ * a renderer can show either straight to a human with no legend (discretion): `resolved` reads as
+ * "this is what the code does", `inferred` reads as "this is what the code probably does". There
+ * is deliberately no third option collapsing the two — an adapter that cannot tell which it has
+ * DECLINES instead (RUN-216 locked decision 6), it never picks a default confidence for a guess.
+ */
+export type EdgeConfidence = 'resolved' | 'inferred';
+
+/**
+ * One import statement an adapter could read as a literal, static specifier — never a resolved
+ * file/symbol URI. `index-adapters.ts`'s own constraint ("an adapter only ever sees ONE file's
+ * decoded text") makes resolving `specifier` to another file's entity a cross-file question this
+ * per-file adapter cannot answer; recording the specifier text itself is not a guess, it is what
+ * the source literally says. A specifier an adapter cannot read statically (a computed dynamic
+ * `import(expr)`) is DECLINED by never appearing here at all, never emitted with a placeholder.
+ */
+export interface ParsedImport {
+  specifier: string;
+}
+
+/**
+ * One call site an adapter could resolve to a specific symbol declared IN THE SAME FILE — never a
+ * cross-file target, for the same one-file-at-a-time reason `ParsedImport.specifier` stays literal
+ * text. `fromSymbolPath`/`toSymbolPath` are RAW (pre-dedup) symbol paths matching some entry this
+ * same `parse()` call also returned in `symbols`; a path matching nothing there is dropped by the
+ * caller rather than trusted (`indexer.ts`'s own may-miss-never-invent posture, one level down from
+ * the adapter). A call an adapter cannot tie to exactly one declared symbol — a call through a
+ * member expression on something other than `this`, a dynamic dispatch, an imported or global
+ * function — is DECLINED by omission, never emitted at low confidence with a guessed target
+ * (locked decision 6: confidence distinguishes two ways of being RIGHT, never licenses a guess).
+ */
+export interface ParsedCall {
+  fromSymbolPath: string[];
+  toSymbolPath: string[];
+  confidence: EdgeConfidence;
+}
+
 export interface AdapterParseInput {
   /** Repository-relative, forward-slash path — already normalized by the caller. */
   path: string;
@@ -76,6 +125,13 @@ export interface AdapterParseInput {
 export interface AdapterParseResult {
   symbols: ParsedSymbol[];
   diagnostics: ParsedDiagnostic[];
+  /** Absent/empty for an adapter that never attempts imports (locked decision 6: declinable
+   *  independently of `calls`) — never a required field an adapter has to remember to satisfy. */
+  imports?: ParsedImport[];
+  /** Absent/empty for an adapter that never attempts calls, or that attempted every call site in
+   *  this file and reliably resolved none of them — indistinguishable from each other on purpose,
+   *  since both mean "no edge", the property `indexer.ts`'s tests hold it to. */
+  calls?: ParsedCall[];
 }
 
 /**
@@ -94,7 +150,7 @@ export interface IndexParserAdapter {
    *  parser instead of the whole daemon. */
   readonly version: string;
   canParse(path: string): boolean;
-  parse(input: AdapterParseInput): AdapterParseResult;
+  parse(input: AdapterParseInput): Promise<AdapterParseResult>;
 }
 
 /**
@@ -138,7 +194,7 @@ export const NOOP_ADAPTER: IndexParserAdapter = {
   id: 'noop',
   version: '1',
   canParse: () => true,
-  parse: () => ({ symbols: [], diagnostics: [] }),
+  parse: async () => ({ symbols: [], diagnostics: [] }),
 };
 
 /**
