@@ -3,6 +3,8 @@ import { readFile, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { CHANGES_BETWEEN_MAX_PATHS } from '../worktree';
+import { DiversionIndexSource, decodeObjectStatus, isDirectoryMode } from './diversion-index-source';
 import type { LockDelegate } from './git';
 import type {
   ChangesBetweenResult,
@@ -58,6 +60,12 @@ const execFileP = promisify(execFile);
  * this in-process queue is — and two DAEMONS on one workspace are not defended against; the
  * workspace registry is `~/.diversion/ws`, one agent per machine, so one daemon per machine
  * is the operating assumption.
+ *
+ * `leaseIndexSnapshot`/`changesBetween` (RUN-255, both refused `unsupported`/`full-index-required`
+ * by RUN-211/212 for want of a measured path) are DELIBERATELY outside the pool-of-1 lease and the
+ * CLI split above: background indexing reads, so it is pure API — no checkout, no workspace, ever
+ * — and cannot contend with a run holding the lease. `diversion-index-source.ts`'s module doc
+ * carries the measurement (a live account, 2026-08-09) behind both.
  */
 
 export interface DvHttpResponse {
@@ -113,6 +121,43 @@ export const realDvHttp =
     return { status: res.status, body: parsed };
   };
 
+export interface DvBlobResult {
+  status: number;
+  /** Present only when `status === 200` — the embedded blob bytes. */
+  bytes?: Buffer;
+  /** Free text for logs on a non-200 status — never structure a caller branches on. */
+  detail?: string;
+}
+
+/**
+ * Injectable raw-bytes transport for blob content (RUN-255) — kept separate from `DvHttp` on
+ * purpose, not merely for symmetry: `realDvHttp` always decodes its response as JSON (`res.text()`
+ * then `JSON.parse`), and that would corrupt binary content — a `.text()` read forces UTF-8
+ * decoding, and a byte sequence that is not valid UTF-8 (any binary asset, and plenty of "text"
+ * files that are not UTF-8) comes back with silent U+FFFD replacement characters, no error to
+ * catch it. `force_blob_embedding=true` is what keeps a content read to ONE request against
+ * `api.diversion.dev`: without it the endpoint answers `204` with a signed redirect to a Cloudflare
+ * R2 URL (measured 2026-08-09) that this transport would otherwise have to follow itself, outside
+ * the Bearer-token auth this whole file is scoped to.
+ */
+export type DvBlobHttp = (repoId: string, refId: string, path: string) => Promise<DvBlobResult>;
+
+export const realDvBlobHttp =
+  (fetchFn: typeof fetch = fetch, home?: string): DvBlobHttp =>
+  async (repoId, refId, filePath) => {
+    const token = await dvStoredToken(home);
+    const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
+    const res = await fetchFn(
+      `${DV_API_BASE}/repos/${encodeURIComponent(repoId)}/blobs/${encodeURIComponent(refId)}/${encodedPath}?force_blob_embedding=true`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (res.status !== 200) {
+      const detail = await res.text().catch(() => '');
+      return { status: res.status, detail: detail.slice(0, 500) };
+    }
+    return { status: 200, bytes: Buffer.from(await res.arrayBuffer()) };
+  };
+
 export const realDvCli: DvCli = async (args, cwd) => {
   const { stdout, stderr } = await execFileP('dv', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
   return { stdout, stderr };
@@ -140,6 +185,28 @@ function dvLocation(ws: Workspace): DvLocation {
   );
 }
 
+/**
+ * What this backend stashes in an `IndexSnapshot`'s `location` (RUN-255) — tagged with a
+ * discriminant `DvLocation` above does not carry, for exactly the reason `git.ts`'s
+ * `GitIndexSnapshotLocation` gives (see that file's comment): `IndexSnapshot` and `Workspace` are
+ * structurally close enough that a `Workspace` satisfies this type by ordinary structural typing,
+ * so `kind` is what lets `dvIndexSnapshotLocation` refuse a foreign object instead of acting on it.
+ */
+interface DvIndexSnapshotLocation {
+  kind: 'index-snapshot';
+  repoId: string;
+}
+
+function dvIndexSnapshotLocation(snapshot: IndexSnapshot): DvIndexSnapshotLocation {
+  const loc = snapshot.location as Partial<DvIndexSnapshotLocation> | null | undefined;
+  if (loc?.kind === 'index-snapshot' && typeof loc.repoId === 'string') {
+    return { kind: 'index-snapshot', repoId: loc.repoId };
+  }
+  throw new Error(
+    'Diversion refuses to release an index snapshot it did not mint — it was minted by another backend or an incompatible daemon version',
+  );
+}
+
 /** The page a human resolves a pending merge on — the CLI prints exactly this shape (§9). */
 export const dvMergeUrl = (repoId: string, mergeId: string): string =>
   `https://app.diversion.dev/repo/${repoId}/merges/${mergeId}`;
@@ -149,6 +216,9 @@ export interface DiversionBackendOpts {
   repoId: string;
   http?: DvHttp;
   cli?: DvCli;
+  /** Content transport for background indexing (RUN-255) — see `DvBlobHttp`'s doc for why it is
+   *  not just `http` again. Unused by anything except `leaseIndexSnapshot`'s snapshot. */
+  blobHttp?: DvBlobHttp;
   /** The Noriq lock view (RUN-100). Diversion's own soft locks are Pro-gated, so the runner's
    *  cross-run coordination + the unified dashboard live in the Noriq lock primitive (the same
    *  primitive git uses); the native soft lock is layered on best-effort and DEGRADES to the
@@ -172,6 +242,7 @@ export class DiversionBackend implements VcsBackend {
   private readonly repoId: string;
   private readonly http: DvHttp;
   private readonly cli: DvCli;
+  private readonly blobHttp: DvBlobHttp;
   private readonly locks?: LockDelegate;
   /**
    * The pool-of-1 lease: one exclusive occupant of the repo's workspace at a time, in-process.
@@ -188,6 +259,7 @@ export class DiversionBackend implements VcsBackend {
     this.repoId = opts.repoId;
     this.http = opts.http ?? realDvHttp();
     this.cli = opts.cli ?? realDvCli;
+    this.blobHttp = opts.blobHttp ?? realDvBlobHttp();
     this.locks = opts.locks;
   }
 
@@ -519,56 +591,159 @@ export class DiversionBackend implements VcsBackend {
   }
 
   /**
-   * Try-acquire only, never enqueue (RUN-211 locked decision 5): a snapshot requested while this
-   * process holds the pool-of-1 lease — exactly when indexing is triggered, right after landing
-   * or publishing — must not wait behind it, or it deadlocks with nothing to time out, the same
-   * shape `integrateFromRun`'s doc warns about one verb over. `held` IS the pool's occupancy
-   * (populated in `lease`, cleared in `dispose`), so checking its size answers "is the pool held"
-   * without touching `queue` — the chain this must never join.
-   *
-   * When the pool is free this still answers `unsupported`, deliberately the conservative half of
-   * the execution spec's discretion note: a real in-place snapshot (a second checkout, or reading
-   * through the CLI without touching the leased workspace) has never been measured against a live
-   * server, and this file's whole discipline (§9) is measured shape or nothing. Revisit only once
-   * that measurement exists.
+   * NEVER `busy`, NEVER touches `held`/`queue` (RUN-255 locked decision 1) — a reversal of
+   * RUN-211's try-acquire posture, not a refinement of it. RUN-211's `busy` check assumed a
+   * hypothetical snapshot mechanism that might share the pool-of-1 workspace or the CLI with a
+   * held run lease, and refused to even TRY rather than risk the `integrateFromRun`-shaped
+   * deadlock a queued wait would be. That assumption no longer holds: this snapshot is pure REST
+   * API — no checkout, no workspace, no CLI call anywhere in it — so it has nothing to contend
+   * with a held lease OVER. Checking `held.size` here would refuse a real, safe acquisition for a
+   * contention that cannot occur, which is worse than the stale check being merely redundant: it
+   * would report `busy` for indexing running the entire time a build run is active, which is
+   * exactly when landing/publishing triggers it. The snapshot is pinned to the repo's DEFAULT
+   * branch's current head (never a moving branch NAME — a long scan must not have its base slide
+   * out from under it), read via `GET /repos/{repo}` then `branchHead`, the same lookup `lease`
+   * already trusts — with one deliberate deviation `lease` does not need: `branchHead` is called
+   * with `default_branch_ID`, never `default_branch_NAME`, because `GET /branches/{name}` measured
+   * a reproducible `500` on this account's own default branch (named `main`) while
+   * `GET /branches/{id}` (the SAME endpoint, an id instead of a name) answered `200` every time —
+   * `branchHead` places whatever string it is given straight into that one URL segment, so this
+   * costs nothing but the choice of which field to read. `default_branch_name` is kept only for
+   * the snapshot's own DISPLAY field (`IndexSnapshot.branch`'s contract: never an operand).
    */
   async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
-    if (this.held.size > 0) return { ok: false, reason: 'busy' };
-    return {
-      ok: false,
-      reason: 'unsupported',
-      detail:
-        'Diversion has no measured read-only snapshot path (§9) — only the pool-of-1 workspace lease exists today',
-    };
-  }
+    const repoRes = await this.api('GET', '');
+    if (repoRes.status !== 200) {
+      return {
+        ok: false,
+        reason: 'unsupported',
+        detail: `could not read repo ${this.repoId} to resolve its default branch: HTTP ${repoRes.status}`,
+      };
+    }
+    const repoBody = repoRes.body as { default_branch_id?: string; default_branch_name?: string };
+    const branchId = repoBody.default_branch_id;
+    const branch = repoBody.default_branch_name;
+    if (!branchId || !branch) {
+      return { ok: false, reason: 'unsupported', detail: `repo ${this.repoId} reports no default branch` };
+    }
+    const baseId = await this.branchHead(branchId);
+    if (baseId === null) {
+      return {
+        ok: false,
+        reason: 'unsupported',
+        detail: `default branch ${branch} (${branchId}) in ${this.repoId} has no commits yet`,
+      };
+    }
 
-  /** Never mints a snapshot (see `leaseIndexSnapshot`), so anything reaching here is foreign —
-   *  refuse it outright, the same discipline `dvLocation` applies to a foreign `Workspace`. */
-  async releaseIndexSnapshot(_snapshot: IndexSnapshot): Promise<void> {
-    throw new Error(
-      'Diversion never mints an index snapshot — nothing here was leased, refusing to touch it',
-    );
+    return {
+      ok: true,
+      snapshot: {
+        source: new DiversionIndexSource(this.repoId, baseId, this.http, this.blobHttp),
+        baseId,
+        branch,
+        readOnly: true,
+        location: { kind: 'index-snapshot', repoId: this.repoId } satisfies DvIndexSnapshotLocation,
+      },
+    };
   }
 
   /**
-   * No cross-commit compare has been measured against a live Diversion server (RUN-212): §9
-   * proved branch heads (`GET /branches/{name}`) and server-side merges, never an arbitrary
-   * from/to diff across the whole tree. Answering `full-index-required` unconditionally is
-   * `openReview`'s precedent applied here (locked decision 5) — present, and naming what a real
-   * implementation needs, rather than silently absent. A real one would need a MEASURED endpoint
-   * (a `GET /diff?from=&to=` or equivalent) that reports path-level changes AND deletions and
-   * decomposes renames the way this interface requires (`ChangesBetweenResult`'s locked decision
-   * 3) — no such surface has been checked against api.diversion.dev.
+   * Idempotent no-op past the identity check (RUN-255): unlike git's snapshot, this one never
+   * materialized anything — no checkout, no directory, no server-side reservation — so there is
+   * nothing to give back beyond confirming the caller is not handing this backend a foreign
+   * object (`dvIndexSnapshotLocation` applies the same discipline `dvLocation` applies to a
+   * foreign `Workspace`). `source.close?.()` is called anyway, defensively, in case a future
+   * source variant ever holds something open.
    */
-  async changesBetween(_repoRoot: string, _from: string, _to: string): Promise<ChangesBetweenResult> {
-    return {
-      ok: false,
-      reason: 'full-index-required',
-      detail:
-        'Diversion has no measured cross-commit diff path (§9 covered branch heads and merges, ' +
-        'not an arbitrary from/to compare) — a real implementation needs a measured diff ' +
-        'endpoint that reports deletions and decomposes renames',
+  async releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void> {
+    dvIndexSnapshotLocation(snapshot);
+    await snapshot.source.close?.();
+  }
+
+  /**
+   * `GET /repos/{repo}/compare?base_id=&other_id=&recurse=all_changes` (RUN-255, measured live) —
+   * `diversion-index-source.ts`'s module doc carries the full measurement; this is the decode.
+   * Every item's `other_item` is present even for a pure deletion (a tombstone entry: same path,
+   * a canonical "deleted" hash, no `blob`) — measured across 10,637 real items, zero exceptions —
+   * so `other_item` absent is treated as an answer this file cannot trust rather than guessed at.
+   * A directory tombstone or add (`mode` TREE/SUBREPO) is skipped: `recurse=all_changes` also lists
+   * the FILES inside a new/deleted folder as their own items, so nothing is lost by ignoring the
+   * folder-level entry itself (measured: a 227-item "move a directory tree" diff carried individual
+   * file adds/deletes alongside the directory-level ones).
+   *
+   * `has_restricted_files` escalates the WHOLE answer (locked decision 8): never measured `true`
+   * against this OWNER-access account, but a `true` means some paths were filtered from `items`
+   * by permissions, and reporting the rest as complete would be the same harm an empty diff is —
+   * a stale generation served as current because nobody could see what was missing.
+   */
+  async changesBetween(_repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
+    const res = await this.api(
+      'GET',
+      `/compare?base_id=${encodeURIComponent(from)}&other_id=${encodeURIComponent(to)}&recurse=all_changes`,
+    );
+    if (res.status !== 200) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `compare ${from}..${to} in ${this.repoId} failed: HTTP ${res.status}`,
+      };
+    }
+
+    const body = res.body as {
+      items?: Array<{
+        status: number;
+        other_item?: { path: string; mode: number; prev_path?: string };
+      }>;
+      has_restricted_files?: boolean;
     };
+    if (body.has_restricted_files) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `compare ${from}..${to} in ${this.repoId} reports has_restricted_files — the listing is incomplete, not a full diff`,
+      };
+    }
+
+    const changed = new Set<string>();
+    const deleted = new Set<string>();
+    for (const item of body.items ?? []) {
+      const oi = item.other_item;
+      if (!oi) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `compare ${from}..${to} in ${this.repoId} returned an item with no other_item — cannot express it`,
+        };
+      }
+      if (isDirectoryMode(oi.mode)) continue; // directories are never index candidates.
+
+      const verb = decodeObjectStatus(item.status);
+      if (verb === null) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `compare ${from}..${to} in ${this.repoId} reported an unrecognized status ${item.status} at ${oi.path}`,
+        };
+      }
+      if (verb === 'intact') continue; // never seen on a real from/to compare — no-op if it is.
+      if (verb === 'deleted') {
+        deleted.add(oi.path);
+      } else {
+        changed.add(oi.path);
+      }
+      // A rename hands the OLD path directly (locked decision 5) — no rename arm, no heuristic:
+      // the old path is removed from the index, the new path is (re-)read into it.
+      if (oi.prev_path && oi.prev_path !== oi.path) deleted.add(oi.prev_path);
+    }
+
+    if (changed.size + deleted.size > CHANGES_BETWEEN_MAX_PATHS) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${changed.size + deleted.size} changed paths between ${from} and ${to} exceeds the ${CHANGES_BETWEEN_MAX_PATHS}-path cap`,
+      };
+    }
+    return { ok: true, changed: [...changed], deleted: [...deleted] };
   }
 
   /**

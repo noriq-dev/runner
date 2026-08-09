@@ -1,11 +1,15 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { AgentDriver, DriverExit, DriverStartOptions } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
+import { scanIndexSource } from '../src/index-scan';
 import { FakeIndexSource } from '../src/index-source';
 import { RunSupervisor } from '../src/supervisor';
-import { DiversionBackend, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
+import { DiversionBackend, type DvBlobHttp, type DvCli, type DvHttp, dvMergeUrl } from '../src/vcs/diversion';
+import { DiversionIndexSource } from '../src/vcs/diversion-index-source';
 import type { LockDelegate } from '../src/vcs/git';
 import type { VcsBackend } from '../src/vcs/types';
+import { CHANGES_BETWEEN_MAX_PATHS } from '../src/worktree';
 
 /** A fake Noriq lock view (the authoritative coordination layer), recording calls. */
 function fakeLocks(acquireResult: unknown = { ok: true, enabled: true, locks: [] }) {
@@ -581,55 +585,629 @@ describe('RunSupervisor over DiversionBackend — the interface survives a live-
   });
 });
 
-// RUN-211: Diversion has no measured read-only snapshot path (§9), so it only ever answers
-// unsupported — but the pool-contention check is real and testable without a server, and is
-// exactly what stands between a background indexer and the deadlock `leaseIndexSnapshot`'s doc
-// warns about (waiting behind a run lease this same process holds, with nothing to time out).
-describe('DiversionBackend — index snapshot (RUN-211): try-acquire only, never a real snapshot', () => {
-  it('answers unsupported when the pool is free — no measured snapshot path exists here', async () => {
-    const { backend } = fakes({});
+// ---------------------------------------------------------------------------
+// RUN-255: `leaseIndexSnapshot`/`changesBetween` measured live against a real Diversion account
+// (2026-08-09, dv CLI v1.0.1017, repo `dv.repo.e821a7a1-382e-4466-a906-61a2b19694f1`, ~7259 files).
+// Every fixture body below is copied VERBATIM from that capture (locked decision 11) — trimmed to
+// the few items each test needs, never paraphrased or hand-invented, except where a comment says
+// otherwise (a field this OWNER-access account never triggered live: `has_restricted_files: true`,
+// `access_denied: true`, an unrecognized `status`, and the "no other_item" defensive branch —
+// each of those is a documented schema shape exercised synthetically, not a captured response).
+// ---------------------------------------------------------------------------
+
+const REPO_ID = 'dv.repo.test';
+
+/** Verbatim `GET /repos/{repo}` body (repo id/name swapped for the test double's `REPO_ID`). */
+const REPO_META = {
+  repo_id: REPO_ID,
+  repo_name: 'Prototype',
+  description: '',
+  size_bytes: 10445915824,
+  owner_user_id: 'dv.u.ef7919578bc5ec51',
+  created_timestamp: 1783542398,
+  digest_method: 'sha1',
+  def_auto_forwarding_enabled: true,
+  default_branch_id: 'dv.branch.1',
+  default_branch_name: 'main',
+  organization_id: 'dv.org.b98b1df5-fa30-4e40-9cbe-e801f50e600b',
+};
+
+/** Verbatim first 6 items of a live `GET /trees/{ref}?recurse=true` page — two real directories
+ *  (`.noriq`, `.ue-mcp`, both mode 16877, no `blob`) interleaved with real files. */
+const TREE_PAGE_SAMPLE = {
+  items: [
+    {
+      path: '.dvignore',
+      hash: '728102a860988f6697b4e80f59535a0f4b263ac2',
+      status: 1,
+      mode: 33188,
+      mtime: '2026-07-23T01:21:32+00:00',
+      blob: { storage_uri: `${REPO_ID}/de/7a/de7a666`, storage_backend: 1101, size: 1595, sha: 'de7a666' },
+    },
+    {
+      path: '.ignore',
+      hash: '683d5b42235d84c688e1cd1408576e0e1b7b636b',
+      status: 1,
+      mode: 33188,
+      mtime: '2026-07-10T17:25:17+00:00',
+      blob: { storage_uri: `${REPO_ID}/45/e5/45e5877`, storage_backend: 1101, size: 517, sha: 'c88b690' },
+    },
+    {
+      path: '.noriq',
+      hash: '1188d1a38462a673de6bb357f528113bc439cf9d',
+      status: 1,
+      mode: 16877,
+      mtime: '2026-07-16T20:58:38+00:00',
+    },
+    {
+      path: '.ue-mcp',
+      hash: '1188d1a38462a673de6bb357f528113bc439cf9d',
+      status: 1,
+      mode: 16877,
+      mtime: '2026-07-12T22:58:51+00:00',
+    },
+    {
+      path: '.ue-mcp/native-modules.json',
+      hash: '8a043549654338eb54b51d671e1359252fbc8354',
+      status: 1,
+      mode: 33188,
+      mtime: '2026-07-12T23:00:24+00:00',
+      blob: { storage_uri: `${REPO_ID}/ce/8d/ce8d3d5`, storage_backend: 1101, size: 2953, sha: '548a134' },
+    },
+    {
+      path: 'AGENTS.md',
+      hash: '48f7a164cb0472d4259384c5752cba01bfbd2c62',
+      status: 1,
+      mode: 33188,
+      mtime: '2026-07-13T17:08:58+00:00',
+      blob: { storage_uri: `${REPO_ID}/ba/d9/bad95db`, storage_backend: 1101, size: 16580, sha: 'bad95db' },
+    },
+  ],
+};
+
+/** Verbatim `dv.commit.472..473` compare item — a real MODIFIED file (top-level `status: 3`,
+ *  matching `other_item.status: 3`; `base_item.status: 1` — the per-side field this backend never
+ *  reads, see `decodeObjectStatus`'s doc). */
+const COMPARE_MODIFY_ITEM = {
+  status: 3,
+  base_item: {
+    path: 'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/Private/NodRuntimeGarmentFitEvaluator.cpp',
+    hash: 'd8cdc4483d8f47d9a534143f5da238326034d82f',
+    status: 1,
+    mode: 33188,
+    prev_path:
+      'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/Private/NodRuntimeGarmentFitEvaluator.cpp',
+    prev_hash: 'f915525785d6ff8de6077e5d2f28035ce4f08583',
+    mtime: '2026-08-05T11:23:51+00:00',
+    blob: { storage_uri: `${REPO_ID}/72/ad/72ad034`, storage_backend: 1101, size: 42951, sha: '188ebd8' },
+  },
+  other_item: {
+    path: 'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/Private/NodRuntimeGarmentFitEvaluator.cpp',
+    hash: '0c81932e934021acdd7ec3a33a5fdbfbabd5e147',
+    status: 3,
+    mode: 33188,
+    prev_path:
+      'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/Private/NodRuntimeGarmentFitEvaluator.cpp',
+    prev_hash: 'd8cdc4483d8f47d9a534143f5da238326034d82f',
+    mtime: '2026-08-05T22:30:34+00:00',
+    blob: { storage_uri: `${REPO_ID}/87/1e/871e408`, storage_backend: 1101, size: 44459, sha: '871e408' },
+  },
+};
+
+/** Verbatim `dv.commit.12..13` compare item — a plain DELETION: `other_item` is a TOMBSTONE (no
+ *  `blob`, the canonical "deleted" hash `185135d1…`, `prev_path` equal to `path` since nothing
+ *  moved), present alongside `base_item` in every one of 10,637 items measured — never absent. */
+const COMPARE_DELETE_ITEM = {
+  status: 4,
+  base_item: {
+    path: '.ignore',
+    hash: '239395f36d8da53004020d8409a235de27c30a21',
+    status: 1,
+    mode: 33188,
+    mtime: '2026-07-10T15:06:59+00:00',
+    blob: { storage_uri: `${REPO_ID}/9c/0f/9c0f0cc`, storage_backend: 1101, size: 459, sha: '1beb1f9' },
+  },
+  other_item: {
+    path: '.ignore',
+    hash: '185135d170e228e5442e1b14b410cb58a1a87d3f',
+    status: 4,
+    mode: 33188,
+    prev_path: '.ignore',
+    prev_hash: '239395f36d8da53004020d8409a235de27c30a21',
+    mtime: '2026-07-10T16:28:38+00:00',
+  },
+};
+
+/** Verbatim `dv.commit.7..8` compare item — a real detected RENAME: no `base_item` at all, one
+ *  `other_item` whose `prev_path` names the OLD path directly (locked decision 5) — the only
+ *  rename Diversion's own move-detection surfaced across a 472-commit scan of this account. */
+const COMPARE_RENAME_ITEM = {
+  status: 3,
+  other_item: {
+    path: 'Plugins/NodEcs/Source/NodEcs/Public/Entity/EcsEntityHandle.h',
+    hash: '5143ee7b03a3ea0cabaabfa4b515f4bfb2b9a264',
+    status: 3,
+    mode: 33188,
+    prev_path: 'Plugins/NodEcs/Source/NodEcs/Public/Entity/EntityHandle.h',
+    prev_hash: '17e4842404c0d28f69ae7740b3f74da6abaf044a',
+    mtime: '2026-07-10T15:10:21+00:00',
+    blob: { storage_uri: `${REPO_ID}/c6/c8/c6c8c55`, storage_backend: 1101, size: 1740, sha: 'ffe569c' },
+  },
+};
+
+/** Verbatim `dv.commit.442..443` compare item — a directory ADD (mode 16877, no `blob`): the
+ *  "Move authored wearables" commit's own tombstone/creation records for the directories
+ *  themselves, alongside per-file records for everything inside (measured: 227 items, 75 of them
+ *  directory-mode). */
+const COMPARE_DIRECTORY_ADD_ITEM = {
+  status: 2,
+  other_item: {
+    path: 'Config',
+    hash: '1188d1a38462a673de6bb357f528113bc439cf9d',
+    status: 1,
+    mode: 16877,
+    mtime: '2026-07-08T20:39:55+00:00',
+  },
+};
+
+/** Verbatim 401 body from a request with a corrupted bearer token — the general shape every
+ *  credential failure (including an expired one, per the task's own measurement note) answers
+ *  with: `{status, title, detail}`, never a 2xx with an empty/partial body. */
+const UNAUTHORIZED_BODY = {
+  detail: "Invalid header string: 'utf-8' codec can't decode byte 0x81 in position 0: invalid start byte",
+  status: 401,
+  title: 'DecodeError',
+  type: 'about:blank',
+};
+
+/** A dedicated fake transport for the indexing surface — deliberately separate from `fakes()`
+ *  above (branches/merges/locks), because `/trees`, `/compare` and blob reads are a different
+ *  shape of call than anything the run-lease surface makes. */
+function indexFakes(opts: {
+  repoStatus?: number;
+  repoBody?: unknown;
+  branches?: Record<string, string>;
+  treePage?: (skip: number) => { status: number; body: unknown };
+  compare?: { status: number; body: unknown };
+  fileEntries?: Record<string, unknown>;
+  blobs?: Record<string, { status: number; bytes?: Buffer; detail?: string }>;
+}) {
+  const httpCalls: string[] = [];
+  const blobCalls: string[] = [];
+
+  const branches: Record<string, string> = { ...opts.branches };
+
+  const http: DvHttp = async (method, apiPath) => {
+    httpCalls.push(`${method} ${apiPath}`);
+    if (method === 'GET' && /^\/repos\/[^/?]+$/.test(apiPath)) {
+      return { status: opts.repoStatus ?? 200, body: opts.repoBody ?? REPO_META };
+    }
+    const branchGet = apiPath.match(/\/branches\/([^/?]+)$/);
+    if (method === 'GET' && branchGet) {
+      const name = decodeURIComponent(branchGet[1] ?? '');
+      const commit = branches[name];
+      return commit ? { status: 200, body: { commit_id: commit } } : { status: 404, body: null };
+    }
+    // `lease()` (exercised by the "held run lease" test) creates the run's own branch — not part
+    // of the indexing surface, but needed so that test can hold a REAL lease alongside a snapshot.
+    if (method === 'POST' && apiPath.includes('/branches?')) {
+      const name = decodeURIComponent(apiPath.match(/branch_name=([^&]+)/)?.[1] ?? '');
+      const commit = decodeURIComponent(apiPath.match(/commit_id=([^&]+)/)?.[1] ?? '');
+      branches[name] = commit;
+      return { status: 201, body: { branch_id: name } };
+    }
+    const treeMatch = apiPath.match(/\/trees\/[^/?]+\?(.+)$/);
+    if (method === 'GET' && treeMatch) {
+      const skip = Number(new URLSearchParams(treeMatch[1]).get('skip') ?? '0');
+      return opts.treePage?.(skip) ?? { status: 200, body: { items: [] } };
+    }
+    if (method === 'GET' && apiPath.includes('/compare?')) {
+      return opts.compare ?? { status: 200, body: { items: [] } };
+    }
+    const fileMatch = apiPath.match(/\/files\/[^/]+\/(.+)$/);
+    if (method === 'GET' && fileMatch) {
+      const p = decodeURIComponent(fileMatch[1] ?? '');
+      const entry = opts.fileEntries?.[p];
+      return entry ? { status: 200, body: entry } : { status: 404, body: null };
+    }
+    throw new Error(`index fake has no answer for ${method} ${apiPath}`);
+  };
+
+  const blobHttp: DvBlobHttp = async (_repoId, _refId, filePath) => {
+    blobCalls.push(filePath);
+    return opts.blobs?.[filePath] ?? { status: 404 };
+  };
+
+  return { http, blobHttp, httpCalls, blobCalls };
+}
+
+const dummyCli: DvCli = async (args) => ({ stdout: args[0] === 'branch-name' ? 'main\n' : '', stderr: '' });
+
+describe('DiversionBackend — index snapshot (RUN-255): real, API-only, never busy', () => {
+  it('mints a real snapshot pinned to the default branch head — WHILE a run lease is held (locked decision 1: no pool contention)', async () => {
+    // `lease()` (called below) resolves `main` by NAME via the CLI's own `branch-name` output;
+    // `leaseIndexSnapshot` resolves the default branch by ID (`dv.branch.1`) — see that method's
+    // doc for why the two differ. Both keys point at the same live head.
+    const { http, blobHttp } = indexFakes({
+      branches: { main: 'dv.commit.473', 'dv.branch.1': 'dv.commit.473' },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+
+    // Hold the pool-of-1 run lease for the ENTIRE call — proving the old RUN-211 busy check
+    // (removed under locked decision 1) is gone: this API-only snapshot never touches `held`.
+    const runWs = await backend.lease('/repo', 'run_1');
+
+    const res = await backend.leaseIndexSnapshot('/repo');
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('unreachable');
+    expect(res.snapshot).toMatchObject({
+      baseId: 'dv.commit.473',
+      branch: 'main',
+      readOnly: true,
+      location: { kind: 'index-snapshot', repoId: REPO_ID },
+    });
+    expect(res.snapshot.source).toBeInstanceOf(DiversionIndexSource);
+    expect(res.snapshot.source.kind).toBe('diversion');
+    expect(res.snapshot.localPath).toBeUndefined(); // materializes nothing (locked decision 1).
+
+    await backend.dispose(runWs);
+  });
+
+  it('answers unsupported when the repo lookup itself fails', async () => {
+    const { http, blobHttp } = indexFakes({ repoStatus: 500 });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
     expect(await backend.leaseIndexSnapshot('/repo')).toEqual({
       ok: false,
       reason: 'unsupported',
-      detail: expect.stringContaining('Diversion'),
+      detail: expect.stringContaining('500'),
     });
   });
 
-  it('answers busy IMMEDIATELY while a run holds the pool — never chains onto the lease queue', async () => {
-    const { backend } = fakes({});
-    const held = await backend.lease('/repo', 'run_1'); // holds the pool; never disposed here
-    // If this wrongly chained onto `queue`, it would hang until `dispose` — which never runs in
-    // this test — and the vitest default timeout would fail the test rather than this awaiting
-    // forever silently.
-    expect(await backend.leaseIndexSnapshot('/repo')).toEqual({ ok: false, reason: 'busy' });
-    await backend.dispose(held);
+  it('answers unsupported when the repo reports no default branch', async () => {
+    const { http, blobHttp } = indexFakes({ repoBody: { ...REPO_META, default_branch_name: undefined } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    expect(await backend.leaseIndexSnapshot('/repo')).toMatchObject({ ok: false, reason: 'unsupported' });
   });
 
-  it('releaseIndexSnapshot refuses everything — this backend never mints a snapshot to release', async () => {
-    const { backend } = fakes({});
+  it('answers unsupported when the default branch has no commits yet', async () => {
+    const { http, blobHttp } = indexFakes({ branches: {} }); // main resolves to nothing
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    expect(await backend.leaseIndexSnapshot('/repo')).toMatchObject({ ok: false, reason: 'unsupported' });
+  });
+
+  it('releaseIndexSnapshot is an idempotent no-op for a snapshot this backend minted', async () => {
+    const { http, blobHttp } = indexFakes({ branches: { 'dv.branch.1': 'dv.commit.473' } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.leaseIndexSnapshot('/repo');
+    if (!res.ok) throw new Error('unreachable');
+    await expect(backend.releaseIndexSnapshot(res.snapshot)).resolves.toBeUndefined();
+    await expect(backend.releaseIndexSnapshot(res.snapshot)).resolves.toBeUndefined(); // idempotent.
+  });
+
+  it('releaseIndexSnapshot refuses a snapshot it did not mint', async () => {
+    const { http, blobHttp } = indexFakes({});
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
     await expect(
       backend.releaseIndexSnapshot({
         source: new FakeIndexSource([]),
-        localPath: '/repo',
         baseId: 'x',
         readOnly: true,
-        location: {},
+        location: { repoRoot: '/x', kind: 'git' }, // a foreign (git-shaped) location
       }),
-    ).rejects.toThrow(/never mints an index snapshot/);
+    ).rejects.toThrow(/did not mint/);
   });
 });
 
-// RUN-212: no live server to measure a cross-commit diff against, so this backend always answers
-// full-index-required — but it must do so HONESTLY (never throw, never fabricate an empty diff)
-// and it must name itself, per `openReview`'s precedent (locked decision 5).
-describe('DiversionBackend — changesBetween (RUN-212): unconditional full-index-required', () => {
-  it('never throws, never reports an empty diff, and names the backend in the detail', async () => {
-    const { backend } = fakes({});
-    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+describe('DiversionIndexSource — list() (RUN-255): /trees, sorted, directories filtered', () => {
+  it('yields file entries in the order the tree already reports, skipping both real directories', async () => {
+    const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 200, body: TREE_PAGE_SAMPLE }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const items = [];
+    for await (const item of source.list()) items.push(item);
+    expect(items).toEqual([
+      { kind: 'file', entry: { path: '.dvignore', size: 1595 } },
+      { kind: 'file', entry: { path: '.ignore', size: 517 } },
+      // '.noriq' and '.ue-mcp' (mode 16877 — FileMode_TREE) never appear as candidates.
+      { kind: 'file', entry: { path: '.ue-mcp/native-modules.json', size: 2953 } },
+      { kind: 'file', entry: { path: 'AGENTS.md', size: 16580 } },
+    ]);
+  });
+
+  it('honours shouldDescend — an ancestor the caller denies is pruned before it ever yields', async () => {
+    const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 200, body: TREE_PAGE_SAMPLE }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const items = [];
+    for await (const item of source.list((dir) => dir !== '.ue-mcp')) items.push(item);
+    expect(items.map((i) => (i.kind === 'file' ? i.entry.path : i.path))).toEqual([
+      '.dvignore',
+      '.ignore',
+      'AGENTS.md',
+    ]);
+  });
+
+  it('records an access_denied entry as a refused listing item, never as a silent drop', async () => {
+    // Never observed `true` against the live (OWNER-access) account — the field and its meaning
+    // come from the OpenAPI `FileEntry` schema (locked decision 8's per-entry sibling).
+    const page = {
+      items: [{ path: 'secret/plan.md', mode: 33188, access_denied: true, blob: { size: 10, sha: 'x' } }],
+    };
+    const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 200, body: page }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const items = [];
+    for await (const item of source.list()) items.push(item);
+    expect(items).toEqual([
+      {
+        kind: 'refused',
+        path: 'secret/plan.md',
+        reason: 'unreadable',
+        detail: expect.stringContaining('access-denied'),
+      },
+    ]);
+  });
+
+  it('a non-200 tree response refuses to enumerate — never reports an empty tree', async () => {
+    const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 401, body: UNAUTHORIZED_BODY }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const items = [];
+    for await (const item of source.list()) items.push(item);
+    expect(items).toEqual([
+      { kind: 'refused', path: '.', reason: 'unreadable', detail: expect.stringContaining('401') },
+    ]);
+  });
+
+  it('paginates via limit+skip and stops on a short page', async () => {
+    // Synthetic — proving the CONTINUATION MECHANICS (skip advances, a short/empty page stops the
+    // walk), not the API's content shape (that is what TREE_PAGE_SAMPLE proves). The page size is
+    // an internal constant, so this drives the fake purely off the `skip` value it receives.
+    const page1 = Array.from({ length: 2000 }, (_, i) => ({
+      path: `f${String(i).padStart(4, '0')}`,
+      mode: 33188,
+      blob: { size: 1, sha: 'x' },
+    }));
+    const page2 = [{ path: 'zlast', mode: 33188, blob: { size: 1, sha: 'y' } }];
+    const { http, blobHttp } = indexFakes({
+      treePage: (skip) => ({ status: 200, body: { items: skip === 0 ? page1 : skip === 2000 ? page2 : [] } }),
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const paths = [];
+    for await (const item of source.list()) if (item.kind === 'file') paths.push(item.entry.path);
+    expect(paths.length).toBe(2001);
+    expect(paths[0]).toBe('f0000');
+    expect(paths.at(-1)).toBe('zlast');
+  });
+
+  it('through the shared policy pipeline: config/.env is denied and its content is NEVER fetched', async () => {
+    // Locked decision 9, proved on THIS source specifically: the deny list lives only in
+    // `index-scan.ts`, so this drives the REAL pipeline (`scanIndexSource`), not a hand-rolled
+    // check, and asserts the blob transport was never called for the denied path.
+    const page = { items: [{ path: 'config/.env', mode: 33188, blob: { size: 20, sha: 'x' } }] };
+    const { http, blobHttp, blobCalls } = indexFakes({ treePage: () => ({ status: 200, body: page }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const result = await scanIndexSource(source, {
+      include: [],
+      exclude: [],
+      languages: [],
+      pollIntervalMinutes: 5,
+      maxFiles: 1000,
+      maxFileBytes: 1_000_000,
+      maxTotalBytes: 10_000_000,
+      readDeadlineMs: 60_000,
+      contentMode: 'full',
+    });
+    expect(result.candidates).toEqual([]);
+    expect(result.statuses).toEqual([{ path: 'config/.env', reason: 'denied', detail: expect.any(String) }]);
+    expect(blobCalls).toEqual([]); // never read.
+  });
+});
+
+describe('DiversionIndexSource — read() (RUN-255): /blobs?force_blob_embedding=true', () => {
+  it('reads content within maxBytes', async () => {
+    const { http, blobHttp } = indexFakes({
+      blobs: { 'a.txt': { status: 200, bytes: Buffer.from('hello') } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.read('a.txt', 100)).toEqual({
+      ok: true,
+      bytes: Buffer.from('hello'),
+      overLimit: false,
+    });
+  });
+
+  it('truncates and reports overLimit when the blob exceeds maxBytes (no measured byte-range read)', async () => {
+    const { http, blobHttp } = indexFakes({
+      blobs: { 'big.bin': { status: 200, bytes: Buffer.from('0123456789') } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.read('big.bin', 4)).toEqual({
+      ok: true,
+      bytes: Buffer.from('0123'),
+      overLimit: true,
+    });
+  });
+
+  it('maps 404 to not-found', async () => {
+    const { http, blobHttp } = indexFakes({ blobs: {} });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.read('gone.txt', 100)).toMatchObject({ ok: false, reason: 'not-found' });
+  });
+
+  it('maps 410 (permanently unreachable — the on-demand fetch queue dead-lettered it) to not-found', async () => {
+    const { http, blobHttp } = indexFakes({ blobs: { 'archived.bin': { status: 410 } } });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.read('archived.bin', 100)).toMatchObject({ ok: false, reason: 'not-found' });
+  });
+
+  it('maps any other non-200 to unreadable', async () => {
+    const { http, blobHttp } = indexFakes({ blobs: { 'bad.bin': { status: 500, detail: 'boom' } } });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.read('bad.bin', 100)).toMatchObject({ ok: false, reason: 'unreadable' });
+  });
+
+  it("the scanner's own content hash is a fresh SHA-256 over the bytes, never the blob's sha (locked decision 6)", async () => {
+    const content = Buffer.from('const x = 1;\n');
+    const page = {
+      items: [{ path: 'x.ts', mode: 33188, blob: { size: content.length, sha: 'not-the-hash' } }],
+    };
+    const { http, blobHttp } = indexFakes({
+      treePage: () => ({ status: 200, body: page }),
+      blobs: { 'x.ts': { status: 200, bytes: content } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const result = await scanIndexSource(source, {
+      include: [],
+      exclude: [],
+      languages: [],
+      pollIntervalMinutes: 5,
+      maxFiles: 10,
+      maxFileBytes: 1_000_000,
+      maxTotalBytes: 1_000_000,
+      readDeadlineMs: 60_000,
+      contentMode: 'full',
+    });
+    expect(result.candidates).toHaveLength(1);
+    const expectedHash = createHash('sha256').update(content).digest('hex');
+    expect(result.candidates[0]!.contentHash).toBe(expectedHash);
+    expect(result.candidates[0]!.contentHash).not.toBe('not-the-hash');
+  });
+});
+
+describe('DiversionIndexSource — digest() (RUN-255): a free lookup off list(), never the index hash', () => {
+  it('returns the sha cached during list() without a second round trip', async () => {
+    const { http, blobHttp, httpCalls } = indexFakes({
+      treePage: () => ({ status: 200, body: TREE_PAGE_SAMPLE }),
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    for await (const _ of source.list()) {
+      /* drain to populate the digest cache */
+    }
+    const before = httpCalls.length;
+    expect(await source.digest('.dvignore')).toBe('de7a666');
+    expect(httpCalls.length).toBe(before); // no new call.
+  });
+
+  it('falls back to a live files/{ref}/{path} lookup for an uncached path', async () => {
+    const { http, blobHttp } = indexFakes({
+      fileEntries: { 'a.txt': { path: 'a.txt', blob: { sha: 'abc123' } } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.digest('a.txt')).toBe('abc123');
+  });
+
+  it('returns undefined for a path with no entry anywhere', async () => {
+    const { http, blobHttp } = indexFakes({});
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(await source.digest('nope.txt')).toBeUndefined();
+  });
+});
+
+describe('DiversionBackend — changesBetween (RUN-255): real diff via /compare', () => {
+  it('reports a real modification as changed', async () => {
+    const { http, blobHttp } = indexFakes({
+      compare: { status: 200, body: { items: [COMPARE_MODIFY_ITEM] } },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.472', 'dv.commit.473');
     expect(res).toEqual({
+      ok: true,
+      changed: [
+        'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/Private/NodRuntimeGarmentFitEvaluator.cpp',
+      ],
+      deleted: [],
+    });
+  });
+
+  it('reports a plain deletion as deleted, never as changed', async () => {
+    const { http, blobHttp } = indexFakes({
+      compare: { status: 200, body: { items: [COMPARE_DELETE_ITEM] } },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.12', 'dv.commit.13');
+    expect(res).toEqual({ ok: true, changed: [], deleted: ['.ignore'] });
+  });
+
+  it('reports a rename as prev_path in deleted, current path in changed — no rename-specific shape', async () => {
+    const { http, blobHttp } = indexFakes({
+      compare: { status: 200, body: { items: [COMPARE_RENAME_ITEM] } },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.7', 'dv.commit.8');
+    expect(res).toEqual({
+      ok: true,
+      changed: ['Plugins/NodEcs/Source/NodEcs/Public/Entity/EcsEntityHandle.h'],
+      deleted: ['Plugins/NodEcs/Source/NodEcs/Public/Entity/EntityHandle.h'],
+    });
+  });
+
+  it('filters directory-mode items out of both changed and deleted', async () => {
+    const { http, blobHttp } = indexFakes({
+      compare: { status: 200, body: { items: [COMPARE_DIRECTORY_ADD_ITEM, COMPARE_MODIFY_ITEM] } },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.442', 'dv.commit.443');
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.changed).not.toContain('Config');
+      expect(res.changed).toHaveLength(1); // only the file-mode item survived.
+    }
+  });
+
+  it('escalates on has_restricted_files rather than treating the listing as complete (locked decision 8)', async () => {
+    // Never measured `true` against the live (OWNER-access) account — the field and its meaning
+    // come from the OpenAPI `ComparisonList` response schema.
+    const { http, blobHttp } = indexFakes({
+      compare: { status: 200, body: { items: [COMPARE_MODIFY_ITEM], has_restricted_files: true } },
+    });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.472', 'dv.commit.473');
+    expect(res).toMatchObject({
       ok: false,
       reason: 'full-index-required',
-      detail: expect.stringContaining('Diversion'),
+      detail: expect.stringContaining('has_restricted_files'),
+    });
+  });
+
+  it('escalates on an unrecognized status code rather than guessing (locked decision 4)', async () => {
+    const bogus = { status: 99, other_item: { path: 'x.ts', mode: 33188 } };
+    const { http, blobHttp } = indexFakes({ compare: { status: 200, body: { items: [bogus] } } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+    expect(res).toMatchObject({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('99'),
+    });
+  });
+
+  it('escalates when a compare item carries no other_item at all (defensive — never measured live)', async () => {
+    const { http, blobHttp } = indexFakes({ compare: { status: 200, body: { items: [{ status: 4 }] } } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+    expect(res).toMatchObject({ ok: false, reason: 'full-index-required' });
+  });
+
+  it('a non-200 compare response escalates to full-index-required, never an empty diff', async () => {
+    const { http, blobHttp } = indexFakes({ compare: { status: 401, body: UNAUTHORIZED_BODY } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+    expect(res).toMatchObject({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('401'),
+    });
+  });
+
+  it(`exceeds ${CHANGES_BETWEEN_MAX_PATHS}-path cap → full-index-required`, async () => {
+    const items = Array.from({ length: CHANGES_BETWEEN_MAX_PATHS + 1 }, (_, i) => ({
+      status: 2,
+      other_item: { path: `f${i}.ts`, mode: 33188 },
+    }));
+    const { http, blobHttp } = indexFakes({ compare: { status: 200, body: { items } } });
+    const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+    const res = await backend.changesBetween('/repo', 'dv.commit.1', 'dv.commit.2');
+    expect(res).toMatchObject({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('cap'),
     });
   });
 });
