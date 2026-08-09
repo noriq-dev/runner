@@ -282,3 +282,75 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
     expect(scanTextForCredentialMarkers(text)).toBeNull();
   });
 });
+
+describe('scanTextForCredentialMarkers — RUN-263, the payload discriminator', () => {
+  // The measured bug this task fixes: THREAT-MODEL.md documents the marker vocabulary, and RUN-258's
+  // marker-only check could not distinguish that from a file that actually contains a credential.
+  // This is the real sentence from THREAT-MODEL.md's own `[index]` section, byte-for-byte.
+  it("does not flag THREAT-MODEL.md's own list of bare issuer-prefix examples", () => {
+    const text =
+      'RUN-258 closes that specific gap for **unambiguous credential markers only** — PEM headers, ' +
+      'JWTs, known issuer prefixes (`ghp_`, `sk-`, `AKIA`, …) — checked over the whole file.';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // The second measured false positive: this very module's own doc comment for `PEM_HEADER_RE`,
+  // which quotes three bare BEGIN headers with no body and no END anywhere near them.
+  it('does not flag a doc comment that quotes bare PEM BEGIN headers with no body or END', () => {
+    const text =
+      'A PEM-encoded key/certificate header — `-----BEGIN RSA PRIVATE KEY-----`, ' +
+      '`-----BEGIN CERTIFICATE-----`, `-----BEGIN OPENSSH PRIVATE KEY-----`, and siblings.';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // A bare stub value with almost no payload — the same shape as this repo's own
+  // `test/security.test.ts` fixture (`GITHUB_TOKEN: 'ghp_x'`), which RUN-258 withheld and RUN-263
+  // must not.
+  it('does not flag a short placeholder/stub value that carries no real payload', () => {
+    const text = "const GITHUB_TOKEN = 'ghp_x';";
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // JWT is left unmodified by this task (discretion point 2): a documentation placeholder's segments
+  // are always shorter than the 10-char-per-segment floor `JWT_SEARCH_RE` already enforces, so it
+  // already discriminates a mention from a real token without any change.
+  it('does not flag a JWT-shaped mention with placeholder segments too short to be real', () => {
+    const text = 'A JWT is three dot-separated base64url segments, shaped like header.payload.signature.';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // The payload requirement must not re-admit RUN-258's own fix: a bare prefix directly ADJACENT to
+  // real payload-shaped characters (not just isolated documentation) still has to be caught, so the
+  // boundary and payload checks are independent layers, not a single weaker one.
+  it('still flags a real credential immediately preceded by prose using the same prefix letters', () => {
+    const text = 'the risk-scoring task uses key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 internally';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/prefix/);
+  });
+
+  // A PEM BEGIN with a matching END but nothing at all between them (no body) is still just
+  // structure being described, not a credential — the body requirement is real, not automatically
+  // satisfied by the presence of a paired END.
+  it('does not flag a PEM BEGIN/END pair with no body between them', () => {
+    const text = '-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // A real PEM block — BEGIN, a base64 body, a matching END — must still be withheld; this is the
+  // planted-credential regression pin for the PEM class specifically (locked decision 2).
+  it('still flags a real PEM private key with a full base64 body and matching END', () => {
+    const text =
+      'const key = `\n-----BEGIN RSA PRIVATE KEY-----\n' +
+      'MIIEowIBAAKCAQEAtx9L8+ClAeGtQeZzYh0aFAYhU8pQ2K0KJhZk1XvT0mF8+lZ9\n' +
+      'Rz3Wc2m0S1oQwq7bYhX9pS3nJvKdE7yA0FqW3z8Rk1cVnQpB2xTmY4sN6oL5eD8g\n' +
+      '-----END RSA PRIVATE KEY-----\n`;';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/PEM/);
+  });
+
+  // A BEGIN for one key type paired with an END for a DIFFERENT key type must not satisfy the
+  // structural check — the label has to match, the same way a real single PEM block always does.
+  it('does not flag a BEGIN of one type paired with an END of a different type', () => {
+    const text =
+      '-----BEGIN CERTIFICATE-----\nMIIEowIBAAKCAQEAtx9L8+ClAeGtQeZzYh0aFAYhU8pQ2K0KJhZk1XvT0mF8+lZ9\n-----END RSA PRIVATE KEY-----\n';
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+});

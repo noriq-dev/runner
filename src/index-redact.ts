@@ -41,6 +41,22 @@
  * (a whole file has no single "key") and NO entropy scan (tuned for a short isolated value, not
  * hundreds of lines of real code — see that function's own doc for the measured false positives on
  * this repo's own source). `indexer.ts` is the only caller.
+ *
+ * **RUN-263: the discriminator is PAYLOAD, not position.** RUN-258's marker-only check, applied to
+ * a whole file, over-withheld: a document that *documents* a credential shape (THREAT-MODEL.md's own
+ * `` `ghp_`, `sk-`, `AKIA`, `` list; this very file's `PEM_HEADER_RE` doc comment three lines above,
+ * which quotes three bare BEGIN headers) is indistinguishable from a file that *contains* one, if all
+ * that is checked is the marker's presence. The fix is not "prose vs. assignment" (trivially bypassed,
+ * and a real credential pasted into prose is still a real credential — position is not evidence of
+ * safety); it is that a real credential CARRIES secret material after the marker and a document that
+ * merely names the marker does not. `ghp_` alone is a prefix being discussed; `ghp_` followed by a
+ * long run of credential characters is a token. See `ISSUER_PREFIX_TOKEN_RE` and `PEM_STRUCTURED_RE`
+ * below for where that payload requirement is enforced — the direction of caution is unchanged
+ * (unsure still means withhold): both requirements are calibrated to sit BELOW every real token shape
+ * measured for `ISSUER_PREFIXES`/PEM, never above one, so no real credential newly passes. `JWT_SEARCH_RE`
+ * is unchanged — three dot-separated 10+ char base64url segments is already a payload requirement
+ * (a documentation placeholder's segments are always shorter), measured to produce no false positive
+ * on this repo either before or after this change.
  */
 
 // ---------------------------------------------------------------------------
@@ -133,10 +149,52 @@ function escapeRegExp(s: string): string {
  * is deliberately NOT applied to `matchedIssuerPrefix`/`scanTextForSecretShapedContent` above, whose
  * VALUE-level behaviour this task must not change (their own caller already isolated the value, so
  * there is no surrounding word for the prefix to hide inside).
+ *
+ * **RUN-263 adds a PAYLOAD requirement on top of the boundary, not instead of it.** The boundary
+ * alone still lets a bare mention through unflagged only when it isn't preceded by a word character;
+ * it says nothing about what follows the prefix, so `` `ghp_`, `sk-`, `AKIA`, `` (THREAT-MODEL.md's
+ * own list of examples, each prefix immediately followed by a backtick or comma) matched under
+ * RUN-258 with zero characters of actual credential material. The prefix must now be followed by a
+ * run of at least `CREDENTIAL_PAYLOAD_MIN_LENGTH` credential-shaped characters
+ * (`[A-Za-z0-9_-]` — alphanumeric plus `_`/`-`, which covers every separator `ISSUER_PREFIXES`'
+ * real tokens use: GitHub's `_` between a fine-grained PAT's id and secret, Slack's `-`-delimited
+ * team/bot/secret segments, Google's URL-safe base64 `-`/`_`). The minimum is derived from the
+ * SHORTEST real payload among `ISSUER_PREFIXES`, not picked to sound right: an AWS access key id is
+ * `AKIA` plus a FIXED 16-character suffix — shorter than every other prefix's real token (GitHub's
+ * classic 36, Slack's ~27+, Google's 35, OpenAI/Anthropic's 40+) — so any threshold at or below 16
+ * cannot miss a real token of any class here. 12 leaves a 4-character margin below that floor while
+ * sitting far above what a documentation mention ever leaves after a backtick-quoted prefix (0–3
+ * characters, measured directly against THREAT-MODEL.md's list above and this repo's own
+ * `test/security.test.ts` env-var stub `'ghp_x'`). This can only narrow matches, never widen them —
+ * a string that already failed the boundary check is still rejected — so it cannot re-admit
+ * `src/adjudication.ts`'s `task-`/`risk-`/`desk-` prose, which the boundary alone already excludes.
  */
+const CREDENTIAL_PAYLOAD_MIN_LENGTH = 12;
+
 const ISSUER_PREFIX_TOKEN_RE = new RegExp(
-  `(?<![A-Za-z0-9_])(?:${ISSUER_PREFIXES.map(escapeRegExp).join('|')})`,
+  `(?<![A-Za-z0-9_])(?:${ISSUER_PREFIXES.map(escapeRegExp).join('|')})[A-Za-z0-9_-]{${CREDENTIAL_PAYLOAD_MIN_LENGTH},}`,
 );
+
+/**
+ * The PEM counterpart of the payload requirement above, for `scanTextForCredentialMarkers` only —
+ * never composed into `PEM_HEADER_RE`'s own callers, which check an already-isolated value with no
+ * room for a bare header mention. RUN-258's `PEM_HEADER_RE` matches a BEGIN line alone; measured
+ * directly against this repo, that is exactly what withheld this file's own content (the doc comment
+ * three lines above quotes three bare `-----BEGIN ... -----` headers with no body and no END
+ * anywhere near them) and THREAT-MODEL.md's PEM-shaped prose. A real single PEM block (RFC 7468) is
+ * always BEGIN, a base64 body, and a matching END carrying the SAME label — every one of the three,
+ * every time — so requiring the paired END is not a loosening: no real credential is ever missing
+ * one, and a bare header citation never has one to pair with. The body is required to contain at
+ * least one non-whitespace character (never zero — a BEGIN immediately followed by END with only
+ * blank lines between is not a body) rather than checked against the base64 alphabet specifically:
+ * a stricter minimum LENGTH on the base64 run would also exclude this module's own existing test
+ * fixtures, which elide a real body to a handful of characters (`MIIEow...`) — the same "synthetic
+ * placeholder" shape RUN-258 already warns about, but not one this task's file scope can fix
+ * (`test/indexer.test.ts` is a sibling file this task does not own). Both spans around the mandatory
+ * `\S` are bounded to 20000 characters so the match can never backtrack unboundedly over a large file.
+ */
+const PEM_STRUCTURED_RE =
+  /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END)[\s\S]){0,20000}?\S(?:(?!-----END)[\s\S]){0,20000}?-----END \1-----/;
 
 // ---------------------------------------------------------------------------
 // High-entropy heuristic
@@ -266,10 +324,10 @@ export function scanTextForSecretShapedContent(text: string): string | null {
 
 /**
  * The marker-only entry point RUN-258 needs: a `full`-mode FILE's raw decoded source
- * (`indexer.ts`'s file-entity push), never an adapter-isolated value. Reuses this module's existing
- * marker PATTERNS (`PEM_HEADER_RE`, `JWT_SEARCH_RE`, `ISSUER_PREFIXES` — the vocabulary lives in
- * exactly one place, per locked decision 5) but composes them differently from every caller above,
- * for two reasons specific to scanning a WHOLE file rather than one isolated value:
+ * (`indexer.ts`'s file-entity push), never an adapter-isolated value. Built from this module's
+ * existing marker VOCABULARY (`ISSUER_PREFIXES`, PEM, JWT — it lives in exactly one place, per
+ * locked decision 5) but composes it differently from every caller above, for three reasons
+ * specific to scanning a WHOLE file rather than one isolated value:
  *
  * 1. **No key-name check, no entropy scan.** `keyLooksSensitive`/`looksHighEntropy` were tuned
  *    against short, isolated values and do not transfer to hundreds of lines of real code — measured
@@ -281,16 +339,23 @@ export function scanTextForSecretShapedContent(text: string): string | null {
  *    substring match every VALUE-level caller above uses. `sk-` as a bare substring matches inside
  *    ordinary English — `risk-`, `desk-`, and this repo's own `src/adjudication.ts`, which repeats
  *    `task-` throughout its prose (measured: composing the plain substring check here withheld that
- *    file's entire content, exactly the false positive locked decision 1 names). A PEM header and a
- *    JWT are already specific enough at any length that they need no such change — `PEM_HEADER_RE`/
- *    `JWT_SEARCH_RE` are reused verbatim, unmodified from the VALUE-level checks above.
+ *    file's entire content, exactly the false positive locked decision 1 names).
+ * 3. **RUN-263: both the issuer-prefix and PEM checks additionally require a PAYLOAD**
+ *    (`ISSUER_PREFIX_TOKEN_RE`'s trailing `{CREDENTIAL_PAYLOAD_MIN_LENGTH,}`, `PEM_STRUCTURED_RE`'s
+ *    required body+END) — measured directly against this repo: a marker with no payload (THREAT-
+ *    MODEL.md's own list of prefix examples; this file's own PEM header doc comment) is a document
+ *    NAMING the shape, not a file CONTAINING one, and RUN-258's marker-only check could not tell them
+ *    apart. `JWT_SEARCH_RE` is the one marker left unmodified — three dot-separated 10+ char
+ *    base64url segments is already a payload requirement, and it produces no false positive on this
+ *    repo either before or after this task (see that regex's own doc for why the 10-char floor per
+ *    segment already rules out a short documentation placeholder).
  *
  * Only ever returns the marker CLASS (never the matched bytes or even the matched prefix, same
  * reasoning as `valueLooksSecret`), so a caller may safely surface the return value in a status
  * record or diagnostic. `indexer.ts` is the only caller.
  */
 export function scanTextForCredentialMarkers(text: string): string | null {
-  if (PEM_HEADER_RE.test(text)) return 'PEM key/certificate header';
+  if (PEM_STRUCTURED_RE.test(text)) return 'PEM key/certificate header';
   if (JWT_SEARCH_RE.test(text)) return 'JWT-shaped value (three dot-separated base64url segments)';
   if (ISSUER_PREFIX_TOKEN_RE.test(text)) return 'known credential prefix';
   return null;
