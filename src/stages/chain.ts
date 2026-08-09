@@ -247,11 +247,31 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
   let last: SessionOutcome | null = null;
   const indexOf = new Map(steps.map((s, i) => [s.id, i]));
 
+  // RUN-261: a decomposed run's true start is its FIRST step's, not whichever step's outcome
+  // happens to be the one the chain returns — a step that fails, or a wave's tail (spawned last but
+  // returned as the chain's own outcome), must not make the run look like it started later than it
+  // did. `noteStarted` folds in every session this chain actually spawns (called at both spawn
+  // sites below — the sequential step loop and the wave's `Promise.all` member loop); taking the
+  // MIN rather than "whichever call came first" is what makes wave order irrelevant, since a wave's
+  // members do not resolve in spawn order. Stays undefined for a chain that spawns no session at
+  // all — `sessionlessChainExit` (supervisor.ts) is what the caller sees then, and it carries no
+  // `agentStartedAt` to begin with, so there is nothing here to substitute one for.
+  let earliestAgentStartedAt: string | undefined;
+  const noteStarted = (at: string | undefined): void => {
+    if (at && (!earliestAgentStartedAt || at < earliestAgentStartedAt)) earliestAgentStartedAt = at;
+  };
+
   /** Fold a raw session outcome into the run's accumulated view — the shape `last` holds. */
   const withAllText = (outcome: SessionOutcome): SessionOutcome => ({
     ...outcome,
     sessionText: allText,
     getSessionText: () => allText + outcome.getSessionText().slice(outcome.sessionText.length),
+    // The earliest moment ANY of this chain's sessions started (RUN-261), never this one step's
+    // own — every carrier of the chain's eventual return value goes through here, which is what
+    // keeps a later step from overriding an earlier one's true start. Falls back to this step's own
+    // moment only in the unreachable case `noteStarted` was not yet called for it (defensive, never
+    // a fabricated value — `outcome.agentStartedAt` is itself real).
+    agentStartedAt: earliestAgentStartedAt ?? outcome.agentStartedAt,
   });
 
   /** The persisted cancellation fact (RUN-165), asked before EVERY chain spawn — the one helper
@@ -357,6 +377,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
     });
 
     if (outcome.parked) return outcome;
+    noteStarted(outcome.agentStartedAt);
     allText += outcome.sessionText;
     const merged = withAllText(outcome);
     last = merged;
@@ -644,6 +665,7 @@ export async function executeChain(host: ExecuteHost, plan: ChainPlan): Promise<
           // Unreachable while childHost never parks; the guard keeps a future edit from silently
           // parking a child workspace nothing can resume into.
           if (outcome.parked) return { step, i, ws, failed: 'steps:child-parked' };
+          noteStarted(outcome.agentStartedAt);
           return { step, i, ws, outcome };
         } catch (err) {
           host.log.warn('a wave step threw before producing an outcome — its siblings still land', {

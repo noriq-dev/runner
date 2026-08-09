@@ -243,17 +243,22 @@ function landingOutcomeOf(ctx: RunPipeline, hasRemainingWork: boolean): EpisodeL
 }
 
 /**
- * The runner's own contribution to the timeline — widened (RUN-227 locked decision 6) so an
- * UPLOADED episode cannot lose ground the server's own automatically-recorded skeleton episode
- * already covers. `ProjectMemory.recordEpisode` is last-writer-wins per field: PLNR-263 already
- * fires a skeleton write (`memory/episodes.ts`'s `recordEpisodeForRun`) off the SAME terminal
- * transition our own upload only starts FROM, essentially instantly (one D1 batch, no network
- * round trip) — so by the time our own richer upload's `complete()` reaches the server, the
- * skeleton's four-entry `timelineFor` (queued/dispatched/agent started/run <outcome>) is
- * ordinarily already the stored value, and our own `timeline` field REPLACES it wholesale.
+ * The runner's own view of when this sitting's work happened.
  *
- * Two of those four entries cost nothing to add — they are already sitting on `ctx.run`, the
- * dispatched `Run` this sitting never re-fetches:
+ * **It does not reach the server, and that is now correct rather than a gap.** This was built under
+ * a contract where `recordEpisode` was last-writer-wins per field, so an uploaded `timeline`
+ * REPLACED the skeleton's own four entries and the runner had to reproduce them or destroy them —
+ * RUN-227 measured that, RUN-261 closed the one entry it could not supply. PLNR-340 then made the
+ * daemon upload a PARTIAL enrichment: the server accepts `filesTouched`/`commands`/`testsRun`/
+ * `failures`/`findings`/`selfSummary` and STRIPS every other key, because D1 owns identity,
+ * lifecycle, cost and review evidence and a daemon must not be able to forge them. So the timeline
+ * is now the server's alone, built from its own rows, and nothing assembled here can damage it.
+ *
+ * Kept because the assembled episode is also this daemon's own local record, and because
+ * `agentStartedAt` is a real observation with a named future consumer — the Project Intelligence
+ * plan's stage-timing work (RUN-242) needs exactly this moment, and it is cheaper to keep an
+ * already-verified observation than to re-derive it. What must NOT happen is a reader concluding
+ * from these entries that the server received them: it does not.
  */
 function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
   const out: EpisodeTimelineEntry[] = [];
@@ -263,18 +268,24 @@ function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
   // change must degrade to "fewer timeline entries", never to a thrown, unparseable datetime.
   if (ctx.run.createdAt) out.push({ at: ctx.run.createdAt, label: 'queued' });
   if (ctx.run.dispatchedAt) out.push({ at: ctx.run.dispatchedAt, label: 'dispatched to runner' });
-  // NOT widened here, on purpose rather than by oversight: the skeleton's third entry, "agent
-  // started" (`runs.started_at`, stamped when the server processes this run's FIRST `running`
-  // status frame), has no counterpart anywhere in `RunPipeline` — no stage threads a daemon-
-  // observed "the primary session actually began" instant this far downstream. Building one would
-  // mean capturing a fresh timestamp in `stages/execute.ts` AND `stages/chain.ts` (a chain's true
-  // start is its FIRST step, not whichever step's outcome happens to reach `afterDriver`) and
-  // adding a field to `RunPipeline` itself — three files outside this task's own scope, on the hot
-  // path budget enforcement and steering both depend on. Left undone rather than invented: an
-  // upload whose `complete()` lands after the server's automatic skeleton (the ordinary case) will
-  // clobber "agent started" out of the stored timeline until a later task threads it through. The
-  // skeleton's fourth entry, its own "run <outcome>" moment, is NOT a gap — it is already
+  // The daemon's own "agent started" (RUN-261). The server has its own, from `runs.started_at`,
+  // stamped when it processes this run's FIRST `running` status frame — this one is strictly more
+  // accurate, being the moment the spawn actually happened rather than the moment a frame about it
+  // was processed, which is why it is worth observing even though PLNR-340 means it never ships.
+  // `ctx.agentStartedAt` is
+  // the wall-clock moment `stages/execute.ts` observed immediately before `host.startAgent` spawned
+  // the session, threaded through `RunPipeline` (via `afterDriver`'s `ctx` parameter, the same route
+  // `contextPack`/`continued`/`executedSpec` already use to reach a pipeline built after the driver
+  // ran). A CHAIN's entry is its FIRST step's, never a later one's — `chain.ts`'s `noteStarted`/
+  // `withAllText` keep the earliest observed across every session the chain spawns, so a wave's
+  // tail (spawned last but returned as the chain's own outcome) cannot make the run look like it
+  // started later than it did. Absent — never a substituted value — when no session ever spawned
+  // this sitting: a chain that fails before its first step (`supervisor.ts`'s
+  // `sessionlessChainExit`) carries no `agentStartedAt` to begin with, and `new Date()` here would
+  // be the settle moment wearing this label, which is exactly the lie this field exists to avoid.
+  // The skeleton's fourth entry, its own "run <outcome>" moment, was never a gap — it is already
   // covered below by this sitting's own `settle:` entry, which is later and strictly more precise.
+  if (ctx.agentStartedAt) out.push({ at: ctx.agentStartedAt, label: 'agent started' });
   if (ctx.continued) {
     out.push({ at: ctx.continued.failedAt, label: 'continuation: resumed from a kept worktree' });
   }

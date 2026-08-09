@@ -3444,6 +3444,10 @@ export class RunSupervisor {
       verifyText: outcome.sessionText,
       getSessionText: outcome.getSessionText,
       tail: outcome.tail,
+      // RUN-261: a resumed sitting still spawns a live session (the restored one, or the fresh
+      // continuation-style one RUN-199 opens) — `outcome` only lacks this when the resumed chain
+      // failed before any step ran (`sessionlessChainExit`), which carries no `agentStartedAt`.
+      ...(outcome.agentStartedAt ? { agentStartedAt: outcome.agentStartedAt } : {}),
     });
   }
 
@@ -3574,6 +3578,10 @@ export class RunSupervisor {
       continued: prepared.continued,
       executedSpec,
       contextPack: prepared.contextPack,
+      // Absent only when the chain failed before any step spawned a session (RUN-261,
+      // `sessionlessChainExit`) — an ordinary undecomposed run always has one, since `executeRun`
+      // is reached only past every cancellation check that could have short-circuited first.
+      ...(outcome.agentStartedAt ? { agentStartedAt: outcome.agentStartedAt } : {}),
     });
   }
 
@@ -4202,6 +4210,10 @@ export class RunSupervisor {
     /** RUN-228's retrieval, carried from `PreparedRun.contextPack` — absent on the `resume` call
      *  site, which has no `prepare` and therefore never fetched one (RunPipeline's own doc). */
     contextPack?: ContextPackRetrieval;
+    /** The wall-clock moment `execute` observed just before spawning (RUN-261), threaded through
+     *  because the pipeline this becomes a field of does not exist until this method builds it.
+     *  Absent iff no session ever spawned this sitting (`sessionlessChainExit`). */
+    agentStartedAt?: string;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
@@ -4239,6 +4251,7 @@ export class RunSupervisor {
       acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
       requirements: ctx.executedSpec?.spec.requirementIds ?? [],
       ...(ctx.contextPack ? { contextPack: ctx.contextPack } : {}),
+      ...(ctx.agentStartedAt ? { agentStartedAt: ctx.agentStartedAt } : {}),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
       // the human even if verify then fails).

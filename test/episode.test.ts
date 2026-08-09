@@ -1,13 +1,21 @@
 import type { Run } from '@noriq-dev/shared';
-import { EffortEpisode } from '@noriq-dev/shared';
-import { describe, expect, it } from 'vitest';
+import { EffortEpisode, ExecutionSpec } from '@noriq-dev/shared';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AcceptanceItem, AcceptanceReport } from '../src/acceptance';
 import type { LedgerEntry } from '../src/adjudication';
 import type { RunAgent } from '../src/client';
 import type { ContinuableRun } from '../src/continuable';
+import type { BudgetRun } from '../src/drivers/budget';
 import { zeroTelemetry } from '../src/drivers/types';
-import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry } from '../src/drivers/types';
+import type {
+  AgentDriver,
+  DriverExit,
+  DriverSession,
+  DriverStartOptions,
+  DriverTelemetry,
+} from '../src/drivers/types';
 import { buildEpisode, normalizeSeverity } from '../src/episode';
+import { type ChainPlan, type ExecuteHost, executeChain } from '../src/stages';
 import { settleStage } from '../src/stages/settle';
 import type { RunPipeline, StageHost } from '../src/stages/types';
 import { type ResolvedRepo, RunTally } from '../src/supervisor';
@@ -203,6 +211,133 @@ describe('buildEpisode — timeline widened to cover the server’s own skeleton
       steeringHistory: [],
     });
     expect(episode.timeline.map((e) => e.label)).toEqual(['queued', expect.stringContaining('settle:')]);
+  });
+});
+
+describe('buildEpisode — "agent started" closes the one gap RUN-227 left open (RUN-261)', () => {
+  it('a non-chained run carries the observed moment, ahead of settle and after dispatch', () => {
+    const episode = buildEpisode(baseCtx({ agentStartedAt: '2026-08-01T00:00:03.000Z' }), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.timeline).toEqual([
+      { at: run.createdAt, label: 'queued' },
+      { at: run.dispatchedAt, label: 'dispatched to runner' },
+      { at: '2026-08-01T00:00:03.000Z', label: 'agent started' },
+      { at: expect.any(String), label: expect.stringContaining('settle:') },
+    ]);
+  });
+
+  it('never observed (no session spawned this sitting) emits no entry — never a substitute', () => {
+    const episode = buildEpisode(baseCtx(), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.timeline.some((e) => e.label === 'agent started')).toBe(false);
+  });
+});
+
+describe('executeChain — a decomposed run reports its FIRST step as "agent started" (RUN-261)', () => {
+  // Only `Date` is faked — `until` below still needs REAL setTimeout ticks to pump the promise
+  // chain `executeChain` drives internally (checkpoint, stopSession, the next step's spawn).
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A driver spawn settled BY HAND, mirroring `stages-execute.test.ts`/`stages-chain.test.ts`'s
+   *  own fixture — this file cannot import theirs (test files are the isolation boundary here), so
+   *  it is reproduced minimally rather than reached across. */
+  class FakeSpawn {
+    private settle!: (e: DriverExit) => void;
+    readonly budgetRun: BudgetRun;
+    constructor(opts: DriverStartOptions) {
+      let settle!: (e: DriverExit) => void;
+      const done = new Promise<DriverExit>((r) => {
+        settle = r;
+      });
+      this.settle = settle;
+      this.budgetRun = {
+        session: { runId: opts.runId, sessionId: `sess-${opts.runId}` } as DriverSession,
+        done,
+        stop: async () => {},
+      };
+    }
+    finish(exit: Partial<DriverExit> = {}): void {
+      this.settle({ outcome: 'done', isError: false, reason: null, telemetry: zeroTelemetry(), ...exit });
+    }
+  }
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 200 && !cond(); i++) await tick();
+    expect(cond()).toBe(true);
+  };
+
+  it("a later step's later spawn never overrides the first step's earlier one", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-08-01T00:00:00.000Z'));
+
+    const spawns: FakeSpawn[] = [];
+    const host: ExecuteHost = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as never,
+      report: () => {},
+      transcript: () => ({ text: () => {}, milestone: () => {} }) as never,
+      startAgent: (_d, opts) => {
+        const s = new FakeSpawn(opts);
+        spawns.push(s);
+        return s.budgetRun;
+      },
+      parkIfBlocked: async () => null,
+    };
+    const steps = ExecutionSpec.parse({
+      steps: [
+        { id: 's1', title: 'first step' },
+        { id: 's2', title: 'second step' },
+      ],
+    }).steps;
+    const plan: ChainPlan = {
+      run,
+      repo,
+      worktree,
+      driver,
+      runAgent,
+      tally: new RunTally(),
+      priorActiveSeconds: 0,
+      start: {
+        runId: run.id,
+        kind: 'build',
+        cwd: worktree.localPath,
+        prompt: 'go',
+        permission: {} as never,
+      },
+      steps,
+      stepPrompt: () => 'go',
+      checkpoint: async () => true,
+    };
+
+    const running = executeChain(host, plan);
+    await until(() => spawns.length === 1);
+    const firstStepStartedAt = new Date().toISOString(); // '2026-08-01T00:00:00.000Z'
+    spawns[0]!.finish();
+    // Advance the wall clock before the second step spawns — if the chain reported whichever step's
+    // outcome it happens to return (the last, scheduled-sequentially-last step here), the entry
+    // would read this later moment instead of the true one.
+    vi.setSystemTime(new Date('2026-08-01T00:10:00.000Z'));
+    await until(() => spawns.length === 2);
+    spawns[1]!.finish();
+
+    const outcome = await running;
+    if ('chainFailed' in outcome || outcome.parked) throw new Error('expected a finished chain');
+    expect(outcome.agentStartedAt).toBe(firstStepStartedAt);
+
+    const episode = buildEpisode(baseCtx({ agentStartedAt: outcome.agentStartedAt }), {
+      filesTouched: [],
+      hasRemainingWork: false,
+      steeringHistory: [],
+    });
+    expect(episode.timeline).toContainEqual({ at: firstStepStartedAt, label: 'agent started' });
   });
 });
 

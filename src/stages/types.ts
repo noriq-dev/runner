@@ -216,6 +216,22 @@ export interface RunPipeline {
    * "nothing to verify or render", the same posture an unopted-in repo already produces.
    */
   readonly contextPack?: ContextPackRetrieval;
+  /**
+   * The wall-clock moment observed immediately before the agent actually spawned (RUN-261) — an
+   * ISO datetime, threaded from `stages/execute.ts`'s own capture through `afterDriver`'s `ctx`
+   * parameter, the same route `contextPack`/`continued`/`executedSpec` above already use to reach a
+   * pipeline that does not exist yet at capture time (the mechanism the RUN-225 precedent — carrying
+   * a stage's own observation forward rather than re-deriving it — actually calls for here; that
+   * ticket's `commandObservations` is a MUTABLE field because verify/review/integrate each append to
+   * it AFTER the pipeline is built, which is a different problem from a fixed fact already known
+   * before construction). Fixed for the sitting, not one of the four below: nothing past `execute`
+   * ever revises when the agent started. Absent when no session ever spawned this sitting (a chain
+   * that fails before its first step, `supervisor.ts`'s `sessionlessChainExit`) — `episode.ts`'s
+   * `timelineOf` treats that as "never observed" and emits no entry, never a substituted moment. A
+   * CHAIN reports its FIRST step's start here, never a later or failing step's — see `chain.ts`'s
+   * own `noteStarted`/`withAllText` for how the earliest-wins.
+   */
+  readonly agentStartedAt?: string;
 
   // ── the four a stage may move ────────────────────────────────────────────────
   /** The run's fate so far. A gate narrows it; nothing ever widens it back to done. */
