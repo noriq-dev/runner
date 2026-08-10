@@ -1,13 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { buildSymbolEntityUri } from '../src/index-entity';
 import type { UriScope } from '../src/index-entity';
-import { createTreeSitterAdapter, createTreeSitterAdapterRegistry } from '../src/index-treesitter';
+import {
+  blankCppMacroNoise,
+  createCppTreeSitterAdapter,
+  createIniTreeSitterAdapter,
+  createTreeSitterAdapter,
+  createTreeSitterAdapterRegistry,
+} from '../src/index-treesitter';
 import { TreeSitterRuntime } from '../src/treesitter-runtime';
 
 const runtime = new TreeSitterRuntime();
 const tsAdapter = createTreeSitterAdapter('typescript', runtime);
 const jsAdapter = createTreeSitterAdapter('javascript', runtime);
 const tsxAdapter = createTreeSitterAdapter('tsx', runtime);
+const cppAdapter = createCppTreeSitterAdapter(runtime);
+const iniAdapter = createIniTreeSitterAdapter(runtime);
 
 describe('createTreeSitterAdapter — canParse', () => {
   it('claims exactly the extensions its grammar owns', () => {
@@ -502,5 +510,451 @@ describe('createTreeSitterAdapterRegistry', () => {
     await registry.select('a.ts')?.parse({ path: 'a.ts', content: 'function f(){}' });
     await registry.select('a.js')?.parse({ path: 'a.js', content: 'function f(){}' });
     expect(sharedRuntime.stats.initCount).toBe(1);
+  });
+
+  it('RUN-239: also routes .cpp/.h/.ini to the new adapters', () => {
+    const { registry } = createTreeSitterAdapterRegistry();
+    expect(registry.select('a.cpp')?.id).toBe('tree-sitter-cpp');
+    expect(registry.select('a.h')?.id).toBe('tree-sitter-cpp');
+    expect(registry.select('a.ini')?.id).toBe('tree-sitter-ini');
+  });
+});
+
+// =============================================================================================
+// C++ (RUN-239)
+// =============================================================================================
+
+describe('createCppTreeSitterAdapter — canParse', () => {
+  it('claims the standard C++ source/header extensions and declines everything else', () => {
+    expect(cppAdapter.canParse('a.cpp')).toBe(true);
+    expect(cppAdapter.canParse('a.cc')).toBe(true);
+    expect(cppAdapter.canParse('a.cxx')).toBe(true);
+    expect(cppAdapter.canParse('a.h')).toBe(true);
+    expect(cppAdapter.canParse('a.hpp')).toBe(true);
+    expect(cppAdapter.canParse('a.hh')).toBe(true);
+    // Discretion: .inl/.ipp are textual fragments meant to be #include-d mid-declaration, not a
+    // standalone translation unit — declined, no measured demand either way.
+    expect(cppAdapter.canParse('a.inl')).toBe(false);
+    expect(cppAdapter.canParse('a.ipp')).toBe(false);
+    // No measured demand for a separate C grammar/extension either (locked decision).
+    expect(cppAdapter.canParse('a.c')).toBe(false);
+    expect(cppAdapter.canParse('a.ts')).toBe(false);
+  });
+
+  it('declares cpp as its language', () => {
+    expect(cppAdapter.languages).toEqual(['cpp']);
+  });
+});
+
+describe('createCppTreeSitterAdapter — declarations (the acceptance fixture)', () => {
+  const FIXTURE = [
+    'namespace ns {',
+    '',
+    'int add(int a, int b) { return a + b; }',
+    '',
+    'template<typename T>',
+    'T maxOf(T a, T b) { return a > b ? a : b; }',
+    '',
+    'class Widget {',
+    'public:',
+    '  Widget();',
+    '  ~Widget();',
+    '  void doThing();',
+    '  int getValue() const { return value_; }',
+    'private:',
+    '  int value_;',
+    '};',
+    '',
+    'Widget::Widget() : value_(0) {}',
+    'void Widget::doThing() { value_ = add(1, 2); this->getValue(); }',
+    '',
+    '}',
+  ].join('\n');
+
+  it('extracts a free function, a template function, a class and its methods — no parse errors', async () => {
+    const result = await cppAdapter.parse({ path: 'widget.cpp', content: FIXTURE });
+    expect(result.diagnostics).toEqual([]);
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['ns', 'add'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['ns', 'maxOf'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['ns', 'Widget'] }));
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['ns', 'Widget', 'doThing'] }),
+    );
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['ns', 'Widget', 'getValue'] }),
+    );
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['ns', 'Widget', '~Widget'] }),
+    );
+  });
+
+  it('gives a declared-only class member (no body) its own symbol too, same as an inline one', async () => {
+    const result = await cppAdapter.parse({ path: 'widget.cpp', content: FIXTURE });
+    // `Widget();` and `void doThing();` are declared with NO body inside the class — still symbols.
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['ns', 'Widget', 'Widget'] }),
+    );
+  });
+
+  it('a header declaration and its out-of-class implementation are TWO symbol entities, not one', async () => {
+    // The discretion this task calls out explicitly: `Widget::Widget()` is defined out-of-class
+    // (line 18 above) while `Widget()` was already declared inside the class body (line 10) —
+    // both resolve to the identical symbolPath `['ns', 'Widget', 'Widget']`, on purpose, mirroring
+    // the SAME way a TS overload group already gets one entity per signature.
+    const result = await cppAdapter.parse({ path: 'widget.cpp', content: FIXTURE });
+    const ctorEntries = result.symbols.filter((s) => s.symbolPath.join('.') === 'ns.Widget.Widget');
+    expect(ctorEntries).toHaveLength(2);
+  });
+
+  it("records the exact source span as a symbol's content", async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: 'int helper() { return 1; }' });
+    const sym = result.symbols.find((s) => s.symbolPath.join('.') === 'helper');
+    expect(sym?.content).toBe('int helper() { return 1; }');
+  });
+
+  it('extracts a struct, an enum, a using-alias, and a typedef', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.h',
+      content: [
+        'struct Point { int x; int y; };',
+        'enum class Color { Red, Green, Blue };',
+        'using Alias = int;',
+        'typedef int MyInt;',
+      ].join('\n'),
+    });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['Point'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['Color'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['Alias'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['MyInt'] }));
+    // Enum MEMBERS are values, not declarations — same rule the TS adapter applies to enums.
+    expect(result.symbols.some((s) => s.symbolPath.includes('Red'))).toBe(false);
+  });
+
+  it('an anonymous namespace nests its members under the ENCLOSING scope, not its own', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content: 'namespace { int helper() { return 1; } }',
+    });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['helper'] }));
+  });
+});
+
+describe('createCppTreeSitterAdapter — declines (may-miss-never-invent)', () => {
+  it('declines a bodyless forward class declaration — nothing to attribute members to', async () => {
+    const result = await cppAdapter.parse({ path: 'a.h', content: 'class Foo;\n' });
+    expect(result.symbols).toEqual([]);
+  });
+
+  it('declines a plain variable declaration — never mistaken for a function', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: 'int globalCounter;\n' });
+    expect(result.symbols).toEqual([]);
+  });
+
+  it('declines a function-pointer VARIABLE declaration — the declarator names a pointer, not a function', async () => {
+    // `int (*fnPtr)(int, int);` parses as a function_declarator whose own declarator is a
+    // parenthesized_declarator — indistinguishable, without unwrapping through an unsound path,
+    // from "function returning a pointer". Declined rather than guessed.
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: 'int (*fnPtr)(int, int);\n' });
+    expect(result.symbols.some((s) => s.symbolPath.includes('fnPtr'))).toBe(false);
+  });
+
+  it("declines an operator overload — canonicalizing its spelling is not this adapter's job", async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.h',
+      content: 'class Foo { public: Foo& operator=(const Foo& other); };',
+    });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['Foo'] }));
+    expect(result.symbols.some((s) => s.label.includes('operator'))).toBe(false);
+  });
+
+  it('declines an out-of-line templated method definition — a template argument is not stable identity text', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content: 'template<typename T>\nT Container<T>::get() { return value_; }\n',
+    });
+    expect(result.symbols).toEqual([]);
+  });
+
+  it('declines a class name mangled by an export-macro-before-classname convention — proves the decline, not a guessed identity', async () => {
+    // A real, measured misparse shape (Project Nod's UC_InventoryComponent.h, reduced to the
+    // minimal reproduction): tree-sitter-cpp has no notion of a `<MODULE>_API` export macro
+    // between `class` and the class name, and its error recovery reads the MACRO TOKEN as the
+    // class name. CORRECTED, measured: this is NOT the dominant cause of this repo's parse errors
+    // (blanking every `_API` token left the error count unchanged, 114/257 — see
+    // `blankCppMacroNoise`'s own doc for what actually is) — it is still a real shape worth a
+    // decline test in its own right, just not the explanation for the bulk of the error rate.
+    const result = await cppAdapter.parse({
+      path: 'a.h',
+      content: [
+        'class SURVIVAL_API UC_InventoryComponent : public UActorComponent',
+        '{',
+        'public:',
+        '  UC_InventoryComponent();',
+        '  void DoThing();',
+        '};',
+      ].join('\n'),
+    });
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+    // The bug this test exists to catch: no symbol may be named after the macro token.
+    expect(result.symbols.some((s) => s.symbolPath.includes('SURVIVAL_API'))).toBe(false);
+    // Nor may the REAL class name be extracted from the same locally-broken subtree — it did
+    // not come from a clean parse, so it is not a fact this adapter can back either.
+    expect(result.symbols.some((s) => s.symbolPath.includes('UC_InventoryComponent'))).toBe(false);
+  });
+
+  it('yields a bounded diagnostic and whatever declarations parsed cleanly, never throws', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: 'int add(int a, int b) { return a + ' });
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+    expect(result.diagnostics.every((d) => d.severity === 'warning' || d.severity === 'error')).toBe(true);
+  });
+
+  it('a fully empty file yields no symbols, no diagnostics, no throw', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: '' });
+    expect(result.symbols).toEqual([]);
+    expect(result.diagnostics).toEqual([]);
+  });
+});
+
+describe('createCppTreeSitterAdapter — macro-noise blanking (RUN-239 correction)', () => {
+  // The `<MODULE>_API` export macro was an earlier, WRONG belief about the dominant cause of this
+  // grammar's real parse errors — blanking it changed nothing (measured). These three macro
+  // families are the actual, measured causes; each test below proves a real recovery, not a
+  // hypothetical one.
+
+  it('GENERATED_BODY() no longer swallows the methods declared after it in the same class body', async () => {
+    const content = [
+      'class UWidget : public UActorComponent',
+      '{',
+      '  GENERATED_BODY()',
+      'public:',
+      '  void DoThing();',
+      '  int GetValue() const;',
+      '};',
+    ].join('\n');
+    const result = await cppAdapter.parse({ path: 'a.h', content });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['UWidget', 'DoThing'] }));
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['UWidget', 'GetValue'] }));
+  });
+
+  it('proves the gain: the SAME content, parsed WITHOUT blanking (bypassing the adapter), loses those methods', async () => {
+    const raw = [
+      'class UWidget : public UActorComponent',
+      '{',
+      '  GENERATED_BODY()',
+      'public:',
+      '  void DoThing();',
+      '  int GetValue() const;',
+      '};',
+    ].join('\n');
+    const parser = await runtime.parserFor('cpp');
+    const tree = parser.parse(raw);
+    expect(tree?.rootNode.hasError).toBe(true);
+    tree?.delete();
+    parser.delete();
+  });
+
+  it("UMETA(...) no longer breaks a UENUM's enumerator list", async () => {
+    const content = [
+      'UENUM(BlueprintType)',
+      'enum class EColor : uint8',
+      '{',
+      '  Red UMETA(DisplayName="Red Color"),',
+      '  Green UMETA(DisplayName="Green Color"),',
+      '};',
+    ].join('\n');
+    const result = await cppAdapter.parse({ path: 'a.h', content });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['EColor'] }));
+    // `UENUM(BlueprintType)` above is ITSELF a call-shaped macro with no trailing `;` — the same
+    // shape as `GENERATED_BODY()`, but `UENUM` is not one of the three measured/blanked patterns —
+    // so this file still carries its OWN unrelated diagnostic even after UMETA is fixed. Exactly
+    // the point this task's own correction makes: the gate recovers the ENUM symbol around the
+    // remaining error, it does not make the file parse clean. Do not assert `diagnostics: []` here.
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+  });
+
+  it('DECLARE_..._DELEGATE...(...) no longer breaks extraction of what follows it', async () => {
+    const content = [
+      'DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnValueChanged, int32, NewValue);',
+      '',
+      'class UWidget',
+      '{',
+      'public:',
+      '  void Broadcast();',
+      '};',
+    ].join('\n');
+    const result = await cppAdapter.parse({ path: 'a.h', content });
+    expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['UWidget', 'Broadcast'] }));
+  });
+
+  it('does NOT blank UCLASS/USTRUCT/UPROPERTY/UFUNCTION — no measured gain, left untouched', () => {
+    const content = 'UCLASS()\nUPROPERTY()\nUFUNCTION()\nUSTRUCT()\n';
+    expect(blankCppMacroNoise(content)).toBe(content);
+  });
+
+  it('blanking preserves content length EXACTLY — the property the whole approach rests on', () => {
+    const content = [
+      'class Foo {',
+      '  GENERATED_BODY()',
+      '  UMETA(DisplayName="x")',
+      '  DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FDel, int32, X);',
+      '};',
+    ].join('\n');
+    const blanked = blankCppMacroNoise(content);
+    expect(blanked.length).toBe(content.length);
+    expect(blanked).not.toBe(content); // proves something was actually blanked, not a no-op
+  });
+
+  it('blanking preserves embedded newlines — line numbers of what follows never shift', () => {
+    const content = [
+      'DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(',
+      '  FOnValueChanged,',
+      '  int32, NewValue);',
+      'void afterDelegate();',
+    ].join('\n');
+    const blanked = blankCppMacroNoise(content);
+    expect(blanked.length).toBe(content.length);
+    expect(blanked.split('\n')).toHaveLength(content.split('\n').length);
+    const originalLine = content.split('\n').findIndex((l) => l.includes('afterDelegate'));
+    const blankedLine = blanked.split('\n').findIndex((l) => l.includes('afterDelegate'));
+    expect(blankedLine).toBe(originalLine);
+  });
+
+  it("a symbol's content is the TRUE original source, never blanked spaces, even when its span includes a blanked macro", async () => {
+    // The class_specifier's OWN span ends at the closing `}` — the trailing `;` is a separate
+    // sibling node at translation_unit level, so `classSpan` (not `content`) is what a symbol's
+    // own `content` field is compared against.
+    const classSpan = ['class Foo', '{', '  GENERATED_BODY()', 'public:', '  void DoThing();', '}'].join(
+      '\n',
+    );
+    const content = `${classSpan};`;
+    const result = await cppAdapter.parse({ path: 'a.h', content });
+    const sym = result.symbols.find((s) => s.symbolPath.join('.') === 'Foo');
+    expect(sym?.content).toContain('GENERATED_BODY()'); // real macro text, never blanked spaces
+    expect(sym?.content).toBe(classSpan); // byte-for-byte the original source, not the blanked copy
+  });
+
+  it('the file this adapter was handed is never mutated — blanking operates on a throwaway copy', async () => {
+    const content = 'class Foo { GENERATED_BODY() };';
+    const input = { path: 'a.h', content };
+    await cppAdapter.parse(input);
+    expect(input.content).toBe(content); // unchanged after parse() returns
+  });
+});
+
+describe('createCppTreeSitterAdapter — includes as imports', () => {
+  it('normalizes a quoted include to a leading "./" — matches the language\'s own quoted-include search rule', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: '#include "Foo.h"\n' });
+    expect(result.imports).toEqual([{ specifier: './Foo.h' }]);
+  });
+
+  it('keeps a relative quoted include (already "./"-shaped) untouched', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: '#include "./Sub/Bar.h"\n' });
+    expect(result.imports).toEqual([{ specifier: './Sub/Bar.h' }]);
+  });
+
+  it('reads an angle-bracket system include as a literal, bare specifier', async () => {
+    const result = await cppAdapter.parse({ path: 'a.cpp', content: '#include <string>\n' });
+    expect(result.imports).toEqual([{ specifier: 'string' }]);
+  });
+});
+
+describe('createCppTreeSitterAdapter — reliable calls', () => {
+  it('resolves an unambiguous bare call to a same-file top-level function as "resolved"', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content: 'int helper(int x) { return x; }\nint add(int a, int b) { return helper(a) + b; }',
+    });
+    expect(result.calls).toContainEqual({
+      fromSymbolPath: ['add'],
+      toSymbolPath: ['helper'],
+      confidence: 'resolved',
+    });
+  });
+
+  it('resolves a this->method() call to a same-class method as "inferred"', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content: 'class Widget { public: void run() { this->render(); } void render() {} };',
+    });
+    expect(result.calls).toContainEqual({
+      fromSymbolPath: ['Widget', 'run'],
+      toSymbolPath: ['Widget', 'render'],
+      confidence: 'inferred',
+    });
+  });
+
+  it('declines a call through a member expression on something other than this', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content: 'class Other { public: void render() {} };\nvoid run(Other* o) { o->render(); }',
+    });
+    expect(result.calls).toEqual([]);
+  });
+
+  it('declines an ambiguous bare call matching more than one same-file declaration', async () => {
+    const result = await cppAdapter.parse({
+      path: 'a.cpp',
+      content:
+        'int overload(int a) { return a; }\nint overload(double a) { return caller(); }\nint caller() { return overload(1); }',
+    });
+    expect(result.calls?.some((c) => c.toSymbolPath.join('.') === 'overload')).toBe(false);
+  });
+});
+
+// =============================================================================================
+// ini (RUN-239)
+// =============================================================================================
+
+describe('createIniTreeSitterAdapter', () => {
+  it('claims .ini and declares ini as its language', () => {
+    expect(iniAdapter.canParse('a.ini')).toBe(true);
+    expect(iniAdapter.canParse('a.toml')).toBe(false);
+    expect(iniAdapter.languages).toEqual(['ini']);
+  });
+
+  it('extracts sections and settings, nested under their section — the real Unreal shape', async () => {
+    // Trailing newline is required by this grammar (measured: a file with no final "\n" reports a
+    // MISSING-newline error even though the setting before it still parses cleanly) — real .ini
+    // files always end with one, so this is not a coverage gap this adapter needs to work around.
+    const content = `${[
+      'GlobalKey=GlobalValue',
+      '',
+      '[/Script/EngineSettings.GameMapsSettings]',
+      'GameDefaultMap=/Game/Maps/MainMenu.MainMenu',
+      '+ExtraArray=Item1',
+      '+ExtraArray=Item2',
+    ].join('\n')}\n`;
+    const result = await iniAdapter.parse({ path: 'Config/DefaultEngine.ini', content });
+    expect(result.diagnostics).toEqual([]);
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['GlobalKey'], content: 'GlobalValue' }),
+    );
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ symbolPath: ['/Script/EngineSettings.GameMapsSettings'] }),
+    );
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({
+        symbolPath: ['/Script/EngineSettings.GameMapsSettings', 'GameDefaultMap'],
+        content: '/Game/Maps/MainMenu.MainMenu',
+      }),
+    );
+    // Unreal's array-append convention (`+Key=Value` repeated) collides on symbolPath by design —
+    // dedupeSymbolPaths (index-entity.ts) disambiguates it the same way a repeated JSON/TOML array
+    // entry or a TS overload signature already is.
+    const extraArrayEntries = result.symbols.filter(
+      (s) => s.symbolPath.join('.') === '/Script/EngineSettings.GameMapsSettings.+ExtraArray',
+    );
+    expect(extraArrayEntries).toHaveLength(2);
+  });
+
+  it('declines a malformed/empty section header — no guessed name', async () => {
+    const result = await iniAdapter.parse({ path: 'a.ini', content: '[]\nKey=Value\n' });
+    expect(result.symbols).toEqual([]);
+  });
+
+  it('a fully empty file yields no symbols, no diagnostics, no throw', async () => {
+    const result = await iniAdapter.parse({ path: 'a.ini', content: '' });
+    expect(result.symbols).toEqual([]);
+    expect(result.diagnostics).toEqual([]);
   });
 });

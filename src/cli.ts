@@ -290,6 +290,9 @@ async function cmdIndexSelftest(): Promise<number> {
     },
     javascript: { path: 'a.js', content: 'function add(a) { return a; }', expect: 'add' },
     tsx: { path: 'a.tsx', content: 'export function App() { return <div>{1}</div>; }', expect: 'App' },
+    // RUN-239.
+    cpp: { path: 'a.cpp', content: 'int add(int a, int b) { return a + b; }', expect: 'add' },
+    ini: { path: 'a.ini', content: '[Section]\nKey=Value\n', expect: 'Section' },
   };
 
   let ok = true;

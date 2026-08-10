@@ -99,6 +99,9 @@ export {
 export {
   createTreeSitterAdapter,
   createTreeSitterAdapterRegistry,
+  createCppTreeSitterAdapter,
+  createIniTreeSitterAdapter,
+  blankCppMacroNoise,
 } from './index-treesitter';
 // The `[index].languages` gate (RUN-219) — the ONE place that filters an adapter into (or out of)
 // a registry by policy; `index-repo` and `index-selftest` both build their registry through this,

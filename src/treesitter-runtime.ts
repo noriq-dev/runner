@@ -29,18 +29,29 @@ import { Language, Parser } from 'web-tree-sitter';
  * **Grammar bytes are INLINED into `dist/cli.js`, never installed as a runtime dependency**
  * (locked decision 3 vs. locked decision 1's tension, resolved here): `@vscode/tree-sitter-wasm`
  * ships ~40 languages and 22MB unpacked — pulling it as an npm dependency for every end user just
- * to reach the 3 grammars (~3.2MB) this daemon actually uses would be exactly the "whole
+ * to reach the handful of grammars this daemon actually uses would be exactly the "whole
  * collection" locked decision 3 forbids. So it is a devDependency ONLY: `scripts/build.mjs` reads
- * the 3 `.wasm` files it needs at BUILD time and injects them as base64 through the same `define`
+ * the `.wasm` files it needs at BUILD time and injects them as base64 through the same `define`
  * rail `__RUNNER_PROMPTS__` already uses to keep `dist/cli.js` self-contained (`prompts.ts`'s own
- * pattern, copied here). Cost: ~4.3MB of base64 text added to the bundle for those 3 grammars —
- * far short of the 22MB/40-language alternative, and paid once at publish time, not per install.
- * The dev/test path (tsx/vitest, no `define`) reads the same `.wasm` files straight out of
- * `@vscode/tree-sitter-wasm`'s `node_modules` install instead — that package IS present there
- * because it is a devDependency, exactly mirroring `prompts.ts`'s "read the file" fallback.
+ * pattern, copied here). The dev/test path (tsx/vitest, no `define`) reads the same `.wasm` files
+ * straight out of `@vscode/tree-sitter-wasm`'s `node_modules` install instead — that package IS
+ * present there because it is a devDependency, exactly mirroring `prompts.ts`'s "read the file"
+ * fallback.
+ *
+ * **RUN-239 grew this from 3 grammars (~3.2MB, ~4.3MB of base64) to 5**: TypeScript, JavaScript,
+ * and TSX stay; C++ (`tree-sitter-cpp.wasm`, 5,394,393 bytes measured on this host) and ini
+ * (`tree-sitter-ini.wasm`, 4,716 bytes) join, on measured demand — see `GRAMMARS`' own comment.
+ * The C++ grammar alone very nearly doubles `dist/cli.js` (see `INDEX-OPERATIONS.md`'s "Adapter
+ * roadmap" for the measured before/after bundle size) — accepted explicitly, on this same
+ * inlining rail, rather than inventing a second, lazy-loaded packaging mechanism for one large
+ * grammar: one mechanism to reason about beats two, and C++ is the one language this task's own
+ * measurement found real demand for at meaningful scale (53,660 lines across 257 files in Project
+ * Nod). C# (`tree-sitter-c-sharp.wasm`, 5,103,332 bytes measured — nearly as large as C++) is the
+ * clearest case for NOT paying that cost twice: only 8 UBT `.Build.cs`/`.Target.cs` files exist
+ * across every Noriq-managed project.
  */
 
-export type GrammarId = 'typescript' | 'javascript' | 'tsx';
+export type GrammarId = 'typescript' | 'javascript' | 'tsx' | 'cpp' | 'ini';
 
 interface GrammarSpec {
   /** `@vscode/tree-sitter-wasm`'s own filename under `wasm/` — meaningful only to the dev-path
@@ -53,6 +64,15 @@ const GRAMMARS: Record<GrammarId, GrammarSpec> = {
   typescript: { wasmFile: 'tree-sitter-typescript.wasm' },
   javascript: { wasmFile: 'tree-sitter-javascript.wasm' },
   tsx: { wasmFile: 'tree-sitter-tsx.wasm' },
+  // RUN-239: measured demand (all three Noriq-managed projects), not the task body's guessed
+  // list — Project Nod (Unreal, on Diversion) has 137 .cpp + 120 .h, 53660 lines; Go and Rust have
+  // ZERO files anywhere. `tree-sitter-cpp.wasm` is 5,394,393 bytes measured on this host — accepted
+  // as the one large addition (see this module's own packaging doc, updated below, for the bundle
+  // arithmetic). `.ini` rides the same rail for Unreal's 6 config files at 4,716 bytes — effectively
+  // free by comparison. C# (`tree-sitter-c-sharp.wasm`, 5,103,332 bytes measured) is deliberately
+  // NOT added: 8 UBT `.Build.cs`/`.Target.cs` files do not justify doubling the bundle again.
+  cpp: { wasmFile: 'tree-sitter-cpp.wasm' },
+  ini: { wasmFile: 'tree-sitter-ini.wasm' },
 };
 
 /**

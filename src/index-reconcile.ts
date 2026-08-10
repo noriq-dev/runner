@@ -37,8 +37,23 @@ import type { ChangesBetweenResult } from './vcs/types';
  * small integer string (compared numerically below) rather than semver — there is exactly one
  * axis that matters here (can this daemon's parsers reproduce what is already indexed?), and an
  * integer makes "did this move at all" a one-line diff in the PR that bumps it.
+ *
+ * RUN-239 bumped this to `'2'`: a C++ adapter, an ini adapter, and the JSON adapter's widened
+ * `canParse` (`.uproject`/`.uplugin`) all change this daemon's output for files that were
+ * previously untouched or NOOP-only — exactly the "output for unchanged files also changed" case
+ * this comment already names as mandatory, not optional. What this buys, precisely, and what it
+ * does NOT: every repo's next reconcile is `full` regardless of whether it has a single C++ file —
+ * `deriveGenerationId` (this module's own doc) is keyed on `indexerVersion`, not on which
+ * languages a repo actually contains, so there is no cheaper, PER-LANGUAGE reindex this daemon can
+ * offer today. `IndexGenerationManifest` (`vendor/noriq-shared/src/memory.ts`) carries only this
+ * one whole-daemon `indexerVersion` field — no per-parser version reaches the wire — and the
+ * vendored contract must land planar-side FIRST (`VENDORED-CONTRACT.md`); a targeted reindex needs
+ * a schema change this task does not make. `parserVersions` (`indexer.ts`'s own `IndexerResult`)
+ * IS recorded per adapter, but locally only, and nothing branches on it — see
+ * `INDEX-OPERATIONS.md`'s "Adapter roadmap" section for this stated as a blocked acceptance line
+ * rather than quietly declared met.
  */
-export const INDEXER_VERSION = '1';
+export const INDEXER_VERSION = '2';
 
 /**
  * ~~A validated staged generation at the base/version this reconciliation is about~~ — REMOVED

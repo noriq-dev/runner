@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { discoverRepos, loadIndexConfig, repoId } from '../src/discovery';
+import { DEFAULT_EXCLUDE_GLOBS } from '../src/index-policy';
 
 let root: string;
 
@@ -120,13 +121,7 @@ describe('DiscoveredRepo.indexConfig / loadIndexConfig (RUN-208)', () => {
       include: ['src/**'],
       exclude: ['**/*.gen.ts'],
       // RUN-262: the machine-wide default is layered on under `exclude`, not merged into it.
-      defaultExclude: [
-        '**/package-lock.json',
-        '**/npm-shrinkwrap.json',
-        '**/yarn.lock',
-        '**/pnpm-lock.yaml',
-        '**/node_modules/**',
-      ],
+      defaultExclude: DEFAULT_EXCLUDE_GLOBS,
       languages: ['typescript', 'markdown'],
       contentMode: 'metadata',
       maxFiles: 500,

@@ -26,6 +26,40 @@ describe('canParse / languages', () => {
     expect(markdownAdapter.canParse('a.txt')).toBe(false);
     expect(markdownAdapter.languages).toEqual(['markdown']);
   });
+
+  it('RUN-239: also claims .uproject/.uplugin — Unreal manifests, still the plain JSON adapter', () => {
+    expect(jsonAdapter.canParse('Survival.uproject')).toBe(true);
+    expect(jsonAdapter.canParse('Plugins/Foo/Foo.uplugin')).toBe(true);
+    expect(jsonAdapter.canParse('Survival.UPROJECT')).toBe(true); // case-insensitive, matching .json above
+    expect(jsonAdapter.canParse('Survival.uprojectx')).toBe(false);
+  });
+});
+
+describe('.uproject/.uplugin (RUN-239) — real Unreal manifest shape', () => {
+  it('extracts the module names an Unreal .uproject declares, through the generic JSON walk', async () => {
+    // Shaped exactly like Project Nod's own Survival.uproject (measured, not invented): a
+    // `Modules[]` array of records, each with a `Name` and (for the primary module only) an
+    // `AdditionalDependencies` array — the project's module dependency graph.
+    const content = JSON.stringify({
+      FileVersion: 3,
+      EngineAssociation: '5.7',
+      Modules: [
+        {
+          Name: 'Survival',
+          Type: 'Runtime',
+          LoadingPhase: 'Default',
+          AdditionalDependencies: ['Engine', 'UMG'],
+        },
+        { Name: 'SurvivalEditor', Type: 'Editor', LoadingPhase: 'Default' },
+      ],
+    });
+    const result = await jsonAdapter.parse({ path: 'Survival.uproject', content });
+    expect(result.diagnostics).toEqual([]);
+    const names = result.symbols.filter((s) => s.label === 'Name').map((s) => s.content);
+    expect(names).toEqual(['Survival', 'SurvivalEditor']);
+    const deps = result.symbols.find((s) => s.label === 'AdditionalDependencies');
+    expect(deps?.content).toBe('[Engine, UMG]');
+  });
 });
 
 // ---------------------------------------------------------------------------

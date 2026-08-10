@@ -2,7 +2,11 @@ import { IndexAdapterRegistry, NOOP_ADAPTER } from './index-adapters';
 import type { IndexParserAdapter } from './index-adapters';
 import { createJsonAdapter, createMarkdownAdapter, createTomlAdapter } from './index-formats';
 import type { IndexLanguage, ResolvedIndexConfig } from './index-policy';
-import { createTreeSitterAdapter } from './index-treesitter';
+import {
+  createCppTreeSitterAdapter,
+  createIniTreeSitterAdapter,
+  createTreeSitterAdapter,
+} from './index-treesitter';
 import { TreeSitterRuntime } from './treesitter-runtime';
 
 /**
@@ -31,8 +35,8 @@ import { TreeSitterRuntime } from './treesitter-runtime';
  *
  * **One shared `TreeSitterRuntime` per call**, matching `createTreeSitterAdapterRegistry`'s own
  * reasoning (`index-treesitter.ts`) — `Parser.init()` and each grammar's `Language.load` still run
- * at most once per registry, regardless of how many of the three TS/JS/TSX grammars a repo's
- * `languages` set actually admits.
+ * at most once per registry, regardless of how many of the five TS/JS/TSX/C++/ini (RUN-239) tree-
+ * sitter grammars a repo's `languages` set actually admits.
  *
  * **Both `index-repo` and `index-selftest` build their registry through this one function**
  * (RUN-219's own acceptance) — so the two commands cannot silently disagree about which adapters
@@ -58,6 +62,9 @@ export function buildIndexAdapterRegistry(
     createTreeSitterAdapter('typescript', runtime),
     createTreeSitterAdapter('tsx', runtime),
     createTreeSitterAdapter('javascript', runtime),
+    // RUN-239: C++ and ini, on measured demand — see index-policy.ts's own INDEX_LANGUAGES doc.
+    createCppTreeSitterAdapter(runtime),
+    createIniTreeSitterAdapter(runtime),
     createJsonAdapter(),
     createTomlAdapter(),
     createMarkdownAdapter(),

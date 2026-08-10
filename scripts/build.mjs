@@ -28,11 +28,18 @@ for (const f of (await readdir(promptsDir)).filter((f) => f.endsWith('.md') && f
 // self-contained without installing that package for every end user. @vscode/tree-sitter-wasm is
 // a devDependency ONLY (see src/treesitter-runtime.ts's module doc) — present here, at build time,
 // and in this repo's own node_modules for tsx/vitest, but never shipped as a runtime dependency.
+//
+// RUN-239 adds cpp (5,394,393 bytes measured on this host — the one large addition, accepted
+// explicitly for measured demand; see src/treesitter-runtime.ts's own doc for the bundle-size
+// trade) and ini (4,716 bytes — effectively free by comparison), on the SAME rail rather than a
+// new lazy-loading mechanism for the large one: one packaging mechanism to reason about.
 const grammarsDir = new URL('../node_modules/@vscode/tree-sitter-wasm/wasm/', import.meta.url);
 const grammarFiles = {
   typescript: 'tree-sitter-typescript.wasm',
   javascript: 'tree-sitter-javascript.wasm',
   tsx: 'tree-sitter-tsx.wasm',
+  cpp: 'tree-sitter-cpp.wasm',
+  ini: 'tree-sitter-ini.wasm',
 };
 const grammars = {};
 for (const [id, file] of Object.entries(grammarFiles)) {

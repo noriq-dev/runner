@@ -23,7 +23,7 @@ describe('IndexPolicy — the runner-owned execution knobs', () => {
   it('defaults every knob when the table is empty', () => {
     const parsed = IndexPolicy.parse({});
     expect(parsed).toEqual({
-      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml'],
+      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini'],
       contentMode: 'full',
       maxFiles: 20_000,
       maxFileBytes: 1_000_000,
@@ -36,6 +36,12 @@ describe('IndexPolicy — the runner-owned execution knobs', () => {
   it('accepts every settled language and refuses an unrecognized one', () => {
     expect(IndexPolicy.safeParse({ languages: ['typescript', 'toml'] }).success).toBe(true);
     expect(IndexPolicy.safeParse({ languages: ['python'] }).success).toBe(false);
+  });
+
+  it('RUN-239: accepts cpp and ini — Go and Rust stay refused, zero measured demand', () => {
+    expect(IndexPolicy.safeParse({ languages: ['cpp', 'ini'] }).success).toBe(true);
+    expect(IndexPolicy.safeParse({ languages: ['go'] }).success).toBe(false);
+    expect(IndexPolicy.safeParse({ languages: ['rust'] }).success).toBe(false);
   });
 
   it('refuses a negative or non-numeric bound', () => {
@@ -93,7 +99,7 @@ describe('resolveIndexConfig — decision 4/5: off unless enabled, invalid refus
       // RUN-262: the machine-wide default is layered on UNDER `exclude`, never merged into it —
       // `exclude` above is exactly what the repo declared, unchanged.
       defaultExclude: DEFAULT_EXCLUDE_GLOBS,
-      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml'],
+      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini'],
       contentMode: 'metadata',
       maxFiles: 10,
       maxFileBytes: 1_000_000,
@@ -222,5 +228,54 @@ describe('scanIndexSource — RUN-262 default exclude actually drops the file (n
     const result = await scanIndexSource(source, config);
     expect(result.statuses).toContainEqual({ path: 'foo.gen.ts', reason: 'excluded' });
     expect(result.statuses).toContainEqual({ path: 'package-lock.json', reason: 'excluded-default' });
+  });
+
+  it('RUN-239: drops Unreal .uasset/.umap under the default, reporting `excluded-default` — never `binary`', async () => {
+    // Binary bytes: were this NOT excluded first, `looksBinary` (a NUL in the first bytes) would
+    // classify it `binary` instead — this proves the exclude check runs, and wins, BEFORE the read.
+    const uassetBytes = Buffer.from([0x00, 0x01, 0x02, 0x03]).toString('latin1');
+    const config = resolveIndexConfig(spec(), { enabled: true });
+    const source = new FakeIndexSource([
+      { kind: 'file', path: 'Content/Characters/Hero.uasset', content: uassetBytes },
+      { kind: 'file', path: 'Content/Maps/Level01.umap', content: uassetBytes },
+      { kind: 'file', path: 'Source/Survival/Survival.cpp', content: 'int main() { return 0; }\n' },
+    ]);
+    const result = await scanIndexSource(source, config);
+    expect(result.candidates.map((c) => c.path)).toEqual(['Source/Survival/Survival.cpp']);
+    expect(result.statuses).toContainEqual({
+      path: 'Content/Characters/Hero.uasset',
+      reason: 'excluded-default',
+    });
+    expect(result.statuses).toContainEqual({ path: 'Content/Maps/Level01.umap', reason: 'excluded-default' });
+  });
+
+  it('RUN-239: `excludeDefaults = false` still brings .uasset/.umap back, same escape hatch as the lockfile default', async () => {
+    const config = resolveIndexConfig(spec(), { enabled: true, excludeDefaults: false });
+    const source = new FakeIndexSource([{ kind: 'file', path: 'Content/Hero.uasset', content: '\x00\x01' }]);
+    const result = await scanIndexSource(source, config);
+    // Binary content, no default exclude to stop it before the read — the ordinary `binary` status
+    // this file would always have gotten on its own bytes, proving the escape hatch does not
+    // silently invent text content for something that never was any.
+    expect(result.candidates).toEqual([]);
+    expect(result.statuses).toEqual([{ path: 'Content/Hero.uasset', reason: 'binary' }]);
+  });
+
+  it('RUN-239: MAX_STATUS_RECORDS still bounds a tree with more excluded Unreal binaries than the cap — no crash, no hang', async () => {
+    // Measured caveat (see index-policy.ts's own DEFAULT_EXCLUDE_GLOBS doc): the exclude/default-
+    // exclude check has no directory-level pruning the way the hard deny list does, so each match
+    // still costs one status-collector slot — this proves the EXISTING cap/overflow bookkeeping
+    // still holds under that load, not that the collector stays small.
+    const config = resolveIndexConfig(spec(), { enabled: true });
+    const files = Array.from({ length: 1200 }, (_, i) => ({
+      kind: 'file' as const,
+      path: `Content/Asset${String(i).padStart(4, '0')}.uasset`,
+      content: '\x00',
+    }));
+    const source = new FakeIndexSource(files);
+    const result = await scanIndexSource(source, config);
+    expect(result.candidates).toEqual([]);
+    expect(result.statuses).toHaveLength(1000);
+    expect(result.statusOverflow).toBe(200);
+    expect(result.statuses.every((s) => s.reason === 'excluded-default')).toBe(true);
   });
 });

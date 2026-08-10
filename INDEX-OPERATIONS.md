@@ -199,6 +199,232 @@ genuinely wired today — `languages` gates the tree-sitter adapter registry
 knob but isn't, that is exactly the defect class this document exists to avoid documenting as a
 feature — report it rather than trusting the comment.
 
+## Adapter roadmap (RUN-239)
+
+Language/format coverage grows from MEASURED demand, not a guessed list — every number below was
+counted on this host, on the three Noriq-managed projects that actually exist, not estimated.
+
+### Measured demand, per project
+
+| Project | VCS | Language/format | Files | Lines |
+| --- | --- | --- | --- | --- |
+| Project Nod (Unreal) | Diversion | `.cpp` + `.h` | 137 + 120 = 257 | 53,660 |
+| Project Nod | Diversion | `.cs` (all `.Build.cs`/`.Target.cs` — UBT, not hand-authored gameplay code) | 8 | — |
+| Project Nod | Diversion | `.ini` | 6 | — |
+| Project Nod | Diversion | `.uplugin` / `.uproject` | 4 + 1 = 5 | — |
+| Project Nod | Diversion | `.py` | 2 | — |
+| Project Nod | Diversion | binary assets (`.uasset`/`.png`/`.umap`, machine-generated) | 3201 + 101 + 6 = 3308 (89% of 3586 total tracked files) | n/a |
+| noriq, runner | git | TypeScript | (already covered) | — |
+| — | — | Go | **0** | — |
+| — | — | Rust | **0** | — |
+
+The task body's own guessed language list led with Go and Rust — zero files, in any managed
+project. C++ was fourth on that list and is the only one with real demand at meaningful scale.
+
+### What shipped, and why
+
+- **C++** (`src/index-treesitter.ts`, `createCppTreeSitterAdapter`): `tree-sitter-cpp.wasm`,
+  inlined through the SAME build-time base64 rail TS/JS/TSX already use (`scripts/build.mjs`,
+  `src/treesitter-runtime.ts`) — one packaging mechanism, not two. Claims `.cpp`/`.cc`/`.cxx`/
+  `.h`/`.hpp`/`.hh` (not `.inl`/`.ipp` — see the adapter's own doc for why, and not `.c` — no
+  measured demand for a separate C grammar). A free function, a class/struct and its methods
+  (inline or declared-only), a namespace, an enum, a `using`-alias, and a `typedef` each become a
+  `symbol` entity; enum members do not (values, not declarations — the same rule the TS adapter
+  already applies). **A header declaration and its out-of-class implementation are deliberately
+  TWO symbol entities, not one** — merging them would require this per-file adapter to decide "is
+  this declaration the same as that definition" across (usually) two files it never sees together,
+  which is exactly the kind of identity claim it cannot back; two entities is the same answer
+  `dedupeSymbolPaths` already gives a TS overload group. Same-file calls resolve on the identical
+  rule the TS adapter uses (`resolved` for an unambiguous bare call, `inferred` for `this->member`).
+  Declines, deliberately, and each PROVEN by a test rather than claimed in a comment
+  (`test/index-treesitter.test.ts`): a bodyless forward class declaration, a plain variable
+  declaration, a function-pointer VARIABLE declaration (`int (*fnPtr)(int,int);` — indistinguishable
+  from "function returning a pointer" without an unsound guess), an operator overload, an
+  out-of-line templated method definition (`Container<T>::method` — a template argument is not
+  stable identity text), and a class whose name was mangled by an export-macro-before-classname
+  convention (`class FOO_API Widget : public Base`) — real, but NOT the dominant cause of this
+  repo's parse errors, corrected below. Every declaration this adapter would otherwise emit a
+  symbol from is gated on `node.hasError` (does ITS OWN parse-tree subtree contain an
+  ERROR/MISSING node), coarser than the TS/JS adapter's one-diagnostic-per-file design — see "why
+  per-declaration, not per-file" below.
+- **Macro-noise blanking** (`blankCppMacroNoise`, applied to a COPY of the source before parsing
+  only — see "measured cause of the parse errors, and the fix" below): three UE macro families
+  measured to actually break the parse are blanked to equal-length spaces before the C++ grammar
+  ever sees them, recovering real declarations the grammar would otherwise lose around them.
+- **ini** (`createIniTreeSitterAdapter`): `tree-sitter-ini.wasm`, 4,716 bytes — effectively free on
+  the same rail. Sections and settings become `symbol` entities, values gated through the same
+  `shouldWithholdValue` check the JSON/TOML adapters already use.
+- **`.uproject`/`.uplugin`**: claimed by the EXISTING JSON adapter (`src/index-formats.ts`) — no
+  grammar, no new code path. Checked against Project Nod's own `Survival.uproject`: a plain JSON
+  object whose `Modules[].AdditionalDependencies` is the project's module dependency graph, which
+  the generic key-value walk already turns into entities with zero project-specific code.
+- **NOT added**: C# (`tree-sitter-c-sharp.wasm`, 5,103,332 bytes measured — nearly as large as
+  C++), Go, Rust, Python. See "What is deliberately absent" below for the measured counts behind
+  each.
+
+### Why per-declaration error gating, not per-file (measured)
+
+The TS/JS adapter trusts declarations found outside one narrow syntax-error region and emits a
+single bounded diagnostic per file. Sampling all 227 `.cpp`/`.h` files under Project Nod's
+`Source/` tree, **97 (42.7%) contain at least one parse-error node** — later widened to all 257
+tracked `.cpp`/`.h` files in the whole repo, **114/257 (44.4%)**. One real, measured cause: parsing
+`class SURVIVAL_API UC_InventoryComponent : public UActorComponent { ... }` (real Project Nod
+source, reduced to a minimal reproduction in `test/index-treesitter.test.ts`), tree-sitter's error
+recovery produces a `class_specifier` whose OWN `name` field is the literal token `SURVIVAL_API`,
+not `UC_InventoryComponent` — the corruption does not sit near the identity this adapter would
+extract, it IS the identity. A per-FILE diagnostic policy would let that fabricated symbol
+through; a per-DECLARATION `hasError` gate declines it (and every sibling still parses
+independently — the gate is never applied to a container node like `namespace_definition`, so one
+broken member never takes a whole namespace down with it).
+
+**This export macro is NOT, however, the dominant cause of the 114/257 error rate** — corrected
+after measurement, not assumed either way: blanking every `\b[A-Z][A-Z0-9_]*_API\b` token to
+equal-length spaces across all 257 files and re-parsing left the error count IDENTICAL, 114/257,
+not one file improved. Clustering the actual first ERROR/MISSING node in each of the 114 failing
+files found the real causes — see "measured cause of the parse errors, and the fix" below.
+
+Confirmed end to end on the real repo: `noriq-runner index-repo --path <Project Nod> --force`
+produced 134 diagnostics, entirely `warning`-severity per-file parse-error notes, zero fabricated
+symbols, zero crashes.
+
+### Measured cause of the parse errors, and the fix (`blankCppMacroNoise`)
+
+Clustering the first ERROR/MISSING node in each of the 114 failing `.cpp`/`.h` files (of 257
+total) gives three real causes, none of them the export macro above:
+
+| Cause | Files | Shape |
+| --- | --- | --- |
+| `GENERATED_BODY()` and siblings (`_UCLASS_BODY`/`_IINTERFACE_BODY`/`_USTRUCT_BODY`) | 82 | Call-shaped, no trailing `;`, inside a class body — the grammar reports a MISSING semicolon and loses whatever follows in that scope. |
+| `UMETA(...)` | 23 | Breaks a `UENUM`'s enumerator list (`enum class X : uint8 { A UMETA(DisplayName="…") }`). |
+| `DECLARE_..._DELEGATE...(...)` | 9 | The `DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam`/`FourParams` family. |
+
+`createCppTreeSitterAdapter` blanks all three to EQUAL-LENGTH spaces — never deletes — before
+handing the text to the parser, on a COPY of `input.content` only: the stored file entity and
+every symbol's own `content` field still read the true, un-blanked source (`content` is sliced
+from the original text via `node.startIndex`/`endIndex`, never `node.text`, which would read off
+the blanked parse tree). An embedded newline inside a matched span is preserved as a newline,
+specifically so line numbers — and therefore every `SymbolRange` — never shift; a byte-for-byte
+space-fill that also blanked newlines would silently mis-line every symbol after the match.
+`UCLASS`/`USTRUCT`/`UPROPERTY`/`UFUNCTION` are deliberately NOT blanked — they already parse as
+ordinary call expressions and no symbol gain was measured from touching them.
+
+**Measured gain, real repo, raw vs. blanked**: the C++ adapter in isolation, fed raw source versus
+source with the three macro families pre-blanked to equal-length spaces:
+
+```
+parse errors  raw: 114/257 (44.4%)   blanked: 114/257 (44.4%)   <- unchanged — see below
+symbols       raw: 1609              blanked: 1875              <- +266 (+16.5%), across 23 files
+```
+
+Confirmed independently, end to end, through the real command an operator would actually run —
+`noriq-runner index-repo --path <Project Nod> --force --json` against the whole repository
+(every language, not just C++), before this fix versus after:
+
+```
+symbol entities   before: 1470   after: 1736   <- +266, matching the isolated C++-only measurement exactly
+declares edges    before: 1470   after: 1736   <- one per symbol, moves in lockstep
+diagnostics.total before: 134    after: 134    <- unchanged — the SAME 134 warnings, not fewer, not more
+```
+
+**The parse-error COUNT does not move — that is the gate working, not a bug.** The
+per-declaration `hasError` gate recovers the GOOD declarations that sit next to a now-blanked
+macro; it does not make the file's OWN remaining unfixed constructs (an export-macro-mangled class
+header, say) parse cleanly, and blanking a macro elsewhere in the file does not remove errors a
+DIFFERENT construct is still causing. **114/257 files still contain a real parse-error node with
+this change in place — that is not a regression to fix, it is the honest number, and no comment or
+document in this repo should claim a clean parse.** The metric that actually improved is symbol
+recovery, not error count.
+
+### Bundle-size trade — measured, before and after
+
+| | dist/cli.js | dist/cli.js.map |
+| --- | --- | --- |
+| Before RUN-239 (TS/JS/TSX only) | 6,096,684 bytes (~5.8 MB) | — |
+| After RUN-239 (+ C++, + ini, + macro-noise blanking) | 13,313,290 bytes (~12.7 MB) | 15.0 MB |
+
+`tree-sitter-cpp.wasm` alone is 5,394,393 bytes — base64-inlined, that is the entire size of the
+increase; `tree-sitter-ini.wasm` (4,716 bytes) is noise by comparison. Accepted explicitly, shown
+these exact numbers, rather than inventing a second, lazily-loaded packaging mechanism for the one
+large grammar — one mechanism to reason about, and C++ is the one language this task's own
+measurement found real demand for at meaningful scale. `npm run build`'s own output prints the
+figure on every build; `noriq-runner index-selftest`, run against the actual built `dist/cli.js`
+(not tsx/vitest, which reads `.wasm` files from `node_modules` directly and would not catch a
+bundling regression — see `src/treesitter-runtime.ts`'s own doc), confirms all five grammars —
+`typescript`/`javascript`/`tsx`/`cpp`/`ini` — load and parse from the bundle, with the runtime
+engine initialized exactly once (`initCount: 1`) regardless of how many grammars a pass touches.
+
+### INDEXER_VERSION bump, and the acceptance line it cannot fully satisfy
+
+`INDEXER_VERSION` (`src/index-reconcile.ts`) moved `'1'` → `'2'` — mandatory, not housekeeping: a
+new adapter (or a widened `canParse`) changes this daemon's output for files that were previously
+untouched or NOOP-only, and `deriveGenerationId` is keyed on `indexerVersion` specifically so an
+older active generation is unconditionally superseded by a FULL pass rather than silently trusted
+as still-accurate.
+
+**What this buys, and what it does not.** Every repo's next reconcile becomes `full`, regardless of
+whether that repo has a single C++ file — there is no cheaper PER-LANGUAGE reindex this daemon can
+offer today. This is the one acceptance line this task cannot satisfy locally: `IndexGenerationManifest`
+(`vendor/noriq-shared/src/memory.ts`) carries only one whole-daemon `indexerVersion` field, no
+per-parser version reaches the wire, and the vendored contract must land planar-side FIRST
+(`VENDORED-CONTRACT.md`) — a targeted reindex needs a schema change this task does not make. Locally,
+`parserVersions` (`indexer.ts`'s own `IndexerResult`, and `noriq-runner index-repo`'s own JSON output
+carries it — see the sample run in this document's own history) IS recorded per adapter, but nothing
+branches on it. Reported blocked here rather than declared met by that field's mere presence.
+
+### Unreal binary assets, DEFAULT_EXCLUDE_GLOBS, and a measured caveat on the status collector
+
+`DEFAULT_EXCLUDE_GLOBS` (`src/index-policy.ts`) gained `**/*.uasset` and `**/*.umap` — Unreal's
+compiled asset/level binaries, machine-generated by the editor on save, never hand-authored, the
+same category as a committed lockfile. `[index].excludeDefaults = false` still brings them back,
+same escape hatch as every other entry on that list.
+
+**What this measurably buys**: the exclude check (`index-scan.ts`) runs BEFORE the read/binary-sniff
+step, so a matched `.uasset`/`.umap` never has its bytes read at all — real I/O and CPU avoided on
+files that are often several MB each — and its status reason becomes the accurate, deliberate
+`excluded-default` rather than the (equally correct, but less informative) `binary` it would have
+gotten anyway.
+
+**What it measurably does NOT buy, checked by actually running it rather than assumed**: a smaller
+scan-status collector. Running `noriq-runner index-repo --path <Project Nod> --force --json`
+against the real repository (live working tree, not a clean checkout — see `index-repo`'s own
+"local dry run" note above) produced `scanStatuses: { total: 1000, overflow: 2308, byReason:
+{ "excluded-default": 899, "too-large": 87, "binary": 14 } }` — the collector's 1000-record cap was
+reached and 2308 more records overflowed past it, with 899 of the 1000 VISIBLE records being
+`excluded-default` .uasset/.umap noise. The reason: `index-scan.ts`'s `exclude`/`defaultExclude`
+check has no directory-level pruning analogue to the one the hard deny list and `vcsIgnored` get
+(`makeShouldDescend`, `index-scan.ts`) — each matched file still costs its own `pushStatus` call,
+identically to what `binary` would have cost. An extension-shaped glob like `**/*.uasset` cannot
+soundly support directory-level pruning either (not every file under a directory containing
+`.uasset` files is itself one), and a directory-NAME-based default (e.g. any `Content/`) would be
+exactly the per-repo-layout judgement call `DEFAULT_EXCLUDE_GLOBS`'s own doc says does not belong
+in this list. Closing this gap properly needs a real (and larger) change to `index-scan.ts`'s
+matching engine — directory-level pruning for `exclude`/`defaultExclude`, or an aggregated-count
+status entry instead of one row per matched file — which this task does not make. What IS true,
+and tested (`test/index-policy.test.ts`): the existing `MAX_STATUS_RECORDS`/`statusOverflow`
+bookkeeping holds correctly under this load — no crash, no hang, an honest count of what did not
+fit — and the escape hatch (`excludeDefaults = false`) still works exactly as it does for every
+other default.
+
+### What is deliberately absent
+
+- **C#, Go, Rust, Python adapters** — measured, not overlooked: 8 UBT `.Build.cs`/`.Target.cs`
+  files (C#, `tree-sitter-c-sharp.wasm` is 5,103,332 bytes — nearly doubling the bundle again for a
+  vendor-tooling format, not gameplay code), 2 `.py` files, and zero Go/Rust files anywhere.
+- **A non-tree-sitter `.Build.cs`/`.Target.cs` adapter** extracting UBT module dependencies without
+  paying the 5.1 MB C# grammar cost — those files declare the Unreal module graph, the most
+  interesting structure in the repo after `.uproject`/`.uplugin`, and are the most likely NEXT step;
+  deliberately not this task.
+- **Per-language parser versions on the wire, and targeted per-language reindex** — see the
+  INDEXER_VERSION section above; blocked on a planar contract change.
+- **Marking Project Nod with a `.noriq/project.toml`** — it has none today, so the daemon does not
+  discover it at all. This task makes C++ ready; it does not onboard that repo.
+- **Load-testing an Unreal repo end to end through the Diversion backend** — RUN-238 already
+  recorded Diversion as unmeasured for the indexing LOAD path, and nothing here changes that (the
+  real-repo runs in this section used `index-repo`'s local filesystem walk, never the Diversion
+  snapshot lease path).
+- **Directory-level pruning for `exclude`/`defaultExclude` in `index-scan.ts`** — see the status-
+  collector caveat immediately above; a real gap, sized larger than this task, left for a follow-up.
+
 ## Load and memory budgets (RUN-238)
 
 An anchor measurement (before this section existed) found a single continuous **6.3-second

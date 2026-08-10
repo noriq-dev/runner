@@ -11,6 +11,7 @@ import { MAX_INGEST_BATCH_BYTES } from '../src/index-batch';
 import { MAX_PARSE_DIAGNOSTICS } from '../src/index-entity';
 import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
+import { INDEXER_VERSION } from '../src/index-reconcile';
 import { FakeIndexSource } from '../src/index-source';
 import type { FakeIndexSourceItem } from '../src/index-source';
 import { resolveRelativeImport, runIndexer } from '../src/indexer';
@@ -129,7 +130,7 @@ describe('runIndexer — determinism', () => {
     ['repositoryKey', 'other-repo'],
     ['branch', 'other-branch'],
     ['baseId', 'sha_2'],
-    ['indexerVersion', '2'],
+    ['indexerVersion', String(Number(INDEXER_VERSION) + 1)],
   ] as const) {
     it(`changes generationId when ${field} changes`, async () => {
       const base = await runIndexer(new FakeIndexSource(fixture()), cfg(), target(), {

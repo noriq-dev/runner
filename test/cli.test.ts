@@ -50,9 +50,9 @@ describe('cli', () => {
     expect(report.ok).toBe(true);
     expect(report.runtime).toEqual({
       initCount: 1,
-      grammarLoadCounts: { typescript: 1, javascript: 1, tsx: 1 },
+      grammarLoadCounts: { typescript: 1, javascript: 1, tsx: 1, cpp: 1, ini: 1 },
     });
-    expect(report.grammars).toHaveLength(3);
+    expect(report.grammars).toHaveLength(5);
     for (const g of report.grammars) expect(g.passed).toBe(true);
   });
 

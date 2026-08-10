@@ -10,6 +10,7 @@ import {
   type ParsedImport,
   type ParsedSymbol,
 } from './index-adapters';
+import { shouldWithholdValue } from './index-redact';
 import { type GrammarId, TreeSitterRuntime, grammarIdForPath } from './treesitter-runtime';
 
 /**
@@ -574,9 +575,684 @@ async function parseFile(
   }
 }
 
-/** Builds a registry with all three tree-sitter adapters ahead of `NOOP_ADAPTER`, sharing one
+// =============================================================================================
+// C++ (RUN-239) — measured demand (Project Nod, the one Noriq-managed Unreal project: 137 .cpp +
+// 120 .h, 53660 lines), not the task body's guessed language list (Go/Rust: zero files anywhere).
+//
+// **Node-type mapping, the substantive judgement this adapter makes**: a free function
+// (`function_definition`/`declaration` whose declarator resolves to a bare `identifier`), a class
+// or struct (`class_specifier`/`struct_specifier`, requiring BOTH a `name` and a `body` field —
+// see "locally broken" below for why a bodyless one is declined rather than treated as a forward
+// declaration worth a symbol), and a method (the same declarator resolution, nested under the
+// class either because it is LEXICALLY inside the class body — `field_identifier`/
+// `destructor_name` declarators — or because it is an out-of-class definition whose
+// `qualified_identifier` declarator names the class explicitly, e.g. `Widget::doThing`). A
+// `namespace` becomes a symbol the same way a class does, nesting its members exactly like
+// `index-treesitter.ts`'s existing TS `internal_module` handling. `enum_specifier`, `using`
+// (`alias_declaration`), and `typedef` (`type_definition`) each become ONE symbol, no nested
+// members — the same "the declaration is the fact, its innards are not" rule the TS adapter
+// already applies to `enum_declaration`.
+//
+// **Header declaration vs. implementation definition: TWO symbols, not one** (the discretion item
+// this task calls out explicitly). `void Widget::doThing();` in a header and
+// `void Widget::doThing() { … }` in a .cpp both resolve to the identical `symbolPath`
+// `['Widget', 'doThing']` — matching, on purpose, so `index-entity.ts`'s `dedupeSymbolPaths`
+// disambiguates them into two distinct entities the SAME way it already disambiguates a TS
+// overload group (`index-treesitter.ts`'s own locked decision 8, reused verbatim rather than
+// invented fresh). Merging them into ONE entity would require deciding "is this declaration the
+// same as that definition", a semantic question this per-file, no-type-information adapter cannot
+// answer even within a single file — let alone across the header/implementation split, which is
+// usually two different files this adapter never sees together at all (`index-adapters.ts`'s own
+// "one file at a time" constraint). Emitting two is the conservative, honest answer: it never
+// claims an identity link this adapter cannot back.
+//
+// **A `qualified_identifier` scope that is itself a template instantiation
+// (`Container<T>::method`) DECLINES** — `resolveScopeChain` only resolves a `namespace_identifier`
+// or another `qualified_identifier`, never a `template_type`. The type argument the source spells
+// out is not stable identity text the way a namespace or class name is (which instantiation is
+// "the" `Container<T>`?), so an out-of-line templated method definition gets no symbol rather than
+// a guessed one. A real coverage gap on template-heavy code, taken deliberately.
+//
+// **`.h` is parsed as C++, unconditionally** (discretion) — there is no C grammar on the same
+// inlining rail and zero measured demand for one (Project Nod's 8 `.cs`/0 `.c` files are the only
+// non-C++ source in the one repo with real C++ demand). A plain C header mostly still parses (the
+// declarative subset this adapter reads — functions, structs, enums, typedefs — is a near-superset
+// in the C++ grammar); a construct that does not degrades through the same "locally broken" and
+// "unresolved declarator" declines as any other unparseable C++.
+//
+// **No `test`/`api` node type, unlike the TS adapter's `describe`/`it`** — there is no single
+// dominant C++ test-macro convention the way JS has one: gtest's `TEST`/`TEST_F`, Catch2's
+// `TEST_CASE`, and Unreal's own `IMPLEMENT_SIMPLE_AUTOMATION_TEST` macro family are three
+// incompatible call/macro shapes, and guessing one framework's spelling is exactly the "a wrong
+// guess is worse than the missing coverage" case this same file's TS adapter already declined for
+// route decorators. Every C++ symbol this adapter emits is `nodeType: 'symbol'`.
+//
+// **A declaration whose own parse tree contains an ERROR/MISSING node anywhere inside it is
+// declined WHOLESALE — no symbol, no recursion into it** (`isCppNodeBroken` below). This is
+// COARSER than the TS/JS adapter's one-diagnostic-per-file design, which still trusts declarations
+// found outside a narrow local ERROR region (this file's own doc, "Isolation is TWO-LAYERED") —
+// deliberately revisited here because MEASURED real C++ breaks the assumption that a nearby error
+// stays nearby. Sampling all 227 `.cpp`/`.h` files in Project Nod's `Source/` tree: 97 (42.7%)
+// contain at least one parse-error node. One shape measured directly — `class SURVIVAL_API
+// UC_InventoryComponent : public UActorComponent` mis-parses so that the `class_specifier`'s OWN
+// `name` field becomes the literal token `SURVIVAL_API`, not the real class name — is real and is
+// exactly why this gate is per-DECLARATION rather than per-file: the corruption does not sit near
+// the identity this adapter would extract, it IS the identity, and admitting it would fabricate a
+// symbol. Declining any node whose subtree `hasError` is what catches that specific misparse
+// without mass-declining whole files: the check is per DECLARATION node (a `class_specifier`, a
+// `function_definition`, …), never per container (`namespace_definition` is never gated this way,
+// so ONE broken member does not take its siblings down with it) and never per file.
+//
+// **CORRECTION, measured**: the `<MODULE>_API` export macro above is NOT what causes most of those
+// 97 (now 114/257 on a later, larger sample — see below) parse errors, and an earlier version of
+// this comment claimed it was. Blanking every `\b[A-Z][A-Z0-9_]*_API\b` token (equal-length spaces)
+// across all 257 real `.cpp`/`.h` files and re-parsing left the error count IDENTICAL — 114/257,
+// not one file improved. Clustering the actual first ERROR/MISSING node per failing file found
+// three real causes instead, none of them the export macro: `GENERATED_BODY()` and its
+// `_UCLASS_BODY`/`_IINTERFACE_BODY`/`_USTRUCT_BODY` siblings — call-shaped with NO trailing `;`
+// inside a class body, so the grammar's recovery reports a MISSING semicolon and loses whatever
+// follows in that scope (82/114 files); `UMETA(...)` breaking a `UENUM`'s enumerator list
+// (23/114); and the `DECLARE_..._DELEGATE...(...)` macro family (9/114). `blankCppMacroNoise`
+// below blanks exactly those three, measured to actually help — see its own doc for the numbers
+// and why `UCLASS`/`USTRUCT`/`UPROPERTY`/`UFUNCTION` are deliberately left untouched.
+// =============================================================================================
+
+const CPP_ADAPTER_VERSION = '1';
+
+/** Extensions this adapter claims — the two Project Nod actually has (`.cpp`/`.h`) plus the
+ *  standard C++ variants sharing the identical grammar (discretion). `.inl`/`.ipp` are NOT
+ *  claimed: those conventionally hold textual fragments meant to be `#include`d mid-declaration
+ *  (a class body, a template definition continued from elsewhere) rather than a standalone
+ *  translation unit, so a generic file-level parse is far more likely to see a dangling fragment
+ *  than a real declaration — no measured demand either way, so left off rather than guessed at. */
+const CPP_EXTENSION_RE = /\.(?:cpp|cc|cxx|h|hpp|hh)$/i;
+
+/**
+ * MEASURED cause of most of this grammar's parse errors on real Unreal C++ — corrected from an
+ * earlier (wrong) belief that a `<MODULE>_API` export macro before the class name was the culprit
+ * (blanking every `_API` token across all 257 real Project Nod `.cpp`/`.h` files left the error
+ * count IDENTICAL, 114/257, not one file improved; see this section's own doc). Clustering the
+ * actual first ERROR/MISSING node per failing file found these three instead:
+ *
+ * - `GENERATED_BODY()` and its `_UCLASS_BODY`/`_IINTERFACE_BODY`/`_USTRUCT_BODY` siblings —
+ *   call-shaped, no trailing `;`, inside a class body: the grammar reports a MISSING semicolon and
+ *   loses whatever follows in that scope. 82 of the 114 failing files.
+ * - `UMETA(...)` inside a `UENUM`'s enumerator list. 23 of the 114.
+ * - `DECLARE_..._DELEGATE...(...)` (`DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam`,
+ *   `_FourParams`, …). 9 of the 114.
+ *
+ * `UCLASS`/`USTRUCT`/`UPROPERTY`/`UFUNCTION` are deliberately NOT included — they already parse as
+ * ordinary call expressions (measured) and no symbol gain was measured from blanking them; adding
+ * them without a measured reason would be exactly the guess this task's "measure, don't assert"
+ * instruction forbids.
+ *
+ * These are TEXT-level patterns, not syntax-aware — a match inside a string literal or a comment
+ * would be blanked too (a known, accepted limitation of this technique, not something this task
+ * attempts to fix by parsing comments/strings out first).
+ */
+const CPP_MACRO_NOISE_PATTERNS: readonly RegExp[] = [
+  /\bGENERATED_(?:BODY|UCLASS_BODY|IINTERFACE_BODY|USTRUCT_BODY)\s*\(\s*\)/g,
+  /\bUMETA\s*\([^)]*\)/g,
+  /\bDECLARE_[A-Z_]*DELEGATE[A-Za-z_]*\s*\([^;]*?\)\s*;/g,
+];
+
+/** Blank every character of a matched macro invocation to a space, EXCEPT an embedded newline,
+ *  which is kept as-is — see `CPP_MACRO_NOISE_PATTERNS`' own doc. A byte-for-byte space-fill that
+ *  also blanked newlines would collapse a multi-line `DECLARE_..._DELEGATE...(...)` call's line
+ *  count, silently shifting the `SymbolRange` of every symbol declared after it in the same file. */
+function blankPreservingNewlines(match: string): string {
+  return match.replace(/[^\n]/g, ' ');
+}
+
+/**
+ * Blank `CPP_MACRO_NOISE_PATTERNS` to EQUAL-LENGTH spaces, never delete — the property the whole
+ * approach rests on (asserted directly in `test/index-treesitter.test.ts`, not just claimed here):
+ * blanking preserves `content.length` exactly, so `node.startIndex`/`endIndex`/`startPosition`/
+ * `endPosition` computed against the BLANKED text remain valid offsets into the ORIGINAL text too.
+ * This is what lets `parseCppFile` parse a throwaway blanked copy while every symbol's `content`
+ * and `range` still describe real, unmodified source (see `pushCppSymbol`) — the file entity
+ * itself (`indexer.ts`'s own mint, outside this adapter entirely) never sees this transform at
+ * all, only `AdapterParseInput.content` as the caller supplied it.
+ */
+export function blankCppMacroNoise(content: string): string {
+  let out = content;
+  for (const pattern of CPP_MACRO_NOISE_PATTERNS) {
+    out = out.replace(pattern, (m) => blankPreservingNewlines(m));
+  }
+  return out;
+}
+
+interface CppCallSite {
+  fromPath: string[] | null;
+  calleeName: string;
+  isThisMember: boolean;
+  enclosingClass: string | null;
+}
+
+interface CppWalkState {
+  symbols: ParsedSymbol[];
+  imports: ParsedImport[];
+  callSites: CppCallSite[];
+  /** The TRUE, un-blanked source text — every symbol's `content` is sliced from THIS (via
+   *  `node.startIndex`/`endIndex`), never `node.text`, which would read off the blanked tree
+   *  `parseCppFile` actually parsed. See `blankCppMacroNoise`'s own doc. */
+  originalContent: string;
+}
+
+interface CppWalkCtx {
+  path: string[] | null;
+  enclosingClass: string | null;
+}
+
+/** See this section's own doc, "A declaration whose own parse tree contains an ERROR/MISSING node
+ *  ... is declined WHOLESALE". `node.hasError` is tree-sitter's own "this node or any descendant
+ *  is an ERROR/MISSING node" — exactly the granularity needed to catch a misparsed declarator
+ *  without punishing an unrelated sibling declaration. */
+function isCppNodeBroken(node: Node): boolean {
+  return node.hasError;
+}
+
+function pushCppSymbol(state: CppWalkState, path: string[], label: string, node: Node): void {
+  state.symbols.push({
+    symbolPath: path,
+    nodeType: 'symbol',
+    label,
+    // Sliced from the ORIGINAL text, not `node.text` — see `CppWalkState.originalContent`'s doc.
+    // Valid because blanking is length- and offset-preserving by construction.
+    content: state.originalContent.slice(node.startIndex, node.endIndex),
+    range: { startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1 },
+  });
+}
+
+/** The child of a C++ `string_literal` (`"like/this"`) that actually holds text, stripped of its
+ *  own quote delimiters — mirrors `literalStringValue` above one grammar over; a different node
+ *  type (`string_literal` vs. TS's `string`) rules out sharing the one function directly. */
+function cppStringLiteralContent(node: Node): string | null {
+  const fragment = node.namedChildren.find((c) => c?.type === 'string_content');
+  return fragment ? fragment.text : null;
+}
+
+/** Peel `pointer_declarator`/`reference_declarator` layers a RETURN-type modifier adds
+ *  (`int* getPtr()`, `Foo& operator=(...)`) down to the `function_declarator` underneath. Returns
+ *  `null` — decline — for anything that does not bottom out at one, which is exactly what a
+ *  function-POINTER VARIABLE declaration does instead (`int (*fnPtr)(int, int);` parses as a
+ *  `function_declarator` whose OWN `declarator` field is a `parenthesized_declarator`, never a
+ *  name): unwrapping through THAT shape too would extract `fnPtr` as if it were a function
+ *  declaration, which is exactly the ambiguity may-miss-never-invent exists to decline rather than
+ *  guess through — the grammar does not disambiguate "function returning a pointer" from "variable
+ *  holding a function pointer" any more precisely than this. */
+function unwrapToFunctionDeclarator(node: Node | null): Node | null {
+  let current = node;
+  while (current && (current.type === 'pointer_declarator' || current.type === 'reference_declarator')) {
+    current = current.childForFieldName('declarator');
+  }
+  return current && current.type === 'function_declarator' ? current : null;
+}
+
+/** The scope segments of a `qualified_identifier`'s own `scope` field — a single
+ *  `namespace_identifier` (`Widget::doThing`'s scope is just `Widget`) or, recursively, a nested
+ *  `qualified_identifier` (`A::B::method`'s outer scope is itself `A::B`). `null` — decline — for
+ *  anything else, most importantly `template_type` (`Container<T>::method`): see this section's
+ *  own doc for why a template argument is not stable identity text. */
+function resolveScopeChain(node: Node | null): string[] | null {
+  if (!node) return null;
+  if (node.type === 'namespace_identifier') return [node.text];
+  if (node.type === 'qualified_identifier') {
+    const scope = resolveScopeChain(node.childForFieldName('scope'));
+    const name = node.childForFieldName('name');
+    if (!scope || !name || name.type !== 'identifier') return null;
+    return [...scope, name.text];
+  }
+  return null;
+}
+
+/** `~Widget` for a `destructor_name` node — its own `identifier` child, prefixed the way the
+ *  source itself spells a destructor, never the bare class name alone (which would collide with
+ *  the constructor's own symbolPath). */
+function destructorLabel(node: Node): string | null {
+  const inner = node.namedChildren.find((c) => c?.type === 'identifier');
+  return inner ? `~${inner.text}` : null;
+}
+
+/** Resolve a `function_declarator`'s own `declarator` field to a name plus the scope segments a
+ *  `qualified_identifier` (an out-of-class definition) carries — `{ scopeSegments: [], name }` for
+ *  a plain `identifier`/`field_identifier`/`destructor_name` (a free function, an inline method, an
+ *  inline destructor), non-empty `scopeSegments` for `Widget::doThing`. `operator_name` (operator
+ *  overloads) DECLINES, deliberately (discretion): canonicalizing `operator[]` vs. `operator ()`
+ *  spacing/spelling is a real ambiguity this adapter chooses not to guess through, the same
+ *  "declined, deliberately" posture the TS adapter takes for route decorators. Anything else
+ *  (a `parenthesized_declarator`, …) declines the same way. */
+function resolveFunctionDeclaratorName(fnDeclarator: Node): { scopeSegments: string[]; name: string } | null {
+  const declarator = fnDeclarator.childForFieldName('declarator');
+  if (!declarator) return null;
+  switch (declarator.type) {
+    case 'identifier':
+    case 'field_identifier':
+      return { scopeSegments: [], name: declarator.text };
+    case 'destructor_name': {
+      const label = destructorLabel(declarator);
+      return label ? { scopeSegments: [], name: label } : null;
+    }
+    case 'qualified_identifier': {
+      const scopeSegments = resolveScopeChain(declarator.childForFieldName('scope'));
+      const nameNode = declarator.childForFieldName('name');
+      if (!scopeSegments || !nameNode) return null;
+      if (nameNode.type === 'identifier') return { scopeSegments, name: nameNode.text };
+      if (nameNode.type === 'destructor_name') {
+        const label = destructorLabel(nameNode);
+        return label ? { scopeSegments, name: label } : null;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** The full extraction for a `function_definition`/`declaration`/`field_declaration`'s OWN
+ *  `declarator` field: unwrap any pointer/reference return-type wrapping, resolve the underlying
+ *  `function_declarator`'s name, and prefix with `pathPrefix` (the enclosing namespace/class path
+ *  already accumulated by the walk) plus any scope the declarator's own qualified name carries.
+ *  `null` — decline, no symbol — for a plain variable declaration, an operator overload, a
+ *  function-pointer variable, or anything `resolveFunctionDeclaratorName` already declines. */
+function resolveDeclaredFunctionPath(
+  outerDeclarator: Node | null,
+  pathPrefix: readonly string[],
+): { path: string[]; scopeSegments: string[] } | null {
+  const fnDeclarator = unwrapToFunctionDeclarator(outerDeclarator);
+  if (!fnDeclarator) return null;
+  const resolved = resolveFunctionDeclaratorName(fnDeclarator);
+  if (!resolved) return null;
+  return {
+    path: [...pathPrefix, ...resolved.scopeSegments, resolved.name],
+    scopeSegments: resolved.scopeSegments,
+  };
+}
+
+/** `call_expression.function` — a bare `identifier` (`add(1, 2)`) or a `this->member()`
+ *  `field_expression` (the C++ spelling of TS's `this.member()`; `argument`/`field` are its own
+ *  field names). Any other receiver (`obj.method()`, `obj->method()` where `obj` is not `this`,
+ *  `Namespace::freeFn()`, a computed callee) declines by simply recording no call site — the same
+ *  posture `index-treesitter.ts`'s TS adapter already takes for every member expression that is
+ *  not `this`. */
+function recordCppCallSite(node: Node, ctx: CppWalkCtx, state: CppWalkState): void {
+  const callee = node.childForFieldName('function');
+  if (callee?.type === 'identifier') {
+    state.callSites.push({
+      fromPath: ctx.path,
+      calleeName: callee.text,
+      isThisMember: false,
+      enclosingClass: ctx.enclosingClass,
+    });
+  } else if (callee?.type === 'field_expression') {
+    const argument = callee.childForFieldName('argument');
+    const field = callee.childForFieldName('field');
+    if (argument?.type === 'this' && field?.type === 'field_identifier') {
+      state.callSites.push({
+        fromPath: ctx.path,
+        calleeName: field.text,
+        isThisMember: true,
+        enclosingClass: ctx.enclosingClass,
+      });
+    }
+  }
+}
+
+function walkCppChildren(node: Node, ctx: CppWalkCtx, state: CppWalkState): void {
+  for (const child of node.namedChildren) {
+    if (child) walkCpp(child, ctx, state);
+  }
+}
+
+function walkCpp(node: Node, ctx: CppWalkCtx, state: CppWalkState): void {
+  switch (node.type) {
+    // A `namespace` never itself gated on `hasError` (see this section's own doc) — its role is
+    // purely a CONTAINER, and each member declared inside is independently gated when the walk
+    // reaches it, the same way a file-level error never blanks out unrelated declarations.
+    case 'namespace_definition': {
+      const name = node.childForFieldName('name');
+      const body = node.childForFieldName('body');
+      if (name && body) {
+        const path = [...(ctx.path ?? []), name.text];
+        pushCppSymbol(state, path, name.text, node);
+        walkCppChildren(node, { ...ctx, path }, state);
+        return;
+      }
+      // An anonymous `namespace { … }` (no `name` field) — falls through to the generic walk
+      // below with `ctx` UNCHANGED: its members belong to the enclosing scope, exactly C++'s own
+      // semantics for an unnamed namespace, so this is not "declined", only "not itself named".
+      break;
+    }
+    case 'class_specifier':
+    case 'struct_specifier': {
+      if (isCppNodeBroken(node)) return;
+      const name = node.childForFieldName('name');
+      const body = node.childForFieldName('body');
+      // BOTH fields required: a bodyless `class Foo;` (a genuine forward declaration, nothing to
+      // attribute members to) and the exact `SURVIVAL_API`-as-classname misparse this section's
+      // doc measures (whose `class_specifier` carries `name` but never `body`, because the real
+      // body landed inside a sibling ERROR node instead) both decline the identical way.
+      if (name && body) {
+        const path = [...(ctx.path ?? []), name.text];
+        pushCppSymbol(state, path, name.text, node);
+        walkCppChildren(node, { path, enclosingClass: name.text }, state);
+        return;
+      }
+      break;
+    }
+    case 'function_definition': {
+      if (isCppNodeBroken(node)) return;
+      const resolved = resolveDeclaredFunctionPath(node.childForFieldName('declarator'), ctx.path ?? []);
+      if (resolved) {
+        pushCppSymbol(state, resolved.path, resolved.path.at(-1)!, node);
+        // An out-of-class definition (`Widget::doThing`) sets `enclosingClass` from its OWN
+        // qualified scope, not the lexical namespace it happens to sit in — a `this->x()` call
+        // inside it resolves against `Widget`'s methods regardless of which namespace block wraps
+        // the definition. An inline definition (empty `scopeSegments`) keeps whatever
+        // `enclosingClass` the surrounding `class_specifier` already set.
+        const enclosingClass =
+          resolved.scopeSegments.length > 0 ? resolved.scopeSegments.at(-1)! : ctx.enclosingClass;
+        walkCppChildren(node, { path: resolved.path, enclosingClass }, state);
+        return;
+      }
+      break;
+    }
+    // `declaration` (a bodyless forward declaration — the .h half of a header/implementation
+    // split, or a ctor/dtor declared but not defined in a class body) and `field_declaration` (a
+    // declared-only method WITH a return type, or a data member) share the identical
+    // declarator-resolution rule: if it names a function, one symbol, no recursion (nothing to
+    // recurse into); if not (a plain variable, or a nested class/struct/enum declared as this
+    // field's own `type` — tree-sitter-cpp's own shape for `class Bar { class Inner {...}; };`),
+    // decline and fall through to the generic walk, which visits any such nested declaration on
+    // its own terms via the `class_specifier` case above.
+    case 'declaration':
+    case 'field_declaration': {
+      if (isCppNodeBroken(node)) return;
+      const resolved = resolveDeclaredFunctionPath(node.childForFieldName('declarator'), ctx.path ?? []);
+      if (resolved) {
+        pushCppSymbol(state, resolved.path, resolved.path.at(-1)!, node);
+        return;
+      }
+      break;
+    }
+    // Members are values, not declarations — same rule the TS adapter already applies to
+    // `enum_declaration`; only the enum's own name becomes a symbol.
+    case 'enum_specifier': {
+      if (isCppNodeBroken(node)) return;
+      const name = node.childForFieldName('name');
+      if (name) pushCppSymbol(state, [...(ctx.path ?? []), name.text], name.text, node);
+      break;
+    }
+    case 'alias_declaration': {
+      if (isCppNodeBroken(node)) return;
+      const name = node.childForFieldName('name');
+      if (name) pushCppSymbol(state, [...(ctx.path ?? []), name.text], name.text, node);
+      break;
+    }
+    case 'type_definition': {
+      if (isCppNodeBroken(node)) return;
+      const declarator = node.childForFieldName('declarator');
+      // Only the simple `typedef <type> Name;` shape is read — a function-pointer or array-shaped
+      // typedef declarator declines the same way an equivalently-shaped variable declaration does.
+      if (declarator?.type === 'type_identifier') {
+        pushCppSymbol(state, [...(ctx.path ?? []), declarator.text], declarator.text, node);
+      }
+      break;
+    }
+    case 'preproc_include': {
+      const pathNode = node.childForFieldName('path');
+      if (pathNode?.type === 'system_lib_string') {
+        // `<string>` — angle-bracket includes are never file-relative, so the specifier is kept
+        // literal (stripped of its own `<`/`>`) rather than normalized: `resolveRelativeImport`
+        // declines any specifier not starting with `.` regardless, the same way a bare TS
+        // `import 'react'` already declines with no special-casing needed here.
+        const text = pathNode.text;
+        if (text.length >= 2) state.imports.push({ specifier: text.slice(1, -1) });
+      } else if (pathNode?.type === 'string_literal') {
+        const content = cppStringLiteralContent(pathNode);
+        // Quoted includes search the INCLUDING FILE'S OWN DIRECTORY first — the C++ standard's own
+        // quoted-include rule, not a framework guess — so a specifier with no leading `.` is
+        // normalized to one (`Foo.h` -> `./Foo.h`) purely so `resolveRelativeImport`'s existing
+        // bare-vs-relative dispatch (index-adapters.ts's own doc) treats it as relative, matching
+        // language semantics rather than inventing a resolution rule of this adapter's own.
+        if (content !== null) {
+          state.imports.push({ specifier: content.startsWith('.') ? content : `./${content}` });
+        }
+      }
+      break;
+    }
+    case 'call_expression': {
+      recordCppCallSite(node, ctx, state);
+      break;
+    }
+    default:
+      break;
+  }
+  walkCppChildren(node, ctx, state);
+}
+
+/** Same-file call resolution — structurally identical to `resolveCalls` above (bare identifier
+ *  resolves only against an unambiguous TOP-LEVEL, i.e. unnamespaced, declaration;
+ *  `this->member()` resolves only against the enclosing class's own methods, at `'inferred'`
+ *  confidence). Kept as its own function rather than sharing `resolveCalls` directly: the two
+ *  languages' `CallSite`/`WalkState` shapes coincide today by construction, not by a documented
+ *  contract, and C++ is the more likely of the two to need call resolution that TS's rule cannot
+ *  express (argument-count-based overload disambiguation, say) — sharing now would mean un-sharing
+ *  later under exactly the kind of change most likely to need it. */
+function resolveCppCalls(state: CppWalkState): ParsedCall[] {
+  const topLevelByName = new Map<string, string[][]>();
+  for (const symbol of state.symbols) {
+    if (symbol.symbolPath.length !== 1) continue;
+    const name = symbol.symbolPath[0]!;
+    const list = topLevelByName.get(name) ?? [];
+    list.push(symbol.symbolPath);
+    topLevelByName.set(name, list);
+  }
+
+  const methodsByClass = new Map<string, Set<string>>();
+  for (const symbol of state.symbols) {
+    if (symbol.symbolPath.length !== 2) continue;
+    const [className, methodName] = symbol.symbolPath as [string, string];
+    const set = methodsByClass.get(className) ?? new Set<string>();
+    set.add(methodName);
+    methodsByClass.set(className, set);
+  }
+
+  const calls: ParsedCall[] = [];
+  for (const site of state.callSites) {
+    if (!site.fromPath) continue;
+    if (site.isThisMember) {
+      if (site.enclosingClass && methodsByClass.get(site.enclosingClass)?.has(site.calleeName)) {
+        calls.push({
+          fromSymbolPath: site.fromPath,
+          toSymbolPath: [site.enclosingClass, site.calleeName],
+          confidence: 'inferred',
+        });
+      }
+      continue;
+    }
+    const candidates = topLevelByName.get(site.calleeName);
+    if (candidates && candidates.length === 1) {
+      calls.push({ fromSymbolPath: site.fromPath, toSymbolPath: candidates[0]!, confidence: 'resolved' });
+    }
+  }
+  return calls;
+}
+
+async function parseCppFile(
+  runtime: TreeSitterRuntime,
+  input: AdapterParseInput,
+): Promise<AdapterParseResult> {
+  // See `parseFile` above for why `parser`/`tree` are freed in `finally` (RUN-238) and why this
+  // isolation is deliberately two-layered with `indexer.ts`'s own per-adapter try/catch.
+  let parser: Parser | undefined;
+  let tree: Tree | null | undefined;
+  try {
+    parser = await runtime.parserFor('cpp');
+    // Parse a BLANKED COPY (see `blankCppMacroNoise`'s own doc) — `input.content` itself is never
+    // mutated, and the caller's file entity (`indexer.ts`, outside this adapter) mints its own
+    // content from that same untouched `input.content`, never from anything this function does.
+    tree = parser.parse(blankCppMacroNoise(input.content));
+    if (!tree) {
+      return { symbols: [], diagnostics: [{ message: 'tree-sitter returned no tree', severity: 'error' }] };
+    }
+    const state: CppWalkState = { symbols: [], imports: [], callSites: [], originalContent: input.content };
+    walkCpp(tree.rootNode, { path: null, enclosingClass: null }, state);
+
+    const diagnostics: ParsedDiagnostic[] = [];
+    if (tree.rootNode.hasError) {
+      const errorCount = countParseErrors(tree.rootNode);
+      diagnostics.push({
+        message: `${errorCount} syntax error location(s) — some declarations may be missing or incomplete`,
+        severity: 'warning',
+      });
+    }
+
+    return { symbols: state.symbols, diagnostics, imports: state.imports, calls: resolveCppCalls(state) };
+  } catch (err) {
+    return {
+      symbols: [],
+      diagnostics: [
+        {
+          message: `tree-sitter-cpp threw while parsing: ${err instanceof Error ? err.message : String(err)}`,
+          severity: 'error',
+        },
+      ],
+    };
+  } finally {
+    tree?.delete();
+    parser?.delete();
+  }
+}
+
+export function createCppTreeSitterAdapter(runtime: TreeSitterRuntime): IndexParserAdapter {
+  return {
+    id: 'tree-sitter-cpp',
+    version: CPP_ADAPTER_VERSION,
+    languages: ['cpp'],
+    canParse: (path) => CPP_EXTENSION_RE.test(path),
+    parse: (input) => parseCppFile(runtime, input),
+  };
+}
+
+// =============================================================================================
+// ini (RUN-239) — Unreal's 6 `.ini` config files; `tree-sitter-ini.wasm` is 4,716 bytes, effectively
+// free on the same inlining rail the C++ grammar above justifies on its own. Flat by construction
+// (a `document` of top-level `setting`s and `section`s, each `section` holding its own `setting`s
+// — no further nesting the grammar exposes), so this adapter reads the tree directly rather than
+// needing the recursive walk C++/TS require. Claims any `.ini`, not only Unreal's `Config/*.ini`
+// (discretion) — the grammar and shape are generic, and narrowing to a path convention would be a
+// judgement call about repo layout this daemon otherwise avoids (`DEFAULT_EXCLUDE_GLOBS`'s own
+// doc, `index-policy.ts`, states the same principle for a different list).
+//
+// Every symbol is `nodeType: 'symbol'`, `content` gated through `shouldWithholdValue` exactly like
+// `index-formats.ts`'s JSON/TOML leaves (same key=value shape, same secret-shaped-value risk —
+// reusing that check rather than inventing a second one). A malformed section header (no closing
+// `]`, or nothing between the brackets) DECLINES the whole section — no guessed name — the same
+// "no defensible identity, no symbol" posture as every other adapter in this file.
+// =============================================================================================
+
+const INI_ADAPTER_VERSION = '1';
+
+/** `pathPrefix` is `[]` for a top-level setting (no enclosing section) or `[sectionName]` for one
+ *  nested under a section — `null` when `node` carries no `setting_name` at all, which the ini
+ *  grammar never actually emits for a `setting` node, but is checked anyway rather than assumed
+ *  (a total function, no non-null assertion). */
+function iniSettingSymbol(node: Node, pathPrefix: readonly string[]): ParsedSymbol | null {
+  const nameNode = node.namedChildren.find((c) => c?.type === 'setting_name');
+  if (!nameNode) return null;
+  const valueNode = node.namedChildren.find((c) => c?.type === 'setting_value');
+  const key = nameNode.text;
+  const value = valueNode ? valueNode.text.trim() : '';
+  const withheldReason = shouldWithholdValue(key, value);
+  return {
+    symbolPath: [...pathPrefix, key],
+    nodeType: 'symbol',
+    label: key,
+    content: withheldReason ? null : value,
+    range: { startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1 },
+  };
+}
+
+function parseIniDocument(tree: Tree): ParsedSymbol[] {
+  const symbols: ParsedSymbol[] = [];
+  for (const child of tree.rootNode.namedChildren) {
+    if (!child) continue;
+    if (child.type === 'setting') {
+      const sym = iniSettingSymbol(child, []);
+      if (sym) symbols.push(sym);
+      continue;
+    }
+    if (child.type !== 'section') continue;
+    const sectionNameNode = child.namedChildren.find((c) => c?.type === 'section_name');
+    const textNode = sectionNameNode?.namedChildren.find((c) => c?.type === 'text');
+    if (!textNode || textNode.text.trim().length === 0) continue; // malformed/empty header — decline the section
+    const sectionName = textNode.text;
+    symbols.push({
+      symbolPath: [sectionName],
+      nodeType: 'symbol',
+      label: sectionName,
+      content: null,
+      range: {
+        startLine: sectionNameNode!.startPosition.row + 1,
+        endLine: sectionNameNode!.endPosition.row + 1,
+      },
+    });
+    for (const settingNode of child.namedChildren) {
+      if (settingNode?.type !== 'setting') continue;
+      const sym = iniSettingSymbol(settingNode, [sectionName]);
+      if (sym) symbols.push(sym);
+    }
+  }
+  return symbols;
+}
+
+async function parseIniFile(
+  runtime: TreeSitterRuntime,
+  input: AdapterParseInput,
+): Promise<AdapterParseResult> {
+  let parser: Parser | undefined;
+  let tree: Tree | null | undefined;
+  try {
+    parser = await runtime.parserFor('ini');
+    tree = parser.parse(input.content);
+    if (!tree) {
+      return { symbols: [], diagnostics: [{ message: 'tree-sitter returned no tree', severity: 'error' }] };
+    }
+    const symbols = parseIniDocument(tree);
+    const diagnostics: ParsedDiagnostic[] = tree.rootNode.hasError
+      ? [{ message: 'ini parse error(s) — some settings may be missing or incomplete', severity: 'warning' }]
+      : [];
+    return { symbols, diagnostics };
+  } catch (err) {
+    return {
+      symbols: [],
+      diagnostics: [
+        {
+          message: `tree-sitter-ini threw while parsing: ${err instanceof Error ? err.message : String(err)}`,
+          severity: 'error',
+        },
+      ],
+    };
+  } finally {
+    tree?.delete();
+    parser?.delete();
+  }
+}
+
+export function createIniTreeSitterAdapter(runtime: TreeSitterRuntime): IndexParserAdapter {
+  return {
+    id: 'tree-sitter-ini',
+    version: INI_ADAPTER_VERSION,
+    languages: ['ini'],
+    canParse: (path) => path.toLowerCase().endsWith('.ini'),
+    parse: (input) => parseIniFile(runtime, input),
+  };
+}
+
+/** Builds a registry with all five tree-sitter adapters ahead of `NOOP_ADAPTER`, sharing one
  *  `TreeSitterRuntime` — the shape a caller (a future indexer coordinator wiring) uses to get real
- *  TS/JS/TSX coverage; `index-adapters.ts`'s own `createDefaultAdapterRegistry()` deliberately stays
+ *  TS/JS/TSX/C++/ini coverage; `index-adapters.ts`'s own `createDefaultAdapterRegistry()` deliberately stays
  *  noop-only (its own doc: "a convenience for 'no real adapters yet'"), so this is a SEPARATE
  *  factory rather than a change to that one's behavior. No warm-up call is needed — `parse()` is
  *  itself async now (this task amended `IndexParserAdapter`'s signature; see `index-adapters.ts`'s
@@ -593,6 +1269,8 @@ export function createTreeSitterAdapterRegistry(): {
     .register(createTreeSitterAdapter('typescript', runtime))
     .register(createTreeSitterAdapter('tsx', runtime))
     .register(createTreeSitterAdapter('javascript', runtime))
+    .register(createCppTreeSitterAdapter(runtime))
+    .register(createIniTreeSitterAdapter(runtime))
     .register(NOOP_ADAPTER);
   return { registry, runtime };
 }

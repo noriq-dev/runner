@@ -308,12 +308,24 @@ function parseJson(content: string): AdapterParseResult {
   return walkConfigRoot(value);
 }
 
+/** `.uproject`/`.uplugin` (RUN-239) — Unreal's own project/plugin manifests, VERIFIED plain JSON
+ *  (checked against Project Nod's real `Survival.uproject`: a JSON object whose
+ *  `Modules[].AdditionalDependencies` is the project's module dependency graph) — claimed by the
+ *  EXISTING JSON adapter rather than a new one: no grammar, no new code path, and the generic
+ *  key-value walk `walkConfigValue` already gives every module/plugin entry a `symbol` entity,
+ *  the same way `package.json`'s `scripts` already falls out of the same walk with no
+ *  project.toml-specific carve-out (this module's own doc, "cross-file references from JSON/TOML"). */
+function isUnrealManifestPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith('.uproject') || lower.endsWith('.uplugin');
+}
+
 export function createJsonAdapter(): IndexParserAdapter {
   return {
     id: 'config-json',
     version: ADAPTER_VERSION,
     languages: ['json'],
-    canParse: (path) => path.toLowerCase().endsWith('.json'),
+    canParse: (path) => path.toLowerCase().endsWith('.json') || isUnrealManifestPath(path),
     parse: async (input) => parseJson(input.content),
   };
 }

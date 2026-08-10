@@ -51,4 +51,23 @@ describe('buildIndexAdapterRegistry (RUN-219)', () => {
     expect(registry.select('a.js')?.id).toBe('tree-sitter-javascript');
     expect(registry.select('a.ts')?.id).toBe('tree-sitter-typescript');
   });
+
+  it('RUN-239: with every language admitted, .cpp/.h/.ini select the new tree-sitter adapters', () => {
+    const { registry } = buildIndexAdapterRegistry({ languages: [...INDEX_LANGUAGES] });
+    expect(registry.select('src/a.cpp')?.id).toBe('tree-sitter-cpp');
+    expect(registry.select('src/a.h')?.id).toBe('tree-sitter-cpp');
+    expect(registry.select('Config/DefaultGame.ini')?.id).toBe('tree-sitter-ini');
+  });
+
+  it('RUN-239: narrowed to cpp only, a .ini path falls through to NOOP_ADAPTER — languages are independent', () => {
+    const { registry } = buildIndexAdapterRegistry({ languages: ['cpp'] });
+    expect(registry.select('a.cpp')?.id).toBe('tree-sitter-cpp');
+    expect(registry.select('a.ini')?.id).toBe(NOOP_ADAPTER.id);
+  });
+
+  it('RUN-239: .uproject/.uplugin select the EXISTING JSON adapter, no new code path', () => {
+    const { registry } = buildIndexAdapterRegistry({ languages: [...INDEX_LANGUAGES] });
+    expect(registry.select('Survival.uproject')?.id).toBe('config-json');
+    expect(registry.select('Plugins/Foo/Foo.uplugin')?.id).toBe('config-json');
+  });
 });

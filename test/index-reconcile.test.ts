@@ -121,11 +121,12 @@ describe('reconcile — moved base (decision 10, defers to changesBetween/RUN-21
 
 describe('reconcile — version skew is decided in both directions (decision 7)', () => {
   it('a NEWER active indexer version → incompatible-version, schedules nothing', () => {
-    const out = reconcile(input({ cursor: CURSOR({ activeGeneration: GEN({ indexerVersion: '2' }) }) }));
+    const newer = String(Number(INDEXER_VERSION) + 1);
+    const out = reconcile(input({ cursor: CURSOR({ activeGeneration: GEN({ indexerVersion: newer }) }) }));
     expect(out).toEqual({
       outcome: 'incompatible-version',
-      activeIndexerVersion: '2',
-      ourIndexerVersion: '1',
+      activeIndexerVersion: newer,
+      ourIndexerVersion: INDEXER_VERSION,
     });
   });
 
