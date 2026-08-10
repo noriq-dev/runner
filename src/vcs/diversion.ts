@@ -65,9 +65,16 @@ const execFileP = promisify(execFile);
  *
  * `leaseIndexSnapshot`/`changesBetween` (RUN-255, both refused `unsupported`/`full-index-required`
  * by RUN-211/212 for want of a measured path) are DELIBERATELY outside the pool-of-1 lease and the
- * CLI split above: background indexing reads, so it is pure API — no checkout, no workspace, ever
- * — and cannot contend with a run holding the lease. `diversion-index-source.ts`'s module doc
- * carries the measurement (a live account, 2026-08-09) behind both.
+ * CLI split above: background indexing reads, so it never checks out, never touches the CLI, and
+ * never waits its turn for the workspace — it cannot contend with a run holding the lease. Since
+ * RUN-281 that is no longer the same as "pure API for every byte": `leaseIndexSnapshot` also
+ * offers `repoRoot` itself — the SAME directory `lease()` above checks branches into — as a
+ * CANDIDATE local root, and `DiversionIndexSource.read()` uses those bytes only after verifying
+ * them against this commit's own digest. Reading that directory needs no lease and takes none: it
+ * is an ordinary filesystem read of whatever happens to be sitting there, verified rather than
+ * trusted, which is exactly what makes it safe to do without coordinating with whichever run might
+ * be re-checking that same directory out at the same moment. `diversion-index-source.ts`'s module
+ * doc carries the measurement (a live account, 2026-08-09, extended 2026-08-10) behind all of this.
  */
 
 export interface DvHttpResponse {
@@ -691,8 +698,18 @@ export class DiversionBackend implements VcsBackend {
    * `GET /branches` list round trip name resolution would otherwise cost. `default_branch_name` is
    * kept only for the snapshot's own DISPLAY field (`IndexSnapshot.branch`'s contract: never an
    * operand).
+   *
+   * `repoRoot` is no longer unused (RUN-281): it is the SAME directory `lease()` above checks
+   * branches into — this daemon's one pool-of-1 workspace for this repo — and it is offered,
+   * unconditionally and without taking any lease, as `IndexSnapshot.localPath` AND as the
+   * `DiversionIndexSource` constructor's own candidate root, so its `read()` can verify-then-read
+   * from it. Offered, never trusted: whatever is sitting at `repoRoot` when this runs could be at
+   * any commit, mid-checkout, or simply not exist, and `DiversionIndexSource` never assumes
+   * otherwise — see that file's module doc for the full scheme. This is exactly the extension
+   * `IndexSnapshot.localPath`'s own doc in `vcs/types.ts` now documents: an operand for the
+   * snapshot's own `source`, still never one for anything outside it.
    */
-  async leaseIndexSnapshot(_repoRoot: string): Promise<IndexSnapshotResult> {
+  async leaseIndexSnapshot(repoRoot: string): Promise<IndexSnapshotResult> {
     const repoRes = await this.api('GET', '');
     if (repoRes.status !== 200) {
       return {
@@ -719,10 +736,14 @@ export class DiversionBackend implements VcsBackend {
     return {
       ok: true,
       snapshot: {
-        source: new DiversionIndexSource(this.repoId, baseId, this.http, this.blobHttp),
+        source: new DiversionIndexSource(this.repoId, baseId, this.http, this.blobHttp, repoRoot),
         baseId,
         branch,
         readOnly: true,
+        // The offer, for logs/diagnostics (`IndexSnapshot.localPath`'s own doc) — the SAME string
+        // just wired into `DiversionIndexSource` above as its verify-then-read candidate root, one
+        // fact minted once, delivered twice. Never read as an operand outside this backend.
+        localPath: repoRoot,
         location: { kind: 'index-snapshot', repoId: this.repoId } satisfies DvIndexSnapshotLocation,
       },
     };

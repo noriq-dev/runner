@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AgentDriver, DriverExit, DriverStartOptions } from '../src/drivers/types';
 import { zeroTelemetry } from '../src/drivers/types';
 import { scanIndexSource } from '../src/index-scan';
@@ -1038,9 +1041,47 @@ describe('DiversionBackend — index snapshot (RUN-255): real, API-only, never b
     });
     expect(res.snapshot.source).toBeInstanceOf(DiversionIndexSource);
     expect(res.snapshot.source.kind).toBe('diversion');
-    expect(res.snapshot.localPath).toBeUndefined(); // materializes nothing (locked decision 1).
+    // RUN-281: `repoRoot` is now OFFERED as a verify-then-read candidate root (never trusted,
+    // never a materialized tree — locked decision 1 above still holds: nothing was checked out to
+    // produce this). Same string minted into the `DiversionIndexSource` constructor at the same
+    // call site; see the "verify-then-read local fast path" describe block below for proof of the
+    // actual read behaviour this offer enables.
+    expect(res.snapshot.localPath).toBe('/repo');
 
     await backend.dispose(runWs);
+  });
+
+  it('verify-then-read succeeds with ZERO HTTP content calls WHILE a run lease is concurrently held over the SAME repoRoot (RUN-281: no lease needed, none taken)', async () => {
+    const localRoot = await mkdtemp(path.join(tmpdir(), 'noriq-dv-concurrent-'));
+    try {
+      const content = Buffer.from('export const z = 3;\n');
+      const sha1 = createHash('sha1').update(content).digest('hex');
+      await writeFile(path.join(localRoot, 'z.ts'), content);
+      const page = { items: [{ path: 'z.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+      const { http, blobHttp, blobCalls } = indexFakes({
+        branches: { main: 'dv.commit.473', 'dv.branch.1': 'dv.commit.473' },
+        treePage: () => ({ status: 200, body: page }),
+      });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+
+      // A run holds the pool-of-1 lease over the exact same directory the whole time — the shared,
+      // mutable workspace this scheme was built to read safely without waiting for.
+      const runWs = await backend.lease(localRoot, 'run_1');
+      const res = await backend.leaseIndexSnapshot(localRoot);
+      if (!res.ok) throw new Error('unreachable');
+      for await (const _ of res.snapshot.source.list()) {
+        /* drain to populate the digest cache */
+      }
+      expect(await res.snapshot.source.read('z.ts', 1_000_000)).toEqual({
+        ok: true,
+        bytes: content,
+        overLimit: false,
+      });
+      expect(blobCalls).toEqual([]); // no HTTP content call, no lease needed to get here.
+      await backend.dispose(runWs);
+    } finally {
+      await rm(localRoot, { recursive: true, force: true });
+    }
   });
 
   it('answers unsupported when the repo lookup itself fails', async () => {
@@ -1085,6 +1126,35 @@ describe('DiversionBackend — index snapshot (RUN-255): real, API-only, never b
         location: { repoRoot: '/x', kind: 'git' }, // a foreign (git-shaped) location
       }),
     ).rejects.toThrow(/did not mint/);
+  });
+
+  it('wires `repoRoot` end to end (RUN-281): the minted source verify-reads from the SAME directory offered as localPath', async () => {
+    const localRoot = await mkdtemp(path.join(tmpdir(), 'noriq-dv-lease-'));
+    try {
+      const content = Buffer.from('export const y = 2;\n');
+      const sha1 = createHash('sha1').update(content).digest('hex');
+      await writeFile(path.join(localRoot, 'y.ts'), content);
+      const page = { items: [{ path: 'y.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+      const { http, blobHttp, blobCalls } = indexFakes({
+        branches: { 'dv.branch.1': 'dv.commit.473' },
+        treePage: () => ({ status: 200, body: page }),
+      });
+      const backend = new DiversionBackend({ repoId: REPO_ID, http, blobHttp, cli: dummyCli });
+      const res = await backend.leaseIndexSnapshot(localRoot);
+      if (!res.ok) throw new Error('unreachable');
+      expect(res.snapshot.localPath).toBe(localRoot);
+      for await (const _ of res.snapshot.source.list()) {
+        /* drain to populate the digest cache */
+      }
+      expect(await res.snapshot.source.read('y.ts', 1_000_000)).toEqual({
+        ok: true,
+        bytes: content,
+        overLimit: false,
+      });
+      expect(blobCalls).toEqual([]); // never fetched over HTTP — the backend's own offer was used.
+    } finally {
+      await rm(localRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1379,6 +1449,161 @@ describe('DiversionIndexSource — digest() (RUN-255): a free lookup off list(),
     const { http, blobHttp } = indexFakes({});
     const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
     expect(await source.digest('nope.txt')).toBeUndefined();
+  });
+});
+
+describe('DiversionIndexSource — verify-then-read local fast path (RUN-281)', () => {
+  let localRoot: string;
+
+  beforeEach(async () => {
+    localRoot = await mkdtemp(path.join(tmpdir(), 'noriq-dv-verify-'));
+  });
+
+  afterEach(async () => {
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
+  /** A transport that FAILS the test outright if the fast path ever falls through to it — the
+   *  acceptance line's own words: "proven by a fake transport that fails the test if called." */
+  const failingBlobHttp: DvBlobHttp = async (_repoId, _refId, filePath) => {
+    throw new Error(`the verify-then-read fast path must not fetch content over HTTP for ${filePath}`);
+  };
+
+  it('reads local bytes and matches the depot digest with ZERO content HTTP calls', async () => {
+    const content = Buffer.from('export const x = 1;\n');
+    const sha1 = createHash('sha1').update(content).digest('hex');
+    await writeFile(path.join(localRoot, 'x.ts'), content);
+    const page = { items: [{ path: 'x.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+    const { http } = indexFakes({ treePage: () => ({ status: 200, body: page }) });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, failingBlobHttp, localRoot);
+    for await (const _ of source.list()) {
+      /* drain to populate the digest cache */
+    }
+    // Not a throw: `failingBlobHttp` above would already have failed this test had `read()`
+    // fallen through to it.
+    expect(await source.read('x.ts', 1_000_000)).toEqual({ ok: true, bytes: content, overLimit: false });
+  });
+
+  it('falls back to HTTP on a hash mismatch — the DEPOT bytes reach the record, never the tampered local ones', async () => {
+    const depotContent = Buffer.from('export const x = 1;\n');
+    const sha1 = createHash('sha1').update(depotContent).digest('hex');
+    // A local file that exists, at the right path, but with DIFFERENT bytes — the exact case a
+    // stale or dirty pool-of-1 checkout produces.
+    await writeFile(path.join(localRoot, 'x.ts'), 'this is NOT what the depot has at this commit');
+    const page = { items: [{ path: 'x.ts', mode: 33188, blob: { size: depotContent.length, sha: sha1 } }] };
+    const { http, blobHttp, blobCalls } = indexFakes({
+      treePage: () => ({ status: 200, body: page }),
+      blobs: { 'x.ts': { status: 200, bytes: depotContent } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp, localRoot);
+    for await (const _ of source.list()) {
+      /* drain to populate the digest cache */
+    }
+    expect(await source.read('x.ts', 1_000_000)).toEqual({
+      ok: true,
+      bytes: depotContent,
+      overLimit: false,
+    });
+    expect(blobCalls).toEqual(['x.ts']); // fell back exactly once, silently — no error surfaced.
+  });
+
+  it('a missing local file falls back to HTTP with no error surfaced to the caller', async () => {
+    const content = Buffer.from('hello from the depot');
+    const sha1 = createHash('sha1').update(content).digest('hex');
+    // Nothing written under `localRoot` for this path at all.
+    const page = { items: [{ path: 'missing.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+    const { http, blobHttp, blobCalls } = indexFakes({
+      treePage: () => ({ status: 200, body: page }),
+      blobs: { 'missing.ts': { status: 200, bytes: content } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp, localRoot);
+    for await (const _ of source.list()) {
+      /* drain to populate the digest cache */
+    }
+    expect(await source.read('missing.ts', 1_000_000)).toEqual({
+      ok: true,
+      bytes: content,
+      overLimit: false,
+    });
+    expect(blobCalls).toEqual(['missing.ts']);
+  });
+
+  it('an unreadable local file (a directory at the candidate path) falls back to HTTP with no error', async () => {
+    const content = Buffer.from('hello from the depot');
+    const sha1 = createHash('sha1').update(content).digest('hex');
+    await mkdir(path.join(localRoot, 'weird.ts')); // a directory, not a file, at the candidate path.
+    const page = { items: [{ path: 'weird.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+    const { http, blobHttp, blobCalls } = indexFakes({
+      treePage: () => ({ status: 200, body: page }),
+      blobs: { 'weird.ts': { status: 200, bytes: content } },
+    });
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp, localRoot);
+    for await (const _ of source.list()) {
+      /* drain to populate the digest cache */
+    }
+    expect(await source.read('weird.ts', 1_000_000)).toEqual({ ok: true, bytes: content, overLimit: false });
+    expect(blobCalls).toEqual(['weird.ts']);
+  });
+
+  it('the set of indexed PATHS is identical whether a local root is offered or not — list() never consults it', async () => {
+    const { http, blobHttp } = indexFakes({ treePage: () => ({ status: 200, body: TREE_PAGE_SAMPLE }) });
+    const withoutRoot = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    const withRoot = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp, localRoot);
+    const collect = async (source: DiversionIndexSource) => {
+      const paths: string[] = [];
+      for await (const item of source.list()) if (item.kind === 'file') paths.push(item.entry.path);
+      return paths;
+    };
+    expect(await collect(withRoot)).toEqual(await collect(withoutRoot));
+  });
+
+  it('contentHash is IDENTICAL whether scanIndexSource read the file locally (verified) or over HTTP — the property that makes this admissible at all', async () => {
+    const content = Buffer.from('const x: number = 42;\nexport default x;\n');
+    const sha1 = createHash('sha1').update(content).digest('hex');
+    await writeFile(path.join(localRoot, 'x.ts'), content);
+    const page = { items: [{ path: 'x.ts', mode: 33188, blob: { size: content.length, sha: sha1 } }] };
+    const scanCfg = {
+      include: [],
+      exclude: [],
+      languages: [],
+      pollIntervalMinutes: 5,
+      maxFiles: 10,
+      maxFileBytes: 1_000_000,
+      maxTotalBytes: 1_000_000,
+      readDeadlineMs: 60_000,
+      contentMode: 'full' as const,
+    };
+
+    const local = indexFakes({ treePage: () => ({ status: 200, body: page }) });
+    const localSource = new DiversionIndexSource(
+      REPO_ID,
+      'dv.commit.473',
+      local.http,
+      local.blobHttp,
+      localRoot,
+    );
+    const localResult = await scanIndexSource(localSource, scanCfg);
+
+    const remote = indexFakes({
+      treePage: () => ({ status: 200, body: page }),
+      blobs: { 'x.ts': { status: 200, bytes: content } },
+    });
+    const remoteSource = new DiversionIndexSource(REPO_ID, 'dv.commit.473', remote.http, remote.blobHttp);
+    const remoteResult = await scanIndexSource(remoteSource, scanCfg);
+
+    expect(local.blobCalls).toEqual([]); // proves the local pass never touched content HTTP.
+    expect(remote.blobCalls).toEqual(['x.ts']); // proves the remote pass did — same content either way.
+    expect(localResult.candidates).toHaveLength(1);
+    expect(remoteResult.candidates).toHaveLength(1);
+    expect(localResult.candidates[0]!.contentHash).toBe(remoteResult.candidates[0]!.contentHash);
+    expect(localResult.candidates[0]!.contentHash).toBe(createHash('sha256').update(content).digest('hex'));
+  });
+
+  it('minReadDeadlineMs is declared on the source — the floor index-work.ts folds into readDeadlineMs', () => {
+    const { http, blobHttp } = indexFakes({});
+    const source = new DiversionIndexSource(REPO_ID, 'dv.commit.473', http, blobHttp);
+    expect(source.minReadDeadlineMs).toBeGreaterThan(0);
+    expect(source.minReadDeadlineMs).toBeGreaterThan(120_000); // above the filesystem-calibrated default.
   });
 });
 

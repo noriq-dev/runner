@@ -4,14 +4,23 @@ import type {
   IndexSourceReadOutcome,
   ShouldDescend,
 } from '../index-source';
+import { readVerifiedLocal } from '../index-source';
 import type { DvBlobHttp, DvHttp } from './diversion';
 
 /**
- * The Diversion half of `IndexSource` (RUN-255): background indexing reads Diversion's REST API
- * ONLY — no `dv` CLI, no checkout, no workspace, no pool-of-1 lease. `diversion.ts`'s module doc
- * draws the division of labour this file depends on: the API is the driver surface, the CLI owns
- * only what must materialize files on disk, and indexing reads, so it never touches the CLI at
- * all. Everything below is grounded in measurement against a live account on 2026-08-09 (dv CLI
+ * The Diversion half of `IndexSource` (RUN-255, extended RUN-281): background indexing reads
+ * Diversion's REST API — never the `dv` CLI, never a checkout, never the pool-of-1 lease — but,
+ * since RUN-281, it is no longer API-ONLY for CONTENT: `read()` first tries a locally-offered
+ * candidate root, and uses those bytes ONLY when a fresh hash over them matches this same commit's
+ * own digest exactly. This does not weaken "no CLI, no checkout, no lease" — it is the opposite of
+ * trusting an ambient checkout: the file below never runs `dv`, never asks anything to materialize
+ * a tree, and never waits its turn for the pool-of-1 workspace, because it never NEEDS one to be
+ * current — a stale, dirty, or entirely absent local root simply fails verification and falls back
+ * to the API path this file has always had. See "Verify-then-read: reading local bytes without
+ * trusting them" below for the full scheme and the measurement behind it. `diversion.ts`'s module
+ * doc draws the division of labour this file depends on for everything else: the API is the driver
+ * surface, the CLI owns only what must materialize files on disk for a RUN, and indexing reads.
+ * Everything below is grounded in measurement against a live account on 2026-08-09 (dv CLI
  * v1.0.1017, ~7259-file repo `dv.repo.e821a7a1-…`), never in documentation trust — the same
  * discipline `diversion.ts`'s §9 reference set for the rest of this backend.
  *
@@ -96,6 +105,29 @@ import type { DvBlobHttp, DvHttp } from './diversion';
  * `index-source.ts`), so `index-scan.ts`'s bounds check refuses a too-large candidate BEFORE
  * `read()` is ever called for it.
  *
+ * **Verify-then-read: reading local bytes without trusting them** (RUN-281). Diversion serves
+ * every file as its own HTTP round trip — measured **161ms/file** against Project Nod's live API,
+ * which is why a 1905-file pass hit `readDeadlineMs`'s old 120s filesystem-calibrated default at
+ * 741 files, `stoppedEarly: true` (see `INDEX-OPERATIONS.md` for the full before/after). This
+ * backend's own pool-of-1 workspace (`diversion.ts`'s `repoRoot`) sits on disk already, checked
+ * out to WHATEVER a run last left it at — reading it directly would be reading the wrong commit,
+ * or somebody's uncommitted diff, under this generation's identity. But `list()` already caches
+ * `path → blob.sha` as it yields (`digestCache` below), one HTTP call per `TREE_PAGE_SIZE` files,
+ * ALREADY PAID FOR by the enumeration this file was going to do anyway — and that digest is
+ * measured to be plain SHA-1 of the raw file bytes (31/31 sampled paths matched, across source,
+ * binaries, a 419MB file, and 10 CRLF-containing files with no line-ending normalization). So a
+ * local read can be VERIFIED rather than trusted: hash the local candidate, compare it to the
+ * cached digest for that exact path at this exact commit, and use those bytes ONLY on an exact
+ * match — `index-source.ts`'s `readVerifiedLocal` is the shared mechanism, reused unchanged by any
+ * future verify-then-read source (Perforce's listing carries a digest too — RUN-281's own deferred
+ * half). A mismatch, a missing file, or an unreadable one all fall back to the unchanged
+ * `/blobs` fetch below with no special case and no error surfaced — the SAME code path this file
+ * has always run when `localRoot` is absent entirely (a repo this daemon has never checked out
+ * locally at all, or a caller that never offers a candidate). Never a lease, never the CLI, never
+ * a wait: indexing yields to runs, always, and a verify-then-read pass that needed the lease to be
+ * safe would not be safe — the whole point of hashing every byte is that it is safe WITHOUT one,
+ * even while a run is actively re-checking that same directory out from under this scan.
+ *
  * **Every non-200 from `/trees` is a REFUSAL to enumerate, never an empty tree** (locked decision 7
  * [RUN-255 numbering], restated for the source that has to act on it): a 401 (expired credential —
  * measured shape: `{"status":401,"title":"…Error","detail":"…"}`) or any other failure status
@@ -104,14 +136,21 @@ import type { DvBlobHttp, DvHttp } from './diversion';
  * `diversion.ts` applies the same rule one layer up for `/compare`.
  *
  * **Containment guarantee, stated the way `openConfined`'s comment states the filesystem one**
- * (locked decision 10): this source is constructed with ONE `repoId`, baked into every request
- * path, and `path` arguments are never filesystem paths — they are keys inside Diversion's own
- * commit tree, resolved server-side against that same `repoId`. There is no local path to escape
- * and no TOCTOU window (no `open`, no descriptor, no re-resolve) — the class of race
- * `FilesystemIndexSource`'s inode-identity check defends against does not exist here. What this
- * does NOT cover: a `repoId` chosen by a caller with the wrong intent (this file trusts whoever
- * constructs it, exactly as `FilesystemIndexSource` trusts its `root` — see that class's doc), and
- * a path Diversion itself is willing to resolve, which this file has no way to second-guess.
+ * (locked decision 10, amended RUN-281 for the local half). Every `path` this file sends to the
+ * API is never a filesystem path — it is a key inside Diversion's own commit tree, resolved
+ * server-side against the ONE `repoId` baked into every request path — so there is no local path
+ * to escape and no TOCTOU window on the API side (no `open`, no descriptor, no re-resolve) at all.
+ * The verify-then-read half DOES open real file descriptors against `localRoot`, so it is not
+ * exempt from the class of race `FilesystemIndexSource`'s inode-identity check defends against —
+ * it reuses that exact mechanism (`openConfined`, via `readVerifiedLocal` in `index-source.ts`)
+ * rather than inventing a second one, confined to `localRoot` the same way `FilesystemIndexSource`
+ * is confined to its own `root`. The hash comparison is a SEPARATE, additional property on top of
+ * that confinement, not a substitute for it: confinement says "this descriptor is really inside
+ * `localRoot`"; the digest match says "and its bytes are really this commit's." What this does NOT
+ * cover: a `repoId` or `localRoot` chosen by a caller with the wrong intent (this file trusts
+ * whoever constructs it, exactly as `FilesystemIndexSource` trusts its `root` — see that class's
+ * doc), and a path Diversion itself is willing to resolve via the API, which this file has no way
+ * to second-guess.
  */
 
 /** `FileMode` (OpenAPI schema, `x-ogen-enum-naming`) — decoded from the spec, never inferred. */
@@ -162,6 +201,28 @@ export function decodeObjectStatus(status: number): DvChangeVerb | null {
  *  hundred KB; a monorepo's total round-trip count is its file count divided by this number. */
 const TREE_PAGE_SIZE = 2000;
 
+/** The digest algorithm the depot's own `blob.sha` is measured to be — see the module doc's
+ *  "verify-then-read" section for the 31/31 sample behind this. Named as a constant, not
+ *  hardcoded at the one call site, so a future correction to the measurement is a one-line change. */
+const LOCAL_VERIFY_HASH_ALGORITHM = 'sha1';
+
+/**
+ * `IndexSource.minReadDeadlineMs`'s value for this backend (RUN-281) — a floor, never a fixed
+ * override: `index-work.ts` takes `Math.max(config.readDeadlineMs, this)`, so a repo's own higher
+ * configured bound always wins. Derived from the measurement this task made directly, not guessed:
+ * Project Nod's own cold pass read 741 files in 123s over HTTP before hitting the OLD 120s default
+ * — 166ms/file end to end, matching the 161ms/file measured independently against the same live
+ * API. Extrapolated to this repo's own ~1905-file candidate set, a fully cold or fully dirty pass
+ * (the verify-then-read fast path finding nothing to verify — a first-ever index, or a checkout
+ * nothing has synced yet) needs roughly 1905 * 0.166s ≈ 316s just for content reads, before
+ * enumeration and per-file processing overhead. 600s (10 minutes) is that estimate with close to
+ * 2x headroom — generous enough that an ordinary cold pass finishes inside it, without being so
+ * large that a genuinely stuck job (a hung connection, a server outage) goes unnoticed for the
+ * better part of an hour. See `INDEX-OPERATIONS.md`'s own before/after numbers for the real pass
+ * this constant was calibrated against.
+ */
+const DIVERSION_MIN_READ_DEADLINE_MS = 600_000;
+
 interface DvFileEntry {
   path: string;
   mode: number;
@@ -211,10 +272,18 @@ function passesShouldDescend(relPath: string, shouldDescend: ShouldDescend): boo
 export class DiversionIndexSource implements IndexSource {
   readonly kind = 'diversion';
 
+  /** See `IndexSource.minReadDeadlineMs`'s own doc for why this is DECLARED rather than something
+   *  the policy layer detects, and `DIVERSION_MIN_READ_DEADLINE_MS`'s own doc for the measurement
+   *  behind the value. */
+  readonly minReadDeadlineMs = DIVERSION_MIN_READ_DEADLINE_MS;
+
   /** `path` → `blob.sha`, filled in as `list()` yields — a free `digest()` for anything already
    *  listed (the tree walk already carries `sha` for every file entry), never a second round trip
    *  for a path this source has already seen. See `IndexSource.digest`'s doc: this is a
-   *  change-detection hint only, never the index's own content hash. */
+   *  change-detection hint only, never the index's own content hash. Doubles, since RUN-281, as
+   *  the trusted digest the verify-then-read fast path hashes a local candidate against — see the
+   *  module doc's "verify-then-read" section.
+   */
   private readonly digestCache = new Map<string, string>();
 
   constructor(
@@ -222,6 +291,17 @@ export class DiversionIndexSource implements IndexSource {
     private readonly refId: string,
     private readonly http: DvHttp,
     private readonly blobHttp: DvBlobHttp,
+    /**
+     * A CANDIDATE local root this source's own backend offers (RUN-281) — never trusted, never
+     * walked, never opened except through `read()`'s own hash check against `digestCache`. Absent
+     * (the RUN-255 shape, still the default for anything that constructs this source directly, as
+     * every test in this repo but the new verify-then-read ones does) means every read goes
+     * straight to `/blobs`, exactly as before this task. See `IndexSnapshot.localPath`'s own doc
+     * in `vcs/types.ts` for what "offer" means at the type level, and `DiversionBackend
+     * .leaseIndexSnapshot` in `diversion.ts` for the one place that mints both this constructor
+     * argument and that field together, from the same `repoRoot`.
+     */
+    private readonly localRoot?: string,
   ) {}
 
   async *list(shouldDescend?: ShouldDescend): AsyncIterable<IndexSourceListItem> {
@@ -266,6 +346,30 @@ export class DiversionIndexSource implements IndexSource {
   }
 
   async read(relPath: string, maxBytes: number): Promise<IndexSourceReadOutcome> {
+    // Verify-then-read (RUN-281): only ever attempted when a candidate root was offered AND this
+    // exact path's digest is already sitting in `digestCache` — populated for free by `list()`,
+    // never fetched fresh here (a fresh fetch would spend an HTTP call to save one, which is not a
+    // fast path). Every ordinary indexing pass enumerates before it reads, so this is populated by
+    // the time `read()` is ever called for a path `list()` yielded; a caller that reads a path
+    // this source never listed (a handful of unit tests below) simply never sees the fast path,
+    // which is the correct, safe answer for a path this source has no digest to verify against.
+    if (this.localRoot !== undefined) {
+      const digest = this.digestCache.get(relPath);
+      if (digest !== undefined) {
+        const verified = await readVerifiedLocal(
+          this.localRoot,
+          relPath,
+          maxBytes,
+          digest,
+          LOCAL_VERIFY_HASH_ALGORITHM,
+        );
+        if (verified) return { ok: true, bytes: verified.bytes, overLimit: verified.overLimit };
+        // null: missing, unreadable, or a hash mismatch — every one of those falls through to the
+        // exact same `/blobs` fetch below, unconditionally and silently (locked decision: the
+        // failure mode of a wrong assumption about the digest must be a slow pass, never a wrong
+        // one — see `readVerifiedLocal`'s own doc in `index-source.ts`).
+      }
+    }
     const res = await this.blobHttp(this.repoId, this.refId, relPath);
     if (res.status === 404) {
       return { ok: false, reason: 'not-found', detail: `no such blob at ${this.refId}` };

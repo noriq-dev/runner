@@ -615,16 +615,83 @@ Project Nod's live Diversion repo (`dv.repo.e821a7a1…`, 6216 tracked files), n
 
 | checked | result |
 | --- | --- |
-| `leaseIndexSnapshot` | ok — `baseId=dv.commit.474`, `branch=main`, `readOnly=true`, no `localPath` (API-backed by design) |
+| `leaseIndexSnapshot` | ok — `baseId=dv.commit.474`, `branch=main`, `readOnly=true`; since RUN-281, `localPath` is the offered checkout root, never a materialized tree (see below) |
 | `list()` | 6216 tracked files in 969 ms, zero refusals, deterministic order |
 | tracked-only property | holds — `Intermediate/`, `Binaries/`, `DerivedDataCache/`, `.o`, `.d`, `.rsp` all absent by construction, per `.dvignore` |
 | `read()` | 10/10 sampled files byte-exact against their on-disk size, 408 B to 58 KB |
 | `releaseIndexSnapshot` | clean (it materializes nothing, so there is nothing to give back) |
 
-What that does NOT cover, and must not be read as covering: a full `runIndexer` pass over a
-Diversion snapshot, an upload of one, `changesBetween` (which this backend refuses outright —
-`full-index-required`), event-loop or memory behaviour under Diversion's API latency, and anything
+What that does NOT cover, and must not be read as covering: a full `runIndexer` PARSE pass (entity
+extraction, tree-sitter) over a Diversion snapshot under real event-loop/memory load, an upload of
+one, `changesBetween` (which this backend refuses outright — `full-index-required`), and anything
 about Perforce. `bench/index-load.mts` still only exercises `FilesystemIndexSource`.
+
+### Verify-then-read for API-backed sources (RUN-281): the deadline problem, measured and fixed
+
+The measurement immediately above is what exposed the actual defect: Diversion serves every file
+as its own HTTP round trip — **161 ms/file measured** against this same live account — so a
+1905-source-file pass hit `readDeadlineMs`'s then-120s filesystem-calibrated default at **741
+files, `stoppedEarly: true`, 123 s elapsed** (~166 ms/file end to end, matching the independent
+161 ms/file figure). Every API-backed backend silently indexes a prefix under that bound and
+re-downloads the whole tree every pass — a cost with no cache to amortize it.
+
+**The fix has two independent parts, and only the second one is unconditional.** First, `list()`
+already caches `path → blob.sha` as it yields (one HTTP call per `TREE_PAGE_SIZE` files, already
+paid for by enumeration) — and that digest is measured to be plain SHA-1 of the raw file bytes
+(31/31 sampled paths matched: source, binaries, `.uasset`/`.png`, the 3 largest tracked files up to
+418,986,745 bytes, and 10 CRLF-containing files with no line-ending normalization by the depot). So
+`DiversionIndexSource.read()` now tries a locally-offered candidate root first (`leaseIndexSnapshot`
+offers the same directory the daemon's pool-of-1 workspace lives at, `repoRoot`, as
+`IndexSnapshot.localPath` — never trusted, never walked, never opened outside `read()`'s own hash
+check): read the local file, SHA-1 it, compare against the cached depot digest for that exact path
+at this exact commit. A match uses those bytes; a mismatch, a missing file, or an unreadable one all
+fall back to the unchanged `/blobs` fetch, silently, with no special case. **The one safety
+property this scheme has, and the only one**: the hash comparison. No mtime check, no size-only
+check, no "the checkout looks clean" shortcut. No lease is ever taken to do this — indexing yields
+to runs, always, and a verify-then-read pass that needed the lease to be safe would not be safe:
+hashing every byte is what makes it safe WITHOUT one, even while a run is actively re-checking that
+same directory out from under the scan. Second, and independently of whether the fast path finds
+anything to verify: `DiversionIndexSource.minReadDeadlineMs` (600,000 ms, a measured floor derived
+from 1905 files × ~166 ms/file with headroom) is folded into the effective deadline by
+`index-work.ts` — `Math.max(config.readDeadlineMs, source.minReadDeadlineMs ?? 0)` — so a cold or
+fully dirty pass (nothing to verify locally) still gets minutes, not the filesystem-calibrated 120s
+default, without relying on the fast path to hide the problem. (Project Nod's own manifest already
+carries an explicit `readDeadlineMs = 600000` as a prior stopgap for this exact symptom — on this
+one repo the two mechanisms agree rather than one masking the other's absence; a Diversion repo with
+no such override gets the same 600s floor automatically, from the source's own declared capability,
+proven independently in `test/index-work.test.ts`.)
+
+**Measured before/after, Project Nod, real repo (`dv.commit.474`, 2026-08-10):**
+
+| | before (given, not re-derived) | after (this task, measured) |
+| --- | --- | --- |
+| wall clock | 123 s | **1.6 s** |
+| files reached | 741 / 1905, `stoppedEarly: true` | **1962 candidates, 1967 files opened, `stoppedEarly: false`** |
+| content HTTP (blob) calls | 741 (one per file reached) | **1** |
+| fast-path (verified-local) hit rate | n/a (scheme did not exist) | **99.9%** (1966 / 1967) |
+| effective `readDeadlineMs` | 120,000 ms (filesystem-calibrated default) | 600,000 ms |
+
+A ~77x wall-clock improvement on a pass that now completes instead of stopping early, with all but
+one of 1967 files served from disk after a fresh hash check rather than a network round trip — the
+one HTTP fallback is exactly what the scheme predicts for a checkout not byte-for-byte current with
+the API's own head.
+
+**Admissibility, proven on the real repo, not only a fixture**: 15 real files sampled from the live
+listing (`.md`/`.ini`/`AGENTS.md`), read once through the verified-local path and once through a
+second `DiversionIndexSource` instance constructed with no local root at all (forcing every read
+over HTTP, the exact pre-RUN-281 shape) — **15/15 produced an identical SHA-256 `contentHash`**,
+proving the property that makes this admissible at all: which path served the bytes is invisible to
+everything downstream of `read()`.
+
+**What this does NOT cover, stated plainly**: a full `runIndexer` PARSE pass (tree-sitter,
+entity/edge extraction) combined with the Diversion source under real event-loop/memory load — this
+measurement only exercises `scanIndexSource`, the scan/read/hash stage, not parsing; an actual
+`uploadGeneration` against a Diversion-backed generation; the pool-of-1 workspace ACTUALLY being
+re-checked-out by a concurrent run while a scan is in flight (reasoned about — a changed file fails
+its hash and falls back — but not observed under a real race); and the Perforce half, deliberately
+not built here (its listing carries a digest for the same reason, and the seam — `IndexSource
+.minReadDeadlineMs`, `index-source.ts`'s `readVerifiedLocal`, `IndexSnapshot.localPath`'s widened
+contract — is shaped to fit it without a Perforce-specific redesign).
 
 **A measurement trap worth keeping, because it cost a nearly-filed false defect**: the first read
 probe reported "ok BUT EMPTY" for all ten files, including a 6972-byte `.cpp`, and the file size was

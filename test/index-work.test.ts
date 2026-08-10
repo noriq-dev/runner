@@ -8,6 +8,7 @@ import { IndexJournal, type JournalStore } from '../src/index-journal';
 import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
 import { FakeIndexSource } from '../src/index-source';
+import type { FakeIndexSourceItem } from '../src/index-source';
 import { fileStagingStore } from '../src/index-stage';
 import { createIndexWorkStep } from '../src/index-work';
 import type { IndexSnapshot, VcsBackend } from '../src/vcs/types';
@@ -58,6 +59,18 @@ function depotShapedSnapshot(): IndexSnapshot {
     readOnly: true,
     location: { kind: 'perforce-index-snapshot' },
   };
+}
+
+/** A `FakeIndexSource` that also declares `IndexSource.minReadDeadlineMs` (RUN-281) — models an
+ *  API-backed source (Diversion) whose `read()` may cost real network time, without pulling in
+ *  the real `DiversionIndexSource`/HTTP fakes this file has no other reason to know about. */
+class ApiBackedFakeSource extends FakeIndexSource {
+  constructor(
+    items: FakeIndexSourceItem[],
+    readonly minReadDeadlineMs: number,
+  ) {
+    super(items);
+  }
 }
 
 const GRANT = { token: 'ing_tok', maxBytes: 8 * 1024 * 1024, expiresAt: '2026-08-08T00:15:00.000Z' };
@@ -306,6 +319,64 @@ describe('createIndexWorkStep (RUN-222)', () => {
     });
     // Never a path or a message string — only counts and a closed-vocabulary breakdown.
     expect(JSON.stringify(line?.fields)).not.toContain('src/add.ts');
+  });
+
+  // RUN-281: `index-scan.ts`'s policy engine never branches on which source it is scanning
+  // (`IndexSource.kind`'s own doc), so the deadline floor a source declares is folded in HERE,
+  // the one place `snapshot.source` and `config` are already threaded together.
+  it('folds a source-declared minReadDeadlineMs into the effective deadline — a tiny configured readDeadlineMs does not truncate an API-backed source that declares it needs more', async () => {
+    const { mintFetch, ingestFetch } = router({});
+    const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      debug() {},
+      error() {},
+      warn: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+      info: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+    } as unknown as Parameters<typeof createIndexWorkStep>[0]['logger'];
+    let calls = 0;
+    // First call is scanIndexSource's own start timestamp; every call after reports 5s elapsed —
+    // well past the 10ms `readDeadlineMs` this ctx configures below, comfortably under the 60s
+    // floor `ApiBackedFakeSource` declares (the exact clock-faking shape index-scan.test.ts's own
+    // deadline test uses).
+    const now = () => (calls++ === 0 ? 0 : 5_000);
+    const step = createIndexWorkStep({
+      client,
+      runnerId: 'rnr_1',
+      vcsFor: () => ({ releaseIndexSnapshot: async () => {} }),
+      staging: fileStagingStore(root),
+      fetchImpl: ingestFetch,
+      logger,
+      now,
+    });
+    const snapshot: IndexSnapshot = {
+      source: new ApiBackedFakeSource(
+        [
+          { kind: 'file', path: 'a.ts', content: 'const a = 1;\n' },
+          { kind: 'file', path: 'b.ts', content: 'const b = 2;\n' },
+        ],
+        60_000,
+      ),
+      baseId: 'base-2',
+      readOnly: true,
+      location: { kind: 'test-index-snapshot' },
+    };
+    const ctx: IndexWorkContext = {
+      target: TARGET,
+      snapshot,
+      outcome: OUTCOME,
+      // 10ms: would trip `deadline-exceeded` immediately on its own — the floor above is what
+      // must save this pass.
+      config: { ...CONFIG, readDeadlineMs: 10 },
+      journal: memJournal(),
+      signal: new AbortController().signal,
+      isRunBusy: () => false,
+    };
+
+    await step(ctx);
+
+    const line = lines.find((l) => l.msg === 'index parse complete');
+    expect(line?.fields).toMatchObject({ files: 2, stoppedEarly: false, skipped: 0 });
   });
 
   // RUN-238: before this task, `ctx.signal` was forwarded ONLY to `uploadGeneration` (one phase

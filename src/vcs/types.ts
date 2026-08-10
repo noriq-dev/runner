@@ -95,13 +95,41 @@ export interface IndexSnapshot {
    */
   source: IndexSource;
   /**
-   * Where this snapshot materialized a tree, IF it did — for logs and diagnostics only. Absent on
-   * a backend that materializes nothing (Perforce's depot, Diversion's API), and a real filesystem
-   * path when present, the ONLY field here that is one.
+   * Where this snapshot materialized a tree, IF it did, OR a CANDIDATE local root a backend offers
+   * for its own `source` to verify bytes against (RUN-281) — a real filesystem path when present
+   * either way, the ONLY field here that is one. Absent on a backend that offers neither
+   * (Perforce's depot, still pure API today).
+   *
+   * **This IS now an operand, and the contract is different for the two roles it plays** — stated
+   * plainly rather than left to be quietly reinterpreted, because this field's doc used to warn
+   * the opposite: "the moment this becomes an operand it is `location` smuggled past the type
+   * system" (see `Workspace.workRef`'s doc, which this file's original comment deliberately
+   * mirrored). That warning is about a caller OUTSIDE the backend that minted a snapshot treating
+   * a display fact as something to act on. It still holds for every caller but one:
+   *
+   *   - **Git's own snapshot**: a freshly-minted, exclusively-owned detached worktree of tracked
+   *     files. Every byte under it is already trusted absolutely — nothing else can write to it —
+   *     so this is diagnostics only, exactly as it always was: for logs, never re-opened or
+   *     re-read by anything that receives the snapshot.
+   *   - **A backend offering a verify-then-read candidate (Diversion, since RUN-281)**: this path
+   *     may be STALE, DIRTY, or belong to a shared, concurrently-mutating workspace (a pool-of-1
+   *     lease another run might be actively checking out) — nothing here guarantees it reflects
+   *     `baseId` at all. It is safe to treat as an operand ONLY because the backend that offers it
+   *     also wires the identical string into its own `source`'s constructor at the same call site
+   *     (`DiversionBackend.leaseIndexSnapshot` mints both together, from the same `repoRoot`), and
+   *     that `source` verifies every byte — a fresh hash against the backend's own per-path digest
+   *     — before ever returning local bytes to a caller. A caller reading THIS field directly and
+   *     opening it itself would be exactly the trap `Workspace.workRef`'s doc warns about: nothing
+   *     outside the minting backend may treat this path as trustworthy, because nothing outside it
+   *     knows to verify first. `index-work.ts`'s own doc states the resulting rule plainly: reads
+   *     `snapshot.source`, never `snapshot.localPath` — that discipline is what keeps this field an
+   *     operand for exactly one piece of code (the backend that minted it) and a diagnostic for
+   *     everyone else, rather than the smuggled-location trap this comment used to warn against.
    *
    * Optional rather than a union arm deliberately: every consumer reads `source`, so a discriminant
-   * would make callers narrow a shape they never branch on. Absent-means-nothing-on-disk is a fact
-   * a log line wants and the indexer does not.
+   * would make callers narrow a shape they never branch on. Absent means "nothing was offered" —
+   * neither a materialized tree nor a local candidate — a fact a log line wants and the indexer
+   * itself does not, because the indexer never looks at this field at all.
    */
   localPath?: string;
   /**

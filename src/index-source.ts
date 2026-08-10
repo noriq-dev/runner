@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Dirent } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
@@ -162,6 +163,22 @@ export interface IndexSource {
   readonly kind: string;
 
   /**
+   * A floor this source needs on `readDeadlineMs`, in milliseconds (RUN-281) — DECLARED, never
+   * detected: the same "read a capability, not a name" discipline `AgentDriver.capabilities`
+   * already applies one seam over (CLAUDE.md's own words for that seam apply verbatim here). A
+   * source whose `read()` may cost a real network round trip per file (Diversion: measured
+   * 161ms/file against a live account — see `diversion-index-source.ts`'s module doc) states its
+   * own minimum here; the POLICY layer (`index-scan.ts`) never reads this field and never learns
+   * WHICH source set it — `kind`'s own doc immediately above still holds, because the caller that
+   * folds this into an effective deadline (`index-work.ts`, which already threads both `snapshot`
+   * and `config` together) is common orchestration, not the policy engine. Absent means "no
+   * floor" — the filesystem source's own honest answer: a local read is microseconds, so the
+   * manifest's configured `readDeadlineMs` (or its 120s default) already fits it with room to
+   * spare.
+   */
+  readonly minReadDeadlineMs?: number;
+
+  /**
    * Enumerate every file this source can see.
    *
    * MUST yield in a deterministic, stable order for a given base — repository-relative path,
@@ -230,6 +247,64 @@ async function readBounded(fh: FileHandle, maxBytes: number): Promise<{ buf: Buf
   return filled > maxBytes
     ? { buf: buf.subarray(0, maxBytes), overLimit: true }
     : { buf: buf.subarray(0, filled), overLimit: false };
+}
+
+/**
+ * Read a LOCAL candidate and verify it against a digest the caller already trusts, for a
+ * verify-then-read source (RUN-281): the local bytes are usable ONLY if a fresh hash over them
+ * matches `expectedDigest` exactly — no mtime check, no size-only check, no "the checkout looks
+ * clean" shortcut, ever. That comparison is the ENTIRE safety property this scheme has: a
+ * generation's `contentHash` asserts it describes a specific baseId, and trusting an unverified
+ * local tree would upload a lie the server cannot detect.
+ *
+ * Returns `null` for EVERY reason the caller must fall back to its own network read — missing
+ * file, unreadable file, outside the confined root, or a hash mismatch — collapsed deliberately
+ * into one signal: a caller reading `null` never has to branch on WHY, because the fallback is
+ * identical in every case (this is RUN-281's own acceptance line: "no error surfaced to the
+ * caller"). A mismatch is never itself a fault to log — a dirty or stale checkout, or a
+ * concurrent re-checkout mid-pass (the pool-of-1 workspace this was built for is shared and
+ * mutable), is the ORDINARY case this function exists to make safe, not an anomaly.
+ *
+ * Confined through `openConfined` (RUN-151), exactly as `FilesystemIndexSource.read` uses it
+ * below — open first, then prove the descriptor is the same inode as the re-resolved, re-contained
+ * path, so a symlink or a parent directory swapped mid-open is refused rather than silently
+ * followed. `root` is trusted input, handed down from whichever `VcsBackend` minted the candidate
+ * (its own `leaseIndexSnapshot`), never re-derived from a manifest field or an env var.
+ *
+ * Bounded exactly like `readBounded` above (`maxBytes + 1`, to detect a cut without buffering an
+ * arbitrarily larger file) — a local candidate whose real size exceeds the bound reads as a
+ * mismatch (a truncated prefix hashes to something the source's own full-file digest never
+ * produces) and falls back to the network the same as any other mismatch, never a special case
+ * of its own. `hashAlgorithm` is the caller's own digest algorithm (Diversion: `sha1`, its blob
+ * sha, measured — see `diversion-index-source.ts`'s module doc for the measurement behind that
+ * specific choice); this function has no opinion of its own, so a future verify-then-read source
+ * (Perforce, whose listing also carries a digest — RUN-281's own deferred half) reuses it
+ * unchanged.
+ */
+export async function readVerifiedLocal(
+  root: string,
+  relPath: string,
+  maxBytes: number,
+  expectedDigest: string,
+  hashAlgorithm: string,
+): Promise<{ bytes: Buffer; overLimit: boolean } | null> {
+  const absPath = path.join(root, ...relPath.split('/'));
+  let fh: FileHandle;
+  try {
+    fh = await openConfined(absPath, root);
+  } catch {
+    return null; // missing, outside the root, not a regular file, or a TOCTOU race — all "fall back".
+  }
+  try {
+    const { buf, overLimit } = await readBounded(fh, maxBytes);
+    const actual = createHash(hashAlgorithm).update(buf).digest('hex');
+    if (actual !== expectedDigest) return null; // the one safety property — no other shortcut.
+    return { bytes: buf, overLimit };
+  } catch {
+    return null; // a read failure after a successful open (EIO, the file vanishing mid-read) — fall back.
+  } finally {
+    await fh.close().catch(() => {});
+  }
 }
 
 /** Map an `openConfined` refusal onto this source's small refusal vocabulary. The swap-race

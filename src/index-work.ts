@@ -16,11 +16,23 @@ import type { VcsBackend } from './vcs/types';
  * a second copy of scanning, hashing, batching, or retry logic — that would be a second answer to
  * "what is this generation," and this codebase already has one.
  *
- * **Reads `snapshot.source`, never `snapshot.localPath`** (locked decision 6): `localPath` is
- * optional diagnostics — only git materializes a tree, and a step reaching for a filesystem path
- * would work on git and silently index nothing on Perforce or Diversion, whose snapshots never set
- * it. `runIndexer` already takes an `IndexSource`, so this is simply never reaching for the other
- * field.
+ * **Reads `snapshot.source`, never `snapshot.localPath`** (locked decision 6, restated after
+ * RUN-281): a step reaching for a filesystem path off `localPath` and opening it ITSELF would work
+ * on git (a trusted, exclusively-owned detached worktree) and silently read unverified,
+ * possibly-stale bytes on Diversion, whose `localPath` is a CANDIDATE, never a trust guarantee
+ * (`vcs/types.ts`'s own doc on `IndexSnapshot.localPath` carries the full split). This module still
+ * never touches that field at all: `runIndexer` takes an `IndexSource`, and the verify-then-read
+ * logic already lives entirely inside the source Diversion's own backend constructed — this is
+ * simply never reaching for the other field, on either backend, for either reason.
+ *
+ * **Folds a source-declared deadline floor into `config` before scanning** (RUN-281): an
+ * API-backed source's `read()` may cost a real network round trip per file (Diversion: measured
+ * 161ms/file), and `readDeadlineMs`'s manifest default (120s) is calibrated for a filesystem walk —
+ * unrelated to the fast path above, which only helps when a verified local candidate exists at
+ * all. `Math.max(config.readDeadlineMs, snapshot.source.minReadDeadlineMs ?? 0)` is the ONE place
+ * this floor is applied: `IndexSource.minReadDeadlineMs`'s own doc explains why it lives here
+ * rather than inside `index-scan.ts`'s policy engine, which is deliberately blind to which source
+ * it is scanning.
  *
  * **Closes over `releaseIndexSnapshot` and hands it to `uploadGeneration` as `release`** (locked
  * decision 7): `IndexWorkContext` carries no VCS access on purpose (`index-coordinator.ts`'s own
@@ -95,9 +107,16 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
     // guess about how long leasing takes rather than an observation of parsing itself.
     ctx.onProgress?.('parsing');
     const { registry } = buildIndexAdapterRegistry(config);
+    // RUN-281: raise, never lower, the repo's own configured deadline when the leased snapshot's
+    // source declares it needs more — see this module's own doc for why the fold happens HERE
+    // rather than inside `index-scan.ts`'s source-blind policy engine.
+    const effectiveConfig = {
+      ...config,
+      readDeadlineMs: Math.max(config.readDeadlineMs, snapshot.source.minReadDeadlineMs ?? 0),
+    };
     const indexed = await runIndexer(
       snapshot.source,
-      config,
+      effectiveConfig,
       {
         projectId: target.projectId,
         projectKey: target.projectKey,
