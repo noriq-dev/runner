@@ -29,8 +29,9 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { PerformanceObserver, constants as perfConstants } from 'node:perf_hooks';
+import v8 from 'node:v8';
 import { gzipSync } from 'node:zlib';
-import { computeContentHash, encodeBatches, sortRecords } from '../src/index-batch';
 import { compareGenerations } from '../src/index-debug';
 import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
@@ -110,20 +111,57 @@ async function generateTree(root: string, fileCount: number): Promise<{ bytes: n
 // ---------------------------------------------------------------------------
 
 interface LagSample {
+  /** ms since this probe started — what a reader wants to see. */
   at: number;
   lag: number;
+  /** The same tick on `performance.now()`'s clock. Carried ONLY so a stall can be joined against
+   *  `GcSample.at`, which Node stamps on that clock and no other (RUN-278) — two probes on two
+   *  different clocks cannot be correlated, and correlating them is the whole point of the GC one. */
+  absAt: number;
 }
 
 function startLagProbe(intervalMs: number): { lags: LagSample[]; stop: () => void } {
   const lags: LagSample[] = [];
-  const start = Date.now();
-  let last = Date.now();
+  const start = performance.now();
+  let last = performance.now();
   const beat = setInterval(() => {
-    const now = Date.now();
-    lags.push({ at: now - start, lag: now - last - intervalMs });
+    const now = performance.now();
+    lags.push({ at: Math.round(now - start), lag: Math.round(now - last - intervalMs), absAt: now });
     last = now;
   }, intervalMs);
   return { lags, stop: () => clearInterval(beat) };
+}
+
+/**
+ * Every GC pause the pass caused, so a stall can be ATTRIBUTED rather than guessed at (RUN-278).
+ * RUN-238 left its residual ~500ms stall recorded as "most likely an ordinary V8 GC pause" — an
+ * inference this observer then refuted outright: GC accounted for 3% of it (13-17ms), the worst
+ * single pause in a whole 20000-file run was 5.9ms, and the real cause was `sortRecords`. Keeping
+ * the observer here means the next unexplained stall is attributable in ONE run instead of a fresh
+ * investigation, which is the only reason a load harness should carry a profiler at all.
+ */
+interface GcSample {
+  at: number;
+  dur: number;
+  kind: string;
+}
+
+function startGcProbe(): { gcs: GcSample[]; stop: () => void } {
+  const kinds: Record<number, string> = {
+    [perfConstants.NODE_PERFORMANCE_GC_MINOR]: 'minor (scavenge)',
+    [perfConstants.NODE_PERFORMANCE_GC_MAJOR]: 'MAJOR (mark-sweep-compact)',
+    [perfConstants.NODE_PERFORMANCE_GC_INCREMENTAL]: 'incremental marking',
+    [perfConstants.NODE_PERFORMANCE_GC_WEAKCB]: 'weak callbacks',
+  };
+  const gcs: GcSample[] = [];
+  const obs = new PerformanceObserver((list) => {
+    for (const e of list.getEntries()) {
+      const kind = (e as unknown as { detail?: { kind?: number } }).detail?.kind;
+      gcs.push({ at: e.startTime, dur: e.duration, kind: kinds[kind ?? -1] ?? 'unknown' });
+    }
+  });
+  obs.observe({ entryTypes: ['gc'] });
+  return { gcs, stop: () => obs.disconnect() };
 }
 
 function startMemProbe(intervalMs: number): {
@@ -168,6 +206,7 @@ function config(): ResolvedIndexConfig {
 async function runInstrumentedPass(root: string) {
   const lag = startLagProbe(50);
   const mem = startMemProbe(50);
+  const gc = startGcProbe();
   const marks: Array<[string, number]> = [];
   const mark = (label: string, ms: number) => marks.push([label, ms]);
 
@@ -182,6 +221,12 @@ async function runInstrumentedPass(root: string) {
     0,
   );
 
+  // Phase timings come from INSIDE the pass (`IndexerDeps.onPhaseTiming`, RUN-278), never from
+  // re-running a stage out here on the finished result. That is not a style preference: this harness
+  // used to time `sortRecords([...result.records])` — an ALREADY-SORTED array, which V8's TimSort
+  // walks in O(n) — and so reported 53ms for a stage that really cost 533ms, hiding the daemon's
+  // last remaining event-loop stall behind the very instrument meant to find it. A re-run can only
+  // measure the input IT constructs; only the pass knows the input it actually had.
   t = Date.now();
   const result = await runIndexer(
     new FilesystemIndexSource(root),
@@ -193,27 +238,21 @@ async function runInstrumentedPass(root: string) {
       branch: 'main',
       baseId: 'deadbeef',
     },
-    { adapters: registry, yieldEveryFiles: YIELD_FILES, yieldEveryRecords: YIELD_RECORDS },
+    {
+      adapters: registry,
+      yieldEveryFiles: YIELD_FILES,
+      yieldEveryRecords: YIELD_RECORDS,
+      onPhaseTiming: (phase, ms) => mark(`  ${phase} (in-pass)`, Math.round(ms)),
+    },
   );
-  mark('runIndexer (scan+parse+sort+hash+encode, yielding)', Date.now() - t);
+  mark('runIndexer total (scan+parse+sort+hash+encode, yielding)', Date.now() - t);
 
-  // Phase breakdown for the three tail stages, timed in ISOLATION on the already-finished records
-  // — informational (the real pass above is what the lag/memory probes actually observed), same
-  // structure as the anchor probe this harness descends from.
-  const unsorted = [...result.records];
-  t = Date.now();
-  const sorted = sortRecords(unsorted);
-  mark('  sortRecords (sync, not chunked — see index-batch.ts)', Date.now() - t);
-  t = Date.now();
-  await computeContentHash(sorted, { yieldEveryRecords: YIELD_RECORDS });
-  mark('  computeContentHash (chunked)', Date.now() - t);
-  t = Date.now();
-  const batches = await encodeBatches(result.manifest.generationId, sorted, {
-    yieldEveryRecords: YIELD_RECORDS,
-  });
-  mark('  encodeBatches / gzipSync (chunked)', Date.now() - t);
-
-  const biggest = batches.reduce((a, b) => (b.compressed.byteLength > a.compressed.byteLength ? b : a));
+  // One gzip of the largest batch's size, on its own — so a reader can tell a single big flush
+  // apart from the accumulated cost of `encode` above, which is what ruled compression out as the
+  // cause of the residual stall RUN-278 went on to pin on the sort.
+  const biggest = result.batches.reduce((a, b) =>
+    b.compressed.byteLength > a.compressed.byteLength ? b : a,
+  );
   t = Date.now();
   gzipSync(Buffer.from('x'.repeat(biggest.compressed.byteLength)));
   mark('  one gzipSync of the largest batch size', Date.now() - t);
@@ -223,11 +262,12 @@ async function runInstrumentedPass(root: string) {
   await new Promise((r) => setTimeout(r, 400));
   lag.stop();
   mem.stop();
+  gc.stop();
 
   const sortedLags = lag.lags.map((l) => l.lag).sort((a, b) => a - b);
   const peak = mem.peak();
 
-  return { result, scan, scannedBytes, marks, lags: lag.lags, sortedLags, peak };
+  return { result, scan, scannedBytes, marks, lags: lag.lags, sortedLags, peak, gcs: gc.gcs };
 }
 
 async function runDeterminismCheck(root: string) {
@@ -280,9 +320,28 @@ async function printInstrumentedPass(root: string): Promise<string> {
   console.log(
     `  p50 ${pct(sortedLags, 50)}   p90 ${pct(sortedLags, 90)}   p99 ${pct(sortedLags, 99)}   MAX ${sortedLags.at(-1) ?? 0} ms`,
   );
-  console.log('  worst 6 stalls (at ms into run -> late by ms):');
-  for (const l of [...pass.lags].sort((a, b) => b.lag - a.lag).slice(0, 6))
-    console.log(`    ${l.at} -> ${l.lag}`);
+  // Each stall is attributed to the GC pauses overlapping the window it covers — [tick - lag -
+  // interval, tick] — so "the loop was blocked" comes with "and this much of it was collection".
+  // Without this join a stall is just a number, and RUN-238 mis-explained one for a whole task.
+  console.log('  worst 6 stalls, each attributed to the GC overlapping its window:');
+  for (const l of [...pass.lags].sort((a, b) => b.lag - a.lag).slice(0, 6)) {
+    const from = l.absAt - l.lag - 50;
+    const overlapping = pass.gcs.filter((g) => g.at + g.dur > from && g.at < l.absAt);
+    const gcMs = overlapping.reduce((n, g) => n + g.dur, 0);
+    const worst = [...overlapping].sort((a, b) => b.dur - a.dur)[0];
+    const share = l.lag > 0 ? Math.round((gcMs / l.lag) * 100) : 0;
+    const worstNote = worst ? `, worst ${worst.dur.toFixed(1)} ms ${worst.kind}` : '';
+    console.log(
+      `    ${String(l.lag).padStart(5)} ms at t=${String(l.at).padStart(6)} — ${overlapping.length} GC(s) totalling ${gcMs.toFixed(0)} ms (${share}% of the stall)${worstNote}`,
+    );
+  }
+  const gcTotal = pass.gcs.reduce((n, g) => n + g.dur, 0);
+  const worstGc = [...pass.gcs].sort((a, b) => b.dur - a.dur)[0];
+  console.log(
+    `  GC over the whole pass: ${pass.gcs.length} collections, ${gcTotal.toFixed(0)} ms total, ` +
+      `worst single pause ${worstGc ? `${worstGc.dur.toFixed(1)} ms ${worstGc.kind}` : 'none'}`,
+  );
+  console.log(`  V8 heap limit on this host: ${mb(v8.getHeapStatistics().heap_size_limit)}`);
   console.log(
     `  ticks late by >250ms: ${sortedLags.filter((l) => l > 250).length}   >1s: ${sortedLags.filter((l) => l > 1000).length}   >5s: ${sortedLags.filter((l) => l > 5000).length}`,
   );

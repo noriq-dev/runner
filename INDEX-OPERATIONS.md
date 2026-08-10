@@ -216,8 +216,11 @@ every `yieldEveryFiles`/`yieldEveryRecords` items, and re-check the coordinator'
 (`runIndexer` took no signal at all; `isRunBusy()` was consulted once, before leasing). A
 checkpoint throws `IndexInterrupted` rather than pausing, so an aborted or busy pass stops before a
 manifest, a generation, or a journal entry ever exists. `sortRecords` itself is NOT chunked — one
-native, uninterruptible `Array.sort` call, 52-149ms across every tree size measured below, an order
-of magnitude under hash/encode's own cost.
+native, uninterruptible `Array.sort` call with no mid-sort yield point to hook, and chunking its
+INPUT would change comparison order. RUN-278 made that acceptable on the merits rather than on a bad
+number: 184ms at 20000 records-heavy files, after the comparator stopped building a string per
+comparison. The figure this line used to carry (52-149ms) was a measurement artifact — see "The
+residual ~500ms stall" below.
 
 ### The harness
 
@@ -238,45 +241,76 @@ per directory), instruments event-loop lag on a 50ms interval THAT OUTLIVES the 
 (an earlier draft of this probe cleared its lag timer the instant `runIndexer` resolved, so the
 tick that would have reported a trailing block never fired — a blocked loop read as a healthy one;
 every timing claim in this section comes from a probe that stays armed past the pass), samples
-peak RSS/heapUsed, and — by default — indexes the same tree twice and compares canonical output
-byte-for-byte (`compareGenerations`, the same function `index-repo --check-determinism` uses)
-to prove yielding changes no byte.
+peak RSS/heapUsed, records every GC pause and attributes each stall to the collections overlapping
+it (RUN-278 — without that join a stall is just a number, and one was mis-explained for a whole
+task), takes its per-phase timings from INSIDE the pass rather than re-running stages on the finished
+result, and — by default — indexes the same tree twice and compares canonical output byte-for-byte
+(`compareGenerations`, the same function `index-repo --check-determinism` uses) to prove yielding
+changes no byte.
 
 ### Measured numbers (this host: Linux, Node v26.7.0, 32 cores, 62 GB RAM, `v8.getHeapStatistics().heap_size_limit` = 4192 MB unconfigured)
 
 | Tree | files scanned | records | batches | peak RSS | peak heapUsed | worst event-loop stall | determinism |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 8000 files / 15.9 MB (3 repeated runs) | 8000 | 335920 | 11 | 496-633 MB | 216-324 MB | 169-211 ms | `contentHash` identical across every run |
-| 20000 files / 40.2 MB (maxFiles-adjacent) | 20000 | 839800 | 27 | 1.2 GB | 605 MB | 514 ms | identical across a fresh re-index |
+| 8000 files / 15.9 MB | 8000 | 335920 | 11 | 477-494 MB | 222-247 MB | 76 ms | `contentHash` identical across every run |
+| 20000 files / 40.2 MB (maxFiles-adjacent) | 20000 | 839800 | 27 | 827 MB | 435 MB | 156 ms | identical across a fresh re-index |
 
-Before the fix, the SAME 8000-file tree produced one continuous 6298ms block (MAX lag), with 1
-tick late by more than 5 seconds. After: MAX lag 169-514ms across both sizes — the pre-fix block
-was 2-3 ORDERS OF MAGNITUDE longer than anything measured after, and the daemon's heartbeat
-tolerance (~90s, three missed 30s beats) is never remotely threatened by either.
+Before RUN-238, the SAME 8000-file tree produced one continuous 6298ms block (MAX lag), with 1 tick
+late by more than 5 seconds. After RUN-238 and RUN-278: MAX lag **76-156ms** at both sizes, zero
+ticks late by more than 250ms — the pre-fix block was **~80x** the worst stall measured now, and the
+daemon's heartbeat tolerance (~90s, three missed 30s beats) is nowhere near threatened.
 
-**The residual 500ms-ish outlier at 20000 files is not explained by checkpoint cadence** — halving
-`yieldEveryFiles` from 100 to 50 did not reduce it (547ms vs. 563ms, no meaningful difference,
-measured directly). Direct isolated timing of `gzipSync(level: 9)` on the REAL largest batch's
-JSONL content (7.86 MB, from an actual generated tree) took 31-34ms, ruling out one big
-`encodeBatches` flush as the cause. The remaining plausible explanation, consistent with the
-outlier scaling roughly with peak heap size across the two tree sizes, is an ordinary V8 GC pause
-under memory pressure — cooperative yielding cannot preempt a stop-the-world GC pause, because that
-pause is not JS-level work with a yield point to hook. This is stated as a reasoned inference from
-the evidence above, not a directly instrumented fact (no GC tracing was added to confirm it
-directly) — and it does not change the conclusion below: at ~0.5s worst case against a 90s
-heartbeat-death threshold, it is not a reason to reach for worker-thread isolation.
+In-pass phase timings, reported from inside `runIndexer` (`IndexerDeps.onPhaseTiming`):
+
+| | scan | parse | sort | hash | encode |
+| --- | --- | --- | --- | --- | --- |
+| 8000 files | 1452 ms | 3049 ms | **65 ms** | 327 ms | 851 ms |
+| 20000 files | 3205 ms | 7738 ms | **184 ms** | 812 ms | 2183 ms |
+
+`contentHash` for the 8000-file tree is `c98fdc64a66aea5f17f818be69fec946bced4cf39e350409c2dc113071f6a5db`
+both before and after RUN-278's comparator change — the same value RUN-238 recorded, which is the
+point: a faster ordering that is not the SAME ordering would be a determinism regression, not an
+optimization.
+
+### The residual ~500ms stall, and why "GC pause" was the wrong answer (RUN-278)
+
+RUN-238 left a single ~500-555ms stall at 20000 files recorded as "most likely an ordinary V8 GC
+pause under memory pressure", explicitly labelled an inference rather than an instrumented fact. It
+was instrumented, and **the inference was wrong**:
+
+- A `PerformanceObserver({entryTypes:['gc']})` over the same tree, joining each stall against the GC
+  pauses overlapping its window, put GC at **13-17ms of the 555ms — 3%**.
+- The worst single GC pause in an entire 20000-file run was **5.9ms**. 832 collections, 649ms total,
+  spread thinly across the whole pass.
+
+The real cause was `sortRecords`, the one stage deliberately left unchunked: **543-587ms** on the
+real in-pass record order. `recordIdentity` was being called on BOTH operands of every comparison, so
+~17M comparisons built ~34M throwaway concatenations *inside the sort*. Comparing an edge's three
+fields in place is the identical ordering with no allocation: **171ms, 3.1x faster** (a
+derive-the-key-once variant was measured too and is worse here — 309ms, and it retains ~540k strings
+for the duration of the sort).
+
+**Why a whole task's measurement missed it, which is the more useful lesson:** the harness timed
+`sortRecords([...result.records])` — and `result.records` is *already sorted*, which V8's TimSort
+walks in O(n). It reported **53ms** for work that cost **533ms**, and `src/index-batch.ts` then
+rested "leave the sort unchunked" on that number. This is the same class of error the harness's own
+module doc already warned about once (a lag probe cleared before the tick that would report the
+block): **a measurement taken from outside a pipeline can only measure the input it constructs
+itself.** Phase timings now come from inside the pass, and the harness carries the GC observer, so
+the next unexplained stall is attributable in one run rather than a fresh investigation.
 
 ### Why not worker threads (locked decision, re-examined against these numbers)
 
-The task's locked decisions forbid worker-thread or process isolation "unless your own measurement
-shows cooperative yielding is insufficient." It does not: the pre-fix defect (one continuous
-multi-second block) is gone, replaced by sub-second, infrequent stalls two-to-three orders of
-magnitude smaller, nowhere near the daemon's own heartbeat-death threshold. A worker would still
-have to cross a structured-clone boundary for 335920-839800 records per pass, would still GC-pause
-internally (merely isolated from the main thread rather than eliminated), and was already reasoned
-against on cost grounds before any of this ran. Cooperative yielding is sufficient; a worker thread
-would trade a bounded, well-understood cost for an unmeasured, more complex one to fix a residual
-that isn't the defect this task exists to close.
+RUN-238's locked decisions forbid worker-thread or process isolation "unless your own measurement
+shows cooperative yielding is insufficient." It does not, and RUN-278 strengthened rather than
+weakened that: the multi-second block is gone, and so is the ~500ms residual that was the only
+remaining argument for isolation — it was ordinary JS work in the sort, which is precisely the kind
+of cost yielding and cheaper comparisons address. What is left is 156-172ms at both measured sizes,
+against a ~90s heartbeat-death threshold. A worker would still have to cross a structured-clone
+boundary for 335920-839800 records per pass, and GC would still happen inside it (isolated from the
+main thread, not eliminated). The lever above worker threads, if the sort ever climbs back toward
+the 250ms bound, is chunk-and-merge — and it has to prove identical ordering before it earns the
+latency, because `contentHash` and the per-batch idempotency key both depend on that order.
 
 ### A second, independent finding: a real memory leak, discovered by this task's own "background-run coexistence" scope
 

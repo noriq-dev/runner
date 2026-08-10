@@ -9,6 +9,7 @@ import {
   computeContentHash,
   deriveGenerationId,
   encodeBatches,
+  recordIdentity,
   sortRecords,
   toStagedRow,
 } from '../src/index-batch';
@@ -103,6 +104,117 @@ describe('sortRecords', () => {
     const e2 = edge({ from: 'a', to: 'y' });
     const out = sortRecords([e1, e2]);
     expect(out).toEqual([e2, e1]);
+  });
+});
+
+/**
+ * RUN-278: `sortRecords` compares an edge's three fields IN PLACE rather than building
+ * `recordIdentity`'s joined string on both operands of every comparison — the same ordering with no
+ * allocation, and 3.1x faster on a real 839800-record pass (533ms -> 171ms). The equivalence rests on
+ * `\u0000` sorting below every character these fields can contain, which is exactly why that
+ * separator was chosen. These tests assert the equivalence against `recordIdentity` DIRECTLY, on the
+ * prefix cases where a naive separator would diverge — because the argument for the optimization is a
+ * property of the data, and a property nobody checks is a comment.
+ */
+describe('sortRecords orders by recordIdentity even though it never builds one (RUN-278)', () => {
+  /** The ordering `sortRecords` is supposed to implement, spelled out the slow, obvious way. */
+  const byIdentity = (records: readonly IndexRecord[]): IndexRecord[] =>
+    [...records].sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === 'node' ? -1 : 1;
+      const ia = recordIdentity(a);
+      const ib = recordIdentity(b);
+      return ia < ib ? -1 : ia > ib ? 1 : 0;
+    });
+
+  it('agrees with the joined-identity ordering when one edge field is a strict PREFIX of another', () => {
+    // The real, everyday shape of this: `x.ts` against `x.tsx`. A URI is a path, and one path being
+    // a prefix of another is the norm rather than a corner — comparing `x.ts<SEP>declares<SEP>a`
+    // against `x.tsx<SEP>declares<SEP>a` must reach the separator against `x`.
+    const records: IndexRecord[] = [
+      edge({ from: 'x.tsx', type: 'declares', to: 'a' }),
+      edge({ from: 'x.ts', type: 'declares', to: 'b' }),
+      edge({ from: 'x.ts', type: 'imports', to: 'a' }),
+      edge({ from: 'x.ts', type: 'declares', to: 'ba' }),
+    ];
+    expect(sortRecords(records)).toEqual(byIdentity(records));
+    // Pin the direction too, so this cannot pass by both orderings being wrong the same way.
+    expect(sortRecords(records).map((r) => (r as EdgeRecord).from)).toEqual([
+      'x.ts',
+      'x.ts',
+      'x.ts',
+      'x.tsx',
+    ]);
+  });
+
+  it('agrees when an edge TYPE is a prefix of another, which no current type is', () => {
+    // Cast deliberately: no two `MemoryEdgeType` values are prefixes of one another today
+    // (`vendor/noriq-shared/src/memory.ts` — 18 values, checked), so this case is unreachable
+    // through the type system and would otherwise go untested. It is still worth pinning, because
+    // the enum is a wire contract that GROWS: the day someone adds `tests_integration` beside
+    // `tests`, the separator's minimum-code-unit property is what keeps this ordering correct, and
+    // nothing else in the suite would notice if it stopped holding.
+    const asType = (t: string) => t as EdgeRecord['type'];
+    const records: IndexRecord[] = [
+      edge({ from: 'a', type: asType('testsMore'), to: 'a' }),
+      edge({ from: 'a', type: asType('tests'), to: 'z' }),
+    ];
+    expect(sortRecords(records)).toEqual(byIdentity(records));
+    expect(sortRecords(records).map((r) => (r as EdgeRecord).type)).toEqual(['tests', 'testsMore']);
+  });
+
+  it('agrees when a field is EMPTY, the extreme of the prefix case', () => {
+    // Also unreachable through the ordinary path — `parseStagedRow` rejects an empty `from`/`to`
+    // (mirrored by `assertSatisfiesServerRowContract` above) — but the comparator must not depend on
+    // that guarantee holding one layer up, and an empty string is where a prefix comparison is most
+    // easily got wrong.
+    const records: IndexRecord[] = [
+      edge({ from: 'a', type: 'tests', to: 'b' }),
+      edge({ from: '', type: 'tests', to: 'b' }),
+      edge({ from: 'a', type: 'tests', to: '' }),
+    ];
+    expect(sortRecords(records)).toEqual(byIdentity(records));
+  });
+
+  it('agrees with the joined-identity ordering on EVERY pair in a dense cross-product', () => {
+    // Exhaustively pairwise, not randomized over whole arrays. Two earlier drafts of this test
+    // sorted a few hundred random records and compared the arrays — and BOTH passed with `type` and
+    // `to` compared in the wrong order. The first drew from too wide an alphabet to produce a
+    // discriminating pair; the second was dense enough that its records became structurally
+    // IDENTICAL, so two genuinely different orderings compared equal under `toEqual`. Comparing
+    // pairs directly has neither failure mode: every ordering decision is its own assertion.
+    // Field values chosen so prefixes abound ('a' < 'ab' < 'abc') — that is where an ordering built
+    // on a joined string and one built field-wise could disagree.
+    const fields = ['', 'a', 'ab', 'abc', 'b'];
+    const types = ['calls', 'declares', 'tests'] as const;
+    const edges: EdgeRecord[] = [];
+    for (const from of fields)
+      for (const type of types) for (const to of fields) edges.push(edge({ from, type, to }));
+
+    const sign = (n: number) => (n < 0 ? -1 : n > 0 ? 1 : 0);
+    let compared = 0;
+    for (const a of edges) {
+      for (const b of edges) {
+        const ia = recordIdentity(a);
+        const ib = recordIdentity(b);
+        // `sortRecords` on exactly two records exposes the comparator's own verdict: it puts the
+        // lesser first, and leaves a tie in input order (V8's sort is stable).
+        const ordered = sortRecords([a, b]);
+        const viaSort = ordered[0] === a && ordered[1] === b ? (ia === ib ? 0 : -1) : 1;
+        expect(sign(viaSort)).toBe(sign(ia < ib ? -1 : ia > ib ? 1 : 0));
+        compared++;
+      }
+    }
+    // Guard the guard: a cross-product that silently collapsed would make every assertion above
+    // vacuous, so pin the count (5 froms x 3 types x 5 tos = 75 edges, squared).
+    expect(edges).toHaveLength(75);
+    expect(compared).toBe(75 * 75);
+  });
+
+  it('keeps nodes ahead of edges regardless of how the identities themselves compare', () => {
+    // A node whose uri sorts LAST against an edge whose identity sorts FIRST: kind still wins.
+    const records: IndexRecord[] = [edge({ from: 'a', to: 'a' }), node({ uri: 'zzz' })];
+    expect(sortRecords(records).map((r) => r.kind)).toEqual(['node', 'edge']);
+    expect(sortRecords(records)).toEqual(byIdentity(records));
   });
 });
 

@@ -57,12 +57,14 @@ import { comparePaths } from './index-source';
  * never a microtask (`Promise.resolve()` or an already-resolved `await`), because that is exactly
  * what the measured defect already showed refills the microtask queue and starves timers/poll
  * (RUN-238's own anchor measurement pinned it to `await adapter.parse(...)` in `indexer.ts`'s
- * candidate loop; the same shape applies here). `sortRecords` deliberately does NOT chunk: it is
- * one native `Array.prototype.sort` call — 52ms on the same measured tree — and V8 gives no
- * mid-sort yield point to hook; splitting the INPUT into chunks would change comparison order (a
- * correctness risk) for a block already an order of magnitude below hash/encode's own. It still
- * takes `CooperativeDeps` and checks once before sorting, so an already-aborted/-busy pass never
- * pays for a sort whose result nothing will use.
+ * candidate loop; the same shape applies here). `sortRecords` deliberately does NOT chunk — see its
+ * own doc for the measured cost that makes that acceptable, and for the two claims RUN-278 had to
+ * retract here: this passage previously put the sort at "52ms on the same measured tree" (a figure
+ * the harness produced by re-sorting ALREADY-SORTED output, hiding a real 533ms) and said it "still
+ * takes `CooperativeDeps` and checks once before sorting", which it never did — it takes only the
+ * records. That second sentence was the kind of comment that reads as a guarantee and holds nothing:
+ * an already-aborted pass DOES pay for the sort, and the checkpoints that surround it in
+ * `runIndexer` are what bound the waste instead.
  *
  * **The record order and every hashed/encoded byte are UNCHANGED by yielding** (locked decision,
  * RUN-238): a `setImmediate` between two loop iterations suspends and resumes the SAME loop over
@@ -196,26 +198,65 @@ function canonicalRowJson(row: StagedRow): string {
 // Deterministic ordering (locked decision 6)
 // ---------------------------------------------------------------------------
 
-/** A node's identity is its `uri`; an edge has none of its own, so its identity is the tuple that
- *  actually distinguishes one edge from another — `comparePaths` (a plain code-unit compare,
- *  despite the name) is reused for whichever string this returns, never `localeCompare`. */
-function recordIdentity(record: IndexRecord): string {
+/**
+ * A record's identity as ONE string — a node's `uri`, an edge's `(from, type, to)` joined by
+ * `\u0000`. **No longer on the sort path** (RUN-278 — `compareRecords` compares an edge's fields in
+ * place instead, for the reason stated there), kept because it names the ordering `compareRecords`
+ * implements far more legibly than three chained comparisons do, and because
+ * `test/index-batch.test.ts` pins the two against each other so the field-wise form can never drift
+ * from the identity it is supposed to be ordering by.
+ */
+export function recordIdentity(record: IndexRecord): string {
   return record.kind === 'node' ? record.uri : `${record.from}\u0000${record.type}\u0000${record.to}`;
 }
 
 /**
- * Sort every record by (kind, identity): nodes before edges (so a human skimming a raw batch sees
- * an entity before any edge that references it — the server does not care about this ordering,
- * only that it is the SAME ordering every run), then by `recordIdentity` within a kind. Plain
- * code-unit comparison throughout, never locale-aware — a locale-dependent sort would make the
- * SAME repository produce a different byte sequence on two machines with different ICU data,
- * defeating the idempotency key `IndexBatch`'s doc describes.
+ * Order two records by (kind, identity): nodes before edges (so a human skimming a raw batch sees an
+ * entity before any edge that references it — the server does not care about this ordering, only
+ * that it is the SAME ordering every run), then by identity within a kind. Plain code-unit
+ * comparison throughout, never locale-aware — a locale-dependent sort would make the SAME
+ * repository produce a different byte sequence on two machines with different ICU data, defeating
+ * the idempotency key `IndexBatch`'s doc describes.
+ *
+ * **An edge is compared FIELD BY FIELD rather than by building its identity string** (RUN-278).
+ * `recordIdentity` was called on BOTH operands of every comparison, so a 20000-file repository
+ * (839800 records, ~17M comparisons) built ~34M throwaway concatenations INSIDE the sort — measured
+ * at 533ms, and the single event-loop stall this daemon had left over after RUN-238. Comparing the
+ * three fields in place is the identical ordering with no allocation at all: **171ms, 3.1x faster**,
+ * element-for-element identical output on the real 839800-record pass. A derive-the-key-once
+ * (Schwartzian) variant was measured too and is the WORSE answer here — 309ms, and it retains ~540k
+ * identity strings for the duration of the sort where this retains none.
+ *
+ * The equivalence rests on one property, stated rather than assumed: `\u0000` sorts below every
+ * character these fields can contain, so a field that is a strict PREFIX of its counterpart compares
+ * the same way in both forms (`"a\0t"` against `"ab\0t"` reaches `\u0000` against `b`). That holds as
+ * long as no field contains `\u0000` itself — which is exactly why that separator was chosen — and
+ * `test/index-batch.test.ts` asserts it against `recordIdentity` directly rather than leaving it to
+ * this comment.
+ */
+function compareRecords(a: IndexRecord, b: IndexRecord): number {
+  if (a.kind !== b.kind) return a.kind === 'node' ? -1 : 1;
+  if (a.kind === 'node') return comparePaths(a.uri, (b as EntityRecord).uri);
+  const other = b as EdgeRecord;
+  return comparePaths(a.from, other.from) || comparePaths(a.type, other.type) || comparePaths(a.to, other.to);
+}
+
+/**
+ * Sort every record into the one canonical order (`compareRecords`).
+ *
+ * **Deliberately synchronous and unchunked**: `Array.prototype.sort` is one native call with no
+ * mid-sort yield point to hook, and chunking the INPUT would change comparison order — trading the
+ * determinism contract for latency. What makes that acceptable is a measured number rather than an
+ * assumed one: 171ms on 839800 records (RUN-278), in line with the ~80ms stalls the rest of a pass
+ * already produces and well under the 250ms bound `bench/index-load.mts` tracks. Before RUN-278 this
+ * file claimed "52-149ms across every tree size measured" and rested the same decision on it — a
+ * figure the harness produced by re-sorting output that was ALREADY SORTED (V8's TimSort is O(n) on
+ * sorted input), hiding a real 533ms cost. The harness times the true in-pass order now; if this
+ * ever climbs back toward the bound, chunk-and-merge is the next lever, and it must prove identical
+ * ordering before it earns the latency.
  */
 export function sortRecords(records: readonly IndexRecord[]): IndexRecord[] {
-  return [...records].sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === 'node' ? -1 : 1;
-    return comparePaths(recordIdentity(a), recordIdentity(b));
-  });
+  return [...records].sort(compareRecords);
 }
 
 // ---------------------------------------------------------------------------

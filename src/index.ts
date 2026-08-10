@@ -141,6 +141,7 @@ export {
   cooperativeCheckpoint,
   deriveGenerationId,
   encodeBatches,
+  recordIdentity,
   sortRecords,
   toStagedRow,
   type AssembleManifestInput,
@@ -153,7 +154,13 @@ export {
   type StagedNodeRow,
   type StagedRow,
 } from './index-batch';
-export { runIndexer, type IndexRunTarget, type IndexerDeps, type IndexerResult } from './indexer';
+export {
+  runIndexer,
+  type IndexPhase,
+  type IndexRunTarget,
+  type IndexerDeps,
+  type IndexerResult,
+} from './indexer';
 export {
   IngestError,
   IngestUpload,

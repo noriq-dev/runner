@@ -186,6 +186,12 @@ export interface IndexRunTarget {
   indexerVersion?: string;
 }
 
+/** The phases `IndexerDeps.onPhaseTiming` can report — the pipeline's own stages, in the order
+ *  `runIndexer` runs them. `parse` covers the candidate loop AND both edge-resolution passes: they
+ *  are one continuous stretch of per-record work at the same checkpoint cadence, and splitting the
+ *  label would imply a boundary an operator cannot act on. */
+export type IndexPhase = 'scan' | 'parse' | 'sort' | 'hash' | 'encode';
+
 export interface IndexerDeps {
   /** Injected clock — `index-scan.ts`'s `IndexScanDeps.now` convention, threaded to the manifest's
    *  `createdAt` and (if supplied) the scan's own deadline clock. */
@@ -219,6 +225,17 @@ export interface IndexerDeps {
    *  measured default (`DEFAULT_YIELD_EVERY_FILES` below). See `CooperativeDeps.yieldEveryRecords`
    *  for why this exists as a knob at all rather than a hardcoded constant. */
   yieldEveryFiles?: number;
+  /**
+   * RUN-278: report how long each phase of THIS pass actually took, as it happens. Added because
+   * `bench/index-load.mts` had been re-deriving the tail phases from the finished result — timing
+   * `sortRecords` on output that was ALREADY SORTED, which V8's TimSort does in O(n), so it reported
+   * 53ms for work that really cost 533ms and hid the daemon's last remaining event-loop stall for a
+   * whole task. A measurement taken from OUTSIDE a pipeline can only re-run its steps under
+   * conditions the pipeline never had; this reports the real ones from inside, so the harness never
+   * has to reconstruct an input order (which would duplicate this file's ordering logic and drift
+   * from it). Optional, and nothing branches on it: absent for every caller that is not measuring.
+   */
+  onPhaseTiming?: (phase: IndexPhase, ms: number) => void;
   /** Test-only override forwarded verbatim to `computeContentHash`/`encodeBatches` as
    *  `CooperativeDeps.yieldEveryRecords` — kept as a SEPARATE knob from `yieldEveryFiles` because
    *  the two loops are bounded by different units (candidates vs. records) with different measured
@@ -287,7 +304,16 @@ export async function runIndexer(
   const indexerVersion = target.indexerVersion ?? INDEXER_VERSION;
   const scope: UriScope = { projectKey: target.projectKey, repositoryKey: target.repositoryKey };
 
+  // RUN-278: `performance.now()` rather than `deps.now` — this is a DURATION, never a timestamp
+  // that reaches a manifest, so it is deliberately outside the injected-clock contract `deps.now`
+  // exists for (`assembleManifest`'s `createdAt` is the only clock-derived field on the wire).
+  const phaseStart = (): number => performance.now();
+  const reportPhase = (phase: IndexPhase, from: number): void =>
+    deps.onPhaseTiming?.(phase, performance.now() - from);
+
+  let tPhase = phaseStart();
   const scanResult = await scanIndexSource(source, config, deps.scan);
+  reportPhase('scan', tPhase);
 
   const records: IndexRecord[] = [];
   const diagnostics = new DiagnosticsCollector();
@@ -314,6 +340,7 @@ export async function runIndexer(
   // already-busy pass never even begins, and a fixture far smaller than `yieldEveryFiles` still
   // observes an interrupt (the property `test/index-yield.test.ts` leans on).
   await cooperativeCheckpoint(cooperativeDeps);
+  tPhase = phaseStart();
 
   let filesSinceCheckpoint = 0;
   for (const candidate of scanResult.candidates) {
@@ -505,13 +532,19 @@ export async function runIndexer(
     records.push({ kind: 'edge', type: 'related_to', from, to });
   }
 
+  reportPhase('parse', tPhase);
+
   const deletions = computeDeletions(currentPaths, deps.previousFilePaths);
-  // `sortRecords` itself does not chunk (index-batch.ts's own doc: one native, uninterruptible
-  // `Array.sort` call, 52ms on the measured tree) — the checkpoint here is what makes an
-  // already-aborted/-busy pass decline BEFORE paying for it, not a yield inside it.
+  // `sortRecords` itself does not chunk (see its own doc for the measured cost that makes that
+  // acceptable) — the checkpoint here is what makes an already-aborted/-busy pass decline BEFORE
+  // paying for it, not a yield inside it.
   await cooperativeCheckpoint(cooperativeDeps);
+  tPhase = phaseStart();
   const sorted = sortRecords(records);
+  reportPhase('sort', tPhase);
+  tPhase = phaseStart();
   const contentHash = await computeContentHash(sorted, cooperativeDeps);
+  reportPhase('hash', tPhase);
   const generationId = deriveGenerationId({
     projectId: target.projectId,
     repositoryKey: target.repositoryKey,
@@ -519,7 +552,9 @@ export async function runIndexer(
     baseId: target.baseId,
     indexerVersion,
   });
+  tPhase = phaseStart();
   const batches = await encodeBatches(generationId, sorted, cooperativeDeps);
+  reportPhase('encode', tPhase);
   const manifest = assembleManifest({
     generationId,
     projectId: target.projectId,
