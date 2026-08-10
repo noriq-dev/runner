@@ -6560,6 +6560,114 @@ describe('the run model mix (RUN-59)', () => {
     });
   });
 
+  describe('RunTally.stageFacts (RUN-243)', () => {
+    it('per-stage tokens sum EXACTLY to the run total across a mixed run', () => {
+      const t = new RunTally();
+      // Claude builder — attributed.
+      t.record(
+        'primary',
+        tel({
+          inputTokens: 100,
+          outputTokens: 50,
+          costUsd: 0.5,
+          modelUsage: { opus: mix({ inputTokens: 100, outputTokens: 50, costUSD: 0.5 }) },
+        }),
+      );
+      // Codex reviewer — tokens, no mix, no cost (the driver never reports one).
+      t.record('review:1', tel({ inputTokens: 30, outputTokens: 10 }));
+      // Claude planner — attributed.
+      t.record(
+        'plan',
+        tel({
+          inputTokens: 20,
+          costUsd: 0.05,
+          modelUsage: { opus: mix({ inputTokens: 20, costUSD: 0.05 }) },
+        }),
+      );
+
+      const { stages, total } = t.stageFacts();
+      expect(total).toEqual(t.total()); // the same walk, not a second one that could disagree
+      const summedTokens = stages.reduce(
+        (a, s) => a + (s.tokens.status === 'complete' ? s.tokens.value : 0),
+        0,
+      );
+      expect(summedTokens).toBe(totalTokens(total));
+      expect(totalTokens(total)).toBe(210); // 150 (primary) + 40 (review:1) + 20 (plan)
+    });
+
+    it('a codex stage reports tokens complete/cost unavailable; a claude stage reports both complete', () => {
+      const t = new RunTally();
+      t.record(
+        'primary',
+        tel({
+          inputTokens: 100,
+          costUsd: 0.5,
+          modelUsage: { opus: mix({ inputTokens: 100, costUSD: 0.5 }) },
+        }),
+      );
+      t.record('review:1', tel({ inputTokens: 30 })); // codex: tokens, no mix, costUsd stays 0
+
+      const { stages } = t.stageFacts();
+      const claudeStage = stages.find((s) => s.stage === 'primary');
+      const codexStage = stages.find((s) => s.stage === 'review:1');
+
+      expect(claudeStage?.tokens).toMatchObject({ status: 'complete', value: 100 });
+      expect(claudeStage?.costUSD).toMatchObject({ status: 'complete', value: 0.5 });
+
+      expect(codexStage?.tokens).toMatchObject({ status: 'complete', value: 30 });
+      // Never `{ status: 'complete', value: 0 }` — that would assert the stage was free.
+      expect(codexStage?.costUSD).toMatchObject({ status: 'unavailable', value: null });
+    });
+
+    it('available stage costs sum to the run total cost — codex contributes nothing, and the total books it at $0', () => {
+      const t = new RunTally();
+      t.record(
+        'primary',
+        tel({
+          inputTokens: 100,
+          costUsd: 0.5,
+          modelUsage: { opus: mix({ inputTokens: 100, costUSD: 0.5 }) },
+        }),
+      );
+      t.record('review:1', tel({ inputTokens: 30 })); // codex — costUsd 0, folded into the total as $0
+
+      const { stages, total } = t.stageFacts();
+      const summedAvailableCost = stages.reduce(
+        (a, s) => a + (s.costUSD.status === 'complete' ? s.costUSD.value : 0),
+        0,
+      );
+      // Fact 1: the codex stage's own cost fact is unavailable, not a measured zero.
+      expect(stages.find((s) => s.stage === 'review:1')?.costUSD.status).toBe('unavailable');
+      // Fact 2: the run total nonetheless already books that same session at exactly $0 (RUN-86),
+      // so summing only the AVAILABLE stage costs still lands on the run total — both true at once.
+      expect(summedAvailableCost).toBeCloseTo(total.costUsd);
+      expect(total.costUsd).toBeCloseTo(0.5);
+    });
+
+    it('two review rounds yield two reviewer-role facts', () => {
+      const t = new RunTally();
+      t.record('review:1', tel({ inputTokens: 10 }));
+      t.record('review:2', tel({ inputTokens: 15 }));
+      const { stages } = t.stageFacts();
+      const reviewers = stages.filter((s) => s.role === 'reviewer');
+      expect(reviewers).toHaveLength(2);
+      expect(reviewers.map((s) => s.stage).sort()).toEqual(['review:1', 'review:2']);
+    });
+
+    it('a slot with absent (zero) telemetry yields an unavailable envelope and leaves the run total unchanged', () => {
+      const t = new RunTally();
+      t.record('primary', tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100 }) } }));
+      const before = t.total();
+      t.record('conflict', tel()); // a stopped session's zero-telemetry exit — no evidence at all
+      const { stages, total } = t.stageFacts();
+
+      const conflictStage = stages.find((s) => s.stage === 'conflict');
+      expect(conflictStage?.tokens).toMatchObject({ status: 'unavailable', value: null });
+      expect(conflictStage?.costUSD).toMatchObject({ status: 'unavailable', value: null });
+      expect(total).toEqual(before); // zero telemetry contributes zero — the total is unmoved
+    });
+  });
+
   it('folds an Opus build + a Sonnet reviewer into ONE mix that sums to the run total', async () => {
     // The exact case the reviewer flagged: a second session on a DIFFERENT model must appear in the
     // run's "actual" mix, and the breakdown must still sum to the reported total.

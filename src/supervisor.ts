@@ -1,6 +1,7 @@
 import type {
   AgentTool,
   EffortEpisode,
+  EpisodeStageFact,
   IntelligenceDurationMs,
   LandPolicy,
   PermissionProfile,
@@ -89,6 +90,7 @@ import { type BudgetReservation, exceedsRun, reserveFromRun } from './run-budget
 import { type StageName, stagesFor, stopBefore } from './run-machine';
 import { STAGE_NORIQ_TOOLS, sanitizedAgentEnv } from './security';
 import { runSetup } from './setup';
+import { stageFactFromTelemetry } from './stage-facts';
 import {
   type ExecuteHost,
   type ExecuteOutcome,
@@ -782,31 +784,74 @@ export class RunTally {
    *  slots with one session's in-flight tick swapped in — without writing that tick anywhere. */
   private sum(snapshots: Iterable<DriverTelemetry>): DriverTelemetry {
     const acc = zeroTelemetry();
-    let mix: Record<string, ModelUsage> | undefined;
+    const fold: MixFold = {};
+    for (const t of snapshots) RunTally.foldSnapshot(acc, fold, t);
+    RunTally.finalizeMix(acc, fold);
+    return acc;
+  }
+
+  /**
+   * Per-slot Project Intelligence facts (RUN-243), built from the SAME walk `total()` runs over
+   * each slot's snapshot — not a second accumulator kept in sync with it by hand. `foldSnapshot`
+   * is the one definition of "how does one slot's snapshot add into a running total"; `sum()`
+   * above calls it per snapshot and this calls it per slot, ADDITIONALLY building the per-slot
+   * fact `sum()` has no reason to. "Stage facts sum to the run total" is therefore structural —
+   * the two numbers come out of the identical addition, not two additions asserted to agree.
+   *
+   * Slot names are read here for the first time (`sum()` only ever sees bare snapshots) —
+   * `stageFactFromTelemetry` (`stage-facts.ts`) is what turns a slot name into the vendored
+   * `ExecutionKind`/`ExecutionRole`, kept in its own module because that classification has
+   * nothing to do with tallying and everything to do with the slot vocabulary's meaning.
+   */
+  stageFacts(): { stages: EpisodeStageFact[]; total: DriverTelemetry } {
+    const acc = zeroTelemetry();
+    const fold: MixFold = {};
+    const stages: EpisodeStageFact[] = [];
+    for (const [slot, t] of this.slots) {
+      RunTally.foldSnapshot(acc, fold, t);
+      stages.push(stageFactFromTelemetry(slot, t));
+    }
+    RunTally.finalizeMix(acc, fold);
+    return { stages, total: acc };
+  }
+
+  /** One snapshot's contribution to a running total — shared by `sum()` and `stageFacts()` so
+   *  they can never independently drift on what "adding a slot in" means. */
+  private static foldSnapshot(acc: DriverTelemetry, fold: MixFold, t: DriverTelemetry): void {
+    acc.inputTokens += t.inputTokens;
+    acc.outputTokens += t.outputTokens;
+    acc.cacheReadTokens += t.cacheReadTokens;
+    acc.cacheCreationTokens += t.cacheCreationTokens;
+    acc.costUsd += t.costUsd;
+    acc.numTurns += t.numTurns;
+    const spent =
+      t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens > 0 || t.costUsd > 0;
     // Spend from mix-less sessions, collected into the one reserved bucket (RUN-86) instead of
     // nuking the whole mix. Each such session adds its OWN aggregate — the same numbers it puts in
     // `acc` — so the bucket + the attributed models sum back to the total (codex lands here at $0,
     // matching that `acc.costUsd` already books it at $0).
-    let unattributed: ModelUsage | undefined;
-    for (const t of snapshots) {
-      acc.inputTokens += t.inputTokens;
-      acc.outputTokens += t.outputTokens;
-      acc.cacheReadTokens += t.cacheReadTokens;
-      acc.cacheCreationTokens += t.cacheCreationTokens;
-      acc.costUsd += t.costUsd;
-      acc.numTurns += t.numTurns;
-      const spent =
-        t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens > 0 || t.costUsd > 0;
-      if (t.modelUsage) mix = mergeModelUsage(mix, t.modelUsage);
-      else if (spent) unattributed = addUnattributed(unattributed, t);
-    }
+    if (t.modelUsage) fold.mix = mergeModelUsage(fold.mix, t.modelUsage);
+    else if (spent) fold.unattributed = addUnattributed(fold.unattributed, t);
+  }
+
+  private static finalizeMix(acc: DriverTelemetry, fold: MixFold): void {
     // A mix exists if ANYTHING was attributed or anything was unattributed; only a spend-less run
     // leaves both undefined (→ no mix, the daemon sends `{}` → the honest "not reported").
-    if (mix || unattributed) {
-      acc.modelUsage = { ...mix, ...(unattributed ? { [UNATTRIBUTED_MODEL_ID]: unattributed } : {}) };
+    if (fold.mix || fold.unattributed) {
+      acc.modelUsage = {
+        ...fold.mix,
+        ...(fold.unattributed ? { [UNATTRIBUTED_MODEL_ID]: fold.unattributed } : {}),
+      };
     }
-    return acc;
   }
+}
+
+/** `RunTally`'s running mix-in-progress, threaded through `foldSnapshot` and closed out by
+ *  `finalizeMix` — split out of the accumulator object itself since `DriverTelemetry.modelUsage`
+ *  is only ever written once, at the end, never accumulated field-by-field like the rest. */
+interface MixFold {
+  mix?: Record<string, ModelUsage>;
+  unattributed?: ModelUsage;
 }
 
 /** The anchor task's human-readable content, inlined into the prompt. */
