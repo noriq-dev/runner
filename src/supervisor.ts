@@ -370,8 +370,9 @@ export interface RunSupervisorDeps {
    */
   reportVerification?: (runId: string, agentToken: string, report: VerificationReportWire) => void;
   /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
-   *  which is exactly the behaviour before it existed. */
-  repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
+   *  which is exactly the behaviour before it existed. `getEntry` (RUN-233) is the seeder's own
+   *  precedence read — see `mapPatternsIfWorthIt`. */
+  repoIntel?: Pick<RepoIntel, 'get' | 'put' | 'getEntry'>;
   /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
    *  omitted → the real fs. */
   readDoc?: DocReader;
@@ -3882,19 +3883,25 @@ export class RunSupervisor {
   }
 
   /**
-   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144).
+   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144),
+   * seeded where possible from Noriq's own verified memory before any of that runs (RUN-233).
    *
    * Returns the brief section to append, or '' — every reason to produce nothing is a reason to
-   * leave the builder exactly as well briefed as it would have been. Skipped when the plan
-   * anticipates no files (there is nothing to find an analog FOR), and when the intel cache
-   * already answers AT THIS BASE: the facts and the analogs come from the same tree, so a fact
-   * that is still current means the analogs would be too.
+   * leave the builder exactly as well briefed as it would have been. The AGENT half (analogs, and
+   * a MISS's own facts) is skipped when the plan anticipates no files (there is nothing to find an
+   * analog FOR) or this workflow never declared the stage; the SEED half below is not, because it
+   * spawns nothing and spends nothing — it is a pure translation of a pack this run already fetched.
    */
   private async mapPatternsIfWorthIt(
     run: Run,
     prepared: PreparedRun,
     checked: CheckedExecutionSpec | null,
   ): Promise<string> {
+    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
+    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
+    // checkout against a fork point, and a later fresh run at that fork point would read them.
+    const intel = prepared.continued ? undefined : this.deps.repoIntel;
+
     if (!stagesFor(prepared.workflow).some((st) => st.name === 'pattern-map')) return '';
     if (!worthMapping(checked) || !checked) return '';
 
@@ -3903,12 +3910,32 @@ export class RunSupervisor {
     // and nothing else — an earlier version skipped the whole stage on a hit, which meant a warm
     // cache produced a WORSE brief than a cold one at the very thing this stage exists for.
     //
-    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
-    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
-    // checkout against a fork point, and a later fresh run at that fork point would read them.
-    const intel = prepared.continued ? undefined : this.deps.repoIntel;
-    const cached = await intel?.get(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
-    if (cached) this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
+    // A SEEDED entry would not be the same kind of hit: it would be translated from server memory
+    // rather than derived by a run that actually read this repo, so it must not outrank what THIS
+    // run is about to work out for itself. Seeding an entry that then silently won every render
+    // forever would make a warm cache produce a worse brief than a cold one — exactly what RUN-144
+    // already fixed once. So only a LEARNED entry blocks the write below and wins the render.
+    //
+    // **Nothing writes `'seeded'` today** (RUN-233): the only candidate source was a verified
+    // context pack, and it has no honest target here — its verified facts are the PATHS a memory
+    // cited, which are not entry points, are already rendered to the agent by `memory-render.ts`
+    // with their statements and verdicts, and would land under this block's own "what earlier runs
+    // worked out" header. A cache exists to avoid re-paying for expensive local derivation; a pack
+    // is one bounded call every run makes anyway. So the origin rule below is a GUARD for a future
+    // writer, not a description of live behaviour — with no seeder, `learned` is always true for an
+    // existing entry and this method behaves exactly as it did before RUN-233.
+    const entry = await intel?.getEntry(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
+    const cached = entry?.facts ?? null;
+    const learned = entry?.origin === 'learned';
+    if (entry) {
+      // A seeded entry's line must not claim a run worked it out, since no run would have. Paired
+      // with the origin rule above, and unreachable until something writes a seed.
+      this.transcript(run.id).milestone(
+        learned
+          ? 'reused what an earlier run worked out about this repo'
+          : "started from what Noriq's memory already says about this repo — nothing has read it yet",
+      );
+    }
 
     const reservation = prepared.tally.reserve();
     if (!reservation.ok) {
@@ -3918,18 +3945,21 @@ export class RunSupervisor {
       });
       return '';
     }
-    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached ?? null);
-    // Shared by the first attempt and the answered re-run (RUN-190): cache the facts on a miss,
-    // render analogs + facts either way.
+    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached);
+    // Shared by the first attempt and the answered re-run (RUN-190): cache the facts on a MISS —
+    // now meaning "no LEARNED entry" rather than "no entry at all" (RUN-233), so this run's own
+    // derived facts still replace a seed — render analogs + facts either way, preferring what this
+    // run just derived over a seed it was entitled to replace.
     const finish = async (m: NonNullable<Awaited<ReturnType<typeof mapPatterns>>>): Promise<string> => {
-      if (intel && !cached && hasFacts(m.facts)) {
+      const derived = !learned && hasFacts(m.facts);
+      if (intel && derived) {
         await intel
           .put(prepared.repo.root, prepared.worktree.baseId, m.facts)
           .catch((err: unknown) =>
             this.log.warn('could not cache what this run learned', { err: String(err) }),
           );
       }
-      return `${renderAnalogs(m.analogs)}${renderRepoFacts(cached ?? m.facts)}`;
+      return `${renderAnalogs(m.analogs)}${renderRepoFacts(derived ? m.facts : cached)}`;
     };
 
     // The mapper's own coordinate (RUN-193): `[stages.pattern-map] agent` on top of the prepared
@@ -3970,7 +4000,7 @@ export class RunSupervisor {
         stage: 'pattern-map',
         tail: '',
       });
-      if (!answered) return renderRepoFacts(cached ?? null);
+      if (!answered) return renderRepoFacts(cached);
       answerBlock += renderPrompt('stage-answer', answered);
       current = await mapPatterns(this.patternMapHost(prepared.tally), {
         run,

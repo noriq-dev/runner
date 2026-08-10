@@ -163,6 +163,44 @@ describe('hasFacts', () => {
   });
 });
 
+// RUN-233: seeded entries are a weaker kind of hit than learned ones — `getEntry` is the seam
+// that lets a caller (the supervisor's `mapPatternsIfWorthIt`) tell the two apart and decide
+// whether a fresh write may replace what is here.
+describe('origin (RUN-233)', () => {
+  it('defaults a bare put() to learned', async () => {
+    const intel = new RepoIntel(memStore(), 'https://noriq.test');
+    await intel.put('repo_a', 'sha1', facts({ entryPoints: ['a.ts'] }));
+    expect(await intel.getEntry('repo_a', 'sha1')).toMatchObject({ origin: 'learned' });
+  });
+
+  it('records a seeded write as seeded, and get() still returns bare facts', async () => {
+    const intel = new RepoIntel(memStore(), 'https://noriq.test');
+    await intel.put('repo_a', 'sha1', facts({ entryPoints: ['a.ts'] }), 'seeded');
+    expect(await intel.getEntry('repo_a', 'sha1')).toMatchObject({ origin: 'seeded' });
+    expect(await intel.get('repo_a', 'sha1')).toMatchObject({ entryPoints: ['a.ts'] });
+  });
+
+  it('reads an on-disk entry with no marker as learned, not seeded', async () => {
+    // Every entry ever written before this task carried no `origin` field at all — the on-disk
+    // shape RepoIntelEntry had until RUN-233. Absence must not silently make old, real facts
+    // replaceable by a seed.
+    const store = memStore();
+    await store.write({
+      'https://noriq.test': {
+        repo_a: { ...facts({ conventions: ['old'] }), baseId: 'sha1', learnedAt: 'x' },
+      },
+    } as never);
+    const intel = new RepoIntel(store, 'https://noriq.test');
+    expect(await intel.getEntry('repo_a', 'sha1')).toMatchObject({ origin: 'learned' });
+  });
+
+  it('getEntry is a miss at a different base, exactly like get', async () => {
+    const intel = new RepoIntel(memStore(), 'https://noriq.test');
+    await intel.put('repo_a', 'sha1', facts({ conventions: ['x'] }), 'seeded');
+    expect(await intel.getEntry('repo_a', 'sha2')).toBeNull();
+  });
+});
+
 describe('the store seam', () => {
   it('is injectable, so nothing here touches a real home directory', async () => {
     const store: IntelStore = { read: vi.fn(async () => ({})), write: vi.fn(async () => {}) };

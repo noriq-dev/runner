@@ -16,6 +16,12 @@
  * cache with a writer and no reader is dead weight, one with a reader and no writer is a permanent
  * miss — and it is why a cache HIT skips this stage entirely: the facts and the analogs were
  * derived from the same base, so if the facts are still current the analogs are too.
+ *
+ * It is still the cache's ONLY writer after RUN-233, which set out to add a second one (translating
+ * a run's verified Noriq context into the same facts) and found no honest source for them — see
+ * `repo-intel.ts`'s own doc. What that task left behind is the precedence RULE for a future writer,
+ * in `supervisor.ts`'s `mapPatternsIfWorthIt`: nothing may outrank facts a run derived by reading
+ * the repo, which is what this stage does.
  */
 
 import { RepoPath, type Run } from '@noriq-dev/shared';
