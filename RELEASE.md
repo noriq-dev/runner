@@ -127,9 +127,12 @@ Stated here rather than left implicit, per this task's own instruction:
   leg and this task did not add one speculatively (a locked decision: an untested third leg makes
   a release runbook a guess). `README.md` and `INDEX-OPERATIONS.md` previously overstated macOS as
   a tested CI leg; both were corrected by this task to say "expected to work, not itself tested."
-- **Perforce and Diversion release verification.** Both VCS backends were already recorded as
-  unmeasured for the indexing LOAD path (`INDEX-OPERATIONS.md`'s "What is unmeasured"); this task
-  adds nothing there and does not claim otherwise.
+- **Perforce and Diversion release verification.** Neither backend's release behaviour was tested
+  here. Diversion's index-SNAPSHOT path has since been verified directly against a live repo
+  (lease/list/read/release — see `INDEX-OPERATIONS.md`'s "What is unmeasured" for exactly what that
+  covers and what it does not), but a release-shaped test — an upgrade, a rollback, a full index pass
+  and upload over a Diversion snapshot — is still not among them. Perforce remains entirely
+  unexercised against a real server.
 - **Server-side object storage ("R2").** Still only DESIGNED, not built — there is no real
   "storage unavailable" signal for this daemon to distinguish from an ordinary 5xx, so the
   compatibility matrix's R2 row tests the one thing that IS real: how an ordinary persistent 5xx

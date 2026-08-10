@@ -209,20 +209,34 @@ counted on this host, on the three Noriq-managed projects that actually exist, n
 
 ### Measured demand, per project
 
-| Project | VCS | Language/format | Files | Lines |
-| --- | --- | --- | --- | --- |
-| Project Nod (Unreal) | Diversion | `.cpp` + `.h` | 137 + 120 = 257 | 53,660 |
-| Project Nod | Diversion | `.cs` (all `.Build.cs`/`.Target.cs` — UBT, not hand-authored gameplay code) | 8 | — |
-| Project Nod | Diversion | `.ini` | 6 | — |
-| Project Nod | Diversion | `.uplugin` / `.uproject` | 4 + 1 = 5 | — |
-| Project Nod | Diversion | `.py` | 2 | — |
-| Project Nod | Diversion | binary assets (`.uasset`/`.png`/`.umap`, machine-generated) | 3201 + 101 + 6 = 3308 (89% of 3586 total tracked files) | n/a |
-| noriq, runner | git | TypeScript | (already covered) | — |
-| — | — | Go | **0** | — |
-| — | — | Rust | **0** | — |
+**CORRECTED after RUN-239 shipped**: the first pass measured
+`~/Diversion/Prototypes/ProjectNodPrototypeV1`, which is NOT the checkout the daemon discovers. The
+marked one — the path in the `dv` registry, carrying `.noriq/project.toml` — is
+`~/Diversion/Prototype`, and it is far larger. Both are recorded below because the mistake is
+instructive: a language-demand count is only as good as the checkout it was taken on, and the
+daemon's own discovery log names which that is. The figures for the MARKED checkout come from the
+Diversion snapshot's own tracked listing, not a filesystem walk.
 
-The task body's own guessed language list led with Go and Rust — zero files, in any managed
-project. C++ was fourth on that list and is the only one with real demand at meaningful scale.
+| Project | VCS | Language/format | Files (marked checkout) | Files (first pass, wrong checkout) |
+| --- | --- | --- | --- | --- |
+| Project Nod (Unreal) | Diversion | `.cpp` + `.h` | **997 + 852 = 1849** | 137 + 120 = 257 |
+| Project Nod | Diversion | `.cs` (all `.Build.cs`/`.Target.cs` — UBT, not hand-authored gameplay code) | **51** | 8 |
+| Project Nod | Diversion | `.md` | 43 | — |
+| Project Nod | Diversion | `.uplugin` / `.uproject` | 20 + 1 = 21 | 4 + 1 = 5 |
+| Project Nod | Diversion | `.ini` | 5 | 6 |
+| Project Nod | Diversion | binary assets (`.uasset` + `.umap`, machine-generated, DEFAULT-EXCLUDED) | **4187 + 15 = 4202, 8.36 GB** | 3201 + 6 |
+| Project Nod | Diversion | total tracked files in the snapshot | **6216** | 3586 |
+| noriq, runner | git | TypeScript | (already covered) | — |
+| — | — | Go | **0** | **0** |
+| — | — | Rust | **0** | **0** |
+
+The task body's own guessed language list led with Go and Rust — zero files, in any managed project,
+on either checkout. C++ was fourth on that list and is the only one with real demand at meaningful
+scale; the corrected count makes that conclusion stronger, not weaker.
+
+The `.uasset`/`.umap` default exclusion earns its place on this repo specifically: **8.36 GB** of
+tracked binary payload that is never read, against ~21 MB of source that is. Without it this repo
+would trip `maxTotalBytes` on asset bytes and index almost none of its code.
 
 ### What shipped, and why
 
@@ -421,9 +435,10 @@ other default.
   INDEXER_VERSION section above; blocked on a planar contract change.
 - **Marking Project Nod with a `.noriq/project.toml`** — it has none today, so the daemon does not
   discover it at all. This task makes C++ ready; it does not onboard that repo.
-- **Load-testing an Unreal repo end to end through the Diversion backend** — RUN-238 already
-  recorded Diversion as unmeasured for the indexing LOAD path, and nothing here changes that (the
-  real-repo runs in this section used `index-repo`'s local filesystem walk, never the Diversion
+- **Load-testing an Unreal repo end to end through the Diversion backend** — the snapshot path
+  (lease/list/read/release) is verified now, see "What is unmeasured" below; the LOAD path is not,
+  and nothing here changes that (the real-repo runs in this section used `index-repo`'s local
+  filesystem walk, never the Diversion
   snapshot lease path).
 - **Directory-level pruning for `exclude`/`defaultExclude` in `index-scan.ts`** — see the status-
   collector caveat immediately above; a real gap, sized larger than this task, left for a follow-up.
@@ -592,10 +607,34 @@ long before `maxTotalBytes` would trip.
 
 ### What is unmeasured
 
-**Perforce and Diversion**: no large live depot was available on this host — the two live VCS
-backends' own `IndexSnapshot.source` implementations (`vcs/perforce-index-source.ts`,
-`vcs/diversion-index-source.ts`) were not load-tested by this task. `bench/index-load.mts` only
-exercises `FilesystemIndexSource`, the same class every git checkout indexes through.
+**Perforce**: no live depot was available on this host — `vcs/perforce-index-source.ts` has never
+been exercised against a real server, for either correctness or load.
+
+**Diversion — the SNAPSHOT path is verified now; LOAD is still not.** Measured directly against
+Project Nod's live Diversion repo (`dv.repo.e821a7a1…`, 6216 tracked files), narrowly and honestly:
+
+| checked | result |
+| --- | --- |
+| `leaseIndexSnapshot` | ok — `baseId=dv.commit.474`, `branch=main`, `readOnly=true`, no `localPath` (API-backed by design) |
+| `list()` | 6216 tracked files in 969 ms, zero refusals, deterministic order |
+| tracked-only property | holds — `Intermediate/`, `Binaries/`, `DerivedDataCache/`, `.o`, `.d`, `.rsp` all absent by construction, per `.dvignore` |
+| `read()` | 10/10 sampled files byte-exact against their on-disk size, 408 B to 58 KB |
+| `releaseIndexSnapshot` | clean (it materializes nothing, so there is nothing to give back) |
+
+What that does NOT cover, and must not be read as covering: a full `runIndexer` pass over a
+Diversion snapshot, an upload of one, `changesBetween` (which this backend refuses outright —
+`full-index-required`), event-loop or memory behaviour under Diversion's API latency, and anything
+about Perforce. `bench/index-load.mts` still only exercises `FilesystemIndexSource`.
+
+**A measurement trap worth keeping, because it cost a nearly-filed false defect**: the first read
+probe reported "ok BUT EMPTY" for all ten files, including a 6972-byte `.cpp`, and the file size was
+confirmed on disk. The probe was wrong, not the backend — `IndexSourceReadOutcome`'s `ok` arm carries
+**`bytes: Buffer`** and `overLimit`, never `content`, and `TextDecoder().decode(undefined)` returns
+the empty string rather than throwing. Ten healthy reads read as ten silent failures. This is the
+third instance in one sitting of an instrument producing a clean-looking wrong answer (the others:
+RUN-238's lag probe cleared before the tick that would report the block, and RUN-278's sort timing
+run against already-sorted input) — check the shape a result is supposed to have before believing
+what it says.
 
 **Windows**: this task's measurements are Linux-only (see this host's own line above). `README.md`
 states Windows is a real CI matrix leg for the runner generally; this task did not re-verify that
