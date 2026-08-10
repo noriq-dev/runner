@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invokedDirectly, renderIndexStatusText, run } from '../src/cli';
+import { COMMANDS } from '../src/completion';
 import { VERSION } from '../src/version';
 import { buildIndexRepoFixture } from './fixtures/index-repo-fixtures';
 
@@ -74,6 +75,15 @@ describe('cli', () => {
     ]) {
       expect(text).toContain(cmd);
     }
+  });
+
+  // RUN-235: help and completion (test/completion.test.ts) are DERIVED from the same
+  // `COMMAND_TABLE` — this is the direction drift would first show if a command were ever added
+  // to one and not the other, so it asserts the derivation rather than a hand-picked subset.
+  it('help lists every command in COMMANDS — the same table completion.ts derives from', async () => {
+    expect(await run(['help'])).toBe(0);
+    const text = out.join('\n');
+    for (const cmd of COMMANDS) expect(text).toContain(cmd);
   });
 });
 

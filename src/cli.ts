@@ -2,7 +2,7 @@
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { type AuthMode, authorize, resolveMode } from './auth';
-import { completionCandidates, completionScript } from './completion';
+import { completionCandidates, completionScript, formatCommandTable } from './completion';
 import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
 import { DEFAULT_CREDENTIALS_PATH } from './credentials';
 import { Daemon } from './daemon';
@@ -36,25 +36,7 @@ Usage:
   noriq-runner <command> [options]
 
 Commands:
-  init             Guided setup: config + authorization, then show what it found
-  init-project     Guided .noriq/project.toml for the repo you are in (commit it)
-  update           Check whether this runner is behind (it will not replace itself)
-  auth             Authorize this machine with Noriq and store its token
-  start            Discover repos, register with Noriq, and supervise dispatched runs
-  discover         Scan roots for .noriq/project.toml markers and list found repos
-  index-repo       Index the current repo locally and print a summary — never uploads (see below)
-  index-status     Show background-indexing status for the repo at --path (see below)
-  index-reindex    Ask a running daemon to reindex the repo at --path now
-  index-retry      Same as index-reindex — retrying is just asking again (see below)
-  index-cancel     Ask a running daemon to cancel the repo's active index job, if any
-  index-forget-journal
-                   Clear LOCAL index-upload bookkeeping for the repo at --path — never touches
-                   the server (see below)
-  index-selftest   Parse a snippet through every bundled tree-sitter grammar (packaging smoke test)
-  config           Load, validate, and print the resolved machine config
-  completion       Print a shell completion script (bash | zsh) — see below
-  version          Print the version
-  help             Print this help
+${formatCommandTable()}
 
 Options:
   --config <path>  Path to runner.toml (default: ${DEFAULT_CONFIG_PATH})
@@ -90,10 +72,12 @@ dry-run what background indexing would produce, without a daemon or a server):
   --check-determinism
                     Index twice and compare the canonical output instead of printing a report
 
-index-status options — nine distinguishable states (no opt-in, unchanged, queued, parsing,
-uploading, server-validating, active, failed, association-conflict). Reads a live daemon's control
-server when one answers; otherwise falls back to the last snapshot that daemon wrote to disk,
-labelled with when it was observed — never a synthesized "now":
+index-status options — ten distinguishable states (no-opt-in, queued, parsing, uploading,
+server-validating, staged, active, failed, association-conflict, plus legacy unchanged — see
+INDEX-OPERATIONS.md). A successful upload ends STAGED, not active: activation is an admin-only
+server step this daemon cannot perform, so search finds nothing until a human activates it. Reads a
+live daemon's control server when one answers; otherwise falls back to the last snapshot that
+daemon wrote to disk, labelled with when it was observed — never a synthesized "now":
   --path <dir>     Repo to report on (default: the current directory)
   --server <url>   Noriq server this repo reports to (default: the config's server)
   --json           Print the record as JSON instead of human-readable text
@@ -121,6 +105,10 @@ Environment:
   NORIQ_TOKEN      A token to use as-is; overrides the stored credentials.
   NORIQ_NO_BROWSER Set to force the device flow, as --device does.
   NORIQ_LOG_LEVEL  Same as --log-level.
+
+See INDEX-OPERATIONS.md in this repo for the full index/memory lifecycle guide: every state,
+local journals and staging, why episode/verification retries have no command here (they retry
+automatically), common failures, and an operator recovery checklist.
 `;
 
 interface ParsedArgs {

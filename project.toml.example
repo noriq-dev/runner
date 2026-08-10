@@ -126,9 +126,15 @@ defaultBranch = "main"
 #                                 # so a slow or huge filesystem walk cannot hang the
 #                                 # daemon indefinitely.
 #
-# pollIntervalMinutes = 60       # Reindex cadence. PARSED ONLY today — nothing schedules
-#                                 # on it yet (that is a later phase); hourly is the
-#                                 # sensible default once something does.
+# pollIntervalMinutes = 60       # Reindex cadence, in minutes, for this repo's slot on the
+#                                 # daemon's single shared poll ticker (RUN-222) — every repo
+#                                 # is also reindexed at daemon startup and after every
+#                                 # successful landing/publish regardless of this value; the
+#                                 # ticker only covers the gap between those. Hourly by
+#                                 # default. RUN-235: fixed a stale comment here that called
+#                                 # this "parsed only, nothing schedules on it yet" — that was
+#                                 # true before RUN-222 wired the poll ticker and is not true
+#                                 # of the code as it stands now.
 #
 # An invalid value anywhere in this table (a negative bound, an unrecognized key, a
 # non-numeric cadence, a glob that escapes the root) refuses INDEXING for this repo only,

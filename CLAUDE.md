@@ -434,14 +434,19 @@ and should be updated alongside any change here.
   confined slice of that repo's own SOURCE (never a credential) for Project Memory. `index-redact.ts`
   is a THIRD floor at a different grain (RUN-218) — the deny list decides whether a path may be
   read, that decides whether an extracted config VALUE may become searchable text, and the direction
-  of caution inverts there: unsure means withhold. As of Phase 3 the READ half is complete and the
-  WRITE half has no caller — scanner, extraction, batching and an ingest client all exist and
-  `index-repo` runs the chain locally, but nothing in `daemon.ts`/`supervisor.ts` invokes any of it
-  and `index-repo` cannot upload by construction. Two things it does NOT cover, both measured rather
-  than assumed: a `full`-mode file entity carries RAW source text with no redaction pass, so a token
-  hardcoded in `src/foo.ts` is in the payload (the value floor only sees what an adapter extracted);
-  and there is no default `[index].exclude`, so committed generated content (a vendored dependency,
-  a checked-in `dist/`, a lockfile) is indexed like source. What that does NOT mean, measured rather
+  of caution inverts there: unsure means withhold. **The daemon now indexes and uploads UNATTENDED**
+  (RUN-222, proven live): once per `[index].enabled` repo at startup, after every successful
+  landing/publish, and on one shared bounded poll — so source crosses the wire without an operator
+  typing anything. ~~The WRITE half has no caller~~ was the Phase-3 wording and is simply false;
+  do not restore it. Only the debug `index-repo` still cannot upload, by construction. What the
+  floors do NOT cover, measured rather than assumed: an UNMARKED secret in source. RUN-258/263
+  withhold a whole file's content on unambiguous credential markers (PEM, JWT, known issuer
+  prefixes, each requiring a real payload after the prefix), so a hardcoded `ghp_…` no longer ships
+  — but a plain password or a bare hex key carries no marker to find, and the entropy heuristics
+  that might catch it were ruled out for whole-file use because they over-redact real source.
+  Committed generated content is now excluded by an overridable default (RUN-262
+  `DEFAULT_EXCLUDE_GLOBS`, opt out with `excludeDefaults = false`), so a lockfile or checked-in
+  `dist/` is skipped unless a repo asks for it. What that does NOT mean, measured rather
   than assumed: the daemon's own path never walks `node_modules`, because `leaseIndexSnapshot` mints
   a DETACHED WORKTREE holding only tracked files — 243 files on this repo, against 6943 for
   `index-repo --path .` pointed at a live working directory. Perforce reads the depot and Diversion

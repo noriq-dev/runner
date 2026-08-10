@@ -309,7 +309,15 @@ export {
   type LandChoices,
   type ManifestChoices,
 } from './init-project';
-export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
+export {
+  COMMAND_TABLE,
+  COMMANDS,
+  FILE_SENTINEL,
+  completionCandidates,
+  completionScript,
+  formatCommandTable,
+} from './completion';
+export type { CommandSpec } from './completion';
 export {
   BUILTIN_WORKFLOWS,
   type StageCoordinateKey,
