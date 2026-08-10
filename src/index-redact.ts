@@ -54,9 +54,24 @@
  * below for where that payload requirement is enforced — the direction of caution is unchanged
  * (unsure still means withhold): both requirements are calibrated to sit BELOW every real token shape
  * measured for `ISSUER_PREFIXES`/PEM, never above one, so no real credential newly passes. `JWT_SEARCH_RE`
- * is unchanged — three dot-separated 10+ char base64url segments is already a payload requirement
- * (a documentation placeholder's segments are always shorter), measured to produce no false positive
- * on this repo either before or after this change.
+ * was left unmodified by RUN-263 — three dot-separated 10+ char base64url segments is already a
+ * payload requirement against a documentation MENTION (a placeholder's segments are always shorter),
+ * measured to produce no false positive on this repo either before or after that change.
+ *
+ * **RUN-283: for the whole-file JWT check specifically, "payload requirement" was not enough.**
+ * Unlike the issuer-prefix/PEM markers, `JWT_SEARCH_RE`'s over-withholding was never a bare mention
+ * with no payload — it was ordinary CODE that happens to have the same shape (chained member/
+ * namespace access: `ModuleRules.PCHUsageMode.UseExplicitPCHs` is a real line from Project Nod, an
+ * Unreal C++ tree, one of 35 whole files it withheld there alone). No length floor separates that
+ * shape from a real token — both populations comfortably clear 10 characters per segment. What does
+ * separate them is that a real signed token's first segment decodes to a JSON object (a JOSE header,
+ * or `itsdangerous`'s headerless payload) and `ModuleRules`/`SomeNamespace`/`module_alias` do not
+ * decode to JSON at all. See
+ * `containsSignedToken`/`decodesToJsonObject` near `JWT_CANDIDATE_RE` below — deliberately scoped
+ * to `scanTextForCredentialMarkers` alone (`JWT_EXACT_RE`/`JWT_SEARCH_RE` above are unchanged; their
+ * own callers already isolate a value or a pre-scoped blob, where this shape of false positive does
+ * not arise the same way — see that section's doc for the measurement and the residual gap this
+ * leaves in `scanTextForSecretShapedContent`).
  */
 
 // ---------------------------------------------------------------------------
@@ -111,6 +126,111 @@ const PEM_HEADER_RE = /-----BEGIN [A-Z0-9 ]+-----/;
  *  that in practice. */
 const JWT_EXACT_RE = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$/;
 const JWT_SEARCH_RE = /[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/;
+
+/**
+ * RUN-283: the whole-file JWT check's own payload requirement, parallel to
+ * `ISSUER_PREFIX_TOKEN_RE`/`PEM_STRUCTURED_RE` above but landing in a different place, because the
+ * shape that leaked here is different in kind. The issuer-prefix and PEM markers over-withheld on a
+ * bare MENTION of the marker with no payload after it; "three dot-separated 10+ char base64url
+ * segments" has no bare-mention form — every match already carries a segment-sized payload. What it
+ * over-withheld on instead, measured directly against Project Nod (an Unreal C++ tree, 1900
+ * `.cpp`/`.h`/`.cs` files, 35 false JWT withholds) and this org's own `noriq` repo (0 false positives
+ * there, only the one real hit) is chained member/namespace access: `ModuleRules.PCHUsageMode.Use…`,
+ * `SomeNamespace.SomeLongClassName.SomeLongMemberName` — ordinary code in C++, C#, TypeScript, and
+ * Python alike, ten-plus characters a segment being a NORMAL identifier length, not evidence of
+ * anything. A length floor cannot discriminate this shape from a real token no matter where it is
+ * set — measured: `SomeNamespace`/`ModuleRules`/`module_alias` are already well past 10 chars, and a
+ * real JWT's payload segment can legally be as short as `eyJzdWIiOiIxIn0` (14 chars) for a minimal
+ * claim set, so no threshold separates the two populations.
+ *
+ * What DOES separate them: a real signed token's first segment is base64url of JSON — a JOSE header
+ * for a JWS/JWE, `itsdangerous`'s payload for a Flask/Django session cookie — and
+ * `ModuleRules`/`SomeNamespace`/`module_alias` do not decode to valid JSON at all (verified directly:
+ * each decodes to a short run of binary garbage that fails `JSON.parse`). `decodesToJsonObject`
+ * below is that check, and its own doc records why it stops there rather than also demanding JOSE's
+ * mandatory `alg` — the stricter test was measured, and it costs a real credential class for nothing.
+ * This
+ * lands ONLY in `scanTextForCredentialMarkers` (the whole-FILE scanner `indexer.ts` calls, and the
+ * only entry point this task's measured false positives came from) — not `JWT_EXACT_RE`
+ * (`valueLooksSecret`, an already-isolated JSON/TOML/adapter value: a config leaf equal to
+ * `ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs` is not a shape that value extraction produces,
+ * so the false-positive corpus measured here does not reach it) and not `JWT_SEARCH_RE`
+ * (`scanTextForSecretShapedContent`, whose own doc — RUN-258 — is explicit its tuning must not move;
+ * that function's callers are markdown sections/code fences already isolated by an adapter, not raw
+ * whole-file source, so the measured corpus does not exercise it either). A source file pasted
+ * verbatim into a markdown fence would still reach `scanTextForSecretShapedContent` unvalidated and
+ * could still false-positive there — a real gap this task leaves unfixed because it is unmeasured
+ * and out of this function's scope; flagged for a follow-up rather than "fixed" here.
+ *
+ * Every candidate is checked, not just the first (locked decision 1's asymmetry, sharpened): a file
+ * whose FIRST dotted-triple is `ModuleRules.PCHUsageMode…` and whose LATER line holds a real token
+ * must still withhold, so `scanTextForCredentialMarkers` iterates every match of
+ * `JWT_CANDIDATE_RE` and withholds on the first one that validates — never on the first one it
+ * finds, which would silently re-open the exact leak locked decision 1 forbids.
+ *
+ * `JWT_CANDIDATE_RE` anchors each candidate at a non-base64url-alphabet boundary (or string
+ * start/end) on BOTH ends, unlike `JWT_SEARCH_RE` above. An unanchored search can slice a candidate
+ * out of the middle of a longer identifier run; anchoring guarantees the matched span — and so the
+ * "first segment" handed to `decodesToJsonObject` — is the real, complete segment a human (or
+ * a real JWT emitter) actually wrote, not an arbitrary substring the regex happened to satisfy.
+ */
+const JWT_CANDIDATE_RE =
+  /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])/g;
+
+/**
+ * Does `segment` decode, as base64url, to a JSON OBJECT? That is the whole discriminator, and the
+ * deliberate choice is what it does NOT additionally require: RFC 7515/7516 mandate an `alg` member
+ * on every real JOSE header, so demanding one would be the precise JOSE test — but a JSON-headered
+ * signed token is not always JOSE. `itsdangerous` (Flask/Django signed session cookies) emits
+ * `<base64url-json>.<timestamp>.<signature>`, three dot-separated base64url segments whose first
+ * decodes to a JSON object with no `alg` anywhere in it, and that is a real credential this floor
+ * exists to stop. Requiring `alg` was measured against all three corpora below and cost 40 fewer
+ * withholds than the defect while MISSING that class; dropping the requirement was measured to cost
+ * ZERO additional false positives across the same 2381 files (the one extra runner file is already
+ * withheld by `PEM_STRUCTURED_RE` before this arm is ever reached). A strictly tighter leak floor at
+ * no measured coverage cost is the trade this module's inversion demands — a false negative LEAKS,
+ * a false positive loses a file, so when the safer rule is free it is not a judgement call.
+ *
+ * An ordinary identifier does not reach the decode path at all, which is why the precision holds:
+ * `ModuleRules`/`SomeNamespace`/`module_alias` are not valid base64url of anything JSON-shaped, and
+ * for one to become a false positive it would have to decode to bytes literally beginning `{` and
+ * parsing as an object. A length-mismatched segment is rejected before decoding — base64 requires a
+ * length that is 0 mod 4 after padding, so a raw base64url run whose length is 1 mod 4 can never be
+ * valid base64 of anything — which is cheap and is the failure mode most of these false-positive
+ * identifiers hit first, code-identifier lengths having no reason to land on a base64-legal boundary.
+ */
+function decodesToJsonObject(segment: string): boolean {
+  let base64 = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const remainder = base64.length % 4;
+  if (remainder === 1) return false; // no valid base64 encoding has this length class
+  if (remainder > 0) base64 += '='.repeat(4 - remainder);
+  let decoded: string;
+  try {
+    decoded = Buffer.from(base64, 'base64').toString('utf8');
+  } catch {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    return false;
+  }
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+}
+
+/** Does `text` contain a signed token whose header segment is real — every `JWT_CANDIDATE_RE` match
+ *  checked (hazard: stopping at the first candidate would miss a real token appearing after a
+ *  false-positive dotted-triple earlier in the same file, which is exactly the leak locked
+ *  decision 1 forbids). `matchAll` is used rather than `exec` in a loop deliberately: it clones the
+ *  regex, so `JWT_CANDIDATE_RE`'s `lastIndex` is never carried between calls. */
+function containsSignedToken(text: string): boolean {
+  for (const match of text.matchAll(JWT_CANDIDATE_RE)) {
+    const firstSegment = match[0].split('.')[0] ?? '';
+    if (decodesToJsonObject(firstSegment)) return true;
+  }
+  return false;
+}
 
 /** Common issuer/vendor prefixes for a token whose TYPE and ISSUER the prefix alone reveals —
  *  which is exactly why locked decision 3 forbids printing even this much of a withheld value. */
@@ -345,10 +465,16 @@ export function scanTextForSecretShapedContent(text: string): string | null {
  *    required body+END) — measured directly against this repo: a marker with no payload (THREAT-
  *    MODEL.md's own list of prefix examples; this file's own PEM header doc comment) is a document
  *    NAMING the shape, not a file CONTAINING one, and RUN-258's marker-only check could not tell them
- *    apart. `JWT_SEARCH_RE` is the one marker left unmodified — three dot-separated 10+ char
- *    base64url segments is already a payload requirement, and it produces no false positive on this
- *    repo either before or after this task (see that regex's own doc for why the 10-char floor per
- *    segment already rules out a short documentation placeholder).
+ *    apart.
+ * 4. **RUN-283: the JWT check additionally requires the first segment to decode to a JSON object**
+ *    (`containsSignedToken`/`decodesToJsonObject`, above `JWT_CANDIDATE_RE`'s own doc for the
+ *    measurement). `JWT_SEARCH_RE`'s bare "three 10+ char dotted segments" was itself a payload
+ *    requirement against a documentation MENTION (right reasoning, RUN-263 above) but not against
+ *    ORDINARY CODE — measured directly against Project Nod (an Unreal C++ tree): 35 whole files
+ *    withheld on chained member/namespace access (`ModuleRules.PCHUsageMode.UseExplicitPCHs`) that
+ *    decodes to nothing JSON-shaped at all. This is the one marker check in this
+ *    function that iterates every candidate rather than testing once — see `containsSignedToken`'s own
+ *    doc for why stopping at the first candidate would leak a real token appearing later in the file.
  *
  * Only ever returns the marker CLASS (never the matched bytes or even the matched prefix, same
  * reasoning as `valueLooksSecret`), so a caller may safely surface the return value in a status
@@ -356,7 +482,7 @@ export function scanTextForSecretShapedContent(text: string): string | null {
  */
 export function scanTextForCredentialMarkers(text: string): string | null {
   if (PEM_STRUCTURED_RE.test(text)) return 'PEM key/certificate header';
-  if (JWT_SEARCH_RE.test(text)) return 'JWT-shaped value (three dot-separated base64url segments)';
+  if (containsSignedToken(text)) return 'JWT-shaped value (three dot-separated base64url segments)';
   if (ISSUER_PREFIX_TOKEN_RE.test(text)) return 'known credential prefix';
   return null;
 }

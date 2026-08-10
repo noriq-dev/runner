@@ -354,3 +354,75 @@ describe('scanTextForCredentialMarkers — RUN-263, the payload discriminator', 
     expect(scanTextForCredentialMarkers(text)).toBeNull();
   });
 });
+
+describe('scanTextForCredentialMarkers — RUN-283, the JSON-header discriminator', () => {
+  // The four false positives this task measured directly, one per language, each a chained
+  // member/namespace access with segments well past the 10-char floor — the exact shape a length
+  // floor alone can never separate from a real token's header/payload/signature segments.
+  it.each([
+    ['Unreal Build Tool (UBT), longer arm', 'PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;'],
+    ['Unreal Build Tool (UBT), shorter arm', 'PCHUsage = ModuleRules.PCHUsageMode.UseExplicitPCHs;'],
+    [
+      'plain TypeScript chained member access',
+      'const x = SomeNamespace.SomeLongClassName.SomeLongMemberName;',
+    ],
+    ['plain Python dotted attribute access', 'value = module_alias.SubModuleName.CONSTANT_NAME_HERE'],
+  ])('does not flag ordinary code shaped like a JWT: %s', (_label, text) => {
+    expect(scanTextForCredentialMarkers(text)).toBeNull();
+  });
+
+  // Hazard A: a single `.test()` (or a loop that returns on the first candidate) would leak here —
+  // the FIRST dotted-triple in this text is the false-positive UBT line, and a naive "find one
+  // candidate, validate it, stop" scan would report null without ever reaching the real token below
+  // it. Every candidate must be checked; withhold if ANY of them validates.
+  it('still withholds when a real JWT appears AFTER a false-positive dotted-triple in the same file', () => {
+    const text = [
+      'PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;',
+      'const x = SomeNamespace.SomeLongClassName.SomeLongMemberName;',
+      'const leaked = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+        'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";',
+    ].join('\n');
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+
+  // Hazard B: `JWT_CANDIDATE_RE` must anchor at both ends, or a match can slice a candidate out of
+  // the middle of a longer identifier run rather than the real segment boundaries. Both flush
+  // against quotes and surrounded by whitespace must still find the whole token.
+  it('finds a real JWT flush against quotes with no surrounding whitespace', () => {
+    const text =
+      '"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+      'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+
+  it('finds a real JWT surrounded by plain whitespace', () => {
+    const text =
+      'token is   eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' +
+      'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c   end of line';
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+
+  // A genuine second real-world JWT shape (a different `alg`, a `kid` header field, minimal claim
+  // payload) — locked decision 2: every real JWT shape the fixtures already cover must still be
+  // caught, proven with more than one token shape rather than only the one repeated fixture.
+  it('flags a distinct genuine JWT shape (RS256, kid header, minimal claims) anywhere in a file', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: 'abc123' })).toString(
+      'base64url',
+    );
+    const payload = Buffer.from(JSON.stringify({ sub: '1', iat: 1700000000 })).toString('base64url');
+    const text = `Authorization: Bearer ${header}.${payload}.k3y9Zq2Wv7Nc5Fh0SaP2mK9Rt6Yh1Bv3`;
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+
+  // The reason `decodesToJsonObject` stops at "a JSON object" instead of also demanding JOSE's
+  // mandatory `alg`: `itsdangerous` (Flask/Django signed session cookies) is the same three-segment
+  // shape with a headerless JSON payload first and no `alg` anywhere in it. It is a real credential,
+  // and the stricter JOSE test — measured against all three corpora at zero false-positive
+  // difference — would have let it through. This test is what stops a future edit "completing" the
+  // check back toward RFC 7515 and silently reopening that class.
+  it('flags a signed token whose JSON first segment carries no `alg` (itsdangerous session cookie)', () => {
+    const payload = Buffer.from(JSON.stringify({ user_id: 42, csrf: 'abc' })).toString('base64url');
+    const text = `SESSION_COOKIE = "${payload}.aBcDeFgHiJ.7xQ1kL_pZm9RtYuIoPaSdFgHjKl"`;
+    expect(scanTextForCredentialMarkers(text)).toMatch(/JWT/);
+  });
+});

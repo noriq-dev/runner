@@ -58,8 +58,17 @@ import type { ChangesBetweenResult } from './vcs/types';
  * NOOP-only — the identical "output for unchanged files also changed" case RUN-239's bump above
  * already names as mandatory. Same reasoning, same consequence (every repo's next reconcile is
  * `full`, not per-language), not restated in full here.
+ *
+ * RUN-283 bumps this to `'4'`, and this bump is the one that is easiest to forget because no adapter
+ * was added: tightening the JWT credential marker's precision (`index-redact.ts`) means 38 files
+ * across the measured repos stop being WITHHELD and start contributing content and symbols. Same
+ * bytes on disk, different output — exactly the condition the two bumps above name. Concretely,
+ * `deriveGenerationId` covers `indexerVersion` but deliberately not `contentHash`, so without this
+ * a repo whose base has not moved (Project Nod sitting at `dv.commit.474` with an ACTIVE generation)
+ * would derive the identical generation id and the recovered files would never reach the server —
+ * the fix would be inert on precisely the repository it was measured against.
  */
-export const INDEXER_VERSION = '3';
+export const INDEXER_VERSION = '4';
 
 /**
  * ~~A validated staged generation at the base/version this reconciliation is about~~ — REMOVED

@@ -489,7 +489,10 @@ adapter causes, and scoping the measurement to the 50 real descriptor files isol
 | Dependency names declined — inside a conditional block, never offered for resolution at all | 16 (across 5 files: 1+1+1+9+4) |
 | Files whose module entity is withheld — see below | 2 |
 
-The 2 withheld files are `Plugins/PIE_Studio/Source/PIE_Studio/PIE_Studio.Build.cs` and
+**Fixed by RUN-283 — the figures in this table are RUN-280's, taken before that fix, and the
+withheld count is now 0.** The diagnosis below is kept because it is what the fix was built from.
+
+The 2 withheld files were `Plugins/PIE_Studio/Source/PIE_Studio/PIE_Studio.Build.cs` and
 `Plugins/UE_MCP_Bridge/Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs` — **not an adapter defect**:
 `indexer.ts`'s pre-existing RUN-258 credential-marker check withholds a file's whole content (and
 skips adapter parsing entirely) before this adapter is ever called. Reading why is itself a real
@@ -538,9 +541,53 @@ locked. For scale, the deferred C# grammar alone (`tree-sitter-c-sharp.wasm`) is
   snapshot lease path).
 - **Directory-level pruning for `exclude`/`defaultExclude` in `index-scan.ts`** — see the status-
   collector caveat immediately above; a real gap, sized larger than this task, left for a follow-up.
-- **The `index-redact.ts` JWT-shaped false positive** on an ordinary namespaced-property chain
-  (measured above, RUN-280) — a cross-language security-floor defect, not UBT-specific; flagged, not
-  fixed here.
+- ~~**The `index-redact.ts` JWT-shaped false positive**~~ — fixed by RUN-283, see below.
+
+## The JWT credential marker's precision (RUN-283)
+
+RUN-280 found the whole-file credential floor withholding two UBT files on
+`PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;`. Measuring it across whole repositories
+showed the shape was not UBT-specific and not rare: `JWT_SEARCH_RE`'s "three dot-separated 10+
+character base64url segments" is ordinary chained member access in C++, C#, TypeScript and Python
+alike. A hit costs the file's **whole content and all of its symbols**, because `indexer.ts` skips
+adapter parsing for a withheld file — so this was a silent coverage hole that reads as a working index.
+
+Measured 2026-08-10, files withheld by the **JWT marker specifically**:
+
+| repo | files scanned | before | after |
+| --- | --- | --- | --- |
+| runner | 233 `.ts` | 0 | 0 |
+| noriq | 280 `.ts` | 5 | **0** |
+| Project Nod (Unreal) | 1868 `.cpp`/`.h`/`.cs` | 33 | **0** |
+
+The other markers do not move: the runner's 6 withholds (4 issuer-prefix, 2 PEM — all deliberate test
+fixtures) and Project Nod's 1 PEM withhold (`NatsC/nats.h`) are identical before and after. Every one
+of the 38 removed hits was verified by inspection to contain no credential —
+`verification.authenticationInfo.newCounter` in noriq's production `apps/api/src/onboarding.ts`,
+`executionSpec.acceptance.observableTruths` in its tests, and the UBT `PCHUsage` line across Unreal.
+
+The fix is precision, never relaxation (a false negative LEAKS; a false positive loses a file): a
+candidate's first segment must base64url-decode to a **JSON object**. Two things about that rule are
+deliberate and measured rather than reasoned:
+
+- **Every candidate in a file is checked, not the first.** A file whose first dotted-triple is
+  `ModuleRules.PCHUsageMode…` and whose later line holds a real token must still withhold. Stopping at
+  the first candidate is a leak, and there is a regression test for exactly that ordering.
+- **It does not additionally require JOSE's mandatory `alg`.** That stricter test is the precise JWT
+  check and measured *identically* on all three corpora — but `itsdangerous` (Flask/Django signed
+  session cookies) is the same three-segment shape with a headerless JSON payload and no `alg`, and it
+  is a real credential. A tighter leak floor at zero measured coverage cost is not a judgement call
+  here, so the weaker decode test ships and a test pins the reasoning in place.
+
+Coverage recovered, shown on a file that was previously invisible:
+`Plugins/NodCharacterCreator/…/NodWardrobeCatalogBaker.cpp` now returns no marker and contributes
+**53 symbols** through the production adapter registry.
+
+What this does **not** change: a hit still withholds the whole file (narrowing the blast radius is a
+separate, larger design question), and `scanTextForSecretShapedContent` — the markdown/free-text
+scanner, whose tuning RUN-258 locked and whose callers pass adapter-isolated sections rather than raw
+source — still carries the loose shape. A source file pasted verbatim into a markdown fence would
+still lose that section's body. Unmeasured in this corpus; a follow-up, not a fix here.
 
 ## Load and memory budgets (RUN-238)
 
