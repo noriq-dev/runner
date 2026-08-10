@@ -14,6 +14,31 @@ vendor:shared` copies it and must be a no-op on a clean tree. Never hand-edit a 
 edit survives until the next refresh silently reverts it, and the two repos then disagree about a
 contract each believes it owns.
 
+**That rule was stated in three places (this file, CLAUDE.md, `vendor/noriq-shared/README.md`) and
+enforced in none, until RUN-240.** `npm run vendor:shared` copied files and printed their names —
+no source commit, no dirty flag, no hashes — so "never hand-edit" was an honor system a diff tool
+could not check. It now writes `vendor/noriq-shared/PROVENANCE.json` alongside the copy: the
+source commit it copied from, whether that source checkout's `packages/shared/src` had
+uncommitted changes at vendor time (a vendor taken from a dirty tree is not reproducible from the
+commit sha alone — recording the sha while hiding the dirt would read as exact and not be), and a
+SHA-256 per vendored file. `npm run vendor:check` (`scripts/vendor-check.mjs`) re-hashes the tree
+and compares: a mismatch is a hand-edit, a file the record names but the disk doesn't have is what
+an interrupted `rm -rf` + `cp` refresh looks like from this side, and a file on disk the record
+never named is the other half of that same interruption. It needs no Noriq checkout — everything
+it reads is committed in THIS repo — so it runs in CI (`.github/workflows/ci.yml`, as its own
+explicit first step) and inside `npm run check` (hashing eight small files costs milliseconds; a
+local hand-edit caught before a PR opens is strictly better than one caught after). `npm run check`
+runs in `publish.yml` too, so a release cannot ship with vendored provenance that doesn't match the
+tree.
+
+Backfilling this repo's own current `vendor/noriq-shared/PROVENANCE.json` needed one extra step,
+worth recording here rather than only in the file itself: the tree predates provenance tracking, so
+no commit was captured live at the original refresh. RUN-240 found the exact source commit by
+diffing the current tree against `noriq`'s history until all eight files matched byte-for-byte
+(they matched exactly once) — a real, checked fact, not a guess — and the record's own `note` field
+says so. Every refresh from here on records commit and dirty live, from the source checkout, at
+vendor time.
+
 A contract change is therefore always at least two commits, in this order:
 
 1. **Planar first** — change `packages/shared/src`, migrate, and land the server side. The server

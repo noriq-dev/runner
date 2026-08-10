@@ -5,9 +5,12 @@ original states plus `staged` (RUN-260) mean, where local bookkeeping lives, how
 retry queues (episode and verification-report delivery) behave, and what to do when something
 fails. [`THREAT-MODEL.md`](THREAT-MODEL.md)'s "Repository intelligence upload (`[index]`)" section
 is the security authority this document does not restate; [`README.md`](README.md)'s "Repository
-intelligence" section is the quick-start. This is the one place the full operator walkthrough
-lives — if you find the same fact stated differently in more than one of these three, that is a
-bug in this document, not a second source of truth to reconcile by hand.
+intelligence" section is the quick-start; [`RELEASE.md`](RELEASE.md) (RUN-240) is the *release*
+authority — old-server/new-runner and new-server/old-runner compatibility, disabled memory, an
+indexer-version migration, and rollback — this document does not restate that either. This is the
+one place the full operator walkthrough lives — if you find the same fact stated differently in
+more than one of these four, that is a bug in this document, not a second source of truth to
+reconcile by hand.
 
 ## Read this first: local state is not server state
 
@@ -853,11 +856,14 @@ Work through this top to bottom; most problems resolve at step 2 or 3.
 
 ## Cross-platform notes
 
-The runner itself — including every command in this document — is tested on Linux, macOS, and
-**native Windows** as a real CI matrix leg, not a best-effort claim (`README.md`'s "Platforms"
-note). The Node-side machinery these commands rest on (`node:fs`, `node:path`, `os.homedir()`) is
-genuinely portable: `~/.noriq/index-journal.json` etc. resolve correctly under `%USERPROFILE%` on
-Windows the same way they resolve under `$HOME` elsewhere.
+The runner itself — including every command in this document — is tested on Linux and **native
+Windows** as real CI matrix legs, not a best-effort claim (`.github/workflows/ci.yml`'s
+`ubuntu-latest`/`windows-latest` matrix; `README.md`'s "Platforms" note). macOS is expected to work
+on the same portable primitives but is not itself a CI leg — unverified, stated plainly rather than
+claimed (RUN-240; this line previously overstated it as tested and was corrected here). The
+Node-side machinery these commands rest on (`node:fs`, `node:path`, `os.homedir()`) is genuinely
+portable: `~/.noriq/index-journal.json` etc. resolve correctly under `%USERPROFILE%` on Windows the
+same way they resolve under `$HOME` elsewhere.
 
 Two things are NOT uniformly cross-platform, stated plainly rather than glossed over:
 

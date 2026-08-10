@@ -5,6 +5,13 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2023"],
     "types": ["node"],
+    // RUN-240: `test/vendor-check.test.ts` imports `scripts/vendor-check.mjs`/`vendor-provenance.mjs`
+    // for real (dependency injection over a temp dir, this repo's own testing discipline — never a
+    // second re-implementation of the check to test against). `allowJs` lets tsc resolve and infer
+    // types for that plain-JS import; `checkJs` stays off (unset, the default) so this does not turn
+    // on full diagnostics for every `.mjs` under `scripts/` (`build.mjs` et al.), which were never
+    // written to strict-TS discipline and are out of this task's scope to bring into it.
+    "allowJs": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

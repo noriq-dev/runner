@@ -75,8 +75,12 @@ CI — configure by hand instead: copy [`runner.toml.example`](runner.toml.examp
 can see. From a checkout, skip the build with `npm run dev -- <command>` (runs `src/cli.ts` via
 tsx); `npm run build` bundles to `dist/cli.js`.
 
-**Platforms:** Linux, macOS, and **native Windows** — no WSL required. Windows is a CI matrix
-leg, not a best-effort claim. Node ≥20 and `git` on PATH everywhere.
+**Platforms:** Linux and **native Windows** are both real CI matrix legs (`.github/workflows/ci.yml`
+runs `ubuntu-latest` and `windows-latest`), not a best-effort claim for either — no WSL required.
+macOS is expected to work (the daemon's platform-specific code is Node's own portable `node:fs`/
+`node:path`/`os.homedir()`, the same primitives every OS uses) but is **not itself a CI leg today**
+— unverified by this project's own tests, stated plainly rather than claimed (RUN-240). Node ≥20
+and `git` on PATH everywhere.
 
 One Windows-specific thing to know, because this file is committed and your teammates may not
 share your OS: your repo's `[verify] cmd` runs under **cmd.exe** there, and under `sh`
@@ -233,9 +237,9 @@ than hard-coding a copy of the list.
 
 **bash and zsh only.** `completion` accepts exactly those two shell names; there is no PowerShell
 or cmd.exe completion script, on any platform. The CLI commands themselves are cross-platform
-(Linux/macOS/native Windows, same CI matrix as the rest of this daemon) — it is only the generated
-completion SCRIPT that assumes a POSIX shell. On Windows, Git Bash or WSL get the bash script;
-native PowerShell gets none.
+(Linux and native Windows are both real CI matrix legs; macOS is expected to work but is not itself
+one — see "Platforms" above) — it is only the generated completion SCRIPT that assumes a POSIX
+shell. On Windows, Git Bash or WSL get the bash script; native PowerShell gets none.
 
 ## Develop
 
