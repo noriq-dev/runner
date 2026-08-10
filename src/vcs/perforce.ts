@@ -10,6 +10,7 @@ import {
   stripDepotPrefix,
 } from './perforce-index-source';
 import type {
+  ChangeStatsResult,
   ChangesBetweenResult,
   CurrentBaseResult,
   IgnoreQueryResult,
@@ -927,6 +928,24 @@ export class PerforceBackend implements VcsBackend {
     }
 
     return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * An honest refusal (RUN-244), `openReview`'s register: `p4 diff2` (this file's own
+   * `changesBetween`, immediately above) reports per-path STATUS via its header lines only — added/
+   * modified/deleted — never a line-level unified diff, so it cannot answer "how many lines" as
+   * measured today. `p4 diff2 -du` would emit a real unified diff whose `+`/`-` lines could be
+   * counted, but parsing that output (per changed file, across a changelist range) is not something
+   * this backend has measured — a materially different, more expensive operation than the header-
+   * only parse `changesBetween` already does. `changeStats` is REQUIRED on the seam regardless (see
+   * its own doc in `types.ts`), so this method exists to say that plainly rather than by omission.
+   */
+  async changeStats(ws: Workspace): Promise<ChangeStatsResult> {
+    return {
+      ok: false,
+      reason: 'unavailable',
+      detail: `Perforce has no measured primitive for line-level change statistics for run ${ws.runId}'s workspace — \`p4 diff2\` reports per-path status only; \`p4 diff2 -du\` unified-diff parsing would be needed and has not been measured against this backend`,
+    };
   }
 
   /**

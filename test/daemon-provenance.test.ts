@@ -24,6 +24,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { backendChangeStats } from '../src/change-stats';
 import { stageFactFromTelemetry } from '../src/stage-facts';
 import { completeDuration, notApplicableDuration, unavailableDuration } from '../src/stage-timing';
 
@@ -88,5 +89,43 @@ describe('every stage-fact envelope is acceptable to the ingest (PLNR-417)', () 
 
   it('elapsedMs, which is always unavailable, is still uploadable', () => {
     expectAcceptable(stageFactFromTelemetry('primary', telemetry()).elapsedMs);
+  });
+});
+
+describe('every change-stats envelope is acceptable to the ingest (PLNR-417, RUN-244)', () => {
+  // The RUN-243 regression restated for a new builder: a refusal must still carry a DAEMON
+  // provenance, and churn's 'derived' provenance (never 'backend_observed') must be in the set too.
+  it('a backend refusal keeps all four metrics uploadable', () => {
+    const stats = backendChangeStats('perforce', {
+      ok: false,
+      reason: 'unavailable',
+      detail: 'no measured primitive',
+    });
+    expectAcceptable(stats.changedFiles);
+    expectAcceptable(stats.additions);
+    expectAcceptable(stats.deletions);
+    expectAcceptable(stats.churn);
+  });
+
+  it('a complete change-stats result keeps all four metrics uploadable', () => {
+    const stats = backendChangeStats('git', {
+      ok: true,
+      stats: { changedFiles: 3, lines: { additions: 12, deletions: 4, uncountableFiles: 0 } },
+    });
+    expectAcceptable(stats.changedFiles);
+    expectAcceptable(stats.additions);
+    expectAcceptable(stats.deletions);
+    expectAcceptable(stats.churn);
+  });
+
+  it('a partial change-stats result (some files uncountable) keeps all four metrics uploadable', () => {
+    const stats = backendChangeStats('git', {
+      ok: true,
+      stats: { changedFiles: 5, lines: { additions: 1, deletions: 0, uncountableFiles: 2 } },
+    });
+    expectAcceptable(stats.changedFiles);
+    expectAcceptable(stats.additions);
+    expectAcceptable(stats.deletions);
+    expectAcceptable(stats.churn);
   });
 });

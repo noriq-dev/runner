@@ -1719,6 +1719,21 @@ describe('DiversionBackend — changesBetween (RUN-255): real diff via /compare'
   });
 });
 
+// RUN-244: no measured line-level diff primitive exists for this backend (`/compare` reports
+// per-path status only, immediately above) — a refusal is a tested behaviour, not an omission.
+describe('DiversionBackend — changeStats (RUN-244): no measured primitive', () => {
+  it('refuses with reason "unavailable" and a detail naming the backend, never a throw', async () => {
+    const { backend } = fakes({});
+    const ws = await backend.lease('/repo', 'run_1');
+    const res = await backend.changeStats(ws);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('unavailable');
+    expect(res.detail).toContain('Diversion');
+    expect(res.detail).toContain(ws.runId);
+  });
+});
+
 describe('DiversionBackend — locking (RUN-100): Noriq view authoritative, soft lock degrades', () => {
   const ctx = { projectId: 'prj_x', token: 'run-token', branch: 'main', taskId: 'task_9' };
 

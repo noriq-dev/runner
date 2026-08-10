@@ -3,6 +3,7 @@ import type { LockClient } from '../lock-client';
 import { type GhExec, openMergeRequest } from '../merge-request';
 import { type WorktreeManager, runBranch } from '../worktree';
 import type {
+  ChangeStatsResult,
   ChangesBetweenResult,
   CurrentBaseResult,
   IgnoreQueryResult,
@@ -298,6 +299,23 @@ export class GitBackend implements VcsBackend {
    *  the same reasoning `changesBetween` above gives one method over. */
   currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult> {
     return this.git.currentBase(repoRoot, branch);
+  }
+
+  /**
+   * An honest refusal, not a claim of incapacity (RUN-244): git CAN answer this — `git diff
+   * --numstat` against `ws.baseId` is the same primitive `changesBetween` already shells out to
+   * one verb over (`worktree.ts`'s own `changesBetween`) — implementing it is simply RUN-245's task,
+   * not this one. `changeStats` is REQUIRED on the seam (see its own doc in `types.ts`), so this
+   * method has to exist either way; what it says is "git's real answer is coming, in RUN-245," the
+   * same distinction `openReview`'s doc draws between an omitted method and a present one that
+   * names why it refuses.
+   */
+  async changeStats(ws: Workspace): Promise<ChangeStatsResult> {
+    return {
+      ok: false,
+      reason: 'unavailable',
+      detail: `git can compute change statistics for run ${ws.runId}'s workspace — RUN-245 owns the real implementation (\`git diff --numstat\` against the workspace base); this task only declares the seam`,
+    };
   }
 
   /**

@@ -240,6 +240,56 @@ export type CurrentBaseResult =
   | { ok: true; baseId: string }
   | { ok: false; reason: 'unknown'; detail?: string };
 
+/**
+ * Raw change counts for one workspace (RUN-244) — COUNTS ONLY, never a path, a path list, or diff
+ * text, not even for the files a backend could not measure. A number has no namespace: there is no
+ * repo-relative-vs-depot-path question (`Workspace`'s own RUN-50 trap) and no separator question
+ * (`comparableWorktreePath`'s concern) for a shape that can never hold a path in the first place.
+ * `changedPaths?` already exists for a caller that genuinely needs paths and this is not a wrapper
+ * over it — a backend MAY implement its own `changeStats` in terms of its own path enumeration,
+ * but that is its business, inside the seam; common code must never do the reverse.
+ *
+ * `lines` is `null` when the backend could not measure line-level change AT ALL — a fact distinct
+ * from having measured it and gotten zero, so a genuine no-op diff (`changedFiles: 0`, `lines:
+ * {additions: 0, deletions: 0, uncountableFiles: 0}`) can never collide with "did not even try."
+ * When present, `uncountableFiles` is how many of `changedFiles` the backend could enumerate but
+ * not measure lines for (binary, generated, whatever the backend's own reason names) — the file
+ * COUNT stays whole even when the line counts are not, the mixed state this task exists to make
+ * representable, without a second boolean to keep in sync. A backend must never let
+ * `uncountableFiles` exceed `changedFiles`; nothing here enforces that at the type level — the same
+ * trust `Workspace.baseId`'s opacity already asks of a backend.
+ *
+ * Every field here is a NON-NEGATIVE INTEGER, narrower than the `number` TypeScript can express:
+ * the analytics envelope these become refines to `int().nonnegative()`, and a value outside it is
+ * rejected at the ingest in a way that discards the whole episode. `change-stats.ts` guards the
+ * boundary so a backend cannot cause that, but the guard reports `unavailable` — so a backend that
+ * hands over `NaN` loses the stat it was trying to report. `git diff --numstat` prints `-` for a
+ * binary file's counts, which is exactly where that goes wrong: those are `uncountableFiles`, not a
+ * count of zero and not the result of coercing `-` to a number.
+ */
+export interface ChangeStats {
+  changedFiles: number;
+  lines: { additions: number; deletions: number; uncountableFiles: number } | null;
+}
+
+/**
+ * The outcome of `VcsBackend.changeStats` (RUN-244) — an outcome union, `CurrentBaseResult`'s exact
+ * shape one method over, for the same reason: "here are the counts" and "I cannot tell" are the
+ * same SHAPE (a metric-bearing answer) and opposite MEANINGS, and the wrong one is silent — folding
+ * a refusal into a zero would tell a human "nothing changed" about a run that changed everything.
+ *
+ * One failure reason, deliberately not split into "this backend has no primitive" vs "the query
+ * errored this once" vs "not implemented yet": every arm produces the identical `unavailable`
+ * metric on the analytics side (`change-stats.ts` is the one place that reads this result), so the
+ * split would buy that one caller nothing to branch on — `ChangesBetweenResult`'s own precedent,
+ * kept verbatim rather than reopened. `detail` is REQUIRED, `ChangesBetweenResult`'s own precedent
+ * again: it is the entire informational content of a refusal, and the human reading the episode
+ * later has only this string to tell "Perforce has no primitive for this" from "the query errored."
+ */
+export type ChangeStatsResult =
+  | { ok: true; stats: ChangeStats }
+  | { ok: false; reason: 'unavailable'; detail: string };
+
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
   readOnly?: boolean;
@@ -637,6 +687,34 @@ export interface VcsBackend {
    * contract and its own reasoning for why a caller must never guess a base from a miss.
    */
   currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult>;
+
+  /**
+   * Change statistics for THIS run's own workspace (RUN-244) — counts only, never paths; see
+   * `ChangeStats`'s own doc for what that excludes and why. Unlike its four neighbors above
+   * (`changesBetween`/`queryIgnored`/`currentBase`, all background-indexing-facing and scoped to
+   * `repoRoot` plus opaque backend ids), this asks the same question `changedPaths?` asks below —
+   * what did THIS run change — answered as counts instead of a path list, for analytics rather than
+   * the lock gate. It takes a `Workspace` for that reason, not a bare `repoRoot`.
+   *
+   * REQUIRED, not optional, despite sitting beside an OPTIONAL sibling that asks the same question
+   * of the same workspace — `openReview`/`changesBetween`/`queryIgnored`/`currentBase`'s own
+   * precedent, stated in each of their own docs, applies verbatim: an omitted method reads as
+   * "nobody thought about this backend," while a present method that refuses records that it WAS
+   * considered and leaves the note where a future implementer will be standing. `changedPaths?`
+   * stays optional because it predates this seam as a LOCK primitive (RUN-102) that the hard-floor
+   * gate degrades gracefully without; this is a newer, analytics-only verb with no such fallback.
+   *
+   * `changeStats` and `changedPaths?` are independent capabilities — either, neither, or both — and
+   * common code must never synthesize one from the other (no `changedPaths().length` wrapper above
+   * this seam): they answer different questions for different consumers, and a backend can honestly
+   * have a cheap primitive for one and none for the other. A BACKEND may implement its own
+   * `changeStats` in terms of its own path enumeration; that is its business, inside the seam.
+   *
+   * Refusal is a value, not a throw: `ChangeStatsResult`'s own doc carries the outcome contract, so
+   * a backend with no way to count lines returns `{ok:false, reason:'unavailable', detail}` and no
+   * run fails over it.
+   */
+  changeStats(ws: Workspace): Promise<ChangeStatsResult>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

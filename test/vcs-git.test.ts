@@ -311,6 +311,31 @@ describe('GitBackend — currentBase (RUN-222)', () => {
   });
 });
 
+// RUN-244: git's changeStats is an interim, HONEST refusal — RUN-245 owns the real
+// `git diff --numstat` implementation. This pins the refusal itself (a value, not a throw, and
+// naming RUN-245) so RUN-245 has to change this test to land its real answer, rather than the
+// method silently starting to succeed with nobody noticing the seam moved.
+describe('GitBackend — changeStats (RUN-244, interim refusal ahead of RUN-245)', () => {
+  const ws: Workspace = {
+    runId: 'run_1',
+    localPath: '/wt/run_1',
+    readOnly: false,
+    baseId: 'base0000',
+    workRef: 'noriq/run/run_1',
+    location: { repoRoot: '/repo', branch: 'noriq/run/run_1' },
+  };
+
+  it('refuses with reason "unavailable" and a detail naming RUN-245, never a throw', async () => {
+    const { ops } = recorder();
+    const res = await new GitBackend(ops).changeStats(ws);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('unavailable');
+    expect(res.detail).toContain('RUN-245');
+    expect(res.detail).toContain(ws.runId);
+  });
+});
+
 // Git has no native lock (RUN-98): the backend's lock ops are pure delegation to the injected
 // Noriq lock client, held as the RUN's token. Absent client → graceful no-op.
 describe('GitBackend — lock delegation (RUN-98)', () => {

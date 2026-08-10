@@ -643,6 +643,8 @@ export {
 } from './verify-reviewer';
 export type {
   ChangesBetweenResult,
+  ChangeStats,
+  ChangeStatsResult,
   IgnoreQueryResult,
   IndexSnapshot,
   IndexSnapshotResult,
@@ -657,6 +659,7 @@ export type {
   VcsBackend,
   Workspace,
 } from './vcs/types';
+export { backendChangeStats } from './change-stats';
 export {
   LockClient,
   parseToolReply,

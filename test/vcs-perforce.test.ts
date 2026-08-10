@@ -725,6 +725,21 @@ describe('PerforceBackend — changesBetween (RUN-254): p4 diff2 -q, measured', 
   });
 });
 
+// RUN-244: no measured line-level diff primitive exists for this backend (`diff2` reports per-path
+// status only, immediately above) — a refusal is a tested behaviour, not an omission.
+describe('PerforceBackend — changeStats (RUN-244): no measured primitive', () => {
+  it('refuses with reason "unavailable" and a detail naming the backend, never a throw', async () => {
+    const { backend } = fakes({});
+    const ws = await backend.lease('/ws1', 'run_1');
+    const res = await backend.changeStats(ws);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('unavailable');
+    expect(res.detail).toContain('Perforce');
+    expect(res.detail).toContain(ws.runId);
+  });
+});
+
 // RUN-256: `p4 ignores -i`, measured against a real p4d rig — see perforce.ts's own doc for what
 // was found (purely local, no client/server needed; exit 0 regardless of match; output echoes
 // ABSOLUTIZED paths suffixed ` ignored`, one line per match, nothing for a non-match).

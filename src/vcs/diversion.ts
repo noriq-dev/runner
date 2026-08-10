@@ -7,6 +7,7 @@ import { CHANGES_BETWEEN_MAX_PATHS } from '../worktree';
 import { DiversionIndexSource, decodeObjectStatus, isDirectoryMode } from './diversion-index-source';
 import type { LockDelegate } from './git';
 import type {
+  ChangeStatsResult,
   ChangesBetweenResult,
   CurrentBaseResult,
   IgnoreQueryResult,
@@ -896,6 +897,25 @@ export class DiversionBackend implements VcsBackend {
       };
     }
     return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * An honest refusal (RUN-244), `openReview`'s register: Diversion genuinely has no measured
+   * primitive here, not merely one this task declined to build. `/compare` (this file's own
+   * `changesBetween`, immediately above) reports per-path STATUS only — added/modified/deleted,
+   * never a byte- or line-level diff — so it cannot answer "how many lines" even in principle; a
+   * real implementation would need a per-file blob diff (fetching both blobs via the same blob-store
+   * this backend already reads for content, then diffing them locally) run once per changed path,
+   * which is a materially different, much more expensive operation than anything measured for this
+   * backend so far. `changeStats` is REQUIRED on the seam regardless (see its own doc in
+   * `types.ts`), so this method exists to say that plainly rather than by omission.
+   */
+  async changeStats(ws: Workspace): Promise<ChangeStatsResult> {
+    return {
+      ok: false,
+      reason: 'unavailable',
+      detail: `Diversion has no measured primitive for line-level change statistics for run ${ws.runId}'s workspace in repo ${this.repoId} — \`/compare\` reports per-path status only; a real implementation would need a per-file blob diff, not yet measured against this backend`,
+    };
   }
 
   /**
