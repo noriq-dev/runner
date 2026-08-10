@@ -28,12 +28,24 @@ import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind, SetupSpec }
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
+import {
+  type VerifiedContextPack,
+  summarizeCitationVerification,
+  verifyContextPack,
+} from '../citation-verify';
 import type { RunAgent } from '../client';
+import {
+  type ContextPackFetcher,
+  type ContextPackRetrieval,
+  retrieveContextPack,
+  summarizeContextPackRetrieval,
+} from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
+import { suggestedMemoryPaths } from '../memory-render';
 import type { DocReader, PathProbe } from '../repo-context';
 import { noriqToolNamesFor } from '../security';
 import { type SetupResult, setupBriefNote, setupMilestone } from '../setup';
@@ -50,6 +62,7 @@ import {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { LockContext, LockOutcome, Workspace } from '../vcs/types';
+import { type VerificationReportWire, buildVerificationReport } from '../verification-report';
 import {
   type Workflow,
   clampPermissionToWorkflow,
@@ -100,6 +113,18 @@ export interface PrepareHost {
   ): LockEnforcer | undefined;
   /** The run's effective ceiling: the dispatch's, else the machine default. Null = unbounded. */
   runBudget(run: Run): RunBudget | null;
+  /** RUN-228's task context pack fetch (`NoriqClient.getContextPack`, bound with this daemon's
+   *  own `runnerId`). Absent → retrieval is not wired at all, which `context-pack.ts` treats
+   *  identically to every other degradation: preparation proceeds exactly as it does today. */
+  getContextPack?: ContextPackFetcher;
+  /**
+   * RUN-230: hand a freshly built verification report to delivery — fire-and-forget, the same
+   * shape as `postComment`/`recordEpisode`: this function itself must stay synchronous (durability
+   * happens inside it, before any network attempt — `deliverVerificationReport`'s own doc), so
+   * `prepareRun` never awaits a round trip to send a report that must never gate a run. Absent →
+   * no delivery layer wired, exactly the posture every host had before this task existed.
+   */
+  reportVerification?: (runId: string, agentToken: string, report: VerificationReportWire) => void;
   /** How `[context]` paths are probed and read (RUN-128/129) — injected so tests touch no disk. */
   readonly context: {
     probe?: PathProbe;
@@ -137,6 +162,23 @@ export interface PreparedRun {
    *  a consumer that needs the spec the run actually executed under takes the plan stage's answer
    *  rather than this — this is the starting point, not the outcome (RUN-145). */
   checkedSpec: CheckedExecutionSpec | null;
+  /**
+   * RUN-228's retrieved task context pack, plus its own retrieval metadata — fetched during THIS
+   * stage (locked decision: "the call site is retrieval happens during preparation, alongside the
+   * other acquisitions"), held here UNCHANGED for RUN-229 (worktree citation verification) and
+   * RUN-230/231 (the bounded quoted-evidence renderer) to attach to. FETCH AND RECORD ONLY: this
+   * task's own acceptance is that `.pack` reaches no agent prompt anywhere — `buildPrompt` below
+   * never reads this field, and neither may anything added after it until those tasks land.
+   */
+  contextPack: ContextPackRetrieval;
+  /**
+   * RUN-229: `contextPack.pack`'s citations, verified against THIS run's own leased worktree —
+   * every memory excerpt's evidence carries its own verdict inline (`citation-verify.ts`'s own
+   * locked decision: "a consumer must not be able to read an excerpt without them"). Null when
+   * there was nothing to verify (no pack, or verification failed — this task classifies evidence,
+   * it does not gate a run over a verification failure). Rendering it into a prompt is RUN-230/231.
+   */
+  verifiedContextPack: VerifiedContextPack | null;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -156,6 +198,11 @@ export interface PreparedRun {
    */
   start: Omit<DriverStartOptions, 'handlers' | 'env'>;
 }
+
+/** How many memory-suggested paths the transcript names before it counts the rest (RUN-232). A
+ *  count with a sample, not a dump: the point of the line is that a divergence HAPPENED and roughly
+ *  where — the paths themselves are already in the agent's own rendered evidence block. */
+const SUGGESTED_PATHS_SHOWN = 12;
 
 export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOutcome> => {
   const refuse = (reason: string): PrepareOutcome => ({ ok: false, reason });
@@ -344,6 +391,76 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const milestone = setupMilestone(setup);
   if (milestone) host.transcript(run.id).milestone(milestone);
 
+  // RUN-228: fetch the task's context pack now — the worktree (its `baseId`) and the anchor's
+  // task id are both already in hand, and nothing below this line depends on the result (FETCH
+  // AND RECORD ONLY is this task's own locked decision; `.pack` reaches no prompt in this file).
+  // Sequential rather than raced against `runSetup` above: this whole function is a deliberately
+  // ordered list of what each step costs and unwinds (see the file's own top-of-file doc), and
+  // retrieval carries its own short, bounded timeout regardless of where it sits — there is no
+  // latency case here that the existing sequencing does not already tolerate just as well.
+  const contextPack = await retrieveContextPack(host.getContextPack, {
+    projectId: run.projectId,
+    taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    // The CANONICAL identity (locked decision), never `repo.id`/the local `repo_<sha>` checkout
+    // id this daemon mints for itself — that id means nothing on the server.
+    repositoryKey: repo.manifest.repositoryKey,
+    // The leased workspace's own base — the opaque revision id in the backend's id-space,
+    // matching what indexing itself was taken from.
+    baseId: worktree.baseId,
+    // The repo's target/integration branch — deliberately NEVER `worktree.workRef` (the run's own
+    // throwaway `noriq/run/<id>` branch): see `ContextPackInquiry.branch`'s own doc for why that
+    // field must not become an operand here.
+    branch: repo.manifest.defaultBranch,
+    role: kind,
+  });
+  // Only when something was actually ASKED (locked decision: record omissions, not just
+  // successes) — the common case today is a repo with no `repositoryKey` at all, and a transcript
+  // line on every one of those runs would be noise nobody asked for (`summarizeContextPackRetrieval`'s
+  // own doc: the same "no note on nothing to bootstrap" posture `setupBriefNote` already takes).
+  if (contextPack.attempted) {
+    host.transcript(run.id).milestone(summarizeContextPackRetrieval(contextPack));
+  }
+
+  // RUN-229: verify the pack's citations against the workspace this daemon actually leased —
+  // before anything downstream can read an excerpt without its verdict attached. Best-effort,
+  // like every other pre-execution enrichment in this file (`runSetup`, the pattern mapper): a
+  // verification failure degrades to null rather than refusing the run — this task classifies
+  // evidence, it does not gate on it (rendering/gating is RUN-230/231's job).
+  let verifiedContextPack: VerifiedContextPack | null = null;
+  if (contextPack.pack) {
+    try {
+      verifiedContextPack = await verifyContextPack(contextPack.pack, {
+        vcs: host.vcsFor(repo),
+        repoRoot: repo.root,
+        worktree,
+        // The CANONICAL identity, same as the request above — never the local `repo_<sha>`
+        // checkout id, and never assumed equal to the citation's own `repositoryKey` (a pack may
+        // legitimately cite a sibling repo in a multi-repo project; that citation is
+        // `unverifiable` against THIS workspace, not silently checked against the wrong tree).
+        repositoryKey: repo.manifest.repositoryKey,
+      });
+      // RUN-234: the bounded metric `CitationVerdict.agreesWithServer`'s own doc names — a
+      // closed, five-value breakdown plus a mismatch count, never a per-citation line (a
+      // memory-heavy pack can carry hundreds; see `summarizeCitationVerification`'s own doc).
+      // Skipped on a pack with nothing to verify — the common case for most tasks today — the
+      // same "no note on nothing to bootstrap" posture every other line in this function takes.
+      const verification = summarizeCitationVerification(verifiedContextPack);
+      if (verification.total > 0) {
+        host.log.info('context pack citations verified', {
+          runId: run.id,
+          total: verification.total,
+          states: verification.byState,
+          serverMismatches: verification.serverMismatches,
+        });
+      }
+    } catch (err) {
+      host.log.warn('context pack citation verification failed — proceeding without verdicts', {
+        runId: run.id,
+        err: String(err),
+      });
+    }
+  }
+
   // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
   // a lookup failure degrades to the bare id rather than sinking the run.
   const task: AnchorTask | null =
@@ -410,6 +527,36 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
       .dispose(worktree)
       .catch(() => {});
     return refuse('no Noriq identity for this run — the daemon must create the agent before spawning it');
+  }
+
+  // RUN-230: report RUN-229's verdicts back to Noriq — here, not beside `verifyContextPack` above,
+  // because the send is authenticated as THIS run's own bound agent (planar's own locked decision:
+  // `conn.boundAgent.id === run.agentId`), and `runAgent` does not exist until this point. Built
+  // from `verifiedContextPack` alone — nothing an agent said can reach this channel, since nothing
+  // downstream of this line has run an agent turn yet. Skipped (never a refusal — this never gates
+  // a run) when there is nothing reportable, or when this workspace has no valid `branch`/
+  // `repositoryKey` to observe AGAINST: `defaultBranch` is optional on a manifest, but the wire's
+  // `branch` field is not nullable server-side, so a repo with none configured has no honest value
+  // to report and every citation would 400 the whole request rather than skip cleanly.
+  if (
+    verifiedContextPack &&
+    repo.manifest.repositoryKey &&
+    repo.manifest.defaultBranch &&
+    host.reportVerification
+  ) {
+    const report = buildVerificationReport(verifiedContextPack, {
+      repositoryKey: repo.manifest.repositoryKey,
+      observedBaseId: worktree.baseId,
+      observedBranch: repo.manifest.defaultBranch,
+    });
+    if (report) {
+      host.reportVerification(run.id, runAgent.token, report);
+      host
+        .transcript(run.id)
+        .milestone(
+          `verification report for ${report.citations.length} citation(s) handed to delivery (fire-and-forget)`,
+        );
+    }
   }
 
   // Dispatch-time predictive locking (RUN-103): with a DECLARED scope, take its locks now — as
@@ -501,6 +648,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     kind,
     ...(workflow ? { workflow } : {}),
     ...(diffCmd ? { diffCmd } : {}),
+    verifiedContextPack,
   });
 
   // Findings go to the RUN'S TRANSCRIPT, not only to daemon stderr — which is what makes the two
@@ -528,6 +676,37 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     // lets whatever the agent then decides become the de-facto plan — the same overwrite RUN-135's
     // flag exists to prevent, one layer along. So it goes in the PROMPT, not only the log.
     host.log.warn('[spec] the server holds an unreadable execution spec for this task', { runId: run.id });
+  }
+
+  // RUN-232: a memory-verified path beyond the spec's OWN declared scope is a SUGGESTION, never a
+  // fold into it (locked decision: "cannot silently broaden the task") — recorded where a human
+  // reads it, the same transcript channel `summarizeContextPackRetrieval` above already uses, and
+  // never in `anticipatedFiles`/`resolveLockScope`'s scope, which stays exactly what the spec (and
+  // a continuation's own touched paths) declared. Only meaningful once a spec exists to diverge
+  // FROM — the planner runs before one is written, so this has nothing to compare against yet.
+  if (verifiedContextPack && checkedSpec?.spec) {
+    const suggested = suggestedMemoryPaths(
+      verifiedContextPack,
+      checkedSpec.spec.anticipatedFiles.map((f) => f.path),
+    );
+    if (suggested.length) {
+      // Bounded and single-line, for the reason `summarizeContextPackRetrieval` above states about
+      // its own line: this is a line the DAEMON writes into a human-facing stream out of what the
+      // server said. A `valid` verdict proves each path exists inside this workspace — so the
+      // content is sound — but neither the COUNT nor a filename's own characters are bounded by
+      // that, and a memory citing two hundred files, or one legal POSIX name carrying a newline,
+      // would either drown the transcript or break the frame's own line shape.
+      const shown = suggested.slice(0, SUGGESTED_PATHS_SHOWN).map((p) => p.replace(/\s+/g, ' '));
+      const more = suggested.length - shown.length;
+      host
+        .transcript(run.id)
+        .milestone(
+          `project memory suggests ${suggested.length} path(s) beyond the spec's declared scope — ` +
+            `evidence for the agent to consider, never a lock: ${shown.join(', ')}${
+              more > 0 ? ` (+${more} more)` : ''
+            }`,
+        );
+    }
   }
   const renderedSpec = authorSpecBlock(task, checkedSpec);
 
@@ -575,6 +754,8 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     rebuildPrompt: (checked, extra = '') =>
       buildPrompt(`${renderExecutionSpec(checked)}${extra}${setupNote}`, checked?.spec ?? null),
     checkedSpec,
+    contextPack,
+    verifiedContextPack,
     repo,
     driver,
     workflow: wf,

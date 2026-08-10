@@ -4,7 +4,9 @@ import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { ProjectManifest } from '@noriq-dev/shared';
 import { parse as parseToml } from 'smol-toml';
+import { type ResolvedIndexConfig, resolveIndexConfig } from './index-policy';
 import { logger as defaultLogger } from './logger';
+import { parseRepositoryKey } from './memory-contract';
 
 /** A repo the daemon discovered under a scan root (has a .noriq/project.toml). */
 export interface DiscoveredRepo {
@@ -15,6 +17,24 @@ export interface DiscoveredRepo {
   name: string;
   defaultBranch: string | null;
   manifest: ProjectManifest;
+  /**
+   * The committed, project-local canonical repository key (Project Memory §6, RUN-208) —
+   * VALIDATED with `parseRepositoryKey`, distinct from `id` above (`repoId()`/`RunnerRepo.id`
+   * are untouched — this is an additional, independent field, never a replacement). Null when
+   * the manifest names none, or when the committed value is malformed: a bad key is a VISIBLE
+   * association failure (logged at `error`, Project Memory §4), never silently rebound to
+   * `projectKey`, `name`, or `repoId()`. A snapshot at discovery time — `repoReport`
+   * (registration.ts) re-validates from whatever manifest it is handed, fresh, per report.
+   */
+  repositoryKey: string | null;
+  /**
+   * The resolved repository-indexing EXECUTION policy (RUN-208, `index-policy.ts`) — merges the
+   * vendored `IndexSpec` (`enabled`/`include`/`exclude`) with this daemon's own knobs. Null when
+   * indexing is off, or the committed `[index]` policy is invalid (logged, never fatal to
+   * discovery). Snapshotted here for convenience at daemon start; RUN-209's actual indexer must
+   * re-read via `loadIndexConfig` below per run — this field is never the re-read authority.
+   */
+  indexConfig: ResolvedIndexConfig | null;
 }
 
 // Directories never worth descending into when hunting for markers.
@@ -59,13 +79,50 @@ export function legacyNetworkKinds(raw: unknown): string[] {
     .map(([kind]) => kind);
 }
 
-async function readManifest(
+/** The parsed marker, before AND after the zod parse — `raw` is the hook every RAW-table reader
+ *  (legacy `network` detection, and RUN-208's `[index]` execution policy) needs, since by the
+ *  time zod is done stripping unknown keys the evidence of a typo is already gone. */
+interface ParsedMarker {
+  raw: unknown;
+  manifest: ProjectManifest;
+}
+
+/**
+ * Neutralize a malformed `repositoryKey` BEFORE the zod parse, or the whole marker fails to
+ * validate (RUN-208, decision 6). The vendored `ProjectManifest.repositoryKey` is
+ * `RepositoryKey.nullable()` — a strict field, not a `.catch()` — so a committed value that fails
+ * `parseRepositoryKey` would otherwise take `ProjectManifest.safeParse` down for the WHOLE
+ * marker, exactly the "one typo skips the whole dispatch path" failure decision 5 refuses for
+ * `[index]`. This is the same shape, one field over: log the visible association failure here,
+ * then rewrite the raw value to null so the rest of the marker still parses and the repo stays
+ * discovered — `parsed.data.repositoryKey` coming out the other side is therefore always either a
+ * validated key or null, never a string `parseRepositoryKey` would refuse.
+ */
+function sanitizeRepositoryKey(
+  raw: unknown,
   markerPath: string,
-  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
-): Promise<ProjectManifest | null> {
+  log: Pick<typeof defaultLogger, 'error'>,
+): unknown {
+  const table = raw as { repositoryKey?: unknown } | null;
+  const rawKey = table?.repositoryKey;
+  if (typeof rawKey !== 'string' || rawKey.length === 0) return raw; // absent/null — nothing to sanitize
+  const result = parseRepositoryKey(rawKey);
+  if (result.ok) return raw; // valid — passes through unchanged
+  log.error('project.toml repositoryKey is malformed — this repo has no canonical repository identity', {
+    marker: markerPath,
+    repositoryKey: rawKey,
+    reason: result.reason,
+  });
+  return { ...(raw as Record<string, unknown>), repositoryKey: null };
+}
+
+async function readMarker(
+  markerPath: string,
+  log: Pick<typeof defaultLogger, 'warn' | 'error'> = defaultLogger,
+): Promise<ParsedMarker | null> {
   try {
     const raw = parseToml(await readFile(markerPath, 'utf8'));
-    const parsed = ProjectManifest.safeParse(raw);
+    const parsed = ProjectManifest.safeParse(sanitizeRepositoryKey(raw, markerPath, log));
     if (!parsed.success) return null; // invalid marker → skip
     // Say the quiet part, every read. A manifest is re-read per Run (see ManifestStore), so this
     // fires at the moment it matters: right before an agent is spawned with egress the committed
@@ -80,10 +137,19 @@ async function readManifest(
         { marker: markerPath, kinds: stale },
       );
     }
-    return parsed.data;
+    // `raw` here is the ORIGINAL (pre-sanitize) table — index policy parsing (loadIndexConfig)
+    // does not care about repositoryKey, and every other raw-table reader wants the real bytes.
+    return { raw, manifest: parsed.data };
   } catch {
     return null;
   }
+}
+
+async function readManifest(
+  markerPath: string,
+  log: Pick<typeof defaultLogger, 'warn' | 'error'> = defaultLogger,
+): Promise<ProjectManifest | null> {
+  return (await readMarker(markerPath, log))?.manifest ?? null;
 }
 
 /** Read + validate a repo's committed manifest off disk. null = absent or invalid.
@@ -91,8 +157,25 @@ async function readManifest(
  *  injectable for tests; everything else on this path takes the module's own. */
 export const loadManifest = (
   root: string,
-  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
+  log: Pick<typeof defaultLogger, 'warn' | 'error'> = defaultLogger,
 ): Promise<ProjectManifest | null> => readManifest(manifestPath(root), log);
+
+/**
+ * The resolved `[index]` execution policy, re-read fresh off disk on every call (RUN-208) — the
+ * same "no restart needed" contract `ManifestStore` gives the rest of the marker. RUN-209's
+ * actual indexer is the intended per-run caller; `discoverRepos` below also calls this once at
+ * startup to seed `DiscoveredRepo.indexConfig`, but that snapshot is convenience only — editing
+ * `[index]` takes effect the next time THIS function is called, not the next daemon restart.
+ */
+export async function loadIndexConfig(
+  root: string,
+  log: Pick<typeof defaultLogger, 'warn' | 'error'> = defaultLogger,
+): Promise<ResolvedIndexConfig | null> {
+  const parsed = await readMarker(manifestPath(root), log);
+  if (!parsed) return null;
+  const rawIndex = (parsed.raw as { index?: unknown } | null)?.index;
+  return resolveIndexConfig(parsed.manifest.index, rawIndex, log);
+}
 
 /** Best-effort default branch from .git/HEAD (no git subprocess). */
 async function gitDefaultBranch(root: string): Promise<string | null> {
@@ -122,9 +205,11 @@ export async function discoverRepos(
     if (depth > maxDepth) return;
     const marker = path.join(dir, '.noriq', 'project.toml');
     if (existsSync(marker)) {
-      const manifest = await readManifest(marker);
-      if (manifest) {
+      const parsed = await readMarker(marker);
+      if (parsed) {
+        const { manifest, raw } = parsed;
         const root = path.resolve(dir);
+        const rawIndex = (raw as { index?: unknown } | null)?.index;
         found.set(root, {
           id: repoId(root),
           root,
@@ -132,6 +217,10 @@ export async function discoverRepos(
           name: path.basename(root),
           defaultBranch: await gitDefaultBranch(root),
           manifest,
+          // Already sanitized by readMarker (a malformed value never survives the zod parse
+          // above) — a straight copy, not a second validation, per decision 8.
+          repositoryKey: manifest.repositoryKey,
+          indexConfig: resolveIndexConfig(manifest.index, rawIndex),
         });
       }
     }

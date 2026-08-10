@@ -259,9 +259,16 @@ export type AdvertisedWorkflow = z.infer<typeof AdvertisedWorkflow>;
 // a Run target. The committed KEY resolves to a projectId per configured server
 // (see ./manifest for the resolution contract, RUN-3).
 export const RunnerRepo = z.object({
-  id: z.string(), // stable per (runner, repo), e.g. hash of the root path
+  id: z.string(), // stable per (runner, repo), e.g. hash of the root path — RunnerCheckoutId's key space, never canonical repository identity
   projectKey: z.string().min(1), // committed KEY from .noriq/project.toml
   projectId: z.string().nullable().default(null), // resolved against this server; null if unknown here
+  // The committed, project-local canonical repository key from .noriq/project.toml's
+  // top-level `repositoryKey` field (§4/§6/PLNR-259, ProjectManifest — manifest.ts) — loose
+  // here (validated server-side against RepositoryKey at the write path) so a malformed value
+  // surfaces as a visible association failure rather than rejecting the whole registration.
+  // Null on an older daemon or a manifest with no `repositoryKey` set — the association is
+  // opt-in, never inferred.
+  repositoryKey: z.string().nullable().default(null),
   // The board lock (RUN-71), riding the key's rails: `board` is the committed NAME from the
   // marker, `boardId` its per-server resolution. Null when the marker names none, the project
   // didn't resolve, or no board matches — unresolved is visible, never silently rebound.

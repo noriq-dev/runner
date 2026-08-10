@@ -298,6 +298,21 @@ export function renderProjectManifest(m: ManifestChoices): string {
     '# Portable project identifier. Resolved to a prj_… id per server, so this checkout works',
     '# against any Noriq instance that has a project under this key.',
     `key = ${tomlString(m.key)}`,
+    '',
+    // Not curated by this wizard (RUN-208) — a hand-edit, like `board` above it in the schema.
+    // TOP-LEVEL on purpose: the vendored schema spells it `repositoryKey`, not a `[repository]`
+    // table — see project.toml.example for the full reasoning.
+    '# Canonical, project-local repository identity (Project Memory §6) — a short slug, distinct',
+    "# from this daemon's own local checkout id. Opt-in: blank means no Project Memory",
+    '# association for this repo. See project.toml.example for the validation rules.',
+    '# repositoryKey = "my-repo"',
+    '',
+    // Also a hand-edit only — see project.toml.example for every knob and its default.
+    '# Repository indexing (Project Memory §7) — OFF unless explicitly enabled: a repo the',
+    '# operator never opts in never has its files read for the graph. See project.toml.example',
+    '# for include/exclude, languages, content mode, size/count bounds, and reindex cadence.',
+    '# [index]',
+    '# enabled = true',
   ];
 
   if (m.tool) {

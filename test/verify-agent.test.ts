@@ -73,6 +73,31 @@ describe('assembleVerifyPrompt', () => {
     expect(p).toMatch(/not for pre-existing code/);
   });
 
+  // RUN-231: the verified context pack, rendered through the reviewer-audience quoted-evidence
+  // frame, must precede the daemon's own ACCEPTANCE/VERDICT instructions — untrusted retrieved
+  // evidence is read before the daemon's own rules so the daemon's rules stay the last word.
+  it('carries the memory block BEFORE acceptance/verdict instructions, by index (RUN-231)', () => {
+    const p = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+      memory: '\n\nQUOTED FROM PROJECT MEMORY — MEMORY-MARKER',
+      acceptance: [{ id: 1, kind: 'truth', text: 'must do the thing' }],
+    });
+    expect(p).toContain('MEMORY-MARKER');
+    const memoryIdx = p.indexOf('MEMORY-MARKER');
+    expect(memoryIdx).toBeLessThan(p.indexOf('ACCEPTANCE CRITERIA'));
+    expect(memoryIdx).toBeLessThan(p.lastIndexOf('VERDICT: PASS'));
+    expect(memoryIdx).toBeLessThan(p.lastIndexOf('End your response'));
+  });
+
+  it('renders nothing extra when no pack was retrieved — memory is absent, not empty noise', () => {
+    const p = assembleVerifyPrompt('spec', {
+      agent: { agentId: 'agt_v', label: 'verify-x' },
+      server: 'https://s',
+    });
+    expect(p).not.toContain('QUOTED FROM PROJECT MEMORY');
+  });
+
   it('excuses specs that live in another repo/service, but not broken contracts (RUN-78)', () => {
     const p = assembleVerifyPrompt('spec', {
       agent: { agentId: 'agt_v', label: 'verify-x' },

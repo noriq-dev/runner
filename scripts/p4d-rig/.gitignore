@@ -1,0 +1,4 @@
+# Runtime state up.sh creates locally — never committed (lockedDecisions #6 extends to anything
+# derived from the vendor binary, not just the binary itself). provision.sh's own scratch client
+# workspace lives outside the repo entirely (see provision.sh) so it never needs an ignore rule.
+.bin/

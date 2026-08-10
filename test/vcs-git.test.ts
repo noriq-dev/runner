@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { FakeIndexSource, FilesystemIndexSource } from '../src/index-source';
 import { GitBackend, type GitOps } from '../src/vcs/git';
-import type { Workspace } from '../src/vcs/types';
-import type { WorktreeInfo } from '../src/worktree';
+import type { IndexSnapshot, Workspace } from '../src/vcs/types';
+import type { IndexSnapshotHandle, WorktreeInfo } from '../src/worktree';
 
 // GitBackend is a naming boundary, so its whole contract is the MAPPING: each outcome reaches
 // the right git verb, with the arguments passed through untouched and the result returned
@@ -19,6 +20,12 @@ const info: WorktreeInfo = {
   branch: 'noriq/run/run_1',
   readOnly: false,
   baseSha: 'base0000',
+};
+
+const snapshotHandle: IndexSnapshotHandle = {
+  repoRoot: '/repo',
+  path: '/wt/repo-index-snapshot-abc',
+  baseSha: 'snap0000',
 };
 
 function recorder() {
@@ -43,6 +50,11 @@ function recorder() {
     landFastForward: record('landFastForward', { ok: true, sha: 'sha1' } as const),
     pushBranch: record('pushBranch', { ok: false, detail: 'offline' } as const),
     reapOrphans: record('reapOrphans', 2),
+    createIndexSnapshot: record('createIndexSnapshot', snapshotHandle),
+    removeIndexSnapshot: record('removeIndexSnapshot', undefined),
+    changesBetween: record('changesBetween', { ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] }),
+    checkIgnored: record('checkIgnored', { ok: true, ignored: new Set(['node_modules']) } as const),
+    currentBase: record('currentBase', { ok: true, baseId: 'cur0000' } as const),
   };
   return { ops, calls };
 }
@@ -182,6 +194,120 @@ describe('GitBackend — the outcome→verb mapping', () => {
     await expect(vcs.publish(alien, 'main')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.publishToRun(alien, 'run_1')).rejects.toThrow(/does not carry a git location/);
     await expect(vcs.dispose(alien)).rejects.toThrow(/run_9/);
+  });
+});
+
+// RUN-211: leaseIndexSnapshot/releaseIndexSnapshot follow the same naming-boundary discipline as
+// every other verb above — this pins the wrap/unwrap and the foreign-object refusal; real git
+// detachment/pinning/reap behaviour is worktree.test.ts's job, exactly as `create`'s is.
+describe('GitBackend — index snapshot (RUN-211)', () => {
+  it('leaseIndexSnapshot wraps the handle into an IndexSnapshot: no branch, readOnly true', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).leaseIndexSnapshot('/repo');
+    if (!res.ok) throw new Error('expected an acquired snapshot');
+    expect(res.snapshot).toMatchObject({
+      localPath: '/wt/repo-index-snapshot-abc',
+      baseId: 'snap0000',
+      readOnly: true,
+      location: { repoRoot: '/repo', kind: 'index-snapshot' },
+    });
+    // Git materializes, so it reads through the FILESYSTEM source (RUN-252/254/255) — and rooted at
+    // the SNAPSHOT, never at the repo, or the indexer would read the operator's working tree
+    // instead of the pinned base. `source` is the field the indexer actually consumes, so asserting
+    // its identity and root matters more than the `localPath` beside it.
+    expect(res.snapshot.source).toBeInstanceOf(FilesystemIndexSource);
+    expect(res.snapshot.source.kind).toBe('filesystem');
+    expect(calls).toEqual([{ method: 'createIndexSnapshot', args: ['/repo'] }]);
+  });
+
+  it('releaseIndexSnapshot unwraps location and calls removeIndexSnapshot verbatim', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const res = await vcs.leaseIndexSnapshot('/repo');
+    calls.length = 0;
+    if (!res.ok) throw new Error('expected ok:true');
+    await vcs.releaseIndexSnapshot(res.snapshot);
+    expect(calls).toEqual([
+      {
+        method: 'removeIndexSnapshot',
+        args: [{ repoRoot: '/repo', path: '/wt/repo-index-snapshot-abc' }],
+      },
+    ]);
+  });
+
+  it('refuses to release a Workspace — structurally close enough to typecheck, refused at runtime anyway', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const runWorkspace: Workspace = {
+      runId: 'run_1',
+      localPath: '/wt/run_1',
+      readOnly: false,
+      baseId: 'base0000',
+      workRef: 'noriq/run/run_1',
+      location: { repoRoot: '/repo', branch: 'noriq/run/run_1' }, // a REAL run's location
+    };
+    // Passed as an IndexSnapshot: exactly the structural-typing hazard the interface doc warns
+    // about — Workspace satisfies IndexSnapshot's shape with an extra field or two.
+    await expect(vcs.releaseIndexSnapshot(runWorkspace as unknown as IndexSnapshot)).rejects.toThrow(
+      /not an index snapshot this backend minted/,
+    );
+    expect(calls.some((c) => c.method === 'removeIndexSnapshot')).toBe(false); // nothing touched
+  });
+
+  it('refuses a hand-edited object with no location at all', async () => {
+    const { ops } = recorder();
+    const vcs = new GitBackend(ops);
+    const alien: IndexSnapshot = {
+      source: new FakeIndexSource([]),
+      localPath: '/somewhere',
+      baseId: 'x',
+      readOnly: true,
+      location: { not: 'a snapshot' },
+    };
+    await expect(vcs.releaseIndexSnapshot(alien)).rejects.toThrow(
+      /not an index snapshot this backend minted/,
+    );
+  });
+});
+
+// RUN-212: same delegation discipline as every other verb — a pure pass-through, no wrap/unwrap,
+// because `from`/`to` are already opaque commit ids and `ChangesBetweenResult` is already the
+// backend-neutral shape. Real git behaviour (renames, deletions, the full-index fallbacks) is
+// worktree.test.ts's job, exactly as `create`'s real git behaviour is.
+describe('GitBackend — changesBetween (RUN-212)', () => {
+  it('passes repoRoot/from/to straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).changesBetween('/repo', 'sha-from', 'sha-to');
+    expect(res).toEqual({ ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] });
+    expect(calls).toEqual([{ method: 'changesBetween', args: ['/repo', 'sha-from', 'sha-to'] }]);
+  });
+});
+
+// RUN-256: same pure pass-through discipline as changesBetween one verb over — worktree.test.ts
+// owns the real `git check-ignore` behaviour, this only pins the delegation.
+describe('GitBackend — queryIgnored (RUN-256)', () => {
+  it('passes repoRoot/paths straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).queryIgnored('/repo', ['node_modules', 'src']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules']) });
+    expect(calls).toEqual([{ method: 'checkIgnored', args: ['/repo', ['node_modules', 'src']] }]);
+  });
+});
+
+// RUN-222: same pure pass-through discipline again — worktree.test.ts owns the real `rev-parse`
+// behaviour, this only pins the delegation (and that `branch` really is optional).
+describe('GitBackend — currentBase (RUN-222)', () => {
+  it('passes repoRoot/branch straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
+    const res = await new GitBackend(ops).currentBase('/repo', 'main');
+    expect(res).toEqual({ ok: true, baseId: 'cur0000' });
+    expect(calls).toEqual([{ method: 'currentBase', args: ['/repo', 'main'] }]);
+  });
+
+  it('omitting branch passes undefined through, never a synthesized default', async () => {
+    const { ops, calls } = recorder();
+    await new GitBackend(ops).currentBase('/repo');
+    expect(calls).toEqual([{ method: 'currentBase', args: ['/repo', undefined] }]);
   });
 });
 

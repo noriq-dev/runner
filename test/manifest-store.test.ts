@@ -217,6 +217,8 @@ describe('changedSections', () => {
     context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
     tool: null,
     defaultBranch: null,
+    repositoryKey: null,
+    index: null,
     land: null,
     setup: null,
     permissions: {
@@ -260,5 +262,14 @@ describe('changedSections', () => {
         }),
       ),
     ).toEqual(['land']);
+  });
+
+  // RUN-208: an operator turning indexing on, or committing a repositoryKey, wants to see it
+  // said — same as every other section this daemon already names on change.
+  it('names repositoryKey and index when they change', () => {
+    expect(changedSections(m(), m({ repositoryKey: 'runner-repo' }))).toEqual(['repositoryKey']);
+    expect(changedSections(m(), m({ index: { enabled: true, include: [], exclude: [] } }))).toEqual([
+      'index',
+    ]);
   });
 });

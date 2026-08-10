@@ -1,5 +1,8 @@
 import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
+import { logger as defaultLogger } from './logger';
+import { ContextPack, type ContextPackRole, RunnerIndexCursor } from './memory-contract';
 import type { RunnerRegistration } from './registration';
+import type { VerificationReportResult, VerificationReportWire } from './verification-report';
 import { VERSION } from './version';
 
 /** Where a spun-off task came from (RUN-188): the run and finding that spawned it. Runner-local,
@@ -170,6 +173,62 @@ export interface NoriqClientOptions {
   onUnauthorized?: () => Promise<string>;
   /** Injectable for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /**
+   * Injectable for tests; defaults to the shared daemon logger. RUN-234: `getIndexCursor` and
+   * `getContextPack` collapse EVERY failure mode to `null` by locked, unweakened contract
+   * (`INDEX-OPERATIONS.md`'s own Troubleshooting section names why: a caller two layers away
+   * must not have to keep three failure modes of a server that can fail in new ways in sync).
+   * That contract is about what a CALLER receives, not about what an operator can ever know —
+   * before this, nothing on this path logged even the HTTP status, so "server memory disabled"
+   * and "a network blip" were genuinely indistinguishable from the daemon's own log. `logFetchFailure`
+   * below logs the distinction at the one place it is still knowable, and returns nothing —
+   * every call site still returns `null` exactly as before.
+   */
+  logger?: typeof defaultLogger;
+}
+
+/**
+ * A non-2xx response from `request()`, carrying the real status/body rather than only a
+ * formatted message. Added for RUN-220: `mintIngestCapability`'s caller (`ingest-client.ts`)
+ * must tell a 503 (ingest not enabled — permanent, per this repo's own locked decision) apart
+ * from a 404 (unresolvable repository key) apart from a 403 (runner outside this connection's
+ * authorized projects) — a bare `Error` string would force it to regex the message. `.message`
+ * keeps the exact pre-existing format (`${method} ${pathname} → ${status}: ${body}`), so this is
+ * additive: every caller that only ever read `.message` is unaffected.
+ */
+export class NoriqHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(message);
+    this.name = 'NoriqHttpError';
+  }
+}
+
+/** A capability minted by `POST /api/runner-ingest/capability` (RUN-220, PLNR-260 §8) — the
+ *  bearer for exactly the five `/api/memory-ingest/:token/*` calls `ingest-client.ts` makes for
+ *  ONE (purpose, scopeId). `maxBytes` is the server's clamp, not this repo's guess at one (locked
+ *  decision 4) — the caller must refuse an oversized batch locally against THIS number. */
+export interface IngestCapabilityGrant {
+  token: string;
+  maxBytes: number;
+  expiresAt: string;
+}
+
+/** The mint request body — one (purpose, scopeId) per capability (locked decision 7: never mint
+ *  broad and reuse across generations). `scopeId` is an `IndexGenerationManifest.generationId`
+ *  for `purpose: 'index'`, or a caller-chosen episode upload id for `purpose: 'episode'`. */
+export interface MintIngestCapabilityInput {
+  projectId: string;
+  repositoryKey: string;
+  purpose: 'index' | 'episode';
+  scopeId: string;
+  runnerId: string;
+  /** Optional per-batch ceiling request — the server clamps it to its own `MAX_INGEST_BATCH_BYTES`
+   *  regardless, so this only ever narrows, never widens, what the mint response allows. */
+  maxBytes?: number;
 }
 
 /** Thin REST client for the Noriq control plane. The daemon authenticates with the
@@ -179,6 +238,7 @@ export class NoriqClient {
   private readonly getToken: () => Promise<string>;
   private readonly onUnauthorized?: () => Promise<string>;
   private readonly fetchImpl: typeof fetch;
+  private readonly log: typeof defaultLogger;
 
   constructor(opts: NoriqClientOptions) {
     this.base = opts.server.replace(/\/+$/, '');
@@ -186,6 +246,26 @@ export class NoriqClient {
     this.getToken = typeof token === 'string' ? async () => token : token;
     this.onUnauthorized = opts.onUnauthorized;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.log = opts.logger ?? defaultLogger;
+  }
+
+  /**
+   * RUN-234: log WHY a null-collapsing fetch produced nothing, without changing what any caller
+   * receives — both call sites below still return `null` on every branch. `fields` never carries
+   * a path, a response body, or a token (locked decision 3): a non-2xx logs the STATUS CODE alone
+   * (a bounded, single small integer, never `NoriqHttpError.body`, which can legitimately hold
+   * server-echoed request content); a transport failure logs the error's own length-capped
+   * message — defense in depth mirroring `ingest-client.ts`'s `redactToken`, since a `fetchImpl`'s
+   * own thrown message can legitimately quote the URL it tried to reach (never a token: this
+   * class sends its bearer in a header, never a path segment, unlike the ingest capability rail).
+   */
+  private logFetchFailure(what: string, fields: Record<string, unknown>, err: unknown): void {
+    if (err instanceof NoriqHttpError) {
+      this.log.warn(`${what} failed`, { ...fields, category: 'http', status: err.status });
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    this.log.warn(`${what} failed`, { ...fields, category: 'transport', err: message.slice(0, 200) });
   }
 
   private async request(method: string, pathname: string, body?: unknown, retry = true): Promise<unknown> {
@@ -201,8 +281,29 @@ export class NoriqClient {
       return this.request(method, pathname, body, false);
     }
     const text = await res.text();
-    if (!res.ok) throw new Error(`${method} ${pathname} → ${res.status}: ${text.slice(0, 500)}`);
+    if (!res.ok)
+      throw new NoriqHttpError(
+        `${method} ${pathname} → ${res.status}: ${text.slice(0, 500)}`,
+        res.status,
+        text,
+      );
     return text ? JSON.parse(text) : {};
+  }
+
+  /** This client's server base URL, trailing slash trimmed — exposed for RUN-220's ingest client,
+   *  which builds its own request URLs directly: the five `/api/memory-ingest/:token/*` calls are
+   *  authorized by the TOKEN IN THE PATH, never by this client's Bearer header, so they cannot go
+   *  through `request()` above. */
+  get baseUrl(): string {
+    return this.base;
+  }
+
+  /** This client's injected fetch — exposed for the same reason as `baseUrl`: RUN-220's ingest
+   *  client is a separate, unauthenticated-by-header transport and needs its own fetch to fake in
+   *  tests without re-plumbing a second `fetchImpl` through every call site that already has one
+   *  of these. */
+  get httpFetch(): typeof fetch {
+    return this.fetchImpl;
   }
 
   /** Register (or re-register, if reg.runnerId is set) this runner. */
@@ -472,5 +573,164 @@ export class NoriqClient {
     } catch {
       return null; // probe unavailable or errored → fail open, never strand a run
     }
+  }
+
+  /**
+   * Fetch RUN-213's index cursor — the active generation's baseId/branch/indexerVersion, staged
+   * generations, staleness, and this checkout's own repository association, in one round trip
+   * (`POST /api/runner-memory/index-cursor`, PLNR-306's agentAuth read). Deliberately OUTSIDE
+   * `/api/projects/:pid/*`: that subtree runs `userAuth` before any route-level auth, so a
+   * Bearer-only daemon can never reach it (VENDORED-CONTRACT.md, this task's locked decision 2).
+   *
+   * `input.projectId` is `null` when this daemon has not resolved which Noriq project the repo's
+   * key belongs to on this server yet (`RegisteredRunnerRepo.projectId`, set from registration) —
+   * the route requires one, so that precondition is refused BEFORE any request is attempted. This
+   * reads as `unavailable` to `index-reconcile.ts`'s `reconcile`, never as `association-conflict`:
+   * that verdict requires the server to have actually compared this checkout against a *resolved*
+   * canonical repository, which requires a projectId to ask it with in the first place.
+   *
+   * Returns `null` on every OTHER failure mode too — network error, non-2xx, or a body that does
+   * not parse as the vendored `RunnerIndexCursor` (locked decision 3: this is the ONLY parser run
+   * over the response, never a hand-rolled read off `unknown` — the server computes `stale` with
+   * the exact function the human-facing dashboard route uses, so a second, independently-typed
+   * reading of the same wire shape is exactly how the two would drift). `reconcile` treats every
+   * `null` identically: schedule nothing, and let the next trigger retry (decision 6) — a fetch
+   * hiccup must cost a retry, never a full reindex of a monorepo.
+   */
+  async getIndexCursor(
+    runnerId: string,
+    input: { projectId: string | null; repositoryKey: string; checkoutId: string },
+  ): Promise<RunnerIndexCursor | null> {
+    if (!input.projectId) {
+      // A precondition this daemon can already see, not a fetch outcome — worth `debug` (routine
+      // on a fresh registration), never `warn`, and distinct from every category below.
+      this.log.debug('index cursor fetch skipped — no resolved project for this repository yet', {
+        repositoryKey: input.repositoryKey,
+      });
+      return null;
+    }
+    try {
+      const out = await this.request('POST', '/api/runner-memory/index-cursor', {
+        projectId: input.projectId,
+        repositoryKey: input.repositoryKey,
+        runnerId,
+        checkoutId: input.checkoutId,
+      });
+      const parsed = RunnerIndexCursor.safeParse(out);
+      if (!parsed.success) {
+        this.log.warn('index cursor fetch failed', {
+          repositoryKey: input.repositoryKey,
+          category: 'schema',
+        });
+        return null;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.logFetchFailure('index cursor fetch', { repositoryKey: input.repositoryKey }, err);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch RUN-228's task context pack (`POST /api/runner-memory/context`, agentAuth) — the
+   * agentAuth twin of the dashboard's userAuth `POST /api/projects/:pid/memory/context`: same
+   * assembler, same shape, `role` defaulting server-side to 'build' rather than the browser
+   * route's 'human' (a runner is never a browser, and 'human' would reweight section budgets
+   * toward the wrong reader — this daemon's own caller always passes one explicitly anyway).
+   *
+   * Same locked-decision shape as `getIndexCursor` above, deliberately: ONE parser (the vendored
+   * `ContextPack` schema, re-exported as a value by `memory-contract.ts` for exactly this), and
+   * every failure — network error, non-2xx (including a 404 from an old server that has not
+   * grown this route), or a body that fails the schema — collapses to `null` rather than three
+   * call sites the daemon's caller (`context-pack.ts`) would otherwise have to keep in sync with
+   * a server that can fail in new ways this repo has never seen. `context-pack.ts` is the layer
+   * that adds a TIMEOUT around this call and decides what an omission means for a run; this
+   * method stays an honest wire call.
+   *
+   * `repositoryKey`/`branch`/`baseId`/`role`/`budgetTokens` are all optional on the wire — this
+   * method does not itself refuse a request missing one; `context-pack.ts` is what enforces "skip
+   * without a repositoryKey" (locked decision) before this is ever called.
+   */
+  async getContextPack(
+    runnerId: string,
+    input: {
+      projectId: string;
+      taskId: string;
+      repositoryKey?: string | null;
+      branch?: string | null;
+      baseId?: string | null;
+      role?: ContextPackRole;
+      budgetTokens?: number;
+    },
+  ): Promise<ContextPack | null> {
+    try {
+      const out = await this.request('POST', '/api/runner-memory/context', {
+        projectId: input.projectId,
+        runnerId,
+        taskId: input.taskId,
+        ...(input.repositoryKey ? { repositoryKey: input.repositoryKey } : {}),
+        ...(input.branch ? { branch: input.branch } : {}),
+        ...(input.baseId ? { baseId: input.baseId } : {}),
+        ...(input.role ? { role: input.role } : {}),
+        ...(input.budgetTokens !== undefined ? { budgetTokens: input.budgetTokens } : {}),
+      });
+      const parsed = ContextPack.safeParse(out);
+      if (!parsed.success) {
+        this.log.warn('context pack fetch failed', { taskId: input.taskId, category: 'schema' });
+        return null;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.logFetchFailure('context pack fetch', { taskId: input.taskId }, err);
+      return null;
+    }
+  }
+
+  /**
+   * Mint a short-lived, single-purpose ingest capability (RUN-220, PLNR-260 §8) — under the
+   * DAEMON's own OAuth identity, via this same authenticated client (locked decision 7), scoped
+   * to exactly the one (purpose, scopeId) `input` names. This is the ONLY thing this client does
+   * with the capability: it hands back the grant and never touches the five token-authorized
+   * routes itself — those live in `ingest-client.ts`, which authorizes with the token alone (no
+   * Bearer, no cookie), a different trust shape from every other call on this class.
+   *
+   * Throws `NoriqHttpError` on any non-2xx — notably 503 when this server has no
+   * `ATTACHMENT_UPLOAD_SECRET`/`ADMIN_TOKEN` configured (ingest not enabled at all: a runner
+   * ahead of its server must treat this as permanent, never retry it into a hot loop), 404 for a
+   * repository key this project has not registered, and 403 when the runner is outside this
+   * connection's authorized projects. `ingest-client.ts` classifies `.status` into the
+   * caller-facing `IngestError` taxonomy; this method stays a thin, honest wire call.
+   */
+  async mintIngestCapability(input: MintIngestCapabilityInput): Promise<IngestCapabilityGrant> {
+    return (await this.request('POST', '/api/runner-ingest/capability', input)) as IngestCapabilityGrant;
+  }
+
+  /**
+   * Send RUN-230's verification report — `POST /api/runs/:runId/verification-report`, the
+   * ordinary agentAuth run surface (planar's own locked decision: capability tokens are for BULK
+   * payloads, this is small and belongs where every other run-scoped agent action already lives).
+   *
+   * Deliberately bypasses `request()`'s Authorization header: that always sends THIS client's own
+   * token (the daemon's), but the server's gate here is `conn.boundAgent.id === run.agentId` —
+   * only a token minted for the run's own agent identity (`RunAgent.token`, from
+   * `createRunAgent`) can satisfy it. `agentToken` is the caller's, never this client's `getToken`.
+   */
+  async reportVerification(
+    runId: string,
+    agentToken: string,
+    report: VerificationReportWire,
+  ): Promise<VerificationReportResult> {
+    const pathname = `/api/runs/${runId}/verification-report`;
+    const res = await this.fetchImpl(`${this.base}${pathname}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${agentToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+    });
+    const text = await res.text();
+    if (!res.ok)
+      throw new NoriqHttpError(`POST ${pathname} → ${res.status}: ${text.slice(0, 500)}`, res.status, text);
+    return text
+      ? (JSON.parse(text) as VerificationReportResult)
+      : { applied: 0, skipped: 0, touchedMemoryIds: [] };
   }
 }

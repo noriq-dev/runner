@@ -29,6 +29,16 @@ export interface SteerResult {
   detail: string | null;
 }
 
+/** `SteerResult` plus the one fact its own return omits — what kind of steer this was (RUN-225).
+ *  The DELIVERY outcome is the observation, not the arrival: a steer that reached zero sessions is
+ *  distinguishable from one `pushInput` accepted, which `SteerResult.delivered` already carries —
+ *  this just keeps `mode` alongside it for the episode text (`episode.ts`'s formatter), since a
+ *  dropped `hard` (a re-scope nobody saw) and a dropped `soft` (a nudge nobody saw) read
+ *  differently to a human. */
+export interface DeliveredSteer extends SteerResult {
+  mode: SteerMode;
+}
+
 /**
  * Canonical mapping from a Noriq comment/event kind to a steer mode — the source
  * of the `mode` carried on the wire. Priority bumps and scope redirects hard-
@@ -86,6 +96,17 @@ export class SteeringBridge {
    * accumulates one entry per cancelled run forever.
    */
   private readonly cancelled = new Set<string>();
+  /**
+   * Every `applySteer` outcome this run has produced, since its last drain (RUN-225) — the
+   * daemon's own observation of DELIVERY, not the server's independent `steers` table read. Kept
+   * here rather than on `RunPipeline`: a steer can land during `execute`, before the pipeline
+   * object exists at all (`afterDriver` builds it only once the driver stops talking), and this
+   * bridge is the one thing already alive for the whole sitting AND reachable from both the
+   * ws-client's steer handler (outside the supervisor entirely) and `settle` (through `StageHost`).
+   * Drained by `steeringHistory`, not merely read, for the same reason `cancelled` is dropped by
+   * `forget`: a long-lived daemon must not accumulate one entry per run forever.
+   */
+  private readonly delivered = new Map<string, DeliveredSteer[]>();
   private readonly log: typeof defaultLogger;
   private readonly interruptGraceMs: number;
 
@@ -236,11 +257,19 @@ export class SteeringBridge {
    * result the caller acks back to Noriq (dedup / notices fallback: RUN-17).
    */
   async applySteer(steer: Steer): Promise<SteerResult> {
+    // Recorded through every exit of this method (RUN-225) — `record` wraps the return value
+    // rather than each `return` site duplicating the push, so a future exit path cannot forget it.
+    const record = (r: SteerResult): SteerResult => {
+      const history = this.delivered.get(steer.runId) ?? [];
+      history.push({ ...r, mode: steer.mode });
+      this.delivered.set(steer.runId, history);
+      return r;
+    };
     const base = { steerId: steer.steerId, runId: steer.runId, noticeCursor: steer.noticeCursor ?? null };
     const sessions = [...(this.targets.get(steer.runId)?.values() ?? [])];
     if (sessions.length === 0) {
       // No live process → can't inject; the MCP notices block is the fallback.
-      return { ...base, delivered: false, via: 'dropped', detail: 'no live run for steer' };
+      return record({ ...base, delivered: false, via: 'dropped', detail: 'no live run for steer' });
     }
     // A steer names the RUN, and the wire carries no session address — so on a decomposed run
     // whose wave holds several live sessions (RUN-170) it is delivered to every one of them.
@@ -274,13 +303,27 @@ export class SteeringBridge {
     );
     if (delivered > 0) {
       this.log.info('steer delivered', { runId: steer.runId, mode: steer.mode, sessions: delivered });
-      return { ...base, delivered: true, via: 'runtime', detail: null };
+      return record({ ...base, delivered: true, via: 'runtime', detail: null });
     }
-    if (errs.length > 0) return { ...base, delivered: false, via: 'fallback', detail: errs[0]!.message };
+    if (errs.length > 0) {
+      return record({ ...base, delivered: false, via: 'fallback', detail: errs[0]!.message });
+    }
     this.log.warn('steer arrived after the session closed — leaving it to the notices fallback', {
       runId: steer.runId,
       mode: steer.mode,
     });
-    return { ...base, delivered: false, via: 'dropped', detail: 'session input closed' };
+    return record({ ...base, delivered: false, via: 'dropped', detail: 'session input closed' });
+  }
+
+  /**
+   * Drain this run's delivery observations (RUN-225) — called once, from `settle`, so the daemon
+   * never accumulates history for a run that already reported. A run whose sitting saw no steers
+   * gets `[]`, indistinguishable from "no steering bridge wired at all" — both are the honest
+   * "nothing observed" answer `episode.ts` records as an empty `steeringEvents`.
+   */
+  steeringHistory(runId: string): DeliveredSteer[] {
+    const history = this.delivered.get(runId) ?? [];
+    this.delivered.delete(runId);
+    return history;
   }
 }

@@ -2,7 +2,7 @@
 
 MODE: PLAN CHECK (read-only). You are judging a PLAN, not a diff. Nothing has been built yet, which is the point: every error you find here costs a paragraph to fix, and the same error found after the build costs the build.
 
-You have read access to this repo's workspace and nothing else — no Noriq tools, no way to change anything. Your entire output is the report below.{{context}}
+You have read access to this repo's workspace and nothing else — no Noriq tools, no way to change anything. Your entire output is the report below.{{context}}{{memory}}
 
 The task this plan is for:
 

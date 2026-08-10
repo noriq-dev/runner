@@ -12,10 +12,189 @@ export {
   type DiscoveredRepo,
   discoverRepos,
   legacyNetworkKinds,
+  loadIndexConfig,
   loadManifest,
   manifestPath,
   repoId,
 } from './discovery';
+export {
+  INDEX_LANGUAGES,
+  IndexContentMode,
+  IndexPolicy,
+  refuseIndexGlob,
+  resolveIndexConfig,
+  type IndexLanguage,
+  type ResolvedIndexConfig,
+} from './index-policy';
+export { isDeniedIndexPath } from './index-deny';
+export {
+  MAX_STATUS_RECORDS,
+  scanIndexSource,
+  scanRepoForIndex,
+  type IndexFileCandidate,
+  type IndexFileCandidateFull,
+  type IndexFileCandidateMetadata,
+  type IndexScanDeps,
+  type IndexScanResult,
+  type IndexStatusReason,
+  type IndexStatusRecord,
+} from './index-scan';
+export {
+  FakeIndexSource,
+  FilesystemIndexSource,
+  comparePaths,
+  type FakeIndexSourceItem,
+  type FakeIndexSourceReadOverrides,
+  type IndexSource,
+  type IndexSourceEntry,
+  type IndexSourceListItem,
+  type IndexSourceReadOutcome,
+  type IndexSourceRefusalReason,
+  type ShouldDescend,
+} from './index-source';
+// The indexer proper (RUN-215): identity, the adapter registry RUN-216/217/218 plug into, the
+// deterministic batch model, and the orchestrator. Both RUN-215 and RUN-220 ran in parallel and
+// were fenced off this file to avoid conflicting on one import block, so their exports land here.
+export {
+  DiagnosticsCollector,
+  MAX_PARSE_DIAGNOSTICS,
+  buildFileEntityUri,
+  buildSymbolEntityUri,
+  computeDeletions,
+  decodeSymbolPath,
+  decodeUriPath,
+  dedupeSymbolPaths,
+  encodeSymbolPath,
+  encodeUriPath,
+  normalizeRepoPath,
+  type EdgeRecord,
+  type EntityRecord,
+  type IndexDiagnostic,
+  type IndexRecord,
+  type SymbolLikeKind,
+  type UriScope,
+} from './index-entity';
+export {
+  IndexAdapterRegistry,
+  NOOP_ADAPTER,
+  createDefaultAdapterRegistry,
+  type AdapterParseInput,
+  type AdapterParseResult,
+  type EdgeConfidence,
+  type IndexParserAdapter,
+  type ParsedCall,
+  type ParsedDiagnostic,
+  type ParsedImport,
+  type ParsedReference,
+  type ParsedSymbol,
+  type SymbolNodeType,
+} from './index-adapters';
+export {
+  TreeSitterRuntime,
+  grammarIdForPath,
+  loadGrammarBytes,
+  type GrammarId,
+  type TreeSitterRuntimeStats,
+} from './treesitter-runtime';
+export {
+  createTreeSitterAdapter,
+  createTreeSitterAdapterRegistry,
+  createCppTreeSitterAdapter,
+  createIniTreeSitterAdapter,
+  blankCppMacroNoise,
+} from './index-treesitter';
+// The `[index].languages` gate (RUN-219) — the ONE place that filters an adapter into (or out of)
+// a registry by policy; `index-repo` and `index-selftest` both build their registry through this,
+// so they cannot silently disagree about which adapters exist.
+export { buildIndexAdapterRegistry, type BuiltIndexAdapterRegistry } from './index-registry';
+// The local debug CLI's own pure report/render/determinism layer (RUN-219) — see `index-repo.ts`
+// for the orchestrator that actually calls `runIndexer` and hands this module the result.
+export {
+  DEFAULT_DEBUG_LIMIT,
+  DEBUG_CONTENT_PREVIEW_CHARS,
+  bounded,
+  buildDebugReport,
+  compareGenerations,
+  displaySafeContent,
+  renderDebugReport,
+  type BoundedList,
+  type BuildDebugReportOptions,
+  type DeterminismCheck,
+  type EdgeView,
+  type EntityView,
+  type IndexDebugReport,
+} from './index-debug';
+export {
+  buildIndexRepoReport,
+  buildVcsIgnoredPredicate,
+  checkIndexRepoDeterminism,
+  resolveIndexRepoConfig,
+  runIndexRepo,
+  type IndexRepoConfigSource,
+  type IndexRepoOptions,
+  type IndexRepoRun,
+  type VcsIgnoreWalkDeps,
+} from './index-repo';
+export {
+  MAX_INGEST_BATCH_BYTES,
+  IndexInterrupted,
+  assembleManifest,
+  computeBatchHash,
+  computeContentHash,
+  cooperativeCheckpoint,
+  deriveGenerationId,
+  encodeBatches,
+  recordIdentity,
+  sortRecords,
+  toStagedRow,
+  type AssembleManifestInput,
+  type CooperativeDeps,
+  type EncodeBatchesOptions,
+  type EncodedBatch,
+  type GenerationIdentity,
+  type IndexInterruptReason,
+  type StagedEdgeRow,
+  type StagedNodeRow,
+  type StagedRow,
+} from './index-batch';
+export {
+  runIndexer,
+  type IndexPhase,
+  type IndexRunTarget,
+  type IndexerDeps,
+  type IndexerResult,
+} from './indexer';
+export {
+  IngestError,
+  IngestUpload,
+  openIngestUpload,
+  type BeginEpisodeIngestInput,
+  type BeginIndexIngestInput,
+  type IngestBatchResult,
+  type IngestCompleteEpisodeResult,
+  type IngestCompleteIndexResult,
+  type IngestFailureReason,
+  type IngestPurpose,
+  type IngestStatusResult,
+} from './ingest-client';
+// The two backend-native sources (RUN-254/255). Neither materializes a tree — Perforce reads the
+// depot with no client workspace, Diversion reads its REST API with no checkout — so they are the
+// reason `IndexSnapshot.source` exists at all. On the surface because RUN-214's coordinator is the
+// first caller that has to construct one, and a public symbol reachable only through its own
+// backend is a symbol the next subsystem re-exports by hand.
+export {
+  PerforceDepotIndexSource,
+  realP4RawCli,
+  stripDepotPrefix,
+  type P4RawCli,
+  type PerforceDepotIndexSourceOpts,
+} from './vcs/perforce-index-source';
+export {
+  DiversionIndexSource,
+  decodeObjectStatus,
+  isDirectoryMode,
+  type DvChangeVerb,
+} from './vcs/diversion-index-source';
 export { ManifestStore, changedSections, type ManifestStoreDeps } from './manifest-store';
 export {
   DEFAULT_TOKEN_PATH,
@@ -104,6 +283,7 @@ export {
   parseFindingResponses,
   applyContestResponses,
   buildLedger,
+  effectiveStatus,
   reconciledEntry,
   renderContestRecord,
   renderLedger,
@@ -144,7 +324,15 @@ export {
   type LandChoices,
   type ManifestChoices,
 } from './init-project';
-export { COMMANDS, FILE_SENTINEL, completionCandidates, completionScript } from './completion';
+export {
+  COMMAND_TABLE,
+  COMMANDS,
+  FILE_SENTINEL,
+  completionCandidates,
+  completionScript,
+  formatCommandTable,
+} from './completion';
+export type { CommandSpec } from './completion';
 export {
   BUILTIN_WORKFLOWS,
   type StageCoordinateKey,
@@ -181,10 +369,58 @@ export {
 } from './registration';
 export {
   NoriqClient,
+  NoriqHttpError,
+  type IngestCapabilityGrant,
+  type MintIngestCapabilityInput,
   type NoriqClientOptions,
   type RegisteredRunner,
   type HeartbeatInput,
 } from './client';
+export {
+  INDEXER_VERSION,
+  associationNotice,
+  reconcile,
+  type IndexReconcileOutcome,
+  type ReconcileInput,
+} from './index-reconcile';
+export {
+  DEFAULT_JOURNAL_PATH,
+  IndexJournal,
+  fileJournalStore,
+  type IndexJournalEntry,
+  type IndexJournalKey,
+  type JournalStore,
+} from './index-journal';
+// Local staging + the upload phase itself (RUN-221) — the journal above records job/batch
+// progress; these two land alongside it as the disposable on-disk copy and the orchestration
+// that drives begin/batch/complete resumably against it. Neither has a caller in `daemon.ts` yet
+// (RUN-222 owns wiring a trigger to reach them) — see VENDORED-CONTRACT.md's phase list.
+export {
+  DEFAULT_STAGING_ROOT,
+  fileStagingStore,
+  stagingDirFor,
+  stagingId,
+  sweepOrphanedStaging,
+  type StagingStore,
+} from './index-stage';
+export {
+  DEFAULT_MAX_STAGED_BYTES,
+  MAX_LOGGED_VALIDATION_PROBLEMS,
+  boundedValidationProblems,
+  uploadGeneration,
+  type UploadGenerationDeps,
+  type UploadGenerationInput,
+  type UploadOutcome,
+  type UploadProgress,
+} from './index-upload';
+export {
+  IndexCoordinator,
+  type IndexCoordinatorDeps,
+  type IndexTarget,
+  type IndexWorkContext,
+  type IndexWorkOutcome,
+  type IndexWorkStep,
+} from './index-coordinator';
 export {
   WsClient,
   runnerWsUrl,
@@ -336,6 +572,56 @@ export {
   type AcceptanceReport,
 } from './acceptance';
 export { buildRepairSpec, renderRepairSpec, type RepairSpec } from './repair';
+export { buildEpisode, deriveEpisodeScopeId, normalizeSeverity, type EpisodeExtra } from './episode';
+export {
+  requestSelfSummary,
+  SELF_SUMMARY_TIMEOUT_MS,
+  SELF_SUMMARY_OUTPUT_CAP,
+  type SelfSummaryContext,
+} from './episode-summary';
+export {
+  DEFAULT_PENDING_EPISODE_PATH,
+  DEFAULT_MAX_PENDING,
+  DEFAULT_MAX_PENDING_AGE_HOURS,
+  EpisodePendingStore,
+  filePendingEpisodeStore,
+  trimPending,
+  type PendingEpisode,
+  type PendingEpisodeFileStore,
+} from './episode-pending';
+export {
+  deliverEpisode,
+  drainPendingEpisodes,
+  uploadEpisode,
+  type EpisodeDeliveryDeps,
+  type UploadEpisodeDeps,
+  type UploadEpisodeInput,
+  type UploadEpisodeOutcome,
+} from './episode-upload';
+export {
+  DEFAULT_PENDING_VERIFICATION_PATH,
+  DEFAULT_MAX_PENDING_VERIFICATION,
+  DEFAULT_MAX_PENDING_VERIFICATION_AGE_HOURS,
+  VerificationPendingStore,
+  filePendingVerificationStore,
+  trimPendingVerification,
+  type PendingVerificationReport,
+  type PendingVerificationFileStore,
+} from './verification-pending';
+export {
+  VERIFICATION_REPORT_SOURCE,
+  buildVerificationReport,
+  deliverVerificationReport,
+  drainPendingVerificationReports,
+  evidenceHash,
+  sendVerificationReport,
+  type VerificationReportContext,
+  type VerificationReportCitationWire,
+  type VerificationReportDeliveryDeps,
+  type VerificationReportOutcome,
+  type VerificationReportResult,
+  type VerificationReportWire,
+} from './verification-report';
 export {
   checkSteps,
   planWaves,
@@ -356,6 +642,10 @@ export {
   type ReviewerPromptContext,
 } from './verify-reviewer';
 export type {
+  ChangesBetweenResult,
+  IgnoreQueryResult,
+  IndexSnapshot,
+  IndexSnapshotResult,
   IntegrateResult,
   LeaseOptions,
   LockContext,
@@ -398,7 +688,9 @@ export {
   dvMergeUrl,
   dvStoredToken,
   realDvHttp,
+  realDvBlobHttp,
   type DiversionBackendOpts,
+  type DvBlobHttp,
   type DvCli,
   type DvHttp,
   type DvHttpResponse,
@@ -411,8 +703,81 @@ export {
   comparableWorktreePath,
   DEFAULT_WORKTREES_DIR,
   WORKTREE_BRANCH_PREFIX,
+  CHANGES_BETWEEN_MAX_PATHS,
   type WorktreeInfo,
   type CreateWorktreeOptions,
   type GitRunner,
+  type IndexSnapshotHandle,
 } from './worktree';
 export * from './repo-intel';
+export {
+  RepositoryKey,
+  ContextPack,
+  parseRepositoryKey,
+  type AuthorityLevel,
+  type BaseId,
+  type BranchRef,
+  type ContextPackCitation,
+  type ContextPackCoverage,
+  type ContextPackEpisodeExcerpt,
+  type ContextPackExcerpt,
+  type ContextPackGraphEntity,
+  type ContextPackMemoryExcerpt,
+  type ContextPackMode,
+  type ContextPackNotice,
+  type ContextPackRole,
+  type ContextPackSection,
+  type ContextPackSectionId,
+  type ContextPackTaskFacts,
+  type EffortEpisode,
+  type EpisodeFinding,
+  type EpisodeLandingOutcome,
+  type EpisodeSelfSummary,
+  type EpisodeTimelineEntry,
+  type EvidenceRef,
+  type IndexBatch,
+  type IndexGenerationManifest,
+  type MemoryItem,
+  type MemoryKind,
+  type ParseRepositoryKeyResult,
+  type RunnerCheckoutId,
+  type VerificationState,
+} from './memory-contract';
+export {
+  RunnerIndexCursor,
+  type RunnerCheckoutAssociationState,
+  type RunnerIndexGeneration,
+  type RunnerStagedGeneration,
+} from './memory-contract';
+export {
+  CONTEXT_PACK_TIMEOUT_MS,
+  retrieveContextPack,
+  summarizeContextPackRetrieval,
+  type ContextPackFetcher,
+  type ContextPackInquiry,
+  type ContextPackOmission,
+  type ContextPackRequest,
+  type ContextPackRetrieval,
+} from './context-pack';
+export {
+  MAX_CITATION_READ_BYTES,
+  readCitationFile,
+  summarizeCitationVerification,
+  verifyContextPack,
+  type CitationFileRead,
+  type CitationFileReader,
+  type CitationVerdict,
+  type CitationVerificationSummary,
+  type CitationVerifyContext,
+  type VerifiedCitation,
+  type VerifiedContextPack,
+  type VerifiedContextPackExcerpt,
+  type VerifiedContextPackSection,
+} from './citation-verify';
+export {
+  MEMORY_AUTHOR_MAX_CHARS,
+  MEMORY_REVIEWER_MAX_CHARS,
+  renderMemoryEvidence,
+  suggestedMemoryPaths,
+  type MemoryAudience,
+} from './memory-render';

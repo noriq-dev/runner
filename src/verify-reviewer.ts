@@ -63,6 +63,12 @@ export interface ReviewerPromptContext {
   /** Criteria the spec named that did not fit the checklist — said out loud, because a list that
    *  silently stops reads as a contract that happens to be short. */
   acceptanceOverflow?: number;
+  /** The verified context pack, rendered through the reviewer-audience quoted-evidence frame
+   *  (RUN-231, `memory-render.ts`) — same posture as `repoContext` above: evidence the reviewer
+   *  weighs, never instructions it follows. Empty/absent → renders nothing. Placed alongside
+   *  `{{context}}` in the template, ahead of the acceptance/verdict instructions, so this
+   *  daemon's own rules stay the last word over anything a stored memory or episode says. */
+  memory?: string;
   /**
    * The requirement ids this work is traceable to (RUN-147), so a finding can name what it
    * threatens. Empty/absent → the reviewer is never asked to tag, and the ledger keys on prose
@@ -152,6 +158,7 @@ export function assembleReviewerPrompt(ctx: ReviewerPromptContext): string {
     verifyPending: ctx.verifyPending ?? null,
     intent: ctx.intent,
     context: ctx.repoContext ?? '',
+    memory: ctx.memory ?? '',
     priorAdjudications: ctx.ledger?.length ? renderLedger(ctx.ledger) : null,
     acceptance: ctx.acceptance?.length
       ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)

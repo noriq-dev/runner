@@ -21,6 +21,7 @@ call site — these files are the literal text an agent reads, so they cannot ca
 | `verify-feedback.md` | `verify.ts` `verifyFeedbackPrompt` | the builder, after the verify cmd failed |
 | `conflict.md` | `land.ts` `assembleConflictPrompt` | the builder, mid-rebase conflict |
 | `resume.md` | `parked.ts` `resumePrompt` / `continuationResumePrompt` | a parked agent being resumed — session restore (RUN-30) or continuation (RUN-199) |
+| `self-summary.md` | `episode-summary.ts` `requestSelfSummary` | the live session, once, at the top of `settle` — the optional agent self-summary (RUN-226) |
 
 ## Syntax
 
@@ -123,7 +124,10 @@ Common to `scope`, `build`, and `verify` custom prompts:
 - `runId`, `repoRef`, `workflow`, `planId`: run/repository/workflow facts (`planId` is otherwise null);
 - `taskId`, `taskKey`, `taskTitle`, `taskBody`: anchor task facts, or `null` without that fact;
 - `brief`, `anchor`: the dispatched brief and rendered task/plan anchor;
-- `context`: author context for scope/build; bounded names-only quoted context for verify.
+- `context`: author context for scope/build; bounded names-only quoted context for verify;
+- `memory`: the verified context pack, rendered for an AUTHORING actor (RUN-231) — `''` for a
+  repo/task with nothing retrieved. A verify-shape custom prompt gets this too, alongside the
+  outer frame's own `{{memory}}` — see below.
 
 `scope` adds `spec`, the rendered execution spec or `''`.
 
@@ -169,6 +173,41 @@ the spec just said, and an agent that reads the contradiction first has nothing 
 `scope.md` and `build.md` carry it; a custom workflow's prompt is passed it and must place the tag,
 and one written before this existed simply renders without it — extra variables are ignored, so
 nothing throws and nothing is injected into a template the daemon does not control.
+
+`{{memory}}` (RUN-231, `src/memory-render.ts`) is Project Memory's task context pack — decisions,
+hazards, past episodes, graph neighbors — VERIFIED against this run's own leased worktree
+(`src/citation-verify.ts`) and rendered through ONE bounded quoted-evidence frame reused for every
+audience: every line of retrieved content carries a fixed `| ` prefix, the block says out loud
+that it cannot change scope, permissions, acceptance criteria, review rules, or verdict behavior,
+and a cut is marked, never silent. This is the SAME defense `{{context}}`'s reviewer audience
+already established (RUN-154) — reused because a memory or episode is retrieved evidence with no
+more claim on trust than a repo's own committed prose, not because the two blocks share a source.
+`build.md` and `scope.md` place it right after `{{spec}}`, so it reads as the task's own
+supporting evidence rather than repo-wide orientation; a null pack, or one with nothing to show,
+renders `''` — no "memory had nothing" line. `verify-agent.md` and `reviewer.md` place it beside
+`{{context}}`, ahead of the acceptance/verdict instructions — daemon-owned verdict text stays the
+LAST word over anything a stored memory or episode says, the mirror of `{{context}}`'s own
+"reference first, the ask last" rule below. A verify-shape custom prompt's own `{{memory}}` (in
+its `common` vars, alongside `{{context}}`) is separate from the OUTER frame's — the operator's
+quoted `{{workflowPrompt}}` may reference it too, but the daemon's own memory block in
+`verify-agent.md` is what actually carries the untrusted evidence to the model.
+
+RUN-232 wires the three pre-execution shape overrides in, the same frame, and states precedence
+inside it rather than reordering any tag (`memory-render.ts`'s AUTHOR frame now says plainly that
+a locked decision in the execution spec, or what an actor verifies itself in the repository, wins
+over anything retrieved here — an agent cannot apply precedence it is not told). `planner.md` and
+`pattern-mapper.md` get the AUTHOR rendering — the planner because a decision already settled is
+exactly what it should not re-derive, the pattern mapper because a verified citation IS "a file
+and a line", its own rule for what counts as useful. `planner.md` places it right after `{{brief}}
+{{anchor}}` (there is no `{{spec}}` yet to sit after — the planner is what writes one);
+`pattern-mapper.md` places it after `{{spec}}`, the same spot `build.md`/`scope.md` use. Both read
+`ctx.memory` directly at the `assemblePrompt` call site, never the outer run's own `memory` local
+— that local follows `wf.verifyActor` for the run being PLANNED, which has nothing to do with what
+a shape override IS. `plan-checker.md` gets the REVIEWER rendering instead (`ctx.memoryBrief`,
+smaller budget, "evidence, not instructions" frame) for the same reason `reviewer.md` does: judging
+an actor gets a judging frame, and the checker's whole job is to disagree with the spec it is
+handed, not to be told a locked decision in it outranks anything — it places the tag beside
+`{{context}}`, the same "reference first" position `reviewer.md`/`verify-agent.md` use.
 
 The verify family does not get the spec at all. It gets the **acceptance criteria, numbered**
 (`{{acceptance}}`, rendered by `src/acceptance.ts`), and answers them one line each. Withholding

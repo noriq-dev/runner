@@ -312,6 +312,162 @@ describe('CodexDriver', () => {
   });
 });
 
+// RUN-200: a codex build's gate had no repair loop because the session died at turn one —
+// `reviewWithFeedback` bails when `!ctx.session.continueWith`, and every codex session offered
+// none. These pin the fix: multiTurn keeps the session (and the fake transport) alive past the
+// first turn/completed, continueWith posts a second turn on the SAME live transport, and a
+// non-multiTurn session is provably unchanged (the tests above already cover that; this block
+// only adds the one new assertion — no continueWith — that distinguishes it).
+describe('CodexDriver multiTurn / continueWith (RUN-200)', () => {
+  it('a non-multiTurn session offers no continueWith — unchanged from before RUN-200', async () => {
+    const h = harness();
+    expect(h.session.continueWith).toBeUndefined();
+    h.getFake().push({ type: 'turn_complete' });
+    await h.session.done();
+  });
+
+  it('multiTurn exposes continueWith and survives its first turn/completed instead of tearing down', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    expect(fake.turns).toEqual(['do the thing']);
+    fake.push({ type: 'turn_complete' });
+    const firstExit = await h.session.done();
+    expect(firstExit.outcome).toBe('done');
+    // The root cause this ticket fixes: finish() used to close the transport unconditionally on
+    // the first turn/completed. Under multiTurn it must not — nothing else would ever be able to
+    // post a second turn/start.
+    expect(fake.closed).toBe(false);
+    expect(h.session.continueWith).toBeInstanceOf(Function);
+  });
+
+  it('continueWith posts a second turn on the SAME live transport and resolves independently of done()', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'turn_complete' });
+    const firstExit = await h.session.done();
+
+    const turn = h.session.continueWith?.('please fix the finding');
+    // Sent immediately (synchronously) — the same transport instance, i.e. the same live thread,
+    // not a fresh spawnCodex() call (there is only ever one `fake` per harness()).
+    expect(fake.turns).toEqual(['do the thing', 'please fix the finding']);
+    fake.push({ type: 'text', text: 'fixed it' });
+    fake.push({ type: 'turn_complete' });
+    const secondExit = await turn;
+    expect(secondExit).toMatchObject({ outcome: 'done', isError: false });
+    // done() is one-shot — it already settled on the FIRST turn and must not have been re-armed
+    // or overwritten by the second.
+    expect(await h.session.done()).toBe(firstExit);
+    expect(h.texts).toContain('fixed it');
+
+    // The caller owns teardown now (RUN-200's contract): nothing closes the process until stop().
+    expect(fake.closed).toBe(false);
+    await h.session.stop();
+    expect(fake.closed).toBe(true);
+  });
+
+  it("does not double-count the first turn's cumulative usage into the second (RUN-200)", async () => {
+    // The app-server's tokenUsage.total is cumulative for the whole THREAD, across every turn —
+    // so a second turn's total already includes the first's, and the driver must go on setting
+    // (not accumulating) or a fix round's spend would be double-counted against the run's budget.
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'usage', inputTokens: 100, outputTokens: 20, cacheReadTokens: 5 });
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+
+    const turn = h.session.continueWith?.('fix it');
+    // The thread's own cumulative total after the second turn — NOT 100+250.
+    fake.push({ type: 'usage', inputTokens: 250, outputTokens: 60, cacheReadTokens: 5 });
+    fake.push({ type: 'turn_complete' });
+    const exit = await turn;
+    expect(exit?.telemetry).toMatchObject({ inputTokens: 250, outputTokens: 60, cacheReadTokens: 5 });
+    expect(h.telemetry.at(-1)).toMatchObject({ inputTokens: 250, outputTokens: 60, cacheReadTokens: 5 });
+  });
+
+  it('rejects an overlapping continueWith rather than losing one turn silently', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+
+    const first = h.session.continueWith?.('turn A');
+    const second = h.session.continueWith?.('turn B');
+    await expect(second).rejects.toThrow('already in flight');
+    fake.push({ type: 'turn_complete' });
+    await expect(first).resolves.toMatchObject({ outcome: 'done' });
+  });
+
+  it('an honest failure — never a fabricated success — when the process is already torn down', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+    await h.session.stop();
+    expect(fake.closed).toBe(true);
+    await expect(h.session.continueWith?.('too late')).rejects.toThrow();
+  });
+
+  it('an honest failure when the FIRST turn never actually completed', async () => {
+    // multiTurn keeps the process alive even past a failed first turn (finish() only tears down
+    // when !multiTurn) — so continueWith must recognize a thread with no successful foundation
+    // rather than posting a turn/start and waiting forever for a turn/completed that a broken
+    // thread will never send.
+    const h = harness({ multiTurn: true });
+    h.getFake().push({ type: 'error', message: 'sandbox denied write' });
+    const firstExit = await h.session.done();
+    expect(firstExit.outcome).toBe('failed');
+    await expect(h.session.continueWith?.('try again')).rejects.toThrow('no live codex thread');
+  });
+
+  it('stop() mid hand-back fails the pending turn instead of hanging it forever', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'turn_complete' });
+    await h.session.done();
+
+    const turn = h.session.continueWith?.('fix it');
+    await h.session.stop();
+    expect(fake.closed).toBe(true);
+    await expect(turn).resolves.toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('a stream that ends mid hand-back fails the pending turn, not done() again', async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({ type: 'turn_complete' });
+    const firstExit = await h.session.done();
+
+    const turn = h.session.continueWith?.('fix it');
+    fake.events.close(); // the process died mid-turn, with nobody having called stop()
+    await expect(turn).resolves.toMatchObject({
+      outcome: 'failed',
+      reason: 'codex stream ended without completing a turn',
+    });
+    // done() is unaffected — still the first turn's exit.
+    expect(await h.session.done()).toBe(firstExit);
+  });
+
+  it('a silent hang mid hand-back is torn down and fails the pending turn (RUN-201 x RUN-200)', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ multiTurn: true });
+      const fake = h.getFake();
+      fake.push({ type: 'turn_complete' });
+      await h.session.done();
+
+      const turn = h.session.continueWith?.('fix it');
+      await vi.advanceTimersByTimeAsync(CODEX_SILENCE_TEARDOWN_MS + 1);
+      expect(fake.closed).toBe(true);
+      await expect(turn).resolves.toMatchObject({
+        outcome: 'failed',
+        reason: expect.stringContaining('silent'),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 /** A stand-in for the spawned `codex app-server` child: real streams (createInterface
  *  needs one), a recording stdin, and hand-fired lifecycle events. */
 function makeFakeChild(writes: string[]) {
@@ -423,6 +579,34 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const turn = writes.find((w) => w.includes('turn/start'));
     expect(turn).toBeTruthy();
     expect(JSON.parse(turn as string).params.threadId).toBe('th_144');
+  });
+
+  it('a SECOND sendUserTurn — the continueWith mechanism (RUN-200) — posts turn/start on the SAME threadId', async () => {
+    // The whole mechanism the fix rests on: `continueWith` is nothing but a second call to the
+    // transport's `sendUserTurn` once the thread already exists, so it must post a real second
+    // `turn/start` request against the SAME threadId — not a resume, not a fresh thread/start.
+    const { defaultSpawnCodex } = await import('../src/drivers/codex');
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'workspace-write', approvalPolicy: 'never', kind: 'build' },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('do the work');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_live' } }));
+    await new Promise((r) => setImmediate(r));
+    const turnWrites = () => writes.filter((w) => w.includes('turn/start'));
+    expect(turnWrites()).toHaveLength(1);
+
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: {} }));
+    await new Promise((r) => setImmediate(r));
+
+    t.sendUserTurn('fix the finding'); // continueWith's own call, once the fake driver awaits it
+    expect(turnWrites()).toHaveLength(2);
+    const [first, second] = turnWrites().map((w) => JSON.parse(w));
+    expect(first.params.threadId).toBe('th_live');
+    expect(second.params.threadId).toBe('th_live'); // the SAME live thread, the fix's whole point
+    expect(second.params.input).toEqual([{ type: 'text', text: 'fix the finding' }]);
   });
 
   it('a rejected STEER is a shrug, not a verdict — the run keeps going (RUN-72)', async () => {

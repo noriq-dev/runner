@@ -26,6 +26,25 @@ import path from 'node:path';
  *
  * Local and machine-scoped, under `~/.noriq/`. It is never committed, never uploaded, and holds
  * only what a read of the repo would tell you anyway.
+ *
+ * **Two origins, one contract (RUN-233) — and only one of them has a writer.** Every entry is
+ * LEARNED: written by a run that actually read the repo. The type admits a SEEDED origin, meaning
+ * an entry translated from elsewhere before any agent ran, and `getEntry` exposes which kind an
+ * entry is — but **nothing writes a seed today**, and that is a finding rather than an omission.
+ * RUN-233 set out to seed this cache from a verified Noriq context pack and found no honest target:
+ * a pack's verified facts are the PATHS a memory cited, which are not entry points, are already
+ * shown to the agent by `memory-render.ts` with their statements and verdicts, and would render
+ * here under a header promising notes from an earlier run at this commit. A cache also exists to
+ * avoid re-paying for expensive local derivation, and a pack is one bounded call every run makes
+ * anyway — so seeding would have cached something free in order to duplicate something already
+ * said, under a label that misdescribed it.
+ *
+ * What is kept is the RULE, because it is the part that would be got wrong later: a seed must never
+ * outrank what a run derives by reading the repo. Without the distinction, an entry written by
+ * anything other than a mapper would block the mapper's write AND win every render at that base
+ * forever, making a warm cache produce a worse brief than a cold one — the regression RUN-144's own
+ * comment records fixing once already. An on-disk entry with no marker reads as learned, which is
+ * what every existing one is.
  */
 
 /** What one run learned about a repo. Deliberately short: this is orientation, not a wiki, and a
@@ -41,13 +60,23 @@ export interface RepoFacts {
   testCommands: string[];
 }
 
+/** Which of the two ways an entry came to exist (RUN-233) — see this file's own top-of-file doc
+ *  for what the distinction buys. A cache key carries no history, so this is the only place that
+ *  memory lives, and it lives per-entry rather than per-file because a repo can hold a learned
+ *  entry at one base and, after the base moves, only a seed at the next. */
+export type RepoIntelOrigin = 'learned' | 'seeded';
+
 export interface RepoIntelEntry extends RepoFacts {
   /** The backend base these facts were derived from (`Workspace.baseId`). An opaque token: it is
    *  compared for equality and never parsed. */
   baseId: string;
-  /** When they were written. Informational — staleness is decided by `baseId`, never by age,
-   *  because a repo that has not moved has not gone stale however long it has been. */
+  /** When they were written (or seeded). Informational — staleness is decided by `baseId`, never
+   *  by age, because a repo that has not moved has not gone stale however long it has been. */
   learnedAt: string;
+  /** RUN-233. Absent on every entry written before this field existed, which `getEntry` reads as
+   *  `'learned'` (this file's own top-of-file doc: it was, and the absence of a marker must not
+   *  silently make old, real facts replaceable). */
+  origin?: RepoIntelOrigin;
 }
 
 /** The whole file: server → repo id → entry. */
@@ -133,16 +162,36 @@ export class RepoIntel {
    * A different base is a miss, not a stale hit with a warning. The alternative — returning older
    * facts and letting the caller judge — puts a "is this still true?" decision in front of an
    * agent, which is precisely the work this exists to save.
+   *
+   * Facts only, whichever origin wrote them — every caller before RUN-233, and every one since
+   * that only wants something to render rather than a policy input. `getEntry` is the same lookup
+   * plus the one thing this signature cannot carry without changing what every existing caller
+   * (and every test written against it) already gets back.
    */
   async get(repoId: string, baseId: string): Promise<RepoFacts | null> {
+    return (await this.getEntry(repoId, baseId))?.facts ?? null;
+  }
+
+  /**
+   * RUN-233: `get`, plus which origin wrote the entry — for the one caller that has to decide
+   * whether a fresh write may REPLACE what is here (`RepoIntelOrigin`'s own doc). A different base
+   * is a miss here too, for the identical reason `get` treats it as one.
+   */
+  async getEntry(
+    repoId: string,
+    baseId: string,
+  ): Promise<{ facts: RepoFacts; origin: RepoIntelOrigin } | null> {
     const file = await this.read();
     const entry = file[this.server]?.[repoId];
     if (!entry || entry.baseId !== baseId) return null;
     return {
-      entryPoints: entry.entryPoints,
-      layout: entry.layout,
-      conventions: entry.conventions,
-      testCommands: entry.testCommands,
+      facts: {
+        entryPoints: entry.entryPoints,
+        layout: entry.layout,
+        conventions: entry.conventions,
+        testCommands: entry.testCommands,
+      },
+      origin: entry.origin ?? 'learned',
     };
   }
 
@@ -161,7 +210,19 @@ export class RepoIntel {
     return typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as IntelFile) : {};
   }
 
-  async put(repoId: string, baseId: string, facts: RepoFacts): Promise<void> {
+  /**
+   * `origin` defaults to `'learned'` — the only kind a run that actually read the repo may write,
+   * and today the only kind written at all (see this module's own doc for why RUN-233 shipped no
+   * seeder). A future seeder passes `'seeded'` through THIS method rather than getting one of its
+   * own, because a second write path is how the precedence rule would drift from the one place that
+   * states it.
+   */
+  async put(
+    repoId: string,
+    baseId: string,
+    facts: RepoFacts,
+    origin: RepoIntelOrigin = 'learned',
+  ): Promise<void> {
     const trimmed: RepoFacts = {
       entryPoints: trim(facts.entryPoints),
       layout: trim(facts.layout),
@@ -171,7 +232,7 @@ export class RepoIntel {
     if (!hasFacts(trimmed)) return; // nothing learned is not worth a write
     const file = await this.read();
     const forServer = file[this.server] ?? {};
-    forServer[repoId] = { ...trimmed, baseId, learnedAt: new Date().toISOString() };
+    forServer[repoId] = { ...trimmed, baseId, learnedAt: new Date().toISOString(), origin };
     file[this.server] = forServer;
     await this.store.write(file);
   }

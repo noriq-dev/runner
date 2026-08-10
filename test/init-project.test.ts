@@ -64,6 +64,26 @@ describe('renderProjectManifest → a manifest the daemon actually accepts', () 
     expect(parsed.permissions.build.allow).toContain('Bash(npm test:*)');
   });
 
+  // RUN-208: neither field is curated by this wizard (a hand-edit only, like `board`), but a
+  // fresh marker still names both so a reader sees they exist without opening the example file —
+  // and, since they are only ever commented guidance here, the manifest still parses clean.
+  it('names repositoryKey and [index] as commented guidance, and still parses (RUN-208)', () => {
+    const toml = renderProjectManifest({
+      key: 'ACME',
+      tool: 'claude',
+      verifyCmd: 'npm run check',
+      landBranch: 'noriq/integration',
+      allow: ['Bash(npm test:*)'],
+    });
+    expect(toml).toMatch(/# repositoryKey = /);
+    expect(toml).toMatch(/# \[index\]/);
+    expect(toml).not.toMatch(/^repositoryKey\s*=/m); // never rendered as a live value
+    expect(toml).not.toMatch(/^\[index\]/m); // never rendered as a live table
+    const parsed = ProjectManifest.parse(parseToml(toml));
+    expect(parsed.repositoryKey).toBeNull();
+    expect(parsed.index).toBeNull();
+  });
+
   it('is valid at its most minimal — no tool, no verify, no land', () => {
     const parsed = ProjectManifest.parse(
       parseToml(

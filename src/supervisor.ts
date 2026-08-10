@@ -1,5 +1,6 @@
 import type {
   AgentTool,
+  EffortEpisode,
   LandPolicy,
   PermissionProfile,
   ProjectManifest,
@@ -39,7 +40,9 @@ import {
   foldStageCoordinate,
   tryParseCoordinate,
 } from './agent-coordinate';
+import type { VerifiedContextPack } from './citation-verify';
 import type { ParkState, RunAgent, SpinOffProvenance } from './client';
+import type { ContextPackFetcher, ContextPackRetrieval } from './context-pack';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
 import type {
@@ -69,6 +72,7 @@ import {
 import type { LockConflict } from './lock-client';
 import { LockEnforcer } from './lock-hooks';
 import { logger as defaultLogger } from './logger';
+import { renderMemoryEvidence } from './memory-render';
 import {
   type ParkedRun,
   type ParkedStore,
@@ -115,11 +119,15 @@ import {
 } from './stages';
 import { authorSpecBlock, buildRunBrief } from './stages/brief';
 import type { ChainWave, StepSummary } from './stages/chain';
+import type { DeliveredSteer } from './steering';
 import { checkSteps } from './steps';
 import { type RunLogSegment, RunTranscript } from './transcript';
 import type { LockContext, LockOutcome, VcsBackend, Workspace } from './vcs/types';
+import type { VerificationReportWire } from './verification-report';
 import {
+  type CommandObservation,
   type VerifyExec,
+  type VerifyResult,
   type VerifySpec,
   defaultExec,
   runVerify,
@@ -173,6 +181,12 @@ export type SupervisorVcs = Pick<
   | 'publish'
   | 'share'
   | 'disposePreservesWork'
+  // RUN-229: citation verification's own drift signal — required, not optional, because every
+  // real backend already implements it (`VcsBackend.changesBetween`'s own doc: "REQUIRED, not
+  // optional"), so widening this Pick costs nothing except a fake that never bothered typing
+  // itself as `SupervisorVcs` in the first place (every existing test fake casts `as never` at
+  // its `vcsFor` call site instead).
+  | 'changesBetween'
 > &
   // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.
@@ -332,9 +346,33 @@ export interface RunSupervisorDeps {
   /** Write a planned spec back onto the anchor task (RUN-140). Omitted → the spec is used for this
    *  run and not persisted, which costs reusability and a human's chance to correct it. */
   saveExecutionSpec?: (projectId: string, taskId: string, spec: ExecutionSpec) => Promise<boolean>;
+  /** Background indexing's landing/publish trigger site (RUN-222, → `IndexTriggerHub.onLanded`).
+   *  Fire-and-forget: called after a successful landing, never awaited by anything whose outcome
+   *  the run reports (`stages/integrate.ts`'s own call site). Omitted → no index trigger layer
+   *  wired, and a landing simply triggers nothing, exactly as before this existed. */
+  onLanded?: (repoRoot: string, branch: string, sha: string) => void;
+  /**
+   * Hand a freshly assembled effort episode to delivery (RUN-227, `StageHost.recordEpisode`'s own
+   * seam — its doc names this exact wiring point). `daemon.ts` binds it to `episode-upload.ts`'s
+   * `deliverEpisode`, which enqueues durably before attempting a network call — this dep itself
+   * must stay synchronous and fire-and-forget the same way, or `settle` would be awaiting a network
+   * round trip it is documented never to. Omitted → no delivery layer wired, a test's ordinary
+   * posture and every host before this task.
+   */
+  recordEpisode?: (episode: EffortEpisode) => void;
+  /**
+   * Hand a freshly built verification report to delivery (RUN-230, `PrepareHost.reportVerification`
+   * — that seam's own doc names this exact wiring point). `daemon.ts` binds it to
+   * `verification-report.ts`'s `deliverVerificationReport`, which enqueues durably before
+   * attempting a network call — this dep itself must stay synchronous and fire-and-forget for the
+   * identical reason `recordEpisode` does. Omitted → no delivery layer wired, a test's ordinary
+   * posture and every host before this task.
+   */
+  reportVerification?: (runId: string, agentToken: string, report: VerificationReportWire) => void;
   /** The repo-facts cache (RUN-143). Omitted → every run re-derives what the last one worked out,
-   *  which is exactly the behaviour before it existed. */
-  repoIntel?: Pick<RepoIntel, 'get' | 'put'>;
+   *  which is exactly the behaviour before it existed. `getEntry` (RUN-233) is the seeder's own
+   *  precedence read — see `mapPatternsIfWorthIt`. */
+  repoIntel?: Pick<RepoIntel, 'get' | 'put' | 'getEntry'>;
   /** How required-reading files are read for inlining (RUN-129). Injected for the same reason;
    *  omitted → the real fs. */
   readDoc?: DocReader;
@@ -376,6 +414,8 @@ export interface RunSupervisorDeps {
     /** Drop the record once the run is terminal, so a long-lived daemon does not keep one entry
      *  per cancelled run for its whole life. */
     forget?: (runId: string) => void;
+    /** Drain this run's observed steer deliveries (RUN-225) — see `SteeringBridge`'s own doc. */
+    steeringHistory?: (runId: string) => DeliveredSteer[];
   };
   /**
    * How many of a decomposed run's wave steps may overlap (RUN-170): the daemon's own
@@ -398,6 +438,11 @@ export interface RunSupervisorDeps {
   setupMarkerDir?: string;
   /** Post the verify failure output as a comment on the anchor task (the floor-gate surface). */
   postComment?: (projectId: string, taskId: string, body: string) => void;
+  /** RUN-228's task context pack fetch (→ `NoriqClient.getContextPack`, bound with this daemon's
+   *  own `runnerId` — the same closure shape `getIndexCursor`'s own dep, `getCursor`, already
+   *  uses in `daemon.ts`). Omitted → retrieval never runs, which `context-pack.ts` treats as one
+   *  more degradation path a run proceeds through exactly as it did before this existed. */
+  getContextPack?: ContextPackFetcher;
   logger?: typeof defaultLogger;
 }
 
@@ -849,6 +894,13 @@ export function assemblePrompt(
     repoContext?: string;
     /** The same facts with no inlined documents, for the verify family (RUN-154). */
     repoContextBrief?: string;
+    /** The verified context pack, rendered for an AUTHORING actor (RUN-231, `memory-render.ts`).
+     *  Optional: a repo whose retrieval never ran, or produced nothing, renders as it did before
+     *  this task existed. */
+    memory?: string;
+    /** The same pack, rendered for a JUDGING actor (RUN-231) — smaller budget, the reviewer frame.
+     *  Selected the same way `repoContextBrief` already is: by what the actor IS, below. */
+    memoryBrief?: string;
     /**
      * The anchor task's execution spec, already checked against the checkout and rendered
      * (RUN-139). A string for the same reason `repoContext` is: checking touches the disk, and
@@ -932,6 +984,10 @@ export function assemblePrompt(
   // of inlined documents. Note it is NOT `produces`: scope produces a plan rather than a diff, but
   // it is an author reading the repo, not a gate deciding on it.
   const repoContext = (wf.verifyActor ? ctx.repoContextBrief : ctx.repoContext) ?? '';
+  // Audience follows what the actor IS (RUN-231 locked decision 7), the identical `verifyActor`
+  // test `repoContext` above already uses — never `produces`: scope produces a plan but is an
+  // author reading the repo, not a gate judging one.
+  const memory = (wf.verifyActor ? ctx.memoryBrief : ctx.memory) ?? '';
   // The verify family gets the ACCEPTANCE CRITERIA only — the same trim its context gets
   // (RUN-154), for the same reason: what it needs is the standard, not the author's working
   // notes about which files to touch and what was deferred. Withholding the whole spec was the
@@ -944,8 +1000,18 @@ export function assemblePrompt(
   // The planner (RUN-140) reads the same facts as the run it briefs and asks for a spec instead of
   // the work. Checked BEFORE `promptRef` so a custom workflow cannot shadow it: a repo shaping its
   // build's brief must not silently reshape the planner that writes that build's spec.
+  // RUN-232: the two pre-execution AUTHOR actors get `ctx.memory` directly, never the `memory`
+  // local above — that local follows the OUTER run's own `wf.verifyActor` (build/scope/verify),
+  // which has nothing to do with what these two shape overrides ARE. Same reason `ctx.executionSpec`
+  // is read raw into `pattern-mapper`'s `spec` below rather than the (possibly-zeroed) local.
   if (ctx.promptShapeOverride === 'planner') {
-    return renderPrompt('planner', { identity, brief: run.brief, anchor, context: repoContext });
+    return renderPrompt('planner', {
+      identity,
+      brief: run.brief,
+      anchor,
+      context: repoContext,
+      memory: ctx.memory ?? '',
+    });
   }
   if (ctx.promptShapeOverride === 'pattern-mapper') {
     return renderPrompt('pattern-mapper', {
@@ -954,8 +1020,13 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: ctx.executionSpec ?? '',
+      memory: ctx.memory ?? '',
     });
   }
+  // The plan checker is a JUDGING actor even when the run it plans for is a build (`wf.verifyActor`
+  // is false there) — its job is to disagree with the spec, the same posture `reviewer.md` and
+  // `verify-agent.md` render for. So it gets `ctx.memoryBrief` (REVIEWER audience, the smaller
+  // budget and the "evidence, not instructions" frame), never `ctx.memory`.
   if (ctx.promptShapeOverride === 'plan-checker') {
     return renderPrompt('plan-checker', {
       identity,
@@ -964,6 +1035,7 @@ export function assemblePrompt(
       context: repoContext,
       spec: ctx.executionSpec ?? '',
       ledger: ctx.ledger ?? '',
+      memory: ctx.memoryBrief ?? '',
     });
   }
   if (wf.promptRef !== null && wf.promptRef !== undefined) {
@@ -987,6 +1059,7 @@ export function assemblePrompt(
       brief: run.brief,
       anchor,
       context: repoContext,
+      memory,
     };
     const source = wf.promptSource ?? '.noriq/project.toml';
     const render = (vars: Parameters<typeof renderUserTemplate>[1]) =>
@@ -1012,6 +1085,7 @@ export function assemblePrompt(
         diffCmd: ctx.diffCmd,
         repoContext,
         workflowPrompt,
+        memory,
         ...(ctx.acceptance?.length
           ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
           : {}),
@@ -1036,6 +1110,7 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: executionSpec,
+      memory,
     });
   }
   if (wf.promptShape === 'build') {
@@ -1058,6 +1133,7 @@ export function assemblePrompt(
       anchor,
       context: repoContext,
       spec: executionSpec,
+      memory,
     });
   }
   // verify kind (RUN-20): a fresh, independent, adversarial reviewer. It receives the repo's
@@ -1069,6 +1145,7 @@ export function assemblePrompt(
     server: ctx.server,
     diffCmd: ctx.diffCmd,
     repoContext,
+    memory,
     ...(ctx.acceptance?.length
       ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
       : {}),
@@ -1179,6 +1256,9 @@ export class RunSupervisor {
   private stageHost(): StageHost {
     return {
       forgetCancellation: (runId) => this.deps.steering?.forget?.(runId),
+      // No history, never "unknown" (RUN-225): a bridge that cannot answer and a bridge that
+      // answered empty read identically to `settle` — both are "nothing observed this sitting".
+      steeringHistory: (runId) => this.deps.steering?.steeringHistory?.(runId) ?? [],
       abandonOrphanedSignal: (runId) => this.abandonOrphanedSignal(runId),
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
@@ -1207,6 +1287,11 @@ export class RunSupervisor {
       verifyWithFeedback: (ctx) => this.verifyWithFeedback(ctx),
       reviewWithFeedback: (ctx) => this.reviewWithFeedback(ctx),
       landRun: (ctx) => this.landRun(ctx),
+      onLanded: (repo, branch, sha) => this.deps.onLanded?.(repo.root, branch, sha),
+      // RUN-227: the seam `StageHost.recordEpisode`'s own doc names as unwired until this task.
+      // `this.deps.recordEpisode` is itself synchronous (see that dep's doc) — nothing here awaits
+      // it, so `settle` calling this stays exactly as non-blocking as it was before it existed.
+      recordEpisode: (episode) => this.deps.recordEpisode?.(episode),
       // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
       // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
       // that the run's sessions divide one ceiling rather than each receiving a copy of it.
@@ -1553,7 +1638,14 @@ export class RunSupervisor {
     // which is precisely the deterministic command's question. Re-running an agent review inside
     // the repo lock would serialize every other run behind a judgment call that cannot change.
     const rebaseGate = cmdVerify(repo.manifest.verify);
+    // The rebase gate's own observation (RUN-225), attached to whichever `LandOutcome` this call
+    // returns below — undefined unless this block actually runs the command (autoPush-only
+    // policies, or a rebase that never got this far, leave it unset rather than a lie).
+    let commandObserved: CommandObservation | undefined;
     if (policy.onlyWhenVerifyPasses && rebaseGate) {
+      // The sessionless path (no live agent to hand a failure back to) runs the command exactly
+      // once — `attempts: 1` is not a default standing in for a missing observation, it is what
+      // happened.
       const result = ctx.session
         ? await this.verifyWithFeedback({
             run: ctx.run,
@@ -1563,9 +1655,27 @@ export class RunSupervisor {
             tally: ctx.tally,
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
-        : await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec });
+        : {
+            ...(await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec })),
+            attempts: 1,
+          };
+      commandObserved = {
+        site: 'landing',
+        cmd: rebaseGate.cmd,
+        passed: result.passed,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        attempts: result.attempts,
+      };
       if (!result.passed) {
-        return { landed: false, branch, reason: 'verify', detail: result.output, resolvedByAgent };
+        return {
+          landed: false,
+          branch,
+          reason: 'verify',
+          detail: result.output,
+          resolvedByAgent,
+          commandObserved,
+        };
       }
       this.log.info('verify passed on the rebased result', { runId: run.id, branch });
       // A fix the live agent made to pass THIS gate lives only in the working tree, but publish
@@ -1594,7 +1704,15 @@ export class RunSupervisor {
     // opt-in, default false, because it crosses the boundary the rest of the model rests on
     // (RUN-27). A failure here must never fail the run: the diff is on the branch either way,
     // and reporting "failed" would send someone hunting for work that is right there.
-    if (!ctx.policy.autoPush) return { landed: true, branch, sha: ff.sha, resolvedByAgent };
+    if (!ctx.policy.autoPush) {
+      return {
+        landed: true,
+        branch,
+        sha: ff.sha,
+        resolvedByAgent,
+        ...(commandObserved ? { commandObserved } : {}),
+      };
+    }
     const push = await vcs.share(ctx.repo.root, branch);
     if (!push.ok) {
       this.log.warn('landed, but the push failed — the work is on the branch locally', {
@@ -1609,6 +1727,7 @@ export class RunSupervisor {
       sha: ff.sha,
       resolvedByAgent,
       pushed: push.ok,
+      ...(commandObserved ? { commandObserved } : {}),
       ...(push.ok ? {} : { pushDetail: push.detail }),
     };
   }
@@ -1655,13 +1774,17 @@ export class RunSupervisor {
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
-  }) {
+  }): Promise<VerifyResult & { attempts: number }> {
     const transcript = this.transcript(ctx.run.id);
     let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
     this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
+    // How many times THIS call actually ran the command (RUN-225) — the daemon's own observation,
+    // separate from `rounds` below (the CEILING on retries, which a session with nothing left to
+    // fix never exhausts).
+    let attempts = 1;
     // continueWith is absent unless the run was started multiTurn — a run with no live session to
     // talk to (or a driver that cannot) simply gets the verdict, exactly as before.
-    if (result.passed || !ctx.session.continueWith) return result;
+    if (result.passed || !ctx.session.continueWith) return { ...result, attempts };
 
     // The repo's committed bound, else the daemon's K=2 (RUN-94). 0 = a pure gate: the verdict
     // stands and no fix turn is spent — the repo said so, in the commit.
@@ -1694,17 +1817,18 @@ export class RunSupervisor {
       if (!exit || exit.outcome !== 'done') {
         if (exit?.reason)
           this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
-        return result;
+        return { ...result, attempts };
       }
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
       result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+      attempts += 1;
       this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
       if (result.passed) {
         this.log.info('verify passed after the agent fixed it', { runId: ctx.run.id, attempt });
-        return result;
+        return { ...result, attempts };
       }
     }
-    return result;
+    return { ...result, attempts };
   }
 
   /**
@@ -1747,7 +1871,15 @@ export class RunSupervisor {
     noriqMcp?: NoriqMcp;
     /** The run's agent identity — what a review-stage park is recorded under (RUN-190). */
     runAgent?: { agentId: string; label: string; token: string };
-  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }> {
+    /** A fix round's own deterministic re-check ran (RUN-225) — reported so the caller can fold it
+     *  into the episode's command evidence; this method has no `RunPipeline` of its own to write. */
+    onCommandObserved?: (o: CommandObservation) => void;
+    /** RUN-231: the run's verified context pack, carried from `RunPipeline.verifiedContextPack` —
+     *  every reviewer round (including the terminal contest's re-adjudication) renders it fresh
+     *  through the reviewer-audience frame. Absent/null → no memory block, exactly as before this
+     *  task existed. */
+    verifiedContextPack?: VerifiedContextPack | null;
+  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }> {
     const reviewer = ctx.repo.manifest.verify?.agent;
     // The repo's committed round budget is the ceiling; a dispatch may only spend UP TO it.
     const manifestRounds = reviewer?.maxRounds ?? 0;
@@ -1814,25 +1946,31 @@ export class RunSupervisor {
       ledger = buildLedger(ledger, parseFindings(v.findings), [], round);
     };
 
+    // Every ACTUAL reviewer invocation (RUN-225) — distinct from `rounds` below, which counts fix
+    // rounds spent. Incremented at the two call sites of `runReviewer` in this method (the initial
+    // look and each re-review) plus whatever `contestTerminalFindings` adds for its own re-
+    // adjudication, so it reads as the true look count at every return, including a first-look PASS.
+    let looks = 1;
+
     await foldFixIntoBranch('pre-review checkpoint');
     let verdict = await this.runReviewer({ ...ctx, intent, round: 1, ledger });
     transcript.milestone(reviewVerdictMilestone(verdict, 1));
     record(verdict, 1);
-    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger };
+    if (verdict.passed || !ctx.session.continueWith) return { ...verdict, rounds: 0, ledger, looks };
 
     for (let round = 1; round <= maxRounds; round++) {
       // Only a clear FAIL is a refusal. 'unknown' means NO JUDGMENT — the reviewer was killed,
       // crashed, breached its ceiling, or never wrote a VERDICT line (RUN-72's dogfood: a human
       // killing a hung codex reviewer read as "reviewer refused the work"). There are no
       // findings to hand the builder, and a fix turn against a non-report is pure spend.
-      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger };
+      if (verdict.verdict !== 'fail') return { ...verdict, rounds: round - 1, ledger, looks };
       // An HONOURED structural escalation ends the loop here (RUN-175): the reviewer has diagnosed
       // an invariant with no single enforcement point and evidenced it, so every remaining fix
       // round would buy patched sites while the class survives — the RUN-66 death, foreseen
       // instead of relived. The verdict (escalation riding on it) goes back a FAIL; the review
       // stage reports the diagnosis and its own terminal reason. The findings are already in the
       // ledger (recorded when raised), so a continuation still sees them.
-      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger };
+      if (verdict.escalation) return { ...verdict, rounds: round - 1, ledger, looks };
       this.log.info('reviewer refused the work — handing the report to the live agent', {
         runId: ctx.run.id,
         round,
@@ -1883,7 +2021,7 @@ export class RunSupervisor {
       if (!exit || exit.outcome !== 'done') {
         if (exit?.reason)
           this.log.info('the fix turn ended early', { runId: ctx.run.id, reason: exit.reason });
-        return { ...verdict, rounds: round, ledger };
+        return { ...verdict, rounds: round, ledger, looks };
       }
       this.deps.report(ctx.run.id, { status: 'running', phase: 'verifying' });
       // A fix that satisfies the reviewer but breaks the typecheck must not slip through: the
@@ -1897,12 +2035,23 @@ export class RunSupervisor {
           tally: ctx.tally,
           phase: 'verifying',
         });
+        // A real command the daemon watched exit (RUN-225) — reported whether it passed or not, so
+        // the episode shows the re-check happened even when it is what ends the round below.
+        ctx.onCommandObserved?.({
+          site: 'review-fix',
+          cmd: floorCmd.cmd,
+          passed: floor.passed,
+          exitCode: floor.exitCode,
+          timedOut: floor.timedOut,
+          attempts: floor.attempts,
+        });
         if (!floor.passed) {
           return {
             verdict: 'fail',
             passed: false,
             rounds: round,
             ledger,
+            looks,
             findings: `the fix for the reviewer's findings broke the deterministic check (\`${floorCmd.cmd}\`):\n${floor.output.slice(-4000)}`,
           };
         }
@@ -1911,9 +2060,10 @@ export class RunSupervisor {
       // `baseId...HEAD` actually advances to include it — without this the re-review is a no-op.
       await foldFixIntoBranch(`reviewer fix round ${round}`);
       verdict = await this.runReviewer({ ...ctx, intent, round: round + 1, ledger });
+      looks += 1;
       transcript.milestone(reviewVerdictMilestone(verdict, round + 1));
       record(verdict, round + 1);
-      if (verdict.passed) return { ...verdict, rounds: round, ledger };
+      if (verdict.passed) return { ...verdict, rounds: round, ledger, looks };
     }
     // RUN-174: one adjudication turn before the run reports a TERMINAL-round FAIL. The terminal
     // round is where the run ENDS, so a finding raised there for the first time was never fixable
@@ -1938,11 +2088,18 @@ export class RunSupervisor {
     if (terminalFindings.length) {
       const contested = await this.contestTerminalFindings(
         { ...ctx, intent },
-        { verdict, findings: terminalFindings, terminalRound: maxRounds + 1, rounds: maxRounds, ledger },
+        {
+          verdict,
+          findings: terminalFindings,
+          terminalRound: maxRounds + 1,
+          rounds: maxRounds,
+          ledger,
+          looks,
+        },
       );
       if (contested) return contested;
     }
-    return { ...verdict, rounds: maxRounds, ledger };
+    return { ...verdict, rounds: maxRounds, ledger, looks };
   }
 
   /**
@@ -2001,6 +2158,12 @@ export class RunSupervisor {
     /** How many times this round has already paused the run — the cap that stops a reviewer
      *  answering every answer with another question from holding the run forever. */
     asks?: number;
+    /** RUN-231: the run's verified context pack. Rendered fresh EVERY round through the
+     *  reviewer-audience frame (`memory-render.ts`), the same "resolved at the point of use"
+     *  posture `reviewerContext` above already has for `[context]` — this method is reached by
+     *  two entry paths (a run that finishes in one sitting, one resumed in another process,
+     *  RUN-30) and only the first ever threaded a prompt to begin with. */
+    verifiedContextPack?: VerifiedContextPack | null;
   }): Promise<VerifyVerdict> {
     const manifest = ctx.repo.manifest;
     const reviewer = manifest.verify?.agent;
@@ -2083,6 +2246,9 @@ export class RunSupervisor {
     // on work no agent did — and since RUN-133 that number is subtracted from what the next session
     // may spend and persisted into a continuation, so the error would compound rather than pass.
     const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
+    // Pure and synchronous (RUN-231) — nothing here touches disk or the clock, so it costs
+    // nothing to compute freshly every round rather than threading a cached render.
+    const memory = renderMemoryEvidence(ctx.verifiedContextPack ?? null, { audience: 'reviewer' });
     const startedAt = monotonicMs();
     const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
@@ -2100,6 +2266,7 @@ export class RunSupervisor {
           verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
           ledger: ctx.ledger,
           repoContext: reviewerContext,
+          memory,
           ...(ctx.acceptance?.length
             ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
             : {}),
@@ -2411,10 +2578,18 @@ export class RunSupervisor {
       /** Fix rounds spent (maxRounds) — the `rounds` the caller would have reported. */
       rounds: number;
       ledger: LedgerEntry[];
+      /** Reviewer invocations before this turn (RUN-225) — `stand` reports it unchanged (no
+       *  `runReviewer` call on that path); the re-adjudication path below reports `looks + 1`. */
+      looks: number;
     },
-  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }) | null> {
+  ): Promise<(VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }) | null> {
     const transcript = this.transcript(ctx.run.id);
-    const stand = (ledger: LedgerEntry[]) => ({ ...args.verdict, rounds: args.rounds, ledger });
+    const stand = (ledger: LedgerEntry[]) => ({
+      ...args.verdict,
+      rounds: args.rounds,
+      ledger,
+      looks: args.looks,
+    });
 
     // Reserve FIRST, before the builder turn: the terminal turn is the run's most likely to find the
     // ceiling already gone (RUN-133, same as resolveConflict). Declining spends nothing where
@@ -2547,6 +2722,15 @@ export class RunSupervisor {
     // the one the builder was answering by. The entry is also the VISIBILITY check: the
     // adjudicator judges what the ledger shows it, so a finding whose entry did not survive the
     // fold (the cap) is not evidence and stands.
+    //
+    // This is also why the overflow-vs-candidacy bug (RUN-189) was a fold bug, not a candidacy
+    // bug: `e` here is whatever `buildLedger` wrote for THIS finding at THIS round, so candidacy
+    // can only ever require what the entry holds. An overflow that kept the held set whole and
+    // dropped the terminal round's own enumeration made `subs` here the OLD claims, not the ones
+    // the terminal reviewer actually raised — a contest of stale claims then read as answering a
+    // finding nobody had re-examined. `buildLedger`'s overflow branch now never drops this round's
+    // own raised claims for the cap (oldest-held goes first instead), so `subs` here is guaranteed
+    // to contain every current terminal sub-claim; this site needed no change beyond that guarantee.
     const answerablyContested = (f: Finding) => {
       const e = reconciledEntry(answered, f, args.terminalRound);
       if (!e) return false;
@@ -2606,7 +2790,7 @@ export class RunSupervisor {
         },
       );
       transcript.milestone('the contest’s fresh look escalated STRUCTURAL — the run fails');
-      return { ...readjudged, rounds: args.rounds, ledger: settled };
+      return { ...readjudged, rounds: args.rounds, ledger: settled, looks: args.looks + 1 };
     }
 
     // The PASS is DAEMON-decided, not taken on the reviewer's word: it clears the run only if the
@@ -2626,7 +2810,7 @@ export class RunSupervisor {
         runId: ctx.run.id,
       });
       transcript.milestone('the contest cleared the terminal findings — the run passes');
-      return { ...readjudged, rounds: args.rounds, ledger: settled };
+      return { ...readjudged, rounds: args.rounds, ledger: settled, looks: args.looks + 1 };
     }
     // The findings stand: the run fails as it does today (the terminal report), but the ledger now
     // carries the builder's pointers and the fresh look — so a human, and a continuation, sees the
@@ -3319,6 +3503,10 @@ export class RunSupervisor {
       verifyText: outcome.sessionText,
       getSessionText: outcome.getSessionText,
       tail: outcome.tail,
+      // RUN-261: a resumed sitting still spawns a live session (the restored one, or the fresh
+      // continuation-style one RUN-199 opens) — `outcome` only lacks this when the resumed chain
+      // failed before any step ran (`sessionlessChainExit`), which carries no `agentStartedAt`.
+      ...(outcome.agentStartedAt ? { agentStartedAt: outcome.agentStartedAt } : {}),
     });
   }
 
@@ -3448,6 +3636,12 @@ export class RunSupervisor {
       tail: outcome.tail,
       continued: prepared.continued,
       executedSpec,
+      contextPack: prepared.contextPack,
+      verifiedContextPack: prepared.verifiedContextPack,
+      // Absent only when the chain failed before any step spawned a session (RUN-261,
+      // `sessionlessChainExit`) — an ordinary undecomposed run always has one, since `executeRun`
+      // is reached only past every cancellation check that could have short-circuited first.
+      ...(outcome.agentStartedAt ? { agentStartedAt: outcome.agentStartedAt } : {}),
     });
   }
 
@@ -3689,19 +3883,25 @@ export class RunSupervisor {
   }
 
   /**
-   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144).
+   * Analogs for the plan's anticipated files, plus the repo facts that outlive this run (RUN-144),
+   * seeded where possible from Noriq's own verified memory before any of that runs (RUN-233).
    *
    * Returns the brief section to append, or '' — every reason to produce nothing is a reason to
-   * leave the builder exactly as well briefed as it would have been. Skipped when the plan
-   * anticipates no files (there is nothing to find an analog FOR), and when the intel cache
-   * already answers AT THIS BASE: the facts and the analogs come from the same tree, so a fact
-   * that is still current means the analogs would be too.
+   * leave the builder exactly as well briefed as it would have been. The AGENT half (analogs, and
+   * a MISS's own facts) is skipped when the plan anticipates no files (there is nothing to find an
+   * analog FOR) or this workflow never declared the stage; the SEED half below is not, because it
+   * spawns nothing and spends nothing — it is a pure translation of a pack this run already fetched.
    */
   private async mapPatternsIfWorthIt(
     run: Run,
     prepared: PreparedRun,
     checked: CheckedExecutionSpec | null,
   ): Promise<string> {
+    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
+    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
+    // checkout against a fork point, and a later fresh run at that fork point would read them.
+    const intel = prepared.continued ? undefined : this.deps.repoIntel;
+
     if (!stagesFor(prepared.workflow).some((st) => st.name === 'pattern-map')) return '';
     if (!worthMapping(checked) || !checked) return '';
 
@@ -3710,12 +3910,32 @@ export class RunSupervisor {
     // and nothing else — an earlier version skipped the whole stage on a hit, which meant a warm
     // cache produced a WORSE brief than a cold one at the very thing this stage exists for.
     //
-    // Skipped entirely for a CONTINUED run: its `baseId` is a merge-base rather than the tree it
-    // is looking at (worktree.ts), so caching under it would file facts learned from a modified
-    // checkout against a fork point, and a later fresh run at that fork point would read them.
-    const intel = prepared.continued ? undefined : this.deps.repoIntel;
-    const cached = await intel?.get(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
-    if (cached) this.transcript(run.id).milestone('reused what an earlier run worked out about this repo');
+    // A SEEDED entry would not be the same kind of hit: it would be translated from server memory
+    // rather than derived by a run that actually read this repo, so it must not outrank what THIS
+    // run is about to work out for itself. Seeding an entry that then silently won every render
+    // forever would make a warm cache produce a worse brief than a cold one — exactly what RUN-144
+    // already fixed once. So only a LEARNED entry blocks the write below and wins the render.
+    //
+    // **Nothing writes `'seeded'` today** (RUN-233): the only candidate source was a verified
+    // context pack, and it has no honest target here — its verified facts are the PATHS a memory
+    // cited, which are not entry points, are already rendered to the agent by `memory-render.ts`
+    // with their statements and verdicts, and would land under this block's own "what earlier runs
+    // worked out" header. A cache exists to avoid re-paying for expensive local derivation; a pack
+    // is one bounded call every run makes anyway. So the origin rule below is a GUARD for a future
+    // writer, not a description of live behaviour — with no seeder, `learned` is always true for an
+    // existing entry and this method behaves exactly as it did before RUN-233.
+    const entry = await intel?.getEntry(prepared.repo.root, prepared.worktree.baseId).catch(() => null);
+    const cached = entry?.facts ?? null;
+    const learned = entry?.origin === 'learned';
+    if (entry) {
+      // A seeded entry's line must not claim a run worked it out, since no run would have. Paired
+      // with the origin rule above, and unreachable until something writes a seed.
+      this.transcript(run.id).milestone(
+        learned
+          ? 'reused what an earlier run worked out about this repo'
+          : "started from what Noriq's memory already says about this repo — nothing has read it yet",
+      );
+    }
 
     const reservation = prepared.tally.reserve();
     if (!reservation.ok) {
@@ -3725,18 +3945,21 @@ export class RunSupervisor {
       });
       return '';
     }
-    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached ?? null);
-    // Shared by the first attempt and the answered re-run (RUN-190): cache the facts on a miss,
-    // render analogs + facts either way.
+    if (this.deps.steering?.isCancelled?.(run.id)) return renderRepoFacts(cached);
+    // Shared by the first attempt and the answered re-run (RUN-190): cache the facts on a MISS —
+    // now meaning "no LEARNED entry" rather than "no entry at all" (RUN-233), so this run's own
+    // derived facts still replace a seed — render analogs + facts either way, preferring what this
+    // run just derived over a seed it was entitled to replace.
     const finish = async (m: NonNullable<Awaited<ReturnType<typeof mapPatterns>>>): Promise<string> => {
-      if (intel && !cached && hasFacts(m.facts)) {
+      const derived = !learned && hasFacts(m.facts);
+      if (intel && derived) {
         await intel
           .put(prepared.repo.root, prepared.worktree.baseId, m.facts)
           .catch((err: unknown) =>
             this.log.warn('could not cache what this run learned', { err: String(err) }),
           );
       }
-      return `${renderAnalogs(m.analogs)}${renderRepoFacts(cached ?? m.facts)}`;
+      return `${renderAnalogs(m.analogs)}${renderRepoFacts(derived ? m.facts : cached)}`;
     };
 
     // The mapper's own coordinate (RUN-193): `[stages.pattern-map] agent` on top of the prepared
@@ -3777,7 +4000,7 @@ export class RunSupervisor {
         stage: 'pattern-map',
         tail: '',
       });
-      if (!answered) return renderRepoFacts(cached ?? null);
+      if (!answered) return renderRepoFacts(cached);
       answerBlock += renderPrompt('stage-answer', answered);
       current = await mapPatterns(this.patternMapHost(prepared.tally), {
         run,
@@ -4008,6 +4231,13 @@ export class RunSupervisor {
       lockEnforcerFor: (repo, run, worktree, kind, token) =>
         this.lockEnforcerFor(repo, run, worktree, kind, token),
       runBudget: (run) => mergeBudget(run.budget, this.deps.defaultBudget) ?? null,
+      ...(this.deps.getContextPack ? { getContextPack: this.deps.getContextPack } : {}),
+      ...(this.deps.reportVerification
+        ? {
+            reportVerification: (runId: string, agentToken: string, report: VerificationReportWire) =>
+              this.deps.reportVerification!(runId, agentToken, report),
+          }
+        : {}),
       context: {
         ...(this.deps.pathProbe ? { probe: this.deps.pathProbe } : {}),
         ...(this.deps.specPathProbe ? { specProbe: this.deps.specPathProbe } : {}),
@@ -4066,6 +4296,16 @@ export class RunSupervisor {
     /** The spec this run was actually briefed with — prepare's, or the one the `plan` stage
      *  synthesized (RUN-145). What the gate answers its acceptance criteria against. */
     executedSpec?: CheckedExecutionSpec | null;
+    /** RUN-228's retrieval, carried from `PreparedRun.contextPack` — absent on the `resume` call
+     *  site, which has no `prepare` and therefore never fetched one (RunPipeline's own doc). */
+    contextPack?: ContextPackRetrieval;
+    /** RUN-229's verdicts over that retrieval, carried from `PreparedRun.verifiedContextPack` —
+     *  same absence rule as `contextPack` above, for the same reason. */
+    verifiedContextPack?: VerifiedContextPack | null;
+    /** The wall-clock moment `execute` observed just before spawning (RUN-261), threaded through
+     *  because the pipeline this becomes a field of does not exist until this method builds it.
+     *  Absent iff no session ever spawned this sitting (`sessionlessChainExit`). */
+    agentStartedAt?: string;
   }): Promise<DriverExit> {
     const { run, repo, worktree, driver, permission, task, runAgent, tally, verifyText, tail } = ctx;
     const continued = ctx.continued ?? null;
@@ -4102,6 +4342,9 @@ export class RunSupervisor {
       acceptance: enumerateAcceptance(ctx.executedSpec?.spec),
       acceptanceOverflow: acceptanceOverflow(ctx.executedSpec?.spec),
       requirements: ctx.executedSpec?.spec.requirementIds ?? [],
+      ...(ctx.contextPack ? { contextPack: ctx.contextPack } : {}),
+      ...(ctx.verifiedContextPack !== undefined ? { verifiedContextPack: ctx.verifiedContextPack } : {}),
+      ...(ctx.agentStartedAt ? { agentStartedAt: ctx.agentStartedAt } : {}),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for
       // the human even if verify then fails).
@@ -4114,6 +4357,9 @@ export class RunSupervisor {
       ledger: continued?.ledger ?? [],
       // Decided by `verify`, once, at the point the pipeline always decided it.
       landPolicy: null,
+      // Appended to by `verify`/`review`/`integrate` as each reaches its own deterministic command
+      // (RUN-225) — empty by construction, not a guess, for a sitting that never reaches one.
+      commandObservations: [],
     };
 
     const host = this.stageHost();

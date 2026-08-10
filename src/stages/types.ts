@@ -12,13 +12,23 @@
  * commit, and the ticket is explicit that this is a move.
  */
 
-import type { LandPolicy, PermissionProfile, Run, RunBudget, RunPhase } from '@noriq-dev/shared';
-import type { AcceptanceItem } from '../acceptance';
+import type {
+  EffortEpisode,
+  LandPolicy,
+  PermissionProfile,
+  Run,
+  RunBudget,
+  RunPhase,
+} from '@noriq-dev/shared';
+import type { AcceptanceItem, AcceptanceReport } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
+import type { VerifiedContextPack } from '../citation-verify';
+import type { ContextPackRetrieval } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverExit, DriverSession, NoriqMcp } from '../drivers/types';
 import type { LandOutcome } from '../land';
 import type { logger as defaultLogger } from '../logger';
+import type { DeliveredSteer } from '../steering';
 import type {
   AnchorTask,
   LockFloorOutcome,
@@ -29,7 +39,7 @@ import type {
 } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { Workspace } from '../vcs/types';
-import type { VerifyResult, VerifySpec } from '../verify';
+import type { CommandObservation, VerifyResult, VerifySpec } from '../verify';
 import type { VerifyVerdict } from '../verify-agent';
 import type { Workflow } from '../workflow';
 
@@ -61,7 +71,10 @@ export interface StageHost {
   withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
   /** RUN-102's hard floor: lock everything the build changed, before it can land. */
   enforceLockFloor(repo: ResolvedRepo, run: Run, ws: Workspace, token: string): Promise<LockFloorOutcome>;
-  /** The deterministic floor, with RUN-29's hand-back to the live session on a failure. */
+  /** The deterministic floor, with RUN-29's hand-back to the live session on a failure.
+   *  `attempts` (RUN-225) is how many times the command actually ran inside this ONE call — the
+   *  initial try plus every hand-back retry — folded rather than itemized (see `CommandObservation`
+   *  on why the site plus the final outcome is what a reader needs). */
   verifyWithFeedback(ctx: {
     run: Run;
     spec: VerifySpec;
@@ -72,8 +85,16 @@ export interface StageHost {
     /** The phase to return to between fix turns — 'verifying' on the standalone gate,
      *  'landing' when this runs inside the landing pipeline (RUN-31). */
     phase: RunPhase;
-  }): Promise<VerifyResult>;
-  /** The inline reviewer and its bounded fix rounds (RUN-61/79). */
+  }): Promise<VerifyResult & { attempts: number }>;
+  /**
+   * The inline reviewer and its bounded fix rounds (RUN-61/79).
+   *
+   * `rounds` counts FIX rounds spent (the existing spend-accounting meaning every caller already
+   * relies on — untouched). `looks` (RUN-225) is a distinct, additive count: every actual reviewer
+   * invocation, including the first look and the contest turn's re-adjudication, so a run that
+   * passed on its first look reads `looks: 1` rather than being indistinguishable from a run that
+   * never reviewed at all (`rounds: 0` in both cases — the exact undercount `episode.ts` names).
+   */
   reviewWithFeedback(ctx: {
     run: Run;
     repo: ResolvedRepo;
@@ -97,7 +118,15 @@ export interface StageHost {
     noriqMcp?: NoriqMcp;
     /** The run's agent identity, so a reviewer that pauses the run can be parked under it. */
     runAgent?: { agentId: string; label: string; token: string };
-  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[] }>;
+    /** A deterministic re-check inside a fix round ran the floor command again (RUN-225) — the
+     *  caller records it, since it is a real command the daemon watched exit and would otherwise
+     *  vanish with the round's own local state. Optional: a caller with no episode to build (a
+     *  test, a future actor that does not care) simply does not get told. */
+    onCommandObserved?: (o: CommandObservation) => void;
+    /** RUN-231: the run's verified context pack — rendered fresh every round through the
+     *  reviewer-audience quoted-evidence frame. Absent/null → no memory block. */
+    verifiedContextPack?: VerifiedContextPack | null;
+  }): Promise<VerifyVerdict & { rounds: number; ledger: LedgerEntry[]; looks: number }>;
   /** Rebase onto the landing branch, re-verify there, fast-forward, and (opt-in) push. */
   landRun(ctx: {
     run: Run;
@@ -116,6 +145,30 @@ export interface StageHost {
   runBudget(run: Run): RunBudget | undefined;
   /** The continuation store, when one is wired. Absent = no continue-a-failed-run support. */
   readonly continuable?: Pick<ContinuableStore, 'get' | 'put' | 'remove'>;
+  /**
+   * A landing just moved `branch` to `sha` on this repo (RUN-222) — background indexing's one
+   * landing/publish trigger site. Fire-and-forget by construction: this returns nothing for the
+   * caller to await, and the one implementation swallows every failure internally (`IndexTriggerHub
+   * .onLanded`'s own doc) — a landing's own outcome must never depend on whether indexing noticed.
+   * Absent = no index trigger layer wired (indexing off machine-wide, or a test with nothing to
+   * prove here).
+   */
+  onLanded?(repo: ResolvedRepo, branch: string, sha: string): void;
+  /**
+   * Hand a freshly assembled effort episode (RUN-224) to whatever wants it. Absent = no sink wired
+   * — every host today: delivery (RUN-227) is blocked on PLNR-340 and is not this task's to build.
+   * The seam exists so a later delivery layer attaches HERE without reshaping `settleStage` or
+   * `buildEpisode` — the same discipline `onLanded` above already established for a trigger nobody
+   * had written yet.
+   */
+  recordEpisode?(episode: EffortEpisode): void;
+  /**
+   * Drain this run's observed steer deliveries (RUN-225) — `SteeringBridge`'s own record of what
+   * `applySteer` actually did, not the server's independent `steers`-table view. Absent = no
+   * steering bridge wired (a test, or a daemon started with steering off); `settle` treats that the
+   * same as a bridge that answers `[]` — both mean "nothing observed", never "unknown".
+   */
+  steeringHistory?(runId: string): DeliveredSteer[];
 }
 
 /**
@@ -157,6 +210,41 @@ export interface RunPipeline {
   /** The requirement ids this work is traceable to (RUN-147) — what a finding may name, and what
    *  the run reports against when it ends. Empty when the spec names none. */
   readonly requirements: string[];
+  /**
+   * RUN-228's retrieved task context pack, carried forward from `prepare` UNCHANGED — the seam
+   * RUN-229 (worktree citation verification) and RUN-230/231 (the bounded quoted-evidence
+   * renderer) attach to. Untrusted server text until both have run: no stage between here and
+   * those may fold `.pack` into any prompt (this task's own locked decision). Absent on a
+   * RESUMED run — `resume` has no `prepare` (this file's own doc: a parked run restores its
+   * state rather than re-preparing), so nothing here fetched one; RUN-229/230 read this as
+   * "nothing to verify or render", the same posture an unopted-in repo already produces.
+   */
+  readonly contextPack?: ContextPackRetrieval;
+  /**
+   * RUN-231's other half: `contextPack.pack`'s citations, verified against THIS run's own leased
+   * worktree (`citation-verify.ts`), carried forward from `prepare` UNCHANGED — the seam this
+   * task's own renderer (`memory-render.ts`) attaches to. Same absence rule as `contextPack`
+   * above: absent on a RESUMED run (`resume` has no `prepare`, so nothing here verified one),
+   * and `null` (present but empty) whenever there was no pack to verify or verification itself
+   * failed — `renderMemoryEvidence(null, …)` reads either as "nothing to render", never a defect.
+   */
+  readonly verifiedContextPack?: VerifiedContextPack | null;
+  /**
+   * The wall-clock moment observed immediately before the agent actually spawned (RUN-261) — an
+   * ISO datetime, threaded from `stages/execute.ts`'s own capture through `afterDriver`'s `ctx`
+   * parameter, the same route `contextPack`/`continued`/`executedSpec` above already use to reach a
+   * pipeline that does not exist yet at capture time (the mechanism the RUN-225 precedent — carrying
+   * a stage's own observation forward rather than re-deriving it — actually calls for here; that
+   * ticket's `commandObservations` is a MUTABLE field because verify/review/integrate each append to
+   * it AFTER the pipeline is built, which is a different problem from a fixed fact already known
+   * before construction). Fixed for the sitting, not one of the four below: nothing past `execute`
+   * ever revises when the agent started. Absent when no session ever spawned this sitting (a chain
+   * that fails before its first step, `supervisor.ts`'s `sessionlessChainExit`) — `episode.ts`'s
+   * `timelineOf` treats that as "never observed" and emits no entry, never a substituted moment. A
+   * CHAIN reports its FIRST step's start here, never a later or failing step's — see `chain.ts`'s
+   * own `noteStarted`/`withAllText` for how the earliest-wins.
+   */
+  readonly agentStartedAt?: string;
 
   // ── the four a stage may move ────────────────────────────────────────────────
   /** The run's fate so far. A gate narrows it; nothing ever widens it back to done. */
@@ -167,6 +255,23 @@ export interface RunPipeline {
   landed: boolean;
   /** The freshest adjudication state, for the continuable record. */
   ledger: LedgerEntry[];
+  /**
+   * Every deterministic command this sitting actually watched exit (RUN-225): `verify`'s own
+   * floor run, `integrate`'s landing-gate run, and any fix-round re-check `review` observed via
+   * `onCommandObserved`. One flat array rather than three optional fields — the only consumer is
+   * `episode.ts`'s `commands`/`testsRun`, and it reads them chronologically, not by site.
+   */
+  commandObservations: CommandObservation[];
+  /**
+   * The review stage's own exact reviewer evidence (RUN-225), carried forward because `settle`
+   * cannot re-derive it: `rounds` here is `reviewWithFeedback`'s `looks` (every actual invocation,
+   * not the FIX-round count of the same-named field on its return value — see `StageHost`'s own
+   * doc on why those two are different numbers), and `acceptance` is the exact `AcceptanceReport`
+   * the reviewer computed, not the ledger's lossy `LedgerEntry[]` re-encoding of it. Undefined when
+   * no review stage ran at all (no `[verify.agent]`, or the run never reached `done` going in) —
+   * `episode.ts`'s ledger-derived fallback is exactly correct for "no review happened": 0.
+   */
+  reviewEvidence?: { rounds: number; acceptance?: AcceptanceReport };
   /**
    * Whether this run is landing, and under which policy — captured ONCE by `verify`, at the same
    * point the pipeline used to capture it, and read by `integrate` afterwards.

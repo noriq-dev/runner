@@ -16,5 +16,11 @@ after a contract change upstream, run from the repo root:
 npm run vendor:shared
 ```
 
+Every refresh records `PROVENANCE.json` beside `src/` — the source commit, whether that source
+checkout was dirty, and a hash per vendored file. `npm run vendor:check` re-verifies the tree
+against it (also wired into `npm run check` and CI) — a hand-edit here fails that check by
+construction rather than by someone noticing a diff. See [`../../VENDORED-CONTRACT.md`](../../VENDORED-CONTRACT.md)
+for the full mechanism (RUN-240).
+
 Once the contract freezes, this is replaced by a published `@noriq-dev/shared`
 dependency (see the plan's open refinements).

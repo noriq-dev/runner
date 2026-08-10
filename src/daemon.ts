@@ -9,10 +9,19 @@ import type {
 } from '@noriq-dev/shared';
 import { NoriqClient, type OwedMerge } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
-import { discoverRepos } from './discovery';
+import { discoverRepos, loadIndexConfig } from './discovery';
 import { totalTokens } from './drivers/budget';
 import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
+import { EpisodePendingStore, filePendingEpisodeStore } from './episode-pending';
+import { type EpisodeDeliveryDeps, deliverEpisode, drainPendingEpisodes } from './episode-upload';
+import { IndexControlServer } from './index-control';
+import { IndexCoordinator } from './index-coordinator';
+import { IndexJournal, fileJournalStore } from './index-journal';
+import { fileStagingStore, sweepOrphanedStaging } from './index-stage';
+import { IndexStatusStore, fileIndexStatusPersist } from './index-status';
+import { IndexTriggerHub, type IndexTriggerRepo } from './index-triggers';
+import { createIndexWorkStep } from './index-work';
 import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
@@ -31,6 +40,12 @@ import { DiversionBackend } from './vcs/diversion';
 import { GitBackend } from './vcs/git';
 import { PerforceBackend } from './vcs/perforce';
 import type { VcsBackend } from './vcs/types';
+import { VerificationPendingStore, filePendingVerificationStore } from './verification-pending';
+import {
+  type VerificationReportDeliveryDeps,
+  deliverVerificationReport,
+  drainPendingVerificationReports,
+} from './verification-report';
 import { type WorkflowCatalog, WorkflowStore } from './workflow-store';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
 import { WsClient, type WsFactory } from './ws-client';
@@ -468,6 +483,28 @@ export function owedMergeReconciler(deps: {
 }
 
 /**
+ * The coordinator surface `daemon.ts` itself depends on, widened past `cancelAll`/`trigger` with
+ * an OPTIONAL `cancelRepo` (RUN-223) — optional so every existing test double that supplies a
+ * fake coordinator without it keeps compiling; production's real `IndexCoordinator` always has
+ * one, and the control server (`index-control.ts`) reads its absence as "cancel not supported"
+ * rather than crashing on a missing method.
+ */
+type IndexCoordinatorLike = Pick<IndexCoordinator, 'cancelAll' | 'trigger'> & {
+  cancelRepo?: IndexCoordinator['cancelRepo'];
+};
+
+/** Same widening, one layer up (RUN-223): `requestManualReindex` is RUN-222's hook that had no
+ *  caller until this task, and `allStatuses` feeds the control server's `/status` — both optional
+ *  here for the identical reason `cancelRepo` is above. */
+type IndexTriggerHubLike = Pick<
+  IndexTriggerHub,
+  'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'
+> & {
+  requestManualReindex?: IndexTriggerHub['requestManualReindex'];
+  allStatuses?: IndexTriggerHub['allStatuses'];
+};
+
+/**
  * Ties the pieces together: register over REST (RUN-9), then hold the long-lived
  * WS connection (RUN-10) that receives dispatches and makes idle-agent steering
  * possible. Actually spawning/supervising agent processes on run.assigned lands
@@ -487,6 +524,20 @@ export class Daemon {
   private readonly continuableStore?: ContinuableStore;
   private readonly stateFile?: string;
   private readonly workflowStore?: WorkflowStore;
+  private readonly indexCoordinatorOverride?: IndexCoordinatorLike;
+  private readonly indexTriggersOverride?: IndexTriggerHubLike;
+  private readonly indexJournalPath?: string;
+  private readonly indexStagingRoot?: string;
+  private readonly indexStatusPath?: string;
+  private readonly indexControlInfoPath?: string;
+  private readonly indexControlOverride?: Pick<IndexControlServer, 'start' | 'stop'>;
+  /** Where RUN-227's undelivered-episode queue lives — defaults to
+   *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning: a test points this at a
+   *  temp file so a fully-driven `start()` never touches the operator's own home directory. */
+  private readonly episodePendingPath?: string;
+  /** Where RUN-230's undelivered-verification-report queue lives — defaults to
+   *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
+  private readonly verificationPendingPath?: string;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -510,6 +561,43 @@ export class Daemon {
       /** Workflow filesystem seam — a fake can prove registration and dispatch re-read without
        *  touching the operator's ~/.noriq directory. */
       workflows?: WorkflowStore;
+      /** RUN-214's index job coordinator — real production wiring by default; a test substitutes
+       *  a fake with a spy `cancelAll`/`trigger` to prove `stop()` joins it, and the trigger layer
+       *  (RUN-222) reaches it, without driving an actual index job. */
+      indexCoordinator?: IndexCoordinatorLike;
+      /** RUN-222's trigger layer — real production wiring by default; a test substitutes a fake to
+       *  prove the daemon calls `reconcileOnStartup`/`startPolling`/`stop` without a real VCS or
+       *  clock. */
+      indexTriggers?: IndexTriggerHubLike;
+      /** Where RUN-214's upload journal lives — defaults to `~/.noriq/index-journal.json`; a test
+       *  points this at a temp file, the same `parked`/`continuable`/`stateFile` reasoning: the
+       *  journal is read (`sweepOrphanedStaging`'s `journal.list()`, locked decision 8) on EVERY
+       *  `start()`, real production wiring or not, so an un-pointed test would read the operator's
+       *  own machine on every daemon test in this suite. */
+      indexJournalPath?: string;
+      /** Where RUN-221's staging directories live — defaults to `~/.noriq/index-staging`; same
+       *  reasoning as `indexJournalPath`, and the same root the real work step (`index-work.ts`)
+       *  stages batches under, so the sweep and the work step always agree on where "here" is. */
+      indexStagingRoot?: string;
+      /** Where RUN-223's disposable status snapshot lives — defaults to
+       *  `~/.noriq/index-status.json`; same `indexJournalPath` reasoning, and written on every
+       *  observable transition regardless of whether anything is enabled to observe. */
+      indexStatusPath?: string;
+      /** Where RUN-223's control-server discovery file lives — defaults to
+       *  `~/.noriq/index-control.json`; same reasoning again, so a fully-driven test `start()`
+       *  never writes the operator's own home directory or binds a port a real daemon on the same
+       *  box would also try to discover. */
+      indexControlInfoPath?: string;
+      /** RUN-223's loopback control server — real production wiring (a real bound socket) by
+       *  default; a test substitutes a fake with a spy `start`/`stop` to prove the daemon starts
+       *  and stops it in the right place without binding a real port. */
+      indexControl?: Pick<IndexControlServer, 'start' | 'stop'>;
+      /** Where RUN-227's undelivered-episode queue lives — defaults to
+       *  `~/.noriq/episode-pending.json`; same `indexJournalPath` reasoning. */
+      episodePendingPath?: string;
+      /** Where RUN-230's undelivered-verification-report queue lives — defaults to
+       *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
+      verificationPendingPath?: string;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -522,6 +610,15 @@ export class Daemon {
     this.continuableStore = deps.continuable;
     this.stateFile = deps.stateFile;
     this.workflowStore = deps.workflows;
+    this.indexCoordinatorOverride = deps.indexCoordinator;
+    this.indexTriggersOverride = deps.indexTriggers;
+    this.indexJournalPath = deps.indexJournalPath;
+    this.indexStagingRoot = deps.indexStagingRoot;
+    this.indexStatusPath = deps.indexStatusPath;
+    this.indexControlInfoPath = deps.indexControlInfoPath;
+    this.indexControlOverride = deps.indexControl;
+    this.episodePendingPath = deps.episodePendingPath;
+    this.verificationPendingPath = deps.verificationPendingPath;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -607,6 +704,161 @@ export class Daemon {
       status: runner.status,
       repos: runner.repos.map((r) => `${r.projectKey}→${r.projectId ?? 'unresolved'}`),
     });
+
+    // RUN-227's undelivered-episode queue, and the delivery deps every enqueue/retry site below
+    // shares. Built here, once `runner.id` exists — `EpisodeDeliveryDeps.runnerId` is captured into
+    // every `PendingEpisode.mint` at enqueue time (locked decision 8's identity half), and this is
+    // the daemon's own registration id, stable across a restart (`saveState` above persists it).
+    const episodePending = new EpisodePendingStore(filePendingEpisodeStore(this.episodePendingPath));
+    const episodeDeliveryDeps: EpisodeDeliveryDeps = {
+      client,
+      runnerId: runner.id,
+      pending: episodePending,
+      logger: this.log,
+    };
+    // Retry whatever a prior process left pending, once, at startup — mirrors the orphaned-staging
+    // sweep just below: a daemon that crashed or was simply off holds episodes nothing has retried
+    // since, and "the box just came up" is exactly the moment worth spending one drain pass on.
+    void drainPendingEpisodes(episodeDeliveryDeps)
+      .then(({ delivered }) => {
+        if (delivered) this.log.info(`delivered ${delivered} previously pending episode(s)`);
+      })
+      .catch((err) => this.log.warn('startup episode delivery retry failed', { err: String(err) }));
+
+    // RUN-230's undelivered-verification-report queue, and its own delivery deps — a SEPARATE
+    // store from the episode one above (`verification-pending.ts`'s own doc on why: no shared
+    // `mint`-style identity, and a retry here can go permanently dead in a way an episode retry
+    // never does).
+    const verificationPending = new VerificationPendingStore(
+      filePendingVerificationStore(this.verificationPendingPath),
+    );
+    const verificationReportDeliveryDeps: VerificationReportDeliveryDeps = {
+      client,
+      pending: verificationPending,
+      logger: this.log,
+    };
+    // Same startup-drain reasoning as episodes just above: a daemon that crashed or was simply off
+    // holds reports nothing has retried since.
+    void drainPendingVerificationReports(verificationReportDeliveryDeps)
+      .then(({ delivered, dropped }) => {
+        if (delivered) this.log.info(`delivered ${delivered} previously pending verification report(s)`);
+        if (dropped)
+          this.log.warn(`dropped ${dropped} undeliverable verification report(s) (run agent token revoked)`);
+      })
+      .catch((err) =>
+        this.log.warn('startup verification report delivery retry failed', { err: String(err) }),
+      );
+
+    // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
+    // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
+    // this file stays wiring-only. `resolveIndexConfigForRoot` is the ONE enabled/off gate both
+    // the coordinator and the trigger layer below consult — never two copies of it. Built here,
+    // before the supervisor, because the landing/publish trigger site (RUN-222) is a supervisor
+    // dep (`onLanded`) that needs the trigger hub to already exist.
+    const resolveIndexConfigForRoot = (root: string) => loadIndexConfig(root, this.log);
+    const indexJournal = new IndexJournal(fileJournalStore(this.indexJournalPath));
+    // RUN-223's operator-status recorder — built before the coordinator so its `onStatus` dep can
+    // close over it. Persists to disk on every mutation (best-effort; a write failure costs the
+    // next CLI read staleness, never an index attempt) — the CLI's offline fallback when no live
+    // daemon answers the control server's `/status` below.
+    const indexStatus = new IndexStatusStore({
+      persist: fileIndexStatusPersist(this.indexStatusPath),
+      logger: this.log,
+    });
+    // Locked decision 8: the orphaned-staging sweep runs EXACTLY here — startup only, before the
+    // coordinator's first trigger, never on a timer. `sweepOrphanedStaging`'s own doc: a snapshot
+    // mid-write or mid-upload looks identical, by inspection, to one a crashed process left behind,
+    // and only "nothing survived the last exit" (true right here, true nowhere later) makes every
+    // directory with no live journal entry unreachable BY CONSTRUCTION rather than unlucky timing.
+    await sweepOrphanedStaging(indexJournal, this.indexStagingRoot)
+      .then(({ removed }) => {
+        if (removed.length) this.log.info(`swept ${removed.length} orphaned index-staging dir(s)`);
+      })
+      .catch((err) => this.log.warn('index staging sweep failed', { err: String(err) }));
+    const indexCoordinator: IndexCoordinatorLike =
+      this.indexCoordinatorOverride ??
+      new IndexCoordinator({
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        resolveConfig: resolveIndexConfigForRoot,
+        getCursor: (target) =>
+          client.getIndexCursor(runner.id, {
+            projectId: target.projectId,
+            repositoryKey: target.repositoryKey,
+            checkoutId: target.checkoutId,
+          }),
+        runWork: createIndexWorkStep({
+          client,
+          runnerId: runner.id,
+          vcsFor: (root) => backendFor.get(root) ?? vcs,
+          staging: fileStagingStore(this.indexStagingRoot),
+          logger: this.log,
+        }),
+        journal: indexJournal,
+        // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
+        // (`this.active`) — one honest definition of busy, not a second one invented here.
+        isRunBusy: () => this.active.size > 0,
+        // RUN-223: every reconcile/phase/success/failure this coordinator decides also lands in
+        // the status recorder above — the ONLY feed `IndexStatusStore` has, so the CLI surface can
+        // never show a state this coordinator did not itself observe.
+        onStatus: (event) => indexStatus.record(event),
+        logger: this.log,
+      });
+
+    // RUN-222's trigger layer: turns startup, a landing, and a periodic poll into debounced calls
+    // to the coordinator above. `projectIdFor` closes over the registration response — the server
+    // resolves a repo's projectId at registration, and re-deriving it per trigger would be a
+    // second source of truth for a fact that does not change over this daemon's lifetime.
+    const projectIdFor = new Map(runner.repos.map((r) => [r.id, r.projectId] as const));
+    const indexTriggerRepos: IndexTriggerRepo[] = repos
+      .filter((r): r is typeof r & { repositoryKey: string } => r.repositoryKey !== null)
+      .map((r) => ({
+        repoRoot: r.root,
+        repositoryKey: r.repositoryKey,
+        checkoutId: r.id,
+        projectId: projectIdFor.get(r.id) ?? null,
+        projectKey: r.manifest.key,
+        defaultBranch: r.manifest.defaultBranch ?? r.defaultBranch,
+      }));
+    const indexTriggers: IndexTriggerHubLike =
+      this.indexTriggersOverride ??
+      new IndexTriggerHub({
+        server: this.config.server,
+        coordinator: indexCoordinator,
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        resolveConfig: resolveIndexConfigForRoot,
+        repos: indexTriggerRepos,
+        logger: this.log,
+      });
+
+    // RUN-223's operator control surface — a loopback HTTP server (see index-control.ts's own doc
+    // for why this shape over a status file the daemon merely writes) so a live CLI command can
+    // read `/status`, or ask for a manual reindex/retry/cancel, without minting anything or
+    // touching `[index].enabled` itself: every route here is a thin ask onto the coordinator and
+    // trigger hub above, which already enforce their own gates. Started unconditionally — there is
+    // no config knob, the same posture the leak sweep and update check already take — because the
+    // one thing worse than a control surface nobody asked for is indexing running unattended with
+    // no way to see it at all, which is exactly the gap this task exists to close.
+    const indexControl: Pick<IndexControlServer, 'start' | 'stop'> =
+      this.indexControlOverride ??
+      new IndexControlServer({
+        statusStore: indexStatus,
+        triggerStatuses: () => indexTriggers.allStatuses?.() ?? [],
+        repoRootFor: (repositoryKey) =>
+          indexTriggerRepos.find((r) => r.repositoryKey === repositoryKey)?.repoRoot,
+        requestManualReindex: (repoRoot) =>
+          indexTriggers.requestManualReindex?.(repoRoot) ?? Promise.resolve(),
+        cancelRepo: (repositoryKey) => {
+          // Only a repo THIS daemon actually knows about may be cancelled — an unrecognized
+          // repositoryKey never reaches the coordinator's own job-key map at all.
+          if (!indexTriggerRepos.some((r) => r.repositoryKey === repositoryKey)) return false;
+          return indexCoordinator.cancelRepo?.({ server: this.config.server, repositoryKey }) ?? false;
+        },
+        controlInfoPath: this.indexControlInfoPath,
+        logger: this.log,
+      });
+    await indexControl
+      .start()
+      .catch((err) => this.log.warn('index control server failed to start', { err: String(err) }));
 
     // Supervisor composes worktree + driver + budget per dispatched Run. The `held`
     // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
@@ -744,6 +996,32 @@ export class Daemon {
       // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
       // feature that has never run.
       saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+      // RUN-228's task context pack fetch — bound with this daemon's own registration id, the same
+      // closure shape `getCursor` above already uses for `getIndexCursor`. `context-pack.ts` is
+      // what adds the timeout and decides what an omission means; this is the thin wire binding.
+      getContextPack: (input) => client.getContextPack(runner.id, input),
+      // Background indexing's landing/publish trigger site (RUN-222). Fire-and-forget: `onLanded`
+      // itself never throws (it catches everything internally) and this daemon never awaits it.
+      onLanded: (repoRoot, branch, sha) => {
+        void indexTriggers.onLanded?.(repoRoot, branch, sha);
+      },
+      // RUN-227's delivery sink. Fire-and-forget, same shape as `onLanded` above: `deliverEpisode`
+      // enqueues durably before it ever touches the network (its own doc), so this dep can stay
+      // synchronous and return before any I/O settles — `settle` never awaits it.
+      recordEpisode: (episode) => {
+        void deliverEpisode(episode, episodeDeliveryDeps).catch((err) =>
+          this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
+        );
+      },
+      // RUN-230's delivery sink. Fire-and-forget for the identical reason `recordEpisode` above is:
+      // `deliverVerificationReport` enqueues durably before it ever touches the network, so this
+      // dep stays synchronous and returns before any I/O settles — `prepareRun` never awaits it.
+      reportVerification: (runId, agentToken, report) => {
+        void deliverVerificationReport(runId, agentToken, report, verificationReportDeliveryDeps).catch(
+          (err) =>
+            this.log.warn('verification report delivery failed unexpectedly', { runId, err: String(err) }),
+        );
+      },
       // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
       // third time the same lesson has been learned: a dep only tests supply is a feature that has
       // never run.
@@ -854,6 +1132,18 @@ export class Daemon {
           // Same shape for parked runs (RUN-30): a human answering while the box is off is the
           // normal case, not the edge one, and nothing else would ever bring that run back.
           void reconcileParked();
+          // Same shape again for RUN-227's pending episodes: a reconnect is precisely "the server
+          // might be reachable now when it was not a moment ago" — the one signal this daemon has
+          // for "worth trying delivery again" short of a fixed-interval timer (discretion 3).
+          void drainPendingEpisodes(episodeDeliveryDeps).catch((err) =>
+            this.log.warn('episode delivery retry on reconnect failed', { err: String(err) }),
+          );
+          // Same shape again for RUN-230's pending verification reports — a reconnect is precisely
+          // "the server might be reachable now when it was not a moment ago", the identical signal
+          // episodes already use it for.
+          void drainPendingVerificationReports(verificationReportDeliveryDeps).catch((err) =>
+            this.log.warn('verification report delivery retry on reconnect failed', { err: String(err) }),
+          );
         },
       },
       logger: this.log,
@@ -902,6 +1192,15 @@ export class Daemon {
       sweepTimer.unref();
     };
     scheduleSweep();
+
+    // RUN-222 acceptance: every enabled repo is reconciled once at startup, and the shared poll
+    // ticker starts right after — one cheap current-base check per enabled repo, never a lease, so
+    // there is nothing here worth racing the rest of startup over. Awaited so a startup that races
+    // the very first heartbeat still has this done, but never allowed to fail startup itself.
+    await indexTriggers
+      .reconcileOnStartup()
+      .catch((err) => this.log.warn('index startup reconcile failed', { err: String(err) }));
+    indexTriggers.startPolling();
 
     /**
      * Open a merge request for every plan that finished and still owes one (RUN-28).
@@ -1030,6 +1329,27 @@ export class Daemon {
       // Join a sweep that was already running when stop() was called — `clearTimeout` cancels the
       // NEXT one, never git commands already in flight.
       await sweepInFlight.catch(() => {});
+      // Stop the trigger layer FIRST (RUN-222) — clears its poll ticker and every PENDING debounce
+      // timer so no new job is handed to the coordinator after this point. A job already in flight
+      // is the coordinator's own `cancelAll`'s job, right below.
+      indexTriggers.stop();
+      // Same race, one subsystem over (RUN-214, locked decision 11): cancel and JOIN any in-flight
+      // index work before this method returns, not merely signal it — returning while a snapshot
+      // is still being read is how a shutdown races its own cleanup, exactly the orphan-sweep join
+      // above. Placed beside it on purpose: both are background maintenance holding a workspace
+      // resource that must be released before the daemon actually exits.
+      await indexCoordinator
+        .cancelAll()
+        .catch((err) => this.log.warn('index coordinator shutdown failed', { err: String(err) }));
+      // RUN-223: stop taking control requests only once nothing is left to act on — `cancelAll`
+      // sets the coordinator's own `stopping` flag SYNCHRONOUSLY at entry, so a request that
+      // sneaks in during the drain above already finds a coordinator refusing new work; this just
+      // closes the door once the drain is done. Removes the discovery file too, so a CLI call
+      // racing this shutdown reads "no daemon" rather than a port nothing answers on for longer
+      // than it has to.
+      await indexControl
+        .stop()
+        .catch((err) => this.log.warn('index control shutdown failed', { err: String(err) }));
       await client
         .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
         .catch((err) =>

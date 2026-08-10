@@ -489,25 +489,23 @@ describe('parsing sub-claims (RUN-180)', () => {
     }
   });
 
-  // The composed shapes only ABSENCE can see: a sibling whose letter survives solely as line
-  // decoration (`(b) FINDING 1 — …`) wears no label a net can attribute — it reads as prose
-  // quoting the record — so the certificate is what voids it: intended but unparsed → not
-  // counted → the whole enumeration voids, never a kept subset. (Its spaced-label sibling,
-  // `(b) FINDING 1 b — …`, is since caught by net four wherever it sits — see below.)
-  it('a mangled sibling invisible to every net still voids — the certificate counts its absence', () => {
+  // A mangled sibling is simply prose (grammar-or-prose, RUN-189): it is never recorded, and it
+  // never voids what DID parse — the certificate mismatch is what voids, exactly as any other
+  // undercount does.
+  it('a mangled sibling is prose — the certificate mismatch is what voids, not the shape', () => {
     const spaced = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: claim A\n' +
         '(b) FINDING 1 — claim B',
     );
-    expect(spaced[0]!.subclaims).toEqual([]);
+    expect(spaced[0]!.subclaims).toEqual([]); // declared 2, only 1 strict line parsed
     const dupLabel = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 3]\n' +
         'FINDING 1a: claim A\n' +
         'FINDING 1b: claim B\n' +
         '(b) FINDING 1b — distinct claim C',
     );
-    expect(dupLabel[0]!.subclaims).toEqual([]);
+    expect(dupLabel[0]!.subclaims).toEqual([]); // declared 3, only 2 strict lines parsed
   });
 
   // Malformed enumeration degrades to the single-claim finding, never to an unparsed line — the
@@ -533,9 +531,9 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // The detector matches one-or-more letters so a malformed multi-letter form cannot slip past it:
-  // a shape the detector cannot see is a shape it cannot void, and `1aa` beside a valid `1a` would
-  // otherwise keep the well-formed subset — the kept-subset escape through the detector itself.
+  // The grammar is strict on the letter's SHAPE too: `1aa` is not `a` followed by a letter, so the
+  // line simply fails to match — one strict line short of the certificate, same as any other
+  // malformed line.
   it('a malformed multi-letter line (FINDING 1aa) voids the enumeration like any other bad line', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
@@ -546,10 +544,9 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // A spaced label is a lettered-INTENT shape the strict form rejects, so the detector must see
-  // it: invisible, it would coexist with a valid `FINDING 1a:` and the kept sibling would read as
-  // the complete enumeration — the kept-subset escape through the detector, second edition.
-  it('a spaced label (FINDING 1 b:) voids the WHOLE enumeration — a valid sibling must not survive it', () => {
+  // The grammar requires the letter glued to the number — `FINDING 1 b:` is not the strict shape,
+  // so it is prose, and the certificate falls one short.
+  it('a spaced label (FINDING 1 b:) is prose — the certificate mismatch voids, not the space', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: a well-formed sub-claim\n' +
@@ -559,12 +556,10 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual([]);
   });
 
-  // There is no malformed-label detector to slip past: every line whose first LETTERS are
-  // `FINDING <n>` that is neither the numbered FINDING line nor the strict sub-claim shape voids
-  // the enumeration. Each shape below is an edition of the escape a detector allowlist leaked
-  // (spaced, parenthesized, trailing word-character, decorated, …) — and the point of classifying
-  // instead of detecting is that the list below is examples, not the rule.
-  it('any malformed label voids the enumeration — a valid sibling never survives as the whole', () => {
+  // A line either matches the strict `FINDING <n><letter>: <claim>` shape or it does not — there
+  // is no shape-by-shape recognition of "almost". Every variant below fails the grammar and reads
+  // as prose, so the certificate (declared 2, one strict line short) is what voids each case.
+  it('any line that fails the strict grammar is prose — the certificate mismatch voids', () => {
     for (const bad of [
       'FINDING 1-b: hyphenated letter',
       'FINDING 1.b: dotted letter',
@@ -575,26 +570,17 @@ describe('parsing sub-claims (RUN-180)', () => {
       'FINDING 1 (b): spaced and parenthesized letter',
       'FINDING 1 -- b: arbitrary junk before the letter',
       'FINDING 1', // a bare number line letters nothing and answers nothing
-      // Markdown decoration is a letterless prefix, so the head net sees these — an anchor that
-      // required line-start whitespace left `- FINDING 1b:` invisible, and the kept sibling read
-      // as the complete enumeration (the kept-subset escape through the anchor itself).
       '- FINDING 1b: bulleted letter',
       '* FINDING 1b: starred letter',
       '> FINDING 1b: quoted letter',
       '**FINDING 1b:** bolded letter',
       '2. FINDING 1b: numbered-list letter',
       '  — FINDING 1b: em-dashed letter',
-      // Decoration WEARING letters slips the head net (its prefix contains a letter), which was
-      // the next edition of the same escape — so the near-colon token net catches the label
-      // itself, anywhere in the line, and the two escapes do not compose inside its window.
       '(b) FINDING 1b: alphabetically decorated letter',
       '(b) FINDING 1 b: decorated AND spaced letter',
       '(b) FINDING 1(b): decorated AND parenthesized letter',
       'Note: FINDING 1b: a word before the token',
       'see FINDING 1b: quoting a sub-claim line mid-prose',
-      // Decoration can also SWALLOW the colon — lettered prefix defeats the head net, no colon
-      // defeats the token net — which is why the out-of-range label net exists: a label glued to
-      // the number that names no recorded letter voids, colon or no colon.
       '(b) FINDING 1b — decorated letter with the colon swallowed',
       'see FINDING 1b — a letter no line recorded',
       'Note: FINDING 1b2 — mutated label, colon replaced',
@@ -608,76 +594,38 @@ describe('parsing sub-claims (RUN-180)', () => {
     }
   });
 
-  // The boundary's other side, equally deliberate: a MID-SENTENCE mention has words before the
-  // token and never voids. Reports narrate their findings by number — voiding on mention would
-  // kill every enumeration in any report that explains itself, and a mention records nothing a
-  // partial contest could clear, so leaving it harmless is the safe direction too.
-  // Narration lives ABOVE the findings (the prompt's own instruction) or below the structural
-  // lines — a mention by number there is harmless prose, exactly as before.
-  it('a prose mention of FINDING <n> outside its zone does not void its enumeration', () => {
-    const out = parseFindings(
+  // A mention of `FINDING <n>` in ordinary narration — wherever it sits in the report — never
+  // matches the strict sub-claim shape, so grammar-or-prose leaves a well-formed enumeration
+  // untouched by it: there is no zone to place the mention inside or outside of.
+  it('a prose mention of FINDING <n> anywhere in the report does not touch its enumeration', () => {
+    const before = parseFindings(
       'The escape described in FINDING 1 is the subject of this report.\n' +
         'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two',
     );
-    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
-  });
-
-  it('narration below the next structural line is harmless — the zone ended there', () => {
-    const out = parseFindings(
+    expect(before[0]!.subclaims).toEqual(['half one', 'half two']);
+    const after = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'VERDICT: FAIL\n' +
         'The escape described in FINDING 1 is the subject of this report.',
     );
-    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
-  });
-
-  // The EMPTY ZONE: from the block's end to the next structural line, only blank lines may
-  // appear. A mangled sibling is written into its own finding's territory; a stale certificate
-  // excludes it by fiat, but position still sees it — ANY content line in the zone voids, even
-  // innocent prose, because the two are indistinguishable by construction. A lost enumeration is
-  // the safe degradation; a kept subset is the escape.
-  it('a content line in the finding’s zone voids — even innocent prose', () => {
-    const out = parseFindings(
+    expect(after[0]!.subclaims).toEqual(['half one', 'half two']);
+    // …including content directly below the block, with no structural line between: there is no
+    // zone left to close. This is the one behaviour change grammar-or-prose makes on purpose —
+    // the old zone rule voided this case even though the prose line matches nothing.
+    const noStructuralLine = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 1b: half two\n' +
         'The escape described in FINDING 1 is the subject of this report.',
     );
-    expect(out[0]!.subclaims).toEqual([]);
+    expect(noStructuralLine[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The stale-certificate escape, closed by position: the certificate counts only the strict
-  // line, so it certifies the subset as complete — but the mangled sibling sits in the finding's
-  // own territory, where the zone rule voids the whole enumeration whatever the line mangled into
-  // (`FINDING 1 b` is invisible to every net that spares prose).
-  it('a stale certificate over a net-invisible mangled sibling voids — position proves the zone', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: recorded claim\n' +
-        '(b) FINDING 1 — hidden claim, its letter surviving only as decoration',
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0]!.subclaims).toEqual([]);
-  });
-
-  // …and a blank line cannot detach the sibling from its list (this round's live probe): the
-  // zone runs to the next STRUCTURAL line, so blank-then-content is still content in the zone.
-  it('a blank line cannot detach a mangled sibling — the whole zone must be empty', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: recorded claim\n' +
-        '\n' +
-        '(b) FINDING 1 — hidden claim, its letter surviving only as decoration',
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0]!.subclaims).toEqual([]);
-  });
-
-  it('an ACCEPTANCE line closes the zone — reports answer criteria right after their findings', () => {
+  it('an ACCEPTANCE line after the block is ordinary prose, not a structural marker', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
@@ -687,90 +635,45 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The SPACED LABEL net, on the exact composition a gate of this task's own gestation mined:
-  // decoration wearing a letter (slips the head net), the colon swallowed by a dash (slips the
-  // near-colon net), the letter adrift of its number by a space (slips the glued-token net) —
-  // and the whole line placed BELOW a structural line, outside every zone. A lone letter hard by
-  // the number is a label wherever it sits; the stale certificate cannot bless the kept subset.
-  it('a spaced lettered token past a structural line still voids — the composed probe', () => {
+  // STATED LIMITATION (RUN-189): the one case grammar-or-prose does not catch is a DOUBLE
+  // FAULT — a mangled sibling AND a certificate whose count happens to exclude it by that same
+  // single error (a stale count, never revised after the line was mangled). The mangled line is
+  // silently dropped as prose, and the certificate — now accurate for what actually parsed —
+  // certifies the smaller enumeration as complete. This is out of scope by decision, not an
+  // oversight: findings stand by default, an unrecorded claim can never be CLEARED, and the
+  // re-adjudicating reviewer still reads the report text, where the mangled line remains visible
+  // as prose. See the comment at the parse chokepoint (parseFindings) for the full argument.
+  it('the stated double fault: a mangled sibling a stale certificate also fails to count', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: visible claim\n' +
-        'ACCEPTANCE 1: VERIFIED a.ts:1 covers it\n' +
-        '(b) FINDING 1 b — hidden claim',
+        'FINDING 1a: recorded claim\n' +
+        '(b) FINDING 1 — hidden claim, its letter surviving only as decoration',
     );
-    expect(out[0]!.subclaims).toEqual([]);
+    expect(out[0]!.subclaims).toEqual(['recorded claim']); // declared 1 == parsed 1 — accepted, not voided
   });
 
-  it('spaced-label variants void outside the zone too — junk letters, brackets, any separator', () => {
+  // Every other malformed shape stays exactly what it always was under grammar-or-prose: prose.
+  // It is never counted as an extra sub-claim of its own, whatever it mangles into — it only
+  // matters when it also changes whether the certificate's count matches (covered above).
+  it('a malformed label is always prose — never an extra sub-claim, never a voider on its own', () => {
     for (const bad of [
       'see FINDING 1 b — a letter adrift of its number',
       'FINDING 1 (b) — spaced and parenthesized, colon swallowed',
       '(b) FINDING 1 b2 — spaced junk label',
       '…as (b) FINDING 1 B — uppercase adrift',
-      'see FINDING 1 ---------- b — the gap is unbounded, a length window is the next minable edge',
+      'as FINDING 1c argues, the same gate leaks elsewhere too',
+      'Here FINDING 1a is contested while (b) stands on the same evidence.',
     ]) {
       const out = parseFindings(
         `FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\nFINDING 1a: half one\nVERDICT: FAIL\n${bad}`,
       );
-      expect(out[0]!.subclaims).toEqual([]);
+      expect(out[0]!.subclaims).toEqual(['half one']); // declared 1 == parsed 1, unaffected by the prose
     }
   });
 
-  // …while a mention whose next word is a real WORD stays harmless — a lone letter is the tell
-  // (`a, b, c…` is what the format is made of); a following letter makes it prose. The lone
-  // single-letter word ('…FINDING 1 a subtle leak…') is the deliberate cost, priced like every
-  // other net cost: a dull single-claim degradation, never a kept subset.
-  it('a mention followed by a real word does not trip the spaced-label net', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
-        'FINDING 1a: half one\n' +
-        'FINDING 1b: half two\n' +
-        'VERDICT: FAIL\n' +
-        'see FINDING 1 before merging; FINDING 1 holds either way — FINDING 1, in short, stands.',
-    );
-    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
-  });
-
-  // No in-range sparing: a recorded letter can be WORN by a distinct unrecorded claim, so a
-  // lettered token off the finding's own lines always voids — narration names letters as `(a)`,
-  // the form every render uses, or by claim text. Placed below VERDICT, outside the zone, so this
-  // pins the NET alone: the lettered token itself is what voids.
-  it('a lettered mention off the finding’s own lines voids — even in-range, even outside the zone', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
-        'FINDING 1a: half one\n' +
-        'FINDING 1b: half two\n' +
-        'VERDICT: FAIL\n' +
-        'Here FINDING 1a is contested while (b) stands on the same evidence.',
-    );
-    expect(out[0]!.subclaims).toEqual([]);
-  });
-
-  // The refutation of the spared-mention theory: a mangled sibling can wear a letter the
-  // enumeration DOES record, and a certificate that counts only the strict line then blesses the
-  // kept subset — the distinct second claim escaping unrecorded. The worn letter voids the whole.
-  it('a distinct claim wearing a recorded letter voids — a stale certificate cannot keep the subset', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: first\n' +
-        '(b) FINDING 1a — distinct second',
-    );
-    expect(out[0]!.subclaims).toEqual([]);
-  });
-
-  it('an out-of-range lettered mention voids — it is an intended sibling the nets could not read', () => {
-    const out = parseFindings(
-      'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
-        'FINDING 1a: half one\n' +
-        'as FINDING 1c argues, the same gate leaks elsewhere too',
-    );
-    expect(out[0]!.subclaims).toEqual([]);
-  });
-
-  // The finding's OWN lines are the one place a lettered token is format rather than mutation: the
-  // numbered FINDING line quoting its own letters (a claim ABOUT the format does exactly this) and
-  // the strict lines themselves must not void the enumeration they are part of.
+  // The finding's OWN lines are ordinary strict lines like any other — quoting its own letters in
+  // the parent claim's prose is just text, since only the certified block below the FINDING line
+  // is ever scanned for that finding's letters.
   it('a finding’s own head line quoting its letters does not void its enumeration', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the parse must keep FINDING 1a distinct [sub-claims: 2]\n' +
@@ -780,17 +683,18 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // …but another finding's line is not this finding's own: a lettered token there is narration
-  // about it, prose-indistinguishable from a mangled sibling, and voids it like any other.
-  it('a lettered token on ANOTHER finding’s strict line voids the finding it names', () => {
+  // …and another finding's claim text mentioning THIS finding's letter is just that finding's own
+  // claim prose — grammar-or-prose judges each line once, by its own shape, never by what its
+  // claim text happens to say about a different finding.
+  it('a finding’s claim text mentioning another finding’s letter does not cross-void it', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: one [sub-claims: 1]\n' +
         'FINDING 1a: half one\n' +
         'FINDING 2 [High] b.ts:1: two [sub-claims: 1]\n' +
         'FINDING 2a: overlaps the claim of FINDING 1a above',
     );
-    expect(out[0]!.subclaims).toEqual([]); // voided by the token on 2's line
-    expect(out[1]!.subclaims).toEqual(['overlaps the claim of FINDING 1a above']); // 2's own line records
+    expect(out[0]!.subclaims).toEqual(['half one']); // untouched by finding 2's claim text
+    expect(out[1]!.subclaims).toEqual(['overlaps the claim of FINDING 1a above']);
   });
 
   // The label must start with a non-digit, so `FINDING 12` is a mention of finding 12 — never
@@ -804,8 +708,6 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one']);
   });
 
-  // The token net keys on a colon NEAR the number — label-intent — so a colon that is ordinary
-  // sentence structure, further along the line, stays prose and spares the enumeration.
   it('a prose mention with a far-away colon does not void either', () => {
     const out = parseFindings(
       'See FINDING 1 for the full chain of evidence: it holds either way.\n' +
@@ -816,8 +718,6 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The report's own `ESCALATE STRUCTURAL FINDING <n>:` line is format-legal and asserts the
-  // finding — it letters nothing and must not void the letters it escalates over.
   it('an ESCALATE STRUCTURAL line does not void the finding it escalates', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 2]\n' +
@@ -828,9 +728,9 @@ describe('parsing sub-claims (RUN-180)', () => {
     expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
   });
 
-  // The strict shapes are checked WITH their number: finding 2's sub-claim line whose claim text
-  // quotes `FINDING 1:` is a recorder for 2 and a voider for 1 — never a recorder for 1.
-  it('a sub-claim line mentioning another finding near-colon voids that finding, not itself', () => {
+  // The strict shape is checked WITH its own number: finding 2's sub-claim line whose claim text
+  // quotes `FINDING 1:` is a recorder for 2 alone — it is prose as far as finding 1 is concerned.
+  it('a finding’s claim text mentioning another finding by number and colon does not cross-void it', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: one [sub-claims: 2]\n' +
         'FINDING 1a: half one\n' +
@@ -838,21 +738,17 @@ describe('parsing sub-claims (RUN-180)', () => {
         'FINDING 2 [High] b.ts:1: two [sub-claims: 1]\n' +
         'FINDING 2a: overlaps FINDING 1: the same gate',
     );
-    expect(out[0]!.subclaims).toEqual([]); // voided by the quoted near-colon token
-    expect(out[1]!.subclaims).toEqual(['overlaps FINDING 1: the same gate']); // recorded for its own number
+    expect(out[0]!.subclaims).toEqual(['half one', 'half two']);
+    expect(out[1]!.subclaims).toEqual(['overlaps FINDING 1: the same gate']);
   });
 
-  // The deliberate cost of the wider net: a PROSE line that happens to start `FINDING 1 rests…`
-  // voids that finding's enumeration. Degrading to the single-claim finding is current behaviour
-  // and always a correct way to record it; a kept subset is the escape. Never an error.
-  it('a prose line starting FINDING <n> degrades the finding to single-claim, never to an error', () => {
+  it('a prose line that merely starts with FINDING <n> is prose, not a voider', () => {
     const out = parseFindings(
       'FINDING 1 [High] a.ts:1: the class [sub-claims: 1]\n' +
         'FINDING 1a: a well-formed sub-claim\n' +
         'FINDING 1 rests on the same evidence either way',
     );
-    expect(out).toHaveLength(1);
-    expect(out[0]!.subclaims).toEqual([]);
+    expect(out[0]!.subclaims).toEqual(['a well-formed sub-claim']);
   });
 
   it('a duplicated letter voids the enumeration — a response naming it would be ambiguous', () => {
@@ -1043,37 +939,43 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
     ]);
   });
 
-  // The union is capped, and the cap never slices: a union it cannot hold keeps the HELD set
-  // whole and drops the new enumeration — all-or-nothing (the parse-side rule, one fold up),
-  // because a sliced union is a kept subset the contest could clear around.
-  it('a union past the ledger cap keeps the held set whole rather than slicing', () => {
+  // The union is capped, and it DOES slice on overflow (RUN-189) — but only the HELD side, oldest
+  // first. This round's own raised claims are never what the cap discards: an entry that kept the
+  // held set whole and dropped the new enumeration let a terminal round's own current claims go
+  // unrecorded, so candidacy read a record that had never seen them (the overflow-vs-candidacy
+  // bug the terminal ledger named).
+  it('overflow keeps this round’s raised claims whole and drops the oldest held claims first', () => {
     const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
     const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
     const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // union = 8, at the cap
     expect(round2[0]!.subclaims).toHaveLength(8);
-    const round3 = buildLedger(round2, [SF(1, claims('three'))], [], 3); // union would be 12
-    expect(round3[0]!.subclaims.map((s) => s.claim)).toEqual(round2[0]!.subclaims.map((s) => s.claim));
+    const round3 = buildLedger(round2, [SF(1, claims('three'))], [], 3); // union would be 12: overflow
+    const names = round3[0]!.subclaims.map((s) => s.claim);
+    expect(names).toHaveLength(8); // the cap holds
+    expect(names.slice(0, 4)).toEqual(claims('three')); // this round's own claims are never dropped
+    expect(names.slice(4)).toEqual(claims('two')); // round 2's claims — still the more recent held set
+    expect(names).not.toEqual(expect.arrayContaining(claims('one'))); // round 1's — the oldest — are gone
   });
 
-  // …and standing whole must not cost this turn's answers: the builder — shown the record's
-  // letters for standing claims — may be contesting one in the very fold that overflows. A letter
-  // this round's enumeration shadows names the report in front of the builder instead (crediting
-  // the held claim too would be inventing).
-  it('the overflow fallback still credits this turn’s answer at the held claim’s position', () => {
+  // A credit this turn lands correctly when the position it names survives the cap — the front of
+  // the held set, not the tail the overflow slice drops.
+  it('the overflow slice still credits this turn’s answer at a surviving held position', () => {
     const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
     const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
-    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // the record now holds (a)–(h)
+    const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // the record holds (a)–(h)
     const round3 = buildLedger(
       round2,
-      [SF(1, claims('three'))], // overflow: the new enumeration is dropped, held set stands…
-      [SR(1, 'e', 'contested', 'e.ts:9', 'answered at its record position')],
+      [SF(1, ['single new claim'])], // one new claim this round — room for 7 of the held 8
+      // (b) is the record's second position, held[1] = 'two claim b' — well inside the surviving 7.
+      [SR(1, 'b', 'contested', 'b.ts:9', 'answered at its record position')],
       3,
     );
     const byClaim = new Map(round3[0]!.subclaims.map((s) => [s.claim, s]));
-    // (e) is the fifth record position — the first past the report's four lines: held[4].
-    expect(byClaim.get('one claim a')).toMatchObject({ status: 'contested', pointer: 'e.ts:9' });
-    // (a) is shadowed by this round's report — it names 'three claim a', never the held claim.
-    expect(byClaim.get('two claim a')!.status).toBe('unanswered');
+    expect(byClaim.get('single new claim')!.status).toBe('unanswered'); // this round's own claim, untouched
+    expect(byClaim.get('two claim b')).toMatchObject({ status: 'contested', pointer: 'b.ts:9' });
+    // 'one claim d' is the last position in the held set (index 7) — the one the slice drops to
+    // make room; a credit landing there would be lost with it, but none was aimed at it here.
+    expect(byClaim.has('one claim d')).toBe(false);
   });
 
   // The same crediting on the letterless-re-raise path: the held set is preserved AND the
@@ -1243,6 +1145,41 @@ describe('folding partial answers into the ledger (RUN-180)', () => {
       ['claim a', 'contested'],
       ['claim b', 'unanswered'],
     ]);
+  });
+
+  // RUN-189: the parent-rephrase bug. The claims below share a 60+ character prefix — enough for
+  // matchIndex's prose rule to still find the same entry — but diverge past it, so trustedCarry's
+  // rule 1 (full parent wording) refuses the carry, and with no requirement bracket rule 2 refuses
+  // it too. Only rule 3 — a held sub-claim re-listed VERBATIM — can keep the record, and the
+  // terminal round re-lists just the already-contested half. Refusing rule 3 dropped the held
+  // UNANSWERED sibling instead of leaving it standing: the original RUN-180 escape reopened in the
+  // one corner rules 1 and 2 do not reach.
+  it('a parent rephrase that re-lists a held sub-claim verbatim keeps the unlisted sibling standing', () => {
+    const prefix = 'the parent rephrase bug in trustedCarry drops a held unanswered sibling when ';
+    const round1 = buildLedger(
+      [],
+      [{ ...SF(1, AB), claim: `${prefix}the parent is examined the first time` }],
+      [SR(1, 'b', 'contested', 'b.ts:9', 'refuted')],
+      1,
+    );
+    // Round 1: (a) unanswered, (b) contested. The terminal round rephrases the PARENT claim past
+    // the shared prefix (no full-wording match, no requirement) and re-lists only 'claim b' —
+    // word for word.
+    const round2 = buildLedger(
+      round1,
+      [{ ...SF(1, ['claim b']), claim: `${prefix}the parent is rephrased on this exact corner` }],
+      [],
+      2,
+    );
+    expect(round2).toHaveLength(1); // still one entry — matchIndex's prose-prefix rule still fires
+    // (a) 'claim a' must STAND — unanswered — not vanish because the parent was reworded.
+    expect(round2[0]!.subclaims.map((s) => [s.claim, s.status])).toEqual([
+      ['claim b', 'contested'], // the verbatim re-listing carries its rebuttal
+      ['claim a', 'unanswered'], // the unlisted sibling stands, behind it in the record's order
+    ]);
+    expect(renderLedger(round2)).toMatch(
+      /\(b\) claim a\n\s+→ builder: no response recorded — this sub-claim STANDS/,
+    );
   });
 
   // The settlement read (requirementOutcomes) uses the RECONCILED sub-claim state: every letter
@@ -1452,13 +1389,16 @@ describe('applyContestResponses', () => {
     reason: 'because',
   });
 
+  // RUN-189: the overflow fold keeps THIS round's own enumeration whole and drops the oldest held
+  // claims — never the other way around — so the record the builder contests always shows the
+  // terminal round's own current claims at its front.
   it('resolves letters against the record even where the report’s own lettering diverges — overflow', () => {
     const claims = (tag: string) => ['a', 'b', 'c', 'd'].map((l) => `${tag} claim ${l}`);
     const round1 = buildLedger([], [SF(1, claims('one'))], [], 1);
     const round2 = buildLedger(round1, [SF(1, claims('two'))], [], 2); // the record holds (a)–(h)
     const terminal = SF(1, claims('three'));
-    const raised = buildLedger(round2, [terminal], [], 3); // overflow: held set stands, report's claims dropped
-    const held = [...claims('two'), ...claims('one')]; // round 2's union order: its own claims first
+    const raised = buildLedger(round2, [terminal], [], 3); // overflow: round 1's claims — the oldest — drop
+    const held = [...claims('three'), ...claims('two')]; // this round's claims lead; round 2's fill the rest
     expect(raised[0]!.subclaims.map((s) => s.claim)).toEqual(held);
     // The record showed (a)–(h) for the HELD claims; the builder contests every displayed letter.
     const letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
@@ -1468,8 +1408,8 @@ describe('applyContestResponses', () => {
       letters.map((l) => SR(1, l, `${l}.ts:1`)),
       3,
     );
-    // Every answer lands on the claim the record displayed at that letter — none discarded against
-    // the dropped report enumeration ('three claim …'), which is not in the record at all.
+    // Every answer lands on the claim the record displayed at that letter — including the
+    // terminal round's OWN claims ('three claim …'), which the overflow fix keeps in the record.
     expect(answered[0]!.subclaims.map((s) => [s.claim, s.status, s.pointer])).toEqual(
       held.map((c, i) => [c, 'contested', `${letters[i]}.ts:1`]),
     );

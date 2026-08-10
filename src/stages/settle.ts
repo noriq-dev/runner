@@ -15,8 +15,15 @@
  *   - the workspace goes last, because everything above may still have needed it.
  */
 
-import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
+import {
+  type AcceptanceReport,
+  acceptanceNeedsAttention,
+  acceptanceSummary,
+  renderAcceptanceReport,
+} from '../acceptance';
 import { totalTokens } from '../drivers/budget';
+import { buildEpisode } from '../episode';
+import { requestSelfSummary } from '../episode-summary';
 import { clearSetupMarker } from '../setup';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
@@ -58,6 +65,28 @@ export async function withTimeout(p: Promise<unknown>, ms: number, onTimeout: ()
 export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
   const { run, repo, worktree, workflow: wf } = ctx;
 
+  // The optional agent self-summary (RUN-226) — requested FIRST, ahead of everything else in this
+  // stage, because `continueWith` is the only mechanism the acceptance permits (no out-of-band
+  // model call) and it is only reachable while the session below is still open. Asked without
+  // knowing the final outcome — the verify-actor gate a few lines down can still flip `done` to
+  // `failed` — so the prompt (`prompts/self-summary.md`) asks for an account of the agent's OWN
+  // WORK, never the verdict, and this cannot itself become one: nothing below reads its result for
+  // anything but `buildEpisode`'s `selfSummary`. Enrichment only — the try/catch mirrors
+  // `buildEpisode`'s own below, so a throw here costs the summary, never the run.
+  const selfSummary = await requestSelfSummary({
+    session: ctx.session,
+    ...(ctx.getSessionText ? { getSessionText: ctx.getSessionText } : {}),
+    tally: ctx.tally,
+    milestone: (text) => host.transcript(run.id).milestone(text),
+    warn: (message, details) => host.log.warn(message, { runId: run.id, ...details }),
+  }).catch((err) => {
+    host.log.warn('self-summary request failed — settling without one', {
+      runId: run.id,
+      err: String(err),
+    });
+    return null;
+  });
+
   // Every gate that could hand work back has now run, so the session has no more work to do. It
   // MUST be closed explicitly: a multiTurn run deliberately does not self-close on its first result
   // (that is the whole point — RUN-29), so nothing else ever shuts the SDK query down, and an open
@@ -71,11 +100,17 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // The one gate that lives in `settle`, and it belongs here rather than in `verify` for a reason
   // worth stating: it judges the text this run's own session produced, so it is only final once
   // that session is closed. Reading it earlier would mean grading a transcript still being written.
+  //
+  // Captured for the episode assembler below (RUN-224) rather than left to fall out of scope: this
+  // is the only per-criterion evidence `settle` itself computes (the inline reviewer's own copy, on
+  // a `build` run, lives and dies inside `stages/review.ts` — see `EpisodeExtra`'s doc comment).
+  let acceptanceEvidence: AcceptanceReport | undefined;
   if (wf.verifyActor && ctx.driverSucceeded) {
     // Verdict AND per-criterion evidence together (RUN-145): a report that marks a criterion
     // FAILED and then signs off PASS is taken as the FAIL it contains, rather than as whichever
     // half the parser happened to read last.
     const v = judgeWithAcceptance(ctx.sessionText, ctx.acceptance);
+    acceptanceEvidence = v.acceptance;
     if (v.acceptance?.entries.length) {
       host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(v.acceptance)}`);
       // Posted on a PASS as well, whenever anything is short of verified: a passing run is the one
@@ -162,11 +197,20 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   const hasRemainingWork =
     wf.produces && !ctx.landed && (ctx.driverSucceeded || (await vcs.hasWork(worktree).catch(() => true)));
 
+  // This sitting's declared write scope, straight from the backend (RUN-130) — read ONCE, while
+  // the workspace still exists, and shared by the continuation record below AND the episode
+  // assembler after `report` (RUN-224): reading it twice could disagree with itself about what
+  // this sitting touched. Best-effort: a backend without `changedPaths`, or a query that errors,
+  // records none — both readers then see empty, exactly as before either existed.
+  const changedPaths = await (vcs.changedPaths?.(worktree) ?? Promise.resolve([]))
+    .then((p) => p)
+    .catch(() => [] as string[]);
+
   const nextLogSeq = host.endTranscript(
     run.id,
     `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`,
   );
-  await recordContinuation(host, ctx, nextLogSeq, hasRemainingWork);
+  await recordContinuation(host, ctx, nextLogSeq, hasRemainingWork, changedPaths);
 
   host.report(run.id, {
     status: ctx.exit.outcome,
@@ -189,6 +233,36 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // kept alive on its behalf) — `hasRemainingWork` already folds that in, so they dispose exactly
   // as before.
   const keptForHuman = hasRemainingWork && !vcs.disposePreservesWork;
+
+  // Effort episode assembly (RUN-224) — the deterministic skeleton doc_msgy182g253w1r02596q §8
+  // names. Placed HERE deliberately, between the two calls that bound it on opposite sides:
+  //
+  //   - AFTER `report` above: the server's own episode ingest (RUN-227, once it lands) skips any
+  //     row whose run has no terminal exit yet, and `report` is what sets one. Assembling earlier
+  //     would build a payload undeliverable by construction the moment delivery exists.
+  //   - BEFORE `dispose` below: `filesTouched` was read from a workspace that must still exist,
+  //     and `dispose` is what reaps it.
+  //
+  // Wrapped so a thrown error, a rejected promise, or a missing `host.recordEpisode` sink costs
+  // only this sitting's episode — never the run's own outcome, which is already fully decided by
+  // this point (see the module doc's completeness argument for why the payload matters, and
+  // settle's own doc for why nothing here may become a second gate).
+  try {
+    const episode = buildEpisode(ctx, {
+      filesTouched: changedPaths,
+      hasRemainingWork,
+      acceptanceEvidence,
+      // Drained once, here — the daemon's own steer-delivery record (RUN-225), not the server's
+      // independent view. `steeringHistory` is optional on `StageHost`; a host with none wired
+      // (a test, steering off machine-wide) reads the same as a bridge that observed nothing.
+      steeringHistory: host.steeringHistory?.(run.id) ?? [],
+      selfSummary,
+    });
+    host.recordEpisode?.(episode);
+  } catch (err) {
+    host.log.warn('episode assembly failed — settling anyway', { runId: run.id, err: String(err) });
+  }
+
   if (!keptForHuman) {
     await vcs
       .dispose(worktree)
@@ -247,10 +321,14 @@ async function recordContinuation(
   /** Whether the workspace still holds unlanded work — settle's own dispose answer, shared so the
    *  record and the workspace cannot disagree about what exists. */
   hasRemainingWork: boolean,
+  /** What this sitting touched, per the backend (RUN-130) — read ONCE by the caller (RUN-224) and
+   *  passed in, rather than queried again here, so this record and the episode assembler cannot
+   *  read the workspace at two different moments and disagree. */
+  changedPaths: string[],
 ): Promise<void> {
   const store = host.continuable;
   if (!store) return;
-  const { run, repo, worktree } = ctx;
+  const { run } = ctx;
   if (ctx.exit.outcome === 'done') {
     await store.remove(run.id).catch(() => {});
     return;
@@ -259,12 +337,6 @@ async function recordContinuation(
   // No record is written and none is removed — a state with no work has nothing to describe.
   if (!hasRemainingWork) return;
   const spent = ctx.exit.telemetry;
-  // What this sitting touched becomes the continuation's declared lock scope (RUN-130).
-  // Best-effort: a backend without `changedPaths`, or a query that errors, simply records none —
-  // the predictive layer then no-ops exactly as it did while nothing was bound.
-  const changedPaths = await (host.vcsFor(repo).changedPaths?.(worktree) ?? Promise.resolve([]))
-    .then((p) => p)
-    .catch(() => [] as string[]);
   await store
     .put({
       runId: run.id,

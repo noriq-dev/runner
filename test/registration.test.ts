@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DiscoveredRepo } from '../src/discovery';
-import { buildRegistration } from '../src/registration';
+import { buildRegistration, repoReport } from '../src/registration';
 
 const repos: DiscoveredRepo[] = [
   {
@@ -11,7 +11,9 @@ const repos: DiscoveredRepo[] = [
     defaultBranch: 'main',
     // The board lock (RUN-71) travels from the marker to the wire — the server resolves
     // the NAME, the daemon never sees a board id.
-    manifest: { key: 'AAA', board: 'Runner' } as never,
+    manifest: { key: 'AAA', board: 'Runner', repositoryKey: null } as never,
+    repositoryKey: null,
+    indexConfig: null,
   },
   {
     id: 'repo_b',
@@ -19,7 +21,9 @@ const repos: DiscoveredRepo[] = [
     projectKey: 'BBB',
     name: 'b',
     defaultBranch: null,
-    manifest: { key: 'BBB', board: null } as never,
+    manifest: { key: 'BBB', board: null, repositoryKey: null } as never,
+    repositoryKey: null,
+    indexConfig: null,
   },
 ];
 
@@ -45,9 +49,18 @@ describe('buildRegistration', () => {
         board: 'Runner',
         name: 'a',
         defaultBranch: 'main',
+        repositoryKey: null,
         workflows: builtins,
       },
-      { id: 'repo_b', projectKey: 'BBB', board: null, name: 'b', defaultBranch: null, workflows: builtins },
+      {
+        id: 'repo_b',
+        projectKey: 'BBB',
+        board: null,
+        name: 'b',
+        defaultBranch: null,
+        repositoryKey: null,
+        workflows: builtins,
+      },
     ]);
     expect('runnerId' in reg).toBe(false); // omitted on first registration
   });
@@ -73,11 +86,14 @@ describe('buildRegistration', () => {
         manifest: {
           key: 'WWW',
           board: null,
+          repositoryKey: null,
           workflows: {
             docs: { base: 'scope', prompt: 'survey it', stages: null, description: 'survey the repo' },
             hotfix: { base: 'build', prompt: null, stages: null, description: null },
           },
         } as never,
+        repositoryKey: null,
+        indexConfig: null,
       },
     ];
     const reg = buildRegistration({ label: 'l', concurrency: 1, tools: ['claude'] }, withWorkflows);
@@ -166,6 +182,38 @@ describe('buildRegistration', () => {
     expect(codex?.efforts).toEqual(['low', 'medium', 'high']);
     // a runner with no tools advertises no agents
     expect(buildRegistration({ label: 'l', concurrency: 1, tools: [] }, []).agents).toEqual([]);
+  });
+});
+
+describe('repoReport — repositoryKey validation (RUN-208)', () => {
+  const repo = { id: 'repo_a', projectKey: 'AAA', name: 'a', defaultBranch: null };
+  const spyLogger = () => {
+    const errors: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    return {
+      errors,
+      log: { error: (msg: string, fields?: Record<string, unknown>) => errors.push({ msg, fields }) },
+    };
+  };
+
+  it('carries a valid committed key through to the report', () => {
+    const report = repoReport(repo, { board: null, workflows: {}, repositoryKey: 'noriq-runner' }, undefined);
+    expect(report.repositoryKey).toBe('noriq-runner');
+  });
+
+  it('reports null and never asks a project — no committed key at all', () => {
+    const report = repoReport(repo, { board: null, workflows: {}, repositoryKey: null }, undefined);
+    expect(report.repositoryKey).toBeNull();
+  });
+
+  // decision 6: a malformed key is a VISIBLE association failure — logged and reported null,
+  // never silently rebound to projectKey/name/repoId().
+  it.each(['ckt_abc123', '1bad', 'a/b'])('refuses %j — logs the reason and reports null', (bad) => {
+    const { errors, log } = spyLogger();
+    const report = repoReport(repo, { board: null, workflows: {}, repositoryKey: bad }, undefined, log);
+    expect(report.repositoryKey).toBeNull();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.fields?.repositoryKey).toBe(bad);
+    expect(String(errors[0]?.fields?.reason)).toMatch(/./); // a reason is always given
   });
 });
 

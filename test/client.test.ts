@@ -1,11 +1,31 @@
 import { describe, expect, it } from 'vitest';
-import { NoriqClient } from '../src/client';
+import { NoriqClient, NoriqHttpError } from '../src/client';
 
 interface Captured {
   url: string;
   method: string;
   auth: string | null;
   body: unknown;
+}
+
+/** RUN-234: capture what a `getIndexCursor`/`getContextPack` failure logs — never a real logger,
+ *  and never `console` (the `logger.ts` default) so a test can assert on structured fields. */
+interface LoggedLine {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  msg: string;
+  fields?: Record<string, unknown>;
+}
+function captureLogger(): {
+  lines: LoggedLine[];
+  logger: import('../src/client').NoriqClientOptions['logger'];
+} {
+  const lines: LoggedLine[] = [];
+  const make = (level: LoggedLine['level']) => (msg: string, fields?: Record<string, unknown>) =>
+    lines.push({ level, msg, fields });
+  return {
+    lines,
+    logger: { debug: make('debug'), info: make('info'), warn: make('warn'), error: make('error') },
+  };
 }
 
 function fakeFetch(status: number, payload: unknown, captured: Captured[]): typeof fetch {
@@ -48,7 +68,15 @@ describe('NoriqClient', () => {
       kinds: ['build'],
       maxConcurrency: 1,
       repos: [
-        { id: 'repo_a', projectKey: 'AAA', board: null, name: 'a', defaultBranch: 'main', workflows: [] },
+        {
+          id: 'repo_a',
+          projectKey: 'AAA',
+          board: null,
+          name: 'a',
+          defaultBranch: 'main',
+          repositoryKey: null,
+          workflows: [],
+        },
       ],
     });
     expect(runner.id).toBe('rnr_1');
@@ -80,6 +108,89 @@ describe('NoriqClient', () => {
       fetchImpl: fakeFetch(404, { error: 'runner not found' }, []),
     });
     await expect(client.heartbeat('rnr_x', { freeSlots: 0 })).rejects.toThrow(/404.*runner not found/);
+  });
+
+  // RUN-220: a bare Error string forced every caller to regex .message for the status. The
+  // ingest client needs to tell a 503 (permanent) apart from a 404/403 (re-mint or give up) —
+  // NoriqHttpError carries the real status/body alongside the pre-existing message format.
+  it('a non-2xx response is a NoriqHttpError carrying the real status and body', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(503, { error: 'ingest capabilities are not enabled' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.heartbeat('rnr_x', { freeSlots: 0 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    const err = caught as NoriqHttpError;
+    expect(err.status).toBe(503);
+    expect(err.body).toContain('ingest capabilities are not enabled');
+  });
+});
+
+// RUN-220: minting under the daemon's own OAuth identity, via this same authenticated client
+// (locked decision 7) — the ONLY thing this client does with an ingest capability. The five
+// token-authorized upload calls themselves live in ingest-client.ts and are exercised there.
+describe('mintIngestCapability (RUN-220)', () => {
+  const INPUT = {
+    projectId: 'prj_1',
+    repositoryKey: 'my-repo',
+    purpose: 'index' as const,
+    scopeId: 'gen_1',
+    runnerId: 'rnr_1',
+  };
+
+  it('POSTs with a bearer token and unwraps the grant', async () => {
+    const captured: Captured[] = [];
+    const grant = { token: 'ing_abc', maxBytes: 8 * 1024 * 1024, expiresAt: '2026-08-08T00:15:00.000Z' };
+    const client = new NoriqClient({
+      server: 'https://noriq.example',
+      token: 'tok123',
+      fetchImpl: fakeFetch(200, grant, captured),
+    });
+    expect(await client.mintIngestCapability(INPUT)).toEqual(grant);
+    expect(captured[0]).toMatchObject({
+      url: 'https://noriq.example/api/runner-ingest/capability',
+      method: 'POST',
+      auth: 'Bearer tok123',
+      body: INPUT,
+    });
+  });
+
+  it('a 503 (ingest not enabled on this server) surfaces as a distinguishable status', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(503, { error: 'ingest capabilities are not enabled' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.mintIngestCapability(INPUT);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    expect((caught as NoriqHttpError).status).toBe(503);
+  });
+
+  it('a 404 (unresolvable repository key) is distinguishable from the 503 above', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'no repository registered for key "my-repo" in this project' }, []),
+    });
+    let caught: unknown;
+    try {
+      await client.mintIngestCapability(INPUT);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NoriqHttpError);
+    expect((caught as NoriqHttpError).status).toBe(404);
   });
 });
 
@@ -352,5 +463,344 @@ describe('getTask spin-off provenance (RUN-188)', () => {
       fetchImpl: mcp({ key: 'K-1', title: 42 }),
     });
     expect(await client.getTask('K-1')).toBeNull();
+  });
+});
+
+// RUN-213: PLNR-306's agentAuth route, reached over the plain REST rail (not MCP) — the daemon's
+// only way to see the server's index cursor at all, since the human-facing read lives under
+// /api/projects/:pid/* (userAuth-gated, unreachable for a Bearer-only daemon).
+describe('getIndexCursor (RUN-213)', () => {
+  const VALID_CURSOR = {
+    repositoryKey: 'my-repo',
+    defaultBranch: 'main',
+    latestObservedBase: 'base-1',
+    activeGeneration: {
+      id: 'gen_1',
+      branch: 'main',
+      baseId: 'base-1',
+      indexerVersion: '1',
+      status: 'active',
+      batchCount: 1,
+      fileCount: 10,
+      sealedAt: '2026-08-01T00:00:00.000Z',
+      validationProblems: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      activatedAt: '2026-08-01T00:00:00.000Z',
+    },
+    stagedGenerations: [],
+    stale: false,
+    failedIngest: false,
+    failedIngestProblems: [],
+    association: { state: 'associated', projectRepositoryId: 'prjrepo_1' },
+  };
+
+  it('POSTs the four fields to the runner-memory route and parses a valid cursor', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_CURSOR, captured),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toEqual(VALID_CURSOR);
+    expect(captured[0]).toMatchObject({
+      url: 'https://a.b/api/runner-memory/index-cursor',
+      method: 'POST',
+      body: { projectId: 'prj_1', repositoryKey: 'my-repo', runnerId: 'rnr_1', checkoutId: 'repo_abc' },
+    });
+  });
+
+  it('an unresolved project (projectId null) is refused before any request is attempted', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_CURSOR, captured),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: null,
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+    expect(captured).toHaveLength(0); // no I/O attempted at all
+  });
+
+  it('a non-2xx response is a null cursor, never a thrown error', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'no repository registered' }, []),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+
+  it('a body that does not parse as RunnerIndexCursor is a null cursor, not a hand-read partial', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      // missing every required field
+      fetchImpl: fakeFetch(200, { ok: true }, []),
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+
+  it('a network error is a null cursor', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: (async () => {
+        throw new Error('ECONNREFUSED');
+      }) as typeof fetch,
+    });
+    const cursor = await client.getIndexCursor('rnr_1', {
+      projectId: 'prj_1',
+      repositoryKey: 'my-repo',
+      checkoutId: 'repo_abc',
+    });
+    expect(cursor).toBeNull();
+  });
+
+  // RUN-234: the same four null-collapsing branches above, now asserting WHAT they log — the
+  // return value is unchanged (still `null` on every branch, still asserted above); this is the
+  // added visibility, never a second answer to what the caller receives.
+  describe('logs the distinction a null return value erases (RUN-234)', () => {
+    it('an unresolved project logs a precondition, not a fetch failure — at debug, not warn', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, {}, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: null, repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'debug', fields: { repositoryKey: 'my-repo' } });
+    });
+
+    it('a non-2xx logs the status code, category "http" — never the response body', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(503, { error: 'a secret-looking detail nobody should see logged' }, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'http', status: 503 } });
+      expect(JSON.stringify(lines[0])).not.toContain('secret-looking detail');
+    });
+
+    it('a schema-invalid 200 logs category "schema" — distinct from an http failure', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, { ok: true }, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'schema' } });
+      expect(lines[0]?.fields?.status).toBeUndefined();
+    });
+
+    it('a transport error logs category "transport" with a bounded message — never the request URL or token', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 'super-secret-token',
+        fetchImpl: (async () => {
+          throw new Error('fetch failed: connect ECONNREFUSED 127.0.0.1:443');
+        }) as typeof fetch,
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'transport' } });
+      expect(JSON.stringify(lines[0])).not.toContain('super-secret-token');
+    });
+  });
+});
+
+describe('getContextPack (RUN-228)', () => {
+  const VALID_PACK = {
+    taskId: 'task_1',
+    projectId: 'prj_1',
+    generatedAt: '2026-08-09T00:00:00.000Z',
+    charBudget: 4000,
+    charsUsed: 100,
+    taskFacts: {
+      taskId: 'task_1',
+      key: 'RUN-1',
+      title: 't',
+      body: null,
+      status: 'todo',
+      priority: 2,
+      claimedBy: null,
+      claimExpiresAt: null,
+      openComments: [],
+      executionSpec: null,
+      executionSpecUnreadable: false,
+    },
+    sections: [],
+  };
+
+  // Same shape as `getIndexCursor`'s own precedent above (locked decision this task cites): ONE
+  // parser, every failure collapsing to `null` rather than three call sites the caller has to
+  // keep in sync with a server that can fail in new ways this daemon has never seen.
+
+  it('POSTs the identity fields to the runner-memory route and parses a valid pack', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_PACK, captured),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+      baseId: 'sha123',
+      branch: 'main',
+      role: 'build',
+    });
+    // `toMatchObject`, not `toEqual`: the schema fills in defaults (role, mode, the various
+    // empty-array fields) that a minimal wire payload never sends — the point of this assertion
+    // is that the fields VALID_PACK DOES carry survived the parse, not that no default fired.
+    expect(pack).toMatchObject(VALID_PACK);
+    expect(captured[0]).toMatchObject({
+      url: 'https://a.b/api/runner-memory/context',
+      method: 'POST',
+      body: {
+        projectId: 'prj_1',
+        runnerId: 'rnr_1',
+        taskId: 'task_1',
+        repositoryKey: 'my-repo',
+        baseId: 'sha123',
+        branch: 'main',
+        role: 'build',
+      },
+    });
+  });
+
+  it('a route absent on an old server (404) is a null pack, never a thrown error', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(404, { error: 'not found' }, []),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('a body that does not parse as ContextPack is a null pack, not a hand-read partial', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      // missing every required field
+      fetchImpl: fakeFetch(200, { ok: true }, []),
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('a network error is a null pack', async () => {
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: (async () => {
+        throw new Error('ECONNREFUSED');
+      }) as typeof fetch,
+    });
+    const pack = await client.getContextPack('rnr_1', {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'my-repo',
+    });
+    expect(pack).toBeNull();
+  });
+
+  it('optional fields absent from the caller are absent from the wire body, never sent as null', async () => {
+    const captured: Captured[] = [];
+    const client = new NoriqClient({
+      server: 'https://a.b',
+      token: 't',
+      fetchImpl: fakeFetch(200, VALID_PACK, captured),
+    });
+    await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+    expect(captured[0]?.body).toEqual({ projectId: 'prj_1', runnerId: 'rnr_1', taskId: 'task_1' });
+  });
+
+  // RUN-234: same three failure-category assertions as `getIndexCursor`'s own block above — this
+  // method has no precondition branch of its own (`repositoryKey`/`taskId` are checked one layer
+  // up, in `context-pack.ts`, never here).
+  describe('logs the distinction a null return value erases (RUN-234)', () => {
+    it('a non-2xx logs the status code, category "http"', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(404, {}, []),
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({
+        level: 'warn',
+        fields: { category: 'http', status: 404, taskId: 'task_1' },
+      });
+    });
+
+    it('a schema-invalid 200 logs category "schema"', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, { ok: true }, []),
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'schema', taskId: 'task_1' } });
+    });
+
+    it('a transport error logs category "transport" with a bounded message', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: (async () => {
+          throw new Error('ECONNREFUSED');
+        }) as typeof fetch,
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'transport' } });
+    });
   });
 });

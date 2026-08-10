@@ -120,6 +120,19 @@ export type ExecuteOutcome =
       /** Live accessor for the same output, which keeps growing through fix turns (RUN-79). */
       getSessionText: () => string;
       tail: string;
+      /**
+       * The wall-clock moment observed immediately before `host.startAgent` spawned this session
+       * (RUN-261) — an ISO datetime, never a `monotonicMs()` reading, because the timeline it feeds
+       * (`episode.ts`'s `timelineOf`) is one the server also writes to and a monotonic value has no
+       * meaning outside this process. `executeRun` below always sets it — this branch is only
+       * reached once the driver actually ran, so the moment was always observed for a REAL session.
+       * Optional on the type only because `supervisor.ts`'s `sessionlessChainExit` builds an inert
+       * outcome of this same shape for a chain that failed before spawning anything (a cancel ahead
+       * of the first step, every wave lease failing) — no session, so nothing to have observed. That
+       * caller omits the field rather than inventing a moment, and `episode.ts` reads its absence as
+       * "never observed", never a substitute.
+       */
+      agentStartedAt?: string;
     };
 
 export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<ExecuteOutcome> => {
@@ -130,6 +143,11 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
   // Active time, for a park's wall-clock accounting (RUN-30): the wait for a human is not the
   // run's, so only the stretch from here to the session's end counts against maxDurationSeconds.
   const startedAt = monotonicMs();
+  // The wall-clock counterpart (RUN-261), captured in the same breath as `startedAt` but never used
+  // for accounting — `monotonicMs()` above is what the budget wrapper and the tally read, untouched
+  // by this. This is telemetry only: the moment `episode.ts`'s "agent started" timeline entry names,
+  // which had no source anywhere on `RunPipeline` until this line.
+  const agentStartedAt = new Date().toISOString();
   const budgetRun = host.startAgent(plan.driver, {
     ...plan.start,
     handlers: {
@@ -203,5 +221,6 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
     sessionText,
     getSessionText: () => sessionText,
     tail,
+    agentStartedAt,
   };
 };

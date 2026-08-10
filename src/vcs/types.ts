@@ -1,3 +1,4 @@
+import type { IndexSource } from '../index-source';
 import type { LockConflict, LockGrant } from '../lock-client';
 
 /**
@@ -66,6 +67,178 @@ export interface Workspace {
    */
   location: unknown;
 }
+
+/**
+ * A read-only lease over the repo's tree for BACKGROUND INDEXING (RUN-211) — never for an agent.
+ * Repeats `Workspace`'s type discipline exactly, for the reason `Workspace`'s own comment gives:
+ * `localPath` is the only field here that is EVER a filesystem path (and is now optional — see
+ * `source`), `baseId` is an opaque token in the owning backend's id-space, and `location` is
+ * backend-owned `unknown` state, so reaching in is a type error rather than a code-review catch.
+ * No ref, branch (beyond the display-only field below), or sha field is added that common code
+ * could pass back to a backend as an operand —
+ * RUN-50's trap applies here verbatim: a Perforce depot path satisfies both `startsWith('/')` and
+ * `path.isAbsolute()` while being no filesystem path at all, and git fuses the two namespaces so a
+ * git-first design never notices. The fusion has to stay unrepresentable, not merely discouraged.
+ */
+export interface IndexSnapshot {
+  /**
+   * How the indexer READS this snapshot (RUN-252/254/255). The one field a caller needs, and the
+   * reason `localPath` below is no longer it: a snapshot's job is to hand over a source, not to
+   * promise a directory.
+   *
+   * Requiring a filesystem path was the seam bug that made both live backends answer
+   * `unsupported` (RUN-211). It forced every backend to MATERIALIZE a full tree first — on a
+   * deliberately-large Perforce depot the single most expensive thing that could be asked of it —
+   * when both live backends can serve file content at a revision far more cheaply: Perforce reads
+   * the depot with no client workspace at all, and Diversion reads its REST API with no checkout.
+   * Neither needs to write a byte to disk, and neither should have to.
+   */
+  source: IndexSource;
+  /**
+   * Where this snapshot materialized a tree, IF it did, OR a CANDIDATE local root a backend offers
+   * for its own `source` to verify bytes against (RUN-281) — a real filesystem path when present
+   * either way, the ONLY field here that is one. Absent on a backend that offers neither
+   * (Perforce's depot, still pure API today).
+   *
+   * **This IS now an operand, and the contract is different for the two roles it plays** — stated
+   * plainly rather than left to be quietly reinterpreted, because this field's doc used to warn
+   * the opposite: "the moment this becomes an operand it is `location` smuggled past the type
+   * system" (see `Workspace.workRef`'s doc, which this file's original comment deliberately
+   * mirrored). That warning is about a caller OUTSIDE the backend that minted a snapshot treating
+   * a display fact as something to act on. It still holds for every caller but one:
+   *
+   *   - **Git's own snapshot**: a freshly-minted, exclusively-owned detached worktree of tracked
+   *     files. Every byte under it is already trusted absolutely — nothing else can write to it —
+   *     so this is diagnostics only, exactly as it always was: for logs, never re-opened or
+   *     re-read by anything that receives the snapshot.
+   *   - **A backend offering a verify-then-read candidate (Diversion, since RUN-281)**: this path
+   *     may be STALE, DIRTY, or belong to a shared, concurrently-mutating workspace (a pool-of-1
+   *     lease another run might be actively checking out) — nothing here guarantees it reflects
+   *     `baseId` at all. It is safe to treat as an operand ONLY because the backend that offers it
+   *     also wires the identical string into its own `source`'s constructor at the same call site
+   *     (`DiversionBackend.leaseIndexSnapshot` mints both together, from the same `repoRoot`), and
+   *     that `source` verifies every byte — a fresh hash against the backend's own per-path digest
+   *     — before ever returning local bytes to a caller. A caller reading THIS field directly and
+   *     opening it itself would be exactly the trap `Workspace.workRef`'s doc warns about: nothing
+   *     outside the minting backend may treat this path as trustworthy, because nothing outside it
+   *     knows to verify first. `index-work.ts`'s own doc states the resulting rule plainly: reads
+   *     `snapshot.source`, never `snapshot.localPath` — that discipline is what keeps this field an
+   *     operand for exactly one piece of code (the backend that minted it) and a diagnostic for
+   *     everyone else, rather than the smuggled-location trap this comment used to warn against.
+   *
+   * Optional rather than a union arm deliberately: every consumer reads `source`, so a discriminant
+   * would make callers narrow a shape they never branch on. Absent means "nothing was offered" —
+   * neither a materialized tree nor a local candidate — a fact a log line wants and the indexer
+   * itself does not, because the indexer never looks at this field at all.
+   */
+  localPath?: string;
+  /**
+   * The snapshot's base, in the backend's own id-space. `Workspace.baseId`'s contract verbatim:
+   * an opaque token, hand it back to the SAME backend as a ref, display it, never parse it.
+   */
+  baseId: string;
+  /**
+   * Reported scope, in words — for logs and the index generation manifest's `branch` field.
+   * `Workspace.workRef`'s exact status, not a looser one: display ONLY, and the moment this
+   * becomes an operand it is `location` smuggled past the type system. Shared's
+   * `IndexGenerationManifest.branch` is a `BranchRef` the server stores as the scope a `baseId`
+   * is fresh against, and its own definition admits a symbolic class ("default", "integration")
+   * where no single branch applies — this is that scope metadata crossing the wire, not a ref
+   * crossing the seam. Absent when the backend's snapshot has no branch at all (git: detached, by
+   * design — see `VcsBackend.leaseIndexSnapshot`).
+   */
+  branch?: string;
+  /**
+   * Intent, not enforcement (discretion note 8 in RUN-211's spec): no backend chmods this tree.
+   * The invariant is structural instead — no agent ever runs in an index snapshot, the indexer
+   * opens files `O_RDONLY` through `openConfined`, and a snapshot (detached, or a pool-of-1
+   * backend's idle workspace) can land nothing — so a full recursive chmod would pay a
+   * monorepo-sized tree walk to defend a property nothing here can violate. Always `true` on an
+   * `ok:true` acquisition result; kept as a field (not dropped) so a caller reads intent without
+   * having to know that fact about every backend.
+   */
+  readOnly: true;
+  /** Backend-owned state, opaque to everything outside the backend that minted it — see
+   *  `Workspace.location`'s comment; the same reasoning applies verbatim. Unlike `Workspace`,
+   *  never round-trips through JSON (a snapshot is never parked), so it carries no
+   *  serializability obligation of its own. */
+  location: unknown;
+}
+
+/**
+ * The outcome of asking for an index snapshot (RUN-211). A discriminated result, never a throw,
+ * for the two ROUTINE conditions: `busy` (a backend whose leases cannot overlap is occupied —
+ * indexing yields to a run, not the other way round) and `unsupported` (this backend cannot
+ * produce a read-only snapshot at all). The same judgement `publish`'s `{ok:false,
+ * reason:'race'}` already records: indexing is background work, so "not now" is an expected
+ * outcome, and a throw would make a routine, correct condition look like a fault. A backend's own
+ * infra failures (a git command that genuinely errors) still reject the promise, exactly as
+ * `lease` does today — this union is for outcomes a caller is meant to branch on, not for faults.
+ */
+export type IndexSnapshotResult =
+  | { ok: true; snapshot: IndexSnapshot }
+  | { ok: false; reason: 'busy' | 'unsupported'; detail?: string };
+
+/**
+ * The outcome of `VcsBackend.changesBetween` (RUN-212) — named as an OUTCOME, never a bare diff:
+ * either "here is what moved" or "ask me for everything". The two arms must never be confused
+ * (locked decision 1): an empty diff and "I could not tell" are the same SHAPE and opposite
+ * MEANINGS, and the wrong one is silent — an index kept serving a stale generation while every
+ * consumer believes it is current. This is `hasWork`'s rule one verb over, for a caller that acts
+ * CREDULOUSLY on the answer (skips re-indexing) rather than destructively — just as bad, and
+ * harder to notice, because nothing crashes.
+ *
+ * `{ok:true}` with both lists empty is a REAL, DISTINCT answer meaning nothing changed (locked
+ * decision 2) — not a stand-in for "could not tell". Every backend that cannot relate two bases
+ * with confidence — unrelated histories, a base it can no longer resolve, an ambiguous
+ * relationship, a query that errored, a rename it cannot express, or a change set past this
+ * backend's own bound — answers `full-index-required` instead, never an empty or partial list.
+ *
+ * A RENAME is a deletion of the old path PLUS a change at the new path (locked decision 3) —
+ * never its own arm, never a from/to pair. The index is path-keyed (the server's generation
+ * carries `deletions: RepoPath[]` and file records by path), so an undecomposed rename would
+ * leave the old path in the index forever, describing a file that no longer exists. Whether a
+ * backend detected a rename via a similarity heuristic must not change the index's contents —
+ * only which of these two lists a path lands in.
+ */
+export type ChangesBetweenResult =
+  | { ok: true; changed: string[]; deleted: string[] }
+  | { ok: false; reason: 'full-index-required'; detail: string };
+
+/**
+ * The outcome of `VcsBackend.queryIgnored` (RUN-256) — an outcome union, never a bare `Set`, for
+ * the same reason `IndexSnapshotResult`/`ChangesBetweenResult` are: "these paths are ignored" and
+ * "I cannot tell" are the same SHAPE (a boolean-ish answer) and opposite MEANINGS, and the wrong
+ * one is silent — a caller that cannot distinguish them either drops files a repo expected indexed
+ * (guessing "not ignored") or filters files a repo never asked to exclude (guessing "ignored").
+ * May-miss-never-invent, `ChangesBetweenResult`'s rule one verb over: `{ok:false}` is the only
+ * honest answer when a backend cannot determine ignore status, and the caller (the debug walk,
+ * `index-repo.ts` — RUN-256 locked decision 6, never the daemon's snapshot path) proceeds exactly
+ * as it did before this method existed: unfiltered, never guessing.
+ *
+ * `{ok:true}` with an EMPTY set is a real, distinct answer (none of the queried paths are
+ * ignored), not a stand-in for "could not tell" — same discipline `ChangesBetweenResult`'s own doc
+ * states for its own empty-list arm.
+ */
+export type IgnoreQueryResult =
+  | { ok: true; ignored: Set<string> }
+  | { ok: false; reason: 'unknown'; detail?: string };
+
+/**
+ * The outcome of `VcsBackend.currentBase` (RUN-222) — an outcome union, `IgnoreQueryResult`'s
+ * exact shape one method over, for the same reason: "this is the current base" and "I cannot
+ * tell" are the same SHAPE and opposite MEANINGS, and the wrong one is silent. The one caller
+ * (the background-indexing trigger layer, never an agent) treats `{ok:false}` as "fire no trigger
+ * for this repository right now" — never a guess at a base, because a fabricated one would make
+ * `reconcile` answer `unchanged` (indexing silently stops forever) or `full` (an unrelated-looking
+ * base re-indexes a whole monorepo) on a fact this method never actually held.
+ *
+ * `baseId` is opaque, in the backend's own id-space — `Workspace.baseId`'s exact contract:
+ * `===`-only, handed back to the SAME backend, never parsed.
+ */
+export type CurrentBaseResult =
+  | { ok: true; baseId: string }
+  | { ok: false; reason: 'unknown'; detail?: string };
 
 export interface LeaseOptions {
   /** Scope runs get a physically read-only checkout (defense-in-depth). */
@@ -342,6 +515,128 @@ export interface VcsBackend {
     repoRoot: string,
     opts?: { onSkip?: (path: string) => void; isOwned?: (runId: string) => boolean },
   ): Promise<number>;
+
+  /**
+   * Acquire a read-only snapshot of the repo's tree for indexing (RUN-211) — never for an agent.
+   * REQUIRED, not optional: `openReview`'s precedent, stated in its own doc, applies verbatim —
+   * an omitted method would BE the silence this verb exists to remove, and a backend that cannot
+   * produce a snapshot says so with `{ok:false, reason:'unsupported'}` rather than by absence.
+   *
+   * Concurrency is preserved PER BACKEND, deliberately not uniform — the same isolation split
+   * `leasesOverlap` names for run leases, one verb over: git isolates in SPACE, so a snapshot
+   * costs nothing extra and many may be held at once, overlapping run leases freely. A live
+   * backend's pool-of-1 (`leasesOverlap` absent) must TRY-ACQUIRE and never enqueue — a snapshot
+   * requested while the SAME process holds a run lease is exactly when indexing is triggered
+   * (after landing or publishing), so chaining onto that queue is `integrateFromRun`'s documented
+   * deadlock shape one verb over: an in-process promise chain with nothing to time out. Refusing
+   * outranks waiting for a second reason too: run execution outranks background indexing.
+   */
+  leaseIndexSnapshot(repoRoot: string): Promise<IndexSnapshotResult>;
+
+  /**
+   * Give a snapshot back. IDEMPOTENT (a second call is a no-op) and structurally incapable of
+   * touching a Run workspace: it removes only a snapshot IT minted, identified through its own
+   * `location`, and refuses anything else — a `Workspace`, or a hand-edited object — with a
+   * message naming the problem, the way `gitLocation` already refuses a foreign workspace.
+   * `IndexSnapshot` and `Workspace` are structurally close enough (both carry
+   * `localPath`/`baseId`/`readOnly`/`location`) that a `Workspace` variable satisfies this
+   * parameter's TYPE by ordinary structural typing — so this runtime check is the only thing
+   * standing between a foreign object and whatever destructive op the backend performs.
+   * REQUIRED for the same reason `leaseIndexSnapshot` is: a backend that answers `unsupported` to
+   * every acquisition still has to say what release does with an object it could never have
+   * minted, which is refuse it, not silently succeed.
+   */
+  releaseIndexSnapshot(snapshot: IndexSnapshot): Promise<void>;
+
+  /**
+   * Relate two opaque bases in THIS backend's own id-space and report what moved between them —
+   * for background indexing (RUN-212), never for an agent. `ChangesBetweenResult`'s doc carries
+   * the full outcome contract; this doc carries the interface-level obligations.
+   *
+   * REQUIRED, not optional — `openReview`'s precedent, stated in its own doc, applies verbatim
+   * (locked decision 5): an omitted method reads as "nobody thought about this backend", while a
+   * present method that refuses records that it WAS considered and why, and leaves the note
+   * where a future implementer will be standing. Git answers this precisely (`worktree.ts`'s
+   * `changesBetween`, the git half of this contract); Diversion and Perforce refuse with
+   * `full-index-required` and a `detail` naming the backend and what a real implementation would
+   * need. Callers treat both identically, so requiring the method everywhere costs nothing and
+   * the information it carries when refused is not nothing.
+   *
+   * Common code — everything outside `git.ts`/`worktree.ts` — never assumes a SHA, a branch
+   * name, a numeric ordering, or an ancestry direction from `from`/`to` (locked decision 6):
+   * they are opaque tokens, exactly `Workspace.baseId`'s contract, handed to the SAME backend
+   * that minted them and never interpreted by a caller. A caller that sorted the two, or assumed
+   * `from` is an ancestor of `to`, would work on git and silently invert — or simply have no
+   * meaning — on a backend where ids are not ordered at all.
+   *
+   * Paths in both of `ChangesBetweenResult`'s lists are repository-relative with FORWARD
+   * SLASHES, matching what `src/index-scan.ts` produces and what the sensitive-file deny list
+   * matches on (locked decision 7): these lists join to the scanner's output and to
+   * `IndexGenerationManifest.deletions`, and two spellings of one path would silently double-
+   * count on Windows — `comparableWorktreePath`'s exact concern, one layer up.
+   */
+  changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult>;
+
+  /**
+   * Which of `paths` does THIS backend's own ignore mechanism drop (RUN-256)? For the DEBUG walk
+   * only (`index-repo.ts`) — never for an agent, and never for the daemon's snapshot path: a
+   * leased index snapshot only ever holds TRACKED files by construction (git: a detached
+   * worktree; Perforce/Diversion: depot/API reads), so a VCS's ignore rules have nothing left to
+   * drop there. The debug walk is different — it enumerates a LIVE filesystem via
+   * `FilesystemIndexSource`, which sees exactly what an agent's own worktree would (including
+   * everything `.gitignore`-shaped a snapshot never materializes), so a debug listing that never
+   * asks this question misrepresents the pipeline by the margin RUN-256 measured (243 tracked
+   * files vs. 6943 on disk, on this repo) — the very thing an operator would use to decide whether
+   * to opt in at all.
+   *
+   * `paths` are candidate repository-relative, POSIX-separated paths — a batch, not one call per
+   * path (locked decision 2: "batch the query"). Deliberately unopinionated about batch size or
+   * shape (a directory listing's siblings, files and subdirectories together, is what the one
+   * caller sends): the seam states the outcome, not how many round trips buy it, and each backend
+   * picks the batching its own underlying tool actually supports (git: `check-ignore --stdin`,
+   * one call per path is not the contract here; Perforce: `p4 ignores -i` accepts many path
+   * arguments in one call; both measured, not assumed — see `git.ts`'s/`worktree.ts`'s and
+   * `perforce.ts`'s own docs for what was found and how the exit-code/output conventions read).
+   *
+   * REQUIRED, not optional — `openReview`'s precedent, stated in its own doc, applies verbatim: an
+   * omitted method reads as "nobody thought about this backend", a present method that answers
+   * `{ok:false, reason:'unknown'}` records that it WAS considered and says why (Diversion: no
+   * measured local ignore-check primitive at all — `diversion.ts`'s own doc names what was
+   * checked). `IgnoreQueryResult`'s own doc carries the outcome contract; never throws for an
+   * ordinary "cannot tell" — a caller that cannot filter still has to finish the walk unfiltered,
+   * not crash a debug command over it.
+   */
+  queryIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult>;
+
+  /**
+   * The cheap "what is current" check (RUN-222) that background indexing's trigger layer needs on
+   * every startup reconcile, every poll tick, and every landing — without ever touching the lease
+   * pool. REQUIRED, not optional — `openReview`/`changesBetween`/`queryIgnored`'s precedent,
+   * stated in each of their own docs, applies verbatim: an omitted method reads as "nobody
+   * considered this backend."
+   *
+   * **Takes no lease, materializes no tree** (locked decision 1). This is NOT `leaseIndexSnapshot`
+   * priced down — git's `leaseIndexSnapshot` mints a real detached worktree (cheap, but a
+   * filesystem write on every call), and a live backend's snapshot, though itself lease-free
+   * today, constructs a whole `IndexSnapshot` (a source object, an id-space token) a caller then
+   * owns the release of. Neither is safe to call once a minute forever; this is one shell-out or
+   * one REST call, nothing minted, nothing to release.
+   *
+   * `branch` is the scope to check, in the backend's own naming (a git ref name, a Diversion
+   * branch name/id) — OPTIONAL, and each backend documents its own fallback: git defaults to
+   * `HEAD` (this repo's own checked-out scope, `leaseIndexSnapshot`'s exact default), Perforce
+   * ignores it (there are no branches — the client's own view mapping is the only scope, exactly
+   * `leaseIndexSnapshot`'s own source of `baseId`), Diversion resolves its own DEFAULT branch when
+   * omitted — the same `GET /repos` call `leaseIndexSnapshot` already makes, never the local `dv`
+   * CLI: this backend's pool-of-1 workspace is re-checked-out per lease, so a CLI read of "what is
+   * this workspace showing" would answer with whatever run last held it, not the repo's default —
+   * `diversion.ts`'s own `currentBase` doc carries the full reasoning.
+   *
+   * Never throws for an ordinary "cannot tell" (a repo with no commits yet, a branch that does not
+   * resolve, a transient network error) — `CurrentBaseResult`'s own doc carries the outcome
+   * contract and its own reasoning for why a caller must never guess a base from a miss.
+   */
+  currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult>;
 
   /**
    * Lock capability (RUN-98), OPTIONAL on the seam: a backend with no lock layer omits it, and

@@ -75,8 +75,12 @@ CI — configure by hand instead: copy [`runner.toml.example`](runner.toml.examp
 can see. From a checkout, skip the build with `npm run dev -- <command>` (runs `src/cli.ts` via
 tsx); `npm run build` bundles to `dist/cli.js`.
 
-**Platforms:** Linux, macOS, and **native Windows** — no WSL required. Windows is a CI matrix
-leg, not a best-effort claim. Node ≥20 and `git` on PATH everywhere.
+**Platforms:** Linux and **native Windows** are both real CI matrix legs (`.github/workflows/ci.yml`
+runs `ubuntu-latest` and `windows-latest`), not a best-effort claim for either — no WSL required.
+macOS is expected to work (the daemon's platform-specific code is Node's own portable `node:fs`/
+`node:path`/`os.homedir()`, the same primitives every OS uses) but is **not itself a CI leg today**
+— unverified by this project's own tests, stated plainly rather than claimed (RUN-240). Node ≥20
+and `git` on PATH everywhere.
 
 One Windows-specific thing to know, because this file is committed and your teammates may not
 share your OS: your repo's `[verify] cmd` runs under **cmd.exe** there, and under `sh`
@@ -89,8 +93,12 @@ prefixes (`FOO=1 npm test`), `2>&1`, `$VAR`, and shell globbing are not. Pin
 **`init` already did this** — read on only if you need to re-authorize, point at a second
 server, or you configured by hand.
 
-The daemon dials the Noriq server with **your OAuth token** — the only secret that
-crosses the wire (model + git credentials never leave the box). One command gets one:
+The daemon dials the Noriq server with **your OAuth token**. Model credentials and git/forge
+credentials never leave the box — nothing changes that. (One other thing can cross, and only if
+you turn it on per repo: a committed `[index].enabled = true` lets this daemon read, and
+unattended, upload a bounded slice of that repo's own source. Never a credential. See
+[Repository intelligence](#repository-intelligence-index--off-by-default) below and
+[`THREAT-MODEL.md`](THREAT-MODEL.md).) One command gets your token:
 
 ```bash
 noriq-runner auth        # opens your browser, approve, done
@@ -195,6 +203,7 @@ server; a name that doesn't resolve simply doesn't bind, and the repo stays disp
 | `noriq-runner start`   | Connect to Noriq and supervise dispatched runs            |
 | `noriq-runner auth`    | Authorize this machine and store its token (`--browser` / `--device`) |
 | `noriq-runner discover`| List repos discovered under the config's scan roots       |
+| `noriq-runner index-repo` / `index-status` / `index-reindex` / `index-retry` / `index-cancel` / `index-forget-journal` | Repository-intelligence operator surface — see "Repository intelligence" below and [`INDEX-OPERATIONS.md`](INDEX-OPERATIONS.md) |
 | `noriq-runner config`  | Load, validate, and print the resolved machine config     |
 | `noriq-runner completion <bash\|zsh>` | Print a shell tab-completion script (source it — see below) |
 | `noriq-runner update`  | Check whether this runner is behind (it will not replace itself) |
@@ -221,8 +230,16 @@ echo 'eval "$(noriq-runner completion bash)"' >> ~/.bashrc
 echo 'eval "$(noriq-runner completion zsh)"' >> ~/.zshrc
 ```
 
-The script is generated from the same command table the CLI parses, so it never drifts out of
-sync — it delegates back to the binary for candidates rather than hard-coding a copy of the list.
+The script is generated from the same command table the CLI parses (`noriq-runner help` renders
+its `Commands:` section from that identical table), so the two can never drift out of sync — the
+shell script itself stays a thin wrapper that delegates back to the binary for candidates rather
+than hard-coding a copy of the list.
+
+**bash and zsh only.** `completion` accepts exactly those two shell names; there is no PowerShell
+or cmd.exe completion script, on any platform. The CLI commands themselves are cross-platform
+(Linux and native Windows are both real CI matrix legs; macOS is expected to work but is not itself
+one — see "Platforms" above) — it is only the generated completion SCRIPT that assumes a POSIX
+shell. On Windows, Git Bash or WSL get the bash script; native PowerShell gets none.
 
 ## Develop
 
@@ -302,14 +319,91 @@ oversight. Point `branch` at something auto-deploying and you've given that up; 
 in [`THREAT-MODEL.md`](THREAT-MODEL.md). Omit `[land]` and nothing auto-lands: every diff
 waits on its own branch, as before.
 
+## Repository intelligence (`[index]`) — off by default
+
+Project Memory can build a searchable index of a repo's own source — file paths, content, and
+hashes — so future runs get better context and evidence-backed answers. It reads no more than a
+repo explicitly opts into, per repo, in `.noriq/project.toml`:
+
+```toml
+[index]
+enabled = true                    # OFF (default) unless this is explicitly true
+include = ["src/**", "docs/**"]   # optional; default is everything not excluded
+exclude = ["**/*.generated.*"]
+```
+
+What that turns on: this daemon reads a bounded slice of the repo's own SOURCE off disk — never
+model or git/forge credentials, which stay off this path entirely (a non-overridable deny list
+also refuses `.env` files, key material, and credential directories outright, on top of whatever
+you exclude). **Once enabled, this daemon indexes unattended** — at startup, again after every
+successful landing/publish, and on a shared poll ticker (`[index].pollIntervalMinutes`, hourly by
+default) — staging batches under `~/.noriq/index-staging` and uploading them through a short-lived
+(15-minute) ingest capability. Turn it off again by removing `[index]` or setting `enabled = false`;
+that stops the *next* trigger, it does not retract anything already uploaded (see below).
+
+**A successful upload does not mean the memory is searchable yet.** Every upload ends in a
+`staged` state — uploaded, sealed, and validated, awaiting an admin to activate it server-side, a
+route this daemon's own agent credential cannot reach. `search_project_memory` finds nothing from
+a `staged` generation until a human activates it. See
+[`INDEX-OPERATIONS.md`](INDEX-OPERATIONS.md) for the full ten-state vocabulary, every command
+below in detail, and an operator troubleshooting/recovery checklist.
+
+Three things worth knowing before you opt in:
+
+- **No implicit exclusions beyond a conservative default.** Unlike repo discovery, the indexer
+  does not skip `node_modules`/`dist`/`.git` on its own — write `[index].exclude` yourself for
+  anything repo-specific. `[index].excludeDefaults` (on by default) layers one machine-wide
+  exclude under that for committed lockfiles and a committed `node_modules/`, which cost real
+  budget without ever being worth citing; set it to `false` if this repo genuinely wants one of
+  those indexed. What this actually reaches is narrower than it sounds either way, because the
+  daemon indexes a clean snapshot of *tracked* files (243 on this repo), never your working
+  directory's `node_modules`. It does still index anything you have COMMITTED and not excluded:
+  a vendored dependency, a checked-in `dist/`, a lockfile you kept in. Note `index-repo --path .`
+  below points at your live directory instead, so it will report far more (6943 here) than the
+  daemon would.
+- **Deleting local state does not retract an upload.** `index-forget-journal` (below) clears only
+  this machine's own bookkeeping for an in-progress attempt — the journal entry and any staged
+  bytes. It cannot unsend what the server already ingested; there is no delete-on-the-server path
+  this daemon can reach.
+- **Source structure and excerpts are business-sensitive even where they hold no credential** —
+  treat this as a data-classification decision, not only a security one.
+
+You can see exactly what an index would contain, without a server and without uploading anything:
+
+```bash
+noriq-runner index-repo                 # summary: files, entities, edges, diagnostics
+noriq-runner index-repo --json          # the same, machine-readable
+noriq-runner index-repo --check-determinism   # index twice, compare canonical output
+```
+
+It refuses without `[index].enabled` unless you pass `--force`, and it cannot transmit anything —
+the upload client is not reachable from its code at all (asserted by import-graph test, not just
+comment).
+
+Once a daemon is running (`noriq-runner start`), these ask it directly rather than reading local
+state — see [`INDEX-OPERATIONS.md`](INDEX-OPERATIONS.md) for exact output and failure modes:
+
+```bash
+noriq-runner index-status               # this repo's current state and last observation
+noriq-runner index-reindex              # ask the daemon to reindex now (index-retry: same call)
+noriq-runner index-cancel               # ask the daemon to cancel this repo's active job, if any
+noriq-runner index-forget-journal       # LOCAL ONLY: forget this machine's own upload bookkeeping
+```
+
+The full trade — what's enforced today, what's designed but not yet built, and every residual
+risk — is in [`THREAT-MODEL.md`](THREAT-MODEL.md), under "Repository intelligence upload
+(`[index]`)".
+
 ## Security model
 
 One git worktree per Run on a throwaway branch; scope runs read-only; per-kind
 permission profiles (including which Noriq MCP tools each kind may call); daemon-enforced
 budgets (SIGTERM on breach); **no push credentials for any agent, ever, and the daemon
 publishes only where the repo opted it in — never merging into the protected branch**;
-secrets stay local (only the OAuth token crosses the wire, injected into the agent's MCP
-transport rather than its shell). A repo that trusts its agents can opt a kind out of the
+model and git/forge credentials stay local (the OAuth token crosses the wire injected
+into the agent's MCP transport rather than its shell; the only other thing that can — a
+repo's own source, and only on an explicit `[index]` opt-in — is covered above). A repo
+that trusts its agents can opt a kind out of the
 command allowlist into the driver's own auto mode (`[permissions.<kind>] auto = true`) —
 read-only stays read-only and the Noriq tool floor holds regardless, but the bash
 allowlist is the price. Full threat model — and the explicit trades auto-landing and

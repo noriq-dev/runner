@@ -1,0 +1,664 @@
+import { posix as posixPath } from 'node:path';
+import type { IndexGenerationManifest } from '@noriq-dev/shared';
+import { type IndexAdapterRegistry, createDefaultAdapterRegistry } from './index-adapters';
+import {
+  type CooperativeDeps,
+  type EncodedBatch,
+  assembleManifest,
+  computeContentHash,
+  cooperativeCheckpoint,
+  dedupeRecords,
+  deriveGenerationId,
+  encodeBatches,
+  sortRecords,
+} from './index-batch';
+import {
+  DiagnosticsCollector,
+  type IndexDiagnostic,
+  type IndexRecord,
+  type UriScope,
+  buildFileEntityUri,
+  buildSymbolEntityUri,
+  computeDeletions,
+  dedupeSymbolPaths,
+  normalizeRepoPath,
+} from './index-entity';
+import type { ResolvedIndexConfig } from './index-policy';
+import { INDEXER_VERSION } from './index-reconcile';
+import { scanTextForCredentialMarkers } from './index-redact';
+import { scanIndexSource } from './index-scan';
+import type { IndexScanDeps, IndexStatusRecord } from './index-scan';
+import type { IndexSource } from './index-source';
+
+/**
+ * The indexer core (RUN-215): turn one `IndexSource` scan into a byte-deterministic manifest plus
+ * a set of gzip'd, hashed, size-bounded batches, ready for RUN-220's ingest client to upload.
+ *
+ * **Owns orchestration only.** Every piece of real work is delegated to a module that already has
+ * a single, auditable job: `scanIndexSource` (`index-scan.ts`) for discovery, filtering, and
+ * content — this file never re-walks, re-hashes, or re-opens anything (locked decision 11);
+ * `index-adapters.ts` for turning one file's text into symbols; `index-entity.ts` for stable URIs,
+ * deduplication, deletions, and bounded diagnostics; `index-batch.ts` for sort order, wire
+ * encoding, batch splitting, and the manifest shape. `runIndexer` below is the one function that
+ * knows the ORDER those pieces run in and threads state (the running `parserVersions` map, the
+ * list of paths seen this pass) between them — nothing here duplicates a decision any of those
+ * modules already owns.
+ *
+ * **Zero model tokens, zero network calls** (locked decision 10): everything from `scanIndexSource`
+ * down through `encodeBatches` is deterministic code over bytes already read from disk (or another
+ * `IndexSource`). Nothing in this file's dependency graph performs I/O beyond what `source` itself
+ * does inside `scanIndexSource` — `await adapter.parse(...)` below is RUN-216's one addition to
+ * that shape (`index-adapters.ts`'s own note on why `parse` returns a `Promise` now: an
+ * unavoidably-async in-process WASM compile, never a network round trip or a partial result).
+ *
+ * **The candidate loop cooperatively yields (RUN-238)** — `await adapter.parse(...)` is a
+ * MICROTASK continuation, not a yield: it refills the microtask queue every iteration, so a busy
+ * event loop's timers and poll phase never get a turn between candidates (measured:
+ * `bench/index-load.mts`, a single continuous 6.3s block on an 8000-file tree, long enough to miss
+ * three of `ws-client.ts`'s 30s heartbeats and make the daemon drop and re-dial its own socket).
+ * Every `yieldEveryFiles` candidates the loop calls `cooperativeCheckpoint` (`index-batch.ts`) —
+ * checks `deps.signal`/`deps.isRunBusy`, THEN yields via a real macrotask (`setImmediate`, never a
+ * microtask) — so cancellation and run-priority both reach a pass already in progress, where
+ * before this neither could: `runIndexer` took no `AbortSignal` at all, and `isRunBusy()` was only
+ * ever consulted once, at the top of `IndexCoordinator.attempt`. A checkpoint THROWS
+ * (`IndexInterrupted`) rather than pausing — `index-work.ts` never catches it, so it reaches
+ * `runIndexer`'s own caller before a manifest, a generation id, or a batch exists, which is what
+ * makes "stops the pass without producing a manifest, a generation, or a journal entry" true by
+ * construction rather than by a caller remembering to check something. The two `pendingImports`/
+ * `pendingReferences` second-pass loops below get the identical treatment, at the same cadence —
+ * extrapolated from the same per-candidate measurement rather than separately measured (this
+ * repo's own synthetic tree has exactly one import per file, so the two costs track together;
+ * `bench/index-load.mts` says so rather than silently assuming it for a repo with far more).
+ *
+ * **A file entity exists whether or not any adapter recognises it** — this is the one thing
+ * `runIndexer` does that no injected module does on its own: every scanned candidate becomes
+ * exactly one `file` node (its `content` when `contentMode: 'full'`, `null` otherwise), and an
+ * adapter only ever ADDS symbol/test/api entities plus `declares` edges on top of that. Shipping
+ * no real language adapters yet (RUN-216/217/218 are deferred) therefore costs symbol coverage,
+ * never file coverage — a repo indexed today already has every file addressable, citable, and
+ * diffable against a later pass that adds real parsing.
+ *
+ * **Adapters never see a `'metadata'`-mode candidate** — there is no decoded text to hand one, so
+ * such a candidate contributes only its file entity. This is the daemon's existing "withhold
+ * source text, not the read" posture (`index-scan.ts`'s module doc) carrying through unchanged:
+ * `contentMode: 'metadata'` costs symbol extraction the same way it costs the file's own stored
+ * content, for the same reason.
+ *
+ * **A `'full'`-mode candidate whose content carries a high-confidence credential marker is treated
+ * the same way** (RUN-258, closing the residual risk THREAT-MODEL.md's `[index]` section names: a
+ * token hardcoded into ordinary source, not a value an adapter extracted from JSON/TOML/markdown —
+ * `index-redact.ts`'s existing value floor never saw a whole file's raw text). Checked here, BEFORE
+ * the file entity's `content` is even assigned — this is the one place that field is set, which
+ * makes it the chokepoint (RUN-90's rule) — via `scanTextForCredentialMarkers`, the marker-only
+ * sibling of `index-redact.ts`'s existing value-shape checks: PEM headers, JWTs, known issuer
+ * prefixes, deliberately WITHOUT the entropy/key-name heuristics tuned for a short isolated value,
+ * which over-fire on whole files of real code (that function's own doc has the measured cases). A
+ * hit withholds the file entity's `content` (never masked, per locked decision 3) and skips adapter
+ * parsing for that file exactly like `'metadata'` mode does above — a symbol's own `content` is
+ * raw source text too (`index-treesitter.ts`'s `node.text`), so parsing a file whose content this
+ * pass just decided not to trust would hand the same bytes back out through a different entity
+ * kind. A bounded diagnostic records the file and the marker CLASS, never the matched bytes.
+ *
+ * **`imports` edges are resolved SNAPSHOT-LOCAL and TWO-PASS** (RUN-217 locked decision 2): an
+ * adapter reports `ParsedImport.specifier` as a literal string with no idea what else this
+ * generation indexed (`index-adapters.ts`'s own "one file at a time" constraint), so resolving it
+ * to a real file entity cannot happen inside the candidate loop above — a file importing a sibling
+ * that has not been scanned yet would resolve to nothing, purely by iteration order, which is
+ * exactly the kind of order-dependent bug the rest of this indexer works hard NOT to have. Instead
+ * every `(importerPath, specifier)` pair this loop sees is collected into `pendingImports` and
+ * resolved in a SECOND pass once `currentPaths` — the loop's own running list — is complete, against
+ * the exact same set of paths a `declares`/`calls` edge above was minted against. `resolveRelativeImport`
+ * is the resolution function itself; see its own doc for the specifier grammar and the fixed
+ * candidate order.
+ *
+ * **`related_to` edges (RUN-257) reuse that exact same resolver and pass shape** — a
+ * `ParsedReference.target` is collected into `pendingReferences` during the loop and resolved
+ * against the finished `currentPaths` in its own second pass, for the identical reason: a markdown
+ * file referencing a sibling that has not been scanned yet must not resolve to nothing purely by
+ * iteration order. The only difference from the `imports` pass is the edge TYPE it writes — same
+ * specifier grammar, same may-miss-never-invent posture (a target `resolveRelativeImport` cannot
+ * pin to exactly one file emits no edge at all), because "does this specifier name a real path in
+ * this generation" does not depend on which relationship an adapter is reporting.
+ */
+
+/**
+ * Extensions tried, in this fixed order, when a relative specifier names no extension (RUN-217
+ * locked decision 3) — this repo's own convention (`./worktree` resolving to `src/worktree.ts`) is
+ * exactly the case a resolver that only handled explicit extensions would miss on the very first
+ * repository it runs against, while still passing every test written against explicit-extension
+ * fixtures.
+ */
+const RELATIVE_IMPORT_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'] as const;
+
+/**
+ * Resolve one `ParsedImport.specifier` (as reported by `importerPath`'s own adapter) against
+ * `currentPaths` — the exact set of repo-relative paths THIS generation's scan actually produced,
+ * never a filesystem stat and never Node's or TypeScript's own module-resolution algorithm (both
+ * would happily resolve to a `node_modules` file this indexer never scanned, minting an edge to a
+ * node that does not exist in this graph — locked decision 2's whole point).
+ *
+ * A specifier not starting with `.` is BARE (`react`, `@noriq-dev/shared`, `node:fs`) and declines
+ * immediately, with no candidate generated at all: this indexer has no package registry or
+ * `node_modules` resolution to consult, so a bare specifier resolves to no node in this graph by
+ * definition, not by a failed lookup.
+ *
+ * A relative specifier is tried, in the fixed order locked decision 3 names, as: the literal
+ * joined path, then each of `RELATIVE_IMPORT_EXTENSIONS` appended, then `/index` plus each of the
+ * same list. If MORE THAN ONE of those candidates is present in `currentPaths`, the specifier is
+ * ambiguous and declines — may-miss-never-invent: an edge naming one of two equally plausible
+ * targets is worse than no edge. Joining and normalizing always use POSIX semantics (`path.posix`)
+ * regardless of the host OS this daemon runs on: `importerPath` already arrives forward-slash
+ * (`index-entity.ts`'s `normalizeRepoPath`), and joining with the platform separator would
+ * silently misresolve on Windows the same way that function exists to prevent one layer up.
+ */
+export function resolveRelativeImport(
+  importerPath: string,
+  specifier: string,
+  currentPaths: ReadonlySet<string>,
+): string | null {
+  if (!specifier.startsWith('.')) return null;
+
+  const joined = posixPath.normalize(posixPath.join(posixPath.dirname(importerPath), specifier));
+
+  const candidates = [joined];
+  for (const ext of RELATIVE_IMPORT_EXTENSIONS) candidates.push(`${joined}${ext}`);
+  for (const ext of RELATIVE_IMPORT_EXTENSIONS) candidates.push(`${joined}/index${ext}`);
+
+  const present = new Set(candidates.filter((c) => currentPaths.has(c)));
+  return present.size === 1 ? [...present].at(0)! : null;
+}
+
+export interface IndexRunTarget {
+  /** The server-resolved Noriq project id — required here (unlike `IndexTarget.projectId` in
+   *  `index-coordinator.ts`, which may be `null` before a project resolves): `generationId`
+   *  cannot be derived without it, and a caller with no resolved project has nothing to index
+   *  against yet (the same precondition `reconcile`'s `unavailable` outcome already encodes one
+   *  layer up). */
+  projectId: string;
+  /** The committed project key (`.noriq/project.toml`'s `key`) — embedded in every entity URI
+   *  (`UriScope`), distinct from `projectId` above. */
+  projectKey: string;
+  repositoryKey: string;
+  branch: string;
+  baseId: string;
+  /** Defaults to `INDEXER_VERSION` — threaded rather than read from the module-level constant so
+   *  a test can vary skew without faking that export, the same reasoning `ReconcileInput` and
+   *  `IndexTarget` both give. */
+  indexerVersion?: string;
+}
+
+/** The phases `IndexerDeps.onPhaseTiming` can report — the pipeline's own stages, in the order
+ *  `runIndexer` runs them. `parse` covers the candidate loop AND both edge-resolution passes: they
+ *  are one continuous stretch of per-record work at the same checkpoint cadence, and splitting the
+ *  label would imply a boundary an operator cannot act on. */
+export type IndexPhase = 'scan' | 'parse' | 'sort' | 'hash' | 'encode';
+
+export interface IndexerDeps {
+  /** Injected clock — `index-scan.ts`'s `IndexScanDeps.now` convention, threaded to the manifest's
+   *  `createdAt` and (if supplied) the scan's own deadline clock. */
+  now?: () => number;
+  /** Defaults to `createDefaultAdapterRegistry()` (the noop fallback only) — a caller wires in
+   *  RUN-216/218's real adapters here once they exist. */
+  adapters?: IndexAdapterRegistry;
+  /** Forwarded to `scanIndexSource` verbatim. */
+  scan?: IndexScanDeps;
+  /**
+   * Paths the PREVIOUS generation indexed, for deletion detection (`index-entity.ts`'s
+   * `computeDeletions`). Optional and caller-supplied because this module makes zero network
+   * calls and holds no local job state of its own (locked decision 10) — a coordinator wiring in
+   * an incremental pass supplies the prior generation's file list; a full pass with nothing to
+   * diff against simply omits it, which correctly yields no deletions rather than treating an
+   * absent baseline as "everything was deleted".
+   */
+  previousFilePaths?: Iterable<string>;
+  /** RUN-238: the coordinator's `AbortSignal` (`IndexWorkContext.signal`, threaded through
+   *  `index-work.ts`) — checked at every cooperative checkpoint below. Absent for every caller that
+   *  is not the real background work step (`index-repo.ts`'s local dry run, most of this file's own
+   *  tests): a pass with nothing that could ever cancel it simply never throws `IndexInterrupted`. */
+  signal?: AbortSignal;
+  /** RUN-238: `IndexWorkContext.isRunBusy` — re-checked at the same checkpoints as `signal`, so a
+   *  run assigned mid-pass makes this indexer abandon rather than share a starved loop for the rest
+   *  of its own duration (locked decision: `IndexCoordinator.attempt` only ever checked this once,
+   *  before leasing). Absent has the same meaning as `signal` absent: never busy, by construction. */
+  isRunBusy?: () => boolean;
+  /** Test-only override for how many candidates (files) separate one checkpoint from the next in
+   *  the main loop and both second-pass edge-resolution loops — production leaves this at the
+   *  measured default (`DEFAULT_YIELD_EVERY_FILES` below). See `CooperativeDeps.yieldEveryRecords`
+   *  for why this exists as a knob at all rather than a hardcoded constant. */
+  yieldEveryFiles?: number;
+  /**
+   * RUN-278: report how long each phase of THIS pass actually took, as it happens. Added because
+   * `bench/index-load.mts` had been re-deriving the tail phases from the finished result — timing
+   * `sortRecords` on output that was ALREADY SORTED, which V8's TimSort does in O(n), so it reported
+   * 53ms for work that really cost 533ms and hid the daemon's last remaining event-loop stall for a
+   * whole task. A measurement taken from OUTSIDE a pipeline can only re-run its steps under
+   * conditions the pipeline never had; this reports the real ones from inside, so the harness never
+   * has to reconstruct an input order (which would duplicate this file's ordering logic and drift
+   * from it). Optional, and nothing branches on it: absent for every caller that is not measuring.
+   */
+  onPhaseTiming?: (phase: IndexPhase, ms: number) => void;
+  /** Test-only override forwarded verbatim to `computeContentHash`/`encodeBatches` as
+   *  `CooperativeDeps.yieldEveryRecords` — kept as a SEPARATE knob from `yieldEveryFiles` because
+   *  the two loops are bounded by different units (candidates vs. records) with different measured
+   *  per-unit costs; a test that wants both chunked loops to checkpoint at the same fixture-scale
+   *  cadence sets both. */
+  yieldEveryRecords?: number;
+}
+
+/**
+ * Measured default (`bench/index-load.mts`, 8000 candidates): see the module doc's own "candidate
+ * loop cooperatively yields" note for the trade this is tuned against — small enough that the
+ * worst observed event-loop stall stays a small multiple of one checkpoint's own cost, large
+ * enough that the NUMBER of `setImmediate` hops (each a real scheduler round trip) does not itself
+ * become the dominant cost of a pass.
+ */
+const DEFAULT_YIELD_EVERY_FILES = 100;
+
+export interface IndexerResult {
+  manifest: IndexGenerationManifest;
+  batches: EncodedBatch[];
+  /** The exact records `batches` were encoded from, already in final sorted order
+   *  (`sortRecords`) — informational, for a caller that wants entity/edge detail without
+   *  decompressing `batches` back out (RUN-219's debug CLI is the first, and the reason this
+   *  field exists at all: it has no server or network path of its own, only local inspection).
+   *  Never an alternate source of truth for `manifest.contentHash` or a batch's own bytes — those
+   *  are computed from `sorted` before this field is even assigned, so a caller that wants the
+   *  CANONICAL fact reads `manifest`/`batches`, never re-derives it by re-hashing this array. */
+  records: readonly IndexRecord[];
+  diagnostics: readonly IndexDiagnostic[];
+  diagnosticsOverflow: number;
+  scanStatuses: readonly IndexStatusRecord[];
+  scanStatusOverflow: number;
+  /** True when the underlying scan stopped early (a bound or the deadline tripped) — the result
+   *  is a PREFIX of the repository, forwarded verbatim from `IndexScanResult`. */
+  stoppedEarly: boolean;
+  /** `adapter.id -> adapter.version` for every adapter that parsed at least one file this run —
+   *  RUN-215 scope's "record indexer and parser versions", the per-parser half (the manifest's
+   *  own `indexerVersion` is the whole-daemon half). Informational only; nothing branches on it. */
+  parserVersions: Record<string, string>;
+  /** How many `'inferred'`-confidence call edges (`index-adapters.ts`'s `ParsedCall`) an adapter
+   *  returned but this indexer did NOT place on the wire (RUN-216) — the current wire `EdgeRecord`
+   *  shape mirrors the server row field-for-field (`index-batch.ts`'s own locked decision 1) and
+   *  has no field to carry confidence, so upgrading an inferred call to an ordinary `calls` edge
+   *  would make it indistinguishable from a resolved one on the wire — exactly what locked decision
+   *  7 forbids. Counted rather than silently dropped so "an inferred edge is distinguishable from a
+   *  resolved one" is an observable property of a run, not only of one adapter's own unit tests. */
+  inferredEdgesOmitted: number;
+  /** Duplicate EDGE rows collapsed before the wire (RUN-279) — the same `(from, type, to)` fact
+   *  stated more than once, which the server's ingest validation counts and refuses. Expected to be
+   *  non-zero on any real repository: a function calling another N times legitimately produces N
+   *  call sites and exactly ONE edge. Counted rather than silently collapsed for the same reason
+   *  `inferredEdgesOmitted` is — a row this daemon chose not to send is a fact about the generation. */
+  duplicateEdgesDropped: number;
+  /** Node URIs minted more than once this pass. **Nothing is dropped for these** — two nodes sharing
+   *  a `uri` carry different `label`/`content`, so collapsing one would hide a URI-minting collision
+   *  behind a clean upload (`dedupeRecords`' own doc). Expected to be EMPTY; a non-empty value is a
+   *  bug worth chasing, and the server will refuse the generation anyway, so surfacing it locally is
+   *  strictly better than discovering it as a validation error. */
+  duplicateNodeUris: readonly string[];
+  /** Symbols an adapter emitted with an empty/whitespace-only `label`, dropped before the wire
+   *  because `MemoryNode.label` in the vendored contract is `z.string().min(1)` — see the comment
+   *  at the drop site. Counted rather than silently discarded for the same reason
+   *  `inferredEdgesOmitted` is: a row this daemon chose not to send is a fact about the generation,
+   *  and one unlabelled row used to fail an ENTIRE generation with a server-side 409. Expected to
+   *  be 0 on almost every repo; a non-zero value names an adapter worth looking at. */
+  unlabelledSymbolsDropped: number;
+  /** RUN-280: `ParsedModuleDependency` names that resolved to no module this generation declared —
+   *  an engine module (`Core`, `Engine`, `UMG`, …) living in the Unreal installation rather than the
+   *  repo, or a name two files ambiguously declared. Expected to be the LARGE majority of a real
+   *  UBT repo's declared dependencies, not a rare tail — most of what a `.Build.cs` depends on is
+   *  the engine itself. Counted for the same reason `inferredEdgesOmitted` is: a row this daemon
+   *  chose not to send is still a fact about the generation. */
+  declinedModuleDependencies: number;
+}
+
+/** Scan `source` under `config` and produce a complete, ready-to-upload generation. */
+export async function runIndexer(
+  source: IndexSource,
+  config: ResolvedIndexConfig,
+  target: IndexRunTarget,
+  deps: IndexerDeps = {},
+): Promise<IndexerResult> {
+  const now = deps.now ?? Date.now;
+  const registry = deps.adapters ?? createDefaultAdapterRegistry();
+  const indexerVersion = target.indexerVersion ?? INDEXER_VERSION;
+  const scope: UriScope = { projectKey: target.projectKey, repositoryKey: target.repositoryKey };
+
+  // RUN-278: `performance.now()` rather than `deps.now` — this is a DURATION, never a timestamp
+  // that reaches a manifest, so it is deliberately outside the injected-clock contract `deps.now`
+  // exists for (`assembleManifest`'s `createdAt` is the only clock-derived field on the wire).
+  const phaseStart = (): number => performance.now();
+  const reportPhase = (phase: IndexPhase, from: number): void =>
+    deps.onPhaseTiming?.(phase, performance.now() - from);
+
+  let tPhase = phaseStart();
+  const scanResult = await scanIndexSource(source, config, deps.scan);
+  reportPhase('scan', tPhase);
+
+  const records: IndexRecord[] = [];
+  const diagnostics = new DiagnosticsCollector();
+  const parserVersions: Record<string, string> = {};
+  const currentPaths: string[] = [];
+  // Collected during the loop, resolved AFTER it — see this module's own doc on why `imports`
+  // cannot resolve inside the candidate loop itself (RUN-217 locked decision 2).
+  const pendingImports: Array<{ importerPath: string; specifier: string }> = [];
+  // Same reason, same shape, different edge type — see this module's doc on `related_to` (RUN-257).
+  const pendingReferences: Array<{ referencerPath: string; target: string }> = [];
+  // RUN-280: name-keyed sibling of the two above — every module name any file's `declaresModule`
+  // reported this pass, mapped to the URI already minted for it. `null` marks a name TWO files
+  // declared (ambiguous — may-miss-never-invent, the same posture an unresolved `imports` specifier
+  // gets), never picked arbitrarily. See `index-formats.ts`'s UBT adapter doc for why this cannot
+  // reuse `resolveRelativeImport`'s relative-path grammar: a UBT module's declaring file has no
+  // directional relationship to the dependant's own directory.
+  const moduleUriByName = new Map<string, string | null>();
+  const pendingModuleDependencies: Array<{ fromUri: string; moduleName: string }> = [];
+  let inferredEdgesOmitted = 0;
+  let unlabelledSymbolsDropped = 0;
+  let declinedModuleDependencies = 0;
+
+  // RUN-238: shared across every checkpoint below — see the module doc's own note on why
+  // `signal`/`isRunBusy` are checked identically at every one of them.
+  const cooperativeDeps: CooperativeDeps = {
+    signal: deps.signal,
+    isRunBusy: deps.isRunBusy,
+    yieldEveryRecords: deps.yieldEveryRecords,
+  };
+  const yieldEveryFiles = deps.yieldEveryFiles ?? DEFAULT_YIELD_EVERY_FILES;
+
+  // Guaranteed once, before the (possibly huge) candidate loop starts — so an already-aborted or
+  // already-busy pass never even begins, and a fixture far smaller than `yieldEveryFiles` still
+  // observes an interrupt (the property `test/index-yield.test.ts` leans on).
+  await cooperativeCheckpoint(cooperativeDeps);
+  tPhase = phaseStart();
+
+  let filesSinceCheckpoint = 0;
+  for (const candidate of scanResult.candidates) {
+    // Counted at the TOP of the loop body, before any `continue` below — a run of skipped
+    // candidates (denied, excluded, no adapter) must not silently stretch the gap between
+    // checkpoints past `yieldEveryFiles`.
+    filesSinceCheckpoint++;
+    if (filesSinceCheckpoint >= yieldEveryFiles) {
+      filesSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+
+    const path = normalizeRepoPath(candidate.path);
+    currentPaths.push(path);
+
+    // RUN-258: a high-confidence credential marker in FULL-mode content withholds this file's
+    // `content` the same way `contentMode: 'metadata'` does — see this module's doc for why the
+    // check runs here, before the field is assigned, and why it forecloses adapter parsing below
+    // rather than only nulling the file entity.
+    const credentialMarker =
+      candidate.contentMode === 'full' ? scanTextForCredentialMarkers(candidate.content) : null;
+    if (credentialMarker) {
+      diagnostics.push({
+        path,
+        message: `file content withheld: contains a credential marker (${credentialMarker})`,
+        severity: 'warning',
+        source: 'index-redact',
+      });
+    }
+
+    const fileUri = buildFileEntityUri(scope, path);
+    records.push({
+      kind: 'node',
+      uri: fileUri,
+      type: 'file',
+      label: path.split('/').pop() || path,
+      content: candidate.contentMode === 'full' && !credentialMarker ? candidate.content : null,
+    });
+
+    // Adapters need decoded source text — a 'metadata'-mode candidate, or a 'full'-mode candidate
+    // whose content was just withheld for a credential marker, contributes only the file entity
+    // above (see this module's doc).
+    if (candidate.contentMode !== 'full' || credentialMarker) continue;
+
+    const adapter = registry.select(path);
+    if (!adapter) continue;
+
+    let parsed: Awaited<ReturnType<typeof adapter.parse>>;
+    try {
+      parsed = await adapter.parse({ path, content: candidate.content });
+    } catch (err) {
+      // RUN-216 locked decision 5: a parser adapter throwing (a WASM trap, an OOM, an internal
+      // adapter bug) must cost this ONE file's symbol coverage, never the whole generation — the
+      // file's own entity record is already pushed above, so it survives regardless. Tree-sitter
+      // itself never throws for ordinary syntax errors (error-tolerant by design, measured), so
+      // reaching here means something outside ordinary parsing went wrong; this is the seam-level
+      // backstop that holds even for an adapter less careful than this daemon's own.
+      diagnostics.push({
+        path,
+        message: `adapter '${adapter.id}' threw while parsing: ${err instanceof Error ? err.message : String(err)}`,
+        severity: 'error',
+        source: `${adapter.id}@${adapter.version}`,
+      });
+      parserVersions[adapter.id] = adapter.version;
+      continue;
+    }
+    parserVersions[adapter.id] = adapter.version;
+
+    const dedupedPaths = dedupeSymbolPaths(parsed.symbols.map((s) => s.symbolPath));
+    // Raw (pre-dedup) symbolPath -> minted URI, so a same-file `calls` edge (below) can resolve a
+    // `ParsedCall`'s `fromSymbolPath`/`toSymbolPath` — always the adapter's OWN raw paths, per
+    // `index-adapters.ts`'s contract — back to the real entity this loop already minted for it.
+    const uriByRawSymbolPath = new Map<string, string>();
+    parsed.symbols.forEach((symbol, i) => {
+      // The wire contract requires a non-empty label (`MemoryNode.label` is `z.string().min(1)` in
+      // the vendored slice), and nothing local used to check it — so ONE unlabelled row out of 6454
+      // made the server reject the whole BATCH (`409 staged node row missing label`) and fail the
+      // entire generation, on the first real upload this daemon ever attempted. The adapter that
+      // produced it now declines the shape at its source (`index-formats.ts`'s `isNameableKey`:
+      // npm's lockfile keys its root package as `""`), and this is the BACKSTOP for every other
+      // route to the same row — a node minted here reaches the wire, so this is the last place it
+      // can be refused locally rather than 409'd after a round trip. Dropped, never relabelled: a
+      // synthesized name would invent an identity the source never had. Counted so a silent drop is
+      // still a visible one, and its `declares` edge is skipped with it — an edge to a node that
+      // was never sent is an edge to nothing (`imports` resolution's own rule, one layer down).
+      if (!symbol.label.trim()) {
+        unlabelledSymbolsDropped += 1;
+        return;
+      }
+      const symbolPath = dedupedPaths[i] ?? symbol.symbolPath;
+      const symbolUri = buildSymbolEntityUri(scope, path, symbolPath, symbol.nodeType);
+      uriByRawSymbolPath.set(JSON.stringify(symbol.symbolPath), symbolUri);
+      records.push({
+        kind: 'node',
+        uri: symbolUri,
+        type: symbol.nodeType,
+        label: symbol.label,
+        content: symbol.content,
+        // Inert on the wire (`index-entity.ts`'s own doc on `EntityRecord.range`) — carried
+        // through only so `IndexerResult.records` below has it for a caller that wants the range,
+        // never so it can leak into `contentHash`/a batch's bytes.
+        range: symbol.range,
+      });
+      records.push({ kind: 'edge', type: 'declares', from: fileUri, to: symbolUri });
+    });
+
+    for (const call of parsed.calls ?? []) {
+      if (call.confidence === 'inferred') {
+        // See `IndexerResult.inferredEdgesOmitted`'s own doc — the wire has nowhere to say
+        // "unsure", so this is dropped rather than silently upgraded to a certain-looking edge.
+        inferredEdgesOmitted += 1;
+        continue;
+      }
+      const from = uriByRawSymbolPath.get(JSON.stringify(call.fromSymbolPath));
+      const to = uriByRawSymbolPath.get(JSON.stringify(call.toSymbolPath));
+      // May-miss-never-invent, one level down from the adapter: a `ParsedCall` naming a symbolPath
+      // this same parse() didn't actually declare (an adapter bug, not a real scenario for a
+      // well-behaved one) is dropped rather than trusted into an edge with a fabricated target.
+      if (from && to) records.push({ kind: 'edge', type: 'calls', from, to });
+    }
+
+    // RUN-280: register this file's own declared module name (if it has one) and queue its
+    // dependency names for the name-keyed second pass below — see `moduleUriByName`'s own doc.
+    // `uriByRawSymbolPath` already holds the URI the loop above minted for it, so this reuses that
+    // instead of recomputing one — the module symbol and the name that resolves OTHER files'
+    // dependencies onto it must always be the same URI, and there is exactly one place that mints it.
+    if (parsed.declaresModule) {
+      const moduleUri = uriByRawSymbolPath.get(JSON.stringify([parsed.declaresModule]));
+      if (moduleUri) {
+        moduleUriByName.set(
+          parsed.declaresModule,
+          moduleUriByName.has(parsed.declaresModule) ? null : moduleUri,
+        );
+        for (const dep of parsed.moduleDependencies ?? []) {
+          pendingModuleDependencies.push({ fromUri: moduleUri, moduleName: dep.moduleName });
+        }
+      }
+    }
+
+    for (const imp of parsed.imports ?? []) {
+      pendingImports.push({ importerPath: path, specifier: imp.specifier });
+    }
+
+    for (const ref of parsed.references ?? []) {
+      pendingReferences.push({ referencerPath: path, target: ref.target });
+    }
+
+    for (const diagnostic of parsed.diagnostics) {
+      diagnostics.push({
+        path,
+        message: diagnostic.message,
+        severity: diagnostic.severity,
+        source: `${adapter.id}@${adapter.version}`,
+      });
+    }
+  }
+
+  // Second pass (RUN-217 locked decision 2): resolve every pending import now that `currentPaths`
+  // — the complete set this generation actually indexed — is finished, never against a
+  // partially-built list a candidate loop order could make order-dependent. `imports` targets the
+  // imported FILE entity, never a symbol inside it (locked decision 4); a URI is deterministic in
+  // the resolved path alone (`buildFileEntityUri`), so no separate dedup key is minted here —
+  // `seenImportEdges` collapses two specifiers from the same file resolving to the same target
+  // (e.g. two separate `require()`/`import` statements naming the same sibling) into one edge.
+  const currentPathSet = new Set(currentPaths);
+  // RUN-238: guaranteed once before either second-pass loop, then periodically inside each — same
+  // cadence as the candidate loop above (see the module doc's note on why this is extrapolated
+  // rather than separately measured).
+  await cooperativeCheckpoint(cooperativeDeps);
+  let importsSinceCheckpoint = 0;
+  for (const { importerPath, specifier } of pendingImports) {
+    importsSinceCheckpoint++;
+    if (importsSinceCheckpoint >= yieldEveryFiles) {
+      importsSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+    const resolvedPath = resolveRelativeImport(importerPath, specifier, currentPathSet);
+    if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
+    const from = buildFileEntityUri(scope, importerPath);
+    const to = buildFileEntityUri(scope, resolvedPath);
+    records.push({ kind: 'edge', type: 'imports', from, to });
+  }
+
+  // RUN-257: `related_to` resolves through the identical function and the identical
+  // dedup-by-(from,to) rule as `imports` above — see this module's own doc for why one resolver
+  // serves both edge types. A `ParsedReference.target` this generation cannot pin to exactly one
+  // file is declined the same way, never stubbed.
+  let referencesSinceCheckpoint = 0;
+  for (const { referencerPath, target } of pendingReferences) {
+    referencesSinceCheckpoint++;
+    if (referencesSinceCheckpoint >= yieldEveryFiles) {
+      referencesSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+    const resolvedPath = resolveRelativeImport(referencerPath, target, currentPathSet);
+    if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
+    const from = buildFileEntityUri(scope, referencerPath);
+    const to = buildFileEntityUri(scope, resolvedPath);
+    records.push({ kind: 'edge', type: 'related_to', from, to });
+  }
+
+  // RUN-280: resolve `pendingModuleDependencies` against the now-complete `moduleUriByName` — a
+  // THIRD two-pass resolution, same shape as the two above and for the identical order-independence
+  // reason, but keyed by NAME rather than by `resolveRelativeImport`'s relative-path grammar (see
+  // `index-formats.ts`'s UBT adapter doc for why a module dependency cannot use that resolver: its
+  // declaring file has no directional relationship to the dependant's own directory). Emits
+  // `depends_on`, never `imports` — a module naming another module is a different claim from a file
+  // importing a sibling, and `depends_on` is the vendored `MemoryEdgeType` arm that already says so.
+  let moduleDepsSinceCheckpoint = 0;
+  for (const { fromUri, moduleName } of pendingModuleDependencies) {
+    moduleDepsSinceCheckpoint++;
+    if (moduleDepsSinceCheckpoint >= yieldEveryFiles) {
+      moduleDepsSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+    const toUri = moduleUriByName.get(moduleName);
+    // Absent (never declared this generation — an engine module, the COMMON case: most UBT
+    // dependencies are Core/CoreUObject/Engine/UMG/Slate, which live in the Unreal installation, not
+    // the repo) or `null` (declared by two different files, ambiguous) both decline the same way an
+    // unresolved `imports` specifier does: an edge to a node this generation never sent is an edge
+    // to nothing. Counted, never silently dropped — see `IndexerResult.declinedModuleDependencies`.
+    if (!toUri) {
+      declinedModuleDependencies += 1;
+      continue;
+    }
+    records.push({ kind: 'edge', type: 'depends_on', from: fromUri, to: toUri });
+  }
+
+  reportPhase('parse', tPhase);
+
+  // RUN-279: the ONE place duplicate rows are collapsed, before anything hashes, sorts, or encodes
+  // them — so `contentHash` describes exactly the rows a server will stage. Before this, `imports`
+  // and `related_to` each carried their own `seen` set, `calls` carried none, and both dogfood repos
+  // were sending thousands of identical `calls` edges (a function calling another 36 times emitted 36
+  // copies); the server's own validation counts staged rows and re-derives the hash, so every upload
+  // failed at `complete()`. See `dedupeRecords` for why edges are collapsed and nodes only counted.
+  const deduped = dedupeRecords(records);
+  const duplicateEdgesDropped = deduped.duplicateEdgesDropped;
+  const duplicateNodeUris = deduped.duplicateNodeUris;
+
+  const deletions = computeDeletions(currentPaths, deps.previousFilePaths);
+  // `sortRecords` itself does not chunk (see its own doc for the measured cost that makes that
+  // acceptable) — the checkpoint here is what makes an already-aborted/-busy pass decline BEFORE
+  // paying for it, not a yield inside it.
+  await cooperativeCheckpoint(cooperativeDeps);
+  tPhase = phaseStart();
+  const sorted = sortRecords(deduped.records);
+  reportPhase('sort', tPhase);
+  tPhase = phaseStart();
+  const contentHash = await computeContentHash(sorted, cooperativeDeps);
+  reportPhase('hash', tPhase);
+  const generationId = deriveGenerationId({
+    projectId: target.projectId,
+    repositoryKey: target.repositoryKey,
+    branch: target.branch,
+    baseId: target.baseId,
+    indexerVersion,
+  });
+  tPhase = phaseStart();
+  const batches = await encodeBatches(generationId, sorted, cooperativeDeps);
+  reportPhase('encode', tPhase);
+  const manifest = assembleManifest({
+    generationId,
+    projectId: target.projectId,
+    repositoryKey: target.repositoryKey,
+    branch: target.branch,
+    baseId: target.baseId,
+    indexerVersion,
+    batchCount: batches.length,
+    fileCount: scanResult.candidates.length,
+    contentHash,
+    deletions,
+    now,
+  });
+
+  return {
+    manifest,
+    batches,
+    records: sorted,
+    diagnostics: diagnostics.diagnostics,
+    diagnosticsOverflow: diagnostics.overflow,
+    scanStatuses: scanResult.statuses,
+    scanStatusOverflow: scanResult.statusOverflow,
+    stoppedEarly: scanResult.stoppedEarly,
+    parserVersions,
+    inferredEdgesOmitted,
+    unlabelledSymbolsDropped,
+    duplicateEdgesDropped,
+    duplicateNodeUris,
+    declinedModuleDependencies,
+  };
+}

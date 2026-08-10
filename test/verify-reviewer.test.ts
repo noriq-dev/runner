@@ -210,6 +210,28 @@ describe('assembleReviewerPrompt', () => {
     expect(readEscalation(taught).escalation?.findingId).toBe(1);
   });
 
+  // RUN-231: the verified context pack, rendered through the reviewer-audience quoted-evidence
+  // frame, must precede the daemon's own ACCEPTANCE/VERDICT instructions — the same ordering
+  // `repoContext` already gets, checked here by INDEX rather than mere presence, since the actual
+  // insertion point (`{{context}}{{memory}}{{#acceptance}}`) is what has to deliver it, not intent.
+  it('carries the memory block BEFORE acceptance/verdict instructions, by index (RUN-231)', () => {
+    const p = assembleReviewerPrompt({
+      intent: 'x',
+      memory: '\n\nQUOTED FROM PROJECT MEMORY — MEMORY-MARKER',
+      acceptance: [{ id: 1, kind: 'truth', text: 'must do the thing' }],
+    });
+    expect(p).toContain('MEMORY-MARKER');
+    const memoryIdx = p.indexOf('MEMORY-MARKER');
+    expect(memoryIdx).toBeLessThan(p.indexOf('ACCEPTANCE CRITERIA'));
+    expect(memoryIdx).toBeLessThan(p.lastIndexOf('VERDICT: PASS'));
+    expect(memoryIdx).toBeLessThan(p.lastIndexOf('End your response'));
+  });
+
+  it('renders nothing extra when no pack was retrieved', () => {
+    const p = assembleReviewerPrompt({ intent: 'x' });
+    expect(p).not.toContain('QUOTED FROM PROJECT MEMORY');
+  });
+
   it('its verdict line round-trips through the shared parser', () => {
     // The reviewer and the dispatched verify kind share one protocol — a drift here would
     // make every reviewer verdict read as 'unknown', i.e. a permanent FAIL.

@@ -20,6 +20,7 @@ import type {
 import { zeroTelemetry } from '../src/drivers/types';
 import type { LockConflict } from '../src/lock-client';
 import type { ParkedRun } from '../src/parked';
+import { renderPrompt } from '../src/prompts';
 import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
 import { LOCK_RELEASE_TIMEOUT_MS } from '../src/stages/settle';
@@ -36,7 +37,7 @@ import {
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
-import type { LockContext, LockOutcome, Workspace } from '../src/vcs/types';
+import type { ChangesBetweenResult, LockContext, LockOutcome, Workspace } from '../src/vcs/types';
 import { BUILTIN_WORKFLOWS } from '../src/workflow';
 import type { WorkflowCatalog } from '../src/workflow-store';
 
@@ -48,8 +49,17 @@ class FakeDriver implements AgentDriver {
   sessionId: string | null = 'sess-fake';
   /** Every start(), in order. A resumed run must reuse the session, not open a fresh one. */
   starts: DriverStartOptions[] = [];
-  /** Turns handed back by the supervisor (RUN-29's verify feedback loop). */
+  /** Turns handed back by the supervisor (RUN-29's verify feedback loop) — fix rounds, reviewer
+   *  feedback, and contest turns ONLY. The settle-time self-summary request (RUN-226) also goes
+   *  through `continueWith`, but it is a distinct, unscripted turn (see `selfSummaries` below) that
+   *  must not silently consume a fix round's queued outcome/text/tokens or count toward a test's
+   *  "no fix turns ran" assertion — it always runs, whenever budget and `continueWith` allow it. */
   continuations: string[] = [];
+  /** Every settle-time self-summary request this driver received, verbatim (RUN-226) — kept apart
+   *  from `continuations` for the reason above. Scripted separately from the shift-based queues:
+   *  this never touches `continueOutcomes`/`continueTexts`/`continueTokens`, so a fix-round test
+   *  that never anticipated this call is unaffected by it. */
+  selfSummaries: string[] = [];
   /** Outcome of each continueWith, in order. Defaults to 'done' — the agent fixed it. */
   continueOutcomes: Array<'done' | 'failed'> = [];
   /** Text the agent "emits" during each continueWith, in order — models the real driver
@@ -108,6 +118,13 @@ class FakeDriver implements AgentDriver {
       // it sees exactly what a scope run sees — no loop.
       continueWith: opts.multiTurn
         ? async (text: string): Promise<DriverExit> => {
+            // The settle-time self-summary request (RUN-226) is not a fix round: it always fires
+            // (whenever budget/continueWith allow it), so it must not consume a fix round's scripted
+            // outcome/text/tokens or count toward `continuations` — see `selfSummaries`' own doc.
+            if (text === renderPrompt('self-summary')) {
+              this.selfSummaries.push(text);
+              return { outcome: 'done', isError: false, reason: null, telemetry: zeroTelemetry() };
+            }
             this.continuations.push(text);
             // Stream this fix turn's output the way the real driver does, so anything reading
             // the session text (the ledger's RESPONSE-block capture) sees it. Emit to THIS
@@ -327,6 +344,13 @@ class FakeWorktrees {
     return this.pushFails ? { ok: false, detail: this.pushFails } : { ok: true };
   };
 
+  // RUN-229: no supervisor test here exercises citation verification (that seam is covered in
+  // `test/citation-verify.test.ts` and `test/stages-prepare.test.ts` against their own fakes) — a
+  // no-op stub only exists so `FakeWorktrees` keeps satisfying `SupervisorVcs`'s now-required
+  // `changesBetween` (RUN-212's own doc: "REQUIRED, not optional", the same reasoning that made
+  // widening this Pick free for every real backend).
+  changesBetween = async (): Promise<ChangesBetweenResult> => ({ ok: true, changed: [], deleted: [] });
+
   // ── waves (RUN-170) ────────────────────────────────────────────────────────
   /** Opt a test into overlapping leases. False (the default) is the pool-of-1 posture, so every
    *  existing test keeps the sequential chain it always modelled — the conservative reading the
@@ -366,6 +390,8 @@ const manifest = (over: Partial<ProjectManifest> = {}): ProjectManifest => ({
   context: { requiredReading: [], entryPoints: [], conventions: [], agentInstructions: 'inline' as const },
   tool: null,
   defaultBranch: null,
+  repositoryKey: null,
+  index: null,
   land: null,
   setup: null,
   permissions: { scope: perm(false), build: perm(true), verify: perm(false) },
@@ -520,6 +546,8 @@ function harness(
     text: string;
   }> = [];
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
+  /** Background indexing's landing trigger (RUN-222) — every call the supervisor makes to it. */
+  const landedEvents: Array<{ repoRoot: string; branch: string; sha: string }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
   let verifyRan = false;
@@ -559,6 +587,7 @@ function harness(
     },
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
+    onLanded: (repoRoot, branch, sha) => landedEvents.push({ repoRoot, branch, sha }),
     // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
     // repo roots (`/repos/repo_a`) do not exist, and a real fs round-trip settles on the
     // threadpool — LATER than the single `flush()` tick these tests spawn within, which would
@@ -651,6 +680,7 @@ function harness(
     worktrees,
     reports,
     comments,
+    landedEvents,
     transcript,
     claude,
     codex,
@@ -915,6 +945,150 @@ describe('the repo context block reaches the brief (RUN-128)', () => {
       const without = assemblePrompt(makeRun({ kind }), manifest(), args);
       expect(withEmpty).toBe(without);
       expect(without).not.toContain('This repo says of itself');
+    }
+  });
+});
+
+// RUN-231: `assemblePrompt` picks between the two pre-rendered memory blocks by `wf.verifyActor`
+// — the identical test `repoContext`/`repoContextBrief` already use — never by re-deriving
+// anything from the pack itself (that walk is `memory-render.ts`'s alone; this file only proves
+// the SELECTION is wired to the right places).
+describe('the memory evidence block reaches the brief (RUN-231)', () => {
+  it('build gets the AUTHOR rendering, after the brief and spec (build.md places {{memory}} last)', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+    // `{{spec}}{{memory}}` at the end of the brief line, ahead of the daemon's own "Done means"
+    // checklist — evidence read after the ask, the daemon's own words last.
+    expect(p.indexOf('Brief:')).toBeLessThan(p.indexOf('AUTHOR-MEMORY-BLOCK'));
+    expect(p.indexOf('AUTHOR-MEMORY-BLOCK')).toBeLessThan(p.indexOf('Done means'));
+  });
+
+  it('scope gets the AUTHOR rendering too — it is a reader of the repo, not a gate over it', () => {
+    const p = assemblePrompt(makeRun({ kind: 'scope' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  it('a dispatched verify run gets the REVIEWER rendering — `verifyActor`, not `produces`', () => {
+    const p = assemblePrompt(makeRun({ kind: 'verify' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+  });
+
+  it('renders exactly as before when neither block is supplied', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+    });
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  // A custom workflow's own template is passed `{{memory}}` in its `common` vars, the same way it
+  // already receives `{{context}}` — README's own documented list, widened by this task.
+  it("a custom build prompt's own template can place {{memory}}", () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.build,
+      id: 'hotfix',
+      promptRef: '{{brief}}{{memory}}',
+      promptSource: '/repo/.noriq/workflows/hotfix.toml',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'build', brief: 'repair it' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+    });
+    expect(p).toBe('repair it\n\nAUTHOR-MEMORY-BLOCK');
+  });
+
+  // A custom verify prompt's outer frame (assembleVerifyPrompt) gets `{{memory}}` too, distinct
+  // from the quoted-and-separately-framed `{{workflowPrompt}}` an operator's own template renders.
+  it('a custom verify prompt still gets the daemon-owned memory block in the outer frame', () => {
+    const workflow = {
+      ...BUILTIN_WORKFLOWS.verify,
+      id: 'security',
+      promptRef: 'focus={{brief}}',
+      promptSource: '/repo/.noriq/workflows/security.md',
+    };
+    const p = assemblePrompt(makeRun({ kind: 'verify', brief: 'audit auth' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      workflow,
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+  });
+});
+
+// RUN-232: the three pre-execution shape overrides read `ctx.memory`/`ctx.memoryBrief` DIRECTLY,
+// never the `memory` local that follows the outer run's own `wf.verifyActor` — a build run's
+// planner/pattern-mapper must not lose the AUTHOR rendering just because `kind: 'build'` happens
+// to share a manifest permission slot with a verify-shaped workflow elsewhere.
+describe('the memory evidence block reaches the pre-execution actors (RUN-232)', () => {
+  it('the planner gets the AUTHOR rendering — a decision already settled is what it should not re-derive', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'planner',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  it('the pattern mapper gets the AUTHOR rendering — a verified citation IS "a file and a line"', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'pattern-mapper',
+    });
+    expect(p).toContain('AUTHOR-MEMORY-BLOCK');
+    expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
+  });
+
+  // The checker is a JUDGING actor even though the run it is planning FOR is a build
+  // (`wf.verifyActor` false there) — it gets the REVIEWER rendering regardless.
+  it('the plan checker gets the REVIEWER rendering, even planning a build (it judges the spec, not the diff)', () => {
+    const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+      agent: testAgent(),
+      server: 'https://s',
+      memory: '\n\nAUTHOR-MEMORY-BLOCK',
+      memoryBrief: '\n\nREVIEWER-MEMORY-BLOCK',
+      promptShapeOverride: 'plan-checker',
+    });
+    expect(p).toContain('REVIEWER-MEMORY-BLOCK');
+    expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+  });
+
+  it('renders exactly as before when neither block is supplied, for all three overrides', () => {
+    for (const shape of ['planner', 'pattern-mapper', 'plan-checker'] as const) {
+      const p = assemblePrompt(makeRun({ kind: 'build' }), manifest(), {
+        agent: testAgent(),
+        server: 'https://s',
+        promptShapeOverride: shape,
+      });
+      expect(p).not.toContain('AUTHOR-MEMORY-BLOCK');
+      expect(p).not.toContain('REVIEWER-MEMORY-BLOCK');
     }
   });
 });
@@ -2586,6 +2760,26 @@ describe('landing a passing build (no human per run)', () => {
     // The diff lives on the integration branch now; keeping a per-run directory forever
     // is exactly the graveyard this replaces.
     expect(h.worktrees.removed).toEqual(['/wt/run_1']);
+  });
+
+  it('fires the index trigger hook (RUN-222) once a build actually lands, with the landed branch and sha', async () => {
+    const h = harness({ manifest: LANDING() });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.landedEvents).toEqual([
+      { repoRoot: '/repos/repo_a', branch: 'noriq/integration', sha: 'landedsha' },
+    ]);
+  });
+
+  it('never fires the index trigger hook when landing failed', async () => {
+    const h = harness({ manifest: LANDING(), verifyPasses: false });
+    const done = h.supervisor.supervise(buildRun());
+    await flush();
+    h.claude.complete('done');
+    await done;
+    expect(h.landedEvents).toEqual([]);
   });
 
   it('creates the landing branch from defaultBranch on first use', async () => {
@@ -4713,11 +4907,12 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     expect(entry?.subclaims).toEqual([]);
   });
 
-  // The record's letters are what the contest resolves against — even where the terminal report's
-  // own lettering diverges, which is exactly the overflow path: the fold keeps the held set whole
-  // and drops the report's enumeration, so the record shows letters for claims the report never
-  // lettered. Answering those letters must credit the displayed claims, not be discarded against
-  // the dropped enumeration (the prompt calls the record authoritative; the code must agree).
+  // RUN-189: the overflow-vs-candidacy fix, at the gate surface. The fold used to keep the held
+  // set whole and drop the terminal round's OWN enumeration, so candidacy read a record that had
+  // never seen the claims the terminal reviewer actually raised — a builder could clear an
+  // overflowed finding by contesting old claims the terminal round never looked at again. Now the
+  // terminal round's own claims are never what the cap drops: the record shows them at its front,
+  // and it is the OLDEST held claims (round one's) that make room by dropping instead.
   it('contesting an overflowed record by its displayed letters earns the fresh look', async () => {
     const h = harness({ manifest: REVIEWED(2), verifyResults: [true, true, true] });
     const finding = (tag: string) =>
@@ -4729,8 +4924,8 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.continueTexts = [
       '', // fix turn 1: no structured response — every letter stays unanswered
       '', // fix turn 2: same
-      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight HELD claims
-      // (rounds one and two), the terminal enumeration having been dropped by the overflow.
+      // The contest answers every letter THE RECORD shows: (a)–(h) label the eight claims the
+      // overflow fold kept — the terminal round's own four, then round two's four.
       ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
         .map((l) => `FINDING 1${l}: CONTESTED src/${l}.ts:1 — the record claim does not hold`)
         .join('\n'),
@@ -4743,20 +4938,19 @@ describe('the terminal-round contest turn (RUN-174)', () => {
     h.claude.complete('done'); // round 1: four letters
     await onReviewTurn(h, 3);
     h.claude.emitText(finding('two'));
-    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight
+    h.claude.complete('done'); // round 2: four MORE letters — the record now holds eight, at the cap
     await onReviewTurn(h, 4);
-    h.claude.emitText(finding('three')); // terminal: four claims the union cannot hold → dropped
+    h.claude.emitText(finding('three')); // terminal: overflow — round 1's claims drop, never these
     h.claude.complete('done');
     await onReviewTurn(h, 5); // every displayed letter contested → the fresh look IS spawned
-    // The answers landed on the record's claims — none discarded against the dropped enumeration:
-    // the adjudicator's PRIOR ADJUDICATIONS shows each held claim with the letter's own pointer,
-    // including the positions past the terminal report's four lines.
+    // The answers landed on the record's claims: the terminal round's own four lead the record,
+    // round two's four fill the rest, and round one's — the oldest — are gone entirely.
     const readjudged = h.claude.starts[4]!.prompt;
-    expect(readjudged).toMatch(/\(a\) two claim 1/); // the record's order: round 2's union
+    expect(readjudged).toMatch(/\(a\) three claim 1/); // this round's own claim leads the record
     expect(readjudged).toContain('CONTESTED (src/a.ts:1)');
-    expect(readjudged).toMatch(/\(e\) one claim 1/); // …and the held tail the report never lettered
+    expect(readjudged).toMatch(/\(e\) two claim 1/); // round two's claims fill the rest
     expect(readjudged).toContain('CONTESTED (src/e.ts:1)');
-    expect(readjudged).not.toContain('three claim'); // the dropped enumeration is not the record
+    expect(readjudged).not.toMatch(/\bone claim \d/); // round one's — the oldest — were dropped, not this round's
     h.claude.emitText('Every pointer holds.\nVERDICT: PASS');
     h.claude.complete('done');
     const exit = await done;
@@ -5983,8 +6177,12 @@ describe('the prompt invites an agent to reach a human (RUN-32)', () => {
       expect(p).toContain('request_input');
       expect(p).toContain('raise_alert');
       // The reassurance is the point: an agent that believes asking ends its run will guess
-      // instead. RUN-30 made "paused, not discarded" true — this is what tells it so.
-      expect(p).toMatch(/paused, not discarded/);
+      // instead. RUN-30 made "resumed with your context intact" true — this is what tells it so.
+      expect(p).toMatch(/resumed with your context intact/);
+      // RUN-191: the same paragraph also names the non-blocking shape (PLNR-237) — an agent that
+      // never hears blocking:false exists will never reach for it, and the answer stays undelivered
+      // no matter how well the daemon routes it.
+      expect(p).toContain('blocking: false');
     }
   });
 

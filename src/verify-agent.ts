@@ -72,6 +72,11 @@ export interface VerifyPromptContext {
   acceptance?: AcceptanceItem[];
   /** Criteria that did not fit the checklist, named rather than dropped. */
   acceptanceOverflow?: number;
+  /** The verified context pack, rendered through the reviewer-audience quoted-evidence frame
+   *  (RUN-231, `memory-render.ts`). Empty/absent → the block renders nothing, exactly as before
+   *  this task landed. Placed BEFORE the acceptance/verdict instructions in the template so the
+   *  daemon's own instructions stay the last word over untrusted retrieved evidence. */
+  memory?: string;
 }
 
 /** Build the adversarial verify prompt (prompts/verify-agent.md) from the phase specs.
@@ -95,6 +100,7 @@ export function assembleVerifyPrompt(specs: string, ctx: VerifyPromptContext): s
     diffCmd: ctx.diffCmd ?? null,
     context: ctx.repoContext ?? '',
     workflowPrompt: ctx.workflowPrompt ?? '',
+    memory: ctx.memory ?? '',
     acceptance: ctx.acceptance?.length
       ? renderAcceptanceChecklist(ctx.acceptance, ctx.acceptanceOverflow ?? 0)
       : null,

@@ -22,11 +22,42 @@ for (const f of (await readdir(promptsDir)).filter((f) => f.endsWith('.md') && f
   prompts[f.slice(0, -3)] = (await readFile(new URL(f, promptsDir), 'utf8')).trimEnd();
 }
 
+// RUN-216: the tree-sitter grammars this daemon actually uses (TypeScript, JavaScript, TSX — never
+// @vscode/tree-sitter-wasm's full ~40-language, 22MB collection, per that task's locked decision
+// 3), base64-inlined through the SAME define rail as the prompts above so dist/cli.js stays
+// self-contained without installing that package for every end user. @vscode/tree-sitter-wasm is
+// a devDependency ONLY (see src/treesitter-runtime.ts's module doc) — present here, at build time,
+// and in this repo's own node_modules for tsx/vitest, but never shipped as a runtime dependency.
+//
+// RUN-239 adds cpp (5,394,393 bytes measured on this host — the one large addition, accepted
+// explicitly for measured demand; see src/treesitter-runtime.ts's own doc for the bundle-size
+// trade) and ini (4,716 bytes — effectively free by comparison), on the SAME rail rather than a
+// new lazy-loading mechanism for the large one: one packaging mechanism to reason about.
+const grammarsDir = new URL('../node_modules/@vscode/tree-sitter-wasm/wasm/', import.meta.url);
+const grammarFiles = {
+  typescript: 'tree-sitter-typescript.wasm',
+  javascript: 'tree-sitter-javascript.wasm',
+  tsx: 'tree-sitter-tsx.wasm',
+  cpp: 'tree-sitter-cpp.wasm',
+  ini: 'tree-sitter-ini.wasm',
+};
+const grammars = {};
+for (const [id, file] of Object.entries(grammarFiles)) {
+  grammars[id] = (await readFile(new URL(file, grammarsDir))).toString('base64');
+}
+
 // @anthropic-ai/claude-agent-sdk stays EXTERNAL (RUN-26): it's a large package that
 // spawns the `claude` binary and carries its own subtree (@anthropic-ai/sdk, the MCP
 // SDK), so it ships as a normal npm dependency and is resolved at runtime — not
 // inlined. It's the only SDK-family package the daemon imports directly.
-const external = ['@anthropic-ai/claude-agent-sdk'];
+//
+// web-tree-sitter joins it for a different but analogous reason (RUN-216, measured — see
+// src/treesitter-runtime.ts's module doc): its own Parser.init() locates its ~200KB runtime WASM
+// file via an import.meta.url-relative lookup from ITS OWN installed location. Bundling its JS
+// would strand that lookup; staying external keeps the package at the location it expects, same
+// as the Agent SDK precedent above. It ships as a normal npm dependency for exactly this reason —
+// unlike @vscode/tree-sitter-wasm, whose grammar BYTES are inlined above instead.
+const external = ['@anthropic-ai/claude-agent-sdk', 'web-tree-sitter'];
 
 await build({
   entryPoints: ['src/cli.ts'],
@@ -41,6 +72,7 @@ await build({
   define: {
     __RUNNER_VERSION__: JSON.stringify(version),
     __RUNNER_PROMPTS__: JSON.stringify(prompts),
+    __RUNNER_GRAMMARS__: JSON.stringify(grammars),
   },
   sourcemap: true,
   // ESM shim so bundled CJS deps that reference require/__dirname still work.

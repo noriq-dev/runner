@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import type { ChangesBetweenResult, CurrentBaseResult, IgnoreQueryResult } from './vcs/types';
 
 const execFileP = promisify(execFile);
 
@@ -34,12 +36,41 @@ export function comparableWorktreePath(p: string): string {
 /** Where per-Run worktrees are created (outside any repo). */
 export const DEFAULT_WORKTREES_DIR = path.join(os.homedir(), '.noriq', 'worktrees');
 
-/** Runs a git subcommand in a repo. Injectable so the lifecycle is testable. */
-export type GitRunner = (args: string[], cwd: string) => Promise<{ stdout: string; stderr: string }>;
+/**
+ * Runs a git subcommand in a repo. Injectable so the lifecycle is testable.
+ *
+ * `stdin`, optional and additive (RUN-256): every existing call site omits it and behaves exactly
+ * as before (closing an unused stdin harms nothing — no other subcommand this file runs reads
+ * one). Added for `checkIgnored`'s `git check-ignore --stdin`, the one caller that needs it —
+ * `-z` (NUL-delimited, the same safety `changedPaths` already trusts for an exotic filename)
+ * measures as refusing outright in positional-argument mode ("fatal: -z only makes sense with
+ * --stdin"), so stdin is not a style choice here, it is what makes the NUL-safe form reachable.
+ */
+export type GitRunner = (
+  args: string[],
+  cwd: string,
+  stdin?: string,
+) => Promise<{ stdout: string; stderr: string }>;
 
-export const defaultGit: GitRunner = async (args, cwd) => {
-  const { stdout, stderr } = await execFileP('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
-  return { stdout, stderr };
+export const defaultGit: GitRunner = (args, cwd, stdin) => {
+  const promise = execFileP('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
+  // `util.promisify(execFile)`'s returned promise exposes the live child via `.child` (Node's own
+  // documented behaviour) — writing to its stdin before awaiting is what lets this stay on
+  // `execFile` (unchanged buffering/encoding/error-shape for every other call site) rather than
+  // moving the whole runner to `spawn` just to support the one caller that needs stdin.
+  //
+  // Every OTHER subcommand this file runs never reads stdin at all, and measured live (not
+  // assumed): git can close its end of that pipe before this line's `.end()` call reaches it,
+  // which surfaces as an EPIPE `'error'` event on the stream — an UNHANDLED one, since nothing
+  // else here listens for it, which crashed the process outright. A closed pipe on a write nobody
+  // was going to read is not a failure of the command that already ran; the handler below is what
+  // keeps this call the same no-op it always was for every caller that never passes `stdin`.
+  const childStdin = promise.child.stdin;
+  if (childStdin) {
+    childStdin.on('error', () => {});
+    childStdin.end(stdin ?? '');
+  }
+  return promise;
 };
 
 /**
@@ -81,6 +112,43 @@ export interface CreateWorktreeOptions {
   readOnly?: boolean;
   /** Base ref to branch from. Defaults to the repo's current HEAD. */
   baseRef?: string;
+}
+
+/**
+ * A read-only index snapshot's git-level handle (RUN-211) — `WorktreeManager.createIndexSnapshot`'s
+ * return, wrapped by `GitBackend.leaseIndexSnapshot` into the backend-neutral `IndexSnapshot`.
+ * Deliberately narrower than `WorktreeInfo`: no `branch` (a snapshot is detached — see
+ * `createIndexSnapshot`) and no `runId` (a snapshot belongs to no run).
+ */
+export interface IndexSnapshotHandle {
+  repoRoot: string;
+  path: string;
+  /** The commit the snapshot is pinned at — resolved at create time, same reasoning as
+   *  `WorktreeInfo.baseSha`, though nothing can move a detached HEAD here after the fact. */
+  baseSha: string;
+}
+
+/**
+ * Past this many changed+deleted paths, `changesBetween` (below) declines with
+ * `full-index-required` rather than returning a huge list (RUN-212 locked decision 4): a base
+ * pair spanning months of history can produce a change list larger than the repo's own file set,
+ * at which point the "incremental" path is a slower full index with none of the savings — worse
+ * than asking for one outright. Kept well under `IndexPolicy.maxFiles`'s default (20,000,
+ * `index-policy.ts`) rather than tied to it: a rename counts TWICE here (its old path in
+ * `deleted`, its new path in `changed` — locked decision 3), so the same nominal file-count
+ * budget buys roughly half as many entries before this trips, and this module has no per-repo
+ * config to read in the first place.
+ */
+export const CHANGES_BETWEEN_MAX_PATHS = 10_000;
+
+/** The infix that makes a snapshot's directory unmistakably not a run worktree (`<repo>-<runId>`
+ *  never contains this), both for a human reading `~/.noriq/worktrees` and for the reap sweep's
+ *  own naming-based recognition below — a snapshot has no branch, so it cannot be recognized the
+ *  way `listManaged` recognizes a run (RUN-211). */
+const INDEX_SNAPSHOT_INFIX = 'index-snapshot';
+
+function indexSnapshotDirName(repoRoot: string, id: string): string {
+  return `${path.basename(repoRoot)}-${INDEX_SNAPSHOT_INFIX}-${id}`;
 }
 
 // Recursively flip write bits on a checkout. Skips the .git pointer. Best-effort:
@@ -201,6 +269,104 @@ export class WorktreeManager {
   }
 
   /**
+   * The cheap "what is current" check (RUN-222, `VcsBackend.currentBase`'s git half): the SAME
+   * scope `createIndexSnapshot` below defaults to (`baseRef ?? 'HEAD'`) — this repo's own
+   * checked-out HEAD, or a named ref when the caller has one — priced at one `rev-parse`, never a
+   * worktree and never a lease. `--quiet` is what keeps a repo with no commits yet (or a branch
+   * that does not exist) an ANSWER (empty stdout, nonzero exit) rather than git's own noisy
+   * "fatal: ambiguous argument" on stderr — this method never throws for that ordinary case,
+   * `CurrentBaseResult`'s own contract.
+   */
+  async currentBase(repoRoot: string, branch?: string): Promise<CurrentBaseResult> {
+    const ref = branch ?? 'HEAD';
+    try {
+      const { stdout } = await this.git(['rev-parse', '--verify', '--quiet', ref], repoRoot);
+      const sha = stdout.trim();
+      return sha
+        ? { ok: true, baseId: sha }
+        : { ok: false, reason: 'unknown', detail: `${ref} did not resolve to a commit in ${repoRoot}` };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `could not resolve ${ref} in ${repoRoot}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Pin a DETACHED worktree at `baseRef` (default HEAD) for read-only indexing (RUN-211) — never
+   * for an agent. No branch, ever: indexing the repo root directly would read the operator's
+   * working tree — dirty files, a mid-rebase state — so the index would describe a tree no
+   * `baseId` names, and a pinned detached checkout is what makes the result deterministic for a
+   * given base instead. No branch also means nothing can land from it, and `reapOrphans`'s own
+   * branch-name recognition (`listManaged`) never mistakes it for an orphaned RUN — the directory
+   * naming (`<repo>-index-snapshot-<id>`, never `<repo>-<runId>`) is what the sweep below uses to
+   * recognize one on its own terms.
+   *
+   * Space-isolated like `create`: every call mints its own worktree, so many snapshots — and a
+   * snapshot alongside any number of run worktrees — may coexist without contention.
+   */
+  async createIndexSnapshot(repoRoot: string, opts: { baseRef?: string } = {}): Promise<IndexSnapshotHandle> {
+    await mkdir(this.baseDir, { recursive: true });
+    const baseRef = opts.baseRef ?? 'HEAD';
+    const dir = path.join(this.baseDir, indexSnapshotDirName(repoRoot, randomUUID()));
+    const { stdout: baseSha } = await this.git(['rev-parse', baseRef], repoRoot);
+    await this.git(['worktree', 'add', '--detach', dir, baseRef], repoRoot);
+    return { repoRoot, path: dir, baseSha: baseSha.trim() };
+  }
+
+  /**
+   * Remove a snapshot minted by `createIndexSnapshot`. IDEMPOTENT: a second call (or one racing a
+   * prior removal) finds `git worktree remove` failing on an already-gone path, which is
+   * swallowed the same way `remove()` swallows it for a run's worktree — a no-op, not an error.
+   * No branch to delete: a snapshot never had one.
+   */
+  async removeIndexSnapshot(handle: Pick<IndexSnapshotHandle, 'repoRoot' | 'path'>): Promise<void> {
+    await this.git(['worktree', 'remove', '--force', handle.path], handle.repoRoot).catch(() => {});
+    await this.git(['worktree', 'prune'], handle.repoRoot).catch(() => {});
+  }
+
+  /** Snapshot worktrees left behind by a crashed daemon, recognized by directory naming alone —
+   *  they carry no branch, so `listManaged`'s branch-based recognition can never see them. Used
+   *  only by `reapOrphans`, which prunes every one it finds ONLY on the startup sweep (`isOwned`
+   *  absent): a snapshot is detached and was never written, so no PROCESS crash can lose work by
+   *  leaving one behind — but a snapshot currently on lease (RUN-214) is indistinguishable from a
+   *  leaked one by inspection, same as a live run's workspace, and deleting it out from under an
+   *  in-flight indexing scan pulls the tree out from under it mid-read. Startup is the one time
+   *  that risk cannot exist: every prior process, and so every lease, died with it. */
+  private async listIndexSnapshots(repoRoot: string): Promise<string[]> {
+    let stdout: string;
+    try {
+      ({ stdout } = await this.git(['worktree', 'list', '--porcelain'], repoRoot));
+    } catch {
+      return [];
+    }
+    const out: string[] = [];
+    let curPath: string | null = null;
+    let detached = false;
+    const flush = () => {
+      if (curPath && detached && path.basename(curPath).includes(`-${INDEX_SNAPSHOT_INFIX}-`)) {
+        out.push(curPath);
+      }
+      curPath = null;
+      detached = false;
+    };
+    for (const line of stdout.split('\n')) {
+      if (line.startsWith('worktree ')) {
+        flush();
+        curPath = line.slice('worktree '.length).trim();
+      } else if (line.trim() === 'detached') {
+        detached = true;
+      } else if (line.trim() === '') {
+        flush();
+      }
+    }
+    flush();
+    return out;
+  }
+
+  /**
    * Did this Run actually produce anything? Counts BOTH uncommitted working-tree
    * changes and commits the agent made on its throwaway branch — an agent may leave
    * the diff either way.
@@ -297,6 +463,167 @@ export class WorktreeManager {
     // at the base, a run branch full of commits reports no paths, and it is that BRANCH that lands.
     if (!set.size) await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
     return [...set];
+  }
+
+  /**
+   * Relate two commits and report what moved between them — git's half of `changesBetween`
+   * (RUN-212; `VcsBackend.changesBetween`'s doc on `vcs/types.ts` carries the full outcome
+   * contract this implements). Needs no worktree at all: `git diff`/`git merge-base` read the
+   * object database directly, so this runs straight against `repoRoot` — a caller never has to
+   * hold a snapshot it does not need just to compare two bases.
+   *
+   * Every uncertain condition below answers `full-index-required` rather than throwing or
+   * reporting an empty diff (the interface's locked decision 1):
+   *
+   *  - either endpoint fails `rev-parse --verify …^{commit}` — gone, never fetched, or simply
+   *    not a commit at all;
+   *  - `merge-base --all` finds no common ancestor (unrelated histories — two separate root
+   *    commits report exit 1 with no output, folded into the generic query-failure branch below
+   *    rather than given its own detail, because the caller does not need to tell "unrelated"
+   *    from "the query broke") or MORE than one (an ambiguous, criss-cross relationship) —
+   *    `--all` rather than the bare form, because the bare form silently picks ONE of several
+   *    best common ancestors instead of ever reporting the ambiguity;
+   *  - the diff query itself fails for any reason (a corrupt object, a transient git error) —
+   *    the path an injected failing `GitRunner` exercises in tests, per this task's acceptance;
+   *  - the reported change set exceeds `CHANGES_BETWEEN_MAX_PATHS`.
+   *
+   * `--name-status -z -M` reports a rename as `R<score>\0old\0new\0` — destination LAST, unlike
+   * `status --porcelain -z`'s destination-FIRST convention `changedPaths` above relies on;
+   * measured, not assumed, the same discipline this file applies everywhere it parses git's
+   * output. A rename decomposes into `deleted: [old]` + `changed: [new]` (locked decision 3); a
+   * copy (`C<score>\0src\0dst`) reports only its destination as changed — the source was never
+   * touched, so it belongs in neither list. `A`/`M`/`T` (add/modify/type-change) all fold into
+   * `changed`: the index treats an added and a modified path identically (both need re-reading),
+   * so a third list would be structure with no consumer (this task's discretion note 5).
+   */
+  async changesBetween(repoRoot: string, from: string, to: string): Promise<ChangesBetweenResult> {
+    for (const [label, id] of [
+      ['from', from],
+      ['to', to],
+    ] as const) {
+      const resolves = await this.git(['rev-parse', '--verify', '--quiet', `${id}^{commit}`], repoRoot).then(
+        () => true,
+        () => false,
+      );
+      if (!resolves) {
+        return {
+          ok: false,
+          reason: 'full-index-required',
+          detail: `${label} base ${JSON.stringify(id)} does not resolve to a commit in ${repoRoot} — gone, never fetched, or invalid`,
+        };
+      }
+    }
+
+    let ancestors: string[];
+    try {
+      const { stdout } = await this.git(['merge-base', '--all', from, to], repoRoot);
+      ancestors = stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `could not relate ${from} and ${to}: ${(err as Error).message}`,
+      };
+    }
+    if (ancestors.length !== 1) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${from} and ${to} have ${ancestors.length} best common ancestor(s) — ambiguous relationship`,
+      };
+    }
+
+    let raw: string;
+    try {
+      const { stdout } = await this.git(['diff', '--name-status', '-z', '-M', from, to], repoRoot);
+      raw = stdout;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `diff query between ${from} and ${to} failed: ${(err as Error).message}`,
+      };
+    }
+
+    const changed = new Set<string>();
+    const deleted = new Set<string>();
+    const tokens = raw.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const status = tokens[i];
+      i += 1;
+      if (!status) continue;
+      const kind = status[0];
+      if (kind === 'R' || kind === 'C') {
+        // Two fields follow: source, then destination (measured above — the reverse of
+        // `status --porcelain -z`'s order).
+        const oldPath = tokens[i];
+        const newPath = tokens[i + 1];
+        i += 2;
+        if (!oldPath || !newPath) continue;
+        if (kind === 'R') deleted.add(oldPath);
+        changed.add(newPath);
+      } else if (kind === 'D') {
+        const p = tokens[i];
+        i += 1;
+        if (p) deleted.add(p);
+      } else {
+        const p = tokens[i];
+        i += 1;
+        if (p) changed.add(p);
+      }
+    }
+
+    if (changed.size + deleted.size > CHANGES_BETWEEN_MAX_PATHS) {
+      return {
+        ok: false,
+        reason: 'full-index-required',
+        detail: `${changed.size + deleted.size} changed paths between ${from} and ${to} exceeds the ${CHANGES_BETWEEN_MAX_PATHS}-path cap`,
+      };
+    }
+
+    return { ok: true, changed: [...changed], deleted: [...deleted] };
+  }
+
+  /**
+   * `git check-ignore --stdin -z` (RUN-256) — git's half of `VcsBackend.queryIgnored`, batched:
+   * every candidate in `paths` in ONE call, never one process per path (`vcs/types.ts`'s own doc
+   * on that method states why: locked decision 2, "batch the query"). Chosen over parsing git's
+   * own ignore file here: nested ignore files, `!` negation, precedence, and `core.excludesFile` are
+   * all real and all easy to get subtly wrong, and this is the same "shell to the tool that
+   * defines the semantics" discipline `changesBetween` above already applies to git's own diff
+   * output.
+   *
+   * Git's exit code for this command is NOT the ordinary 0-success/nonzero-failure convention —
+   * measured directly (not assumed): **0 means "at least one of the given paths is ignored", 1
+   * means "none of them are"** (a real, distinct ANSWER, never an error), and only something else
+   * (129 for a bad flag, measured; git's own docs name 128 for a fatal error) is an actual
+   * failure. `this.git` rejects on any nonzero exit (this file's own convention throughout), so
+   * this method catches the rejection and reads the numeric exit code off it: exactly `1` folds
+   * into the empty-set answer, anything else answers `unknown` (never guessed — RUN-256 locked
+   * decision 3) rather than treating an unreadable answer as "nothing is ignored".
+   */
+  async checkIgnored(repoRoot: string, paths: string[]): Promise<IgnoreQueryResult> {
+    if (paths.length === 0) return { ok: true, ignored: new Set() };
+    try {
+      const { stdout } = await this.git(
+        ['check-ignore', '--stdin', '-z'],
+        repoRoot,
+        paths.map((p) => `${p}\0`).join(''),
+      );
+      return { ok: true, ignored: new Set(stdout.split('\0').filter(Boolean)) };
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      if (code === 1) return { ok: true, ignored: new Set() };
+      return {
+        ok: false,
+        reason: 'unknown',
+        detail: `git check-ignore failed in ${repoRoot}: ${(err as Error).message}`,
+      };
+    }
   }
 
   /** Tear down a worktree + delete its (never-pushed) branch. Safe to call twice. */
@@ -622,6 +949,22 @@ export class WorktreeManager {
       await this.remove({ repoRoot, path: w.path, branch: w.branch });
       removed += 1;
     }
+
+    // Index snapshots (RUN-211) are pruned only on the STARTUP sweep — `opts.isOwned` absent,
+    // this same doc's "Absent = the startup meaning" above. At startup no process survives, so no
+    // snapshot can be on lease, and it is safe by construction: detached, never written, holds no
+    // work. Mid-flight (`isOwned` present) a leased snapshot looks exactly like a leaked one — the
+    // same problem `isOwned` exists to solve for `managed` above — and unlike a run's worktree it
+    // has no "still holds unsaved work" check to fall back on, because nothing is ever written to
+    // one; the failure mode instead is deleting the tree out from under an in-flight scan reading
+    // it (RUN-214's coordinator leases and releases one). Never added to `removed` either way: a
+    // snapshot is not a run, and counting it would corrupt the reaped-run total the daemon logs.
+    if (!opts.isOwned) {
+      for (const snapshotPath of await this.listIndexSnapshots(repoRoot)) {
+        await this.removeIndexSnapshot({ repoRoot, path: snapshotPath });
+      }
+    }
+
     return removed;
   }
 

@@ -29,6 +29,14 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # RUN-240: vendor/noriq-shared/src is a checked-in COPY (VENDORED-CONTRACT.md) that must
+      # never drift from what scripts/vendor-shared.mjs last recorded in PROVENANCE.json — a
+      # hand-edit here is the exact failure the vendoring posture exists to prevent (the two repos
+      # silently disagreeing about a contract each believes it owns). This step is redundant with
+      # `npm run check` below on a normal run (vendor:check is now its first step) but stays
+      # explicit and first so a provenance drift fails FAST and with an unambiguous step name,
+      # rather than as a cryptic first line inside a longer `check` log.
+      - run: npm run vendor:check
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run test

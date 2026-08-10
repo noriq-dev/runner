@@ -6,7 +6,7 @@ You have read access to this repo's workspace and nothing else. Your entire outp
 
 Brief: {{brief}}{{anchor}}
 
-{{spec}}
+{{spec}}{{memory}}
 
 The rule that decides whether this was worth the tokens: **name the file and the lines, never the idea.**
 

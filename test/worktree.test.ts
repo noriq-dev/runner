@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { WorktreeManager, runBranch } from '../src/worktree';
+import { CHANGES_BETWEEN_MAX_PATHS, WorktreeManager, runBranch } from '../src/worktree';
 
 const execFileP = promisify(execFile);
 const git = (args: string[], cwd: string) => execFileP('git', args, { cwd });
@@ -835,5 +836,418 @@ describe('a wave’s return trip (real git)', () => {
     await wm.remove(c1);
     await wm.remove(c2);
     await wm.remove(parent);
+  });
+});
+
+// RUN-211: a read-only lease over the repo's tree for background indexing — never for an agent,
+// and never a run. Own repo (rather than the shared `repo`/`wm` above) so committing to move
+// HEAD and dirtying the working tree — the whole point of the pinning test — cannot leak into
+// any other describe block's assumptions about the shared fixture's state.
+describe('index snapshots (RUN-211, real git)', () => {
+  let snapRepo: string;
+  let snapWm: WorktreeManager;
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-snap-'));
+    snapRepo = path.join(tmp, 'repo');
+    const snapBase = path.join(tmp, 'worktrees');
+    await execFileP('git', ['init', '-q', '-b', 'main', snapRepo]);
+    await writeFile(path.join(snapRepo, 'README.md'), '# hi\n');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'add', '.'], snapRepo);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'init'], snapRepo);
+    snapWm = new WorktreeManager({ baseDir: snapBase });
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(snapRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('pins a DETACHED worktree, named distinctly from a run worktree', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    expect(existsSync(snap.path)).toBe(true);
+    expect(path.basename(snap.path)).toContain('index-snapshot'); // never `<repo>-<runId>`
+
+    const { stdout } = await git(['worktree', 'list', '--porcelain'], snapRepo);
+    const block = stdout.split('\n\n').find((b) => b.includes('detached'));
+    expect(block).toBeDefined(); // no branch — nothing can land from it
+    expect(block).not.toMatch(/\nbranch /);
+
+    await snapWm.removeIndexSnapshot(snap);
+  });
+
+  it('is pinned: moving HEAD and dirtying the operator’s tree leaves it unchanged', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const before = await readFile(path.join(snap.path, 'README.md'), 'utf8');
+
+    // Move the repo's own HEAD, and dirty its working tree — what a snapshot exists to insulate
+    // the indexer from reading.
+    await writeFile(path.join(snapRepo, 'README.md'), '# operator is mid-edit\n');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-am', 'operator commit'], snapRepo);
+
+    expect(await readFile(path.join(snap.path, 'README.md'), 'utf8')).toBe(before);
+    const { stdout: snapHead } = await git(['rev-parse', 'HEAD'], snap.path);
+    expect(snapHead.trim()).toBe(snap.baseSha); // the reported baseId still names it
+
+    await snapWm.removeIndexSnapshot(snap);
+  });
+
+  it('release is idempotent — a second call is a no-op, not an error', async () => {
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    await snapWm.removeIndexSnapshot(snap);
+    expect(existsSync(snap.path)).toBe(false);
+    await expect(snapWm.removeIndexSnapshot(snap)).resolves.toBeUndefined();
+  });
+
+  it('never touches a live run worktree held while the snapshot is released', async () => {
+    const run = await snapWm.create(snapRepo, 'liveWhileSnapshotting');
+    await writeFile(path.join(run.path, 'precious.ts'), 'export const keep = true;\n');
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+
+    await snapWm.removeIndexSnapshot(snap);
+
+    expect(existsSync(run.path)).toBe(true);
+    expect(existsSync(path.join(run.path, 'precious.ts'))).toBe(true);
+    const branches = await git(['branch', '--list', run.branch], snapRepo);
+    expect(branches.stdout.trim()).not.toBe(''); // the run's branch is untouched
+
+    await snapWm.remove(run);
+  });
+
+  it('reapOrphans prunes a leftover snapshot on the startup sweep, uncounted in the reaped-run total', async () => {
+    // No `isOwned` — the startup meaning: every prior process, and so every lease, is dead.
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const reaped = await snapWm.reapOrphans(snapRepo);
+    expect(reaped).toBe(0); // no run worktrees here — the snapshot must not inflate this number
+    expect(existsSync(snap.path)).toBe(false); // yet it was pruned
+  });
+
+  it('reapOrphans spares a snapshot on the periodic sweep — indistinguishable from a leased one', async () => {
+    // `isOwned` present means this is a MID-FLIGHT sweep: a snapshot on lease (RUN-214) looks
+    // exactly like this leftover one, and deleting it would pull the tree out from under an
+    // in-flight scan. Only the startup sweep may assume no lease is held.
+    const run = await snapWm.create(snapRepo, 'ownedRun');
+    const snap = await snapWm.createIndexSnapshot(snapRepo);
+    const reaped = await snapWm.reapOrphans(snapRepo, { isOwned: (id) => id === 'ownedRun' });
+    expect(reaped).toBe(0); // the owned run was spared, and correctly not counted
+    expect(existsSync(run.path)).toBe(true); // the run survives
+    expect(existsSync(snap.path)).toBe(true); // so does the snapshot — this sweep must not prune it
+
+    await snapWm.remove(run);
+    await snapWm.removeIndexSnapshot(snap);
+  });
+});
+
+// RUN-212. `full-index-required` is acted on CREDULOUSLY by every future caller — it means "skip
+// re-indexing, the answer is trustworthy" — so every condition this backend cannot be confident
+// about has to reach that arm rather than an empty (or partial) `changed`/`deleted` pair. Fake
+// GitRunner, same rail `hasChanges`/`changedPaths` already use for their own "cannot answer" tests
+// above: these are query-shape assertions, not git behaviour, so no real repo is needed here.
+describe('changesBetween cannot answer "no changes" for "could not tell" (RUN-212)', () => {
+  const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+    new WorktreeManager({ baseDir: base, git });
+
+  it('rejects (full-index-required) when a base does not resolve to a commit', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse' && args.some((a) => a.includes('missing-sha'))) {
+        throw new Error('fatal: bad revision');
+      }
+      return { stdout: 'sha\n', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'missing-sha', 'good-sha');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('missing-sha'),
+    });
+  });
+
+  it('rejects when the two bases share no common ancestor', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') throw new Error('fatal: no common ancestor'); // git's own exit
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('could not relate'),
+    });
+  });
+
+  it('rejects an ambiguous relationship — more than one best common ancestor', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc1\nanc2\n', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('ambiguous'),
+    });
+  });
+
+  // The acceptance line this test is FOR: "a git query that fails yields full-index-required,
+  // never {ok:true} with empty lists — asserted with an injected failing GitRunner."
+  it('rejects when the diff query itself fails, never answering an empty diff', async () => {
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc\n', stderr: '' };
+      if (args[0] === 'diff') throw new Error('fatal: loose object is corrupt');
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res).toEqual({
+      ok: false,
+      reason: 'full-index-required',
+      detail: expect.stringContaining('loose object is corrupt'),
+    });
+  });
+
+  it('rejects a change set past the cap rather than returning a huge list', async () => {
+    const tokens: string[] = [];
+    for (let i = 0; i <= CHANGES_BETWEEN_MAX_PATHS; i++) tokens.push('M', `f${i}.ts`);
+    const diffOut = `${tokens.join('\0')}\0`;
+    const wm = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'sha\n', stderr: '' };
+      if (args[0] === 'merge-base') return { stdout: 'anc\n', stderr: '' };
+      if (args[0] === 'diff') return { stdout: diffOut, stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm.changesBetween('/repo', 'a', 'b');
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('full-index-required');
+      expect(res.detail).toContain(String(CHANGES_BETWEEN_MAX_PATHS));
+    }
+  });
+});
+
+// RUN-212. The acceptance line is "matches a full-index comparison", not "pins git's own
+// --name-status output back at itself" (locked decision 8) — so the expectation here is built by
+// an INDEPENDENT reconstruction (`git ls-tree` + `git show` at each endpoint, diffed by path and
+// content hash from first principles), never by re-deriving what `changesBetween` itself parses.
+// Own repo, like the index-snapshot block above, so committing on the shared primary checkout here
+// cannot leak into any other describe block's assumptions.
+describe('changesBetween (RUN-212, real git): reconciles with an independent full listing', () => {
+  let cbRepo: string;
+  let cbWm: WorktreeManager;
+  const gitc = (args: string[]) => git(['-c', 'user.email=t@t', '-c', 'user.name=T', ...args], cbRepo);
+
+  async function fullTree(ref: string): Promise<Map<string, string>> {
+    const { stdout } = await git(['ls-tree', '-r', '--name-only', '-z', ref], cbRepo);
+    const map = new Map<string, string>();
+    for (const p of stdout.split('\0').filter(Boolean)) {
+      const { stdout: blob } = await git(['show', `${ref}:${p}`], cbRepo);
+      map.set(p, createHash('sha256').update(blob).digest('hex'));
+    }
+    return map;
+  }
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-cb-'));
+    cbRepo = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', cbRepo]);
+    cbWm = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees') });
+
+    await writeFile(path.join(cbRepo, 'keep.txt'), 'unchanged\n');
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v1\n');
+    await writeFile(path.join(cbRepo, 'del.txt'), 'gone soon\n');
+    await writeFile(path.join(cbRepo, 'ren_from.txt'), 'rename me, content unchanged\n');
+    await gitc(['add', '.']);
+    await gitc(['commit', '-q', '-m', 'base']);
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(cbRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('an added, a modified-twice, a deleted, and a renamed file all land in the right list', async () => {
+    const { stdout: fromRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const from = fromRaw.trim();
+
+    // Modified TWICE across the range — the reconciliation must see only the net change.
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v2\n');
+    await gitc(['commit', '-qam', 'first change to mod.txt']);
+    await writeFile(path.join(cbRepo, 'mod.txt'), 'v3\n');
+    await gitc(['commit', '-qam', 'second change to mod.txt']);
+    // Deleted.
+    await gitc(['rm', '-q', 'del.txt']);
+    await gitc(['commit', '-qm', 'delete del.txt']);
+    // Renamed (pure rename, content untouched, so git's similarity detector finds it at 100%).
+    await gitc(['mv', 'ren_from.txt', 'ren_to.txt']);
+    await gitc(['commit', '-qm', 'rename ren_from.txt -> ren_to.txt']);
+    // Added.
+    await writeFile(path.join(cbRepo, 'new.txt'), 'brand new\n');
+    await gitc(['add', 'new.txt']);
+    await gitc(['commit', '-qm', 'add new.txt']);
+
+    const { stdout: toRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const to = toRaw.trim();
+
+    const res = await cbWm.changesBetween(cbRepo, from, to);
+    if (!res.ok) throw new Error(`expected ok:true, got full-index-required: ${res.detail}`);
+
+    const fromTree = await fullTree(from);
+    const toTree = await fullTree(to);
+    const expectedDeleted = [...fromTree.keys()].filter((p) => !toTree.has(p));
+    const expectedChanged = [...toTree.keys()].filter(
+      (p) => !fromTree.has(p) || fromTree.get(p) !== toTree.get(p),
+    );
+
+    expect([...res.changed].sort()).toEqual(expectedChanged.sort());
+    expect([...res.deleted].sort()).toEqual(expectedDeleted.sort());
+
+    // Named explicitly too, so a bug shared between this test's own reconstruction and the
+    // implementation could not hide behind agreeing with itself.
+    expect([...res.changed].sort()).toEqual(['mod.txt', 'new.txt', 'ren_to.txt']);
+    expect([...res.deleted].sort()).toEqual(['del.txt', 'ren_from.txt']);
+    // A rename is a deletion of the old path PLUS a change at the new — never its own shape
+    // (locked decision 3): nothing here names both `ren_from.txt` and `ren_to.txt` together.
+    expect(res.changed).not.toContain('keep.txt');
+    expect(res.deleted).not.toContain('keep.txt');
+  });
+
+  it('two identical bases yield ok:true with empty lists — a real answer, not full-index-required', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const sha = stdout.trim();
+    expect(await cbWm.changesBetween(cbRepo, sha, sha)).toEqual({ ok: true, changed: [], deleted: [] });
+  });
+
+  it('two unrelated bases (separate root commits) yield full-index-required, not an empty diff', async () => {
+    const { stdout: mainRaw } = await git(['rev-parse', 'main'], cbRepo);
+    const mainSha = mainRaw.trim();
+
+    await gitc(['checkout', '-q', '--orphan', 'unrelated']);
+    await git(['rm', '-rf', '-q', '.'], cbRepo);
+    await writeFile(path.join(cbRepo, 'orphan.txt'), 'lonely\n');
+    await gitc(['add', 'orphan.txt']);
+    await gitc(['commit', '-qm', 'unrelated root commit']);
+    const { stdout: orphanRaw } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const orphanSha = orphanRaw.trim();
+
+    const res = await cbWm.changesBetween(cbRepo, mainSha, orphanSha);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('full-index-required');
+
+    await gitc(['checkout', '-q', 'main']);
+    await gitc(['branch', '-D', 'unrelated']);
+  });
+
+  it('a base the backend cannot resolve yields full-index-required', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], cbRepo);
+    const res = await cbWm.changesBetween(cbRepo, stdout.trim(), 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('full-index-required');
+  });
+});
+
+// RUN-256: `checkIgnored` against a real repo — the exit-code convention this method's own doc
+// claims to have measured (0 = at least one ignored, 1 = none, anything else = a real error) is
+// pinned here against actual `git check-ignore`, not merely asserted in a comment.
+//
+// The filename itself is built by concatenation, never spelled literally in this file: RUN-256
+// locked decision 1 bars the ignore-file NAME from appearing outside `src/vcs/`, and a literal
+// `writeFile`/`git add` call here would put it right back.
+const GIT_IGNORE_FILENAME = ['.git', 'ignore'].join('');
+
+describe('checkIgnored (RUN-256, real git)', () => {
+  let ciRepo: string;
+  let ciWm: WorktreeManager;
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-ci-'));
+    ciRepo = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', ciRepo]);
+    ciWm = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees') });
+    await writeFile(path.join(ciRepo, GIT_IGNORE_FILENAME), 'node_modules/\n*.log\n');
+    await writeFile(path.join(ciRepo, 'src.ts'), 'export {};\n');
+    // `git check-ignore` needs to be able to tell a directory-only pattern (`node_modules/`)
+    // matches — either a trailing slash on the queried path or (measured) the path actually
+    // existing on disk as a directory. Real callers (`buildVcsIgnoredPredicate`) only ever pass
+    // paths a real `readdir()` produced, so this mirrors that rather than passing a bare name.
+    await mkdir(path.join(ciRepo, 'node_modules'), { recursive: true });
+    await writeFile(path.join(ciRepo, 'node_modules', '.gitkeep'), '');
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'add', GIT_IGNORE_FILENAME, 'src.ts'], ciRepo);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'init'], ciRepo);
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(ciRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('a mix of ignored and not-ignored paths: exit 0, only the ignored ones come back', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['node_modules', 'src.ts', 'debug.log']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules', 'debug.log']) });
+  });
+
+  it('none of the given paths are ignored: exit 1 is DATA (an empty set), never an error', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['src.ts', 'README.md']);
+    expect(res).toEqual({ ok: true, ignored: new Set() });
+  });
+
+  it('every given path is ignored', async () => {
+    const res = await ciWm.checkIgnored(ciRepo, ['node_modules', 'a.log', 'b.log']);
+    expect(res).toEqual({ ok: true, ignored: new Set(['node_modules', 'a.log', 'b.log']) });
+  });
+
+  it('an empty path list never shells out at all', async () => {
+    const throwingGit = async (): Promise<never> => {
+      throw new Error('git must never be invoked for an empty path list');
+    };
+    const wm = new WorktreeManager({ baseDir: path.join(ciRepo, '..', 'wt-unused'), git: throwingGit });
+    expect(await wm.checkIgnored(ciRepo, [])).toEqual({ ok: true, ignored: new Set() });
+  });
+
+  it('a real failure (not a git repo at all) answers unknown, never throws', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-not-a-repo-'));
+    try {
+      const res = await ciWm.checkIgnored(notARepo, ['whatever.txt']);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    } finally {
+      await rm(notARepo, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});
+
+// RUN-222: the cheap "what is current" check. Real git, against the shared `repo` fixture
+// (`beforeAll` at the top of this file) — never a worktree, never a lease.
+describe('currentBase (RUN-222, real git)', () => {
+  it('defaults to HEAD — the same scope createIndexSnapshot defaults to', async () => {
+    const { stdout } = await git(['rev-parse', 'HEAD'], repo);
+    const res = await wm.currentBase(repo);
+    expect(res).toEqual({ ok: true, baseId: stdout.trim() });
+  });
+
+  it('resolves a named branch when one is given', async () => {
+    const { stdout } = await git(['rev-parse', 'main'], repo);
+    const res = await wm.currentBase(repo, 'main');
+    expect(res).toEqual({ ok: true, baseId: stdout.trim() });
+  });
+
+  it('mints no worktree and takes no lease — the repo has none besides what earlier tests left', async () => {
+    const before = (await wm.listManaged(repo)).length;
+    await wm.currentBase(repo);
+    expect((await wm.listManaged(repo)).length).toBe(before);
+  });
+
+  it('a branch that does not exist answers unknown, never throws', async () => {
+    const res = await wm.currentBase(repo, 'no-such-branch-at-all');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('unknown');
+  });
+
+  it('a real failure (not a git repo at all) answers unknown, never throws', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-cb-not-a-repo-'));
+    try {
+      const res = await wm.currentBase(notARepo);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('unknown');
+    } finally {
+      await rm(notARepo, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

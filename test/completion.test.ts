@@ -63,6 +63,56 @@ describe('completionCandidates', () => {
     expect(out).toContain('--help');
     expect(out).toContain('--config');
   });
+
+  it('offers index-repo’s own flags once it is chosen, and signals file completion for --path', () => {
+    const out = completionCandidates(['index-repo', '--']);
+    expect(out).toContain('--force');
+    expect(out).toContain('--json');
+    expect(out).toContain('--limit');
+    expect(out).toContain('--show-content');
+    expect(out).toContain('--check-determinism');
+    expect(completionCandidates(['index-repo', '--path', ''])).toEqual([FILE_SENTINEL]);
+    expect(completionCandidates(['index-repo', '--limit', ''])).toEqual([]);
+  });
+
+  // RUN-223: every new command is a real command the completion vocabulary must list, and every
+  // flag it accepts (--path/--server/--json, all reused from existing commands — no new parseArgs
+  // surface) must complete under it.
+  it('lists every RUN-223 command on an empty word', () => {
+    const out = completionCandidates(['']);
+    for (const c of [
+      'index-status',
+      'index-reindex',
+      'index-retry',
+      'index-cancel',
+      'index-forget-journal',
+    ]) {
+      expect(out).toContain(c);
+    }
+  });
+
+  it('offers --path/--server/--json under index-status, and signals file completion for --path', () => {
+    const out = completionCandidates(['index-status', '--']);
+    expect(out).toContain('--path');
+    expect(out).toContain('--server');
+    expect(out).toContain('--json');
+    expect(completionCandidates(['index-status', '--path', ''])).toEqual([FILE_SENTINEL]);
+  });
+
+  it('offers --path/--server under index-reindex/index-retry/index-cancel/index-forget-journal', () => {
+    for (const cmd of ['index-reindex', 'index-retry', 'index-cancel', 'index-forget-journal']) {
+      const out = completionCandidates([cmd, '--']);
+      expect(out).toContain('--path');
+      expect(out).toContain('--server');
+      // None of these take --json — asking for a nonexistent flag is exactly what would let a
+      // stray flag from index-status silently leak into an unrelated command.
+      expect(out).not.toContain('--json');
+    }
+  });
+
+  it('does not offer index-status’ --json under a foreign command', () => {
+    expect(completionCandidates(['start', '--'])).not.toContain('--json');
+  });
 });
 
 describe('completionScript', () => {

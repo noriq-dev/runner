@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +20,10 @@ import {
 import type { DaemonHandle } from '../src/daemon';
 import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { DriverExit, DriverSession } from '../src/drivers/types';
+import type { IndexCoordinator } from '../src/index-coordinator';
+import type { IndexTriggerHub } from '../src/index-triggers';
+import { suggestedMemoryPaths } from '../src/memory-render';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
@@ -162,6 +167,56 @@ describe('continuationLockScope', () => {
 
     it('still declares nothing when neither side has anything', async () => {
       expect(await continuationLockScope(store({}))(run('run_1'), spec([]))).toBeNull();
+    });
+  });
+
+  // RUN-232 locked decision 2: a memory-derived path never becomes a lock on its own, however
+  // well verified. `continuationLockScope`'s own SIGNATURE is the enforcement — it takes a `Run`
+  // and an `ExecutionSpec`, never a `VerifiedContextPack` — so the strongest regression is to
+  // compute a real memory suggestion beside a real lock-scope call and show the two never meet:
+  // the suggestion a pack would offer for THIS run stays entirely outside what gets locked.
+  describe('a memory-verified path never widens the lock scope (RUN-232)', () => {
+    // A minimal `VerifiedContextPack` — only the fields `suggestedMemoryPaths` actually walks.
+    // Its own exhaustive shape coverage lives in memory-render.test.ts; this fixture exists only
+    // to prove the two functions' outputs never merge.
+    const memoryPackSuggesting = (path: string) =>
+      ({
+        sections: [
+          {
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                evidence: [
+                  {
+                    path,
+                    verification: {
+                      state: 'valid',
+                      reason: '',
+                      serverState: 'valid',
+                      agreesWithServer: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }) as unknown as import('../src/citation-verify').VerifiedContextPack;
+
+    it('suggestedMemoryPaths finds a path beyond the spec, and continuationLockScope never includes it', async () => {
+      const declared = ['src/declared.ts'];
+      const memoryPack = memoryPackSuggesting('src/memory-only.ts');
+      // The pack DOES suggest something outside the declared scope — otherwise this test would
+      // pass trivially, having proven nothing.
+      expect(suggestedMemoryPaths(memoryPack, declared)).toEqual(['src/memory-only.ts']);
+
+      const resolve = continuationLockScope(store({ run_1: entry({ changedPaths: ['src/touched.ts'] }) }));
+      const scope = await resolve(
+        run('run_1'),
+        ExecutionSpec.parse({ anticipatedFiles: declared.map((path) => ({ path })) }),
+      );
+      expect(scope).toEqual(['src/declared.ts', 'src/touched.ts']);
+      expect(scope).not.toContain('src/memory-only.ts');
     });
   });
 });
@@ -752,6 +807,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       superviseGate?: Promise<void>;
       scanRoots?: string[];
       workflows?: WorkflowStore;
+      indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
+      indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
@@ -773,6 +830,21 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
+      indexCoordinator: over.indexCoordinator,
+      indexTriggers: over.indexTriggers,
+      // RUN-222: a REAL IndexCoordinator/IndexTriggerHub is constructed whenever a test does not
+      // override them (most tests here don't) — and `sweepOrphanedStaging`/the journal are read on
+      // every `start()` regardless, so without this every daemon test in this suite would touch
+      // the operator's own `~/.noriq/index-journal.json` and `~/.noriq/index-staging`, the same
+      // `parked`/`continuable`/`stateFile` reasoning one layer up.
+      indexJournalPath: path.join(tmp, 'index-journal.json'),
+      indexStagingRoot: path.join(tmp, 'index-staging'),
+      // RUN-223: same reasoning as `indexJournalPath`/`indexStagingRoot` above — the status store
+      // persists on every mutation and the control server always starts (no config knob) unless a
+      // test overrides it, so both need to be pointed off the operator's own `~/.noriq` for every
+      // test in this suite, not only ones that exercise them directly.
+      indexStatusPath: path.join(tmp, 'index-status.json'),
+      indexControlInfoPath: path.join(tmp, 'index-control.json'),
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -832,6 +904,105 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  // RUN-214, locked decision 11: `stop()` must cancel and JOIN in-flight index work, beside where
+  // it already joins the in-flight orphan sweep — returning while a snapshot is still being read
+  // is the same race the sweep join exists to prevent. Nothing triggers a real index job yet
+  // (RUN-222 owns that), so this proves the WIRING: a fake coordinator's `cancelAll` is awaited to
+  // completion before `stop()` itself resolves.
+  it('stop() cancels and joins the index coordinator before returning (RUN-214)', async () => {
+    const order: string[] = [];
+    let resolveCancel!: () => void;
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll' | 'trigger'> = {
+      cancelAll: () =>
+        new Promise<void>((resolve) => {
+          order.push('cancelAll called');
+          resolveCancel = () => {
+            order.push('cancelAll resolved');
+            resolve();
+          };
+        }),
+      trigger: async () => {},
+    };
+    const { handle } = await harness({ indexCoordinator });
+    handles.pop(); // this test manages this handle's stop() itself — afterEach must not double-stop it
+    const stopped = handle.stop().then(() => order.push('stop() returned'));
+    await tick();
+    expect(order).toEqual(['cancelAll called']); // stop() is genuinely waiting on it
+    resolveCancel();
+    await stopped;
+    expect(order).toEqual(['cancelAll called', 'cancelAll resolved', 'stop() returned']);
+  });
+
+  // RUN-222: the trigger layer's own lifecycle hooks — startup reconcile once, polling starts,
+  // and shutdown stops it BEFORE the coordinator's own cancelAll (so no new job is handed to a
+  // coordinator that is about to be torn down).
+  it('reconciles once and starts polling at startup, and stops the trigger layer before the coordinator on shutdown', async () => {
+    const order: string[] = [];
+    const indexTriggers: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'> =
+      {
+        reconcileOnStartup: async () => {
+          order.push('reconcileOnStartup');
+        },
+        startPolling: () => {
+          order.push('startPolling');
+        },
+        stop: () => {
+          order.push('indexTriggers.stop');
+        },
+        onLanded: async () => {},
+      };
+    const indexCoordinator: Pick<IndexCoordinator, 'cancelAll' | 'trigger'> = {
+      cancelAll: async () => {
+        order.push('indexCoordinator.cancelAll');
+      },
+      trigger: async () => {},
+    };
+    const { handle } = await harness({ indexTriggers, indexCoordinator });
+    expect(order).toEqual(['reconcileOnStartup', 'startPolling']);
+    await handle.stop();
+    handles.pop(); // already stopped above — afterEach must not double-stop it
+    expect(order).toEqual([
+      'reconcileOnStartup',
+      'startPolling',
+      'indexTriggers.stop',
+      'indexCoordinator.cancelAll',
+    ]);
+  });
+
+  // RUN-222 locked decision 8: the orphaned-staging sweep runs at STARTUP, for real, through the
+  // REAL `sweepOrphanedStaging` (never faked out) — driven here by pointing `indexStagingRoot` at
+  // a tmp dir holding a directory with NO matching journal entry, exactly what an orphan looks
+  // like. There is exactly one call site for it in daemon.ts, unconditionally inside `start()`,
+  // never inside `scheduleSweep`'s timer closure or the poll ticker — so "never reached from a
+  // timer" holds by construction, not by racing a fake clock against unrelated async work this
+  // suite does not otherwise fake.
+  it('sweeps an orphaned index-staging directory at startup (RUN-221/222)', async () => {
+    // Matches the path `harness()` itself points `indexStagingRoot` at.
+    const stagingRoot = path.join(tmp, 'index-staging');
+    const orphan = path.join(stagingRoot, 'orphan-with-no-journal-entry');
+    await mkdir(orphan, { recursive: true });
+    await harness({});
+    expect(existsSync(orphan)).toBe(false);
+  });
+
+  // RUN-222: the landing/publish trigger site — a supervisor dep the daemon wires to the trigger
+  // hub, fire-and-forget.
+  it('wires onLanded through to the trigger hub', async () => {
+    const landed: Array<{ repoRoot: string; branch: string; sha: string }> = [];
+    const indexTriggers: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'> =
+      {
+        reconcileOnStartup: async () => {},
+        startPolling: () => {},
+        stop: () => {},
+        onLanded: async (repoRoot, branch, sha) => {
+          landed.push({ repoRoot, branch, sha });
+        },
+      };
+    const { deps } = await harness({ indexTriggers });
+    deps.onLanded?.('/repo/a', 'main', 'sha-1');
+    expect(landed).toEqual([{ repoRoot: '/repo/a', branch: 'main', sha: 'sha-1' }]);
   });
 
   it('re-reads and pins a workflow catalog beside the manifest for each dispatch', async () => {
@@ -918,6 +1089,64 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     await tick();
     await tick();
     expect(supervised).toEqual(['run_a', 'run_b']);
+  });
+
+  // RUN-191: PLNR-237's own closing note is that a `blocking: false` request_input answer, when
+  // a run is live, is delivered as an ORDINARY steer over this socket — a `steers` row with the
+  // signal id as its dedup source, so the existing steer.ack machinery applies unmodified. The
+  // audit for this ticket was to find out whether that is actually true before writing any new
+  // routing, since a driver that could not be steered mid-turn would silently drop the answer.
+  // Both drivers declare `capabilities.steer = true` (src/drivers/claude.ts, src/drivers/codex.ts)
+  // and `SteeringBridge.applySteer` (src/steering.ts) already fans a steer out to every session
+  // registered for a run — including a chain's wave children (RUN-170, see the "several live
+  // sessions of one run" block in test/steering.test.ts). This test is deliverable 1: it pins the
+  // one hop steering.test.ts cannot reach — the daemon's own onSteer wiring — by driving a real
+  // 'steer' wire frame through the fake socket and asserting it reaches the registered session and
+  // is acked delivered/runtime, exactly like a human's steer. No production code changed for this;
+  // if it had failed, that would have been the signal to add routing.
+  describe('a non-blocking request_input answer arrives as an ordinary steer (RUN-191)', () => {
+    class FakeAnswerSession implements DriverSession {
+      readonly runId = 'run_answered';
+      readonly inputs: string[] = [];
+      pushInput(text: string): boolean {
+        this.inputs.push(text);
+        return true;
+      }
+      async interrupt(): Promise<void> {}
+      async stop(): Promise<void> {}
+      done(): Promise<DriverExit> {
+        return new Promise(() => {}); // never resolves — this test only cares about pushInput
+      }
+    }
+
+    it('reaches the live session’s pushInput and acks via=’runtime’ — no daemon routing needed', async () => {
+      const { deps, sockets } = await harness();
+      const s = sockets[0]!;
+      const session = new FakeAnswerSession();
+      // The registration a real build session performs on start (supervisor.ts) — stood up by
+      // hand here since this test drives the wire frame directly, not a supervised run.
+      deps.steering!.register(session.runId, session, async () => {});
+      s.emit(
+        'message',
+        JSON.stringify({
+          type: 'steer',
+          runId: session.runId,
+          steerId: 'sig_1', // the signal id PLNR-237 uses as the steer row's dedup source
+          mode: 'soft', // non-blocking: queue the answer, do not interrupt the agent's turn
+          body: 'the answer to your question: yes, use the v2 endpoint',
+          sourceCommentId: null,
+          sourceMessageId: null,
+          noticeCursor: null,
+          issuedAt: '2026-08-09T00:00:00.000Z',
+        }),
+      );
+      await tick();
+      expect(session.inputs).toEqual(['the answer to your question: yes, use the v2 endpoint']);
+      const acks = s.sent
+        .map((x) => JSON.parse(x) as Record<string, unknown>)
+        .filter((f) => f.type === 'steer.ack');
+      expect(acks).toEqual([expect.objectContaining({ steerId: 'sig_1', delivered: true, via: 'runtime' })]);
+    });
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {
