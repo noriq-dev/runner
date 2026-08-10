@@ -484,6 +484,62 @@ describe('Markdown adapter — links and code references', () => {
   });
 });
 
+describe('Markdown adapter — references (RUN-257)', () => {
+  // Both outputs are built from the same accepted reference, never one without the other — see
+  // `parseMarkdown`'s own doc on why a `symbol` entity and a `ParsedReference` are two different
+  // facts about one mention, not a fact recorded twice.
+  it('emits a ParsedReference alongside the symbol entity for a relative link', async () => {
+    const result = await markdownAdapter.parse({
+      path: 'a.md',
+      content: 'See [CLAUDE.md](../CLAUDE.md) for the design.\n',
+    });
+    expect(result.references).toEqual([{ target: '../CLAUDE.md' }]);
+  });
+
+  it('emits a ParsedReference for a path-shaped code reference too', async () => {
+    const result = await markdownAdapter.parse({
+      path: 'a.md',
+      content: 'See `src/index-formats.ts` for the adapter.\n',
+    });
+    expect(result.references).toEqual([{ target: 'src/index-formats.ts' }]);
+  });
+
+  it('strips a trailing #fragment before handing the target to the resolver, keeps it in the symbol', async () => {
+    const result = await markdownAdapter.parse({
+      path: 'a.md',
+      content: 'See [setup](../CLAUDE.md#setup) for the rules.\n',
+    });
+    expect(result.references).toEqual([{ target: '../CLAUDE.md' }]);
+    expect(result.symbols).toContainEqual(
+      expect.objectContaining({ label: 'link', content: '../CLAUDE.md#setup' }),
+    );
+  });
+
+  it('still emits a reference for a target the resolver will itself decline (e.g. a bare external URL)', async () => {
+    // Declining is `indexer.ts`'s resolver's job (no leading `.`), not this adapter's — the
+    // adapter reports every accepted mention uniformly and lets the shared resolver decide.
+    const result = await markdownAdapter.parse({
+      path: 'a.md',
+      content: 'See [the docs](https://example.com/docs) for more.\n',
+    });
+    expect(result.references).toEqual([{ target: 'https://example.com/docs' }]);
+  });
+
+  it('emits no reference for a target declined outright as secret-shaped — same decline as the symbol', async () => {
+    const result = await markdownAdapter.parse({
+      path: 'a.md',
+      content: 'See [token](https://example.com?token=ghp_16C7e42F292c6912E7710c838347Ae178B4a) for more.\n',
+    });
+    expect(result.references).toEqual([]);
+  });
+
+  it('emits no reference for a dropped in-document anchor link', async () => {
+    const content = '# Setup\n\nSee [setup](#setup) above.\n\n## Details\n';
+    const result = await markdownAdapter.parse({ path: 'a.md', content });
+    expect(result.references).toEqual([]);
+  });
+});
+
 describe('githubHeadingSlug', () => {
   it('lowercases, strips punctuation, and hyphenates spaces — deterministically', () => {
     expect(githubHeadingSlug('Getting Started!')).toBe('getting-started');

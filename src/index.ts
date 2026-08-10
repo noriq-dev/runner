@@ -85,6 +85,7 @@ export {
   type ParsedCall,
   type ParsedDiagnostic,
   type ParsedImport,
+  type ParsedReference,
   type ParsedSymbol,
   type SymbolNodeType,
 } from './index-adapters';

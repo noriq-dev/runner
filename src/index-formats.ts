@@ -3,6 +3,7 @@ import type {
   AdapterParseResult,
   IndexParserAdapter,
   ParsedDiagnostic,
+  ParsedReference,
   ParsedSymbol,
 } from './index-adapters';
 import { scanTextForSecretShapedContent, shouldWithholdValue } from './index-redact';
@@ -27,8 +28,11 @@ import { scanTextForSecretShapedContent, shouldWithholdValue } from './index-red
  * `indexer.ts` a real consumer for `AdapterParseResult.imports`: it resolves a `.`-leading
  * specifier into a wire `imports` edge, which means MODULE dependency on that wire, not "this
  * document mentions that path". A markdown link is not a module dependency, so routing it through
- * `imports` would mint a wire edge with the wrong meaning. See `parseMarkdown`'s own doc, right
- * above where the entities are built, for the full reasoning and the seam gap this works around.
+ * `imports` would mint a wire edge with the wrong meaning. Since RUN-257 they are ALSO
+ * `ParsedReference`s — a second, complementary output the `symbol` entity does not replace — so a
+ * resolvable reference gets a typed `related_to` edge too. See `parseMarkdown`'s own doc, right
+ * above where both are built, for the full reasoning and why keeping both is not the same
+ * duplication `AdapterParseResult.imports`'s edge would have been.
  *
  * **JSON is `JSON.parse`; TOML is `smol-toml`** (locked decision 7 — `smol-toml` is already a
  * runtime dependency, used by `config.ts`/`discovery.ts`/`workflow-store.ts`, so `.noriq/
@@ -576,24 +580,38 @@ function parseFencedCodeBlocks(lines: string[]): FencedCodeBlock[] {
 }
 
 /**
- * Why link/code-reference targets become `symbol` entities here rather than `ParsedImport`
- * specifiers (corrected after RUN-218 landed alongside RUN-217's `imports`-edge resolution):
- * `indexer.ts` now resolves every adapter's `ParsedImport.specifier` into a wire `imports` edge
- * when it starts with `.` and matches a real file in this generation's scan. `imports` on the wire
- * means a MODULE dependency — code that would not run without the thing it names. A markdown link
- * or a backtick file mention is not that; treating `[guide](./guide.md)` as an `imports` edge
- * would tell a consumer asking "what imports `worktree.ts`" that a documentation file does,
- * which is simply false. The seam has no better-fitting edge type to reach for instead:
- * `AdapterParseResult` can express exactly two relationship shapes, `imports` and `calls`
- * (`index-adapters.ts`), and neither is "this document REFERENCES that path" — `related_to` exists
- * in the wire's own `MemoryEdgeType` vocabulary but nothing in the adapter interface can produce
- * it. Recording each reference as its own `symbol` entity (`referenceSymbol` above) sidesteps that
- * gap rather than mislabelling through the nearest available field: the extraction this task's
- * acceptance actually wants — "a doc referencing a path that no longer exists" as a graphable,
- * drift-detectable fact — survives untyped as an edge but fully present as a node a later phase
- * (once the seam grows a `related_to`-shaped edge, or a resolver reads these entities directly)
- * can act on. Widening `AdapterParseResult` itself is out of this file's fence and is left to
- * whoever takes that on deliberately.
+ * Strip a trailing `#fragment` or `?query` before a target is handed to `indexer.ts`'s resolver
+ * (RUN-257) — `resolveRelativeImport`'s specifier grammar has no notion of either (a real repo path
+ * never contains an unescaped `#`/`?`; see `index-entity.ts`'s own percent-encoding of exactly
+ * those characters), so `[decision](../CLAUDE.md#invariants)` would otherwise decline as "no
+ * candidate matches" even though the file half resolves cleanly. Only the copy handed to the
+ * resolver is trimmed — `referenceSymbol`'s own `content` keeps the untouched target text, because
+ * the raw fragment is part of what the document actually says.
+ */
+function referenceResolutionTarget(target: string): string {
+  const cut = target.search(/[#?]/);
+  return cut === -1 ? target : target.slice(0, cut);
+}
+
+/**
+ * Link/code-reference targets get BOTH a `symbol` entity (unchanged since RUN-218) AND, since
+ * RUN-257, a `ParsedReference` — two different facts about the same mention, not one fact
+ * recorded twice. The `symbol` entity is the durable, resolution-independent record: it survives
+ * verbatim whether or not `target` currently names a real file, which is exactly what the task's
+ * own acceptance wants ("a doc referencing a path that no longer exists" stays visible as a node —
+ * a graph EDGE cannot point at a node the wire never sent, so a dangling reference could never be
+ * an edge in the first place). The `ParsedReference` is the complementary, RESOLUTION-dependent
+ * fact: when `target` does name a real file in this generation, `indexer.ts` now has somewhere to
+ * put that as a typed, queryable `related_to` edge ("what relates to `worktree.ts`") — the
+ * capability RUN-218's original version of this comment named as out of its own fence
+ * ("`AdapterParseResult` can express exactly two relationship shapes ... `related_to` exists in
+ * the wire's own vocabulary but nothing in the adapter interface can produce it"). `imports` is
+ * still the wrong edge for either: it means a MODULE dependency — code that would not run without
+ * the thing it names — and `[guide](./guide.md)` is not that; routing it through `imports` would
+ * tell a consumer asking "what imports `worktree.ts`" that a documentation file does, which is
+ * simply false. A secret-shaped target is declined from BOTH outputs identically (the `symbol`
+ * branch already refuses to mint an entity whose identity is the secret; a target that unsafe is
+ * not worth resolving into an edge either).
  */
 function parseMarkdown(content: string): AdapterParseResult {
   const lines = content.split(/\r\n|\n|\r/);
@@ -633,12 +651,14 @@ function parseMarkdown(content: string): AdapterParseResult {
     ...extractLinkTargets(lines, anchors).map((r) => ({ kind: 'link' as const, ...r })),
     ...extractCodeReferenceTargets(lines).map((r) => ({ kind: 'code reference' as const, ...r })),
   ];
+  const parsedReferences: ParsedReference[] = [];
   for (const { kind, lineNumber, target } of references) {
     const sym = referenceSymbol(headings, kind, lineNumber, target);
     if (sym) symbols.push(sym); // null = target was secret-shaped; declined outright, see doc above.
+    if (sym) parsedReferences.push({ target: referenceResolutionTarget(target) });
   }
 
-  return { symbols, diagnostics: [] };
+  return { symbols, diagnostics: [], references: parsedReferences };
 }
 
 /**

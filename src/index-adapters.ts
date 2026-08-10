@@ -136,6 +136,33 @@ export interface ParsedCall {
   confidence: EdgeConfidence;
 }
 
+/**
+ * One reference an adapter found from its own file to another repository path that is neither a
+ * module dependency nor a same-file call — a markdown link, a backtick file mention, and (a future
+ * adapter's own judgement call) anything else that is a documented POINTER rather than something
+ * that runs (RUN-257). `target` uses the exact specifier grammar `ParsedImport.specifier` does —
+ * bare-vs-relative dispatch, extension probing, ambiguity — because `indexer.ts` resolves both
+ * through the SAME snapshot-local two-pass resolver (`resolveRelativeImport`, reused rather than
+ * reimplemented: whichever relationship an adapter is reporting, "does this specifier name a real
+ * path in this generation" is one question with one answer). A target this generation's own scan
+ * cannot resolve — bare, ambiguous, or naming nothing that exists — is DECLINED the same way an
+ * unresolved import is: no edge, never a guess (locked decision, one layer down from
+ * `ParsedImport`'s own "declined by omission" rule).
+ *
+ * **A distinct type from `ParsedImport`, not a generalisation of it** — the two share a resolution
+ * grammar but not a meaning, and `indexer.ts` types the wire edge it produces from each
+ * differently (`imports` vs `related_to`) precisely because they are different claims: "this file
+ * would not run without that one" versus "this file points at that one". Merging the types would
+ * either bolt reference-only concerns (a markdown link with no notion of module resolution) onto
+ * every import, or bolt import-only concerns (`node_modules`, a package registry) onto every
+ * reference — see `index-formats.ts`'s markdown adapter for the concrete case that forced the
+ * split: a `[guide](./guide.md)` link resolving through `imports` would tell a consumer asking
+ * "what imports `worktree.ts`" that a documentation file does, which is simply false.
+ */
+export interface ParsedReference {
+  target: string;
+}
+
 export interface AdapterParseInput {
   /** Repository-relative, forward-slash path — already normalized by the caller. */
   path: string;
@@ -155,6 +182,9 @@ export interface AdapterParseResult {
    *  this file and reliably resolved none of them — indistinguishable from each other on purpose,
    *  since both mean "no edge", the property `indexer.ts`'s tests hold it to. */
   calls?: ParsedCall[];
+  /** Absent/empty for an adapter that never attempts references (RUN-257) — declinable
+   *  independently of `imports`/`calls`, same as those two are of each other. */
+  references?: ParsedReference[];
 }
 
 /**

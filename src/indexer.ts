@@ -88,6 +88,15 @@ import type { IndexSource } from './index-source';
  * the exact same set of paths a `declares`/`calls` edge above was minted against. `resolveRelativeImport`
  * is the resolution function itself; see its own doc for the specifier grammar and the fixed
  * candidate order.
+ *
+ * **`related_to` edges (RUN-257) reuse that exact same resolver and pass shape** — a
+ * `ParsedReference.target` is collected into `pendingReferences` during the loop and resolved
+ * against the finished `currentPaths` in its own second pass, for the identical reason: a markdown
+ * file referencing a sibling that has not been scanned yet must not resolve to nothing purely by
+ * iteration order. The only difference from the `imports` pass is the edge TYPE it writes — same
+ * specifier grammar, same may-miss-never-invent posture (a target `resolveRelativeImport` cannot
+ * pin to exactly one file emits no edge at all), because "does this specifier name a real path in
+ * this generation" does not depend on which relationship an adapter is reporting.
  */
 
 /**
@@ -236,6 +245,8 @@ export async function runIndexer(
   // Collected during the loop, resolved AFTER it — see this module's own doc on why `imports`
   // cannot resolve inside the candidate loop itself (RUN-217 locked decision 2).
   const pendingImports: Array<{ importerPath: string; specifier: string }> = [];
+  // Same reason, same shape, different edge type — see this module's doc on `related_to` (RUN-257).
+  const pendingReferences: Array<{ referencerPath: string; target: string }> = [];
   let inferredEdgesOmitted = 0;
   let unlabelledSymbolsDropped = 0;
 
@@ -353,6 +364,10 @@ export async function runIndexer(
       pendingImports.push({ importerPath: path, specifier: imp.specifier });
     }
 
+    for (const ref of parsed.references ?? []) {
+      pendingReferences.push({ referencerPath: path, target: ref.target });
+    }
+
     for (const diagnostic of parsed.diagnostics) {
       diagnostics.push({
         path,
@@ -381,6 +396,22 @@ export async function runIndexer(
     if (seenImportEdges.has(key)) continue;
     seenImportEdges.add(key);
     records.push({ kind: 'edge', type: 'imports', from, to });
+  }
+
+  // RUN-257: `related_to` resolves through the identical function and the identical
+  // dedup-by-(from,to) rule as `imports` above — see this module's own doc for why one resolver
+  // serves both edge types. A `ParsedReference.target` this generation cannot pin to exactly one
+  // file is declined the same way, never stubbed.
+  const seenReferenceEdges = new Set<string>();
+  for (const { referencerPath, target } of pendingReferences) {
+    const resolvedPath = resolveRelativeImport(referencerPath, target, currentPathSet);
+    if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
+    const from = buildFileEntityUri(scope, referencerPath);
+    const to = buildFileEntityUri(scope, resolvedPath);
+    const key = `${from}\u0000${to}`;
+    if (seenReferenceEdges.has(key)) continue;
+    seenReferenceEdges.add(key);
+    records.push({ kind: 'edge', type: 'related_to', from, to });
   }
 
   const deletions = computeDeletions(currentPaths, deps.previousFilePaths);

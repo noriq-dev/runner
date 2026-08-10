@@ -805,6 +805,136 @@ describe('runIndexer — imports edges (RUN-217 locked decisions 1/2/3/4)', () =
   });
 });
 
+describe('runIndexer — related_to edges (RUN-257)', () => {
+  /** Mirrors `importAdapter` above, one field over — proves the `references` wiring end to end
+   *  without depending on the real markdown adapter (already covered in its own suite). */
+  const referenceAdapter = (referencesByPath: Record<string, string[]>): IndexParserAdapter => ({
+    id: 'fake-references',
+    version: '1',
+    canParse: () => true,
+    parse: async (input: AdapterParseInput): Promise<AdapterParseResult> => ({
+      symbols: [],
+      diagnostics: [],
+      references: (referencesByPath[input.path] ?? []).map((target) => ({ target })),
+    }),
+  });
+
+  function relatedToEdges(result: Awaited<ReturnType<typeof runIndexer>>) {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .filter((r) => r.kind === 'edge' && r.type === 'related_to');
+  }
+
+  function fileUriFor(result: Awaited<ReturnType<typeof runIndexer>>, path: string): unknown {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .find((r) => r.kind === 'node' && r.type === 'file' && String(r.uri).endsWith(`/${path}`))?.uri;
+  }
+
+  it('wires a resolved reference into a related_to edge, never imports', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'README.md', content: 'x' },
+        { kind: 'file', path: 'guide.md', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(referenceAdapter({ 'README.md': ['./guide.md'] })) },
+    );
+    expect(relatedToEdges(result)).toEqual([
+      {
+        kind: 'edge',
+        type: 'related_to',
+        from: fileUriFor(result, 'README.md'),
+        to: fileUriFor(result, 'guide.md'),
+      },
+    ]);
+    const importEdges = result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .filter((r) => r.kind === 'edge' && r.type === 'imports');
+    expect(importEdges).toEqual([]);
+  });
+
+  it('resolves a reference whose target sorts, and is therefore processed, AFTER the referencer', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'a.md', content: 'x' },
+        { kind: 'file', path: 'z.md', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(referenceAdapter({ 'a.md': ['./z.md'] })) },
+    );
+    expect(relatedToEdges(result)).toEqual([
+      {
+        kind: 'edge',
+        type: 'related_to',
+        from: fileUriFor(result, 'a.md'),
+        to: fileUriFor(result, 'z.md'),
+      },
+    ]);
+  });
+
+  it('declines a bare target — no edge to a node that does not exist in this graph', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'README.md', content: 'x' }]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          referenceAdapter({ 'README.md': ['https://example.com/docs'] }),
+        ),
+      },
+    );
+    expect(relatedToEdges(result)).toEqual([]);
+  });
+
+  it('declines a reference that resolves to nothing this generation actually indexed', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'README.md', content: 'x' }]),
+      cfg(),
+      target(),
+      { adapters: new IndexAdapterRegistry().register(referenceAdapter({ 'README.md': ['./missing.md'] })) },
+    );
+    expect(relatedToEdges(result)).toEqual([]);
+  });
+
+  it('collapses two references from the same file resolving to the same target into one edge', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'README.md', content: 'x' },
+        { kind: 'file', path: 'guide.md', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          referenceAdapter({ 'README.md': ['./guide.md', './guide.md'] }),
+        ),
+      },
+    );
+    expect(relatedToEdges(result)).toHaveLength(1);
+  });
+
+  it('produces a byte-identical result across two runs with related_to edges present', async () => {
+    const run = () =>
+      runIndexer(
+        new FakeIndexSource([
+          { kind: 'file', path: 'README.md', content: 'x' },
+          { kind: 'file', path: 'guide.md', content: 'x' },
+        ]),
+        cfg(),
+        target(),
+        {
+          adapters: new IndexAdapterRegistry().register(referenceAdapter({ 'README.md': ['./guide.md'] })),
+        },
+      );
+    const first = await run();
+    const second = await run();
+    expect(first.manifest.contentHash).toBe(second.manifest.contentHash);
+  });
+});
+
 describe('runIndexer — deletions', () => {
   it('reports no deletions when no previous file list is supplied', async () => {
     const result = await runIndexer(new FakeIndexSource(fixture()), cfg(), target(), {
