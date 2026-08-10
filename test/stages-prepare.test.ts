@@ -531,3 +531,137 @@ describe("the execute stage's coordinate picks the builder's agent (RUN-193)", (
     expect(out.permission.write).toBe(false); // verify judges, never edits (RUN-118) — model only
   });
 });
+
+// RUN-234: citation verification's own bounded metric, wired end to end through `prepareRun` —
+// `citation-verify.test.ts` proves `summarizeCitationVerification`'s own counting; this proves
+// prepare.ts actually calls it and logs the result once a pack was retrieved and verified.
+describe('citation verification is logged as a bounded metric (RUN-234)', () => {
+  const CONTEXT_REPO = () => ({
+    root: '/repo',
+    manifest: manifest({ repositoryKey: 'acme/widgets', defaultBranch: 'main' }),
+  });
+
+  /** Two citations at the workspace's OWN base (`ws().baseId`) — `classifyCitation` then never
+   *  needs `changesBetween` at all (bases-equal path), so the fake `vcs` needs no such method.
+   *  Neither path exists on real disk under `/wt/run_1` — the default `readCitationFile` reads
+   *  ENOENT for both, so both verify as `missing`, deterministically, with no temp directory. */
+  const pack = (citations: Array<{ path: string; verificationState: string }>) =>
+    ({
+      taskId: 'task_9',
+      projectId: 'prj_p',
+      branch: null,
+      baseId: null,
+      tokenBudget: null,
+      verifiedDecisions: [],
+      relevantEntities: [],
+      similarEpisodes: [],
+      knownHazards: [],
+      affectedTests: [],
+      activeNeighboringWork: [],
+      staleWarnings: [],
+      generatedAt: '2026-08-01T00:00:00.000Z',
+      role: 'build',
+      mode: 'keyword',
+      charBudget: 4000,
+      charsUsed: 100,
+      taskFacts: {
+        taskId: 'task_9',
+        key: 'RUN-9',
+        title: 't',
+        body: null,
+        status: 'todo',
+        priority: 2,
+        claimedBy: null,
+        claimExpiresAt: null,
+        openComments: [],
+        executionSpec: null,
+        executionSpecUnreadable: false,
+      },
+      sections: [
+        {
+          id: 'active_decisions',
+          provenance: ['exact'],
+          notice: null,
+          charsAllotted: 500,
+          charsUsed: 100,
+          excerpts: [
+            {
+              excerptKind: 'memory',
+              id: 'mem_1',
+              memoryKind: 'decision',
+              statement: 's',
+              authority: 3,
+              confidence: null,
+              validity: 'active',
+              isLead: false,
+              leadReasons: [],
+              evidence: citations.map((c) => ({
+                repositoryKey: 'acme/widgets',
+                branch: 'main',
+                baseId: 'basesha',
+                path: c.path,
+                symbol: null,
+                verificationState: c.verificationState,
+                lastVerifiedAt: null,
+                lastVerifiedBaseId: null,
+                lastVerifiedBranch: null,
+                verifiedForCaller: false,
+              })),
+              recordedByAgentId: null,
+              recordedAt: '2026-08-01T00:00:00.000Z',
+              supersedesMemoryId: null,
+            },
+          ],
+          graphEntities: [],
+          coverage: null,
+          items: [],
+        },
+      ],
+      notices: [],
+    }) as never;
+
+  it('logs total/byState/serverMismatches once a pack is retrieved and verified', async () => {
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const { host } = harness({ repo: CONTEXT_REPO() });
+    const withContext: PrepareHost = {
+      ...host,
+      log: {
+        ...host.log,
+        info: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+      } as never,
+      getContextPack: async () =>
+        pack([
+          { path: 'src/a.ts', verificationState: 'missing' }, // agrees — real verdict is also missing
+          { path: 'src/b.ts', verificationState: 'valid' }, // disagrees — real verdict is missing
+        ]),
+    };
+
+    const out = await prepareRun(withContext, makeRun({ anchor: { type: 'task', taskId: 'task_9' } }));
+
+    if (!out.ok) throw new Error(out.reason);
+    const line = lines.find((l) => l.msg === 'context pack citations verified');
+    expect(line).toBeDefined();
+    expect(line?.fields).toMatchObject({
+      runId: 'run_1',
+      total: 2,
+      states: { valid: 0, moved: 0, changed: 0, missing: 2, unverifiable: 0 },
+      serverMismatches: 1,
+    });
+  });
+
+  it('logs nothing when there is no pack to verify (the ordinary, unopted-in case)', async () => {
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const { host } = harness({ repo: CONTEXT_REPO() });
+    const withNoContext: PrepareHost = {
+      ...host,
+      log: {
+        ...host.log,
+        info: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+      } as never,
+      // getContextPack absent — the ordinary posture for most repos today.
+    };
+    const out = await prepareRun(withNoContext, makeRun({ anchor: { type: 'task', taskId: 'task_9' } }));
+    if (!out.ok) throw new Error(out.reason);
+    expect(lines.find((l) => l.msg === 'context pack citations verified')).toBeUndefined();
+  });
+});

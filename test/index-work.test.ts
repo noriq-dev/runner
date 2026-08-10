@@ -64,7 +64,9 @@ const GRANT = { token: 'ing_tok', maxBytes: 8 * 1024 * 1024, expiresAt: '2026-08
 
 /** The same two-transport split index-upload.test.ts's own router uses (mint vs. token-in-path
  *  ingest) — narrowed to what these tests need, plus an order-recording hook. */
-function router(opts: { onCall?: (label: string) => void; validationOk?: boolean } = {}) {
+function router(
+  opts: { onCall?: (label: string) => void; validationOk?: boolean; validationProblems?: string[] } = {},
+) {
   const mintFetch = (async () => {
     opts.onCall?.('mint');
     return new Response(JSON.stringify(GRANT), { status: 200 });
@@ -88,7 +90,7 @@ function router(opts: { onCall?: (label: string) => void; validationOk?: boolean
         JSON.stringify({
           ok,
           batchesReceived: 1,
-          validation: { ok, problems: ok ? [] : ['bad content hash'] },
+          validation: { ok, problems: ok ? [] : (opts.validationProblems ?? ['bad content hash']) },
         }),
         { status: 200 },
       );
@@ -249,5 +251,90 @@ describe('createIndexWorkStep (RUN-222)', () => {
       batchesReceived: 1,
       generationId: expect.any(String),
     });
+  });
+
+  // RUN-234: before this, everything `runIndexer` computed about the scan/parse pass
+  // (diagnostics, skipped-file counts, whether the walk stopped early) was dropped on the floor
+  // here — the sole way to see any of it was `index-repo` run locally. This is the ONE bounded
+  // summary line that now reports it from the background job itself.
+  it('logs a bounded parse/file-outcome summary — counts only, never a path', async () => {
+    const { mintFetch, ingestFetch } = router({});
+    const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
+    const lines: Array<{ level: string; msg: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      debug() {},
+      warn: (msg: string, fields?: Record<string, unknown>) => lines.push({ level: 'warn', msg, fields }),
+      info: (msg: string, fields?: Record<string, unknown>) => lines.push({ level: 'info', msg, fields }),
+      error() {},
+    } as unknown as Parameters<typeof createIndexWorkStep>[0]['logger'];
+    const step = createIndexWorkStep({
+      client,
+      runnerId: 'rnr_1',
+      vcsFor: () => ({ releaseIndexSnapshot: async () => {} }),
+      staging: fileStagingStore(root),
+      fetchImpl: ingestFetch,
+      logger,
+    });
+    const ctx: IndexWorkContext = {
+      target: TARGET,
+      snapshot: depotShapedSnapshot(),
+      outcome: OUTCOME,
+      config: CONFIG,
+      journal: memJournal(),
+      signal: new AbortController().signal,
+    };
+
+    await step(ctx);
+
+    const line = lines.find((l) => l.msg === 'index parse complete');
+    expect(line).toBeDefined();
+    expect(line?.level).toBe('info'); // nothing noteworthy on this clean, one-file pass
+    expect(line?.fields).toMatchObject({
+      repositoryKey: 'my-repo',
+      files: 1,
+      diagnostics: 0,
+      diagnosticErrors: 0,
+      diagnosticsOverflow: 0,
+      skipped: 0,
+      skippedOverflow: 0,
+      stoppedEarly: false,
+    });
+    // Never a path or a message string — only counts and a closed-vocabulary breakdown.
+    expect(JSON.stringify(line?.fields)).not.toContain('src/add.ts');
+  });
+
+  it('a validation rejection with many problems throws a bounded message — never the raw joined array', async () => {
+    const manyProblems = Array.from({ length: 20 }, (_, i) => `entity ${i}: field invalid`.repeat(10));
+    const { mintFetch, ingestFetch } = router({ validationOk: false, validationProblems: manyProblems });
+    const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
+    const step = createIndexWorkStep({
+      client,
+      runnerId: 'rnr_1',
+      vcsFor: () => ({ releaseIndexSnapshot: async () => {} }),
+      staging: fileStagingStore(root),
+      fetchImpl: ingestFetch,
+      logger: quiet,
+    });
+    const ctx: IndexWorkContext = {
+      target: TARGET,
+      snapshot: depotShapedSnapshot(),
+      outcome: OUTCOME,
+      config: CONFIG,
+      journal: memJournal(),
+      signal: new AbortController().signal,
+    };
+
+    let thrown: Error | undefined;
+    try {
+      await step(ctx);
+    } catch (err) {
+      thrown = err as Error;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown?.message).toContain('20 problem(s)');
+    // The full 20-entry, 250-char-each array must never land in the thrown message verbatim —
+    // that message is what `index-coordinator.ts`'s catch-all logs and persists into
+    // `IndexStatusRecord.lastError` (RUN-234, one hop downstream of where the array is thrown away).
+    expect(thrown?.message.length).toBeLessThan(2000);
   });
 });

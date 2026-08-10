@@ -1,4 +1,5 @@
 import { ExecutionSpec, hasExecutionSpec } from '@noriq-dev/shared';
+import { logger as defaultLogger } from './logger';
 import { ContextPack, type ContextPackRole, RunnerIndexCursor } from './memory-contract';
 import type { RunnerRegistration } from './registration';
 import type { VerificationReportResult, VerificationReportWire } from './verification-report';
@@ -172,6 +173,18 @@ export interface NoriqClientOptions {
   onUnauthorized?: () => Promise<string>;
   /** Injectable for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /**
+   * Injectable for tests; defaults to the shared daemon logger. RUN-234: `getIndexCursor` and
+   * `getContextPack` collapse EVERY failure mode to `null` by locked, unweakened contract
+   * (`INDEX-OPERATIONS.md`'s own Troubleshooting section names why: a caller two layers away
+   * must not have to keep three failure modes of a server that can fail in new ways in sync).
+   * That contract is about what a CALLER receives, not about what an operator can ever know —
+   * before this, nothing on this path logged even the HTTP status, so "server memory disabled"
+   * and "a network blip" were genuinely indistinguishable from the daemon's own log. `logFetchFailure`
+   * below logs the distinction at the one place it is still knowable, and returns nothing —
+   * every call site still returns `null` exactly as before.
+   */
+  logger?: typeof defaultLogger;
 }
 
 /**
@@ -225,6 +238,7 @@ export class NoriqClient {
   private readonly getToken: () => Promise<string>;
   private readonly onUnauthorized?: () => Promise<string>;
   private readonly fetchImpl: typeof fetch;
+  private readonly log: typeof defaultLogger;
 
   constructor(opts: NoriqClientOptions) {
     this.base = opts.server.replace(/\/+$/, '');
@@ -232,6 +246,26 @@ export class NoriqClient {
     this.getToken = typeof token === 'string' ? async () => token : token;
     this.onUnauthorized = opts.onUnauthorized;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.log = opts.logger ?? defaultLogger;
+  }
+
+  /**
+   * RUN-234: log WHY a null-collapsing fetch produced nothing, without changing what any caller
+   * receives — both call sites below still return `null` on every branch. `fields` never carries
+   * a path, a response body, or a token (locked decision 3): a non-2xx logs the STATUS CODE alone
+   * (a bounded, single small integer, never `NoriqHttpError.body`, which can legitimately hold
+   * server-echoed request content); a transport failure logs the error's own length-capped
+   * message — defense in depth mirroring `ingest-client.ts`'s `redactToken`, since a `fetchImpl`'s
+   * own thrown message can legitimately quote the URL it tried to reach (never a token: this
+   * class sends its bearer in a header, never a path segment, unlike the ingest capability rail).
+   */
+  private logFetchFailure(what: string, fields: Record<string, unknown>, err: unknown): void {
+    if (err instanceof NoriqHttpError) {
+      this.log.warn(`${what} failed`, { ...fields, category: 'http', status: err.status });
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    this.log.warn(`${what} failed`, { ...fields, category: 'transport', err: message.slice(0, 200) });
   }
 
   private async request(method: string, pathname: string, body?: unknown, retry = true): Promise<unknown> {
@@ -567,7 +601,14 @@ export class NoriqClient {
     runnerId: string,
     input: { projectId: string | null; repositoryKey: string; checkoutId: string },
   ): Promise<RunnerIndexCursor | null> {
-    if (!input.projectId) return null; // unresolved project — see this method's doc
+    if (!input.projectId) {
+      // A precondition this daemon can already see, not a fetch outcome — worth `debug` (routine
+      // on a fresh registration), never `warn`, and distinct from every category below.
+      this.log.debug('index cursor fetch skipped — no resolved project for this repository yet', {
+        repositoryKey: input.repositoryKey,
+      });
+      return null;
+    }
     try {
       const out = await this.request('POST', '/api/runner-memory/index-cursor', {
         projectId: input.projectId,
@@ -576,8 +617,16 @@ export class NoriqClient {
         checkoutId: input.checkoutId,
       });
       const parsed = RunnerIndexCursor.safeParse(out);
-      return parsed.success ? parsed.data : null;
-    } catch {
+      if (!parsed.success) {
+        this.log.warn('index cursor fetch failed', {
+          repositoryKey: input.repositoryKey,
+          category: 'schema',
+        });
+        return null;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.logFetchFailure('index cursor fetch', { repositoryKey: input.repositoryKey }, err);
       return null;
     }
   }
@@ -626,8 +675,13 @@ export class NoriqClient {
         ...(input.budgetTokens !== undefined ? { budgetTokens: input.budgetTokens } : {}),
       });
       const parsed = ContextPack.safeParse(out);
-      return parsed.success ? parsed.data : null;
-    } catch {
+      if (!parsed.success) {
+        this.log.warn('context pack fetch failed', { taskId: input.taskId, category: 'schema' });
+        return null;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.logFetchFailure('context pack fetch', { taskId: input.taskId }, err);
       return null;
     }
   }

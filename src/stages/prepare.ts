@@ -28,7 +28,11 @@ import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind, SetupSpec }
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
-import { type VerifiedContextPack, verifyContextPack } from '../citation-verify';
+import {
+  type VerifiedContextPack,
+  summarizeCitationVerification,
+  verifyContextPack,
+} from '../citation-verify';
 import type { RunAgent } from '../client';
 import {
   type ContextPackFetcher,
@@ -435,6 +439,20 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
         // `unverifiable` against THIS workspace, not silently checked against the wrong tree).
         repositoryKey: repo.manifest.repositoryKey,
       });
+      // RUN-234: the bounded metric `CitationVerdict.agreesWithServer`'s own doc names — a
+      // closed, five-value breakdown plus a mismatch count, never a per-citation line (a
+      // memory-heavy pack can carry hundreds; see `summarizeCitationVerification`'s own doc).
+      // Skipped on a pack with nothing to verify — the common case for most tasks today — the
+      // same "no note on nothing to bootstrap" posture every other line in this function takes.
+      const verification = summarizeCitationVerification(verifiedContextPack);
+      if (verification.total > 0) {
+        host.log.info('context pack citations verified', {
+          runId: run.id,
+          total: verification.total,
+          states: verification.byState,
+          serverMismatches: verification.serverMismatches,
+        });
+      }
     } catch (err) {
       host.log.warn('context pack citation verification failed — proceeding without verdicts', {
         runId: run.id,

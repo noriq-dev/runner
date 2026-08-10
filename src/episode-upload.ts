@@ -266,7 +266,23 @@ export async function deliverEpisode(episode: EffortEpisodeType, deps: EpisodeDe
     log.warn('episode upload attempt threw', { runId: episode.runId, scopeId, err: String(err) });
     return null;
   });
-  if (outcome?.ok) await deps.pending.remove(scopeId).catch(() => {});
+  if (outcome?.ok) {
+    await deps.pending.remove(scopeId).catch(() => {});
+  } else if (outcome) {
+    // RUN-234: `uploadEpisode` never throws for an ordinary failure (this module's own doc,
+    // "every IngestError and cancellation come back as a typed outcome") — which means, before
+    // this, the ONLY branch above that could ever log anything was the `.catch()` for a genuine
+    // bug. Every ordinary failure (network down, ingest disabled, a validation skip) was silent
+    // here; the entry just sat in the pending queue until a later drain, with no record of WHY.
+    // `outcome.reason` is a closed, bounded vocabulary (`IngestFailureReason` plus two literals);
+    // `detail` is already bounded (`IngestError.message`'s own 300-char cap, or a short local string).
+    log.warn('episode upload did not complete — left pending for the next drain', {
+      runId: episode.runId,
+      scopeId,
+      reason: outcome.reason,
+      ...(outcome.reason !== 'cancelled' ? { detail: outcome.detail } : {}),
+    });
+  }
 }
 
 /**
@@ -297,6 +313,17 @@ export async function drainPendingEpisodes(
     if (outcome?.ok) {
       await deps.pending.remove(entry.scopeId).catch(() => {});
       delivered++;
+    } else if (outcome) {
+      // RUN-234: same gap as `deliverEpisode`'s own — a typed, non-throwing failure was
+      // previously invisible here too, and this is the ONLY per-entry signal a retry pass
+      // produces (the caller in `daemon.ts` logs `delivered`/`remaining` COUNTS, never why the
+      // remainder didn't move). Bounded per entry: a closed reason plus an already-capped detail.
+      log.warn('episode retry did not complete — remains pending', {
+        runId: entry.episode.runId,
+        scopeId: entry.scopeId,
+        reason: outcome.reason,
+        ...(outcome.reason !== 'cancelled' ? { detail: outcome.detail } : {}),
+      });
     }
   }
   return { delivered, remaining: entries.length - delivered };

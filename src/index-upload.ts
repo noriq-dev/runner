@@ -146,6 +146,31 @@ const DEFAULT_MAX_RETRY_ATTEMPTS = 5;
  * proves nothing), and `bad-request`/`conflict`/`forbidden`/`not-found` (terminal for the
  * attempt, locked decision 5's own vocabulary).
  */
+/** RUN-234 locked decision 2: a server validation rejection names one problem per bad entity in
+ *  the generation, which scales with the REPOSITORY, not with this event — logging the whole
+ *  array would be a per-entity dump wearing a log line's clothes. A capped, truncated sample
+ *  plus the real count is a diagnosis (what kind of thing failed) without being a listing. */
+export const MAX_LOGGED_VALIDATION_PROBLEMS = 5;
+
+/** Bound one problem string's own length the same way `IngestError`'s message already bounds a
+ *  response body (`ingest-client.ts`'s 300-char slice) — a single server-authored string is not
+ *  the unbounded-cardinality case decision 2 is about, but nothing here guarantees it is short. */
+const MAX_PROBLEM_CHARS = 200;
+
+/** The bounded projection of `completed.validation.problems` this module logs — never the raw
+ *  array. Exported so `index-work.ts`'s own thrown-error message (the ONLY other place these
+ *  strings can reach a log line, via `index-coordinator.ts`'s catch-all) can bound identically
+ *  rather than re-deriving the same cap with a different number. */
+export function boundedValidationProblems(problems: readonly string[]): {
+  count: number;
+  sample: string[];
+} {
+  return {
+    count: problems.length,
+    sample: problems.slice(0, MAX_LOGGED_VALIDATION_PROBLEMS).map((p) => p.slice(0, MAX_PROBLEM_CHARS)),
+  };
+}
+
 export const RETRYABLE_REASONS: ReadonlySet<IngestFailureReason> = new Set([
   'http',
   'transport',
@@ -318,6 +343,19 @@ export async function uploadGeneration(
       ordered.length,
     );
 
+    // RUN-234: the ONE place this daemon can say "this attempt is picking up where a prior one
+    // left off" — a fact the server's own `status()` just proved, not a guess (`confirmed` above
+    // already reflects it). Only when there is something to resume FROM: a fresh attempt with
+    // nothing confirmed yet is the ordinary case and would make this line noise on every upload.
+    if (confirmed > 0) {
+      log.info('index upload resuming a prior attempt', {
+        repositoryKey: key.repositoryKey,
+        generationId: key.generationId,
+        batchesConfirmed: confirmed,
+        batchCount: ordered.length,
+      });
+    }
+
     for (const batch of ordered) {
       if (batch.batchNumber < confirmed) continue; // the server already has it (locked decision 2/3)
       ensureNotCancelled(deps.signal);
@@ -340,7 +378,7 @@ export async function uploadGeneration(
       log.warn('index upload: server rejected validation at complete()', {
         repositoryKey: key.repositoryKey,
         generationId: key.generationId,
-        problems: completed.validation.problems,
+        ...boundedValidationProblems(completed.validation.problems),
       });
       return { ok: false, reason: 'validation', problems: completed.validation.problems };
     }

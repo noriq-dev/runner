@@ -8,6 +8,26 @@ interface Captured {
   body: unknown;
 }
 
+/** RUN-234: capture what a `getIndexCursor`/`getContextPack` failure logs — never a real logger,
+ *  and never `console` (the `logger.ts` default) so a test can assert on structured fields. */
+interface LoggedLine {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  msg: string;
+  fields?: Record<string, unknown>;
+}
+function captureLogger(): {
+  lines: LoggedLine[];
+  logger: import('../src/client').NoriqClientOptions['logger'];
+} {
+  const lines: LoggedLine[] = [];
+  const make = (level: LoggedLine['level']) => (msg: string, fields?: Record<string, unknown>) =>
+    lines.push({ level, msg, fields });
+  return {
+    lines,
+    logger: { debug: make('debug'), info: make('info'), warn: make('warn'), error: make('error') },
+  };
+}
+
 function fakeFetch(status: number, payload: unknown, captured: Captured[]): typeof fetch {
   return (async (url: string | URL, init?: RequestInit) => {
     captured.push({
@@ -554,6 +574,68 @@ describe('getIndexCursor (RUN-213)', () => {
     });
     expect(cursor).toBeNull();
   });
+
+  // RUN-234: the same four null-collapsing branches above, now asserting WHAT they log — the
+  // return value is unchanged (still `null` on every branch, still asserted above); this is the
+  // added visibility, never a second answer to what the caller receives.
+  describe('logs the distinction a null return value erases (RUN-234)', () => {
+    it('an unresolved project logs a precondition, not a fetch failure — at debug, not warn', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, {}, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: null, repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'debug', fields: { repositoryKey: 'my-repo' } });
+    });
+
+    it('a non-2xx logs the status code, category "http" — never the response body', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(503, { error: 'a secret-looking detail nobody should see logged' }, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'http', status: 503 } });
+      expect(JSON.stringify(lines[0])).not.toContain('secret-looking detail');
+    });
+
+    it('a schema-invalid 200 logs category "schema" — distinct from an http failure', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, { ok: true }, []),
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'schema' } });
+      expect(lines[0]?.fields?.status).toBeUndefined();
+    });
+
+    it('a transport error logs category "transport" with a bounded message — never the request URL or token', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 'super-secret-token',
+        fetchImpl: (async () => {
+          throw new Error('fetch failed: connect ECONNREFUSED 127.0.0.1:443');
+        }) as typeof fetch,
+        logger,
+      });
+      await client.getIndexCursor('rnr_1', { projectId: 'prj_1', repositoryKey: 'my-repo', checkoutId: 'c' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'transport' } });
+      expect(JSON.stringify(lines[0])).not.toContain('super-secret-token');
+    });
+  });
 });
 
 describe('getContextPack (RUN-228)', () => {
@@ -671,5 +753,54 @@ describe('getContextPack (RUN-228)', () => {
     });
     await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
     expect(captured[0]?.body).toEqual({ projectId: 'prj_1', runnerId: 'rnr_1', taskId: 'task_1' });
+  });
+
+  // RUN-234: same three failure-category assertions as `getIndexCursor`'s own block above — this
+  // method has no precondition branch of its own (`repositoryKey`/`taskId` are checked one layer
+  // up, in `context-pack.ts`, never here).
+  describe('logs the distinction a null return value erases (RUN-234)', () => {
+    it('a non-2xx logs the status code, category "http"', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(404, {}, []),
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({
+        level: 'warn',
+        fields: { category: 'http', status: 404, taskId: 'task_1' },
+      });
+    });
+
+    it('a schema-invalid 200 logs category "schema"', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: fakeFetch(200, { ok: true }, []),
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'schema', taskId: 'task_1' } });
+    });
+
+    it('a transport error logs category "transport" with a bounded message', async () => {
+      const { lines, logger } = captureLogger();
+      const client = new NoriqClient({
+        server: 'https://a.b',
+        token: 't',
+        fetchImpl: (async () => {
+          throw new Error('ECONNREFUSED');
+        }) as typeof fetch,
+        logger,
+      });
+      await client.getContextPack('rnr_1', { projectId: 'prj_1', taskId: 'task_1' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: 'warn', fields: { category: 'transport' } });
+    });
   });
 });

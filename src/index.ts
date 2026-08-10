@@ -391,6 +391,8 @@ export {
 } from './index-stage';
 export {
   DEFAULT_MAX_STAGED_BYTES,
+  MAX_LOGGED_VALIDATION_PROBLEMS,
+  boundedValidationProblems,
   uploadGeneration,
   type UploadGenerationDeps,
   type UploadGenerationInput,
@@ -746,10 +748,12 @@ export {
 export {
   MAX_CITATION_READ_BYTES,
   readCitationFile,
+  summarizeCitationVerification,
   verifyContextPack,
   type CitationFileRead,
   type CitationFileReader,
   type CitationVerdict,
+  type CitationVerificationSummary,
   type CitationVerifyContext,
   type VerifiedCitation,
   type VerifiedContextPack,

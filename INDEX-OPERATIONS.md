@@ -298,8 +298,14 @@ from everything above — worth knowing so you don't go looking for `noriq-runne
 Both drain automatically at exactly two moments: daemon startup, and every WebSocket reconnect —
 "the server might be reachable now when it was not a moment ago" is the one signal this daemon has
 for either, short of a fixed-interval timer, and both are logged at `info` (delivered count) and
-`warn` (dropped/queued count) on every drain attempt. If a report or episode seems stuck, the
-daemon's own log at those two moments is the only visibility today — there is no
+`warn` (dropped/queued count) on every drain attempt. RUN-234: an episode's PER-ATTEMPT `warn` now
+also names *why* — `reason` (a closed vocabulary: `disabled`/`expired`/`too-large`/`transport`/…,
+or `skipped-server-side` for the recorded-nothing race `episode-upload.ts` already classified) plus
+a bounded `detail` — both on the first delivery attempt (`deliverEpisode`) and on every later drain
+pass (`drainPendingEpisodes`); before this an ordinary (non-throwing) failed attempt was entirely
+silent between drains, with only the aggregate `delivered`/`remaining` counts visible. If a report
+or episode seems stuck, the daemon's own log at those two moments — including now the per-attempt
+reason — is the only visibility today; there is no
 `noriq-verification-status` to ask instead. A verification-report enqueue also logs the current
 queue DEPTH on every failed send attempt (`pendingCount`), so a growing backlog is visible in the
 log line itself rather than only inferable from repeated warnings.
@@ -322,15 +328,20 @@ Every entry names what `index-status` (or the daemon's log) actually shows, and 
 cursor fetch (`getIndexCursor`) collapses *every* failure mode (network error, non-2xx, an
 unparseable body, or an old server missing the route) into the identical generic outcome —
 `detail: index cursor unavailable — the fetch failed, returned an unparseable body, or this
-checkout has no resolved project on this server yet`. **`index-status` alone cannot distinguish
-"server memory is disabled" from "a network blip" from "this server predates the route"** — nothing
-in this path logs the underlying HTTP status even at `--log-level debug`, so today the honest next
-step is checking with whoever operates your Noriq server (is Project Memory enabled? what version
-is it running?), not iterating on the CLI. If the failure instead happens during upload itself
-(after a `queued`/`uploading` state), the ingest client DOES distinguish a `503` — `detail` will
-read `ingest begin → 503: ...` and the reason is a real `disabled`, meaning the server has no
-ingest at all right now. `index-reindex` is always safe to try again once you believe the server
-side has changed.
+checkout has no resolved project on this server yet`. **`index-status`'s `detail` text alone still
+cannot distinguish these** — that collapse is a locked, deliberate contract (`client.ts`'s own doc:
+one parser, so a caller never has to keep three failure modes in sync with a server that fails in
+new ways). RUN-234 closed the actual visibility gap one layer down, without touching that contract:
+the daemon's own log now carries a `warn` line for every failed attempt, naming the CATEGORY —
+`category: "http"` with the real numeric status code, `category: "schema"` for a 200 whose body
+fails the vendored schema, or `category: "transport"` for a network-level failure — never the
+response body, never the request URL. Read the daemon's log (not `index-status`) for this
+distinction: a `404`/`503` there is a real, actionable difference from an `ECONNREFUSED`, even
+though `index-status` itself still shows the same generic `detail` either way. If the failure
+instead happens during upload itself (after a `queued`/`uploading` state), the ingest client
+DOES distinguish a `503` in `detail` directly — it will read `ingest begin → 503: ...` and the
+reason is a real `disabled`, meaning the server has no ingest at all right now. `index-reindex` is
+always safe to try again once you believe the server side has changed.
 
 **R2/staging unavailable.** Server-side object storage for uploaded batches is still only
 DESIGNED, not built (see `THREAT-MODEL.md`'s "PARTLY IMPLEMENTED" row) — there is no distinct
@@ -357,11 +368,18 @@ repository is blocked.
 **Parser failure on a file.** This is per-FILE, not per-job — one file that a tree-sitter adapter
 cannot parse never fails the whole indexing attempt; it becomes a bounded diagnostic
 (`IndexDiagnostic`, `src/index-entity.ts`) and the rest of the repository is still indexed and
-still uploaded. **This is invisible in `index-status`** — background-indexing status never carries
-per-file diagnostics, only job-level phase/success/failure. The only way to see it is
-`noriq-runner index-repo` (or `index-repo --json`) run locally against the same checkout, which
-prints a bounded diagnostics section (`diagnostics: N (+M beyond the collector's own cap)`) — that
-is where a parser regression or a genuinely malformed file shows up.
+still uploaded. **This is still invisible in `index-status`** — background-indexing status never
+carries per-file diagnostics, only job-level phase/success/failure, and that is unchanged. What
+RUN-234 added is a level below that: the daemon's own log now carries one bounded `index parse
+complete` line per job (`info`, or `warn` when there is something worth chasing) — total files,
+diagnostic count and how many were errors vs. warnings, whether either bounded collector overflowed,
+how many candidates were skipped broken down by a closed reason vocabulary
+(`excluded`/`binary`/`too-large`/... — never a path), and whether the scan stopped early. That
+answers "did anything go wrong this pass, and roughly what kind" without a local run at all — it
+still never names a file. For WHICH file, `noriq-runner index-repo` (or `index-repo --json`) run
+locally against the same checkout is still the only way: it prints a bounded diagnostics section
+(`diagnostics: N (+M beyond the collector's own cap)`) with the actual paths, which is where a
+parser regression or a genuinely malformed file shows up.
 
 **Ingest capability expiry.** A minted ingest capability's TTL is **15 minutes**. Ordinary
 expiry mid-upload is handled automatically and transparently — the client re-mints against the
@@ -380,7 +398,10 @@ exactly as intended; the daemon has done everything it can. Activation (`POST
 agent-authenticated credential structurally cannot reach. `search_project_memory` returns nothing
 from a `staged` generation until a human with admin access on the Noriq server activates it. If a
 generation has been `staged` for a long time, that is a server-side admin action to chase, not a
-runner-side retry.
+runner-side retry. RUN-234: the daemon's own log says this at the moment it happens too, not only
+`index-status` — every successful upload logs `index generation uploaded — staged, awaiting admin
+activation` (`info`), so a generation that never leaves `staged` is diagnosable from the log alone,
+not only from a live or persisted `index-status` read.
 
 **`UPGRADE REQUIRED` failure.** `index-status` shows `state: failed [BLOCKED — upgrade this daemon,
 do not retry]`, `requiresUpgrade: true` in JSON output, and `detail` prefixed unmistakably with

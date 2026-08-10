@@ -353,6 +353,36 @@ describe('deliverEpisode (RUN-227)', () => {
     // The entry survives — delivery failed, so the pending queue still holds it for a later retry.
     expect(await pending.list()).toHaveLength(1);
   });
+
+  // RUN-234: `uploadEpisode` never THROWS for an ordinary failure (its own doc) — before this,
+  // that meant a typed, non-ok outcome here was entirely silent (only a genuine bug that threw
+  // ever reached a log line). A 503 ("ingest not enabled") is exactly the ordinary case: caught
+  // inside `uploadEpisode`, returned as a typed outcome, never thrown.
+  it('an ordinary (non-throwing) failed attempt is now logged with its reason — not silent', async () => {
+    const { mintFetch, ingestFetch } = router({ mint: () => new Response('{}', { status: 503 }) });
+    const pending = new EpisodePendingStore(memPendingStore());
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const deps: EpisodeDeliveryDeps = {
+      client: new NoriqClient({ server: 'https://noriq.example', token: 'tok', fetchImpl: mintFetch }),
+      fetchImpl: ingestFetch,
+      runnerId: 'rnr_1',
+      pending,
+      maxRetryAttempts: 0,
+      logger: {
+        debug() {},
+        info() {},
+        error() {},
+        warn: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+      } as never,
+    };
+
+    await deliverEpisode(episode(), deps);
+
+    const line = lines.find((l) => l.msg.includes('did not complete'));
+    expect(line).toBeDefined();
+    expect(line?.fields).toMatchObject({ runId: 'run_1', reason: 'disabled' });
+    expect(await pending.list()).toHaveLength(1); // still pending — a later drain retries it
+  });
 });
 
 describe('drainPendingEpisodes (RUN-227)', () => {
@@ -398,6 +428,7 @@ describe('drainPendingEpisodes (RUN-227)', () => {
       }
       return ingestFetch(url, init);
     }) as typeof fetch;
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
     const deps: EpisodeDeliveryDeps = {
       client: new NoriqClient({ server: 'https://noriq.example', token: 'tok', fetchImpl: mintFetch }),
       fetchImpl: alternatingIngest,
@@ -406,6 +437,12 @@ describe('drainPendingEpisodes (RUN-227)', () => {
       retryBaseMs: 1,
       retryMaxMs: 2,
       maxRetryAttempts: 1,
+      logger: {
+        debug() {},
+        info() {},
+        error() {},
+        warn: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+      } as never,
     };
 
     const result = await drainPendingEpisodes(deps);
@@ -413,6 +450,11 @@ describe('drainPendingEpisodes (RUN-227)', () => {
     expect(result).toEqual({ delivered: 1, remaining: 1 });
     const survivors = await pending.list();
     expect(survivors.map((e) => e.scopeId)).toEqual(['epi_b']);
+    // RUN-234: the surviving entry's WHY, not just its count — the server's own
+    // `recorded`/`skipped` split, folded into `uploadEpisode`'s typed `skipped-server-side` outcome.
+    const line = lines.find((l) => l.msg.includes('remains pending'));
+    expect(line).toBeDefined();
+    expect(line?.fields).toMatchObject({ runId: 'run_b', scopeId: 'epi_b', reason: 'skipped-server-side' });
   });
 });
 

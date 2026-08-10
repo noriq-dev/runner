@@ -1,8 +1,9 @@
 import type { NoriqClient } from './client';
 import type { IndexWorkContext, IndexWorkResult, IndexWorkStep } from './index-coordinator';
 import { buildIndexAdapterRegistry } from './index-registry';
+import type { IndexStatusReason } from './index-scan';
 import { type StagingStore, fileStagingStore } from './index-stage';
-import { uploadGeneration } from './index-upload';
+import { boundedValidationProblems, uploadGeneration } from './index-upload';
 import { runIndexer } from './indexer';
 import { logger as defaultLogger } from './logger';
 import type { VcsBackend } from './vcs/types';
@@ -123,6 +124,46 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       generationId: indexed.manifest.generationId,
     };
 
+    // RUN-234: the ONLY place this daemon reports what `runIndexer` actually found for a
+    // background job — before this, `indexed.diagnostics`/`.scanStatuses`/`.stoppedEarly` were
+    // computed, bounded, and then dropped on the floor here; the sole way to see any of it was
+    // `noriq-runner index-repo` run locally against the same checkout (`INDEX-OPERATIONS.md`'s
+    // own Troubleshooting section: "This is invisible in `index-status`... The only way to see
+    // it is `index-repo`"). Counts and a closed-vocabulary breakdown only (locked decision 2): a
+    // `path` never appears here — `scanStatuses`/`diagnostics` are each already capped collectors
+    // (`MAX_STATUS_RECORDS`/`MAX_PARSE_DIAGNOSTICS`) with their own overflow counters, so summing
+    // by `reason`/`severity` (both closed enums, a handful of values) stays bounded regardless of
+    // repository size — this line's own cost does not grow with the repo the way a per-file
+    // listing would. `warn` only when there is something an operator would want to chase (a real
+    // parse error, an overflowed collector, or a scan that stopped short of the whole tree);
+    // otherwise `info`, the same "routine unless it isn't" split every other job-level line here
+    // already uses.
+    const diagnosticErrors = indexed.diagnostics.filter((d) => d.severity === 'error').length;
+    const skippedByReason: Partial<Record<IndexStatusReason, number>> = {};
+    for (const status of indexed.scanStatuses) {
+      skippedByReason[status.reason] = (skippedByReason[status.reason] ?? 0) + 1;
+    }
+    const parseNoteworthy =
+      diagnosticErrors > 0 ||
+      indexed.diagnosticsOverflow > 0 ||
+      indexed.scanStatusOverflow > 0 ||
+      indexed.stoppedEarly;
+    log[parseNoteworthy ? 'warn' : 'info']('index parse complete', {
+      repositoryKey: target.repositoryKey,
+      files: indexed.manifest.fileCount,
+      deletions: indexed.manifest.deletions.length,
+      diagnostics: indexed.diagnostics.length,
+      diagnosticErrors,
+      diagnosticsOverflow: indexed.diagnosticsOverflow,
+      skipped: indexed.scanStatuses.length,
+      skippedOverflow: indexed.scanStatusOverflow,
+      skippedByReason,
+      stoppedEarly: indexed.stoppedEarly,
+      inferredEdgesOmitted: indexed.inferredEdgesOmitted,
+      unlabelledSymbolsDropped: indexed.unlabelledSymbolsDropped,
+      parserVersions: indexed.parserVersions,
+    });
+
     // RUN-223: batching/staging/network calls all live inside `uploadGeneration` below, so
     // "uploading" starts here, before that call — the only phase this module can time from the
     // outside (the finer `server-validating` moment lives INSIDE `uploadGeneration`, at its own
@@ -154,9 +195,18 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
     );
 
     if (!outcome.ok) {
+      // RUN-234: this Error's own `.message` is the SECOND place `completed.validation.problems`
+      // could reach a log line — `index-coordinator.ts`'s catch-all logs `err: String(err)` and
+      // persists `err.message` into `IndexStatusRecord.lastError` — so it gets the same bound
+      // `index-upload.ts`'s own warn line does, never the raw `.join('; ')` a monorepo's worth of
+      // per-entity problems would turn into an unbounded string here (locked decision 2, one hop
+      // downstream of where the array itself is thrown away).
       const detail =
         outcome.reason === 'validation'
-          ? outcome.problems.join('; ')
+          ? (() => {
+              const { count, sample } = boundedValidationProblems(outcome.problems);
+              return `${count} problem(s): ${sample.join('; ')}${count > sample.length ? ', …' : ''}`;
+            })()
           : outcome.reason === 'cancelled'
             ? 'cancelled'
             : outcome.detail;

@@ -7,6 +7,7 @@ import {
   type CitationFileReader,
   type CitationVerifyContext,
   readCitationFile,
+  summarizeCitationVerification,
   verifyContextPack,
 } from '../src/citation-verify';
 import { IndexAdapterRegistry, NOOP_ADAPTER } from '../src/index-adapters';
@@ -504,5 +505,53 @@ describe('readCitationFile — confinement (RUN-151 posture)', () => {
     const v = await classify(citation({ path: rel }), ctx);
     expect(v.verification.state).toBe('unverifiable');
     expect(JSON.stringify(v)).not.toContain('SHOULD-NEVER-BE-READ');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// RUN-234: the bounded metric — a closed, five-value breakdown plus a server-mismatch count,
+// never a per-citation line.
+// ---------------------------------------------------------------------------------------------
+
+describe('summarizeCitationVerification (RUN-234)', () => {
+  it('counts every state across sections/excerpts and flags server disagreement, without a per-citation line', async () => {
+    const ctx = baseCtx({
+      // `classifyCitation` checks the CURRENT tree before ever consulting `changesBetween` (module
+      // doc: "2. path absent (current tree) -> missing", checked BEFORE the base comparison) — so
+      // the `changed` fixture must still exist locally; only `gone.ts` is genuinely absent.
+      readFile: fakeReader({
+        'src/foo.ts': { kind: 'present', content: 'x' },
+        'src/changed.ts': { kind: 'present', content: 'y' },
+      }).reader,
+      vcs: fakeVcs((from) =>
+        from === 'base-old'
+          ? { ok: true, changed: ['src/changed.ts'], deleted: [] }
+          : { ok: true, changed: [], deleted: [] },
+      ).vcs,
+    });
+    const citations = [
+      citation({ path: 'src/foo.ts', baseId: CURRENT_BASE, verificationState: 'valid' }), // valid, agrees
+      citation({ path: 'gone.ts', verificationState: 'valid' }), // missing, DISAGREES (server said valid)
+      citation({ path: 'src/changed.ts', baseId: 'base-old', verificationState: 'changed' }), // changed, agrees
+      citation({ repositoryKey: 'other/repo', verificationState: 'unverifiable' }), // unverifiable, agrees
+    ];
+    const verified = await verifyContextPack(pack(citations), ctx);
+
+    const summary = summarizeCitationVerification(verified);
+
+    expect(summary).toEqual({
+      total: 4,
+      byState: { valid: 1, moved: 0, changed: 1, missing: 1, unverifiable: 1 },
+      serverMismatches: 1,
+    });
+  });
+
+  it('an empty pack summarizes to all zeros, never throws', () => {
+    const summary = summarizeCitationVerification({ ...pack([]), sections: [] } as never);
+    expect(summary).toEqual({
+      total: 0,
+      byState: { valid: 0, moved: 0, changed: 0, missing: 0, unverifiable: 0 },
+      serverMismatches: 0,
+    });
   });
 });

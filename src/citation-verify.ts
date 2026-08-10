@@ -408,3 +408,49 @@ export async function verifyContextPack(
 
   return { ...pack, sections: await Promise.all(pack.sections.map(verifySection)) };
 }
+
+// ---------------------------------------------------------------------------
+// RUN-234: the bounded metric this module's own verdicts already carry for free.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fixed, five-value breakdown (`VerificationState` is closed — see the vendored contract) plus
+ * how many verdicts DISAGREED with what the server already believed (`CitationVerdict.agreesWithServer`'s
+ * own doc: "what a caller building RUN-234's metrics would want to count without recomputing this
+ * comparison"). Never a per-citation line — a memory-heavy pack can carry hundreds of citations,
+ * and a caller logging one line each would be a dump wearing a diagnosis's clothes; this is the
+ * whole point of the verdict already being a CLOSED enum rather than free text.
+ */
+export interface CitationVerificationSummary {
+  total: number;
+  byState: Record<VerificationState, number>;
+  /** Verdicts where this module's own independent check disagreed with `citation.verificationState`
+   *  — not itself proof of anything (`CitationVerdict.agreesWithServer`'s own doc), but the count an
+   *  operator watching drift between the two tiers (doc §9's "two-tier" verification) wants first. */
+  serverMismatches: number;
+}
+
+export function summarizeCitationVerification(pack: VerifiedContextPack): CitationVerificationSummary {
+  const byState: Record<VerificationState, number> = {
+    valid: 0,
+    moved: 0,
+    changed: 0,
+    missing: 0,
+    unverifiable: 0,
+  };
+  let total = 0;
+  let serverMismatches = 0;
+  for (const section of pack.sections) {
+    for (const excerpt of section.excerpts) {
+      // Episode excerpts carry no `ContextPackCitation[]` at all (this module's own doc) — nothing
+      // to count here for one.
+      if (excerpt.excerptKind !== 'memory') continue;
+      for (const citation of excerpt.evidence) {
+        total++;
+        byState[citation.verification.state]++;
+        if (!citation.verification.agreesWithServer) serverMismatches++;
+      }
+    }
+  }
+  return { total, byState, serverMismatches };
+}

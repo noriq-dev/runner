@@ -9,8 +9,10 @@ import { IndexJournal, type IndexJournalKey, type JournalStore } from '../src/in
 import { fileStagingStore, stagingDirFor } from '../src/index-stage';
 import {
   DEFAULT_MAX_STAGED_BYTES,
+  MAX_LOGGED_VALIDATION_PROBLEMS,
   type UploadGenerationDeps,
   type UploadGenerationInput,
+  boundedValidationProblems,
   uploadGeneration,
 } from '../src/index-upload';
 
@@ -279,6 +281,51 @@ describe('uploadGeneration (RUN-221)', () => {
     expect(putOrder).toEqual([1, 2]);
   });
 
+  // RUN-234: "resume" is one of this task's own event categories — before this, a genuine resume
+  // (the server already holding some batches from a prior attempt) was silent; only a MISMATCH
+  // between the server's count and this attempt's own encoding got a log line at all.
+  it('a genuine resume (server already holds batches) is logged; a fresh attempt (nothing confirmed) is not', async () => {
+    const resumeLines: Array<Record<string, unknown> | undefined> = [];
+    const logger = {
+      debug() {},
+      error() {},
+      warn() {},
+      info: (msg: string, fields?: Record<string, unknown>) => {
+        if (msg.includes('resuming')) resumeLines.push(fields);
+      },
+    } as unknown as UploadGenerationDeps['logger'];
+
+    const { mintFetch: resumeMint, ingestFetch: resumeIngest } = router({
+      status: () =>
+        new Response(JSON.stringify({ status: 'pending', batchesReceived: 1, batchesExpected: 3 }), {
+          status: 200,
+        }),
+    });
+    const { deps: resumeDeps } = await makeDeps(
+      root,
+      { logger },
+      { mintFetch: resumeMint, ingestFetch: resumeIngest },
+    );
+    await uploadGeneration({ key: KEY, mint: MINT_INPUT, manifest: MANIFEST, batches: BATCHES }, resumeDeps);
+    expect(resumeLines).toHaveLength(1);
+    expect(resumeLines[0]).toMatchObject({
+      repositoryKey: 'my-repo',
+      generationId: 'gen_1',
+      batchesConfirmed: 1,
+      batchCount: 3,
+    });
+
+    resumeLines.length = 0;
+    const { mintFetch: freshMint, ingestFetch: freshIngest } = router({}); // status: 'unknown' by default
+    const { deps: freshDeps } = await makeDeps(
+      root,
+      { logger },
+      { mintFetch: freshMint, ingestFetch: freshIngest },
+    );
+    await uploadGeneration({ key: KEY, mint: MINT_INPUT, manifest: MANIFEST, batches: BATCHES }, freshDeps);
+    expect(resumeLines).toHaveLength(0);
+  });
+
   it('resume: status "complete" short-circuits to local cleanup — no begin, no batch PUT, no complete() call', async () => {
     const calledPaths: string[] = [];
     const { mintFetch, ingestFetch } = router({
@@ -422,6 +469,58 @@ describe('uploadGeneration (RUN-221)', () => {
 
     expect(result).toEqual({ ok: false, reason: 'validation', problems: ['batch 2 checksum mismatch'] });
     expect(await journal.get(KEY)).not.toBeNull(); // left for the next attempt
+  });
+
+  // RUN-234 locked decision 2: the RETURNED outcome above still carries every problem (a caller
+  // that wants the full list unabridged still gets it — this is a LOGGING bound, not a contract
+  // change); what must never happen is the full array reaching a log line unbounded, which a
+  // monorepo's worth of per-entity validation problems would turn into a dump.
+  it('a large validation problem list is logged bounded — count plus a capped, truncated sample', async () => {
+    const manyProblems = Array.from({ length: 200 }, (_, i) => `entity ${i}: field "x" is invalid`.repeat(5));
+    const { mintFetch, ingestFetch } = router({
+      complete: () =>
+        new Response(
+          JSON.stringify({ ok: true, batchesReceived: 3, validation: { ok: false, problems: manyProblems } }),
+          { status: 200 },
+        ),
+    });
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      debug() {},
+      info() {},
+      error() {},
+      warn: (msg: string, fields?: Record<string, unknown>) => lines.push({ msg, fields }),
+    } as unknown as UploadGenerationDeps['logger'];
+    const { deps } = await makeDeps(root, { logger }, { mintFetch, ingestFetch });
+    const input: UploadGenerationInput = { key: KEY, mint: MINT_INPUT, manifest: MANIFEST, batches: BATCHES };
+
+    const result = await uploadGeneration(input, deps);
+
+    expect(result).toMatchObject({ ok: false, reason: 'validation' });
+    const line = lines.find((l) => l.msg.includes('rejected validation'));
+    expect(line).toBeDefined();
+    expect(line?.fields?.count).toBe(200);
+    const sample = line?.fields?.sample as string[];
+    expect(sample).toHaveLength(MAX_LOGGED_VALIDATION_PROBLEMS);
+    for (const s of sample) expect(s.length).toBeLessThanOrEqual(200);
+    // The raw problems array must never appear as its own field on the logged line.
+    expect(line?.fields?.problems).toBeUndefined();
+  });
+
+  describe('boundedValidationProblems (RUN-234)', () => {
+    it('caps the sample and truncates each entry, but always reports the true count', () => {
+      const problems = Array.from({ length: 50 }, (_, i) => `p${i}`.repeat(100));
+      const { count, sample } = boundedValidationProblems(problems);
+      expect(count).toBe(50);
+      expect(sample).toHaveLength(MAX_LOGGED_VALIDATION_PROBLEMS);
+      for (const s of sample) expect(s.length).toBeLessThanOrEqual(200);
+    });
+
+    it('a short list is returned in full, untruncated', () => {
+      const { count, sample } = boundedValidationProblems(['one problem']);
+      expect(count).toBe(1);
+      expect(sample).toEqual(['one problem']);
+    });
   });
 
   it('"too-large" is not retried and not counted as a network failure — one PUT attempt only', async () => {
