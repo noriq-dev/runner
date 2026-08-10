@@ -12,7 +12,11 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
-import type { ExecutedConfigurationEvidence, ExecutionSpec } from '@noriq-dev/shared';
+import type {
+  ConfigurationFingerprint,
+  ExecutedConfigurationEvidence,
+  ExecutionSpec,
+} from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import {
   type AcceptanceItem,
@@ -44,6 +48,7 @@ import {
 } from './agent-coordinate';
 import type { VerifiedContextPack } from './citation-verify';
 import type { ParkState, RunAgent, SpinOffProvenance } from './client';
+import { computeConfigurationFingerprints } from './config-fingerprint';
 import type { ContextPackFetcher, ContextPackRetrieval } from './context-pack';
 import type { ContinuableRun, ContinuableStore } from './continuable';
 import { type BudgetRun, monotonicMs, superviseBudget, totalTokens } from './drivers/budget';
@@ -144,6 +149,7 @@ import {
   readEscalation,
 } from './verify-agent';
 import { assembleReviewerPrompt, reviewerContestPrompt, reviewerFeedbackPrompt } from './verify-reviewer';
+import { VERSION } from './version';
 import {
   BUILTIN_WORKFLOWS,
   type StageCoordinateKey,
@@ -3687,7 +3693,34 @@ export class RunSupervisor {
     // `vendor`/`reviewer`/`verifier` stay null: this repo has no vendor identifier distinct from
     // `tool`, and neither judging actor's coordinate is chosen this early (the inline reviewer's is
     // resolved per round inside `runReviewer`) — a guess would be worse than an honest gap here.
-    // `configuration: []` is RUN-246's field to populate; `[]` is the schema's own default.
+    //
+    // `configuration` (RUN-246, `config-fingerprint.ts`): the per-component fingerprints that make
+    // two revisions of the same `workflow.id`/manifest distinguishable, since a name alone is not —
+    // see that module's own doc for the sorting, the per-kind content chosen, and what is kept out
+    // (no absolute path, no credential, ever). It reads `prepared.workflow`/`prepared.repo.manifest`
+    // — exactly what THIS run resolved to, the same reasoning `strategy` above rests on.
+    //
+    // Computed SYNCHRONOUSLY and inline, which is the whole reason `config-fingerprint.ts` hashes
+    // with `createHash` instead of awaiting the shared `crypto.subtle`-based helper — see that
+    // module's own doc. The two alternatives were measured and both cost something real: awaiting
+    // five macrotask digests puts event-loop turns on this run's critical path (RUN-238's
+    // distinction), and reporting them fire-and-forget loses a race with the terminal status, which
+    // `daemon.ts` uses to drop an undelivered `pendingConfiguration` — so a fast run would report
+    // no configuration at all. A hashing bug must never cost the run, so it degrades to strategy
+    // alone rather than throwing out of `supervise`.
+    let configuration: ConfigurationFingerprint[] = [];
+    try {
+      configuration = computeConfigurationFingerprints({
+        runnerVersion: VERSION,
+        manifest: prepared.repo.manifest,
+        workflow: prepared.workflow,
+      });
+    } catch (err) {
+      this.log.warn('could not compute configuration fingerprints — reporting strategy only', {
+        runId: run.id,
+        err: String(err),
+      });
+    }
     this.deps.report(run.id, {
       status: 'running',
       executedConfiguration: {
@@ -3702,7 +3735,7 @@ export class RunSupervisor {
           contextStrategy: null,
           concurrencyStrategy: null,
         },
-        configuration: [],
+        configuration,
       },
     });
 

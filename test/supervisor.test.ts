@@ -3002,8 +3002,17 @@ describe('a run records the coordinate it actually resolved (RUN-241)', () => {
       tool: 'claude',
       workflow: 'build',
     });
-    // RUN-246 populates fingerprints; this task sends the schema's own empty default.
-    expect(reported[0]!.executedConfiguration!.configuration).toEqual([]);
+    // RUN-246 fills what RUN-241 left as the schema's empty default. Assert the SHAPE of real
+    // evidence rather than a count: every entry names one of the vendored kinds and carries a
+    // non-empty digest, and `runner`/`workflow`/`manifest` are the three this harness can always
+    // determine. A bare `not.toEqual([])` would pass on a single junk entry.
+    const configuration = reported[0]!.executedConfiguration!.configuration;
+    expect(configuration.map((c) => c.kind)).toEqual(
+      expect.arrayContaining(['runner', 'workflow', 'manifest']),
+    );
+    for (const entry of configuration) {
+      expect(entry.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    }
   });
 
   it('never reports it a second time across a verify fix round', async () => {
