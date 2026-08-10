@@ -16,9 +16,9 @@ import type { ContextPack, ContextPackRole } from './memory-contract';
 // ---------------------------------------------------------------------------
 
 /** The wire shape `NoriqClient.getContextPack` sends — every identity field the server uses to
- *  scope and weight the pack (this task's locked decision). `branch` is OPTIONAL and currently
- *  never populated (RUN-274): the server cannot yet be asked to weight by branch without excluding
- *  on it, so naming one drops every memory recorded elsewhere. See `retrieveContextPack`. */
+ *  scope and weight the pack (this task's locked decision). `branch` WEIGHTS rather than filters
+ *  since PLNR-385; it stays optional because one release deliberately withheld it (RUN-274/276),
+ *  and a request built without it must still be a legal one. */
 export interface ContextPackRequest {
   projectId: string;
   taskId: string;
@@ -139,29 +139,22 @@ export async function retrieveContextPack(
     taskId: input.taskId,
     repositoryKey: input.repositoryKey,
     baseId: input.baseId,
-    // `branch` is deliberately NOT SENT (RUN-274), and this is the one place that decides it.
+    // Sent again since RUN-276, and the round trip is worth recording because the failure was
+    // invisible. For one release this field was withheld (RUN-274): the server took a single
+    // `branch` value and used it as BOTH a hard filter and a rerank preference, so any branch named
+    // EXCLUDED every memory recorded on a different one — and since every run works off a branch
+    // while this daemon names the repo's `defaultBranch`, normal operation asked for the one branch
+    // the project's memory was not recorded against. It failed at 200, schema-valid, with
+    // honest-looking empty sections, which is how the whole RUN-228…232 chain could work perfectly
+    // and deliver nothing. Measured on this repo's own project: 800 characters and zero memories.
     //
-    // The server takes one `branch` value and uses it as BOTH a hard filter and a rerank
-    // preference (`ProjectMemory.searchProjectMemory` → `applyMemoryFilters` + `rankCandidates`),
-    // so any branch we name EXCLUDES every memory recorded on a different one. Every run works off
-    // a branch and this daemon correctly names the repo's `defaultBranch`, so in normal operation
-    // we asked for the one branch the project's memory was not recorded against. Measured against
-    // the live server on this repo's own project: `branch: main` returned 800 characters with every
-    // memory section empty, `branch: plan/project-memory` returned 6632 and all six memories. It
-    // fails silently — 200, schema-valid, honest-looking empty sections — which is why the whole
-    // RUN-228…232 chain could work perfectly and deliver nothing.
-    //
-    // Omitting is not the same as naming a different branch, which would be a lie: it asks for no
-    // branch scoping, which is the truthful request, because this daemon cannot know which branch a
-    // memory was recorded on. What we still send is `baseId`, and that is the STRONGER of the two
-    // checks the server's `verifiedForBase` applies — a citation verified at the same revision is
-    // sound evidence whatever branch it was checked on, while the reverse does not hold. The
-    // branch half of that predicate is what we give up, and it costs this daemon nothing: RUN-229
-    // verifies every citation against the leased tree itself and RUN-231 renders THAT verdict,
-    // treating the server's as a recorded second opinion shown only where the two disagree.
-    //
-    // Reverting is one line, and PLNR-385 is the condition: once the server can be told to WEIGHT
-    // by branch without excluding on it, send it again and let ranking do its job.
+    // PLNR-385 separated the two knobs (`branch` filters, `preferBranch` demotes) and maps a
+    // context pack's caller branch to the ranking half, so naming a branch now WEIGHTS rather than
+    // excludes. Verified against the live server before this line came back — the same request that
+    // returned 800 returns 9319 with every memory present — because the original defect was
+    // undetectable from the response alone, and a fix assumed rather than checked would have
+    // restored it silently.
+    branch: input.branch,
     role: input.role,
     ...(input.budgetTokens !== undefined ? { budgetTokens: input.budgetTokens } : {}),
   };
