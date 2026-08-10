@@ -1,12 +1,12 @@
 {
-  "sourceCommit": "957195072831bea472163c4e4bb0d69908a77bf6",
+  "sourceCommit": "ad8613107965387381a2bdf65e30c6f7d274bf52",
   "sourceDirty": false,
-  "vendoredAt": "2026-08-10T19:45:28.336Z",
+  "vendoredAt": "2026-08-10T23:24:45.269Z",
   "files": {
     "events.ts": "4c521e2a4a280d0860dfcbaea35e5d89edd2bac4d764f448ce63654c2142beab",
     "execution-spec.ts": "27432bfc454ffc6672ba34e11f8914cda517c0773fd4c9cc86c32e7a17936ca4",
     "index.ts": "b553f481ababbd362e473331a2648de9484e57255d86239ab55e1daf5a3f3bf1",
-    "intelligence.ts": "d1533e8711e0d01d5794ecb3885f79ddcdd1a4c48188b756b664dafb4b0c4052",
+    "intelligence.ts": "faefb312d802f611e3482ddb9f6aee7cfab4d0d29aed6dcbf96e953a9d93aa32",
     "manifest.ts": "d260338959fb85b9e9a786c8e497c2156a00df5ec13a3a7788690201653cb260",
     "memory.ts": "1834aae1ee15350ce5d5cc3ac7bd9b59f36f2ceb2c9e59c34759fb42bafe74eb",
     "model.ts": "81fcf491132b23a754936cac4d4efdc2ee26bcc815073be683d391e4a5ed22f6",

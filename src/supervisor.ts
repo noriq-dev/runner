@@ -11,6 +11,7 @@ import type {
   RunEffort,
   RunKind,
   RunPhase,
+  UploadedEpisodeIntelligence,
 } from '@noriq-dev/shared';
 import type {
   ConfigurationFingerprint,
@@ -383,8 +384,11 @@ export interface RunSupervisorDeps {
    * must stay synchronous and fire-and-forget the same way, or `settle` would be awaiting a network
    * round trip it is documented never to. Omitted → no delivery layer wired, a test's ordinary
    * posture and every host before this task.
+   *
+   * `intelligence` (RUN-284) is threaded through unchanged — see `StageHost.recordEpisode`'s own
+   * doc on why it rides as a second argument rather than a field on `episode`.
    */
-  recordEpisode?: (episode: EffortEpisode) => void;
+  recordEpisode?: (episode: EffortEpisode, intelligence?: UploadedEpisodeIntelligence) => void;
   /**
    * Hand a freshly built verification report to delivery (RUN-230, `PrepareHost.reportVerification`
    * — that seam's own doc names this exact wiring point). `daemon.ts` binds it to
@@ -713,6 +717,28 @@ export class RunTally {
   /** Agent-active seconds burned so far, including any prior sitting's. */
   activeSeconds(): number {
     return this.active;
+  }
+
+  /**
+   * Every verify-duration envelope this run has actually observed (RUN-284, RUN-242's own
+   * "one duration per attempt, logged as it happens" — this is where "logged" also becomes
+   * "kept"). Appended, never replaced: a retry loop's later attempts are a DIFFERENT command run
+   * (`verifyWithFeedback`'s own doc), so each one is its own entry rather than overwriting the
+   * last, and `intelligence-payload.ts` is what folds this list into the run-wide sum semantics —
+   * this object stays a plain accumulator, the same division of labour `stageFacts()` already
+   * draws between "what was recorded" and "what it means".
+   */
+  private readonly verifyDurationEvents: IntelligenceDurationMs[] = [];
+
+  /** Record one verify-duration observation — every call site that used to only log `timedVerify`'s
+   *  callback now also calls this, so `settle` can read what RUN-242 was already measuring. */
+  recordVerifyDuration(d: IntelligenceDurationMs): void {
+    this.verifyDurationEvents.push(d);
+  }
+
+  /** Every verify-duration envelope recorded so far, in observation order. */
+  verifyDurations(): readonly IntelligenceDurationMs[] {
+    return this.verifyDurationEvents;
   }
 
   /**
@@ -1359,7 +1385,7 @@ export class RunSupervisor {
       // RUN-227: the seam `StageHost.recordEpisode`'s own doc names as unwired until this task.
       // `this.deps.recordEpisode` is itself synchronous (see that dep's doc) — nothing here awaits
       // it, so `settle` calling this stays exactly as non-blocking as it was before it existed.
-      recordEpisode: (episode) => this.deps.recordEpisode?.(episode),
+      recordEpisode: (episode, intelligence) => this.deps.recordEpisode?.(episode, intelligence),
       // The run's effective ceiling: the dispatch's, else the machine default (RUN-14). Only
       // `prepare` reads this — every LATER session reserves from the tally instead (RUN-133), so
       // that the run's sessions divide one ceiling rather than each receiving a copy of it.
@@ -1727,12 +1753,14 @@ export class RunSupervisor {
             ...(await timedVerify(
               rebaseGate,
               worktree.localPath,
-              (d) =>
+              (d) => {
                 this.log.info('deterministic verify (landing, sessionless) timed', {
                   runId: ctx.run.id,
                   cmd: rebaseGate.cmd,
                   durationMs: d,
-                }),
+                });
+                ctx.tally.recordVerifyDuration(d);
+              },
               { exec: this.deps.verifyExec },
             )),
             attempts: 1,
@@ -1856,14 +1884,18 @@ export class RunSupervisor {
     const transcript = this.transcript(ctx.run.id);
     // One duration per attempt (RUN-242) — logged as it happens rather than folded into one figure
     // for the whole call, since a retry loop's later attempts are a DIFFERENT command run, not a
-    // continuation of the first one's clock.
-    const logDuration = (attempt: number) => (d: IntelligenceDurationMs) =>
+    // continuation of the first one's clock. Also RECORDED onto the run's tally now (RUN-284), not
+    // merely logged — `intelligence-payload.ts` is what folds the per-attempt list `settle` reads
+    // off `ctx.tally.verifyDurations()` into the sum semantics locked decision.
+    const logDuration = (attempt: number) => (d: IntelligenceDurationMs) => {
       this.log.info('deterministic verify command timed', {
         runId: ctx.run.id,
         cmd: ctx.spec.cmd,
         attempt,
         durationMs: d,
       });
+      ctx.tally.recordVerifyDuration(d);
+    };
     let result = await timedVerify(ctx.spec, ctx.cwd, logDuration(1), { exec: this.deps.verifyExec });
     this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
     // How many times THIS call actually ran the command (RUN-225) — the daemon's own observation,

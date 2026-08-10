@@ -86,3 +86,20 @@ export function notApplicableDuration(source: DurationSource, reason: string): I
 export function unavailableDuration(source: DurationSource, reason: string): IntelligenceDurationMs {
   return { status: 'unavailable', value: null, ...observation(source, reason) };
 }
+
+/**
+ * A SUM across several measurements where at least one term is missing (RUN-284) — e.g. a verify
+ * command retried three times but only two attempts were actually timed. `value` still carries the
+ * sum of the terms that WERE measured (never null: `partial` is the schema's one status besides
+ * `complete` that carries a real value), and `reason` is where "how much is missing" has to live,
+ * since the envelope itself has no separate count field. Distinct from `unavailable` (the whole
+ * measurement was lost) and from `complete` (nothing was missing): a `partial` figure is real and
+ * usable, just known to be an undercount.
+ */
+export function partialDuration(
+  value: number,
+  source: DurationSource,
+  reason: string,
+): IntelligenceDurationMs {
+  return { status: 'partial', value, ...observation(source, reason) };
+}

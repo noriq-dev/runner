@@ -1,7 +1,19 @@
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { ModelDefault, PermissionProfile, ProjectManifest, Run, RunBudget } from '@noriq-dev/shared';
-import { ExecutionSpec, UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+import type {
+  EffortEpisode,
+  ModelDefault,
+  PermissionProfile,
+  ProjectManifest,
+  Run,
+  RunBudget,
+  UploadedEpisodeIntelligence,
+} from '@noriq-dev/shared';
+import {
+  ExecutionSpec,
+  UNATTRIBUTED_MODEL_ID,
+  UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceSchema,
+} from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
 import type { LedgerEntry } from '../src/adjudication';
 import type { ParkState, RunAgent } from '../src/client';
@@ -23,6 +35,7 @@ import type { ParkedRun } from '../src/parked';
 import { renderPrompt } from '../src/prompts';
 import type { DocReader, PathProbe } from '../src/repo-context';
 import { noriqToolNamesFor } from '../src/security';
+import { completeDuration } from '../src/stage-timing';
 import { LOCK_RELEASE_TIMEOUT_MS } from '../src/stages/settle';
 import {
   type AnchorTask,
@@ -551,6 +564,10 @@ function harness(
   const comments: Array<{ projectId: string; taskId: string; body: string }> = [];
   /** Background indexing's landing trigger (RUN-222) — every call the supervisor makes to it. */
   const landedEvents: Array<{ repoRoot: string; branch: string; sha: string }> = [];
+  /** The episode delivery seam (RUN-227), and since RUN-284 its `intelligence` half — every call
+   *  `settle` makes to `StageHost.recordEpisode`, wired unconditionally like `onLanded` above so a
+   *  test can assert on it without opting in. */
+  const recordedEpisodes: Array<{ episode: EffortEpisode; intelligence?: UploadedEpisodeIntelligence }> = [];
   const claude = new FakeDriver('claude');
   const codex = new FakeDriver('codex');
   let verifyRan = false;
@@ -591,6 +608,7 @@ function harness(
     reportLog: (_runId, segments) => transcript.push(...segments),
     postComment: (projectId, taskId, body) => comments.push({ projectId, taskId, body }),
     onLanded: (repoRoot, branch, sha) => landedEvents.push({ repoRoot, branch, sha }),
+    recordEpisode: (episode, intelligence) => recordedEpisodes.push({ episode, intelligence }),
     // `[context]` resolution (RUN-128/129) is stubbed out here, like every other seam: these
     // repo roots (`/repos/repo_a`) do not exist, and a real fs round-trip settles on the
     // threadpool — LATER than the single `flush()` tick these tests spawn within, which would
@@ -684,6 +702,7 @@ function harness(
     reports,
     comments,
     landedEvents,
+    recordedEpisodes,
     transcript,
     claude,
     codex,
@@ -6674,6 +6693,78 @@ describe('the run model mix (RUN-59)', () => {
       expect(conflictStage?.tokens).toMatchObject({ status: 'unavailable', value: null });
       expect(conflictStage?.costUSD).toMatchObject({ status: 'unavailable', value: null });
       expect(total).toEqual(before); // zero telemetry contributes zero — the total is unmoved
+    });
+  });
+
+  describe('RunTally.verifyDurations (RUN-284)', () => {
+    it('a fresh tally has recorded nothing', () => {
+      const t = new RunTally();
+      expect(t.verifyDurations()).toEqual([]);
+    });
+
+    it('recordVerifyDuration APPENDS — a retry loop’s later attempts are each their own entry', () => {
+      const t = new RunTally();
+      const a = completeDuration(10, { source: 'runner', sourceId: 'verify' });
+      const b = completeDuration(20, { source: 'runner', sourceId: 'verify' });
+      t.recordVerifyDuration(a);
+      t.recordVerifyDuration(b);
+      expect(t.verifyDurations()).toEqual([a, b]);
+    });
+  });
+
+  // RUN-284: proves the WIRING, not just the fold — that a real run through `supervise()` actually
+  // lands `RunTally.stageFacts()`/`verifyDurations()` on `settle`'s assembled `intelligence`, which
+  // then reaches `StageHost.recordEpisode` as its second argument. `test/intelligence-payload.test.ts`
+  // covers `buildUploadedIntelligence`'s fold logic directly; this is the other half — that the three
+  // call sites which now call `RunTally.recordVerifyDuration` (the not-landing floor's not_applicable
+  // path, and `verifyWithFeedback`'s per-attempt `timedVerify`) actually feed it.
+  describe('episode intelligence delivery (RUN-284)', () => {
+    it('a build whose deterministic floor passed once carries a COMPLETE verifyDurationMs and its stage facts', async () => {
+      const h = harness({ manifest: manifest() }); // default manifest: `verify.cmd: 'npm test'`, no [land]
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done', { inputTokens: 10, outputTokens: 5, costUsd: 0.1 });
+      await done;
+
+      expect(h.recordedEpisodes).toHaveLength(1);
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence).toBeDefined();
+      // Round-trip against the REAL vendored schema — never hand-typed, so a future narrowing of
+      // `UploadedEpisodeIntelligence` fails HERE.
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+      expect(intelligence?.execution?.stages?.some((s) => s.stage === 'primary')).toBe(true);
+      expect(intelligence?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete' });
+    });
+
+    it('a repo with no [verify].cmd sends not_applicable rather than omitting the clock', async () => {
+      const h = harness({ manifest: manifest({ verify: null }) });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done');
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'not_applicable' });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+    });
+
+    it('a run whose verify fixed itself after one failed attempt sums BOTH attempts (complete, not partial)', async () => {
+      const h = harness({ verifyResults: [false, true] });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done');
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      // Two attempts, both actually timed — the sum is real and complete, not an undercount.
+      expect(intelligence?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete' });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
     });
   });
 

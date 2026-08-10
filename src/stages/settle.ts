@@ -24,6 +24,7 @@ import {
 import { totalTokens } from '../drivers/budget';
 import { buildEpisode } from '../episode';
 import { requestSelfSummary } from '../episode-summary';
+import { buildUploadedIntelligence } from '../intelligence-payload';
 import { clearSetupMarker } from '../setup';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
@@ -258,7 +259,16 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       steeringHistory: host.steeringHistory?.(run.id) ?? [],
       selfSummary,
     });
-    host.recordEpisode?.(episode);
+    // The narrow Project Intelligence payload (RUN-284) — assembled from facts the run's own
+    // tally already accumulated (RUN-243's `stageFacts()`, RUN-242's verify durations, actually
+    // KEPT since this task). Wrapped in the SAME try as `buildEpisode` above: a throw here must
+    // cost only the intelligence half of this sitting's episode, never the run's own outcome,
+    // exactly like the episode assembly it rides alongside.
+    const intelligence = buildUploadedIntelligence({
+      stages: ctx.tally.stageFacts().stages,
+      verifyDurations: ctx.tally.verifyDurations(),
+    });
+    host.recordEpisode?.(episode, intelligence);
   } catch (err) {
     host.log.warn('episode assembly failed — settling anyway', { runId: run.id, err: String(err) });
   }

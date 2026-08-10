@@ -171,6 +171,80 @@ describe('EpisodePendingStore — retention bounds enforced on write (RUN-227 lo
   });
 });
 
+describe('EpisodePendingStore — intelligence (RUN-284)', () => {
+  const VERIFY_SOURCE = { source: 'runner' as const, sourceId: 'verify' };
+  const intelligence = {
+    execution: {
+      clocks: {
+        verifyDurationMs: {
+          status: 'complete' as const,
+          value: 12,
+          provenance: 'runner_observed' as const,
+          source: VERIFY_SOURCE.source,
+          sourceId: VERIFY_SOURCE.sourceId,
+          observedAt: '2026-08-01T00:00:00.000Z',
+          acceptedAt: null,
+          reason: null,
+        },
+      },
+    },
+  };
+
+  it('an entry WITH intelligence persists it byte-identically — a retry resends the same payload', async () => {
+    const backing = memStore();
+    const store = new EpisodePendingStore(backing, { now: NOW });
+    const original = entry({ enqueuedAt: '2026-08-07T00:00:00.000Z', intelligence });
+    await store.put(original);
+    const [back] = await store.list();
+    expect(back?.intelligence).toEqual(intelligence);
+  });
+
+  // The compatibility case RUN-284's own locked decision names: a spool entry persisted BEFORE
+  // this field existed carries no `intelligence` key at all in its serialized JSON — not `null`,
+  // not `undefined` written out, simply absent. `EpisodePendingStore` does no schema validation of
+  // its own (`toEnrichmentPayload` is the one validation point, applied fresh on every send), so an
+  // old entry must load and be uploadable exactly as it always was.
+  it('a PRE-EXISTING entry with no intelligence key loads fine — the old-spool-entry compatibility case', async () => {
+    const backing = memStore();
+    // Write the OLD shape directly, bypassing `entry()`'s helper (which would happily accept an
+    // `intelligence: undefined` key that JSON.stringify would drop anyway — this instead models the
+    // literal on-disk shape a pre-RUN-284 daemon actually wrote: the key is simply not there).
+    const oldShapeEntry = {
+      scopeId: 'epi_old',
+      episode: episode(),
+      mint: { projectId: 'prj_p', repositoryKey: 'myrepo', runnerId: 'rnr_1' },
+      enqueuedAt: '2026-08-07T00:00:00.000Z',
+    };
+    await backing.write({ pending: [oldShapeEntry as unknown as PendingEpisode] });
+
+    const store = new EpisodePendingStore(backing, { now: NOW });
+    const survived = await store.list();
+
+    expect(survived).toHaveLength(1);
+    expect(survived[0]?.scopeId).toBe('epi_old');
+    expect(survived[0]?.intelligence).toBeUndefined();
+  });
+
+  it('put on a store already holding an old-shape entry does not disturb it', async () => {
+    const backing = memStore();
+    const oldShapeEntry = {
+      scopeId: 'epi_old',
+      episode: episode(),
+      mint: { projectId: 'prj_p', repositoryKey: 'myrepo', runnerId: 'rnr_1' },
+      enqueuedAt: '2026-08-07T00:00:00.000Z',
+    };
+    await backing.write({ pending: [oldShapeEntry as unknown as PendingEpisode] });
+    const store = new EpisodePendingStore(backing, { now: NOW });
+
+    await store.put(entry({ scopeId: 'epi_new', enqueuedAt: '2026-08-07T01:00:00.000Z', intelligence }));
+
+    const survived = await store.list();
+    expect(survived.map((e) => e.scopeId).sort()).toEqual(['epi_new', 'epi_old']);
+    expect(survived.find((e) => e.scopeId === 'epi_old')?.intelligence).toBeUndefined();
+    expect(survived.find((e) => e.scopeId === 'epi_new')?.intelligence).toEqual(intelligence);
+  });
+});
+
 describe('filePendingEpisodeStore — corrupt file degrades to empty (RUN-227, index-journal.ts’s precedent)', () => {
   it('a store whose read throws is treated as empty by EpisodePendingStore, never as a crash', async () => {
     const broken: PendingEpisodeFileStore = {

@@ -124,11 +124,12 @@ export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     if (!floorCmd) {
       // The stage reaches this point but has nothing to run (RUN-242): no `[verify].cmd` committed
       // for this repo. Logged as `not_applicable`, never silently skipped — a duration of "0ms"
-      // would read as "ran instantly", which is a different fact than "did not run at all".
-      host.log.info('deterministic verify: not applicable', {
-        runId: run.id,
-        durationMs: verifyNotApplicable('no [verify].cmd configured for this repo'),
-      });
+      // would read as "ran instantly", which is a different fact than "did not run at all". Also
+      // RECORDED onto the run's tally (RUN-284) so `settle` reports the same fact rather than
+      // inferring "verify never reached" from an empty accumulator.
+      const notApplicable = verifyNotApplicable('no [verify].cmd configured for this repo');
+      host.log.info('deterministic verify: not applicable', { runId: run.id, durationMs: notApplicable });
+      ctx.tally.recordVerifyDuration(notApplicable);
     } else {
       // Same silence as landing, and the longer of the two in practice: the full suite with no
       // token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to the agent

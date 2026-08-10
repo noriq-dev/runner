@@ -9,11 +9,14 @@
  * `ExecutionKind`/`ExecutionRole` are PLNR-290's authority and this module invents no vocabulary of
  * its own, only a mapping from ours to theirs.
  *
- * Two things this module does NOT do, on purpose: it does not populate `EffortEpisode.intelligence`
- * or widen any upload surface (the server strips it — RUN-241's comment in `episode-upload.ts`;
- * PLNR-417 gates that end), and it does not synthesize `executionId` (RUN-265..272's lineage plan
- * owns execution ids; a guessed one here would wear an identity field's clothes). Both are left for
- * whoever wires this into an actual upload.
+ * Two things this module does NOT do, on purpose. It does not populate `EffortEpisode.intelligence`
+ * — that field stays server-owned and null on the local record (RUN-284 locked decision; the whole
+ * point of `UploadedEpisodeIntelligence` is that a daemon never has to assemble that field). It also
+ * does not synthesize `executionId` (RUN-265..272's lineage plan owns execution ids; a guessed one
+ * here would wear an identity field's clothes). What it used to also defer — actually reaching an
+ * upload at all — no longer applies: this module's output (`stageFactFromTelemetry`, read via
+ * `RunTally.stageFacts()`) is what `src/intelligence-payload.ts` assembles into
+ * `UploadedEpisodeIntelligence.execution.stages` and `src/episode-upload.ts` sends, since RUN-284.
  */
 
 import type {
@@ -82,12 +85,18 @@ function metric(available: boolean, value: number, slot: string, unavailableReas
       // `provenance` names the CHANNEL that observed this, and `status` says what that channel
       // could tell us — they are different questions, and conflating them broke the upload.
       // PLNR-417's ingest refines every daemon metric through DAEMON_PROVENANCE
-      // ('runner_observed' | 'driver_reported' | 'backend_observed' | 'derived'), and a refine
-      // failure skips the WHOLE episode row rather than the one metric — so a `provenance:
-      // 'unavailable'` here (legal in MetricProvenance, reserved for the server's own
-      // nobody-observed-this case) would have silently discarded every episode carrying a Codex
-      // cost, which is the common case this module exists to describe. `stage-timing.ts` already
-      // had this right: one constant provenance per channel, availability in `status` alone.
+      // ('runner_observed' | 'driver_reported' | 'backend_observed' | 'derived' | 'unavailable'),
+      // and a refine failure skips the WHOLE episode row rather than the one metric — so a
+      // `provenance: 'unavailable'` here would have silently discarded every episode carrying a
+      // Codex cost, which is the common case this module exists to describe. That was true when
+      // this comment was first written; PLNR-426 then widened DAEMON_PROVENANCE to allow
+      // 'unavailable' from a daemon too (it is no longer "reserved for the server's own
+      // nobody-observed-this case"), which retires the reason this constant picks
+      // `driver_reported` rather than `unavailable` — but not the constant itself: `provenance`
+      // still names the CHANNEL, and a metric this module could not observe was still reported
+      // over the driver channel, so `driver_reported` remains the correct value here regardless
+      // of which provenance a daemon is now permitted to send. `stage-timing.ts` already had this
+      // right: one constant provenance per channel, availability in `status` alone.
       provenance: 'driver_reported' as const,
       source: 'driver' as const,
       sourceId: slot,

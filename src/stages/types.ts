@@ -19,6 +19,7 @@ import type {
   Run,
   RunBudget,
   RunPhase,
+  UploadedEpisodeIntelligence,
 } from '@noriq-dev/shared';
 import type { AcceptanceItem, AcceptanceReport } from '../acceptance';
 import type { LedgerEntry } from '../adjudication';
@@ -160,8 +161,14 @@ export interface StageHost {
    * The seam exists so a later delivery layer attaches HERE without reshaping `settleStage` or
    * `buildEpisode` — the same discipline `onLanded` above already established for a trigger nobody
    * had written yet.
+   *
+   * `intelligence` (RUN-284) rides as a second, independent argument rather than a field on
+   * `episode` — the same split `UploadEpisodeInput`/`PendingEpisode` make, because
+   * `EffortEpisode.intelligence` stays the FULL server-owned shape and this is the narrow
+   * daemon-assertable one (see `intelligence-payload.ts`'s module doc). Undefined whenever `settle`
+   * assembled nothing intelligence-shaped for this sitting.
    */
-  recordEpisode?(episode: EffortEpisode): void;
+  recordEpisode?(episode: EffortEpisode, intelligence?: UploadedEpisodeIntelligence): void;
   /**
    * Drain this run's observed steer deliveries (RUN-225) — `SteeringBridge`'s own record of what
    * `applySteer` actually did, not the server's independent `steers`-table view. Absent = no

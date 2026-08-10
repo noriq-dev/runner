@@ -1,7 +1,10 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { EffortEpisode as EffortEpisodeType } from '@noriq-dev/shared';
+import type {
+  EffortEpisode as EffortEpisodeType,
+  UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceType,
+} from '@noriq-dev/shared';
 import type { MintIngestCapabilityInput } from './client';
 
 /**
@@ -32,6 +35,17 @@ export interface PendingEpisode {
   /** When this entry was written — the age bound's own clock, and never touched again: an entry
    *  ages from the moment its episode became undeliverable, not from whenever it is retried. */
   enqueuedAt: string;
+  /**
+   * The narrow Project Intelligence payload (RUN-284), when `settle` assembled one — rides BESIDE
+   * the episode, never inside it, the same split `UploadEpisodeInput` makes. Optional for two
+   * independent reasons that must both degrade the same way: a sitting that observed nothing
+   * intelligence-shaped never had one to carry, and every entry this store persisted BEFORE this
+   * field existed has no key here at all. Both read as "send the episode without it" — this store
+   * does no schema validation of its own (`toEnrichmentPayload` is the one validation point, run
+   * fresh on every send including a retry drained from here), so an old entry loads exactly as it
+   * always did.
+   */
+  intelligence?: UploadedEpisodeIntelligenceType;
 }
 
 type PendingEpisodeFile = { pending: PendingEpisode[] };

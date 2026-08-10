@@ -1,5 +1,9 @@
 import { gunzipSync } from 'node:zlib';
-import type { EffortEpisode as EffortEpisodeType } from '@noriq-dev/shared';
+import type {
+  EffortEpisode as EffortEpisodeType,
+  UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceType,
+} from '@noriq-dev/shared';
+import { UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { NoriqClient } from '../src/client';
 import { deriveEpisodeScopeId } from '../src/episode';
@@ -17,6 +21,8 @@ import {
   toEnrichmentPayload,
   uploadEpisode,
 } from '../src/episode-upload';
+import { stageFactFromTelemetry } from '../src/stage-facts';
+import { completeDuration } from '../src/stage-timing';
 
 // RUN-227: episode delivery over the existing signed ingest protocol. Fakes are built at the FETCH
 // layer — never by mocking `IngestUpload` — the same discipline `index-upload.test.ts` already
@@ -557,5 +563,110 @@ describe('toEnrichmentPayload (RUN-264)', () => {
   it('runId always ships — the one field the enrichment shape requires, never optional', () => {
     const payload = toEnrichmentPayload(episode({ runId: 'run_xyz' }));
     expect(payload.runId).toBe('run_xyz');
+  });
+});
+
+// RUN-284: `intelligence` validated fresh inside `toEnrichmentPayload`, on every call, and dropped
+// (never the episode) on a failure. `test/intelligence-payload.test.ts` covers the ASSEMBLY (what
+// `buildUploadedIntelligence` produces); this covers the BOUNDARY — what actually reaches the wire.
+
+const VERIFY_SOURCE = { source: 'runner' as const, sourceId: 'verify' };
+
+function validIntelligence(): UploadedEpisodeIntelligenceType {
+  return {
+    execution: {
+      stages: [
+        stageFactFromTelemetry('primary', {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          costUsd: 0.1,
+          numTurns: 1,
+        } as never),
+      ],
+      clocks: { verifyDurationMs: completeDuration(12, VERIFY_SOURCE) },
+    },
+  };
+}
+
+describe('toEnrichmentPayload — intelligence (RUN-284)', () => {
+  it('no intelligence passed → the key is absent, not sent as undefined or {}', () => {
+    const payload = toEnrichmentPayload(episode());
+    expect(Object.prototype.hasOwnProperty.call(payload, 'intelligence')).toBe(false);
+  });
+
+  it('a VALID payload ships through, parsed (schema-normalized) rather than the raw input object', () => {
+    const intelligence = validIntelligence();
+    const payload = toEnrichmentPayload(episode(), intelligence);
+    expect(payload.intelligence).toEqual(intelligence);
+    expect(UploadedEpisodeIntelligence.safeParse(payload.intelligence).success).toBe(true);
+  });
+
+  it('an INVALID payload is dropped — the field is absent, the rest of the payload ships anyway', () => {
+    const bad = structuredClone(validIntelligence()) as {
+      execution: { stages: Array<{ tokens: { provenance: string } }> };
+    };
+    bad.execution.stages[0]!.tokens.provenance = 'server_observed'; // legal MetricProvenance, not daemon-legal
+    const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const log = { warn: (msg: string, fields?: Record<string, unknown>) => warnings.push({ msg, fields }) };
+
+    const payload = toEnrichmentPayload(
+      episode({ filesTouched: ['a.ts'] }),
+      bad as unknown as UploadedEpisodeIntelligenceType,
+      log,
+    );
+
+    expect(Object.prototype.hasOwnProperty.call(payload, 'intelligence')).toBe(false);
+    expect(payload.filesTouched).toEqual(['a.ts']); // the rest of the episode still ships
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.msg).toMatch(/failed validation/);
+    // Names the issue's PATH — where inside the payload it broke — not just "something is wrong".
+    expect(String(warnings[0]?.fields?.issuePath)).toMatch(/stages/);
+  });
+
+  it('the actual wire body carries intelligence.execution.stages/.clocks.verifyDurationMs when observed', async () => {
+    const { mintFetch, ingestFetch, calls } = router({});
+    const deps = makeDeps({}, { mintFetch, ingestFetch });
+    const intelligence = validIntelligence();
+    const input: UploadEpisodeInput = {
+      scopeId: 'epi_scope_1',
+      mint: MINT_INPUT,
+      episode: episode(),
+      intelligence,
+    };
+
+    await uploadEpisode(input, deps);
+
+    const body = decodeBatchBody(calls) as { intelligence?: UploadedEpisodeIntelligenceType };
+    expect(body.intelligence).toEqual(intelligence);
+    // No server-owned field anywhere in what actually left the box.
+    for (const key of ['identity', 'sources', 'versions', 'outcome', 'executedStrategy', 'executedSpec']) {
+      expect(body.intelligence).not.toHaveProperty(key);
+    }
+    expect(body.intelligence?.execution).not.toHaveProperty('configuration');
+    expect(Object.prototype.hasOwnProperty.call(body, 'preExecution')).toBe(false);
+  });
+
+  it('a bad payload never reaches the wire, and the episode still delivers — HTTP still gets its other fields', async () => {
+    const { mintFetch, ingestFetch, calls } = router({});
+    const deps = makeDeps({}, { mintFetch, ingestFetch });
+    const bad = structuredClone(validIntelligence()) as {
+      execution: { clocks: { verifyDurationMs: { source: string } } };
+    };
+    bad.execution.clocks.verifyDurationMs.source = 'd1_coordination'; // legal IntelligenceSource, not daemon-legal
+    const input: UploadEpisodeInput = {
+      scopeId: 'epi_scope_1',
+      mint: MINT_INPUT,
+      episode: episode({ filesTouched: ['a.ts'] }),
+      intelligence: bad as unknown as UploadedEpisodeIntelligenceType,
+    };
+
+    const result = await uploadEpisode(input, deps);
+
+    expect(result).toEqual({ ok: true }); // the episode itself still delivered
+    const body = decodeBatchBody(calls) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(body, 'intelligence')).toBe(false);
+    expect(body.filesTouched).toEqual(['a.ts']);
   });
 });

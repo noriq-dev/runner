@@ -1,4 +1,8 @@
-import type { EffortEpisode as EffortEpisodeType } from '@noriq-dev/shared';
+import type {
+  EffortEpisode as EffortEpisodeType,
+  UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceType,
+} from '@noriq-dev/shared';
+import { UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import type { MintIngestCapabilityInput, NoriqClient } from './client';
 import { deriveEpisodeScopeId } from './episode';
 import type { EpisodePendingStore, PendingEpisode } from './episode-pending';
@@ -52,6 +56,15 @@ export interface UploadEpisodeInput {
    *  including every retry — decides what actually leaves the box, so the retry-determinism
    *  property holds at the wire subset too: the same object always projects to the same payload. */
   episode: EffortEpisodeType;
+  /**
+   * The narrow, daemon-assertable Project Intelligence payload (RUN-284) — assembled once by
+   * `src/intelligence-payload.ts`'s `buildUploadedIntelligence` and carried BESIDE the episode,
+   * never inside it (locked decision: `EffortEpisode.intelligence` stays server-owned and null on
+   * the local record). Like `episode` above, the SAME object rides every retry — `toEnrichmentPayload`
+   * re-validates it fresh each send, so a retry cannot ship something this sitting's own assembly
+   * never produced, but it also never re-derives a different value for it.
+   */
+  intelligence?: UploadedEpisodeIntelligenceType;
 }
 
 /**
@@ -63,15 +76,18 @@ export interface UploadEpisodeInput {
  * `remainingWork`, `taskId`, `repositoryKey`, `baseId`) because D1 owns identity, lifecycle, cost,
  * and review evidence and a daemon must not be able to forge them.
  *
- * `intelligence` (PLNR-290's additive analytics-grade facts, `EffortEpisode.intelligence`) is
- * deliberately NOT among the picked keys, and this is the strip site a future task populating it
- * will need to widen — not the schema. `UPLOADED_EPISODE_SHAPE` in planar's `ProjectMemory.ts`
- * (`.pick()`'d from the same six keys above, `.partial()`'d) does not accept it either: a payload
- * that carried it today would get HTTP 200 and the field would be silently discarded server-side,
- * which is the exact "populated and then ignored" defect class this plan has produced repeatedly
- * (see CLAUDE.md). Extending `EpisodeEnrichmentPayload`/`toEnrichmentPayload` to include
- * `intelligence` without ALSO widening `UPLOADED_EPISODE_SHAPE` server-side first would recreate
- * it here.
+ * **`intelligence` used to belong in that stripped list too, and does not any more — say so rather
+ * than restate the old claim (CLAUDE.md's standing rule for a superseded invariant).** This block
+ * previously said `intelligence` was "deliberately NOT among the picked keys" and that a payload
+ * carrying it "would get HTTP 200 and the field would be silently discarded server-side". Both were
+ * true when written, against `EffortEpisode.intelligence` — PLNR-290's additive analytics-grade
+ * field, typed as the FULL `ProjectIntelligenceEpisode` (server-owned identity, sources, versions,
+ * outcome and all). That field is still stripped, and this module still never populates it — see
+ * `episode.ts`'s own doc on why `buildEpisode` leaves it untouched. But `UPLOADED_EPISODE_SHAPE`
+ * was WIDENED under PLNR-426 (`apps/api/src/do/ProjectMemory.ts:422`) to additionally accept a
+ * SEPARATE, narrower key — `intelligence: UploadedEpisodeIntelligence.optional()` — the
+ * daemon-assertable subset vendored at `vendor/noriq-shared/src/intelligence.ts`. `toEnrichmentPayload`
+ * below is now the strip site that no longer needs widening: it already carries that key.
  */
 export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
   Partial<
@@ -79,7 +95,14 @@ export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
       EffortEpisodeType,
       'filesTouched' | 'commands' | 'testsRun' | 'failures' | 'findings' | 'selfSummary'
     >
-  >;
+  > & {
+    /** The narrow Project Intelligence subset (RUN-284), validated fresh on every send inside
+     *  `toEnrichmentPayload` — never carried in from the caller unchecked. Absent whenever this
+     *  sitting observed nothing intelligence-shaped, OR whenever it observed something but that
+     *  something failed `safeParse` against the vendored schema (dropped, not sent invalid — see
+     *  `toEnrichmentPayload`'s own doc). */
+    intelligence?: UploadedEpisodeIntelligenceType;
+  };
 
 /**
  * Project the full local record down to exactly what the wire contract accepts, and OMIT whatever
@@ -124,8 +147,25 @@ export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
  * form can erase a prior sitting's summary. Omitted here anyway so every enrichment field follows
  * one rule, rather than a selfSummary-shaped exception a future reader has to re-derive from the
  * server source to trust.
+ *
+ * **`intelligence` (RUN-284) is validated HERE, immediately before the bytes are built, and on
+ * every call — including every retry `uploadEpisode` makes for the identical `input`.** This is the
+ * one place a payload assembled by `intelligence-payload.ts` is checked against the vendored
+ * `UploadedEpisodeIntelligence` schema before it can leave the box. On success the parsed (and
+ * therefore schema-normalized) value ships; on failure the field is DROPPED and the rest of the
+ * payload sends anyway — a bad metric must not cost the episode it rode in on (locked decision), the
+ * same asymmetry `apps/api/src/do/ProjectMemory.ts`'s own comment gives for why it does NOT do
+ * per-metric salvage server-side: "the actual fix... is upstream of here... a Runner can safeParse
+ * its own payload and catch a bad enum value before it is ever uploaded". This is that safeParse.
+ * `log` defaults to the module logger so ordinary callers need not thread one through, but
+ * `uploadEpisode` below passes its own so a caller-supplied logger (tests, a scoped daemon logger)
+ * sees the warning too.
  */
-export function toEnrichmentPayload(episode: EffortEpisodeType): EpisodeEnrichmentPayload {
+export function toEnrichmentPayload(
+  episode: EffortEpisodeType,
+  intelligence?: UploadedEpisodeIntelligenceType,
+  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
+): EpisodeEnrichmentPayload {
   const payload: EpisodeEnrichmentPayload = { runId: episode.runId };
   if (episode.filesTouched.length > 0) payload.filesTouched = episode.filesTouched;
   if (episode.commands.length > 0) payload.commands = episode.commands;
@@ -133,6 +173,19 @@ export function toEnrichmentPayload(episode: EffortEpisodeType): EpisodeEnrichme
   if (episode.failures.length > 0) payload.failures = episode.failures;
   if (episode.findings.length > 0) payload.findings = episode.findings;
   if (episode.selfSummary) payload.selfSummary = episode.selfSummary;
+  if (intelligence) {
+    const parsed = UploadedEpisodeIntelligence.safeParse(intelligence);
+    if (parsed.success) {
+      payload.intelligence = parsed.data;
+    } else {
+      const issue = parsed.error.issues[0];
+      log.warn('episode intelligence failed validation — dropping the field, episode still delivered', {
+        runId: episode.runId,
+        issuePath: issue ? issue.path.join('.') || '(root)' : '(unknown)',
+        issueMessage: issue?.message,
+      });
+    }
+  }
   return payload;
 }
 
@@ -204,7 +257,7 @@ export async function uploadEpisode(
       }
       throw err;
     }
-    const bytes = compressBatch(JSON.stringify(toEnrichmentPayload(input.episode)));
+    const bytes = compressBatch(JSON.stringify(toEnrichmentPayload(input.episode, input.intelligence, log)));
     await withRetry(() => upload.putBatch(0, bytes), retry);
     ensureNotCancelled(signal);
     const completed = (await withRetry(() => upload.complete(), retry)) as IngestCompleteEpisodeResult;
@@ -250,7 +303,16 @@ export interface EpisodeDeliveryDeps extends UploadEpisodeDeps {
  * fail that mint identically on every retry forever — a pending entry that can never succeed is
  * strictly worse than none, since it would occupy a bounded queue's slot until age alone evicted it.
  */
-export async function deliverEpisode(episode: EffortEpisodeType, deps: EpisodeDeliveryDeps): Promise<void> {
+export async function deliverEpisode(
+  episode: EffortEpisodeType,
+  deps: EpisodeDeliveryDeps,
+  /** The narrow Project Intelligence payload (RUN-284), when `settle` assembled one — carried
+   *  alongside the episode into the SAME pending entry, so a spooled retry projects the identical
+   *  payload every time. Undefined is the ordinary case for a sitting that observed nothing
+   *  intelligence-shaped, and identical to how every entry persisted before this task loads: no key
+   *  at all. */
+  intelligence?: UploadedEpisodeIntelligenceType,
+): Promise<void> {
   const log = deps.logger ?? defaultLogger;
   if (!episode.repositoryKey) {
     log.debug('episode has no repositoryKey — skipping delivery (no canonical repository to mint against)', {
@@ -264,7 +326,13 @@ export async function deliverEpisode(episode: EffortEpisodeType, deps: EpisodeDe
     repositoryKey: episode.repositoryKey,
     runnerId: deps.runnerId,
   };
-  const entry: PendingEpisode = { scopeId, episode, mint, enqueuedAt: new Date().toISOString() };
+  const entry: PendingEpisode = {
+    scopeId,
+    episode,
+    mint,
+    enqueuedAt: new Date().toISOString(),
+    ...(intelligence ? { intelligence } : {}),
+  };
   await deps.pending.put(entry).catch((err) =>
     log.warn('episode enqueue failed — this sitting’s episode may not survive a restart', {
       runId: episode.runId,
@@ -272,7 +340,7 @@ export async function deliverEpisode(episode: EffortEpisodeType, deps: EpisodeDe
       err: String(err),
     }),
   );
-  const outcome = await uploadEpisode({ scopeId, mint, episode }, deps).catch((err) => {
+  const outcome = await uploadEpisode({ scopeId, mint, episode, intelligence }, deps).catch((err) => {
     log.warn('episode upload attempt threw', { runId: episode.runId, scopeId, err: String(err) });
     return null;
   });

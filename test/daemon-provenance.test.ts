@@ -1,35 +1,44 @@
 /**
- * The daemon-provenance floor (PLNR-417).
+ * The daemon-provenance floor (PLNR-417, PLNR-426).
  *
  * Every Project Intelligence metric this daemon uploads is refined server-side by
- * `isDaemonObservation` (planar `apps/api/src/memory/episode-intelligence.ts`):
+ * `isDaemonObservation` (planar `apps/api/src/memory/episode-intelligence.ts`) against
+ * `DAEMON_PROVENANCE`/`DAEMON_SOURCES` — and since PLNR-426 those two allowlists, plus the
+ * `UploadedEpisodeIntelligence` shape they gate, live in `packages/shared/src/intelligence.ts` and
+ * are VENDORED wholesale into this repo (`vendor/noriq-shared/src/intelligence.ts`). This file used
+ * to say the opposite — "that constraint lives in the server's own source and is NOT part of the
+ * vendored slice, so nothing in this repo can typecheck against it" — which PLNR-426 made false by
+ * moving the constraint itself, not merely by adding a copy of it. That premise is retired; this
+ * test now imports the real allowlists rather than pinning a hand-copied Set.
  *
- *   DAEMON_PROVENANCE = { runner_observed, driver_reported, backend_observed, derived }
- *   DAEMON_SOURCES    = { runner, driver, vcs_backend }
+ * The hand-copied Set this file used to declare had already drifted from what it claimed to pin:
+ * planar's `DAEMON_PROVENANCE` carries FIVE values, including `'unavailable'` (deliberately — the
+ * common case when a Codex reviewer reports tokens but never sets a cost field must stay allowed),
+ * while the copy here had four and its own comment called `'unavailable'` "reserved for the server's
+ * own nobody-observed-this case". The drift happened within two days of the copy being written, in
+ * the safe direction (stricter than the server, so it cost a false failure here rather than a lost
+ * episode in production) — which is exactly the argument for importing instead of hand-maintaining a
+ * second copy that can only ever drift again.
  *
  * A refine failure does NOT drop the offending metric — `UPLOADED_EPISODE_SHAPE.safeParse` fails and
  * `ProjectMemory` skips the WHOLE uploaded row ("skipping malformed uploaded row"). So one wrong
- * provenance value costs an entire episode, silently, with an HTTP 200.
+ * provenance value costs an entire episode, silently, with an HTTP 200 — `src/episode-upload.ts`'s
+ * `toEnrichmentPayload` is what now catches that here, before upload, rather than letting planar
+ * discover it.
  *
- * That constraint lives in the server's own source and is NOT part of the vendored slice, so nothing
- * in this repo can typecheck against it. This file is the substitute: the allowlists are duplicated
- * here deliberately, as a pinned copy of a remote contract, so a builder that drifts outside them
- * fails here rather than in production as a vanished episode. If planar widens or narrows those sets,
- * this test is the thing that should be updated — and the mismatch it reports is the point.
- *
- * `MetricProvenance` itself is WIDER than the daemon set (`server_observed`, `inferred` and
- * `unavailable` are all legal values this daemon may never send), which is exactly how the original
- * defect passed every local check: `provenance: 'unavailable'` parses perfectly against
- * `EpisodeStageFact` and is rejected only at the ingest boundary.
+ * `MetricProvenance` itself is WIDER than the daemon set (`server_observed`, `inferred` are legal
+ * values this daemon may never send), which is exactly how the original defect passed every local
+ * check: `provenance: 'unavailable'` parses perfectly against `EpisodeStageFact` and used to be
+ * rejected only at the ingest boundary — and would still be, for any value truly outside the daemon
+ * set, which is why this test still exists even now that the allowlist itself is imported rather
+ * than copied: a typo here still needs to fail as loudly as it did before.
  */
 
+import { DAEMON_PROVENANCE, DAEMON_SOURCES } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { backendChangeStats } from '../src/change-stats';
 import { stageFactFromTelemetry } from '../src/stage-facts';
 import { completeDuration, notApplicableDuration, unavailableDuration } from '../src/stage-timing';
-
-const DAEMON_PROVENANCE = new Set(['runner_observed', 'driver_reported', 'backend_observed', 'derived']);
-const DAEMON_SOURCES = new Set(['runner', 'driver', 'vcs_backend']);
 
 const expectAcceptable = (metric: { provenance: string; source: string; acceptedAt: string | null }) => {
   expect(DAEMON_PROVENANCE.has(metric.provenance)).toBe(true);

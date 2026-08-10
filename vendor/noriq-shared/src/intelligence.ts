@@ -327,3 +327,87 @@ export const ProjectAnalyticsHealth = z.object({
   }),
 });
 export type ProjectAnalyticsHealth = z.infer<typeof ProjectAnalyticsHealth>;
+
+// PLNR-426: the daemon-reportable Project Intelligence CONTRACT — what a runner, driver, or VCS
+// backend may assert about an episode via the upload path (apps/api/src/do/ProjectMemory.ts'
+// completeEpisodeIngest). Storage/merge POLICY — how an accepted observation folds into the
+// server's ProjectIntelligenceEpisode, immutable commissioning fingerprints, last-writer-wins per
+// metric envelope, server-stamped acceptedAt — deliberately stays server-side, in
+// apps/api/src/memory/episode-intelligence.ts: a daemon has no business knowing HOW its facts are
+// merged, only WHAT it is allowed to assert. This file is vendored wholesale into the Runner repo,
+// so it can `safeParse` its own upload payload before sending it.
+
+/**
+ * Daemon-legal subsets of MetricProvenance / IntelligenceSource. Each is declared as a `const`
+ * tuple checked with `satisfies readonly MetricProvenance[]` (resp. `IntelligenceSource[]`), so a
+ * typo or a value that has drifted out of its parent enum fails `npx tsc --noEmit` at THIS
+ * declaration — not silently at runtime, three function calls later, as an entire discarded
+ * episode. That gap is exactly what PLNR-426 closes: `provenance: 'unavailable'` was legal in
+ * `MetricProvenance` but absent from the old hand-written `Set`, so it parsed clean against the
+ * vendored `EpisodeStageFact`, passed the Runner's typecheck/lint/tests, and still failed
+ * `daemonMetric`'s refine server-side — discarding the whole episode behind an HTTP 200.
+ *
+ * Membership must be preserved exactly: `server_observed` / `inferred` stay server-only (a daemon
+ * cannot forge a server-observed fact), and `unavailable` — the common case when, say, a Codex
+ * reviewer reports tokens but never sets a cost field — must stay allowed.
+ */
+const DAEMON_PROVENANCE_VALUES = [
+  'runner_observed',
+  'driver_reported',
+  'backend_observed',
+  'derived',
+  'unavailable',
+] as const satisfies readonly MetricProvenance[];
+export const DAEMON_PROVENANCE: ReadonlySet<string> = new Set(DAEMON_PROVENANCE_VALUES);
+
+const DAEMON_SOURCE_VALUES = [
+  'runner',
+  'driver',
+  'vcs_backend',
+] as const satisfies readonly IntelligenceSource[];
+export const DAEMON_SOURCES: ReadonlySet<string> = new Set(DAEMON_SOURCE_VALUES);
+
+type DaemonAssertableMetric = { provenance: string; source: string };
+
+function isDaemonObservation(metric: DaemonAssertableMetric): boolean {
+  return DAEMON_PROVENANCE.has(metric.provenance) && DAEMON_SOURCES.has(metric.source);
+}
+
+const daemonMetric = <T extends DaemonAssertableMetric>(schema: z.ZodType<T>) => schema.refine(isDaemonObservation, {
+  message: 'daemon intelligence must carry runner, driver, or VCS-backend provenance',
+});
+
+const UploadedEpisodeStageFact = EpisodeStageFact.extend({
+  elapsedMs: daemonMetric(EpisodeStageFact.shape.elapsedMs),
+  tokens: daemonMetric(EpisodeStageFact.shape.tokens),
+  costUSD: daemonMetric(EpisodeStageFact.shape.costUSD),
+});
+
+const UploadedBackendChangeStats = z.object({
+  backend: BackendChangeStats.shape.backend.optional(),
+  changedFiles: daemonMetric(BackendChangeStats.shape.changedFiles).optional(),
+  additions: daemonMetric(BackendChangeStats.shape.additions).optional(),
+  deletions: daemonMetric(BackendChangeStats.shape.deletions).optional(),
+  churn: daemonMetric(BackendChangeStats.shape.churn).optional(),
+});
+
+/**
+ * The only Project Intelligence facts an episode-uploading daemon may assert. Everything else in
+ * ProjectIntelligenceEpisode is server-owned and is stripped at the ingest boundary, including
+ * identity, source watermarks, algorithm versions, commissioning task/spec/strategy/budget,
+ * outcome, executed strategy, and executed spec.
+ */
+export const UploadedEpisodeIntelligence = z.object({
+  preExecution: z.object({
+    configuration: z.array(ConfigurationFingerprint).optional(),
+  }).optional(),
+  execution: z.object({
+    observedModelUsage: daemonMetric(IntelligenceModelUsageMetric).optional(),
+    clocks: z.object({
+      verifyDurationMs: daemonMetric(IntelligenceDurationMs).optional(),
+    }).optional(),
+    stages: z.array(UploadedEpisodeStageFact).optional(),
+    changes: UploadedBackendChangeStats.optional(),
+  }).optional(),
+});
+export type UploadedEpisodeIntelligence = z.infer<typeof UploadedEpisodeIntelligence>;

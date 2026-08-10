@@ -1021,8 +1021,8 @@ export class Daemon {
       // RUN-227's delivery sink. Fire-and-forget, same shape as `onLanded` above: `deliverEpisode`
       // enqueues durably before it ever touches the network (its own doc), so this dep can stay
       // synchronous and return before any I/O settles — `settle` never awaits it.
-      recordEpisode: (episode) => {
-        void deliverEpisode(episode, episodeDeliveryDeps).catch((err) =>
+      recordEpisode: (episode, intelligence) => {
+        void deliverEpisode(episode, episodeDeliveryDeps, intelligence).catch((err) =>
           this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
         );
       },
