@@ -78,24 +78,34 @@ import type { ContextPackGraphEntity, ContextPackSectionId } from './memory-cont
 export type MemoryAudience = 'author' | 'reviewer';
 
 /**
- * The author budget mirrors `repo-context.ts`'s `CONTEXT_BUDGET_CHARS` precedent (same number,
- * same reasoning: past this a brief stops being something a model reliably attends to as a
- * whole). It is a GUESS, not a measurement — this task shipped without a real `ContextPack` to
- * render against, and the frame here adds real overhead per excerpt (a label line plus a quoted
- * line per citation/lead-reason/support entry) that a raw `pack.charsUsed` figure does not
- * account for, so a pack the server bounded to, say, 12k characters of raw content could easily
- * render past 16k once framed. Watch it against a real pack before trusting this number either
- * way — it could be too generous or too tight, and this comment does not know which.
+ * The author budget, MEASURED (RUN-273) rather than the guess RUN-231 shipped: a real pack
+ * carrying two recorded memories with three citations renders to 3759 characters, so 16k holds
+ * roughly eight to ten such records — comfortable, and still the `CONTEXT_BUDGET_CHARS` precedent's
+ * reasoning for why there is a ceiling at all (past it a brief stops being something a model
+ * attends to as a whole). The per-excerpt framing overhead a raw `pack.charsUsed` does not account
+ * for is real but modest: 3759 rendered against 3716 of `charsUsed` for those same two records.
  */
 export const MEMORY_AUTHOR_MAX_CHARS = 16_000;
 
 /**
- * The judging-actor budget mirrors `repo-context.ts`'s `REVIEWER_CONTEXT_MAX_CHARS` precedent,
- * for the identical reason stated there: a reviewer's context already carries the diff it must
- * hold in mind, and `statement`/`whatWasAttempted`/etc. are unbounded free text a record's own
- * author controls the length of. Same "guess, not measurement" caveat as the author budget above.
+ * The judging-actor budget. RUN-231 set this to 2000 by analogy with
+ * `repo-context.ts`'s `REVIEWER_CONTEXT_MAX_CHARS`, and rendering a real pack (RUN-273) showed the
+ * analogy was wrong: THAT block is names-only conventions, a few short lines, while a memory
+ * excerpt is a recorded paragraph plus a quoted line per citation. Two real memories did not fit —
+ * the block truncated at 2000 with its cut marker, and it truncated BEFORE the duplicate rollup
+ * this task removed, which is why deleting ~2900 characters of duplication left the reviewer
+ * rendering byte-identical and still cut.
+ *
+ * 4000 is measured against that pack (two records + the reviewer frame ≈ 3600) with headroom for a
+ * third, not another analogy. The reason for a tighter ceiling than the author's is unchanged and
+ * still right — a reviewer's context already carries the diff, and a record's own author controls
+ * how long its statement is — it just has to be a number real content fits inside.
+ *
+ * The character slice stays the backstop rather than the plan: one pathological statement can
+ * exceed any ceiling, and when that happens the cut is MARKED in the output, so a judging actor
+ * that receives a record ending mid-sentence can see that is what happened.
  */
-export const MEMORY_REVIEWER_MAX_CHARS = 2_000;
+export const MEMORY_REVIEWER_MAX_CHARS = 4_000;
 
 const QUOTE = '| ';
 
@@ -149,6 +159,25 @@ function safeStringify(item: Record<string, unknown>): string {
     return '(structured content that could not be rendered)';
   }
 }
+
+/**
+ * `source_excerpts` carries no content of its own (RUN-273, found by rendering a REAL pack): the
+ * assembler's own words are "a pure ROLLUP of what already survived its OWN section's budget
+ * above", de-duplicated by `(kind, id)` — so every excerpt in it was already rendered under
+ * `active_decisions`/`known_hazards`/etc. Walking it like any other section showed each memory
+ * TWICE, statement and citations and verdicts entire. Measured on a two-memory pack: ~2916 of 6449
+ * author characters were the duplicate, and the reviewer rendering came to 2063 against its 2000
+ * budget — so real evidence was cut purely because it had been said once already. Planar's own
+ * quoted-evidence renderer excludes this section for the identical reason.
+ *
+ * Skipped by SECTION rather than by deduping excerpt ids while walking, because the rollup is a
+ * property of the section in the contract, not a coincidence between two sections — and a
+ * membership test is a rule a future rollup section could slip past, where the walk is one place.
+ *
+ * The worse half of the harm was never the budget: a model shown one record twice reads two
+ * independent records that agree, which is exactly the weight a LEAD must not carry.
+ */
+const ROLLUP_SECTIONS: ReadonlySet<ContextPackSectionId> = new Set(['source_excerpts']);
 
 const SECTION_TITLES: Record<ContextPackSectionId, string> = {
   active_decisions: 'ACTIVE DECISIONS',
@@ -283,11 +312,12 @@ function renderSection(section: VerifiedContextPackSection): string[] {
  *  audience, since "nothing to show" is a fact about the PACK, not about who is reading it. */
 function packHasContent(pack: VerifiedContextPack): boolean {
   const sectionHasContent = (s: VerifiedContextPackSection): boolean =>
-    s.excerpts.length > 0 ||
-    s.graphEntities.length > 0 ||
-    s.items.length > 0 ||
-    s.notice !== null ||
-    s.coverage?.complete === false;
+    !ROLLUP_SECTIONS.has(s.id) &&
+    (s.excerpts.length > 0 ||
+      s.graphEntities.length > 0 ||
+      s.items.length > 0 ||
+      s.notice !== null ||
+      s.coverage?.complete === false);
   return pack.sections.some(sectionHasContent) || pack.notices.length > 0 || pack.staleWarnings.length > 0;
 }
 
@@ -300,7 +330,12 @@ function buildBody(pack: VerifiedContextPack): string[] {
   // than re-sorting by the enum's declaration order: correct either way if the server fills them in
   // that order (the common case the enum's own comment asserts), and still correct — never silently
   // reordering server-provided priority — if some future server response ever did not.
-  for (const section of pack.sections) lines.push(...renderSection(section));
+  // The ONE place a rollup section is declined (RUN-273, see `ROLLUP_SECTIONS`) — inside the walk,
+  // so every later consumer of `renderSection` inherits it rather than repeating the test.
+  for (const section of pack.sections) {
+    if (ROLLUP_SECTIONS.has(section.id)) continue;
+    lines.push(...renderSection(section));
+  }
   if (pack.notices.length) {
     lines.push('\nPACK-LEVEL NOTICES:');
     for (const n of pack.notices) {
@@ -360,6 +395,10 @@ export function suggestedMemoryPaths(pack: VerifiedContextPack, declared: readon
   const seen = new Set<string>();
   const out: string[] = [];
   for (const section of pack.sections) {
+    // Skips rollups for the same reason the render walk does (RUN-273). The `seen` dedupe below
+    // already made the RESULT right; reading the same section set is what keeps it right if a
+    // later change ever counts occurrences rather than collecting distinct paths.
+    if (ROLLUP_SECTIONS.has(section.id)) continue;
     for (const exc of section.excerpts) {
       if (exc.excerptKind !== 'memory') continue;
       for (const c of exc.evidence) {

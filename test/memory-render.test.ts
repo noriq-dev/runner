@@ -465,6 +465,48 @@ describe('renderMemoryEvidence — graph entities and uninterpreted items', () =
   });
 });
 
+// RUN-273, found by rendering a REAL pack rather than a fixture: `source_excerpts` is a ROLLUP of
+// excerpts already carried by their own sections, so walking it showed every memory twice. The
+// shape below is the live server's — a decision in `active_decisions`, a hazard in `known_hazards`,
+// and BOTH repeated in `source_excerpts`.
+describe('renderMemoryEvidence — rollup sections (RUN-273)', () => {
+  const decision = memoryExcerpt({ id: 'mem_d', statement: 'DECISION-STATEMENT-MARKER' });
+  const hazard = memoryExcerpt({
+    id: 'mem_h',
+    memoryKind: 'hazard',
+    statement: 'HAZARD-STATEMENT-MARKER',
+  });
+  const withRollup = pack([
+    section({ id: 'active_decisions', excerpts: [decision] }),
+    section({ id: 'known_hazards', excerpts: [hazard] }),
+    section({ id: 'source_excerpts', provenance: ['exact'], excerpts: [decision, hazard] }),
+  ]);
+
+  it('renders each excerpt exactly once, and never the rollup section itself', () => {
+    const out = renderMemoryEvidence(withRollup, { audience: 'author', budget: 100_000 });
+    const count = (m: string) => out.split(m).length - 1;
+    expect(count('DECISION-STATEMENT-MARKER')).toBe(1);
+    expect(count('HAZARD-STATEMENT-MARKER')).toBe(1);
+    expect(out).toContain('ACTIVE DECISIONS');
+    expect(out).toContain('KNOWN HAZARDS');
+    expect(out).not.toContain('SOURCE EXCERPTS');
+  });
+
+  it('a pack whose ONLY content is the rollup renders nothing, rather than a header with no body', () => {
+    const rollupOnly = pack([section({ id: 'source_excerpts', excerpts: [decision] })]);
+    expect(renderMemoryEvidence(rollupOnly, { audience: 'author' })).toBe('');
+  });
+
+  it('suggestedMemoryPaths reads the same section set the renderer does', () => {
+    const cited = memoryExcerpt({ id: 'mem_c', evidence: [citation({ path: 'src/one.ts' })] });
+    const p = pack([
+      section({ id: 'active_decisions', excerpts: [cited] }),
+      section({ id: 'source_excerpts', excerpts: [cited] }),
+    ]);
+    expect(suggestedMemoryPaths(p, [])).toEqual(['src/one.ts']);
+  });
+});
+
 describe('renderMemoryEvidence — section order', () => {
   it("renders sections in the PACK's own array order, not re-sorted by the schema enum", () => {
     const p = pack([
