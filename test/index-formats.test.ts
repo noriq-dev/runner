@@ -3,6 +3,7 @@ import {
   createJsonAdapter,
   createMarkdownAdapter,
   createTomlAdapter,
+  createUbtAdapter,
   githubHeadingSlug,
   isRepoGuidanceSurfacePath,
 } from '../src/index-formats';
@@ -10,6 +11,7 @@ import {
 const jsonAdapter = createJsonAdapter();
 const tomlAdapter = createTomlAdapter();
 const markdownAdapter = createMarkdownAdapter();
+const ubtAdapter = createUbtAdapter();
 
 describe('canParse / languages', () => {
   it('claims the extension each adapter owns, and declares its language', () => {
@@ -614,5 +616,303 @@ describe('isRepoGuidanceSurfacePath', () => {
   it('extraction is uniform regardless of guidance status — headings still extract from a non-guidance file', async () => {
     const result = await markdownAdapter.parse({ path: 'src/notes.md', content: '# Notes\n\nsome text\n' });
     expect(result.symbols).toContainEqual(expect.objectContaining({ symbolPath: ['Notes'] }));
+  });
+});
+
+describe('.Build.cs / .Target.cs — UBT module descriptor (RUN-280)', () => {
+  it('claims .Build.cs and .Target.cs case-insensitively, and declares its language', () => {
+    expect(ubtAdapter.canParse('Source/ProjectNod/ProjectNod.Build.cs')).toBe(true);
+    expect(ubtAdapter.canParse('Source/ProjectNod.TARGET.CS')).toBe(true);
+    expect(ubtAdapter.canParse('Source/ProjectNod/ProjectNod.cpp')).toBe(false);
+    expect(ubtAdapter.languages).toEqual(['ubt']);
+  });
+
+  // Every fixture below is copied verbatim from the marked checkout the daemon actually discovers
+  // (~/Diversion/Prototype — the one RUN-239 measured wrong; see INDEX-OPERATIONS.md at 1adaaea),
+  // per this task's own execution spec ("Fixtures from the REAL repo's shapes").
+
+  it('Source/ProjectNodEditor/ProjectNodEditor.Build.cs — single-line new[] {...}, depends on an in-repo module', async () => {
+    const content = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class ProjectNodEditor : ModuleRules
+{
+	public ProjectNodEditor(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "ProjectNod" });
+		PrivateDependencyModuleNames.AddRange(new[]
+		{
+			"UnrealEd", "AssetRegistry", "ToolMenus", "ContentBrowser", "Slate", "SlateCore",
+			"NodCharacterCreator", "NodCharacterCreatorEditor", "NodInventoryCore", "GameplayTags",
+			"ChaosOutfitAssetEngine", "ChaosClothAssetEngine",
+			"MetaHumanCharacter", "MetaHumanCharacterPalette", "RenderCore", "MeshDescription"
+		});
+	}
+}
+`;
+    const result = await ubtAdapter.parse({
+      path: 'Source/ProjectNodEditor/ProjectNodEditor.Build.cs',
+      content,
+    });
+    expect(result.diagnostics).toEqual([]);
+    expect(result.declaresModule).toBe('ProjectNodEditor');
+    expect(result.symbols).toEqual([
+      {
+        symbolPath: ['ProjectNodEditor'],
+        nodeType: 'symbol',
+        label: 'ProjectNodEditor',
+        content: null,
+        range: { startLine: 5, endLine: 5 },
+      },
+    ]);
+    const names = result.moduleDependencies?.map((d) => d.moduleName);
+    expect(names).toEqual([
+      'Core',
+      'CoreUObject',
+      'Engine',
+      'ProjectNod', // the real, in-repo edge this fixture exists to prove (resolved in indexer.test.ts).
+      'UnrealEd',
+      'AssetRegistry',
+      'ToolMenus',
+      'ContentBrowser',
+      'Slate',
+      'SlateCore',
+      'NodCharacterCreator',
+      'NodCharacterCreatorEditor',
+      'NodInventoryCore',
+      'GameplayTags',
+      'ChaosOutfitAssetEngine',
+      'ChaosClothAssetEngine',
+      'MetaHumanCharacter',
+      'MetaHumanCharacterPalette',
+      'RenderCore',
+      'MeshDescription',
+    ]);
+  });
+
+  it('Source/ProjectNod/ProjectNod.Build.cs — a real conditional block declines, and is counted', async () => {
+    // Trimmed to the shape that matters (the huge unconditional PrivateDependencyModuleNames list is
+    // exercised by a shorter fixture below) — the multi-line AddRange plus the real
+    // `if (Target.bBuildEditor) { PrivateDependencyModuleNames.AddRange(...) }` guard is what this
+    // fixture proves.
+    const content = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class ProjectNod : ModuleRules
+{
+	public ProjectNod(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput",
+			// Project-owned wearable authoring metadata subclasses UNodWearableItem.
+			"NodCharacterCreator",
+		});
+
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[]
+			{
+				"UnrealEd", "BlueprintGraph", "BlueprintEditorLibrary", "AssetTools",
+			});
+		}
+	}
+}
+`;
+    const result = await ubtAdapter.parse({ path: 'Source/ProjectNod/ProjectNod.Build.cs', content });
+    expect(result.declaresModule).toBe('ProjectNod');
+    const names = result.moduleDependencies?.map((d) => d.moduleName);
+    expect(names).toEqual([
+      'Core',
+      'CoreUObject',
+      'Engine',
+      'InputCore',
+      'EnhancedInput',
+      'NodCharacterCreator',
+    ]);
+    // The four editor-only names must NOT appear above — declined, never extracted as unconditional.
+    expect(names).not.toContain('UnrealEd');
+    expect(result.diagnostics).toEqual([
+      {
+        message:
+          '4 dependency name(s) declared inside a conditional block ' +
+          '(if/for/foreach/while/switch/catch/try/do) were not extracted — this adapter reads only ' +
+          'unconditionally declared dependencies',
+        severity: 'warning',
+      },
+    ]);
+  });
+
+  it('Plugins/NodBuildingSystem/.../NodBuildingSystemCore.Build.cs — every dependency is an engine module', async () => {
+    // Real, not invented: this is the ENTIRE file. Exercises the decline path this task's own
+    // acceptance names explicitly — a .Build.cs whose dependencies are all engine modules still
+    // yields a module entity (proven here) and, once resolved by runIndexer, zero edges (proven in
+    // indexer.test.ts, since resolution is a cross-file question this adapter cannot answer alone).
+    const content = `// Copyright Project Nod. All Rights Reserved.
+
+using UnrealBuildTool;
+
+// Dependency-lean core: piece/material/claim types and the tiling solver.
+// No actors, no GeometryScript, no UI — everything here must stay unit-testable in isolation.
+public class NodBuildingSystemCore : ModuleRules
+{
+	public NodBuildingSystemCore(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"Core",
+			"CoreUObject",
+			"Engine"
+		});
+	}
+}
+`;
+    const result = await ubtAdapter.parse({
+      path: 'Plugins/NodBuildingSystem/Source/NodBuildingSystemCore/NodBuildingSystemCore.Build.cs',
+      content,
+    });
+    expect(result.declaresModule).toBe('NodBuildingSystemCore');
+    expect(result.moduleDependencies?.map((d) => d.moduleName)).toEqual(['Core', 'CoreUObject', 'Engine']);
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  it('Source/ProjectNod.Target.cs — ExtraModuleNames.Add, a repeated single-string call, not AddRange', async () => {
+    const content = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using UnrealBuildTool;
+using System.Collections.Generic;
+
+public class ProjectNodTarget : TargetRules
+{
+	public ProjectNodTarget(TargetInfo Target) : base(Target)
+	{
+		Type = TargetType.Game;
+		DefaultBuildSettings = BuildSettingsVersion.V7;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;
+		ExtraModuleNames.Add("ProjectNod");
+	}
+}
+`;
+    const result = await ubtAdapter.parse({ path: 'Source/ProjectNod.Target.cs', content });
+    expect(result.declaresModule).toBe('ProjectNodTarget');
+    expect(result.moduleDependencies).toEqual([{ moduleName: 'ProjectNod' }]);
+    expect(result.symbols[0]?.label).toBe('ProjectNodTarget');
+  });
+
+  it('Plugins/.../NodCoreTechRuntime.Build.cs — a commented-out call never mints a phantom dependency', async () => {
+    // Real, measured hazard, not a hypothetical: this file's OWN comment (line 52 in the real repo)
+    // reads `// Original had: if (...) PrivateDependencyModuleNames.Add("UnrealEd");` — text that,
+    // read naively, is indistinguishable from a live call. If comment-stripping did not run first,
+    // "UnrealEd" would appear in moduleDependencies from a sentence about code that no longer runs.
+    const content = `// Vendored from Engine/Plugins/MetaHuman/MetaHumanCoreTechLib (UE 5.8), retyped Runtime.
+
+using UnrealBuildTool;
+using System.IO;
+
+public class NodCoreTechRuntime : ModuleRules
+{
+	public NodCoreTechRuntime(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PublicDependencyModuleNames.AddRange(new string[] {
+			"Engine",
+			"Eigen",
+			"RigLogicLib",
+			"RigLogicModule",
+			"MetaHumanSDKRuntime",
+		});
+
+		PrivateDependencyModuleNames.AddRange(new string[] {
+			"Core",
+			"CoreUObject",
+			"Projects",
+			"Json",
+			"ImageCore",
+			"CaptureDataCore",
+			"MetaHumanCoreTech",
+			"simde",
+			// Nod additions: runtime vertex apply (external morph sets) + baked vertex map asset.
+			"NodCharacterCreator",
+			"RenderCore",
+			"RHI",
+			// Runtime blend backend: UMetaHumanCharacter preset assets + preset enumeration.
+			"MetaHumanCharacter",
+			"AssetRegistry",
+			// Groom equip: UGroomComponent::SetGroomAsset (runtime-legal; bindings ship pre-built).
+			"HairStrandsCore",
+			"MeshDescription",
+			"SkeletalMeshDescription",
+			"MeshResizingCore"
+		});
+
+		// Original had: if (Target.Type == TargetType.Editor) PrivateDependencyModuleNames.Add("UnrealEd");
+		// Removed — UnrealEd is not load-bearing for the blend math, and this module must build in cooked targets.
+
+		if (Target.IsInPlatformGroup(UnrealPlatformGroup.Desktop))
+		{
+			PrivateDefinitions.Add("CARBON_ENABLE_SSE=1");
+		}
+	}
+}
+`;
+    const result = await ubtAdapter.parse({
+      path: 'Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/NodCoreTechRuntime.Build.cs',
+      content,
+    });
+    const names = result.moduleDependencies?.map((d) => d.moduleName) ?? [];
+    expect(names).not.toContain('UnrealEd');
+    expect(names).toHaveLength(22);
+    expect(names).toContain('NodCharacterCreator');
+    // No conditional-decline diagnostic here — the near-miss line is fully inside a `//` comment, so
+    // it never reaches the conditional-block scan at all (it is gone before that runs).
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  it('declines the whole file when no ModuleRules/TargetRules subclass is found', async () => {
+    const result = await ubtAdapter.parse({ path: 'Source/Weird.Build.cs', content: '// nothing here\n' });
+    expect(result.symbols).toEqual([]);
+    expect(result.declaresModule).toBeUndefined();
+    expect(result.diagnostics).toEqual([
+      { message: 'no ModuleRules or TargetRules subclass found — nothing extracted', severity: 'warning' },
+    ]);
+  });
+
+  it('a module that declares no dependency list at all still yields its own entity, zero dependencies', async () => {
+    // Real: Plugins/MeshNet/Source/ThirdParty/NatsC/NatsC.Build.cs never calls
+    // Public/PrivateDependencyModuleNames — only PublicSystemIncludePaths/PublicAdditionalLibraries/
+    // PublicSystemLibraries, none of which this adapter tracks (measured: zero occurrences of any
+    // other AddRange target across every real .Build.cs under Source/ and Plugins/).
+    const content = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using System.IO;
+using UnrealBuildTool;
+
+public class NatsC : ModuleRules
+{
+	public NatsC(ReadOnlyTargetRules Target) : base(Target)
+	{
+		Type = ModuleType.External;
+		PublicSystemIncludePaths.Add(Path.Combine(ModuleDirectory, "include"));
+		if (Target.Platform == UnrealTargetPlatform.Linux)
+		{
+			PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "lib", "Linux", "libnats_static.a"));
+			PublicSystemLibraries.Add("pthread");
+		}
+	}
+}
+`;
+    const result = await ubtAdapter.parse({
+      path: 'Plugins/MeshNet/Source/ThirdParty/NatsC/NatsC.Build.cs',
+      content,
+    });
+    expect(result.declaresModule).toBe('NatsC');
+    expect(result.moduleDependencies).toEqual([]);
+    expect(result.diagnostics).toEqual([]);
   });
 });

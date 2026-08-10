@@ -303,6 +303,13 @@ export interface IndexerResult {
    *  and one unlabelled row used to fail an ENTIRE generation with a server-side 409. Expected to
    *  be 0 on almost every repo; a non-zero value names an adapter worth looking at. */
   unlabelledSymbolsDropped: number;
+  /** RUN-280: `ParsedModuleDependency` names that resolved to no module this generation declared —
+   *  an engine module (`Core`, `Engine`, `UMG`, …) living in the Unreal installation rather than the
+   *  repo, or a name two files ambiguously declared. Expected to be the LARGE majority of a real
+   *  UBT repo's declared dependencies, not a rare tail — most of what a `.Build.cs` depends on is
+   *  the engine itself. Counted for the same reason `inferredEdgesOmitted` is: a row this daemon
+   *  chose not to send is still a fact about the generation. */
+  declinedModuleDependencies: number;
 }
 
 /** Scan `source` under `config` and produce a complete, ready-to-upload generation. */
@@ -337,8 +344,17 @@ export async function runIndexer(
   const pendingImports: Array<{ importerPath: string; specifier: string }> = [];
   // Same reason, same shape, different edge type — see this module's doc on `related_to` (RUN-257).
   const pendingReferences: Array<{ referencerPath: string; target: string }> = [];
+  // RUN-280: name-keyed sibling of the two above — every module name any file's `declaresModule`
+  // reported this pass, mapped to the URI already minted for it. `null` marks a name TWO files
+  // declared (ambiguous — may-miss-never-invent, the same posture an unresolved `imports` specifier
+  // gets), never picked arbitrarily. See `index-formats.ts`'s UBT adapter doc for why this cannot
+  // reuse `resolveRelativeImport`'s relative-path grammar: a UBT module's declaring file has no
+  // directional relationship to the dependant's own directory.
+  const moduleUriByName = new Map<string, string | null>();
+  const pendingModuleDependencies: Array<{ fromUri: string; moduleName: string }> = [];
   let inferredEdgesOmitted = 0;
   let unlabelledSymbolsDropped = 0;
+  let declinedModuleDependencies = 0;
 
   // RUN-238: shared across every checkpoint below — see the module doc's own note on why
   // `signal`/`isRunBusy` are checked identically at every one of them.
@@ -475,6 +491,24 @@ export async function runIndexer(
       if (from && to) records.push({ kind: 'edge', type: 'calls', from, to });
     }
 
+    // RUN-280: register this file's own declared module name (if it has one) and queue its
+    // dependency names for the name-keyed second pass below — see `moduleUriByName`'s own doc.
+    // `uriByRawSymbolPath` already holds the URI the loop above minted for it, so this reuses that
+    // instead of recomputing one — the module symbol and the name that resolves OTHER files'
+    // dependencies onto it must always be the same URI, and there is exactly one place that mints it.
+    if (parsed.declaresModule) {
+      const moduleUri = uriByRawSymbolPath.get(JSON.stringify([parsed.declaresModule]));
+      if (moduleUri) {
+        moduleUriByName.set(
+          parsed.declaresModule,
+          moduleUriByName.has(parsed.declaresModule) ? null : moduleUri,
+        );
+        for (const dep of parsed.moduleDependencies ?? []) {
+          pendingModuleDependencies.push({ fromUri: moduleUri, moduleName: dep.moduleName });
+        }
+      }
+    }
+
     for (const imp of parsed.imports ?? []) {
       pendingImports.push({ importerPath: path, specifier: imp.specifier });
     }
@@ -535,6 +569,33 @@ export async function runIndexer(
     const from = buildFileEntityUri(scope, referencerPath);
     const to = buildFileEntityUri(scope, resolvedPath);
     records.push({ kind: 'edge', type: 'related_to', from, to });
+  }
+
+  // RUN-280: resolve `pendingModuleDependencies` against the now-complete `moduleUriByName` — a
+  // THIRD two-pass resolution, same shape as the two above and for the identical order-independence
+  // reason, but keyed by NAME rather than by `resolveRelativeImport`'s relative-path grammar (see
+  // `index-formats.ts`'s UBT adapter doc for why a module dependency cannot use that resolver: its
+  // declaring file has no directional relationship to the dependant's own directory). Emits
+  // `depends_on`, never `imports` — a module naming another module is a different claim from a file
+  // importing a sibling, and `depends_on` is the vendored `MemoryEdgeType` arm that already says so.
+  let moduleDepsSinceCheckpoint = 0;
+  for (const { fromUri, moduleName } of pendingModuleDependencies) {
+    moduleDepsSinceCheckpoint++;
+    if (moduleDepsSinceCheckpoint >= yieldEveryFiles) {
+      moduleDepsSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+    const toUri = moduleUriByName.get(moduleName);
+    // Absent (never declared this generation — an engine module, the COMMON case: most UBT
+    // dependencies are Core/CoreUObject/Engine/UMG/Slate, which live in the Unreal installation, not
+    // the repo) or `null` (declared by two different files, ambiguous) both decline the same way an
+    // unresolved `imports` specifier does: an edge to a node this generation never sent is an edge
+    // to nothing. Counted, never silently dropped — see `IndexerResult.declinedModuleDependencies`.
+    if (!toUri) {
+      declinedModuleDependencies += 1;
+      continue;
+    }
+    records.push({ kind: 'edge', type: 'depends_on', from: fromUri, to: toUri });
   }
 
   reportPhase('parse', tPhase);
@@ -598,5 +659,6 @@ export async function runIndexer(
     unlabelledSymbolsDropped,
     duplicateEdgesDropped,
     duplicateNodeUris,
+    declinedModuleDependencies,
   };
 }

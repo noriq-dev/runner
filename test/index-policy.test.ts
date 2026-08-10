@@ -23,7 +23,7 @@ describe('IndexPolicy — the runner-owned execution knobs', () => {
   it('defaults every knob when the table is empty', () => {
     const parsed = IndexPolicy.parse({});
     expect(parsed).toEqual({
-      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini'],
+      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini', 'ubt'],
       contentMode: 'full',
       maxFiles: 20_000,
       maxFileBytes: 1_000_000,
@@ -99,7 +99,7 @@ describe('resolveIndexConfig — decision 4/5: off unless enabled, invalid refus
       // RUN-262: the machine-wide default is layered on UNDER `exclude`, never merged into it —
       // `exclude` above is exactly what the repo declared, unchanged.
       defaultExclude: DEFAULT_EXCLUDE_GLOBS,
-      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini'],
+      languages: ['typescript', 'javascript', 'markdown', 'json', 'toml', 'cpp', 'ini', 'ubt'],
       contentMode: 'metadata',
       maxFiles: 10,
       maxFileBytes: 1_000_000,

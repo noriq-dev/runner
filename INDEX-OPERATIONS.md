@@ -372,7 +372,8 @@ engine initialized exactly once (`initCount: 1`) regardless of how many grammars
 
 ### INDEXER_VERSION bump, and the acceptance line it cannot fully satisfy
 
-`INDEXER_VERSION` (`src/index-reconcile.ts`) moved `'1'` → `'2'` — mandatory, not housekeeping: a
+`INDEXER_VERSION` (`src/index-reconcile.ts`) moved `'1'` → `'2'` (RUN-239), then `'2'` → `'3'`
+(RUN-280, the `.Build.cs`/`.Target.cs` adapter below) — mandatory, not housekeeping, both times: a
 new adapter (or a widened `canParse`) changes this daemon's output for files that were previously
 untouched or NOOP-only, and `deriveGenerationId` is keyed on `indexerVersion` specifically so an
 older active generation is unconditionally superseded by a FULL pass rather than silently trusted
@@ -422,19 +423,114 @@ bookkeeping holds correctly under this load — no crash, no hang, an honest cou
 fit — and the escape hatch (`excludeDefaults = false`) still works exactly as it does for every
 other default.
 
+### RUN-280: the `.Build.cs`/`.Target.cs` module descriptor adapter — no grammar, measured against the marked checkout
+
+RUN-239 deferred a C# adapter over `tree-sitter-c-sharp.wasm`'s 5.1 MB, having measured only 8
+files — on the WRONG checkout (`~/Diversion/Prototypes/ProjectNodPrototypeV1`; corrected above). The
+marked checkout (`~/Diversion/Prototype`, the one carrying `.noriq/project.toml`) has **50**: 47
+`.Build.cs` + 3 `.Target.cs` (the task body's own figure of 51 combined `.cs`/`.Build.cs`/`.Target.cs`
+included one file under a since-excluded `node_modules/` copy of a plugin, not scanned here). Adding
+the grammar for 50 files this small is still the wrong trade — a UBT module descriptor is a fixed,
+tiny shape (one class declaration, one or two `AddRange`/`Add` calls naming string literals), not
+general C#, so `src/index-formats.ts`'s `createUbtAdapter` reads it the same hand-rolled,
+non-tree-sitter way the JSON/TOML/markdown adapters already read their own fixed shapes.
+
+**What is extracted**: the module/target class name (`class X : ModuleRules` / `class X :
+TargetRules`) and the string-literal entries of `PublicDependencyModuleNames` /
+`PrivateDependencyModuleNames` (a `.Build.cs`) or `ExtraModuleNames` (a `.Target.cs`) — the only
+`*ModuleNames.Add(Range)` properties with any real occurrence across every `.Build.cs`/`.Target.cs`
+under Project Nod's `Source/`/`Plugins/` (grep-measured; no `DynamicallyLoadedModuleNames`, no
+`PublicIncludePathModuleNames`, anywhere). Comments are stripped before anything else runs — a real,
+measured hazard, not a hypothetical one: `Plugins/NodCharacterCreator/Source/NodCoreTechRuntime/
+NodCoreTechRuntime.Build.cs` carries the line `// Original had: if (...)
+PrivateDependencyModuleNames.Add("UnrealEd");`, commented-out code that a naive regex over raw text
+would read as a live call. A dependency name inside a conditional block (`if
+(Target.bBuildEditor)`, `if (Target.Platform == ...)`) is declined, never extracted as
+unconditional — also measured, not hypothetical: real files gate calls behind both kinds of guard
+(`ProjectNod.Build.cs`, `NatsC.Build.cs`, three others), and the adapter counts what it declined in
+a diagnostic per file rather than dropping the fact silently.
+
+**Representation**: a module (or target) is a `nodeType: 'symbol'` entity on its own file —
+`MemoryNodeType` is a vendored wire contract this repo cannot grow, and `symbol` is the same arm
+every other adapter in `index-formats.ts` uses for "a repository-scoped declaration a graph can
+point at". The dependency is a `depends_on` edge — a distinct `MemoryEdgeType` arm, unused anywhere
+in this codebase before this task, and the semantically correct one: `imports` means "this FILE
+would not run without that one" and resolves through `resolveRelativeImport`'s relative-path
+grammar; a UBT module dependency is a MODULE naming another MODULE by a bare name whose declaring
+file can live anywhere in the tree (measured: `Source/ProjectNod/ProjectNod.Build.cs` depends on
+`Plugins/NodCharacterCreator/Source/NodCharacterCreator/NodCharacterCreator.Build.cs` — not a
+sibling, unreachable by any relative-path guess). `src/indexer.ts` resolves it through a THIRD
+two-pass mechanism (`moduleUriByName`/`pendingModuleDependencies`), name-keyed rather than
+path-keyed, mirroring the `imports`/`related_to` two-pass shape RUN-217/257 already established for
+the identical order-independence reason.
+
+**A dependency naming a module this generation never declared emits no edge — measured as the
+COMMON case, not an edge case.** Most UBT dependencies are engine modules (`Core`, `CoreUObject`,
+`Engine`, `UMG`, `Slate`, …) living in the Unreal installation, never scanned by this indexer.
+`IndexerResult.declinedModuleDependencies` counts every one, the same "counted, never silently
+dropped" posture `inferredEdgesOmitted` already has.
+
+**Measured against real content** (not a synthetic fixture): every `.Build.cs`/`.Target.cs` under
+the marked checkout was copied, with its real relative path preserved, into a scratch directory and
+indexed with `noriq-runner index-repo --force` — a full-repository run at the marked checkout's own
+root stops early on `[index].maxTotalBytes` (100 MB, the repo's own default) before ever reaching
+`Source/`/`Plugins/`, because `Content/` — 8.36 GB of tracked `.uasset`/`.umap`, default-excluded
+but still walked in directory order — sorts first; this is `index-scan.ts`'s existing, already-
+documented walk-order/budget behaviour (see the status-collector caveat above), not anything this
+adapter causes, and scoping the measurement to the 50 real descriptor files isolates it cleanly:
+
+| | count |
+| --- | --- |
+| `.Build.cs` + `.Target.cs` files (marked checkout) | 50 |
+| Module/target entities extracted | 48 |
+| `declares` edges (file → its module entity) | 48 |
+| `depends_on` edges (in-repo module dependency, resolved) | 123 |
+| Dependency names declined — this generation never declared them (engine modules, the common case) | 318 |
+| Dependency names declined — inside a conditional block, never offered for resolution at all | 16 (across 5 files: 1+1+1+9+4) |
+| Files whose module entity is withheld — see below | 2 |
+
+The 2 withheld files are `Plugins/PIE_Studio/Source/PIE_Studio/PIE_Studio.Build.cs` and
+`Plugins/UE_MCP_Bridge/Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs` — **not an adapter defect**:
+`indexer.ts`'s pre-existing RUN-258 credential-marker check withholds a file's whole content (and
+skips adapter parsing entirely) before this adapter is ever called. Reading why is itself a real
+finding, filed for whoever owns `index-redact.ts` rather than fixed here (out of this task's own
+scope — that check is a cross-language security floor, not UBT-specific): both files trip it on
+line 7, `PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;` — three dot-separated
+10+ character identifiers is exactly what `JWT_SEARCH_RE` (`src/index-redact.ts`) matches, and an
+ordinary C# namespaced-property chain satisfies that shape with no JWT anywhere near it. Confirmed
+by direct inspection: neither file contains anything resembling a real token. A false positive on
+this shape will recur on any `Namespace.Class.LongPropertyName` chain in any language this daemon
+ever adds a text-scanning floor over.
+
+Determinism holds on this real data too: `index-repo --check-determinism` over the same 50-file
+mirror reports `PASS — two runs produced byte-identical output`. The two acceptance-line fixtures
+are both present in the real graph, not just in unit tests: `ProjectNodEditor` → `ProjectNod` is a
+real `depends_on` edge (an in-repo dependency, resolved), and `NodBuildingSystemCore` — whose entire
+declared dependency list is `Core`, `CoreUObject`, `Engine` — produces its module entity and zero
+outgoing edges.
+
+### Bundle size, measured before and after this task
+
+| | dist/cli.js |
+| --- | --- |
+| Before RUN-280 | 13,317,923 bytes |
+| After RUN-280 | 13,326,911 bytes |
+
++8,988 bytes (~0.07%) for the whole adapter plus its `indexer.ts` resolution pass — no grammar, as
+locked. For scale, the deferred C# grammar alone (`tree-sitter-c-sharp.wasm`) is 5,103,332 bytes.
+
 ### What is deliberately absent
 
-- **C#, Go, Rust, Python adapters** — measured, not overlooked: 8 UBT `.Build.cs`/`.Target.cs`
-  files (C#, `tree-sitter-c-sharp.wasm` is 5,103,332 bytes — nearly doubling the bundle again for a
-  vendor-tooling format, not gameplay code), 2 `.py` files, and zero Go/Rust files anywhere.
-- **A non-tree-sitter `.Build.cs`/`.Target.cs` adapter** extracting UBT module dependencies without
-  paying the 5.1 MB C# grammar cost — those files declare the Unreal module graph, the most
-  interesting structure in the repo after `.uproject`/`.uplugin`, and are the most likely NEXT step;
-  deliberately not this task.
+- **A general C# adapter and the C# tree-sitter grammar** — RUN-280 shipped the narrow, no-grammar
+  `.Build.cs`/`.Target.cs` adapter instead (see above); `tree-sitter-c-sharp.wasm` (5,103,332 bytes)
+  remains unshipped, still the wrong trade for 50 files with a fixed shape.
+- Go, Rust, Python adapters — measured, not overlooked: 2 `.py` files and zero Go/Rust files
+  anywhere in any Noriq-managed project.
+- **Evaluating conditional UBT logic** (`if (Target.Platform == ...)` branches around a dependency
+  list) — the RUN-280 adapter extracts only what is unconditionally declared and counts what a
+  conditional block hid; it does not attempt to resolve `Target.*` at parse time.
 - **Per-language parser versions on the wire, and targeted per-language reindex** — see the
   INDEXER_VERSION section above; blocked on a planar contract change.
-- **Marking Project Nod with a `.noriq/project.toml`** — it has none today, so the daemon does not
-  discover it at all. This task makes C++ ready; it does not onboard that repo.
 - **Load-testing an Unreal repo end to end through the Diversion backend** — the snapshot path
   (lease/list/read/release) is verified now, see "What is unmeasured" below; the LOAD path is not,
   and nothing here changes that (the real-repo runs in this section used `index-repo`'s local
@@ -442,6 +538,9 @@ other default.
   snapshot lease path).
 - **Directory-level pruning for `exclude`/`defaultExclude` in `index-scan.ts`** — see the status-
   collector caveat immediately above; a real gap, sized larger than this task, left for a follow-up.
+- **The `index-redact.ts` JWT-shaped false positive** on an ordinary namespaced-property chain
+  (measured above, RUN-280) — a cross-language security-floor defect, not UBT-specific; flagged, not
+  fixed here.
 
 ## Load and memory budgets (RUN-238)
 

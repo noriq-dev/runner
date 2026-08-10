@@ -713,3 +713,366 @@ export function createMarkdownAdapter(): IndexParserAdapter {
     parse: async (input) => parseMarkdown(input.content),
   };
 }
+
+// ---------------------------------------------------------------------------
+// UBT module descriptor adapter (RUN-280): `.Build.cs` / `.Target.cs`
+// ---------------------------------------------------------------------------
+
+/**
+ * RUN-239 deferred a C# adapter over `tree-sitter-c-sharp.wasm`'s 5.1 MB (~6.8 MB inlined) — and
+ * measured only 8 files while doing it, on the wrong checkout (corrected in `INDEX-OPERATIONS.md`
+ * at commit `1adaaea`: the marked checkout has 47 `.Build.cs` + 3 `.Target.cs` = 50). Both halves of
+ * that reasoning still hold the grammar off, but the corrected count makes the files themselves
+ * worth reading: a UBT module descriptor is not general C#, it is a FIXED, TINY shape —
+ *
+ * ```csharp
+ * public class ProjectNod : ModuleRules {
+ *   public ProjectNod(ReadOnlyTargetRules Target) : base(Target) {
+ *     PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
+ *   }
+ * }
+ * ```
+ *
+ * — one class declaration plus one or two `AddRange`/`Add` calls naming string literals. This
+ * adapter reads exactly that shape with the same hand-rolled, non-tree-sitter approach
+ * `parseMarkdown` above already uses for a different fixed shape, never a general C# parser.
+ *
+ * **What is extracted, and nothing more** (locked decision): the module/target class NAME
+ * (`class X : ModuleRules` / `class X : TargetRules`) and the string-literal entries of
+ * `PublicDependencyModuleNames`/`PrivateDependencyModuleNames` (a `.Build.cs`) or `ExtraModuleNames`
+ * (a `.Target.cs`) — both real, measured shapes (`grep`-counted across every `.Build.cs`/`.Target.cs`
+ * under Project Nod's `Source/`/`Plugins/`: no `DynamicallyLoadedModuleNames`, no
+ * `PublicIncludePathModuleNames`, anywhere). `PCHUsage` and every other property assignment is
+ * ignored — it is not a dependency and evaluating it would not change what a module's OWN edges are.
+ *
+ * **Comments are stripped before anything else runs** (`stripCSharpComments`) — not a defensive
+ * guess, a MEASURED hazard: Project Nod's own `NodCoreTechRuntime.Build.cs` carries the line
+ * `// Original had: if (Target.Type == TargetType.Editor) PrivateDependencyModuleNames.Add("UnrealEd");`
+ * — commented-OUT code that, read as text, is indistinguishable from a real call. A naive regex over
+ * raw source would mint a phantom dependency on `UnrealEd` from a sentence about a line that no
+ * longer runs. Comments are blanked to same-length spaces (preserving line numbers and every other
+ * byte), the same "blank the noise, keep the positions" move `blankCppMacroNoise`
+ * (`index-treesitter.ts`) makes for a different measured hazard in the C++ adapter.
+ *
+ * **A dependency name inside a conditional block is declined, never extracted as unconditional**
+ * (deferred: "evaluating `if (Target.Platform == ...)` branches is out of scope; extract what is
+ * unconditionally declared and say plainly that conditional dependencies are not covered"). Also
+ * measured, not hypothetical: real UBT files gate an entire `PrivateDependencyModuleNames.Add(...)`
+ * behind `if (Target.bBuildEditor)` (`ProjectNod.Build.cs`, `NodEcsTests.Build.cs`, three others) and
+ * one behind a platform check (`NatsC.Build.cs`: `if (Target.Platform == UnrealTargetPlatform.Linux)`).
+ * This adapter cannot evaluate `Target.bBuildEditor` — it has no `Target` — so it tracks brace depth
+ * (`computeConditionalMask`) and simply declines any `AddRange`/`Add` call whose call site sits
+ * inside an `if`/`else`/`for`/`foreach`/`while`/`switch`/`catch`/`try`/`do` block, counting how many
+ * names it declined rather than silently dropping them (mirrors `IndexerResult.inferredEdgesOmitted`'s
+ * own "counted, not silently dropped" posture, one layer down at parse time instead of resolve time).
+ *
+ * **A module is represented as a `nodeType: 'symbol'` entity on its own `.Build.cs`/`.Target.cs`
+ * file** (locked decision: document the choice, never mint a new node type — `MemoryNodeType` is a
+ * vendored wire contract this repo cannot grow). `symbol` is the same arm every other adapter in
+ * this file uses for "a repository-scoped declaration a graph can point at" (this file's own doc,
+ * "every symbol/test/api entity ... is `nodeType: 'symbol'`") — a UBT module is exactly that: a
+ * named thing this file declares, addressable by other files' dependency lists the same way a TOML
+ * section or a markdown heading is addressable by a link. `symbolPath` is `[ModuleName]` — a single
+ * segment, since a `.Build.cs` declares exactly one module and nothing nests under it here (no
+ * per-dependency-name entity is minted; the dependency EDGE carries that fact, an entity would only
+ * duplicate it — "measure the value before adding surface", this task's own discretion).
+ *
+ * **The dependency EDGE is `depends_on`, never `imports`** — a different vendored `MemoryEdgeType`
+ * arm, unused anywhere else in this codebase until now, and the semantically correct one:
+ * `imports` means "this FILE would not run without that one" and is resolved through
+ * `resolveRelativeImport`'s relative-path grammar (`indexer.ts`'s own doc); a UBT module dependency
+ * is a MODULE naming another MODULE by a bare name that can resolve to a file anywhere in the
+ * repository tree, not a sibling. `indexer.ts` resolves it through a separate, NAME-keyed two-pass
+ * mechanism (`moduleUriByName`/`pendingModuleDependencies`) — see that file's own doc for why reusing
+ * `resolveRelativeImport` was considered and rejected: `Source/ProjectNod/ProjectNod.Build.cs`
+ * depends on `Plugins/NodCharacterCreator/Source/NodCharacterCreator/NodCharacterCreator.Build.cs`,
+ * which no relative-path guess from the importer's own directory could ever reach.
+ *
+ * **An unresolved dependency name emits no edge — the COMMON case, not an edge case.** Most UBT
+ * dependencies are engine modules (`Core`, `CoreUObject`, `Engine`, `UMG`, `Slate`, …) that live in
+ * the Unreal installation, never scanned by this indexer; a `.Build.cs` whose dependencies are ALL
+ * engine modules is expected to yield its module entity and exactly zero edges. This adapter itself
+ * has no opinion on which names resolve — that is `indexer.ts`'s cross-file question, not a single
+ * file's — it only ever emits `moduleDependencies` (raw names) and trusts the second pass to decline
+ * whatever this generation never declared, exactly the way an unresolved `ParsedImport` declines.
+ *
+ * **`.Target.cs` is claimed by the SAME adapter** (discretion, resolved after reading real examples:
+ * `ProjectNod.Target.cs`/`ProjectNodEditor.Target.cs`/`ProjectNodServer.Target.cs`) — a `TargetRules`
+ * subclass with `ExtraModuleNames.Add("ModuleName")` calls, structurally the same "class declares a
+ * name, then names other modules by string literal" shape as a `.Build.cs`, just through `.Add`
+ * instead of `.AddRange` and a different property name. One adapter, one small parser, rather than
+ * two near-duplicates — the two file kinds share every helper below and differ only in which class
+ * base and which property names they look for.
+ */
+
+/** Blank `//` and `/* *​/` comments to same-length spaces (newlines preserved), string literals left
+ *  verbatim — see this section's own doc for the measured commented-out-code hazard this exists to
+ *  neutralise. A minimal escape-aware string scan (`\"` never ends a string early) so a comment
+ *  marker inside a string literal is never mistaken for a real comment start either. */
+function stripCSharpComments(content: string): string {
+  let out = '';
+  let i = 0;
+  const n = content.length;
+  let inString = false;
+  while (i < n) {
+    const ch = content[i]!;
+    if (inString) {
+      out += ch;
+      if (ch === '\\' && i + 1 < n) {
+        out += content[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '/') {
+      while (i < n && content[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '*') {
+      out += '  ';
+      i += 2;
+      while (i < n && !(content[i] === '*' && content[i + 1] === '/')) {
+        out += content[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      if (i < n) {
+        out += '  ';
+        i += 2;
+      }
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/** Same length as `clean`, but every character strictly INSIDE a `"..."` string literal (never the
+ *  quotes themselves) is replaced with a space — so the brace/paren structural scans below can never
+ *  be thrown off by a `{`/`(` that happens to appear inside a quoted module name. Real UBT module
+ *  names never contain one, but this is cheap insurance for the same reason `resolveRelativeImport`
+ *  prefers a declined edge to a guessed one: a mis-scanned brace would corrupt conditional-block
+ *  detection for the REST of the file, not just one call site. */
+function blankStringInteriors(clean: string): string {
+  let out = '';
+  let inString = false;
+  let prevWasEscape = false;
+  for (let i = 0; i < clean.length; i += 1) {
+    const ch = clean[i]!;
+    if (ch === '"' && !prevWasEscape) {
+      inString = !inString;
+      out += ch;
+      prevWasEscape = false;
+      continue;
+    }
+    if (inString) {
+      out += ch === '\n' ? '\n' : ' ';
+      prevWasEscape = ch === '\\' && !prevWasEscape;
+      continue;
+    }
+    out += ch;
+    prevWasEscape = false;
+  }
+  return out;
+}
+
+const CONDITIONAL_KEYWORDS = new Set(['if', 'for', 'foreach', 'while', 'switch', 'catch']);
+const BARE_CONDITIONAL_KEYWORDS = new Set(['else', 'try', 'finally', 'do']);
+
+/** Is the brace at `sanitized[bracePos]` opening a conditional block — `if (...)`, `else`, `for
+ *  (...)`, and siblings — rather than a class/constructor/namespace body? Walks backward from the
+ *  brace to the nearest preceding word, matching a closing `)` back to its own `(` first (so
+ *  `public Foo(...) : base(Target)\n{` is correctly NOT conditional — the word before that `(` is
+ *  `base`, not `if`). Operates on `sanitized` (string interiors already blanked) so a quoted brace
+ *  can never desync this walk. */
+function isConditionalBraceOpen(sanitized: string, bracePos: number): boolean {
+  let j = bracePos - 1;
+  while (j >= 0 && /\s/.test(sanitized[j]!)) j -= 1;
+  if (j < 0) return false;
+  if (sanitized[j] === ')') {
+    let depth = 1;
+    j -= 1;
+    while (j >= 0 && depth > 0) {
+      if (sanitized[j] === ')') depth += 1;
+      else if (sanitized[j] === '(') depth -= 1;
+      j -= 1;
+    }
+    while (j >= 0 && /\s/.test(sanitized[j]!)) j -= 1;
+    const end = j + 1;
+    while (j >= 0 && /\w/.test(sanitized[j]!)) j -= 1;
+    return CONDITIONAL_KEYWORDS.has(sanitized.slice(j + 1, end));
+  }
+  const end = j + 1;
+  while (j >= 0 && /\w/.test(sanitized[j]!)) j -= 1;
+  return BARE_CONDITIONAL_KEYWORDS.has(sanitized.slice(j + 1, end));
+}
+
+/** `mask[i] === true` when position `i` in `sanitized` sits inside at least one conditional block —
+ *  a single forward pass tracking brace depth and, per open brace, whether `isConditionalBraceOpen`
+ *  called it in. */
+function computeConditionalMask(sanitized: string): boolean[] {
+  const mask = new Array<boolean>(sanitized.length).fill(false);
+  const stack: boolean[] = [];
+  let conditionalDepth = 0;
+  for (let i = 0; i < sanitized.length; i += 1) {
+    const ch = sanitized[i];
+    if (ch === '{') {
+      const conditional = isConditionalBraceOpen(sanitized, i);
+      stack.push(conditional);
+      if (conditional) conditionalDepth += 1;
+    } else if (ch === '}') {
+      if (stack.pop()) conditionalDepth -= 1;
+    }
+    mask[i] = conditionalDepth > 0;
+  }
+  return mask;
+}
+
+/** The index just past the `(` at `sanitized[openIdx]`'s matching `)`, or -1 for an unbalanced file
+ *  (declines the call rather than guessing a boundary — same "declines by omission" posture as
+ *  every other adapter in this file). */
+function findMatchingParen(sanitized: string, openIdx: number): number {
+  let depth = 1;
+  for (let i = openIdx + 1; i < sanitized.length; i += 1) {
+    if (sanitized[i] === '(') depth += 1;
+    else if (sanitized[i] === ')') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+const STRING_LITERAL_RE = /"((?:[^"\\]|\\.)*)"/g;
+
+/** Every quoted string literal's own text (unescaping never needed — a UBT module name is a plain
+ *  identifier in every real example this adapter was built against). */
+function extractStringLiterals(text: string): string[] {
+  const out: string[] = [];
+  STRING_LITERAL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null = STRING_LITERAL_RE.exec(text);
+  while (m !== null) {
+    out.push(m[1]!);
+    m = STRING_LITERAL_RE.exec(text);
+  }
+  return out;
+}
+
+/** Every `Property.AddRange(...)`/`Property.Add(...)` call for one of `propertyNames`, resolved to
+ *  its full argument span via balanced-paren matching (so a multi-line `AddRange(new string[]
+ *  {\n  "A", "B"\n})` is read as one call, not truncated at the array literal's own `{`) — then the
+ *  quoted names inside that span, UNLESS the call site itself sits inside a conditional block (this
+ *  section's own doc), in which case the names are counted as declined rather than extracted. */
+function extractDependencyNames(
+  clean: string,
+  sanitized: string,
+  propertyNames: readonly string[],
+): { names: string[]; declinedConditionalCount: number } {
+  const mask = computeConditionalMask(sanitized);
+  const callRe = new RegExp(`\\b(?:${propertyNames.join('|')})\\s*\\.\\s*(?:AddRange|Add)\\s*\\(`, 'g');
+  const names: string[] = [];
+  let declinedConditionalCount = 0;
+  let match: RegExpExecArray | null = callRe.exec(sanitized);
+  while (match !== null) {
+    const openParenIdx = match.index + match[0].length - 1;
+    const closeParenIdx = findMatchingParen(sanitized, openParenIdx);
+    if (closeParenIdx === -1) break; // unbalanced — decline the rest of this file's calls too.
+    const found = extractStringLiterals(clean.slice(openParenIdx + 1, closeParenIdx));
+    if (mask[match.index]) declinedConditionalCount += found.length;
+    else names.push(...found);
+    callRe.lastIndex = closeParenIdx + 1;
+    match = callRe.exec(sanitized);
+  }
+  return { names, declinedConditionalCount };
+}
+
+const MODULE_CLASS_RE = /\bclass\s+(\w+)\s*:\s*ModuleRules\b/;
+const TARGET_CLASS_RE = /\bclass\s+(\w+)\s*:\s*TargetRules\b/;
+
+/** `.Build.cs`'s two dependency-list properties (measured — see this section's own doc; no other
+ *  property on `ModuleRules` had any real occurrence to justify claiming it, "measure the value
+ *  before adding surface"). */
+const MODULE_DEPENDENCY_PROPERTIES = ['PublicDependencyModuleNames', 'PrivateDependencyModuleNames'];
+/** `.Target.cs`'s equivalent — a target names the modules it pulls in beyond its primary one. */
+const TARGET_DEPENDENCY_PROPERTIES = ['ExtraModuleNames'];
+
+function lineOf(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index; i += 1) if (content[i] === '\n') line += 1;
+  return line;
+}
+
+function parseUbtDescriptor(content: string): AdapterParseResult {
+  const clean = stripCSharpComments(content);
+  const moduleMatch = MODULE_CLASS_RE.exec(clean);
+  const targetMatch = moduleMatch ? null : TARGET_CLASS_RE.exec(clean);
+  const match = moduleMatch ?? targetMatch;
+  if (!match) {
+    return {
+      symbols: [],
+      diagnostics: [
+        { message: 'no ModuleRules or TargetRules subclass found — nothing extracted', severity: 'warning' },
+      ],
+    };
+  }
+
+  const className = match[1]!;
+  const propertyNames = moduleMatch ? MODULE_DEPENDENCY_PROPERTIES : TARGET_DEPENDENCY_PROPERTIES;
+  const sanitized = blankStringInteriors(clean);
+  const { names, declinedConditionalCount } = extractDependencyNames(clean, sanitized, propertyNames);
+  const declaredLine = lineOf(content, match.index);
+
+  const diagnostics: ParsedDiagnostic[] = [];
+  if (declinedConditionalCount > 0) {
+    diagnostics.push({
+      message: `${declinedConditionalCount} dependency name(s) declared inside a conditional block (if/for/foreach/while/switch/catch/try/do) were not extracted — this adapter reads only unconditionally declared dependencies`,
+      severity: 'warning',
+    });
+  }
+
+  return {
+    symbols: [
+      {
+        symbolPath: [className],
+        nodeType: 'symbol',
+        label: className,
+        // The structure (this entity plus its `depends_on` edges) is the useful fact, the same
+        // "a section carries no content of its own" posture `pushSection` above takes — the raw
+        // dependency list (including every name declined below) is still visible per-file through
+        // `runIndexer`'s `IndexerResult.declinedModuleDependencies` count, never silently lost.
+        content: null,
+        range: { startLine: declaredLine, endLine: declaredLine },
+      },
+    ],
+    diagnostics,
+    declaresModule: className,
+    moduleDependencies: names.map((moduleName) => ({ moduleName })),
+  };
+}
+
+function isUbtDescriptorPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith('.build.cs') || lower.endsWith('.target.cs');
+}
+
+export function createUbtAdapter(): IndexParserAdapter {
+  return {
+    id: 'ubt-module',
+    version: ADAPTER_VERSION,
+    languages: ['ubt'],
+    canParse: isUbtDescriptorPath,
+    parse: async (input) => parseUbtDescriptor(input.content),
+  };
+}

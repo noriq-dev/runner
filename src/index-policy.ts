@@ -41,6 +41,14 @@ import { logger as defaultLogger } from './logger';
  * (Unreal, on Diversion) has 137 `.cpp` + 120 `.h` (53660 lines) and 6 `.ini`; Go and Rust, first
  * on the task body's own guessed list, have zero files anywhere. See `treesitter-runtime.ts`'s own
  * doc for the bundle-size trade the C++ grammar carries and why it was accepted anyway.
+ *
+ * `ubt` (RUN-280) is deliberately NOT named `csharp` — it claims exactly two UBT-specific shapes
+ * (`.Build.cs`/`.Target.cs`), never general C#, and a repo's own `[index].languages = ["csharp"]`
+ * should not silently mean "your 51 UBT descriptor files, and nothing else with a `.cs` extension".
+ * Corrected count, measured against the checkout the daemon actually discovers rather than RUN-239's
+ * wrong one (see `INDEX-OPERATIONS.md`): 47 `.Build.cs` + 3 `.Target.cs` = 50 on Project Nod. No
+ * grammar backs it — `index-formats.ts`'s `createUbtAdapter` reads the same fixed, tiny descriptor
+ * shape RUN-239 measured `tree-sitter-c-sharp.wasm`'s 5.1 MB as not worth paying for.
  */
 export const INDEX_LANGUAGES = [
   'typescript',
@@ -50,6 +58,7 @@ export const INDEX_LANGUAGES = [
   'toml',
   'cpp',
   'ini',
+  'ubt',
 ] as const;
 const IndexLanguage = z.enum(INDEX_LANGUAGES);
 export type IndexLanguage = z.infer<typeof IndexLanguage>;

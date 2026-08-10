@@ -163,6 +163,26 @@ export interface ParsedReference {
   target: string;
 }
 
+/**
+ * One dependency an adapter's own file names by a bare NAME rather than a path (RUN-280) — a UBT
+ * `.Build.cs`'s `PublicDependencyModuleNames`/`PrivateDependencyModuleNames` entry, resolved
+ * against every OTHER module this generation declared, never against `ParsedImport`'s relative-path
+ * grammar. The two are genuinely different claims, not a generalisation of one another: a UBT
+ * module's declaring file can live anywhere under `Source/` or `Plugins/<name>/Source/` with no
+ * directional relationship to the dependant's own directory (measured on Project Nod:
+ * `Source/ProjectNod/ProjectNod.Build.cs` depends on
+ * `Plugins/NodCharacterCreator/Source/NodCharacterCreator/NodCharacterCreator.Build.cs` — not a
+ * sibling, not reachable by any relative-path guess `resolveRelativeImport` could make), so
+ * `indexer.ts` resolves this by a repo-wide NAME -> declaring-URI map instead (see its own doc on
+ * `moduleUriByName`). A name this generation never declared — the common case, since most UBT
+ * dependencies are engine modules (`Core`, `Engine`, `UMG`, …) that live in the Unreal installation,
+ * not the repo — declines the same way an unresolved `ParsedImport` does: no edge, counted rather
+ * than silently dropped.
+ */
+export interface ParsedModuleDependency {
+  moduleName: string;
+}
+
 export interface AdapterParseInput {
   /** Repository-relative, forward-slash path — already normalized by the caller. */
   path: string;
@@ -185,6 +205,15 @@ export interface AdapterParseResult {
   /** Absent/empty for an adapter that never attempts references (RUN-257) — declinable
    *  independently of `imports`/`calls`, same as those two are of each other. */
   references?: ParsedReference[];
+  /** The NAME this file itself declares (RUN-280) — a UBT module or target class name. Absent for
+   *  every adapter but the UBT one; present exactly when `symbols` also carries a matching
+   *  `symbolPath: [name]` entity, so `indexer.ts` can look up the URI it already minted rather than
+   *  recomputing one. This is the key side of `moduleDependencies` below. */
+  declaresModule?: string;
+  /** Named dependencies this file's own declaration lists, resolved by NAME rather than path — see
+   *  `ParsedModuleDependency`'s own doc. Meaningless without `declaresModule` also being set (there
+   *  is no declaring entity to hang the edge off of), and `indexer.ts` treats it that way. */
+  moduleDependencies?: ParsedModuleDependency[];
 }
 
 /**

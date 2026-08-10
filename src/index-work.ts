@@ -188,6 +188,9 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       stoppedEarly: indexed.stoppedEarly,
       inferredEdgesOmitted: indexed.inferredEdgesOmitted,
       unlabelledSymbolsDropped: indexed.unlabelledSymbolsDropped,
+      // RUN-280: routine, not a defect — most UBT dependencies are engine modules this generation
+      // never scanned, so this does not promote the line to `warn` (see the field's own doc).
+      declinedModuleDependencies: indexed.declinedModuleDependencies,
       // RUN-279: a count, never the URIs — `duplicateEdgesDropped` is routinely in the thousands on a
       // real repo (N call sites, one edge) and carries no path. `duplicateNodeUris` DOES carry paths,
       // so only its length is logged here; a non-zero length is the signal, and `index-repo` is where

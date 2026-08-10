@@ -52,8 +52,14 @@ import type { ChangesBetweenResult } from './vcs/types';
  * IS recorded per adapter, but locally only, and nothing branches on it — see
  * `INDEX-OPERATIONS.md`'s "Adapter roadmap" section for this stated as a blocked acceptance line
  * rather than quietly declared met.
+ *
+ * RUN-280 bumps this to `'3'`: the UBT `.Build.cs`/`.Target.cs` adapter (`index-formats.ts`'s
+ * `createUbtAdapter`) changes this daemon's output for 50 files on Project Nod that were previously
+ * NOOP-only — the identical "output for unchanged files also changed" case RUN-239's bump above
+ * already names as mandatory. Same reasoning, same consequence (every repo's next reconcile is
+ * `full`, not per-language), not restated in full here.
  */
-export const INDEXER_VERSION = '2';
+export const INDEXER_VERSION = '3';
 
 /**
  * ~~A validated staged generation at the base/version this reconciliation is about~~ — REMOVED

@@ -1,6 +1,11 @@
 import { IndexAdapterRegistry, NOOP_ADAPTER } from './index-adapters';
 import type { IndexParserAdapter } from './index-adapters';
-import { createJsonAdapter, createMarkdownAdapter, createTomlAdapter } from './index-formats';
+import {
+  createJsonAdapter,
+  createMarkdownAdapter,
+  createTomlAdapter,
+  createUbtAdapter,
+} from './index-formats';
 import type { IndexLanguage, ResolvedIndexConfig } from './index-policy';
 import {
   createCppTreeSitterAdapter,
@@ -68,6 +73,9 @@ export function buildIndexAdapterRegistry(
     createJsonAdapter(),
     createTomlAdapter(),
     createMarkdownAdapter(),
+    // RUN-280: UBT's `.Build.cs`/`.Target.cs` module descriptors — no grammar, see
+    // index-formats.ts's own doc on why this is the same non-tree-sitter approach as the three above.
+    createUbtAdapter(),
   ];
 
   const registry = new IndexAdapterRegistry();

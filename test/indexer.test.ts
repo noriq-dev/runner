@@ -9,6 +9,7 @@ import type {
 } from '../src/index-adapters';
 import { MAX_INGEST_BATCH_BYTES, computeContentHash, recordIdentity } from '../src/index-batch';
 import { MAX_PARSE_DIAGNOSTICS } from '../src/index-entity';
+import { createUbtAdapter } from '../src/index-formats';
 import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
 import { INDEXER_VERSION } from '../src/index-reconcile';
@@ -933,6 +934,244 @@ describe('runIndexer — related_to edges (RUN-257)', () => {
     const first = await run();
     const second = await run();
     expect(first.manifest.contentHash).toBe(second.manifest.contentHash);
+  });
+});
+
+describe('runIndexer — UBT module dependency edges (RUN-280)', () => {
+  /** Reports whatever `declaresModule`/`moduleDependencies` the test wired up for each path — proves
+   *  `indexer.ts`'s name-keyed second pass end to end without depending on the real UBT text parser
+   *  (already covered in its own suite, `index-formats.test.ts`). Mirrors `importAdapter`/
+   *  `referenceAdapter` above, one field over. */
+  const moduleAdapter = (
+    declByPath: Record<string, { declares: string; deps: string[] }>,
+  ): IndexParserAdapter => ({
+    id: 'fake-ubt',
+    version: '1',
+    canParse: () => true,
+    parse: async (input: AdapterParseInput): Promise<AdapterParseResult> => {
+      const decl = declByPath[input.path];
+      if (!decl) return { symbols: [], diagnostics: [] };
+      return {
+        symbols: [{ symbolPath: [decl.declares], nodeType: 'symbol', label: decl.declares, content: null }],
+        diagnostics: [],
+        declaresModule: decl.declares,
+        moduleDependencies: decl.deps.map((moduleName) => ({ moduleName })),
+      };
+    },
+  });
+
+  function dependsOnEdges(result: Awaited<ReturnType<typeof runIndexer>>) {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .filter((r) => r.kind === 'edge' && r.type === 'depends_on');
+  }
+
+  function moduleUriFor(result: Awaited<ReturnType<typeof runIndexer>>, moduleName: string): unknown {
+    return result.batches
+      .flatMap((b) => decodeBatchRows(b.compressed))
+      .find((r) => r.kind === 'node' && r.type === 'symbol' && r.label === moduleName)?.uri;
+  }
+
+  it('wires a same-generation module dependency into a depends_on edge between the two module URIs', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'A.Build.cs', content: 'x' },
+        { kind: 'file', path: 'B.Build.cs', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({
+            'A.Build.cs': { declares: 'A', deps: ['B'] },
+            'B.Build.cs': { declares: 'B', deps: [] },
+          }),
+        ),
+      },
+    );
+    expect(dependsOnEdges(result)).toEqual([
+      { kind: 'edge', type: 'depends_on', from: moduleUriFor(result, 'A'), to: moduleUriFor(result, 'B') },
+    ]);
+  });
+
+  it('resolves a dependency whose declaring file sorts, and is therefore parsed, AFTER the dependant', async () => {
+    // FakeIndexSource enumerates in sorted path order, so 'A.Build.cs' is scanned strictly before
+    // 'Z.Build.cs' — the case a single-pass resolver would miss, same reasoning as
+    // `resolveRelativeImport`'s own order-independence test above, just name-keyed instead of
+    // path-keyed.
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'A.Build.cs', content: 'x' },
+        { kind: 'file', path: 'Z.Build.cs', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({
+            'A.Build.cs': { declares: 'A', deps: ['Z'] },
+            'Z.Build.cs': { declares: 'Z', deps: [] },
+          }),
+        ),
+      },
+    );
+    expect(dependsOnEdges(result)).toEqual([
+      { kind: 'edge', type: 'depends_on', from: moduleUriFor(result, 'A'), to: moduleUriFor(result, 'Z') },
+    ]);
+  });
+
+  it('declines a dependency naming a module this generation never declared — the COMMON case (engine modules)', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'A.Build.cs', content: 'x' }]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({ 'A.Build.cs': { declares: 'A', deps: ['Core', 'CoreUObject', 'Engine'] } }),
+        ),
+      },
+    );
+    expect(dependsOnEdges(result)).toEqual([]);
+    expect(result.declinedModuleDependencies).toBe(3);
+  });
+
+  it('a module whose dependencies are ALL engine modules yields a module entity and zero edges — asserted explicitly', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([{ kind: 'file', path: 'A.Build.cs', content: 'x' }]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({ 'A.Build.cs': { declares: 'A', deps: ['Core', 'Engine'] } }),
+        ),
+      },
+    );
+    const moduleNode = result.records.find((r) => r.kind === 'node' && r.type === 'symbol');
+    expect(moduleNode).toBeDefined();
+    expect(dependsOnEdges(result)).toEqual([]);
+  });
+
+  it('declines when two files declare the same module name — ambiguous, may-miss-never-invent', async () => {
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'Dep.Build.cs', content: 'x' },
+        { kind: 'file', path: 'DependantOne.Build.cs', content: 'x' },
+        { kind: 'file', path: 'DependantTwo.Build.cs', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({
+            // Two DIFFERENT files both claim to declare module "Dup" — a real UBT repo never does
+            // this, but an adapter reporting it must not let indexer.ts guess which one is real.
+            'DependantOne.Build.cs': { declares: 'Dup', deps: [] },
+            'DependantTwo.Build.cs': { declares: 'Dup', deps: [] },
+            'Dep.Build.cs': { declares: 'Consumer', deps: ['Dup'] },
+          }),
+        ),
+      },
+    );
+    expect(dependsOnEdges(result)).toEqual([]);
+    expect(result.declinedModuleDependencies).toBe(1);
+  });
+
+  it('collapses two identical dependency entries from the same file into one edge — no per-writer dedup needed', async () => {
+    // RUN-280 locked decision: dedup is the RUN-279 chokepoint's job, not a fifth writer-owned seen
+    // set. This adapter deliberately reports the same name twice, unguarded, exactly like a real
+    // `.Build.cs` naming the same module in both Public and Private dependency lists would.
+    const result = await runIndexer(
+      new FakeIndexSource([
+        { kind: 'file', path: 'A.Build.cs', content: 'x' },
+        { kind: 'file', path: 'B.Build.cs', content: 'x' },
+      ]),
+      cfg(),
+      target(),
+      {
+        adapters: new IndexAdapterRegistry().register(
+          moduleAdapter({
+            'A.Build.cs': { declares: 'A', deps: ['B', 'B'] },
+            'B.Build.cs': { declares: 'B', deps: [] },
+          }),
+        ),
+      },
+    );
+    expect(dependsOnEdges(result)).toHaveLength(1);
+    expect(result.duplicateEdgesDropped).toBe(1);
+  });
+
+  it('produces a byte-identical result across two runs with module dependency edges present', async () => {
+    const run = () =>
+      runIndexer(
+        new FakeIndexSource([
+          { kind: 'file', path: 'A.Build.cs', content: 'x' },
+          { kind: 'file', path: 'B.Build.cs', content: 'x' },
+        ]),
+        cfg(),
+        target(),
+        {
+          adapters: new IndexAdapterRegistry().register(
+            moduleAdapter({ 'A.Build.cs': { declares: 'A', deps: ['B', 'Core'] } }),
+          ),
+        },
+      );
+    const first = await run();
+    const second = await run();
+    expect(first.manifest.contentHash).toBe(second.manifest.contentHash);
+  });
+
+  describe('end to end with the real UBT adapter (index-formats.ts), fixtures copied from Project Nod', () => {
+    const projectNodEditorBuildCs = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class ProjectNodEditor : ModuleRules
+{
+	public ProjectNodEditor(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "ProjectNod" });
+	}
+}
+`;
+    const projectNodBuildCs = `// Copyright Fake Reality Studios, LLC. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class ProjectNod : ModuleRules
+{
+	public ProjectNod(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
+	}
+}
+`;
+
+    it('ProjectNodEditor depends on the real, in-repo ProjectNod module: one edge, three engine declines', async () => {
+      const result = await runIndexer(
+        new FakeIndexSource([
+          { kind: 'file', path: 'Source/ProjectNod/ProjectNod.Build.cs', content: projectNodBuildCs },
+          {
+            kind: 'file',
+            path: 'Source/ProjectNodEditor/ProjectNodEditor.Build.cs',
+            content: projectNodEditorBuildCs,
+          },
+        ]),
+        cfg(),
+        target(),
+        { adapters: new IndexAdapterRegistry().register(createUbtAdapter()) },
+      );
+      const edges = dependsOnEdges(result);
+      expect(edges).toEqual([
+        {
+          kind: 'edge',
+          type: 'depends_on',
+          from: moduleUriFor(result, 'ProjectNodEditor'),
+          to: moduleUriFor(result, 'ProjectNod'),
+        },
+      ]);
+      // Core/CoreUObject/Engine, declared by BOTH files — 3 (ProjectNodEditor) + 3 (ProjectNod) = 6.
+      expect(result.declinedModuleDependencies).toBe(6);
+    });
   });
 });
 

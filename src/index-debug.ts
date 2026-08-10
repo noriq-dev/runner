@@ -122,6 +122,10 @@ export interface IndexDebugReport {
   parserVersions: Record<string, string>;
   inferredEdgesOmitted: number;
   unlabelledSymbolsDropped: number;
+  /** RUN-280: see `IndexerResult.declinedModuleDependencies`'s own doc — surfaced here for the same
+   *  reason `inferredEdgesOmitted` is: a debug report that hid a count `runIndexer` already computed
+   *  would make the operator re-derive it from the raw edge listing instead of reading it. */
+  declinedModuleDependencies: number;
   stoppedEarly: boolean;
   entities: BoundedList<EntityView>;
   edges: BoundedList<EdgeView>;
@@ -212,6 +216,7 @@ export function buildDebugReport(result: IndexerResult, options: BuildDebugRepor
     parserVersions: { ...result.parserVersions },
     inferredEdgesOmitted: result.inferredEdgesOmitted,
     unlabelledSymbolsDropped: result.unlabelledSymbolsDropped,
+    declinedModuleDependencies: result.declinedModuleDependencies,
     stoppedEarly: result.stoppedEarly,
     entities: {
       shown: boundedNodes.shown.map((n) => entityView(n, showContent)),
@@ -259,6 +264,14 @@ export function renderDebugReport(report: IndexDebugReport): string {
   lines.push(
     `edges: ${formatCounts(report.edgeCounts)} (inferred, omitted from the wire: ${report.inferredEdgesOmitted})`,
   );
+  // RUN-280: only when non-zero — a repo with no UBT descriptors leaves this at 0, and printing it
+  // there would be noise on every non-Unreal run. Worded as expected, not a defect: most UBT
+  // dependencies are engine modules this generation never scanned (see this field's own doc).
+  if (report.declinedModuleDependencies > 0) {
+    lines.push(
+      `  NOTE: ${report.declinedModuleDependencies} UBT module dependency name(s) resolved to no module this generation declared (engine modules, or an ambiguous duplicate name) — no edge emitted`,
+    );
+  }
   lines.push('');
   lines.push(
     `diagnostics: ${report.diagnostics.total}${report.diagnostics.overflow ? ` (+${report.diagnostics.overflow} beyond the collector's own cap)` : ''}`,
