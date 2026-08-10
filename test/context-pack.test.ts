@@ -95,6 +95,34 @@ function validPack(over: Partial<ContextPack> = {}): ContextPack {
   };
 }
 
+// RUN-274, measured against the live server before it was written: the server takes one `branch`
+// value and uses it as both a hard filter and a rerank preference, so naming any branch drops every
+// memory recorded on another one — and this daemon correctly names `defaultBranch` while every run
+// works off a branch. `branch: main` returned 800 chars with all memory sections empty; the same
+// request with no branch returned 9319 and four excerpts. Reverts when PLNR-385 separates the two.
+describe('retrieveContextPack — branch is not sent (RUN-274)', () => {
+  it('omits `branch` from the wire request even when the inquiry supplies one', async () => {
+    let sent: ContextPackRequest | undefined;
+    const fetcher: ContextPackFetcher = async (input) => {
+      sent = input;
+      return validPack();
+    };
+    const result = await retrieveContextPack(fetcher, {
+      projectId: 'prj_1',
+      taskId: 'task_1',
+      repositoryKey: 'repo-key',
+      baseId: 'sha',
+      branch: 'main',
+      role: 'build',
+    });
+    expect(result.pack).not.toBeNull();
+    expect(sent && 'branch' in sent).toBe(false);
+    // The scoping that DOES survive, and is the stronger of the two the server checks.
+    expect(sent?.baseId).toBe('sha');
+    expect(sent?.repositoryKey).toBe('repo-key');
+  });
+});
+
 describe('retrieveContextPack — the bounded, always-degrading fetch', () => {
   it('no fetcher wired: not attempted, no I/O', async () => {
     const result = await retrieveContextPack(undefined, {
@@ -163,12 +191,13 @@ describe('retrieveContextPack — the bounded, always-degrading fetch', () => {
     expect(result.attempted).toBe(true);
     expect(result.omission).toBeNull();
     expect(result.pack).toEqual(validPack());
+    // No `branch` — the inquiry supplied one and RUN-274 declines to send it; a deep-equal is how
+    // that stays true, since an extra field reappearing here is exactly the regression.
     expect(captured).toEqual({
       projectId: 'prj_1',
       taskId: 'task_1',
       repositoryKey: 'repo-key',
       baseId: 'sha123',
-      branch: 'main',
       role: 'verify',
       budgetTokens: 500,
     });
@@ -455,8 +484,11 @@ describe("prepareRun — RUN-228 retrieval, in the daemon's own preparation pipe
     expect(captured?.repositoryKey).toBe('acme/widgets'); // repo.manifest.repositoryKey
     expect(captured?.baseId).toBe(LEASED_BASE_ID); // worktree.baseId
     expect(captured?.baseId).not.toBe(LOCAL_CHECKOUT_ID);
-    expect(captured?.branch).toBe('main'); // repo.manifest.defaultBranch, never worktree.workRef
-    expect(captured?.branch).not.toBe('noriq/run/run_1');
+    // `branch` is not sent at all since RUN-274 (the server would filter on it and drop every
+    // memory recorded elsewhere). The original invariant this line guarded — the run's own
+    // throwaway `workRef` must never become `branch` — now holds by construction rather than by
+    // choosing the right value, and is asserted as absence.
+    expect('branch' in (captured ?? {})).toBe(false);
     expect(captured?.projectId).toBe('prj_p'); // run.projectId
     expect(captured?.taskId).toBe('task_9');
     expect(captured?.role).toBe('build'); // the effective kind
