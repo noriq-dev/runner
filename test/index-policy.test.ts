@@ -27,7 +27,7 @@ describe('IndexPolicy — the runner-owned execution knobs', () => {
       contentMode: 'full',
       maxFiles: 20_000,
       maxFileBytes: 1_000_000,
-      maxTotalBytes: 500_000_000,
+      maxTotalBytes: 100_000_000,
       readDeadlineMs: 120_000,
       pollIntervalMinutes: 60,
     });
@@ -97,7 +97,7 @@ describe('resolveIndexConfig — decision 4/5: off unless enabled, invalid refus
       contentMode: 'metadata',
       maxFiles: 10,
       maxFileBytes: 1_000_000,
-      maxTotalBytes: 500_000_000,
+      maxTotalBytes: 100_000_000,
       readDeadlineMs: 120_000,
       pollIntervalMinutes: 60,
     });

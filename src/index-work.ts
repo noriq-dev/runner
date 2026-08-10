@@ -113,7 +113,11 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
         baseId: snapshot.baseId,
         indexerVersion: target.indexerVersion,
       },
-      { now: deps.now, adapters: registry },
+      // RUN-238: `ctx.signal`/`ctx.isRunBusy` reach the parse loop from here — before this they
+      // were only ever forwarded to `uploadGeneration` below (a phase later), so `cancelRepo`
+      // could not interrupt a parse in progress and a run assigned mid-pass shared a starved loop
+      // with it for the rest of that pass's duration.
+      { now: deps.now, adapters: registry, signal: ctx.signal, isRunBusy: ctx.isRunBusy },
     );
 
     const key = {

@@ -1,4 +1,4 @@
-import type { Node } from 'web-tree-sitter';
+import type { Node, Parser, Tree } from 'web-tree-sitter';
 import {
   type AdapterParseInput,
   type AdapterParseResult,
@@ -505,14 +505,19 @@ async function parseFile(
   runtime: TreeSitterRuntime,
   input: AdapterParseInput,
 ): Promise<AdapterParseResult> {
+  // RUN-238: `parser`/`tree` are freed in the `finally` below — see its own comment for why. Held
+  // in outer-scope `let`s (not `const` inside the `try`) so that comment's cleanup reaches whichever
+  // of the two ever got constructed, including a throw between them.
+  let parser: Parser | undefined;
+  let tree: Tree | null | undefined;
   try {
     // `TreeSitterRuntime.parserFor` awaits the cached grammar (compiled at most once — see this
     // adapter's own doc) and hands back a FRESH `Parser` bound to it: a `Parser` carries mutable
     // state (its own `tree`), so per-call construction is what keeps concurrent `parse()` calls
     // for different files from racing each other, while the expensive part (the grammar itself)
     // stays cached and shared.
-    const parser = await runtime.parserFor(grammar);
-    const tree = parser.parse(input.content);
+    parser = await runtime.parserFor(grammar);
+    tree = parser.parse(input.content);
     if (!tree) {
       return { symbols: [], diagnostics: [{ message: 'tree-sitter returned no tree', severity: 'error' }] };
     }
@@ -547,6 +552,25 @@ async function parseFile(
         },
       ],
     };
+  } finally {
+    // RUN-238 (discovered load-testing "background-run coexistence" — this task's own title, not
+    // only its single-pass event-loop finding): `web-tree-sitter`'s `Parser`/`Tree` hold
+    // Emscripten/WASM-allocated memory that plain JS garbage collection never reclaims — there is
+    // no `FinalizationRegistry` anywhere in that library (checked in `node_modules`), so `.delete()`
+    // is the ONLY release, and this call site never made one. `walk()` above is fully synchronous
+    // and every string this adapter returns (`node.text`, copied by tree-sitter's own getter) is
+    // already a plain JS value by the time either object is used past this point, so freeing them
+    // here costs nothing this adapter still needs. Measured, not theoretical: leaving this leaked
+    // across a ~20000-file pass left the ONE process-wide WASM arena (`Parser.init()` is a single
+    // shared Emscripten module — `treesitter-runtime.ts`'s own doc) bloated enough that a SECOND
+    // full pass in the same process — exactly what a long-lived daemon does on every landing/poll
+    // reindex — degraded from ~15s to effectively hung (still running past 3 minutes, confirmed via
+    // `bench/index-load.mts`'s own determinism check, which runs two more full passes). The
+    // `language` (grammar) this parser was bound to is deliberately NOT deleted here — it is
+    // `TreeSitterRuntime`'s own cached, shared, reused-by-every-file object, and deleting a
+    // `Parser` does not delete the `Language` it referenced.
+    tree?.delete();
+    parser?.delete();
   }
 }
 

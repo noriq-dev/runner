@@ -100,6 +100,13 @@ export interface IndexWorkContext {
   config: ResolvedIndexConfig;
   journal: IndexJournal;
   signal: AbortSignal;
+  /** RUN-238: the SAME predicate `attempt()` checks once before leasing, re-exposed here so a work
+   *  step can re-check it at its own yield points during a long parse — a run assigned mid-pass
+   *  used to share a starved loop for the whole remainder, because `isRunBusy()` was consulted
+   *  exactly once, at the top of this class's own `attempt()`. This is a straight pass-through of
+   *  `IndexCoordinatorDeps.isRunBusy`, never a second predicate: one daemon-owned notion of "busy",
+   *  read from two places. */
+  isRunBusy: () => boolean;
   /** RUN-223 locked decision 4: the work step is the ONLY code that knows when parsing ends and
    *  uploading begins, or when the server starts validating `complete()` — a phase inferred from
    *  elapsed time or a journal side effect would be a guess dressed as a status. Optional so a
@@ -400,6 +407,7 @@ export class IndexCoordinator {
         config,
         journal: this.deps.journal,
         signal,
+        isRunBusy: this.deps.isRunBusy,
         onProgress,
       });
       // RUN-234 (locked decision 4): a successful attempt is STAGED, never active — RUN-260's own

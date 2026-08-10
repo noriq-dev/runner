@@ -46,6 +46,33 @@ import { comparePaths } from './index-source';
  * timestamp in this whole pipeline is `IndexGenerationManifest.createdAt`, injected via `deps.now`
  * exactly like `index-scan.ts`'s own clock injection, and it is a MANIFEST field, never a row
  * field.
+ *
+ * **`computeContentHash` and `encodeBatches` cooperatively yield (RUN-238)** — the measured defect
+ * (`bench/index-load.mts`, an 8000-file/335920-record tree matching this repo's own shape) found a
+ * single continuous 6.3s event-loop block covering the parse loop AND this file's own synchronous
+ * tail: 382ms hashing plus 904ms encoding, back to back with no yield between them. Both functions
+ * now walk `sortedRecords` one at a time (never a pre-built `.map()` array — the SAME per-record
+ * work, just not all materialized before the first byte is hashed/packed) and yield to a REAL
+ * macrotask (`setImmediate`, via `cooperativeCheckpoint` below) every `yieldEveryRecords` records —
+ * never a microtask (`Promise.resolve()` or an already-resolved `await`), because that is exactly
+ * what the measured defect already showed refills the microtask queue and starves timers/poll
+ * (RUN-238's own anchor measurement pinned it to `await adapter.parse(...)` in `indexer.ts`'s
+ * candidate loop; the same shape applies here). `sortRecords` deliberately does NOT chunk: it is
+ * one native `Array.prototype.sort` call — 52ms on the same measured tree — and V8 gives no
+ * mid-sort yield point to hook; splitting the INPUT into chunks would change comparison order (a
+ * correctness risk) for a block already an order of magnitude below hash/encode's own. It still
+ * takes `CooperativeDeps` and checks once before sorting, so an already-aborted/-busy pass never
+ * pays for a sort whose result nothing will use.
+ *
+ * **The record order and every hashed/encoded byte are UNCHANGED by yielding** (locked decision,
+ * RUN-238): a `setImmediate` between two loop iterations suspends and resumes the SAME loop over
+ * the SAME array at the SAME index — it inserts a pause, never a reorder. `computeContentHash`
+ * hashes incrementally (`hash.update` per record, a literal `'\n'` between records, none after the
+ * last) rather than building the old `.map().join('\n')` string first — chosen so a huge repository
+ * never holds a second copy of its own serialized content in memory just to hash it, and verified
+ * byte-identical to the prior joined-string form by `index-batch.test.ts`. `bench/index-load.mts`
+ * proves this on the real generated tree, not only in a fixture-sized unit test (RUN-238 acceptance:
+ * "indexing the same tree twice produces the identical contentHash with yielding enabled").
  */
 
 // ---------------------------------------------------------------------------
@@ -68,6 +95,85 @@ export interface StagedEdgeRow {
 }
 
 export type StagedRow = StagedNodeRow | StagedEdgeRow;
+
+// ---------------------------------------------------------------------------
+// Cooperative yielding (RUN-238)
+// ---------------------------------------------------------------------------
+
+/** Why a pass stopped short of a manifest — mirrors `IngestError`'s own `reason`-carrying shape
+ *  (`ingest-client.ts`) rather than a bare string, so a caller (a log line, a test) can branch on
+ *  it without parsing `.message`. */
+export type IndexInterruptReason = 'aborted' | 'busy';
+
+/** Thrown from a cooperative checkpoint (never from anywhere else in this pipeline) when the
+ *  pass must stop before it finishes. Deliberately a THROW, not a sentinel return: every caller
+ *  between here and `runIndexer`'s own top level is plain synchronous-shaped orchestration with no
+ *  outcome type of its own to carry a sentinel through, and `index-work.ts` already lets a thrown
+ *  Error from `runIndexer` reach the coordinator's existing catch-all (`index work step failed`,
+ *  logged and never rethrown) — the identical path `uploadGeneration`'s own `UploadCancelled`
+ *  (`index-upload.ts`) already takes one phase later. Reusing that class here would be the wrong
+ *  signal: an aborted PARSE never touched the journal, upload, or staging that class's name and
+ *  doc are about — this is deliberately its own type, checked with `instanceof` where the reason
+ *  matters (`test/index-yield.test.ts`) and just another `Error` everywhere else. */
+export class IndexInterrupted extends Error {
+  constructor(
+    readonly reason: IndexInterruptReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'IndexInterrupted';
+  }
+}
+
+/** What every cooperative checkpoint in the indexer needs — `indexer.ts`'s candidate loop and this
+ *  file's own hash/encode tails share this shape so a signal or a busy daemon is honoured
+ *  identically wherever a pass can be interrupted, per RUN-238's locked decision to check both "at
+ *  the same yield points." */
+export interface CooperativeDeps {
+  /** The coordinator's own `AbortSignal` (`IndexWorkContext.signal`), threaded all the way down —
+   *  before RUN-238 this never reached `runIndexer` at all (only `uploadGeneration`, one phase
+   *  later), so `cancelRepo`/`cancelAll` could not interrupt a parse in progress. */
+  signal?: AbortSignal;
+  /** `IndexWorkContext.isRunBusy` — re-checked HERE rather than trusted from `attempt()`'s one
+   *  top-of-function check, because a run assigned mid-pass would otherwise share a starved loop
+   *  for the whole remainder of an already-decided-to-be-lower-priority job. */
+  isRunBusy?: () => boolean;
+  /** Test-only override for how many units of work separate one checkpoint from the next —
+   *  production leaves this unset and gets the measured default (see each call site). Mirrors
+   *  `EncodeBatchesOptions.maxUncompressedBytes`'s own "test-only, production never passes this"
+   *  convention: a fast test forces a checkpoint after every single item without needing thousands
+   *  of fixture records to reach one. */
+  yieldEveryRecords?: number;
+}
+
+/** Yield to the event loop via a REAL macrotask. Never `Promise.resolve()` or a bare `await` on an
+ *  already-resolved promise — RUN-238's own anchor measurement is precisely that a microtask
+ *  continuation (`await adapter.parse(...)`) refills the microtask queue every iteration and never
+ *  lets a timer or the poll phase run, so a "yield" built the same way would look like a fix and
+ *  change nothing. `setImmediate` is a Node-only macrotask, acceptable here because this whole
+ *  pipeline already assumes a Node daemon (`node:crypto`, `node:zlib` above). */
+function macrotaskYield(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** One cooperative checkpoint: check the signal, then the busy predicate, THEN yield — in that
+ *  order, so an already-interrupted pass never pays for a macrotask hop it is about to throw past
+ *  anyway. Exported so `indexer.ts`'s candidate loop (the parse-time half of the same measured
+ *  block) shares this instead of a second, possibly-diverging implementation of "check both, yield
+ *  once." Called at the START of every chunked function below (so even a fixture far smaller than
+ *  `yieldEveryRecords` still observes an already-aborted/-busy signal) and then every
+ *  `yieldEveryRecords` records thereafter. */
+export async function cooperativeCheckpoint(deps: CooperativeDeps): Promise<void> {
+  if (deps.signal?.aborted) throw new IndexInterrupted('aborted', 'indexing aborted');
+  if (deps.isRunBusy?.()) {
+    throw new IndexInterrupted('busy', 'indexing abandoned — the daemon became busy with a run');
+  }
+  await macrotaskYield();
+}
+
+/** Measured default (`bench/index-load.mts`, 335920 records): see `computeContentHash`'s own call
+ *  site for the trade this trades off and the numbers behind the choice. */
+const DEFAULT_YIELD_EVERY_RECORDS = 2_000;
 
 export function toStagedRow(record: IndexRecord): StagedRow {
   return record.kind === 'node'
@@ -116,12 +222,31 @@ export function sortRecords(records: readonly IndexRecord[]): IndexRecord[] {
 // Content hash and generation id
 // ---------------------------------------------------------------------------
 
-/** A single fingerprint over the WHOLE generation's content, independent of how it is later split
- *  into batches — `IndexGenerationManifest.contentHash`. Computed over already-sorted, already-
- *  canonicalized rows so re-running the same snapshot and versions reproduces it exactly. */
-export function computeContentHash(sortedRecords: readonly IndexRecord[]): string {
-  const text = sortedRecords.map((r) => canonicalRowJson(toStagedRow(r))).join('\n');
-  return createHash('sha256').update(text, 'utf8').digest('hex');
+/**
+ * A single fingerprint over the WHOLE generation's content, independent of how it is later split
+ * into batches — `IndexGenerationManifest.contentHash`. Computed over already-sorted, already-
+ * canonicalized rows so re-running the same snapshot and versions reproduces it exactly.
+ *
+ * RUN-238: `async` and cooperatively yielding — measured at 382ms/335920 records on the anchor
+ * tree, part of the 1.3s synchronous tail that used to run back to back with the parse loop's own
+ * block with no yield anywhere. Hashes incrementally (one `hash.update` per record, a `'\n'`
+ * between records and never after the last — byte-identical to the old `.map().join('\n')` form,
+ * proven by `index-batch.test.ts`) rather than materializing the whole joined string first, so
+ * this function's own peak memory does not grow with a second full-content copy on a huge repo.
+ */
+export async function computeContentHash(
+  sortedRecords: readonly IndexRecord[],
+  deps: CooperativeDeps = {},
+): Promise<string> {
+  const everyN = deps.yieldEveryRecords ?? DEFAULT_YIELD_EVERY_RECORDS;
+  const hash = createHash('sha256');
+  await cooperativeCheckpoint(deps); // guaranteed once, even for a fixture far under `everyN`.
+  for (let i = 0; i < sortedRecords.length; i++) {
+    if (i > 0) hash.update('\n', 'utf8');
+    hash.update(canonicalRowJson(toStagedRow(sortedRecords[i]!)), 'utf8');
+    if ((i + 1) % everyN === 0) await cooperativeCheckpoint(deps);
+  }
+  return hash.digest('hex');
 }
 
 export interface GenerationIdentity {
@@ -194,7 +319,7 @@ export interface EncodedBatch {
   rowCount: number;
 }
 
-export interface EncodeBatchesOptions {
+export interface EncodeBatchesOptions extends CooperativeDeps {
   /** Test-only override for `DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES` — lets a test exercise
    *  multi-batch splitting without needing megabytes of fixture content. Production code never
    *  passes this. */
@@ -206,14 +331,21 @@ export interface EncodeBatchesOptions {
  * Always produces AT LEAST ONE batch, even for zero records: `IndexGenerationManifest.batchCount`
  * is `positive` in the vendored schema, so an empty generation (everything excluded, denied, or
  * unreadable) still uploads one empty batch rather than being unrepresentable.
+ *
+ * RUN-238: `async` and cooperatively yielding — measured at 904ms/335920 records/11 batches on the
+ * anchor tree, the largest single piece of the 1.3s synchronous tail (`gzipSync` at `level: 9`
+ * dominates it; one call on the largest batch alone measured ~1ms, so the cost is the NUMBER of
+ * `flush()` calls across a big generation, not any single one). Builds each line lazily off
+ * `sortedRecords[i]` rather than a pre-built `lines` array, for the same peak-memory reasoning as
+ * `computeContentHash`'s own doc.
  */
-export function encodeBatches(
+export async function encodeBatches(
   generationId: string,
   sortedRecords: readonly IndexRecord[],
   options: EncodeBatchesOptions = {},
-): EncodedBatch[] {
+): Promise<EncodedBatch[]> {
   const maxUncompressed = options.maxUncompressedBytes ?? DEFAULT_MAX_BATCH_UNCOMPRESSED_BYTES;
-  const lines = sortedRecords.map((r) => canonicalRowJson(toStagedRow(r)));
+  const everyN = options.yieldEveryRecords ?? DEFAULT_YIELD_EVERY_RECORDS;
 
   const batches: EncodedBatch[] = [];
   let currentLines: string[] = [];
@@ -243,13 +375,16 @@ export function encodeBatches(
     currentBytes = 0;
   };
 
-  for (const line of lines) {
+  await cooperativeCheckpoint(options); // guaranteed once, even for a fixture far under `everyN`.
+  for (let i = 0; i < sortedRecords.length; i++) {
+    const line = canonicalRowJson(toStagedRow(sortedRecords[i]!));
     const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // +1 for the newline joiner.
     if (currentLines.length > 0 && currentBytes + lineBytes > maxUncompressed) {
       flush();
     }
     currentLines.push(line);
     currentBytes += lineBytes;
+    if ((i + 1) % everyN === 0) await cooperativeCheckpoint(options);
   }
   flush(); // Always runs — the one empty-generation batch, or the final partial one.
 

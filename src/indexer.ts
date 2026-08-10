@@ -2,9 +2,11 @@ import { posix as posixPath } from 'node:path';
 import type { IndexGenerationManifest } from '@noriq-dev/shared';
 import { type IndexAdapterRegistry, createDefaultAdapterRegistry } from './index-adapters';
 import {
+  type CooperativeDeps,
   type EncodedBatch,
   assembleManifest,
   computeContentHash,
+  cooperativeCheckpoint,
   deriveGenerationId,
   encodeBatches,
   sortRecords,
@@ -47,6 +49,25 @@ import type { IndexSource } from './index-source';
  * does inside `scanIndexSource` — `await adapter.parse(...)` below is RUN-216's one addition to
  * that shape (`index-adapters.ts`'s own note on why `parse` returns a `Promise` now: an
  * unavoidably-async in-process WASM compile, never a network round trip or a partial result).
+ *
+ * **The candidate loop cooperatively yields (RUN-238)** — `await adapter.parse(...)` is a
+ * MICROTASK continuation, not a yield: it refills the microtask queue every iteration, so a busy
+ * event loop's timers and poll phase never get a turn between candidates (measured:
+ * `bench/index-load.mts`, a single continuous 6.3s block on an 8000-file tree, long enough to miss
+ * three of `ws-client.ts`'s 30s heartbeats and make the daemon drop and re-dial its own socket).
+ * Every `yieldEveryFiles` candidates the loop calls `cooperativeCheckpoint` (`index-batch.ts`) —
+ * checks `deps.signal`/`deps.isRunBusy`, THEN yields via a real macrotask (`setImmediate`, never a
+ * microtask) — so cancellation and run-priority both reach a pass already in progress, where
+ * before this neither could: `runIndexer` took no `AbortSignal` at all, and `isRunBusy()` was only
+ * ever consulted once, at the top of `IndexCoordinator.attempt`. A checkpoint THROWS
+ * (`IndexInterrupted`) rather than pausing — `index-work.ts` never catches it, so it reaches
+ * `runIndexer`'s own caller before a manifest, a generation id, or a batch exists, which is what
+ * makes "stops the pass without producing a manifest, a generation, or a journal entry" true by
+ * construction rather than by a caller remembering to check something. The two `pendingImports`/
+ * `pendingReferences` second-pass loops below get the identical treatment, at the same cadence —
+ * extrapolated from the same per-candidate measurement rather than separately measured (this
+ * repo's own synthetic tree has exactly one import per file, so the two costs track together;
+ * `bench/index-load.mts` says so rather than silently assuming it for a repo with far more).
  *
  * **A file entity exists whether or not any adapter recognises it** — this is the one thing
  * `runIndexer` does that no injected module does on its own: every scanned candidate becomes
@@ -183,7 +204,37 @@ export interface IndexerDeps {
    * absent baseline as "everything was deleted".
    */
   previousFilePaths?: Iterable<string>;
+  /** RUN-238: the coordinator's `AbortSignal` (`IndexWorkContext.signal`, threaded through
+   *  `index-work.ts`) — checked at every cooperative checkpoint below. Absent for every caller that
+   *  is not the real background work step (`index-repo.ts`'s local dry run, most of this file's own
+   *  tests): a pass with nothing that could ever cancel it simply never throws `IndexInterrupted`. */
+  signal?: AbortSignal;
+  /** RUN-238: `IndexWorkContext.isRunBusy` — re-checked at the same checkpoints as `signal`, so a
+   *  run assigned mid-pass makes this indexer abandon rather than share a starved loop for the rest
+   *  of its own duration (locked decision: `IndexCoordinator.attempt` only ever checked this once,
+   *  before leasing). Absent has the same meaning as `signal` absent: never busy, by construction. */
+  isRunBusy?: () => boolean;
+  /** Test-only override for how many candidates (files) separate one checkpoint from the next in
+   *  the main loop and both second-pass edge-resolution loops — production leaves this at the
+   *  measured default (`DEFAULT_YIELD_EVERY_FILES` below). See `CooperativeDeps.yieldEveryRecords`
+   *  for why this exists as a knob at all rather than a hardcoded constant. */
+  yieldEveryFiles?: number;
+  /** Test-only override forwarded verbatim to `computeContentHash`/`encodeBatches` as
+   *  `CooperativeDeps.yieldEveryRecords` — kept as a SEPARATE knob from `yieldEveryFiles` because
+   *  the two loops are bounded by different units (candidates vs. records) with different measured
+   *  per-unit costs; a test that wants both chunked loops to checkpoint at the same fixture-scale
+   *  cadence sets both. */
+  yieldEveryRecords?: number;
 }
+
+/**
+ * Measured default (`bench/index-load.mts`, 8000 candidates): see the module doc's own "candidate
+ * loop cooperatively yields" note for the trade this is tuned against — small enough that the
+ * worst observed event-loop stall stays a small multiple of one checkpoint's own cost, large
+ * enough that the NUMBER of `setImmediate` hops (each a real scheduler round trip) does not itself
+ * become the dominant cost of a pass.
+ */
+const DEFAULT_YIELD_EVERY_FILES = 100;
 
 export interface IndexerResult {
   manifest: IndexGenerationManifest;
@@ -250,7 +301,31 @@ export async function runIndexer(
   let inferredEdgesOmitted = 0;
   let unlabelledSymbolsDropped = 0;
 
+  // RUN-238: shared across every checkpoint below — see the module doc's own note on why
+  // `signal`/`isRunBusy` are checked identically at every one of them.
+  const cooperativeDeps: CooperativeDeps = {
+    signal: deps.signal,
+    isRunBusy: deps.isRunBusy,
+    yieldEveryRecords: deps.yieldEveryRecords,
+  };
+  const yieldEveryFiles = deps.yieldEveryFiles ?? DEFAULT_YIELD_EVERY_FILES;
+
+  // Guaranteed once, before the (possibly huge) candidate loop starts — so an already-aborted or
+  // already-busy pass never even begins, and a fixture far smaller than `yieldEveryFiles` still
+  // observes an interrupt (the property `test/index-yield.test.ts` leans on).
+  await cooperativeCheckpoint(cooperativeDeps);
+
+  let filesSinceCheckpoint = 0;
   for (const candidate of scanResult.candidates) {
+    // Counted at the TOP of the loop body, before any `continue` below — a run of skipped
+    // candidates (denied, excluded, no adapter) must not silently stretch the gap between
+    // checkpoints past `yieldEveryFiles`.
+    filesSinceCheckpoint++;
+    if (filesSinceCheckpoint >= yieldEveryFiles) {
+      filesSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
+
     const path = normalizeRepoPath(candidate.path);
     currentPaths.push(path);
 
@@ -387,7 +462,17 @@ export async function runIndexer(
   // (e.g. two separate `require()`/`import` statements naming the same sibling) into one edge.
   const currentPathSet = new Set(currentPaths);
   const seenImportEdges = new Set<string>();
+  // RUN-238: guaranteed once before either second-pass loop, then periodically inside each — same
+  // cadence as the candidate loop above (see the module doc's note on why this is extrapolated
+  // rather than separately measured).
+  await cooperativeCheckpoint(cooperativeDeps);
+  let importsSinceCheckpoint = 0;
   for (const { importerPath, specifier } of pendingImports) {
+    importsSinceCheckpoint++;
+    if (importsSinceCheckpoint >= yieldEveryFiles) {
+      importsSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
     const resolvedPath = resolveRelativeImport(importerPath, specifier, currentPathSet);
     if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
     const from = buildFileEntityUri(scope, importerPath);
@@ -403,7 +488,13 @@ export async function runIndexer(
   // serves both edge types. A `ParsedReference.target` this generation cannot pin to exactly one
   // file is declined the same way, never stubbed.
   const seenReferenceEdges = new Set<string>();
+  let referencesSinceCheckpoint = 0;
   for (const { referencerPath, target } of pendingReferences) {
+    referencesSinceCheckpoint++;
+    if (referencesSinceCheckpoint >= yieldEveryFiles) {
+      referencesSinceCheckpoint = 0;
+      await cooperativeCheckpoint(cooperativeDeps);
+    }
     const resolvedPath = resolveRelativeImport(referencerPath, target, currentPathSet);
     if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
     const from = buildFileEntityUri(scope, referencerPath);
@@ -415,8 +506,12 @@ export async function runIndexer(
   }
 
   const deletions = computeDeletions(currentPaths, deps.previousFilePaths);
+  // `sortRecords` itself does not chunk (index-batch.ts's own doc: one native, uninterruptible
+  // `Array.sort` call, 52ms on the measured tree) — the checkpoint here is what makes an
+  // already-aborted/-busy pass decline BEFORE paying for it, not a yield inside it.
+  await cooperativeCheckpoint(cooperativeDeps);
   const sorted = sortRecords(records);
-  const contentHash = computeContentHash(sorted);
+  const contentHash = await computeContentHash(sorted, cooperativeDeps);
   const generationId = deriveGenerationId({
     projectId: target.projectId,
     repositoryKey: target.repositoryKey,
@@ -424,7 +519,7 @@ export async function runIndexer(
     baseId: target.baseId,
     indexerVersion,
   });
-  const batches = encodeBatches(generationId, sorted);
+  const batches = await encodeBatches(generationId, sorted, cooperativeDeps);
   const manifest = assembleManifest({
     generationId,
     projectId: target.projectId,

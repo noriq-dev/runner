@@ -117,10 +117,15 @@ defaultBranch = "main"
 #
 # maxFiles = 20000               # Bounded size/count controls — daemon POSTURE, not wire
 # maxFileBytes = 1000000         # contract, so raising them never needs a server change.
-# maxTotalBytes = 500000000      # Defaults: 20k files and 500 MB total keep a large
-#                                 # monorepo bounded without truncating an ordinary repo;
-#                                 # 1 MB per file excludes generated/minified/binary-shaped
-#                                 # files without excluding ordinary hand-written source.
+# maxTotalBytes = 100000000      # Defaults: 20k files and 100 MB total content. RUN-238
+#                                 # measured ~15-16x decoded-content-to-peak-heap amplification
+#                                 # on this daemon's own indexing pipeline (bench/index-load.mts)
+#                                 # — 100 MB keeps predicted peak heap under ordinary Node
+#                                 # defaults (see INDEX-OPERATIONS.md's "Load and memory
+#                                 # budgets" section for the numbers and how to raise this once
+#                                 # you have measured your own host's headroom); 1 MB per file
+#                                 # excludes generated/minified/binary-shaped files without
+#                                 # excluding ordinary hand-written source.
 #
 # readDeadlineMs = 120000        # Wall-clock ceiling on ONE indexing pass (2 minutes),
 #                                 # so a slow or huge filesystem walk cannot hang the

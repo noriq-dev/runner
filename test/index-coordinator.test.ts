@@ -169,6 +169,25 @@ describe('priority — runs outrank indexing (decision 10)', () => {
   });
 });
 
+describe('RUN-238: isRunBusy is threaded into the work context, not just checked once at the top', () => {
+  it('ctx.isRunBusy passed to runWork is the exact same predicate as deps.isRunBusy', async () => {
+    let busy = false;
+    const observed: boolean[] = [];
+    const { vcs } = fakeVcs();
+    const { deps } = makeDeps({
+      vcsFor: () => vcs,
+      isRunBusy: () => busy,
+      runWork: async (ctx) => {
+        observed.push(ctx.isRunBusy());
+        busy = true; // flip AFTER the first read — proves this is a live predicate, not a snapshot.
+        observed.push(ctx.isRunBusy());
+      },
+    });
+    await new IndexCoordinator(deps).trigger(TARGET());
+    expect(observed).toEqual([false, true]);
+  });
+});
+
 describe('manifest resolution gate', () => {
   it('a null resolved config starts nothing, without ever asking for a cursor', async () => {
     const { deps, getCursorCalls } = makeDeps({ resolveConfig: async () => null });

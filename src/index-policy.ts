@@ -71,7 +71,22 @@ export const IndexPolicy = z
     maxFileBytes: z.number().int().positive().default(1_000_000),
     // A second, AGGREGATE bound: maxFiles × maxFileBytes could still total several GB for a huge
     // repo of medium files, so this caps the whole pass independently of the per-file limit.
-    maxTotalBytes: z.number().int().positive().default(500_000_000),
+    //
+    // RUN-238: lowered from 500 MB — measured (`bench/index-load.mts`, this repo's own default
+    // host) at ~15-18x decoded-content-to-peak-heapUsed amplification and ~30-33x-to-peak-RSS,
+    // stable across two tree sizes (8000 files/15.9 MB -> 216-324 MB heap / 496-633 MB RSS across
+    // repeated runs; 20000 files/40.2 MB -> ~605 MB heap / ~1.2 GB RSS). 500 MB of content therefore
+    // predicts roughly 7.5-9 GB of peak V8 heap — comfortably past this exact host's own MEASURED,
+    // unconfigured `v8.getHeapStatistics().heap_size_limit` (4192 MB on a 62 GB-RAM machine: Node's
+    // default old-space cap does not simply track available RAM) — so the OLD default read as a
+    // protection and was not one; hitting it would crash the whole daemon process with a JS heap
+    // OOM, not merely truncate one index pass. 100 MB keeps predicted peak heap (~1.5-1.8 GB) under
+    // ~40% of that measured ceiling, leaving headroom for the rest of the daemon plus GC slack,
+    // while still permitting 2.5x more content than this task's own largest measured tree. See
+    // INDEX-OPERATIONS.md's "Load and memory budgets (RUN-238)" for the full numbers and how to
+    // raise this per-repo once you have measured your own host's headroom (a larger
+    // `--max-old-space-size`, or a host known to have more free RAM).
+    maxTotalBytes: z.number().int().positive().default(100_000_000),
     // Wall-clock ceiling on one indexing pass, so a slow or huge filesystem walk cannot hang the
     // daemon indefinitely — 2 minutes covers an ordinary repo with room to spare.
     readDeadlineMs: z.number().int().positive().default(120_000),

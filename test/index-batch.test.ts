@@ -134,36 +134,50 @@ describe('deriveGenerationId', () => {
 });
 
 describe('computeContentHash', () => {
-  it('is identical for identical sorted records', () => {
+  it('is identical for identical sorted records', async () => {
     const records = sortRecords([node(), edge()]);
-    expect(computeContentHash(records)).toBe(computeContentHash(sortRecords([node(), edge()])));
+    expect(await computeContentHash(records)).toBe(await computeContentHash(sortRecords([node(), edge()])));
   });
 
-  it('changes when any record changes', () => {
+  it('changes when any record changes', async () => {
     const a = sortRecords([node()]);
     const b = sortRecords([node({ label: 'different' })]);
-    expect(computeContentHash(a)).not.toBe(computeContentHash(b));
+    expect(await computeContentHash(a)).not.toBe(await computeContentHash(b));
+  });
+
+  // RUN-238: chunking must not change a single hashed byte. `yieldEveryRecords: 1` forces a real
+  // `setImmediate` checkpoint between EVERY record — the most aggressive chunking this function
+  // can ever do in production — and the digest must still match the never-chunked (default) run.
+  it('is byte-identical whether it checkpoints after every record or never at all', async () => {
+    const records = sortRecords([
+      node(),
+      edge(),
+      node({ uri: 'noriq://file/RUN/runner/b.ts', label: 'b.ts' }),
+    ]);
+    const chunked = await computeContentHash(records, { yieldEveryRecords: 1 });
+    const unchunked = await computeContentHash(records, { yieldEveryRecords: 1_000_000 });
+    expect(chunked).toBe(unchunked);
   });
 });
 
 describe('encodeBatches', () => {
-  it('always produces at least one batch, even for zero records', () => {
-    const batches = encodeBatches('gen_1', []);
+  it('always produces at least one batch, even for zero records', async () => {
+    const batches = await encodeBatches('gen_1', []);
     expect(batches).toHaveLength(1);
     expect(batches[0]?.rowCount).toBe(0);
     expect(batches[0]?.batchNumber).toBe(0);
   });
 
-  it('batchHash is the SHA-256 of the compressed bytes, independently verifiable', () => {
-    const batches = encodeBatches('gen_1', sortRecords([node()]));
+  it('batchHash is the SHA-256 of the compressed bytes, independently verifiable', async () => {
+    const batches = await encodeBatches('gen_1', sortRecords([node()]));
     const batch = batches[0]!;
     const expected = createHash('sha256').update(batch.compressed).digest('hex');
     expect(batch.batchHash).toBe(expected);
   });
 
-  it('decompresses back to the exact canonical JSONL of the sorted rows', () => {
+  it('decompresses back to the exact canonical JSONL of the sorted rows', async () => {
     const records = sortRecords([node(), edge()]);
-    const batches = encodeBatches('gen_1', records);
+    const batches = await encodeBatches('gen_1', records);
     const decompressed = gunzipSync(batches[0]!.compressed).toString('utf8');
     const expectedLines = records.map((r) => {
       const row = toStagedRow(r);
@@ -175,16 +189,16 @@ describe('encodeBatches', () => {
     expect(decompressed).toBe(`${expectedLines.join('\n')}\n`);
   });
 
-  it('never exceeds MAX_INGEST_BATCH_BYTES compressed', () => {
-    const batches = encodeBatches('gen_1', sortRecords([node()]));
+  it('never exceeds MAX_INGEST_BATCH_BYTES compressed', async () => {
+    const batches = await encodeBatches('gen_1', sortRecords([node()]));
     for (const batch of batches) expect(batch.compressed.length).toBeLessThanOrEqual(MAX_INGEST_BATCH_BYTES);
   });
 
-  it('splits into multiple batches once the uncompressed budget is exceeded', () => {
+  it('splits into multiple batches once the uncompressed budget is exceeded', async () => {
     const records: IndexRecord[] = Array.from({ length: 20 }, (_, i) =>
       node({ uri: `noriq://file/RUN/runner/f${i}.ts`, label: `f${i}.ts`, content: 'x'.repeat(500) }),
     );
-    const batches = encodeBatches('gen_1', sortRecords(records), { maxUncompressedBytes: 2_000 });
+    const batches = await encodeBatches('gen_1', sortRecords(records), { maxUncompressedBytes: 2_000 });
     expect(batches.length).toBeGreaterThan(1);
     // Batch numbers are contiguous starting at 0, and every row across every batch accounts for
     // exactly the input records — no record dropped, none duplicated.
@@ -193,23 +207,42 @@ describe('encodeBatches', () => {
     expect(totalRows).toBe(records.length);
   });
 
-  it('stamps every batch with the same generationId', () => {
+  it('stamps every batch with the same generationId', async () => {
     const records: IndexRecord[] = Array.from({ length: 10 }, (_, i) =>
       node({ uri: `noriq://file/RUN/runner/f${i}.ts`, label: `f${i}.ts`, content: 'x'.repeat(200) }),
     );
-    const batches = encodeBatches('gen_shared', sortRecords(records), { maxUncompressedBytes: 500 });
+    const batches = await encodeBatches('gen_shared', sortRecords(records), { maxUncompressedBytes: 500 });
     expect(batches.length).toBeGreaterThan(1);
     for (const batch of batches) expect(batch.generationId).toBe('gen_shared');
   });
 
-  it('stays under the real 8 MiB ceiling for a large batch of poorly-compressible content', () => {
+  it('stays under the real 8 MiB ceiling for a large batch of poorly-compressible content', async () => {
     // Base64 has a limited (64-symbol) alphabet, so it still compresses somewhat — this is a
     // realistic stress test of the DEFAULT (non-overridden) safety margin, not a claim that gzip
     // can never compress it at all. The correctness guarantee itself rests on DEFLATE's bounded
     // worst-case framing overhead (see index-batch.ts's module doc), not on this test.
     const bigRecord = node({ content: randomBytes(6_000_000).toString('base64') });
-    const batches = encodeBatches('gen_1', sortRecords([bigRecord]));
+    const batches = await encodeBatches('gen_1', sortRecords([bigRecord]));
     for (const batch of batches) expect(batch.compressed.length).toBeLessThanOrEqual(MAX_INGEST_BATCH_BYTES);
+  });
+
+  // RUN-238: same property as computeContentHash above, at this function's own grain — chunking
+  // must not move a record into a different batch or change a batch's own bytes.
+  it('produces byte-identical batches whether it checkpoints after every record or never at all', async () => {
+    const records: IndexRecord[] = Array.from({ length: 20 }, (_, i) =>
+      node({ uri: `noriq://file/RUN/runner/f${i}.ts`, label: `f${i}.ts`, content: 'x'.repeat(500) }),
+    );
+    const sorted = sortRecords(records);
+    const chunked = await encodeBatches('gen_1', sorted, {
+      maxUncompressedBytes: 2_000,
+      yieldEveryRecords: 1,
+    });
+    const unchunked = await encodeBatches('gen_1', sorted, {
+      maxUncompressedBytes: 2_000,
+      yieldEveryRecords: 1_000_000,
+    });
+    expect(chunked.map((b) => b.batchHash)).toEqual(unchunked.map((b) => b.batchHash));
+    expect(chunked.map((b) => b.rowCount)).toEqual(unchunked.map((b) => b.rowCount));
   });
 });
 

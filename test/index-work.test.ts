@@ -157,6 +157,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
 
     await step(ctx); // must not throw — a thrown error would mean the upload never validated
@@ -186,6 +187,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
     await expect(step(ctx)).rejects.toThrow(/validation/);
   });
@@ -212,6 +214,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
     await expect(step(ctx)).rejects.toThrow(/projectId/);
     expect(scanned).toBe(false);
@@ -242,6 +245,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
     // RUN-223: a successful attempt now reports back what it uploaded (`IndexWorkResult`) — the
     // coordinator's own status recorder needs it, and this is the wiring-only test that proves
@@ -282,6 +286,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
 
     await step(ctx);
@@ -303,6 +308,70 @@ describe('createIndexWorkStep (RUN-222)', () => {
     expect(JSON.stringify(line?.fields)).not.toContain('src/add.ts');
   });
 
+  // RUN-238: before this task, `ctx.signal` was forwarded ONLY to `uploadGeneration` (one phase
+  // after parsing) — `runIndexer` took no signal at all. This proves the wiring reaches the
+  // EARLIER phase: an already-aborted signal must stop the pass before a single network call, not
+  // merely before an upload retry.
+  it('an already-aborted ctx.signal stops the pass during parsing — before any network call at all', async () => {
+    const { mintFetch, ingestFetch } = router({});
+    const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
+    let networkCalled = false;
+    const step = createIndexWorkStep({
+      client,
+      runnerId: 'rnr_1',
+      vcsFor: () => ({ releaseIndexSnapshot: async () => {} }),
+      staging: fileStagingStore(root),
+      fetchImpl: async (...args) => {
+        networkCalled = true;
+        return ingestFetch(...args);
+      },
+      logger: quiet,
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const ctx: IndexWorkContext = {
+      target: TARGET,
+      snapshot: depotShapedSnapshot(),
+      outcome: OUTCOME,
+      config: CONFIG,
+      journal: memJournal(),
+      signal: controller.signal,
+      isRunBusy: () => false,
+    };
+    await expect(step(ctx)).rejects.toMatchObject({ name: 'IndexInterrupted' });
+    expect(networkCalled).toBe(false);
+  });
+
+  // Same wiring, the other predicate: `ctx.isRunBusy` used to be checked only once, at the top of
+  // `IndexCoordinator.attempt`, before this step was ever called — never inside it.
+  it('an already-busy ctx.isRunBusy() stops the pass during parsing — before any network call at all', async () => {
+    const { mintFetch, ingestFetch } = router({});
+    const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
+    let networkCalled = false;
+    const step = createIndexWorkStep({
+      client,
+      runnerId: 'rnr_1',
+      vcsFor: () => ({ releaseIndexSnapshot: async () => {} }),
+      staging: fileStagingStore(root),
+      fetchImpl: async (...args) => {
+        networkCalled = true;
+        return ingestFetch(...args);
+      },
+      logger: quiet,
+    });
+    const ctx: IndexWorkContext = {
+      target: TARGET,
+      snapshot: depotShapedSnapshot(),
+      outcome: OUTCOME,
+      config: CONFIG,
+      journal: memJournal(),
+      signal: new AbortController().signal,
+      isRunBusy: () => true,
+    };
+    await expect(step(ctx)).rejects.toMatchObject({ name: 'IndexInterrupted' });
+    expect(networkCalled).toBe(false);
+  });
+
   it('a validation rejection with many problems throws a bounded message — never the raw joined array', async () => {
     const manyProblems = Array.from({ length: 20 }, (_, i) => `entity ${i}: field invalid`.repeat(10));
     const { mintFetch, ingestFetch } = router({ validationOk: false, validationProblems: manyProblems });
@@ -322,6 +391,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       config: CONFIG,
       journal: memJournal(),
       signal: new AbortController().signal,
+      isRunBusy: () => false,
     };
 
     let thrown: Error | undefined;

@@ -169,9 +169,13 @@ contentMode = "full"              # "full" (default) stores read content, bounde
                                    # only — never raw source text.
 
 maxFiles = 20000                  # Daemon POSTURE, not wire contract — raising these never needs
-maxFileBytes = 1000000            # a server change. Defaults: 20k files / 500 MB total keeps a
-maxTotalBytes = 500000000         # large monorepo bounded; 1 MB/file excludes generated/binary
-                                   # content without excluding ordinary hand-written source.
+maxFileBytes = 1000000            # a server change. Defaults: 20k files / 100 MB total keeps a
+maxTotalBytes = 100000000         # large monorepo bounded without exceeding an ordinary Node
+                                   # heap (RUN-238 — see "Load and memory budgets" below for the
+                                   # measured amplification behind this number and how to raise
+                                   # it once you've measured your own host's headroom); 1 MB/file
+                                   # excludes generated/binary content without excluding ordinary
+                                   # hand-written source.
 
 readDeadlineMs = 120000           # Wall-clock ceiling on ONE indexing pass (2 minutes).
 
@@ -194,6 +198,149 @@ genuinely wired today — `languages` gates the tree-sitter adapter registry
 (`src/index-triggers.ts`). None of these are parsed-and-ignored. If you find one that reads as a
 knob but isn't, that is exactly the defect class this document exists to avoid documenting as a
 feature — report it rather than trusting the comment.
+
+## Load and memory budgets (RUN-238)
+
+An anchor measurement (before this section existed) found a single continuous **6.3-second
+event-loop block** on an 8000-file/335920-record synthetic monorepo: `await adapter.parse(...)`
+inside the candidate loop is a microtask continuation, not a yield — it refills the microtask
+queue every iteration, so timers and the poll phase never get a turn — and the synchronous tail
+(`sortRecords`/`computeContentHash`/`encodeBatches`) ran inside the same unbroken block. Long
+enough to miss three of `ws-client.ts`'s 30s heartbeats and make the daemon drop and re-dial its
+own socket while a large repo indexed.
+
+**The fix**: `runIndexer`'s candidate loop and `index-batch.ts`'s `computeContentHash`/
+`encodeBatches` now cooperatively yield to a REAL macrotask (`setImmediate`, never a microtask)
+every `yieldEveryFiles`/`yieldEveryRecords` items, and re-check the coordinator's `AbortSignal` and
+`isRunBusy()` predicate at every one of those checkpoints — both previously unreachable mid-pass
+(`runIndexer` took no signal at all; `isRunBusy()` was consulted once, before leasing). A
+checkpoint throws `IndexInterrupted` rather than pausing, so an aborted or busy pass stops before a
+manifest, a generation, or a journal entry ever exists. `sortRecords` itself is NOT chunked — one
+native, uninterruptible `Array.sort` call, 52-149ms across every tree size measured below, an order
+of magnitude under hash/encode's own cost.
+
+### The harness
+
+`bench/index-load.mts` is the committed, reproducible load harness (deliberately excluded from
+`npm run test`/`npm run check` — it takes tens of seconds and its numbers are host-dependent):
+
+```bash
+npx tsx bench/index-load.mts                                   # 8000 files, the anchor's own shape
+npx tsx bench/index-load.mts --files 20000                     # maxFiles-adjacent scale
+npx tsx bench/index-load.mts --yield-files 50 --yield-records 500   # tune the checkpoint cadence
+npx tsx bench/index-load.mts --skip-determinism                # skip the extra two full passes
+npx tsx bench/index-load.mts --keep                            # leave the generated tree on disk
+```
+
+It generates its own synthetic TypeScript tree (committed generator, not a checked-in fixture —
+12 numbered functions + 1 combinator + 1 interface + 1 relative import per file, sharded 100 files
+per directory), instruments event-loop lag on a 50ms interval THAT OUTLIVES the work it measures
+(an earlier draft of this probe cleared its lag timer the instant `runIndexer` resolved, so the
+tick that would have reported a trailing block never fired — a blocked loop read as a healthy one;
+every timing claim in this section comes from a probe that stays armed past the pass), samples
+peak RSS/heapUsed, and — by default — indexes the same tree twice and compares canonical output
+byte-for-byte (`compareGenerations`, the same function `index-repo --check-determinism` uses)
+to prove yielding changes no byte.
+
+### Measured numbers (this host: Linux, Node v26.7.0, 32 cores, 62 GB RAM, `v8.getHeapStatistics().heap_size_limit` = 4192 MB unconfigured)
+
+| Tree | files scanned | records | batches | peak RSS | peak heapUsed | worst event-loop stall | determinism |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8000 files / 15.9 MB (3 repeated runs) | 8000 | 335920 | 11 | 496-633 MB | 216-324 MB | 169-211 ms | `contentHash` identical across every run |
+| 20000 files / 40.2 MB (maxFiles-adjacent) | 20000 | 839800 | 27 | 1.2 GB | 605 MB | 514 ms | identical across a fresh re-index |
+
+Before the fix, the SAME 8000-file tree produced one continuous 6298ms block (MAX lag), with 1
+tick late by more than 5 seconds. After: MAX lag 169-514ms across both sizes — the pre-fix block
+was 2-3 ORDERS OF MAGNITUDE longer than anything measured after, and the daemon's heartbeat
+tolerance (~90s, three missed 30s beats) is never remotely threatened by either.
+
+**The residual 500ms-ish outlier at 20000 files is not explained by checkpoint cadence** — halving
+`yieldEveryFiles` from 100 to 50 did not reduce it (547ms vs. 563ms, no meaningful difference,
+measured directly). Direct isolated timing of `gzipSync(level: 9)` on the REAL largest batch's
+JSONL content (7.86 MB, from an actual generated tree) took 31-34ms, ruling out one big
+`encodeBatches` flush as the cause. The remaining plausible explanation, consistent with the
+outlier scaling roughly with peak heap size across the two tree sizes, is an ordinary V8 GC pause
+under memory pressure — cooperative yielding cannot preempt a stop-the-world GC pause, because that
+pause is not JS-level work with a yield point to hook. This is stated as a reasoned inference from
+the evidence above, not a directly instrumented fact (no GC tracing was added to confirm it
+directly) — and it does not change the conclusion below: at ~0.5s worst case against a 90s
+heartbeat-death threshold, it is not a reason to reach for worker-thread isolation.
+
+### Why not worker threads (locked decision, re-examined against these numbers)
+
+The task's locked decisions forbid worker-thread or process isolation "unless your own measurement
+shows cooperative yielding is insufficient." It does not: the pre-fix defect (one continuous
+multi-second block) is gone, replaced by sub-second, infrequent stalls two-to-three orders of
+magnitude smaller, nowhere near the daemon's own heartbeat-death threshold. A worker would still
+have to cross a structured-clone boundary for 335920-839800 records per pass, would still GC-pause
+internally (merely isolated from the main thread rather than eliminated), and was already reasoned
+against on cost grounds before any of this ran. Cooperative yielding is sufficient; a worker thread
+would trade a bounded, well-understood cost for an unmeasured, more complex one to fix a residual
+that isn't the defect this task exists to close.
+
+### A second, independent finding: a real memory leak, discovered by this task's own "background-run coexistence" scope
+
+Running the harness's determinism check (two extra full passes, same process) at 20000-file scale
+first HUNG — confirmed via direct pass-by-pass timing (`node`, isolated script): pass 1 completed
+in ~15s, pass 2 was still running past 3 minutes, CPU-bound (100%+), RSS flat (not still growing),
+23 open file descriptors (no fd exhaustion). Root cause, found by reading `web-tree-sitter`'s own
+type declarations: its `Parser` and `Tree` classes hold Emscripten/WASM-allocated memory behind an
+explicit `.delete()` method, and there is no `FinalizationRegistry` anywhere in that library — so
+plain JS garbage collection of the wrapper object never frees the underlying WASM memory.
+`index-treesitter.ts`'s `parseFile` constructed a fresh `Parser`/`Tree` per file and never called
+`.delete()` on either, across the ENTIRE life of the process (`Parser.init()` is one shared
+Emscripten module, per `treesitter-runtime.ts`'s own doc — every file's leaked allocation lands in
+the SAME arena). One 20000-file pass leaves ~20000 un-freed parse trees in that arena; a second
+pass in the same process starts already bloated and compounds it.
+
+This is not a harness artifact: it is exactly what a long-lived daemon does across its own
+lifetime — every landing, every publish, every shared-poll-ticker tick re-triggers indexing
+(`IndexTriggerHub`, `src/index-triggers.ts`) in the SAME process, for however many days it stays
+up. Fixed in `index-treesitter.ts`'s `parseFile` (`.delete()` on both `tree` and `parser` in a
+`finally`, never on the shared, cached `Language` a `Parser` was bound to). Verified directly: the
+same isolated 3-pass timing that hung before the fix now completes in 13.3-14.2s per pass,
+consistently, with no degradation across repeated passes. It also lowered PEAK RSS for a single
+pass substantially — 8000 files went from ~1065 MB to 496-633 MB — because the leaked WASM
+allocations were counted in RSS the whole time, even within one pass's own lifetime. All numbers
+in this section are POST-fix.
+
+### What this means for `[index].maxTotalBytes`
+
+Peak heapUsed amplification over decoded content, measured post-fix: ~18x at 8000 files (216-324
+MB / 15.9 MB), ~15x at 20000 files (605 MB / 40.2 MB) — stable, mildly decreasing with scale.
+Peak RSS amplification: ~30-33x. The OLD default (`maxTotalBytes = 500_000_000`) predicted roughly
+7.5-9 GB of peak V8 heap for a repo that actually reached it — comfortably past this exact host's
+own measured, UNCONFIGURED `v8.getHeapStatistics().heap_size_limit` (4192 MB, on a 62 GB-RAM
+machine: Node's default old-space cap does not simply track available RAM). That is a bound that
+reads as a protection and is not one: hitting it crashes the WHOLE daemon process with a JS heap
+OOM — every active run's supervision along with it — not merely truncates one index pass. The new
+default (`100_000_000`, RUN-238) predicts ~1.5-1.8 GB of peak heap, under 40% of this host's
+measured ceiling, leaving headroom for the rest of the daemon plus GC slack, while still 2.5x more
+generous than this task's own largest measured tree (40.2 MB).
+
+**This is calibrated to ONE measured host, stated as such rather than assumed universal.** A
+repo/operator that has measured more headroom on their own host — a machine with an explicit
+larger `--max-old-space-size`, or known-larger free RAM plus a raised V8 heap limit — can raise
+`[index].maxTotalBytes` accordingly; the daemon reads it fresh per repo with no restart needed.
+Nothing here bounds `maxFiles` (still 20000) or `maxFileBytes` (still 1 MB) differently — the
+20000-file/40.2 MB tree measured above sits comfortably under 100 MB on content alone, so
+`maxFiles` remains the practical ceiling for an ordinary (non-generated-content-heavy) monorepo
+long before `maxTotalBytes` would trip.
+
+### What is unmeasured
+
+**Perforce and Diversion**: no large live depot was available on this host — the two live VCS
+backends' own `IndexSnapshot.source` implementations (`vcs/perforce-index-source.ts`,
+`vcs/diversion-index-source.ts`) were not load-tested by this task. `bench/index-load.mts` only
+exercises `FilesystemIndexSource`, the same class every git checkout indexes through.
+
+**Windows**: this task's measurements are Linux-only (see this host's own line above). `README.md`
+states Windows is a real CI matrix leg for the runner generally; this task did not re-verify that
+claim for the indexing load path specifically.
+
+**A tree larger than 20000 files**: not generated or measured — `maxFiles`'s own default is the
+practical ceiling this task tested up to. The amplification coefficients above are reported with
+the two data points they came from; extrapolating them further is not done here.
 
 ## Incremental vs. full behaviour
 
