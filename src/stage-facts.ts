@@ -79,10 +79,21 @@ function metric(available: boolean, value: number, slot: string, unavailableReas
     return {
       status: 'unavailable' as const,
       value: null,
-      provenance: 'unavailable' as const,
+      // `provenance` names the CHANNEL that observed this, and `status` says what that channel
+      // could tell us — they are different questions, and conflating them broke the upload.
+      // PLNR-417's ingest refines every daemon metric through DAEMON_PROVENANCE
+      // ('runner_observed' | 'driver_reported' | 'backend_observed' | 'derived'), and a refine
+      // failure skips the WHOLE episode row rather than the one metric — so a `provenance:
+      // 'unavailable'` here (legal in MetricProvenance, reserved for the server's own
+      // nobody-observed-this case) would have silently discarded every episode carrying a Codex
+      // cost, which is the common case this module exists to describe. `stage-timing.ts` already
+      // had this right: one constant provenance per channel, availability in `status` alone.
+      provenance: 'driver_reported' as const,
       source: 'driver' as const,
       sourceId: slot,
       observedAt: null,
+      // Never stamped here: `acceptedAt` means the SERVER accepted the observation, which this
+      // process cannot know. PLNR-417's `acceptMetric` sets it on ingest.
       acceptedAt: null,
       reason: unavailableReason,
     };
@@ -95,7 +106,8 @@ function metric(available: boolean, value: number, slot: string, unavailableReas
     source: 'driver' as const,
     sourceId: slot,
     observedAt: now,
-    acceptedAt: now,
+    // See the unavailable arm above: `acceptedAt` is the server's stamp, not ours.
+    acceptedAt: null,
     reason: null,
   };
 }

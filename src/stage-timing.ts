@@ -54,7 +54,9 @@ const observation = (source: DurationSource, reason: string | null) => ({
   source: source.source,
   sourceId: source.sourceId ?? null,
   observedAt: nowIso(),
-  acceptedAt: nowIso(),
+  // NOT stamped here (RUN-246 follow-up): `acceptedAt` means the SERVER accepted this observation,
+  // which this process cannot know. PLNR-417's ingest sets it via `acceptMetric` on arrival.
+  acceptedAt: null,
   reason,
 });
 
