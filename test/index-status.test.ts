@@ -22,8 +22,8 @@ const quiet = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Ind
 describe('reconcileOperatorState — every IndexReconcileOutcome arm maps to exactly one state', () => {
   const SAMPLE_OUTCOMES: IndexReconcileOutcome[] = [
     { outcome: 'unchanged' },
-    { outcome: 'incremental', fromBase: 'a', toBase: 'b', resumeCandidate: null },
-    { outcome: 'full', reason: 'no active generation', resumeCandidate: null },
+    { outcome: 'incremental', fromBase: 'a', toBase: 'b' },
+    { outcome: 'full', reason: 'no active generation' },
     { outcome: 'association-conflict', projectRepositoryId: 'prjrepo_1', reason: 'bound elsewhere' },
     { outcome: 'unavailable', reason: 'fetch failed' },
     { outcome: 'incompatible-version', activeIndexerVersion: '2', ourIndexerVersion: '1' },
@@ -83,7 +83,7 @@ describe('IndexStatusStore', () => {
     store.record({
       type: 'reconcile',
       repositoryKey: 'my-repo',
-      outcome: { outcome: 'full', reason: 'no active generation on the server', resumeCandidate: null },
+      outcome: { outcome: 'full', reason: 'no active generation on the server' },
     });
     const rec = store.get('my-repo');
     expect(rec?.state).toBe('queued');
@@ -248,7 +248,7 @@ describe('IndexStatusStore', () => {
       store.record({
         type: 'reconcile',
         repositoryKey: 'my-repo',
-        outcome: { outcome: 'full', reason: 'active generation older than ours', resumeCandidate: null },
+        outcome: { outcome: 'full', reason: 'active generation older than ours' },
         activeGenerationId: 'gen_1',
       });
       expect(store.get('my-repo')?.state).toBe('queued');

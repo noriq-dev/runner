@@ -367,7 +367,6 @@ export {
   reconcile,
   type IndexReconcileOutcome,
   type ReconcileInput,
-  type ResumeCandidate,
 } from './index-reconcile';
 export {
   DEFAULT_JOURNAL_PATH,

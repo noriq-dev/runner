@@ -43,7 +43,7 @@ const TARGET: IndexTarget = {
   currentBaseId: 'base-2',
 };
 
-const OUTCOME: IndexWorkOutcome = { outcome: 'full', reason: 'no active generation', resumeCandidate: null };
+const OUTCOME: IndexWorkOutcome = { outcome: 'full', reason: 'no active generation' };
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Parameters<
   typeof createIndexWorkStep

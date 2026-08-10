@@ -66,12 +66,7 @@ describe('reconcile — moved base (decision 10, defers to changesBetween/RUN-21
     const out = reconcile(
       input({ currentBaseId: 'base-2', changesBetween: { ok: true, changed: ['a.ts'], deleted: [] } }),
     );
-    expect(out).toEqual({
-      outcome: 'incremental',
-      fromBase: 'base-1',
-      toBase: 'base-2',
-      resumeCandidate: null,
-    });
+    expect(out).toEqual({ outcome: 'incremental', fromBase: 'base-1', toBase: 'base-2' });
   });
 
   it('full-index-required from changesBetween becomes full', () => {
@@ -90,31 +85,28 @@ describe('reconcile — moved base (decision 10, defers to changesBetween/RUN-21
     expect(out.outcome).toBe('full');
   });
 
-  it('surfaces a validated staged generation at the current base as a resume candidate', () => {
+  // RUN-275: the three tests that used to live here pinned a `resumeCandidate` on the outcome.
+  // Nothing ever read it, and it could not soundly justify skipping work either — it matched on
+  // base and indexer version, while `deriveGenerationId` leaves the MANIFEST out, so one id can
+  // hold content built under different include/exclude globs. What survives is the property that
+  // matters: a staged generation, whatever its state, does not change the DECISION.
+  it('a staged generation at the current base does not change the outcome (RUN-275)', () => {
     const candidate = staged({ baseId: 'base-2', indexerVersion: INDEXER_VERSION });
-    const out = reconcile(
+    const bare = reconcile(
+      input({ currentBaseId: 'base-2', changesBetween: { ok: true, changed: [], deleted: [] } }),
+    );
+    const withStaged = reconcile(
       input({
         currentBaseId: 'base-2',
         cursor: CURSOR({ stagedGenerations: [candidate] }),
         changesBetween: { ok: true, changed: [], deleted: [] },
       }),
     );
-    expect(out).toMatchObject({ outcome: 'incremental', resumeCandidate: candidate });
+    expect(withStaged).toEqual(bare);
+    expect(withStaged.outcome).toBe('incremental');
   });
 
-  it('a staged generation at a DIFFERENT base is not offered as a resume candidate', () => {
-    const stale = staged({ baseId: 'base-9', indexerVersion: INDEXER_VERSION });
-    const out = reconcile(
-      input({
-        currentBaseId: 'base-2',
-        cursor: CURSOR({ stagedGenerations: [stale] }),
-        changesBetween: { ok: true, changed: [], deleted: [] },
-      }),
-    );
-    expect(out).toMatchObject({ resumeCandidate: null });
-  });
-
-  it('an unvalidated staged generation at the current base is not offered as a resume candidate', () => {
+  it('an unvalidated staged generation likewise changes nothing (RUN-275)', () => {
     const unvalidated = staged({ baseId: 'base-2', indexerVersion: INDEXER_VERSION, validated: false });
     const out = reconcile(
       input({
@@ -123,7 +115,7 @@ describe('reconcile — moved base (decision 10, defers to changesBetween/RUN-21
         changesBetween: { ok: true, changed: [], deleted: [] },
       }),
     );
-    expect(out).toMatchObject({ resumeCandidate: null });
+    expect(out).toEqual({ outcome: 'incremental', fromBase: 'base-1', toBase: 'base-2' });
   });
 });
 

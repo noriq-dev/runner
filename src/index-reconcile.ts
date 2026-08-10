@@ -1,8 +1,4 @@
-import type {
-  RunnerCheckoutAssociationState,
-  RunnerIndexCursor,
-  RunnerStagedGeneration,
-} from './memory-contract';
+import type { RunnerCheckoutAssociationState, RunnerIndexCursor } from './memory-contract';
 import type { ChangesBetweenResult } from './vcs/types';
 
 /**
@@ -44,9 +40,26 @@ import type { ChangesBetweenResult } from './vcs/types';
  */
 export const INDEXER_VERSION = '1';
 
-/** A validated staged generation at the base/version this reconciliation is about — decision 12:
- *  surfaced as a resume CANDIDATE only. Whether/how to actually resume onto it is RUN-214's. */
-export type ResumeCandidate = RunnerStagedGeneration;
+/**
+ * ~~A validated staged generation at the base/version this reconciliation is about~~ — REMOVED
+ * (RUN-275). It was computed on every `incremental`/`full` outcome, threaded onward, and read by
+ * nothing, in the belief that RUN-214 would resume onto it. Two things settled it instead of a
+ * consumer:
+ *
+ *   - resume already works, by a different route. `uploadGeneration` asks the server's own
+ *     `status()` and picks up from what it already holds (RUN-221), which is what made the first
+ *     live 409 resume the same generation rather than duplicate it.
+ *   - the candidate could not soundly justify SKIPPING work either, which is the only other thing
+ *     it was good for. It matched on base and indexer version — and `deriveGenerationId` is built
+ *     from (project, repository, branch, base, indexerVersion) with the MANIFEST deliberately
+ *     outside it, so the same id can hold content built under different include/exclude globs.
+ *     RUN-262 made that concrete by adding default excludes: every repo's content changed with no
+ *     base change. Skipping on a base+version match would then leave the old content staged and
+ *     never build the new.
+ *
+ * Deleted rather than given a reader, because a consumer added to justify a producer would have
+ * left two resume paths that can disagree about the same generation.
+ */
 
 /**
  * The six outcomes (locked decision 5), each carrying exactly what the next stage needs. A
@@ -61,7 +74,6 @@ export type IndexReconcileOutcome =
       fromBase: string;
       /** This checkout's current base — where to diff TO. */
       toBase: string;
-      resumeCandidate: ResumeCandidate | null;
     }
   | {
       outcome: 'full';
@@ -69,7 +81,6 @@ export type IndexReconcileOutcome =
        *  unrelated/unresolvable base, or a `changesBetween` the caller never supplied. Free text
        *  for the operator log, never branched on. */
       reason: string;
-      resumeCandidate: ResumeCandidate | null;
     }
   | {
       outcome: 'incompatible-version';
@@ -118,19 +129,6 @@ export interface ReconcileInput {
    * to it.
    */
   changesBetween?: ChangesBetweenResult;
-}
-
-/** A validated staged generation matching BOTH this base and this indexer version — decision 12,
- *  narrowed by the same version-compatibility reasoning as the main decision: a staged generation
- *  from a parser we no longer run is not a safe resume target even if its base matches. */
-function resumeCandidateAt(
-  staged: readonly RunnerStagedGeneration[],
-  baseId: string,
-  indexerVersion: string,
-): ResumeCandidate | null {
-  return (
-    staged.find((g) => g.validated && g.baseId === baseId && g.indexerVersion === indexerVersion) ?? null
-  );
 }
 
 /** `INDEXER_VERSION`'s ordering: a small integer. `null` when a version string does not parse as
@@ -187,14 +185,12 @@ export function reconcile(input: ReconcileInput): IndexReconcileOutcome {
   // below — an association that has simply not been created yet (a registration race, or a key
   // new to this server) must not silently stop indexing the way a real conflict does.
 
-  const resumeCandidate = resumeCandidateAt(cursor.stagedGenerations, currentBaseId, indexerVersion);
   const active = cursor.activeGeneration;
 
   if (!active) {
     return {
       outcome: 'full',
       reason: 'no active generation on the server for this repository',
-      resumeCandidate,
     };
   }
 
@@ -211,7 +207,6 @@ export function reconcile(input: ReconcileInput): IndexReconcileOutcome {
       reason:
         `active generation was built by indexer version ${active.indexerVersion}, older than this ` +
         `daemon's ${indexerVersion} — a parser change also changes output for unchanged files`,
-      resumeCandidate,
     };
   }
 
@@ -226,12 +221,11 @@ export function reconcile(input: ReconcileInput): IndexReconcileOutcome {
   // on a confident `changesBetween`; every `full-index-required`, and every case the caller never
   // asked, becomes `full`.
   if (changesBetween?.ok) {
-    return { outcome: 'incremental', fromBase: active.baseId, toBase: currentBaseId, resumeCandidate };
+    return { outcome: 'incremental', fromBase: active.baseId, toBase: currentBaseId };
   }
   return {
     outcome: 'full',
     reason: !changesBetween ? 'base moved and no changesBetween result was supplied' : changesBetween.detail,
-    resumeCandidate,
   };
 }
 
