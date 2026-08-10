@@ -30,6 +30,7 @@ import type { AgentDriver, DriverSession, DriverStartOptions } from '../drivers/
 import type { CheckedExecutionSpec } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
 import { type RepoFacts, emptyFacts, hasFacts } from '../repo-intel';
+import { type Clock, defaultClock, elapsedMs } from '../stage-timing';
 import type { RunReport } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 
@@ -56,6 +57,9 @@ export interface PatternMapHost {
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
   startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  /** The clock this stage times its own wall-clock stretch against (RUN-242) — see
+   *  `PlanHost.clock`'s doc; optional, defaults to `performance.now()`. */
+  clock?: Clock;
   steering?: {
     register: (runId: string, session: DriverSession, stop: () => Promise<void>) => void;
     unregister: (runId: string) => void;
@@ -148,7 +152,10 @@ export const mapPatterns = async (
 ): Promise<PatternMap | null> => {
   host.report(input.run.id, { status: 'running', phase: 'agent' });
   let text = '';
-  const startedAt = Date.now();
+  // Monotonic (RUN-242) — see stage-timing.ts's doc; consumed in the `finally` below so a mapper
+  // that throws still charges the run for the stretch it actually ran.
+  const clock = host.clock ?? defaultClock;
+  const startedAt = clock();
   const budgetRun = host.startAgent(input.driver, {
     ...input.start,
     prompt: input.prompt,
@@ -174,7 +181,7 @@ export const mapPatterns = async (
   } finally {
     host.steering?.unregister(input.run.id);
     await budgetRun.stop().catch(() => {});
-    host.charge((Date.now() - startedAt) / 1000);
+    host.charge(elapsedMs(startedAt, clock) / 1000);
   }
 
   if (exit.outcome !== 'done') {

@@ -1,7 +1,16 @@
 import { spawn } from 'node:child_process';
+import type { IntelligenceDurationMs } from '@noriq-dev/shared';
 import { killProcessTree, treeSpawnOptions } from './proc';
 import { renderPrompt } from './prompts';
 import { sanitizedAgentEnv } from './security';
+import {
+  type Clock,
+  completeDuration,
+  defaultClock,
+  elapsedMs,
+  notApplicableDuration,
+  unavailableDuration,
+} from './stage-timing';
 
 // The deterministic verify floor (RUN-19): after a build run's agent exits, the
 // daemon shells out to the manifest `verify` command in the Run's worktree —
@@ -127,6 +136,63 @@ export async function runVerify(
   const timeoutMs = (spec.timeoutSeconds ?? DEFAULT_VERIFY_TIMEOUT_SECONDS) * 1000;
   const { exitCode, output, timedOut } = await exec(spec.cmd, cwd, timeoutMs, spec.shell ?? undefined);
   return { passed: !timedOut && exitCode === 0, exitCode, output: output.trim(), timedOut };
+}
+
+/** Where every duration this module measures points its `source`/`sourceId` (RUN-242) — one
+ *  constant so a reader of the log line can tell "the daemon watched the verify command run" from
+ *  any other kind of duration without re-deriving it per call site. */
+const VERIFY_DURATION_SOURCE = { source: 'runner' as const, sourceId: 'verify' };
+
+/**
+ * Time one `runVerify` call (RUN-242) — the plan's v1-mandatory metric, and until now completely
+ * untimed. A wrapper around `runVerify` rather than a change to it: the fix-round loop
+ * (`verifyWithFeedback` in supervisor.ts) calls `runVerify` once per attempt and wants a duration
+ * PER attempt, and folding the clock into `runVerify` itself would change its return shape for
+ * every existing caller and test for a field only the timing-aware callers need.
+ *
+ * try/finally, not try/catch: `defaultExec`'s own promise never rejects (see its doc — a timeout or
+ * a spawn error both resolve with an answer), so `onDuration` sees `complete` on every real path.
+ * The `catch` exists for an INJECTED `VerifyExec` (tests, or a future exec that can throw) — the
+ * boundary between "started" and "settled" is lost there, which is exactly what `unavailable`
+ * means — and the error itself is never swallowed: `onDuration` always fires before it propagates,
+ * but it still propagates.
+ */
+export async function timedVerify(
+  spec: VerifySpec,
+  cwd: string,
+  onDuration: (d: IntelligenceDurationMs) => void,
+  deps: { exec?: VerifyExec; clock?: Clock } = {},
+): Promise<VerifyResult> {
+  const clock = deps.clock ?? defaultClock;
+  const startedAt = clock();
+  let caught: unknown;
+  let threw = false;
+  try {
+    return await runVerify(spec, cwd, deps);
+  } catch (err) {
+    threw = true;
+    caught = err;
+    throw err;
+  } finally {
+    onDuration(
+      threw
+        ? unavailableDuration(
+            VERIFY_DURATION_SOURCE,
+            `the verify command errored before it settled: ${caught instanceof Error ? caught.message : String(caught)}`,
+          )
+        : completeDuration(elapsedMs(startedAt, clock), VERIFY_DURATION_SOURCE),
+    );
+  }
+}
+
+/**
+ * The deterministic floor never ran here (RUN-242) — no `[verify].cmd` configured, or the workflow
+ * declined the stage. `value` is forced `null` by the schema; this is what a caller reports INSTEAD
+ * of simply not measuring anything, so a dashboard reading "0ms" can never mean "it ran instantly"
+ * when what actually happened is "it did not run".
+ */
+export function verifyNotApplicable(reason: string): IntelligenceDurationMs {
+  return notApplicableDuration(VERIFY_DURATION_SOURCE, reason);
 }
 
 /** Format a verify failure for a task comment (the floor-gate surface). */

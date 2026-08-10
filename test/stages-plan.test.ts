@@ -229,6 +229,18 @@ describe('the plan stage', () => {
     expect(i.tally.chargeTime).toHaveBeenCalled();
   });
 
+  // RUN-242: chargeTime used to be a `Date.now()` difference, which a wall-clock step can send
+  // negative — `IntelligenceDurationMs`'s own schema would reject that. The clock is now injected
+  // and monotonic, so the charged figure is exact and provable without a real timer.
+  it('charges the exact elapsed time from an injected clock, never a wall-clock reading', async () => {
+    const readings = [1_000, 4_800]; // 3800ms elapsed
+    const h = host({ clock: () => readings.shift() ?? 4_800 });
+    const i = input(driverSaying('```json\n{}\n```')) as { tally: ReturnType<typeof tally> };
+    const planned = await planRun(h, i as never);
+    if (planned) await planned.close(planned.checked);
+    expect(i.tally.chargeTime).toHaveBeenCalledWith(3.8);
+  });
+
   // The planner wrote these paths from what it read, so a `modify` naming a file that is not there
   // means it guessed — and the builder is told, in the same shape a delivered spec's findings take.
   it('carries the check’s findings through to the builder', async () => {

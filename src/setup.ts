@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { SetupSpec } from '@noriq-dev/shared';
+import { defaultClock, elapsedMs } from './stage-timing';
 import type { VerifyExec } from './verify';
 
 /**
@@ -110,7 +111,7 @@ export async function runSetup(
   const timeoutMs = (spec.timeoutSeconds || 600) * 1_000;
   const ran: SetupCommandResult[] = [];
   for (const cmd of spec.cmds) {
-    const startedAt = Date.now();
+    const startedAt = defaultClock();
     // `exec` is contracted never to reject; the catch is for a caller that injected one that does,
     // and turns it into the same reported failure rather than an exception out of `prepare`.
     const r = await exec(cmd, cwd, timeoutMs).catch((err: unknown) => ({
@@ -118,7 +119,9 @@ export async function runSetup(
       output: String(err),
       timedOut: false,
     }));
-    const seconds = Math.round((Date.now() - startedAt) / 1000);
+    // RUN-242: monotonic, because this figure is REPORTED to the agent in its brief — a
+    // wall-clock step would put a wrong or negative duration in front of it.
+    const seconds = Math.round(elapsedMs(startedAt) / 1000);
     const ok = r.exitCode === 0 && !r.timedOut;
     ran.push({
       cmd,

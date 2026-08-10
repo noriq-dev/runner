@@ -1,4 +1,5 @@
 import type { ContextPack, ContextPackRole } from './memory-contract';
+import { defaultClock, elapsedMs } from './stage-timing';
 
 /**
  * RUN-228's task context pack retrieval: fetch, bound, and RECORD ONLY.
@@ -159,7 +160,7 @@ export async function retrieveContextPack(
     ...(input.budgetTokens !== undefined ? { budgetTokens: input.budgetTokens } : {}),
   };
 
-  const started = Date.now();
+  const started = defaultClock();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<'timeout'>((resolve) => {
     timer = setTimeout(() => resolve('timeout'), timeoutMs);
@@ -172,7 +173,9 @@ export async function retrieveContextPack(
     // or a future fetcher that does not honour it, turn a run's preparation into an unhandled
     // rejection instead of the degradation this whole module exists to guarantee.
     const settled = await Promise.race([fetcher(request).catch(() => null), timedOut]);
-    const tookMs = Date.now() - started;
+    // RUN-242: monotonic — this rides back beside the timeout verdict above, and a
+    // wall-clock step could make the two disagree about the same interval.
+    const tookMs = elapsedMs(started);
     if (settled === 'timeout') {
       return { attempted: true, pack: null, omission: { reason: 'timeout', afterMs: timeoutMs }, tookMs };
     }

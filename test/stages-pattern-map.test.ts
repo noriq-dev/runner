@@ -185,6 +185,47 @@ describe('the stage', () => {
     expect(h.record).toHaveBeenCalledWith('pattern-map', expect.anything());
     expect(h.charge).toHaveBeenCalled();
   });
+
+  // RUN-242: the stage's wall-clock stretch is timed against an injectable monotonic clock, not
+  // Date.now() — a real timer would make this test slow and flaky; a scripted clock makes the
+  // elapsed value exact and instant to assert.
+  it('charges the exact elapsed time from the injected clock', async () => {
+    const h = host();
+    const readings = [1_000, 6_500]; // 5500ms elapsed
+    (h as PatternMapHost).clock = () => readings.shift() ?? 6_500;
+    await mapPatterns(h, input(driverSaying('```json\n{"analogs":[{"analog":"a","copy":"b"}]}\n```')));
+    expect(h.charge).toHaveBeenCalledWith(5.5);
+  });
+
+  // "A stage that throws mid-flight still records" (RUN-242): the session's own `done` rejecting
+  // is a genuine throw the stage's try/finally has to survive — the mapper produces no analogs (a
+  // failed stage cannot gate the run), but the elapsed time it actually spent is still charged.
+  it('still charges elapsed time when the session throws mid-flight', async () => {
+    const h = host();
+    const readings = [2_000, 9_000]; // 7000ms elapsed
+    (h as PatternMapHost).clock = () => readings.shift() ?? 9_000;
+    const throwingDriver: AgentDriver = {
+      tool: 'claude',
+      capabilities: {
+        toolHooks: true,
+        steer: true,
+        interrupt: true,
+        resumableSession: true,
+        perModelTelemetry: true,
+      },
+      catalog: { models: [], efforts: [] },
+      start: (opts: DriverStartOptions) => ({
+        runId: opts.runId,
+        pushInput: () => true,
+        interrupt: async () => {},
+        stop: async () => {},
+        done: () => Promise.reject(new Error('session crashed')),
+      }),
+    };
+    const result = await mapPatterns(h, input(throwingDriver));
+    expect(result).toBeNull();
+    expect(h.charge).toHaveBeenCalledWith(7);
+  });
 });
 
 describe('rendering analogs into the brief', () => {

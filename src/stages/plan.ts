@@ -26,6 +26,7 @@ import type { AgentDriver, DriverSession, DriverStartOptions } from '../drivers/
 import type { CheckedExecutionSpec } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
 import { renderPrompt } from '../prompts';
+import { type Clock, defaultClock, elapsedMs } from '../stage-timing';
 import type { ResolvedRepo, RunReport, RunTally } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import type { Workspace } from '../vcs/types';
@@ -43,6 +44,11 @@ export interface PlanHost {
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
   startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  /** The clock `abandon`/`close` time this stage's stretch against (RUN-242). Optional — defaults
+   *  to `performance.now()` — so a test can drive elapsed time without a real timer, and so this
+   *  stage's duration is measured against the SAME clock the budget-supervision layer uses rather
+   *  than a wall clock that can step. */
+  clock?: Clock;
   /** Makes the planner cancellable while it runs (RUN-16/18) — it is a live session like any
    *  other, and one outside this is one `run.cancel` cannot reach. */
   steering?: {
@@ -165,7 +171,10 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   /** Non-null only while a repair (RUN-197) or revision (RUN-198) turn runs — that turn's own
    *  bounded accumulator, because a length snapshot into the sliding tail cap cannot isolate one. */
   let repairBuf: string | null = null;
-  const startedAt = Date.now();
+  // Monotonic (RUN-242) — see stage-timing.ts's doc for why Date.now() charged the budget a
+  // negative or inflated stretch on a wall-clock step.
+  const clock = host.clock ?? defaultClock;
+  const startedAt = clock();
   const budgetRun = host.startAgent(plan.driver, {
     ...plan.start,
     prompt: plan.prompt,
@@ -202,7 +211,7 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   const abandon = async (why: string): Promise<null> => {
     host.steering?.unregister(run.id);
     await budgetRun.stop().catch(() => {});
-    tally.chargeTime((Date.now() - startedAt) / 1000);
+    tally.chargeTime(elapsedMs(startedAt, clock) / 1000);
     host.transcript(run.id).milestone(`${why} — proceeding unplanned`);
     return null;
   };
@@ -343,7 +352,7 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
       } finally {
         host.steering?.unregister(run.id);
         await budgetRun.stop().catch(() => {});
-        tally.chargeTime((Date.now() - startedAt) / 1000);
+        tally.chargeTime(elapsedMs(startedAt, clock) / 1000);
       }
     },
   };

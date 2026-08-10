@@ -1,6 +1,7 @@
 import type {
   AgentTool,
   EffortEpisode,
+  IntelligenceDurationMs,
   LandPolicy,
   PermissionProfile,
   ProjectManifest,
@@ -130,7 +131,7 @@ import {
   type VerifyResult,
   type VerifySpec,
   defaultExec,
-  runVerify,
+  timedVerify,
   verifyFeedbackPrompt,
   verifyFixRounds,
 } from './verify';
@@ -1672,7 +1673,17 @@ export class RunSupervisor {
             phase: 'landing', // this verify IS the landing pipeline; don't rename it mid-flight
           })
         : {
-            ...(await runVerify(rebaseGate, worktree.localPath, { exec: this.deps.verifyExec })),
+            ...(await timedVerify(
+              rebaseGate,
+              worktree.localPath,
+              (d) =>
+                this.log.info('deterministic verify (landing, sessionless) timed', {
+                  runId: ctx.run.id,
+                  cmd: rebaseGate.cmd,
+                  durationMs: d,
+                }),
+              { exec: this.deps.verifyExec },
+            )),
             attempts: 1,
           };
       commandObserved = {
@@ -1792,7 +1803,17 @@ export class RunSupervisor {
     phase: RunPhase;
   }): Promise<VerifyResult & { attempts: number }> {
     const transcript = this.transcript(ctx.run.id);
-    let result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+    // One duration per attempt (RUN-242) — logged as it happens rather than folded into one figure
+    // for the whole call, since a retry loop's later attempts are a DIFFERENT command run, not a
+    // continuation of the first one's clock.
+    const logDuration = (attempt: number) => (d: IntelligenceDurationMs) =>
+      this.log.info('deterministic verify command timed', {
+        runId: ctx.run.id,
+        cmd: ctx.spec.cmd,
+        attempt,
+        durationMs: d,
+      });
+    let result = await timedVerify(ctx.spec, ctx.cwd, logDuration(1), { exec: this.deps.verifyExec });
     this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
     // How many times THIS call actually ran the command (RUN-225) — the daemon's own observation,
     // separate from `rounds` below (the CEILING on retries, which a session with nothing left to
@@ -1836,7 +1857,7 @@ export class RunSupervisor {
         return { ...result, attempts };
       }
       this.deps.report(ctx.run.id, { status: 'running', phase: ctx.phase });
-      result = await runVerify(ctx.spec, ctx.cwd, { exec: this.deps.verifyExec });
+      result = await timedVerify(ctx.spec, ctx.cwd, logDuration(attempt + 1), { exec: this.deps.verifyExec });
       attempts += 1;
       this.recordVerifyOutcome(transcript, ctx.spec.cmd, result);
       if (result.passed) {

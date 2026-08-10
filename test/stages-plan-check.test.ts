@@ -101,6 +101,15 @@ describe('a plan that passes', () => {
     // putting in front of the builder as if they were problems.
     expect(r.findings).toBe('');
   });
+
+  // RUN-242: the round's wall-clock stretch is timed against an injectable monotonic clock rather
+  // than Date.now(), so the charged figure is exact and provable without a real timer.
+  it('charges the exact elapsed time from an injected clock', async () => {
+    const readings = [2_000, 5_250]; // 3250ms elapsed
+    const h = host({ clock: () => readings.shift() ?? 5_250 });
+    await checkPlan(h, input(checkerSaying('Looks coherent.\nVERDICT: PASS')));
+    expect(h.charge).toHaveBeenCalledWith(3.25);
+  });
 });
 
 describe('a plan that fails', () => {

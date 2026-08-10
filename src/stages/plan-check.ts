@@ -34,6 +34,7 @@ import type { AgentDriver, DriverExit, DriverStartOptions } from '../drivers/typ
 import type { CheckedExecutionSpec, SpecFinding } from '../execution-spec';
 import type { logger as defaultLogger } from '../logger';
 import { renderPrompt } from '../prompts';
+import { type Clock, defaultClock, elapsedMs } from '../stage-timing';
 import type { RunReport } from '../supervisor';
 import type { RunTranscript } from '../transcript';
 import { type Verdict, parseVerdict } from '../verify-agent';
@@ -43,6 +44,9 @@ export interface PlanCheckHost {
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
   startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  /** The clock a checker round times its own wall-clock stretch against (RUN-242) — see
+   *  `PlanHost.clock`'s doc; optional, defaults to `performance.now()`. */
+  clock?: Clock;
   /** Ask the PLANNER to revise, in its still-open session. Returns the revised spec, or null when
    *  the turn failed or produced nothing usable — either of which ends the loop. */
   revise(feedback: string): Promise<{ checked: CheckedExecutionSpec; text: string } | null>;
@@ -106,7 +110,10 @@ async function checkOnce(
       },
     },
   });
-  const startedAt = Date.now();
+  // Monotonic (RUN-242), and consumed in `finally` below so a round that THROWS (budgetRun.done
+  // rejecting) still charges the run for the stretch it actually ran, rather than losing it.
+  const clock = host.clock ?? defaultClock;
+  const startedAt = clock();
   const slot = `plan-check:${round}`;
   try {
     const exit = await budgetRun.done;
@@ -117,7 +124,7 @@ async function checkOnce(
     }
   } finally {
     await budgetRun.stop().catch(() => {});
-    host.charge((Date.now() - startedAt) / 1000);
+    host.charge(elapsedMs(startedAt, clock) / 1000);
   }
   const v = parseVerdict(text);
   return { verdict: v.verdict, findings: v.findings };

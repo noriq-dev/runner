@@ -16,7 +16,7 @@
 
 import { lockFloorComment } from '../lock-hooks';
 import { cmdVerify, runCommitMessage } from '../supervisor';
-import { verifyFailureComment } from '../verify';
+import { verifyFailureComment, verifyNotApplicable } from '../verify';
 import type { RunPipeline, StageHost } from './types';
 
 export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<void> => {
@@ -120,39 +120,49 @@ export const verifyStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // The deterministic floor (RUN-19), when NOT landing — the landing pipeline verifies the REBASED
   // result instead, which is strictly the better question.
   const floorCmd = cmdVerify(repo.manifest.verify);
-  if (wf.produces && ctx.driverSucceeded && ctx.exit.outcome === 'done' && !ctx.landPolicy && floorCmd) {
-    // Same silence as landing, and the longer of the two in practice: the full suite with no token
-    // burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to the agent on a
-    // failure, which flips the phase to 'agent' again.
-    host.report(run.id, { status: 'running', phase: 'verifying' });
-    const result = await host.verifyWithFeedback({
-      run,
-      spec: floorCmd,
-      cwd: worktree.localPath,
-      session: ctx.session,
-      tally: ctx.tally,
-      phase: 'verifying',
-    });
-    // A real command the daemon watched exit (RUN-225) — recorded whatever the outcome, so the
-    // episode shows this sitting reached the floor even on the FAIL path below.
-    ctx.commandObservations.push({
-      site: 'verify',
-      cmd: floorCmd.cmd,
-      passed: result.passed,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      attempts: result.attempts,
-    });
-    if (result.passed) {
-      host.log.info('deterministic verify passed', { runId: run.id });
-    } else {
-      host.log.warn('deterministic verify FAILED — run gated (not done)', {
+  if (wf.produces && ctx.driverSucceeded && ctx.exit.outcome === 'done' && !ctx.landPolicy) {
+    if (!floorCmd) {
+      // The stage reaches this point but has nothing to run (RUN-242): no `[verify].cmd` committed
+      // for this repo. Logged as `not_applicable`, never silently skipped — a duration of "0ms"
+      // would read as "ran instantly", which is a different fact than "did not run at all".
+      host.log.info('deterministic verify: not applicable', {
         runId: run.id,
+        durationMs: verifyNotApplicable('no [verify].cmd configured for this repo'),
+      });
+    } else {
+      // Same silence as landing, and the longer of the two in practice: the full suite with no
+      // token burn to show for it (RUN-31). verifyWithFeedback can also hand work BACK to the agent
+      // on a failure, which flips the phase to 'agent' again.
+      host.report(run.id, { status: 'running', phase: 'verifying' });
+      const result = await host.verifyWithFeedback({
+        run,
+        spec: floorCmd,
+        cwd: worktree.localPath,
+        session: ctx.session,
+        tally: ctx.tally,
+        phase: 'verifying',
+      });
+      // A real command the daemon watched exit (RUN-225) — recorded whatever the outcome, so the
+      // episode shows this sitting reached the floor even on the FAIL path below.
+      ctx.commandObservations.push({
+        site: 'verify',
+        cmd: floorCmd.cmd,
+        passed: result.passed,
         exitCode: result.exitCode,
         timedOut: result.timedOut,
+        attempts: result.attempts,
       });
-      comment(verifyFailureComment(floorCmd, result));
-      ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'verify' };
+      if (result.passed) {
+        host.log.info('deterministic verify passed', { runId: run.id });
+      } else {
+        host.log.warn('deterministic verify FAILED — run gated (not done)', {
+          runId: run.id,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+        });
+        comment(verifyFailureComment(floorCmd, result));
+        ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'verify' };
+      }
     }
   }
 };
