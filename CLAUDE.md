@@ -67,6 +67,9 @@ The dispatch path:
    *above* the seam (`DriverStartOptions.env`, computed once in the supervisor's `startAgent`), so the
    trust boundary holds no matter who spawns. We deliberately keep executing **inside our own trust
    boundary** — no third-party runtime adapter — but the seam is clean enough to add one later.
+   [DRIVER-SEAM.md](DRIVER-SEAM.md) states what a NEW vendor must satisfy to sit here, and records
+   why GitHub Copilot cannot (RUN-282): its auth IS forge-push authority, which the agent half of
+   THREAT-MODEL invariant #1 forbids — a NO the seam's own requirements make structural, not a gap.
 6. **`verify.ts`** (deterministic, zero-token manifest command) then **`verify-agent.ts`** (independent
    adversarial agent) gate a build; **`land.ts`** rebases + re-verifies + fast-forwards when `[land]`
    is configured.
