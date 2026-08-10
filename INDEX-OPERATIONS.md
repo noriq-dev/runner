@@ -982,6 +982,47 @@ about whether any particular citation has been verified, and a verification-repo
 failure never blocks or fails a run (the report is fire-and-forget from `stages/prepare.ts`'s point
 of view).
 
+## What the dogfood actually retrieved (RUN-236)
+
+RUN-236 asks for retrieved context to be compared against real task outcomes and recorded as
+useful/misleading/missing rather than declared to work. Measured 2026-08-10 against the live server,
+asking for a task whose ground truth was fully known because it had just been finished (RUN-283:
+`src/index-redact.ts`, `test/index-redact.test.ts`, `INDEX-OPERATIONS.md`, `src/index-reconcile.ts`).
+
+**Useful.** The required-facts half is exactly as specified and is the part that carries its weight:
+title, body, the whole `executionSpec` with all six locked decisions, and the acceptance criteria
+came back complete at a 3000-token budget and again at 30000, never displaced by the retrieved
+sections. `known_hazards` returned two genuinely load-bearing hazards at the larger budget, one of
+which ("anything read from `main` is missing the entire Project Memory execution plane") is precisely
+the mistake a fresh reader of this repo makes.
+
+**Missing.** `similar_episodes` is empty because **no episode has ever been recorded** — the daemon's
+`recordEpisode` sink fires from `settle`, so it needs a real dispatched run, and no run has been
+dispatched since the episode path was built. That is RUN-236's own second acceptance criterion, and
+it is gated on a dispatch this daemon cannot originate: the server assigns work, the daemon only
+dials out, and there is deliberately no `dispatch` CLI command. `graph_neighborhood` is empty for the
+reason RUN-277 already documents in full — a task has no edge into the code graph, so a task-seeded
+pack cannot reach code even when the index is healthy.
+
+**Misleading, and this is the finding worth keeping.** `graph_neighborhood` reports
+`coverage: {complete: true, reasons: []}` while returning nothing — at a 52504-character allotment,
+so not a budget artifact. `complete: true` is an affirmative claim that nothing is related, which is
+exactly the reading `explain_project_area`'s own contract forbids ("an empty result with
+`coverage.complete: false` ... is NEVER the same claim as nothing is related"). The correct answer is
+the one `affected_tests` gives in the same response — `unanswerable`, `no-writer-yet` — and having
+both shapes side by side in one pack is what makes the wrong one legible. Recorded on RUN-277 rather
+than filed separately: same root cause, same fix site.
+
+A second, smaller one: at a 3000-token budget `known_hazards` returned zero excerpts alongside the
+notice "2 more hazard(s) did not fit in 424 characters". Nothing fit, so "2 more" overstates what was
+delivered — a section that included none of them reads as though it included some.
+
+**Withholding inventory, re-measured over tracked files after RUN-283.** `noriq`: zero withheld
+(previously six, none of which held a credential). `noriq-runner`: six, every one a test fixture
+carrying a real issuer prefix or PEM body — correct behaviour, and the useful contrast. Both repos'
+`.noriq/project.toml` comments were stating the old figures and have been corrected; a marker comment
+that misdescribes what leaves the machine is worse than no comment.
+
 ## Troubleshooting
 
 Every entry names what `index-status` (or the daemon's log) actually shows, and what to do.
