@@ -6177,8 +6177,12 @@ describe('the prompt invites an agent to reach a human (RUN-32)', () => {
       expect(p).toContain('request_input');
       expect(p).toContain('raise_alert');
       // The reassurance is the point: an agent that believes asking ends its run will guess
-      // instead. RUN-30 made "paused, not discarded" true — this is what tells it so.
-      expect(p).toMatch(/paused, not discarded/);
+      // instead. RUN-30 made "resumed with your context intact" true — this is what tells it so.
+      expect(p).toMatch(/resumed with your context intact/);
+      // RUN-191: the same paragraph also names the non-blocking shape (PLNR-237) — an agent that
+      // never hears blocking:false exists will never reach for it, and the answer stays undelivered
+      // no matter how well the daemon routes it.
+      expect(p).toContain('blocking: false');
     }
   });
 

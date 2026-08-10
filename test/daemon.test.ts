@@ -20,6 +20,7 @@ import {
 import type { DaemonHandle } from '../src/daemon';
 import { repoId } from '../src/discovery';
 import { zeroTelemetry } from '../src/drivers/types';
+import type { DriverExit, DriverSession } from '../src/drivers/types';
 import type { IndexCoordinator } from '../src/index-coordinator';
 import type { IndexTriggerHub } from '../src/index-triggers';
 import { suggestedMemoryPaths } from '../src/memory-render';
@@ -1088,6 +1089,64 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     await tick();
     await tick();
     expect(supervised).toEqual(['run_a', 'run_b']);
+  });
+
+  // RUN-191: PLNR-237's own closing note is that a `blocking: false` request_input answer, when
+  // a run is live, is delivered as an ORDINARY steer over this socket — a `steers` row with the
+  // signal id as its dedup source, so the existing steer.ack machinery applies unmodified. The
+  // audit for this ticket was to find out whether that is actually true before writing any new
+  // routing, since a driver that could not be steered mid-turn would silently drop the answer.
+  // Both drivers declare `capabilities.steer = true` (src/drivers/claude.ts, src/drivers/codex.ts)
+  // and `SteeringBridge.applySteer` (src/steering.ts) already fans a steer out to every session
+  // registered for a run — including a chain's wave children (RUN-170, see the "several live
+  // sessions of one run" block in test/steering.test.ts). This test is deliverable 1: it pins the
+  // one hop steering.test.ts cannot reach — the daemon's own onSteer wiring — by driving a real
+  // 'steer' wire frame through the fake socket and asserting it reaches the registered session and
+  // is acked delivered/runtime, exactly like a human's steer. No production code changed for this;
+  // if it had failed, that would have been the signal to add routing.
+  describe('a non-blocking request_input answer arrives as an ordinary steer (RUN-191)', () => {
+    class FakeAnswerSession implements DriverSession {
+      readonly runId = 'run_answered';
+      readonly inputs: string[] = [];
+      pushInput(text: string): boolean {
+        this.inputs.push(text);
+        return true;
+      }
+      async interrupt(): Promise<void> {}
+      async stop(): Promise<void> {}
+      done(): Promise<DriverExit> {
+        return new Promise(() => {}); // never resolves — this test only cares about pushInput
+      }
+    }
+
+    it('reaches the live session’s pushInput and acks via=’runtime’ — no daemon routing needed', async () => {
+      const { deps, sockets } = await harness();
+      const s = sockets[0]!;
+      const session = new FakeAnswerSession();
+      // The registration a real build session performs on start (supervisor.ts) — stood up by
+      // hand here since this test drives the wire frame directly, not a supervised run.
+      deps.steering!.register(session.runId, session, async () => {});
+      s.emit(
+        'message',
+        JSON.stringify({
+          type: 'steer',
+          runId: session.runId,
+          steerId: 'sig_1', // the signal id PLNR-237 uses as the steer row's dedup source
+          mode: 'soft', // non-blocking: queue the answer, do not interrupt the agent's turn
+          body: 'the answer to your question: yes, use the v2 endpoint',
+          sourceCommentId: null,
+          sourceMessageId: null,
+          noticeCursor: null,
+          issuedAt: '2026-08-09T00:00:00.000Z',
+        }),
+      );
+      await tick();
+      expect(session.inputs).toEqual(['the answer to your question: yes, use the v2 endpoint']);
+      const acks = s.sent
+        .map((x) => JSON.parse(x) as Record<string, unknown>)
+        .filter((f) => f.type === 'steer.ack');
+      expect(acks).toEqual([expect.objectContaining({ steerId: 'sig_1', delivered: true, via: 'runtime' })]);
+    });
   });
 
   it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {
