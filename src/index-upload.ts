@@ -77,7 +77,7 @@ export interface UploadProgress {
 }
 
 export type UploadOutcome =
-  | { ok: true; batchesReceived: number }
+  | { ok: true; batchesReceived: number; activated?: string }
   | { ok: false; reason: 'validation'; problems: string[] }
   | { ok: false; reason: IngestFailureReason; detail: string }
   | { ok: false; reason: 'cancelled' };
@@ -385,7 +385,11 @@ export async function uploadGeneration(
 
     await deps.journal.forget(key);
     await deps.staging.clear(key);
-    return { ok: true, batchesReceived: completed.batchesReceived };
+    return {
+      ok: true,
+      batchesReceived: completed.batchesReceived,
+      ...(completed.activation ? { activated: completed.activation.activated } : {}),
+    };
   } catch (err) {
     if (err instanceof UploadCancelled) return { ok: false, reason: 'cancelled' };
     if (err instanceof IngestError) return { ok: false, reason: err.reason, detail: err.message };

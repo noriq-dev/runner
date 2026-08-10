@@ -122,6 +122,8 @@ export interface IndexWorkResult {
   generationId: string;
   baseId: string;
   batchesReceived: number;
+  /** Server-confirmed atomic activation from complete(); absent for older servers/test doubles. */
+  activated?: string;
 }
 
 export type IndexWorkStep = (ctx: IndexWorkContext) => Promise<IndexWorkResult> | Promise<void>;
@@ -410,29 +412,32 @@ export class IndexCoordinator {
         isRunBusy: this.deps.isRunBusy,
         onProgress,
       });
-      // RUN-234 (locked decision 4): a successful attempt is STAGED, never active — RUN-260's own
-      // module doc (`index-status.ts`) is unweakened, this call site never learns of activation
-      // (an admin-only server route this daemon's credential cannot reach). Saying so here, in the
-      // daemon's own log stream, is what makes it diagnosable "from logs alone" rather than only
-      // from `index-status`'s persisted state — an operator tailing the log at the moment this
-      // fires must not read a bare "completed" as "done" the way `active` would honestly mean.
-      this.log.info('index generation uploaded — staged, awaiting admin activation', {
-        repositoryKey: rk,
-        kind: outcome.outcome,
-        generationId: result?.generationId ?? 'unknown',
-        batchesReceived: result?.batchesReceived ?? 0,
-      });
+      // Current servers return their own atomic activation result from complete(); older servers
+      // do not. Report exactly that evidence rather than assuming either state from HTTP success.
+      this.log.info(
+        result?.activated
+          ? 'index generation uploaded, validated, and activated'
+          : 'index generation uploaded and validated — server did not confirm activation',
+        {
+          repositoryKey: rk,
+          kind: outcome.outcome,
+          generationId: result?.generationId ?? 'unknown',
+          batchesReceived: result?.batchesReceived ?? 0,
+          activated: result?.activated ?? null,
+        },
+      );
       // RUN-223: a work step that reports nothing (every existing no-op test double) still gets an
-      // honest `success`/`staged` transition — the snapshot's own base is the best this class can
+      // honest success transition without claiming activation — the snapshot's own base is the
+      // best this class can
       // derive on its own, and `generationId: 'unknown'` names exactly what it does not know
-      // rather than fabricating one. (Stated as `staged`, not `active`, per RUN-260 — see the
-      // module doc's own note on why `success` alone is never evidence of activation.)
+      // rather than fabricating one. See index-status.ts for why bare success remains staged.
       this.emitStatus({
         type: 'success',
         repositoryKey: rk,
         generationId: result?.generationId ?? 'unknown',
         baseId: result?.baseId ?? snapshot.baseId,
         batchesReceived: result?.batchesReceived ?? 0,
+        ...(result?.activated ? { activated: result.activated } : {}),
       });
     } catch (err) {
       // A background subsystem's failure is logged, never thrown at whoever called `trigger` —

@@ -236,10 +236,10 @@ describe('renderIndexStatusText — the requiresUpgrade distinction is visible w
     expect(text).toContain('state: unknown');
   });
 
-  // RUN-260: `staged` (uploaded, sealed, validated — awaiting an admin) must not read as a runner
+  // `staged` (uploaded and validated without an activation receipt) must not read as a runner
   // failure on the state line itself, the same "unmistakable without parsing detail" bar
   // `requiresUpgrade` already clears for `incompatible-version`.
-  it('a staged record renders an admin-activation marker on the state line, distinct from BLOCKED', () => {
+  it('a staged record renders a server-confirmation recovery marker on the state line, distinct from BLOCKED', () => {
     const text = renderIndexStatusText({
       repositoryKey: 'my-repo',
       server: 'https://noriq.test',
@@ -248,7 +248,7 @@ describe('renderIndexStatusText — the requiresUpgrade distinction is visible w
         repositoryKey: 'my-repo',
         state: 'staged',
         stateSince: '2026-08-09T00:00:00.000Z',
-        detail: 'uploaded, sealed and validated — awaiting activation.',
+        detail: 'uploaded, sealed and validated, but this server did not confirm activation.',
         lastError: null,
         lastSuccess: {
           at: '2026-08-09T00:00:00.000Z',
@@ -263,7 +263,7 @@ describe('renderIndexStatusText — the requiresUpgrade distinction is visible w
     });
     const stateLine = text.split('\n').find((l) => l.startsWith('state:'));
     expect(stateLine).toContain('staged');
-    expect(stateLine).toMatch(/admin/i);
+    expect(stateLine).toMatch(/server did not confirm activation/i);
     expect(stateLine).not.toContain('BLOCKED');
   });
 

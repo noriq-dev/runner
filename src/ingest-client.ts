@@ -60,6 +60,9 @@ export interface IngestCompleteIndexResult {
   ok: true;
   batchesReceived: number;
   validation: { ok: boolean; problems: string[] };
+  /** Current servers atomically activate a validated generation when its recorded predecessor is
+   *  still active. Absent means an older server completed validation without auto-activation. */
+  activation?: { activated: string; superseded: string[] };
 }
 
 export interface IngestCompleteEpisodeResult {

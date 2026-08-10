@@ -250,6 +250,11 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       throw new Error(`index upload did not complete (${outcome.reason}): ${detail}`);
     }
 
-    return { generationId: key.generationId, baseId: key.baseId, batchesReceived: outcome.batchesReceived };
+    return {
+      generationId: key.generationId,
+      baseId: key.baseId,
+      batchesReceived: outcome.batchesReceived,
+      ...(outcome.activated ? { activated: outcome.activated } : {}),
+    };
   };
 }

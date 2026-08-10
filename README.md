@@ -341,10 +341,11 @@ default) — staging batches under `~/.noriq/index-staging` and uploading them t
 (15-minute) ingest capability. Turn it off again by removing `[index]` or setting `enabled = false`;
 that stops the *next* trigger, it does not retract anything already uploaded (see below).
 
-**A successful upload does not mean the memory is searchable yet.** Every upload ends in a
-`staged` state — uploaded, sealed, and validated, awaiting an admin to activate it server-side, a
-route this daemon's own agent credential cannot reach. `search_project_memory` finds nothing from
-a `staged` generation until a human activates it. See
+**A successful upload is validated and atomically activated by current Noriq servers** when the
+active predecessor still matches the generation's starting cursor. The completion response is the
+Runner's activation proof; it never infers `active` from a bare HTTP success. An older server that
+does not return that proof remains `staged` until a cursor reconcile or admin recovery confirms
+activation. `search_project_memory` never reads an unactivated staged generation. See
 [`INDEX-OPERATIONS.md`](INDEX-OPERATIONS.md) for the full ten-state vocabulary, every command
 below in detail, and an operator troubleshooting/recovery checklist.
 

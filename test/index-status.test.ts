@@ -164,11 +164,7 @@ describe('IndexStatusStore', () => {
     expect(store.get('my-repo')?.state).toBe('server-validating');
   });
 
-  // RUN-260: a successful upload is staged/sealed/validated, never active — activation is
-  // `userAuth` + `requireAdmin` and this daemon can never call it. The old code reported `active`
-  // here unconditionally; measured on a real dogfood ingest, the server disagreed (`status:
-  // staged`, `activeGeneration: None`) and `search_project_memory` returned zero results.
-  it('a success event records staged (never active) + lastSuccess, and keeps a prior lastError as history', () => {
+  it('a current-server success receipt records active + lastSuccess and keeps prior error history', () => {
     const store = new IndexStatusStore({ now: () => 3000, logger: quiet });
     store.record({ type: 'failure', repositoryKey: 'my-repo', detail: 'earlier attempt broke' });
     store.record({
@@ -177,11 +173,11 @@ describe('IndexStatusStore', () => {
       generationId: 'gen_1',
       baseId: 'base-1',
       batchesReceived: 4,
+      activated: 'gen_1',
     });
     const rec = store.get('my-repo');
-    expect(rec?.state).toBe('staged');
-    expect(rec?.state).not.toBe('active');
-    expect(rec?.detail).toMatch(/admin/i);
+    expect(rec?.state).toBe('active');
+    expect(rec?.detail).toContain('atomically activated');
     expect(rec?.lastSuccess).toEqual({
       at: new Date(3000).toISOString(),
       generationId: 'gen_1',
@@ -192,12 +188,22 @@ describe('IndexStatusStore', () => {
     expect(rec?.lastError?.message).toBe('earlier attempt broke');
   });
 
-  // RUN-260: `active` may be reported ONLY from server evidence — the cursor's own
-  // `activeGeneration`, threaded on the reconcile event as `activeGenerationId`. `'unchanged'` is
-  // the one reconcile outcome that, by `reconcile`'s own contract, only fires while the cursor's
-  // active generation matches this checkout's current base/version and is not stale — that is the
-  // evidence, so this is the one arm that promotes.
-  describe('active is reported only from reconcile evidence, never from success alone', () => {
+  it('keeps a success without an activation receipt staged for older-server compatibility', () => {
+    const store = new IndexStatusStore({ now: () => 3000, logger: quiet });
+    store.record({
+      type: 'success',
+      repositoryKey: 'my-repo',
+      generationId: 'gen_legacy',
+      baseId: 'base-1',
+      batchesReceived: 4,
+    });
+    expect(store.get('my-repo')?.state).toBe('staged');
+    expect(store.get('my-repo')?.detail).toContain('did not confirm activation');
+  });
+
+  // `active` may be reported only from server evidence: either complete()'s activation receipt or
+  // the cursor's activeGeneration threaded through reconcile.
+  describe('active is reported only from explicit server evidence', () => {
     it('an unchanged reconcile carrying activeGenerationId promotes straight to active', () => {
       const store = new IndexStatusStore({ now: () => 7000, logger: quiet });
       store.record({
@@ -221,7 +227,7 @@ describe('IndexStatusStore', () => {
       expect(store.get('my-repo')?.state).not.toBe('active');
     });
 
-    it('a staged record is promoted to active by the NEXT reconcile confirming activation, not by the upload itself', () => {
+    it('a legacy staged record is promoted to active by the next reconcile confirming activation', () => {
       const store = new IndexStatusStore({ now: () => 8000, logger: quiet });
       store.record({
         type: 'success',

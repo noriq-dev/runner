@@ -78,9 +78,9 @@ Sample text output (a live daemon, `staged`):
 repository: noriq-runner
 server: https://app.noriq.dev
 source: live daemon
-state: staged [awaiting admin activation — not a runner failure, do not retry]
+state: staged [server did not confirm activation — reconcile or recover as admin, do not retry]
 since: 2026-08-09T12:00:00.000Z
-detail: uploaded, sealed and validated — awaiting activation. Activation is an admin/human step this daemon cannot perform; this is not a runner failure and will not resolve itself with a retry.
+detail: uploaded, sealed and validated, but this server did not confirm activation; reconcile the server cursor before treating it as active.
 last success: 2026-08-09T12:00:00.000Z (generation gen_abc123, base b1a2c3d, 4 batch(es) received)
 last error: none observed
 parser (indexer) version: 1
@@ -893,8 +893,8 @@ dogfood ingest showed the old code reporting `active` while the server's own cur
 | `parsing` | The work step's own progress callback — scanning and hashing is happening now | Wait |
 | `uploading` | Batches are being staged and sent | Wait |
 | `server-validating` | The upload's `complete()` call is in flight, server-side validation running | Wait |
-| **`staged`** | Upload succeeded, sealed and validated — **awaiting admin activation, which this daemon cannot perform** | Nothing to retry. See "generation stuck STAGED" below |
-| `active` | The server's own cursor confirms this checkout's exact base is the active, serving generation | Nothing — this is the goal state |
+| **`staged`** | Upload validated, but an older server returned no atomic activation receipt and the cursor has not yet confirmed it active | Do not re-upload. Reconcile the cursor, then use admin recovery only if it remains staged |
+| `active` | The server's completion receipt or cursor confirms this checkout's exact base is the active, serving generation | Nothing — this is the goal state |
 | `failed` | The attempt did not proceed, for a reason named in `detail` | See Troubleshooting below; most `failed` states are safely retried with `index-reindex` |
 | `association-conflict` | This checkout is bound to a different canonical repository server-side | See Troubleshooting below — this is a data-integrity gate, not a transient failure |
 | `unchanged` (legacy) | Kept in the type only so an OLDER daemon's persisted snapshot still parses | See note below — a live daemon on current code cannot produce this as a fresh observation |
@@ -913,7 +913,7 @@ running daemon on current code, that is worth reporting as a regression, not tre
 
 A `failed` from `incompatible-version` is visible on the state line itself
 (`state: failed [BLOCKED — upgrade this daemon, do not retry]`), and `staged` gets its own
-unmistakable marker (`[awaiting admin activation — not a runner failure, do not retry]`) — neither
+unmistakable marker (`[server did not confirm activation — reconcile or recover as admin, do not retry]`) — neither
 requires reading `detail` closely to act correctly.
 
 ## Local journals and staging
@@ -1094,17 +1094,15 @@ only thing that ever ends one. If you believe a capability was compromised, ther
 daemon can do about it beyond waiting for it to expire — this is a real, acknowledged gap, not an
 oversight this document is hiding.
 
-**A generation stuck `staged`, awaiting activation.** This is not a runner failure and
-`index-reindex` will not change it — a `staged` generation is uploaded, sealed, and validated
-exactly as intended; the daemon has done everything it can. Activation (`POST
-.../generations/:id/activate`) is `userAuth` + `requireAdmin` on the server, a route this daemon's
-agent-authenticated credential structurally cannot reach. `search_project_memory` returns nothing
-from a `staged` generation until a human with admin access on the Noriq server activates it. If a
-generation has been `staged` for a long time, that is a server-side admin action to chase, not a
-runner-side retry. RUN-234: the daemon's own log says this at the moment it happens too, not only
-`index-status` — every successful upload logs `index generation uploaded — staged, awaiting admin
-activation` (`info`), so a generation that never leaves `staged` is diagnosable from the log alone,
-not only from a live or persisted `index-status` read.
+**A generation stuck `staged` without activation proof.** Current servers validate and atomically
+activate inside `complete()` while enforcing that the active predecessor has not changed. Runner
+records `active` only from that returned receipt or a later server cursor. `staged` therefore means
+an older server returned no receipt (or a persisted record predates the current behavior), not
+that another upload is needed. Run `index-status` again so the daemon reconciles the canonical
+cursor. If the server itself still reports the generation staged, an instance admin may inspect
+and activate or abort it in Memory > Operations. `search_project_memory` never reads it before
+activation. The daemon log distinguishes “validated and activated” from “server did not confirm
+activation,” so the missing proof is diagnosable without exposing a capability token.
 
 **`UPGRADE REQUIRED` failure.** `index-status` shows `state: failed [BLOCKED — upgrade this daemon,
 do not retry]`, `requiresUpgrade: true` in JSON output, and `detail` prefixed unmistakably with
@@ -1127,7 +1125,7 @@ Work through this top to bottom; most problems resolve at step 2 or 3.
    `index-cancel` all need one; `noriq-runner start` if not. `index-status` alone degrades
    gracefully to the last local snapshot with no daemon at all.
 3. **Read the state, not just "it failed."** `index-status` (or `--json` for scripting) — check
-   whether it's `staged` (nothing to do — chase server-side activation), `association-conflict`
+   whether it's `staged` (reconcile, then use server-side admin recovery if still needed), `association-conflict`
    (a data-integrity gate, not a retry target), `requiresUpgrade` (upgrade the daemon, don't
    retry), or an ordinary `failed` (safe to retry).
 4. **For an ordinary `failed`, just ask again.** `index-reindex` — it converges on the same

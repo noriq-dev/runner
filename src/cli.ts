@@ -74,8 +74,9 @@ dry-run what background indexing would produce, without a daemon or a server):
 
 index-status options — ten distinguishable states (no-opt-in, queued, parsing, uploading,
 server-validating, staged, active, failed, association-conflict, plus legacy unchanged — see
-INDEX-OPERATIONS.md). A successful upload ends STAGED, not active: activation is an admin-only
-server step this daemon cannot perform, so search finds nothing until a human activates it. Reads a
+INDEX-OPERATIONS.md). Current servers validate and atomically activate a successful upload;
+STAGED means an older server did not return activation proof and must be reconciled or recovered
+by an admin before search can use it. Reads a
 live daemon's control server when one answers; otherwise falls back to the last snapshot that
 daemon wrote to disk, labelled with when it was observed — never a synthesized "now":
   --path <dir>     Repo to report on (default: the current directory)
@@ -465,16 +466,16 @@ export function renderIndexStatusText(info: {
     // OTHER `failed` invites a retry, this one means retrying is pointless until the daemon
     // itself is upgraded — printed on the state line itself, not left to a prose scan.
     //
-    // `'staged'` (RUN-260) gets the same unmistakable-on-the-state-line treatment, keyed off the
+    // `'staged'` gets the same unmistakable-on-the-state-line treatment, keyed off the
     // state itself rather than a second boolean — unlike `requiresUpgrade`, which disambiguates
     // WITHIN the shared `'failed'` bucket, `'staged'` is its own named state produced by nothing
     // else, so there is no ambiguity a flag would resolve. Every OTHER non-terminal state here
-    // invites a retry; this one names a human/admin step so an operator does not retry an upload
-    // that already succeeded.
+    // invites a retry; this one names server reconciliation/admin recovery so an operator does
+    // not retry an upload that already validated.
     lines.push(
       `state: ${record.state}` +
         `${record.requiresUpgrade ? ' [BLOCKED — upgrade this daemon, do not retry]' : ''}` +
-        `${record.state === 'staged' ? ' [awaiting admin activation — not a runner failure, do not retry]' : ''}`,
+        `${record.state === 'staged' ? ' [server did not confirm activation — reconcile or recover as admin, do not retry]' : ''}`,
       `since: ${record.stateSince}`,
     );
     if (record.detail) lines.push(`detail: ${record.detail}`);

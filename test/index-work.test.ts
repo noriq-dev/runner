@@ -78,7 +78,12 @@ const GRANT = { token: 'ing_tok', maxBytes: 8 * 1024 * 1024, expiresAt: '2026-08
 /** The same two-transport split index-upload.test.ts's own router uses (mint vs. token-in-path
  *  ingest) — narrowed to what these tests need, plus an order-recording hook. */
 function router(
-  opts: { onCall?: (label: string) => void; validationOk?: boolean; validationProblems?: string[] } = {},
+  opts: {
+    onCall?: (label: string) => void;
+    validationOk?: boolean;
+    validationProblems?: string[];
+    activation?: boolean;
+  } = {},
 ) {
   const mintFetch = (async () => {
     opts.onCall?.('mint');
@@ -104,6 +109,7 @@ function router(
           ok,
           batchesReceived: 1,
           validation: { ok, problems: ok ? [] : (opts.validationProblems ?? ['bad content hash']) },
+          ...(ok && opts.activation ? { activation: { activated: 'gen_server', superseded: [] } } : {}),
         }),
         { status: 200 },
       );
@@ -234,7 +240,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
   });
 
   it('a git-shaped snapshot (localPath present, detached, no branch) still uploads under a "default" branch label', async () => {
-    const { mintFetch, ingestFetch } = router({});
+    const { mintFetch, ingestFetch } = router({ activation: true });
     const client = new NoriqClient({ server: TARGET.server, token: 'daemon-tok', fetchImpl: mintFetch });
     const step = createIndexWorkStep({
       client,
@@ -267,6 +273,7 @@ describe('createIndexWorkStep (RUN-222)', () => {
       baseId: 'gitsha',
       batchesReceived: 1,
       generationId: expect.any(String),
+      activated: 'gen_server',
     });
   });
 

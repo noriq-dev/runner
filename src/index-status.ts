@@ -30,11 +30,12 @@ import { logger as defaultLogger } from './logger';
  * `failed` is never left guessing whether that means "network blip" or "validation rejected" or
  * "an older daemon would have downgraded the index".
  *
- * **`'staged'` (RUN-260) is a tenth state, added deliberately over an otherwise-closed vocabulary**
- * — a successful upload does NOT mean the generation is serving search. `POST
- * .../generations/:id/activate` is `userAuth` + `requireAdmin`; this daemon authenticates as an
- * agent and can never call it, so a `success` event can only ever mean "uploaded, sealed and
- * validated — awaiting an admin". Measured on the first real dogfood ingest: the old code reported
+ * **`'staged'` (RUN-260) is a tenth state, added deliberately over an otherwise-closed vocabulary.**
+ * A successful upload alone does not prove the generation serves search. Current servers return
+ * an `activation` receipt from `complete()` after an atomic validate-and-promote; that receipt is
+ * server evidence and may report `active` immediately. Older servers omit it, so success remains
+ * `staged` until a later cursor reconcile confirms activation. Measured on the first real dogfood
+ * ingest, the old code reported
  * `active` here while the server's cursor still had `activeGeneration: None` and the generation
  * was not projected into `nodes`/`edges` at all — `search_project_memory` returned zero results
  * while the operator was told everything was fine. Reusing `server-validating` would be wrong (that
@@ -43,7 +44,7 @@ import { logger as defaultLogger } from './logger';
  * condition (`vendor/noriq-shared/src/memory.ts`), so the operator vocabulary keeps mapping onto
  * machinery that already exists rather than growing a parallel one.
  *
- * **`active` is reported only from evidence the server supplied, never from a local `success`.**
+ * **`active` is reported only from evidence the server supplied, never from bare local success.**
  * The only outcome `reconcile` (`index-reconcile.ts`) can return while an ACTIVE generation
  * demonstrably matches this checkout is `'unchanged'` — by construction it requires a non-null
  * `cursor.activeGeneration`, the same `indexerVersion`, the same `baseId` as this checkout's
@@ -69,8 +70,8 @@ import { logger as defaultLogger } from './logger';
  * it is its own named state, produced by nothing else, so `record.state === 'staged'` already gives
  * any caller the identical one-line certainty a boolean would, and a redundant field would be
  * exactly the kind of "reads as a feature, does nothing new" surface this module exists to avoid.
- * What the acceptance actually requires — the CLI's state line saying activation is a human/admin
- * step — is satisfied by branching the render on `state === 'staged'` directly (`cli.ts`), the same
+ * The CLI's state line names a missing activation receipt as server reconciliation/admin recovery,
+ * satisfied by branching the render on `state === 'staged'` directly (`cli.ts`), the same
  * way the `'incompatible-version'` BLOCKED marker branches on `requiresUpgrade` today.
  *
  * **`incompatible-version` is not an ordinary `failed`, and that must be visible without reading
@@ -180,7 +181,14 @@ export type IndexStatusEvent =
       activeGenerationId?: string | null;
     }
   | { type: 'phase'; repositoryKey: string; phase: IndexJobPhase; detail?: string }
-  | { type: 'success'; repositoryKey: string; generationId: string; baseId: string; batchesReceived: number }
+  | {
+      type: 'success';
+      repositoryKey: string;
+      generationId: string;
+      baseId: string;
+      batchesReceived: number;
+      activated?: string;
+    }
   | { type: 'failure'; repositoryKey: string; detail: string };
 
 export interface IndexStatusRecord {
@@ -289,19 +297,15 @@ export class IndexStatusStore {
         };
         break;
       case 'success':
-        // RUN-260: a successful upload means uploaded, sealed and validated — never `'active'`.
-        // Activation is `POST .../generations/:id/activate`, `userAuth` + `requireAdmin`; this
-        // daemon authenticates as an agent and can never reach that route, so this event alone can
-        // never be evidence of activation (see the module doc). The next reconcile that observes
-        // the server's own `activeGeneration` matching this checkout is what may promote it.
+        // Bare success remains staged for compatibility with older servers. Current servers return
+        // an activation receipt from complete(); that is canonical server evidence, not inference.
         next = {
           ...base,
-          state: 'staged',
+          state: event.activated ? 'active' : 'staged',
           stateSince: nowIso,
-          detail:
-            'uploaded, sealed and validated — awaiting activation. Activation is an admin/human ' +
-            'step this daemon cannot perform; this is not a runner failure and will not resolve ' +
-            'itself with a retry.',
+          detail: event.activated
+            ? `server validated and atomically activated generation ${event.activated}`
+            : 'uploaded, sealed and validated, but this server did not confirm activation; reconcile the server cursor before treating it as active.',
           lastSuccess: {
             at: nowIso,
             generationId: event.generationId,

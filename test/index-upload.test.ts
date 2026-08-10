@@ -164,13 +164,23 @@ describe('uploadGeneration (RUN-221)', () => {
         putOrder.push(n);
         return new Response(JSON.stringify({ ok: true, deduped: false }), { status: 200 });
       },
+      complete: () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            batchesReceived: 3,
+            validation: { ok: true, problems: [] },
+            activation: { activated: 'gen_1', superseded: ['gen_0'] },
+          }),
+          { status: 200 },
+        ),
     });
     const { deps, journal } = await makeDeps(root, {}, { mintFetch, ingestFetch });
     const input: UploadGenerationInput = { key: KEY, mint: MINT_INPUT, manifest: MANIFEST, batches: BATCHES };
 
     const result = await uploadGeneration(input, deps);
 
-    expect(result).toEqual({ ok: true, batchesReceived: 3 });
+    expect(result).toEqual({ ok: true, batchesReceived: 3, activated: 'gen_1' });
     expect(putOrder).toEqual([0, 1, 2]);
     expect(calls.some((c) => c.url.endsWith('/begin'))).toBe(true);
     expect(await journal.get(KEY)).toBeNull(); // cleaned up on success

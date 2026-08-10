@@ -9,6 +9,7 @@ import { IndexJournal } from '../src/index-journal';
 import type { ResolvedIndexConfig } from '../src/index-policy';
 import { INDEXER_VERSION } from '../src/index-reconcile';
 import { FakeIndexSource } from '../src/index-source';
+import type { IndexStatusEvent } from '../src/index-status';
 import type { RunnerIndexCursor } from '../src/memory-contract';
 import type { ChangesBetweenResult, IndexSnapshot, IndexSnapshotResult, VcsBackend } from '../src/vcs/types';
 
@@ -426,6 +427,30 @@ describe('the snapshot is released on every exit path (decision 7)', () => {
     releaseOrder.push('cancelAll returned');
     await p;
     expect(releaseOrder).toEqual(['released', 'cancelAll returned']);
+  });
+});
+
+describe('server-confirmed activation status', () => {
+  it('threads the work step activation receipt into the success event', async () => {
+    const events: IndexStatusEvent[] = [];
+    const { deps } = makeDeps({
+      runWork: async () => ({
+        generationId: 'gen_1',
+        baseId: 'base-2',
+        batchesReceived: 2,
+        activated: 'gen_1',
+      }),
+      onStatus: (event) => events.push(event),
+    });
+
+    await new IndexCoordinator(deps).trigger(TARGET());
+
+    expect(events.find((event) => event.type === 'success')).toMatchObject({
+      type: 'success',
+      generationId: 'gen_1',
+      activated: 'gen_1',
+      batchesReceived: 2,
+    });
   });
 });
 
