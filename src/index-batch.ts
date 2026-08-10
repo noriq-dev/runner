@@ -211,6 +211,68 @@ export function recordIdentity(record: IndexRecord): string {
 }
 
 /**
+ * Collapse duplicate EDGES, and report duplicate NODES without touching them (RUN-279).
+ *
+ * The live failure this exists for: the server's ingest validation (planar `2308246`, "auto-accept
+ * validated runner indexes") counts the rows it could stage and re-derives `contentHash` over them,
+ * and both dogfood repos were sending thousands of identical `calls` edges — a function calling
+ * another 36 times emitted 36 copies of one edge. `indexer.ts` had a `seen` set for `imports` and
+ * another for `related_to`, none for `calls`, and `declares` was unique only by accident (because
+ * `dedupeSymbolPaths` already makes symbol URIs unique). Four writers, two guarded: this is the
+ * chokepoint that replaces all of them (RUN-90's rule), so the NEXT edge type cannot reintroduce it.
+ *
+ * **Edges are collapsed; nodes are only COUNTED — and the asymmetry is the point.** An edge carries
+ * no payload beyond `(from, type, to)`, so a second copy is the same fact stated twice and dropping
+ * it loses nothing. Two NODES sharing a `uri` carry different `label`/`content`, so silently keeping
+ * the first would hide a real URI-minting collision behind a clean upload — precisely the class of
+ * bug this repo keeps finding. Measured at RUN-279: zero duplicate nodes across both dogfood repos,
+ * so the counter is a tripwire rather than a cleanup, and `runIndexer` surfaces it the same way it
+ * already surfaces `unlabelledSymbolsDropped`.
+ *
+ * Order-stable, keeping the FIRST occurrence: `sortRecords` imposes the final order regardless, but
+ * a stable dedup keeps the pre-sort record list reproducible, which is the property every
+ * determinism test in this pipeline rests on.
+ */
+export interface DedupedRecords {
+  records: IndexRecord[];
+  /** Duplicate edge rows dropped — the same fact more than once. */
+  duplicateEdgesDropped: number;
+  /** Node URIs seen more than once. NOT dropped: see this function's own doc for why collapsing one
+   *  would hide a collision rather than tidy one. Expected to be 0; a non-zero value names a
+   *  URI-minting bug worth chasing. */
+  duplicateNodeUris: string[];
+}
+
+export function dedupeRecords(records: readonly IndexRecord[]): DedupedRecords {
+  const seenEdges = new Set<string>();
+  const seenNodeUris = new Set<string>();
+  const duplicateNodeUris = new Set<string>();
+  const out: IndexRecord[] = [];
+  let duplicateEdgesDropped = 0;
+
+  for (const record of records) {
+    if (record.kind === 'edge') {
+      // Keyed on `recordIdentity`, the same string `compareRecords` orders by — so "two rows the
+      // sort would consider equal" and "two rows the server would stage as one" are the same
+      // question with one answer, rather than two definitions that could drift apart.
+      const key = recordIdentity(record);
+      if (seenEdges.has(key)) {
+        duplicateEdgesDropped++;
+        continue;
+      }
+      seenEdges.add(key);
+    } else if (seenNodeUris.has(record.uri)) {
+      duplicateNodeUris.add(record.uri);
+    } else {
+      seenNodeUris.add(record.uri);
+    }
+    out.push(record);
+  }
+
+  return { records: out, duplicateEdgesDropped, duplicateNodeUris: [...duplicateNodeUris] };
+}
+
+/**
  * Order two records by (kind, identity): nodes before edges (so a human skimming a raw batch sees an
  * entity before any edge that references it — the server does not care about this ordering, only
  * that it is the SAME ordering every run), then by identity within a kind. Plain code-unit

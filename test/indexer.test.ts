@@ -7,7 +7,7 @@ import type {
   IndexParserAdapter,
   ParsedCall,
 } from '../src/index-adapters';
-import { MAX_INGEST_BATCH_BYTES } from '../src/index-batch';
+import { MAX_INGEST_BATCH_BYTES, computeContentHash, recordIdentity } from '../src/index-batch';
 import { MAX_PARSE_DIAGNOSTICS } from '../src/index-entity';
 import { INDEX_LANGUAGES } from '../src/index-policy';
 import type { ResolvedIndexConfig } from '../src/index-policy';
@@ -933,6 +933,118 @@ describe('runIndexer — related_to edges (RUN-257)', () => {
     const first = await run();
     const second = await run();
     expect(first.manifest.contentHash).toBe(second.manifest.contentHash);
+  });
+});
+
+describe('runIndexer — duplicate rows are collapsed at one chokepoint (RUN-279)', () => {
+  /** An adapter that reports the SAME call N times — exactly what a real one does for a function
+   *  called repeatedly, and what silently produced thousands of identical `calls` edges until the
+   *  server's own ingest validation counted staged rows and refused every upload. */
+  const repeatedCallAdapter = (callCount: number): IndexParserAdapter => ({
+    id: 'repeat-calls',
+    version: '1',
+    canParse: (path) => path.endsWith('.ts'),
+    parse: async () => ({
+      symbols: [
+        { symbolPath: ['caller'], nodeType: 'symbol', label: 'caller', content: null },
+        { symbolPath: ['callee'], nodeType: 'symbol', label: 'callee', content: null },
+      ],
+      diagnostics: [],
+      calls: Array.from({ length: callCount }, () => ({
+        fromSymbolPath: ['caller'],
+        toSymbolPath: ['callee'],
+        confidence: 'resolved' as const,
+      })),
+    }),
+  });
+
+  const oneFile: FakeIndexSourceItem[] = [{ kind: 'file', path: 'src/a.ts', content: 'x' }];
+
+  it('a function calling another 36 times produces exactly ONE calls edge', async () => {
+    const result = await runIndexer(new FakeIndexSource(oneFile), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(repeatedCallAdapter(36)),
+    });
+    const calls = result.records.filter((r) => r.kind === 'edge' && r.type === 'calls');
+    expect(calls).toHaveLength(1);
+    // The 35 it dropped are REPORTED, not silently swallowed — the same posture
+    // `inferredEdgesOmitted`/`unlabelledSymbolsDropped` already take.
+    expect(result.duplicateEdgesDropped).toBe(35);
+  });
+
+  it('leaves no duplicate (kind, identity) pair in the whole record set — the property the server validates', async () => {
+    const result = await runIndexer(new FakeIndexSource(oneFile), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(repeatedCallAdapter(12)),
+    });
+    const keys = result.records.map((r) => `${r.kind} ${recordIdentity(r)}`);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('a duplicate node URI is REPORTED and kept, never silently collapsed', async () => {
+    // Two symbols an adapter labels differently but which mint one URI. Collapsing one would hide a
+    // URI-minting collision behind a clean upload; the count is a tripwire, so it must not dedup.
+    const collidingAdapter: IndexParserAdapter = {
+      id: 'collide',
+      version: '1',
+      canParse: (path) => path.endsWith('.ts'),
+      parse: async () => ({
+        symbols: [
+          { symbolPath: ['dup'], nodeType: 'symbol', label: 'first', content: 'a' },
+          { symbolPath: ['dup'], nodeType: 'symbol', label: 'second', content: 'b' },
+        ],
+        diagnostics: [],
+      }),
+    };
+    const result = await runIndexer(new FakeIndexSource(oneFile), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(collidingAdapter),
+    });
+    // `dedupeSymbolPaths` disambiguates same-named symbols, so an ordinary adapter never collides.
+    // The contract asserted here holds either way and is not vacuous in either branch: whatever
+    // nodes survive, NOTHING is dropped for being a duplicate, and `duplicateNodeUris` names exactly
+    // the URIs that really do appear more than once.
+    const uris = result.records.filter((r) => r.kind === 'node').map((n) => (n as { uri: string }).uri);
+    const trulyRepeated = [...new Set(uris.filter((u, i) => uris.indexOf(u) !== i))].sort();
+    expect([...result.duplicateNodeUris].sort()).toEqual(trulyRepeated);
+    // Nothing dropped: every node the adapter produced (2) plus the file entity (1) is still here,
+    // which is what makes the counter a tripwire rather than a silent cleanup.
+    expect(uris).toHaveLength(3);
+  });
+
+  it('imports and related_to stay deduped now that their own seen-sets are gone', async () => {
+    // Two import statements naming the same sibling, and two markdown links to it — both used to be
+    // collapsed by per-writer sets that the chokepoint replaced.
+    const dupRefAdapter: IndexParserAdapter = {
+      id: 'dup-refs',
+      version: '1',
+      canParse: (path) => path.endsWith('.ts') || path.endsWith('.md'),
+      parse: async (input: AdapterParseInput) => ({
+        symbols: [],
+        diagnostics: [],
+        // Scoped to a.ts alone: `b.ts` importing './b' would resolve to ITSELF, a legitimately
+        // distinct edge (different `from`) that would make this test's expected count wrong for a
+        // reason having nothing to do with dedup. The first draft of this test did exactly that.
+        imports: input.path === 'src/a.ts' ? [{ specifier: './b' }, { specifier: './b.ts' }] : undefined,
+        references: input.path.endsWith('.md') ? [{ target: './b.ts' }, { target: './b.ts' }] : undefined,
+      }),
+    };
+    const items: FakeIndexSourceItem[] = [
+      { kind: 'file', path: 'src/a.ts', content: 'x' },
+      { kind: 'file', path: 'src/b.ts', content: 'y' },
+      { kind: 'file', path: 'src/c.md', content: 'z' },
+    ];
+    const result = await runIndexer(new FakeIndexSource(items), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(dupRefAdapter),
+    });
+    expect(result.records.filter((r) => r.kind === 'edge' && r.type === 'imports')).toHaveLength(1);
+    expect(result.records.filter((r) => r.kind === 'edge' && r.type === 'related_to')).toHaveLength(1);
+  });
+
+  it('contentHash and batch row counts describe the DEDUPED set, so a server stages exactly what the manifest claims', async () => {
+    const result = await runIndexer(new FakeIndexSource(oneFile), cfg(), target(), {
+      adapters: new IndexAdapterRegistry().register(repeatedCallAdapter(20)),
+    });
+    const rows = result.batches.reduce((n, b) => n + b.rowCount, 0);
+    expect(rows).toBe(result.records.length);
+    expect(await computeContentHash(result.records)).toBe(result.manifest.contentHash);
   });
 });
 

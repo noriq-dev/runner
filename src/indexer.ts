@@ -7,6 +7,7 @@ import {
   assembleManifest,
   computeContentHash,
   cooperativeCheckpoint,
+  dedupeRecords,
   deriveGenerationId,
   encodeBatches,
   sortRecords,
@@ -283,6 +284,18 @@ export interface IndexerResult {
    *  7 forbids. Counted rather than silently dropped so "an inferred edge is distinguishable from a
    *  resolved one" is an observable property of a run, not only of one adapter's own unit tests. */
   inferredEdgesOmitted: number;
+  /** Duplicate EDGE rows collapsed before the wire (RUN-279) — the same `(from, type, to)` fact
+   *  stated more than once, which the server's ingest validation counts and refuses. Expected to be
+   *  non-zero on any real repository: a function calling another N times legitimately produces N
+   *  call sites and exactly ONE edge. Counted rather than silently collapsed for the same reason
+   *  `inferredEdgesOmitted` is — a row this daemon chose not to send is a fact about the generation. */
+  duplicateEdgesDropped: number;
+  /** Node URIs minted more than once this pass. **Nothing is dropped for these** — two nodes sharing
+   *  a `uri` carry different `label`/`content`, so collapsing one would hide a URI-minting collision
+   *  behind a clean upload (`dedupeRecords`' own doc). Expected to be EMPTY; a non-empty value is a
+   *  bug worth chasing, and the server will refuse the generation anyway, so surfacing it locally is
+   *  strictly better than discovering it as a validation error. */
+  duplicateNodeUris: readonly string[];
   /** Symbols an adapter emitted with an empty/whitespace-only `label`, dropped before the wire
    *  because `MemoryNode.label` in the vendored contract is `z.string().min(1)` — see the comment
    *  at the drop site. Counted rather than silently discarded for the same reason
@@ -488,7 +501,6 @@ export async function runIndexer(
   // `seenImportEdges` collapses two specifiers from the same file resolving to the same target
   // (e.g. two separate `require()`/`import` statements naming the same sibling) into one edge.
   const currentPathSet = new Set(currentPaths);
-  const seenImportEdges = new Set<string>();
   // RUN-238: guaranteed once before either second-pass loop, then periodically inside each — same
   // cadence as the candidate loop above (see the module doc's note on why this is extrapolated
   // rather than separately measured).
@@ -504,9 +516,6 @@ export async function runIndexer(
     if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
     const from = buildFileEntityUri(scope, importerPath);
     const to = buildFileEntityUri(scope, resolvedPath);
-    const key = `${from}\u0000${to}`;
-    if (seenImportEdges.has(key)) continue;
-    seenImportEdges.add(key);
     records.push({ kind: 'edge', type: 'imports', from, to });
   }
 
@@ -514,7 +523,6 @@ export async function runIndexer(
   // dedup-by-(from,to) rule as `imports` above — see this module's own doc for why one resolver
   // serves both edge types. A `ParsedReference.target` this generation cannot pin to exactly one
   // file is declined the same way, never stubbed.
-  const seenReferenceEdges = new Set<string>();
   let referencesSinceCheckpoint = 0;
   for (const { referencerPath, target } of pendingReferences) {
     referencesSinceCheckpoint++;
@@ -526,13 +534,20 @@ export async function runIndexer(
     if (!resolvedPath) continue; // bare, unresolved, or ambiguous — declined, never stubbed.
     const from = buildFileEntityUri(scope, referencerPath);
     const to = buildFileEntityUri(scope, resolvedPath);
-    const key = `${from}\u0000${to}`;
-    if (seenReferenceEdges.has(key)) continue;
-    seenReferenceEdges.add(key);
     records.push({ kind: 'edge', type: 'related_to', from, to });
   }
 
   reportPhase('parse', tPhase);
+
+  // RUN-279: the ONE place duplicate rows are collapsed, before anything hashes, sorts, or encodes
+  // them — so `contentHash` describes exactly the rows a server will stage. Before this, `imports`
+  // and `related_to` each carried their own `seen` set, `calls` carried none, and both dogfood repos
+  // were sending thousands of identical `calls` edges (a function calling another 36 times emitted 36
+  // copies); the server's own validation counts staged rows and re-derives the hash, so every upload
+  // failed at `complete()`. See `dedupeRecords` for why edges are collapsed and nodes only counted.
+  const deduped = dedupeRecords(records);
+  const duplicateEdgesDropped = deduped.duplicateEdgesDropped;
+  const duplicateNodeUris = deduped.duplicateNodeUris;
 
   const deletions = computeDeletions(currentPaths, deps.previousFilePaths);
   // `sortRecords` itself does not chunk (see its own doc for the measured cost that makes that
@@ -540,7 +555,7 @@ export async function runIndexer(
   // paying for it, not a yield inside it.
   await cooperativeCheckpoint(cooperativeDeps);
   tPhase = phaseStart();
-  const sorted = sortRecords(records);
+  const sorted = sortRecords(deduped.records);
   reportPhase('sort', tPhase);
   tPhase = phaseStart();
   const contentHash = await computeContentHash(sorted, cooperativeDeps);
@@ -581,5 +596,7 @@ export async function runIndexer(
     parserVersions,
     inferredEdgesOmitted,
     unlabelledSymbolsDropped,
+    duplicateEdgesDropped,
+    duplicateNodeUris,
   };
 }

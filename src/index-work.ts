@@ -151,7 +151,11 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       diagnosticErrors > 0 ||
       indexed.diagnosticsOverflow > 0 ||
       indexed.scanStatusOverflow > 0 ||
-      indexed.stoppedEarly;
+      indexed.stoppedEarly ||
+      // RUN-279: a duplicate node URI means two entities collided on one identity — a bug, unlike
+      // `duplicateEdgesDropped`, which is an ordinary fact about any repo with repeated call sites
+      // and deliberately does NOT promote this line.
+      indexed.duplicateNodeUris.length > 0;
     log[parseNoteworthy ? 'warn' : 'info']('index parse complete', {
       repositoryKey: target.repositoryKey,
       files: indexed.manifest.fileCount,
@@ -165,6 +169,13 @@ export function createIndexWorkStep(deps: IndexWorkStepDeps): IndexWorkStep {
       stoppedEarly: indexed.stoppedEarly,
       inferredEdgesOmitted: indexed.inferredEdgesOmitted,
       unlabelledSymbolsDropped: indexed.unlabelledSymbolsDropped,
+      // RUN-279: a count, never the URIs — `duplicateEdgesDropped` is routinely in the thousands on a
+      // real repo (N call sites, one edge) and carries no path. `duplicateNodeUris` DOES carry paths,
+      // so only its length is logged here; a non-zero length is the signal, and `index-repo` is where
+      // an operator reads which. It also promotes this line to `warn`, because unlike every other
+      // counter here a duplicate node URI is a bug rather than a routine fact about the repository.
+      duplicateEdgesDropped: indexed.duplicateEdgesDropped,
+      duplicateNodeUris: indexed.duplicateNodeUris.length,
       parserVersions: indexed.parserVersions,
     });
 
