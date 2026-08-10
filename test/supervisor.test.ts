@@ -411,6 +411,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   projectId: 'prj_p',
   runnerId: 'rnr_1',
   agentId: null,
+  // PLNR-366: orchestration assignment is additive and null on every run this repo's own
+  // fixtures still dispatch without negotiating orchestration.v1.
+  execution: null,
   // No plan by default: a one-off dispatch. The per-plan branch (RUN-28) is opt-in on both
   // sides — a `<planKey>` template AND a run that actually belongs to a plan.
   planKey: null,
@@ -2978,6 +2981,43 @@ describe('a run records the spec it was briefed with (RUN-166)', () => {
     h.claude.complete('done');
     await done;
     expect(h.reports.filter((r) => r.executedSpec)).toHaveLength(0);
+  });
+});
+
+// RUN-241. Mirrors the executedSpec test above exactly — same shape, same "exactly once" claim —
+// for the resolved coordinate a run actually executes under. Unlike executedSpec (which depends on
+// a task/planner producing one), every run resolves SOME configuration, so this reports on every
+// run rather than only ones with a spec, and stays null everywhere else.
+describe('a run records the coordinate it actually resolved (RUN-241)', () => {
+  it('reports it once, with the tool/workflow this run actually resolved', async () => {
+    const h = harness({});
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    const reported = h.reports.filter((r) => r.executedConfiguration);
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.executedConfiguration!.strategy).toMatchObject({
+      tool: 'claude',
+      workflow: 'build',
+    });
+    // RUN-246 populates fingerprints; this task sends the schema's own empty default.
+    expect(reported[0]!.executedConfiguration!.configuration).toEqual([]);
+  });
+
+  it('never reports it a second time across a verify fix round', async () => {
+    // A failing-then-passing gate drives the SAME session through a hand-back turn
+    // (`continueWith`) rather than a second `complete()` — see FakeDriver's own doc — so this
+    // proves the report the supervisor makes once at the top of `supervise` does not repeat
+    // when that loop runs.
+    const h = harness({ verifyResults: [false, true] });
+    const done = h.supervisor.supervise(makeRun({ kind: 'build' }));
+    await flush();
+    h.claude.complete('done');
+    await done;
+
+    expect(h.reports.filter((r) => r.executedConfiguration)).toHaveLength(1);
   });
 });
 

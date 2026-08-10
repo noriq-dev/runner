@@ -42,6 +42,9 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   projectId: 'prj_p',
   runnerId: 'rnr_1',
   agentId: null,
+  // PLNR-366: orchestration assignment is additive and null on every run this repo's own
+  // fixtures still dispatch without negotiating orchestration.v1.
+  execution: null,
   planKey: null,
   targetBranch: null,
   kind: 'build',

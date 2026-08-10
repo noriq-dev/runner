@@ -62,6 +62,16 @@ export interface UploadEpisodeInput {
  * `tokenUsage`, `costUSD`, `acceptanceCoverage`, `steeringEvents`, `landingOutcome`,
  * `remainingWork`, `taskId`, `repositoryKey`, `baseId`) because D1 owns identity, lifecycle, cost,
  * and review evidence and a daemon must not be able to forge them.
+ *
+ * `intelligence` (PLNR-290's additive analytics-grade facts, `EffortEpisode.intelligence`) is
+ * deliberately NOT among the picked keys, and this is the strip site a future task populating it
+ * will need to widen — not the schema. `UPLOADED_EPISODE_SHAPE` in planar's `ProjectMemory.ts`
+ * (`.pick()`'d from the same six keys above, `.partial()`'d) does not accept it either: a payload
+ * that carried it today would get HTTP 200 and the field would be silently discarded server-side,
+ * which is the exact "populated and then ignored" defect class this plan has produced repeatedly
+ * (see CLAUDE.md). Extending `EpisodeEnrichmentPayload`/`toEnrichmentPayload` to include
+ * `intelligence` without ALSO widening `UPLOADED_EPISODE_SHAPE` server-side first would recreate
+ * it here.
  */
 export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
   Partial<

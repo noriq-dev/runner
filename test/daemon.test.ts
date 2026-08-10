@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ExecutionSpec, ProjectManifest, RunnerConfig } from '@noriq-dev/shared';
-import type { Run } from '@noriq-dev/shared';
+import type { ExecutedConfigurationEvidence, Run } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
@@ -1201,6 +1201,84 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     // A stray later tick for the same run carries null — nothing lingers past terminal.
     report('run_3', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 7 } });
     expect(s.telemetry().at(-1)!.executedSpec).toBeNull();
+  });
+
+  // RUN-241: `executedConfiguration` mirrors `executedSpec` byte-for-byte at the daemon layer —
+  // the same owed-until-delivered posture, on its own map, cleared by the same triggers. These
+  // three pin that mirroring the same way the three tests above pin it for the spec.
+  describe('executedConfiguration is owed-until-delivered, mirroring executedSpec (RUN-241)', () => {
+    const configuration: ExecutedConfigurationEvidence = {
+      strategy: {
+        tool: 'claude',
+        vendor: null,
+        model: 'opus-4.8',
+        effort: 'high',
+        workflow: 'build',
+        reviewer: null,
+        verifier: null,
+        contextStrategy: null,
+        concurrencyStrategy: null,
+      },
+      configuration: [],
+    };
+
+    it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {
+      const { sockets, report } = await harness();
+      const s = sockets[0]!;
+
+      // Socket down: the configuration resolves, the report is made, but the frame throws on send.
+      s.deliver = false;
+      report('run_1', { status: 'running', executedConfiguration: configuration });
+      expect(s.telemetry()).toHaveLength(0); // nothing left the socket
+
+      // Socket up: a later tick that itself carries no configuration must still deliver the held one.
+      s.deliver = true;
+      report('run_1', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 10 } });
+      const delivered = s.telemetry();
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]!.executedConfiguration).toMatchObject({
+        strategy: { tool: 'claude', model: 'opus-4.8', effort: 'high', workflow: 'build' },
+      });
+
+      // Cleared: the next successful tick carries null, proving the daemon no longer holds it.
+      report('run_1', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 20 } });
+      expect(s.telemetry()).toHaveLength(2);
+      expect(s.telemetry()[1]!.executedConfiguration).toBeNull();
+    });
+
+    it('drops the pending record on a terminal status even when it never delivered', async () => {
+      const { sockets, report } = await harness();
+      const s = sockets[0]!;
+
+      // Retained (send fails), then the run fails while the socket is still down — never delivered.
+      s.deliver = false;
+      report('run_2', { status: 'running', executedConfiguration: configuration });
+      report('run_2', { status: 'failed' });
+      expect(s.telemetry()).toHaveLength(0);
+
+      // Socket restored: a subsequent live tick carries null — the terminal status dropped the record.
+      s.deliver = true;
+      report('run_2', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 5 } });
+      const delivered = s.telemetry();
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]!.executedConfiguration).toBeNull();
+    });
+
+    it('a delivered record is also gone once the run reaches a terminal status', async () => {
+      const { sockets, report } = await harness();
+      const s = sockets[0]!;
+
+      // Delivered live (frame carries the configuration, cleared on success), then the run completes.
+      report('run_3', { status: 'running', executedConfiguration: configuration });
+      expect(s.telemetry()[0]!.executedConfiguration).toMatchObject({
+        strategy: { tool: 'claude', model: 'opus-4.8' },
+      });
+      report('run_3', { status: 'done', exit: { outcome: 'done' } });
+
+      // A stray later tick for the same run carries null — nothing lingers past terminal.
+      report('run_3', { status: 'running', telemetry: { ...zeroTelemetry(), inputTokens: 7 } });
+      expect(s.telemetry().at(-1)!.executedConfiguration).toBeNull();
+    });
   });
 
   // RUN-195. The hello's repo reports are recomputed per CONNECTION, never pinned at startup:

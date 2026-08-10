@@ -1,6 +1,7 @@
 import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
 import type {
   AgentTool,
+  ExecutedConfigurationEvidence,
   ExecutionSpec,
   Run,
   RunKind,
@@ -225,6 +226,9 @@ export class WsClient {
       phase?: RunPhase | null;
       /** The spec this run was briefed with (RUN-166) — once, then null. */
       executedSpec?: ExecutionSpec | null;
+      /** The coordinate this run actually resolved and started under (RUN-241) — once, then
+       *  null. Mirrors `executedSpec` exactly; see `RunReport.executedConfiguration`'s doc. */
+      executedConfiguration?: ExecutedConfigurationEvidence | null;
     },
   ): boolean {
     return this.sendRaw({
@@ -241,6 +245,9 @@ export class WsClient {
       // Write-once server-side (RUN-166): what a run was briefed with is a fact about a moment
       // that has passed, so a redelivered frame must not replace it with a later view.
       executedSpec: t.executedSpec ?? null,
+      // Write-once server-side too (RUN-241/PLNR-291): late Runner evidence about the resolved
+      // configuration, not permission to rewrite the server's commissioning snapshot.
+      executedConfiguration: t.executedConfiguration ?? null,
       at: new Date().toISOString(),
     });
   }

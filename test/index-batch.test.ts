@@ -369,7 +369,10 @@ describe('assembleManifest', () => {
       indexerVersion: '1',
       batchCount: 1,
       fileCount: 3,
-      contentHash: 'abc123',
+      // The vendored schema now regex-validates contentHash as a lowercase SHA-256 hex digest;
+      // production always computes one (index-scan.ts's `createHash('sha256')`), so the fixture
+      // matches rather than exercising a shape the real writer never produces.
+      contentHash: 'a'.repeat(64),
       deletions: ['old.ts'],
       now: () => Date.UTC(2026, 0, 1),
     });

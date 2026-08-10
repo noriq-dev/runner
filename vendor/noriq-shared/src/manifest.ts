@@ -410,7 +410,14 @@ export const ProjectManifest = z.object({
   defaultBranch: z.string().nullable().default(null),
   // The canonical, project-local repository identity (Project Memory §6, PLNR-244) — distinct
   // from any runner-local checkout id, and stable across re-clones and machine changes in a way
-  // a checkout id is not. Null on a manifest that has not opted into Project Memory yet.
+  // a checkout id is not. Null on a manifest that has not opted into Project Memory yet, OR on
+  // one that has: PLNR-321 makes registration itself optional-with-a-derived-default (the
+  // server derives the project's own key, lowercased, when a caller omits the key at
+  // registration — see index.ts's deriveDefaultRepositoryKey), so a repo can start using
+  // Project Memory without ever hand-authoring a slug here. This field is NOT a secret — it is
+  // a public, stable identifier and a visible segment of every entity URI
+  // (`noriq://file/<projectKey>/<repositoryKey>/<path>`); set it explicitly only when a
+  // project spans more than one repository, or to pin the derived default in writing.
   repositoryKey: RepositoryKey.nullable().default(null),
   // Null = indexing off for this repo, byte-identical to every manifest written before this
   // existed.

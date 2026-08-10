@@ -1,6 +1,16 @@
 import { z } from 'zod';
 import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage } from './runner';
 import { ExecutionSpec } from './execution-spec';
+import { ExecutedConfigurationEvidence } from './intelligence';
+import {
+  ExecutionReportAck,
+  ORCHESTRATION_CAPABILITY,
+  RunnerExecutionDeclaration,
+  RunnerExecutionEventReport,
+  RunnerExecutionReconciliation,
+  RunnerExecutionRelationReport,
+  RunnerProtocolCapability,
+} from './orchestration';
 
 // ---------------------------------------------------------------------------
 // The runtime channel (RUN plan, Phase 1) — a persistent WebSocket the daemon
@@ -19,6 +29,7 @@ import { ExecutionSpec } from './execution-spec';
 // Bump when the envelope shape changes incompatibly; sent in `hello` so the
 // server can reject or adapt to an out-of-date daemon.
 export const RUNNER_PROTOCOL_VERSION = 1;
+export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY] as const;
 
 // How a steer is injected into the live CLI session:
 //   soft — queue as the next user turn (the agent finishes its current thought)
@@ -44,6 +55,7 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
     runnerId: z.string(),
     protocol: z.number().int(),
     serverTime: z.string().datetime(),
+    acceptedCapabilities: z.array(RunnerProtocolCapability).default([]),
   }),
 
   // A Run has been dispatched to this runner. Carries the full server-authored
@@ -105,6 +117,8 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   }),
 
   z.object({ type: z.literal('pong') }),
+
+  z.object({ type: z.literal('execution.ack'), ack: ExecutionReportAck }),
 ]);
 export type RunnerServerMessage = z.infer<typeof RunnerServerMessage>;
 
@@ -117,6 +131,7 @@ export type RunnerServerMessage = z.infer<typeof RunnerServerMessage>;
 export const RunnerHello = z.object({
   type: z.literal('hello'),
   protocol: z.number().int(),
+  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
   // Present on reconnect so the server re-binds to the existing Runner row.
   runnerId: z.string().nullable().default(null),
   label: z.string().min(1),
@@ -151,6 +166,30 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     // gives the server/dashboard visibility into where the Run is executing.
     worktreePath: z.string().nullable().default(null),
     at: z.string().datetime(),
+  }),
+
+  z.object({
+    type: z.literal('execution.declare'),
+    runId: z.string(),
+    declaration: RunnerExecutionDeclaration,
+  }),
+
+  z.object({
+    type: z.literal('execution.relation'),
+    runId: z.string(),
+    relation: RunnerExecutionRelationReport,
+  }),
+
+  z.object({
+    type: z.literal('execution.event'),
+    runId: z.string(),
+    event: RunnerExecutionEventReport,
+  }),
+
+  z.object({
+    type: z.literal('execution.reconcile'),
+    runId: z.string(),
+    reconciliation: RunnerExecutionReconciliation,
   }),
 
   // Live run telemetry (RUN-22): a high-frequency, non-transitional heartbeat of
@@ -196,6 +235,9 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
      * mint a status change, and `run.status` has no running → running edge to carry it on.
      */
     executedSpec: ExecutionSpec.nullable().default(null),
+    // PLNR-291: resolved Runner/driver configuration is late evidence, not permission to rewrite
+    // the immutable server commissioning record. Older Runners omit it.
+    executedConfiguration: ExecutedConfigurationEvidence.nullable().default(null),
     at: z.string().datetime(),
   }),
 

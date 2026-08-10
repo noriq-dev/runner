@@ -1,5 +1,6 @@
 import type {
   AgentTool,
+  ExecutedConfigurationEvidence,
   ExecutionSpec,
   ProjectManifest,
   Run,
@@ -884,6 +885,9 @@ export class Daemon {
      *  actually goes out, and when the run ends, so a daemon does not hold one per run for its
      *  whole life. */
     const pendingSpec = new Map<string, ExecutionSpec>();
+    /** RUN-241: the same owed-until-delivered posture as `pendingSpec`, for the resolved
+     *  coordinate a run actually executes under (see `RunReport.executedConfiguration`'s doc). */
+    const pendingConfiguration = new Map<string, ExecutedConfigurationEvidence>();
     const steering = new SteeringBridge({ logger: this.log });
     // The session-capacity ledger (RUN-170): waveLimit RESERVES what it answers, so simultaneous
     // chains cannot double-spend the same spare slots, and freeSlots sees a granted wave as
@@ -921,7 +925,11 @@ export class Daemon {
         // free: the server appends only when the spec differs from the last one it holds.
         if (rep.executedSpec) pendingSpec.set(runId, rep.executedSpec);
         const spec = pendingSpec.get(runId) ?? null;
-        if (rep.telemetry || rep.phase || spec) {
+        // RUN-241: same owed-until-delivered handling as `spec`, one frame field over — see the
+        // pendingConfiguration declaration and RunReport.executedConfiguration's doc.
+        if (rep.executedConfiguration) pendingConfiguration.set(runId, rep.executedConfiguration);
+        const configuration = pendingConfiguration.get(runId) ?? null;
+        if (rep.telemetry || rep.phase || spec || configuration) {
           // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
           // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
           if (held.ws) {
@@ -933,15 +941,20 @@ export class Daemon {
               // transition — run.status has no running → running edge, so it would be rejected
               // there and silently dropped.
               executedSpec: spec,
+              executedConfiguration: configuration,
             });
             // Clear the pending record ONLY once the frame actually LEFT the socket — that is what
             // sendTelemetry's boolean reports. A down socket still sets `held.ws`, so keying the
             // clear on its presence counted a dropped frame as a delivery and lost the record with
             // nothing to correct it; retaining it lets the next live frame re-send (RUN-172/173).
             if (spec && left) pendingSpec.delete(runId);
+            if (configuration && left) pendingConfiguration.delete(runId);
           }
         }
-        if (rep.status === 'done' || rep.status === 'failed') pendingSpec.delete(runId);
+        if (rep.status === 'done' || rep.status === 'failed') {
+          pendingSpec.delete(runId);
+          pendingConfiguration.delete(runId);
+        }
         if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
           lastRunStatus.set(runId, rep.status);
           // agentId finally has a value to carry: the daemon created the identity, so it no

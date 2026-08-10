@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ExecutionAssignment } from './orchestration';
 
 // ---------------------------------------------------------------------------
 // Noriq Runner — the execution plane (RUN plan, Phase 1). Runtime-neutral zod:
@@ -156,6 +157,9 @@ export const Run = z.object({
   // daemon). Null until the process registers; the daemon supervises the
   // *process*, the agent reports its *work* via its own MCP calls.
   agentId: z.string().nullable().default(null),
+  // Additive orchestration assignment (PLNR-366). The server includes it for a daemon that
+  // negotiated orchestration.v1; old Runner schemas strip the unknown property safely.
+  execution: ExecutionAssignment.nullable().default(null),
   kind: RunKind,
   anchor: RunAnchor,
   // VERIFY runs only: the BUILD run whose diff this one judges. The daemon branches the

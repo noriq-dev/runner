@@ -10,7 +10,7 @@ import type {
   RunKind,
   RunPhase,
 } from '@noriq-dev/shared';
-import type { ExecutionSpec } from '@noriq-dev/shared';
+import type { ExecutedConfigurationEvidence, ExecutionSpec } from '@noriq-dev/shared';
 import { UNATTRIBUTED_MODEL_ID, hasExecutionSpec } from '@noriq-dev/shared';
 import {
   type AcceptanceItem,
@@ -249,6 +249,22 @@ export interface RunReport {
    * precisely where it is needed.
    */
   executedSpec?: ExecutionSpec;
+  /**
+   * RUN-241: the coordinate this run actually resolved and started under — sent ONCE, when
+   * `prepareRun` has settled tool/model/effort/workflow, and absent on every other frame. Mirrors
+   * `executedSpec` exactly (see `ws.ts`'s own doc comment on that field for why this rides
+   * telemetry rather than minting a status transition): late Runner evidence, not permission to
+   * rewrite the server's immutable commissioning snapshot, so it is deliberately write-once on
+   * the server side too.
+   *
+   * `configuration` (per-component fingerprints) is left `[]` here — populating it is RUN-246's
+   * task, and `[]` is the schema's own default, so an empty array says "not populated yet", not
+   * "nothing configured". `reviewer`/`verifier` stay `null`: neither is chosen this early in
+   * `supervise` (the inline reviewer's coordinate is resolved inside `runReviewer`, per round),
+   * and a guessed value would be worse than an honest gap for a field Project Intelligence reads
+   * as evidence.
+   */
+  executedConfiguration?: ExecutedConfigurationEvidence;
   exit?: Record<string, unknown> | null;
 }
 
@@ -3594,6 +3610,35 @@ export class RunSupervisor {
     if (hasExecutionSpec(executedSpec?.spec)) {
       this.deps.report(run.id, { status: 'running', executedSpec: executedSpec!.spec });
     }
+
+    // The resolved coordinate this run is actually executing under (RUN-241), sent once, the same
+    // way and for the same reason as `executedSpec` just above — see `RunReport.executedConfiguration`'s
+    // doc for why it rides this frame rather than a status transition. Read from `prepared`/`start`
+    // rather than the dispatch request: `driver.tool` and `workflow.id` are what prepare actually
+    // picked (a workflow's execute-stage coordinate can override the dispatch tool), and `start`
+    // is post-`planIfUnplanned` so a plan-mutated prompt does not race this report — though planning
+    // only ever rewrites the prompt, never the tool/model/effort/workflow ladder.
+    // `vendor`/`reviewer`/`verifier` stay null: this repo has no vendor identifier distinct from
+    // `tool`, and neither judging actor's coordinate is chosen this early (the inline reviewer's is
+    // resolved per round inside `runReviewer`) — a guess would be worse than an honest gap here.
+    // `configuration: []` is RUN-246's field to populate; `[]` is the schema's own default.
+    this.deps.report(run.id, {
+      status: 'running',
+      executedConfiguration: {
+        strategy: {
+          tool: prepared.driver.tool,
+          vendor: null,
+          model: start.model ?? null,
+          effort: start.effort ?? null,
+          workflow: prepared.workflow.id,
+          reviewer: null,
+          verifier: null,
+          contextStrategy: null,
+          concurrencyStrategy: null,
+        },
+        configuration: [],
+      },
+    });
 
     const chain = checkSteps(executedSpec?.spec);
     const executed = chain.steps.length

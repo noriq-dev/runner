@@ -1,16 +1,17 @@
 {
-  "sourceCommit": "2779095d5e76a9b8956e48be95236937eef92267",
+  "sourceCommit": "957195072831bea472163c4e4bb0d69908a77bf6",
   "sourceDirty": false,
-  "vendoredAt": "2026-08-10T15:23:00.000Z",
-  "note": "Backfilled by RUN-240: this repo's vendor/noriq-shared/src predates provenance tracking, so no commit was captured live at the original `npm run vendor:shared` run. The commit above was found by diffing the current tree against noriq's history — all 8 files matched byte-for-byte, exactly once, at this commit — not guessed. sourceDirty is false because a historical commit is definitionally a clean, fully-committed tree; it does not attest to the working tree's state at the moment the original refresh actually ran, only to the commit whose content matches what's here. Every refresh from this point on (scripts/vendor-shared.mjs) records commit and dirty live, from the source checkout, at vendor time.",
+  "vendoredAt": "2026-08-10T19:45:28.336Z",
   "files": {
-    "events.ts": "32614e19375408fa8825e55d8746f752a229529801c2b5286a4728c75917cef9",
+    "events.ts": "4c521e2a4a280d0860dfcbaea35e5d89edd2bac4d764f448ce63654c2142beab",
     "execution-spec.ts": "27432bfc454ffc6672ba34e11f8914cda517c0773fd4c9cc86c32e7a17936ca4",
-    "index.ts": "df9722d0d25f820765b87677982dd809c04ca79e18ea377f223d883d7f41c23a",
-    "manifest.ts": "1d2b2a764186873b1baf76bbcaa284e689c651a7f9d5b12f0d4fd4f20955506f",
-    "memory.ts": "3211a08a084426bd485963a8eaa1e5c0a8412f73b1a62f5ef0104928d7e5d0c5",
+    "index.ts": "b553f481ababbd362e473331a2648de9484e57255d86239ab55e1daf5a3f3bf1",
+    "intelligence.ts": "d1533e8711e0d01d5794ecb3885f79ddcdd1a4c48188b756b664dafb4b0c4052",
+    "manifest.ts": "d260338959fb85b9e9a786c8e497c2156a00df5ec13a3a7788690201653cb260",
+    "memory.ts": "1834aae1ee15350ce5d5cc3ac7bd9b59f36f2ceb2c9e59c34759fb42bafe74eb",
     "model.ts": "81fcf491132b23a754936cac4d4efdc2ee26bcc815073be683d391e4a5ed22f6",
-    "runner.ts": "e943e94eb2d0260cbde8fae2df5578ce4298d110c815833cdf22f5e6c76bd268",
-    "ws.ts": "7b8b38d6e9e5dd2da0fbbe5464585d4eb498ab5931aa3663904fcc220432ef78"
+    "orchestration.ts": "861824bf3ff9625e1b7c66f0b3e2c4dfed2f2ebea382077c0a1dd2299cb32428",
+    "runner.ts": "50f6220b59b68cef149d94873caa9db805869472beadf10c0f76fe267e921c84",
+    "ws.ts": "728583a9bedf2a4c82f6742ec8ad13fbb32475dc1f5c87955a528ad5951a93dc"
   }
 }

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { RepoPath, ExecutionSpec } from './execution-spec';
+import { ProjectIntelligenceEpisode } from './intelligence';
 import { RunModelUsage } from './runner';
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,30 @@ export const EvidenceRef = z.object({
   verificationState: VerificationState.default('unverifiable'),
 });
 export type EvidenceRef = z.infer<typeof EvidenceRef>;
+
+/** SHA-256 over JSON.stringify's exact UTF-8 bytes. Property insertion order is therefore part
+ *  of this wire contract: callers that must reproduce an identity hash should use the shared
+ *  higher-level helper rather than reconstructing its object locally. */
+export async function canonicalHash(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const digest = await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export type EvidenceIdentity = Pick<EvidenceRef, 'repositoryKey' | 'branch' | 'baseId' | 'path' | 'symbol'>;
+
+/** Stable citation identity shared byte-for-byte by the server and Runner verification tier.
+ *  Freshness fields are deliberately excluded: they describe the cited artifact, not the
+ *  identity of the citation itself. */
+export function evidenceHash(ref: EvidenceIdentity): Promise<string> {
+  return canonicalHash({
+    repositoryKey: ref.repositoryKey,
+    branch: ref.branch,
+    baseId: ref.baseId,
+    path: ref.path,
+    symbol: ref.symbol,
+  });
+}
 
 /**
  * The five-level authority scale (§12). Higher is stronger; promotion between
@@ -308,6 +333,10 @@ export const EffortEpisode = z.object({
   steeringEvents: z.array(z.string()).default([]),
   landingOutcome: EpisodeLandingOutcome.default('pending'),
   remainingWork: z.array(z.string()).default([]),
+  // PLNR-290: additive analytics-grade facts. Absence is permanent backwards compatibility,
+  // not a legacy error — old Runners/episodes remain valid and later extraction reports the
+  // corresponding metrics as unavailable.
+  intelligence: ProjectIntelligenceEpisode.nullable().optional(),
   // Absent OR malformed both leave the episode valid (§14) — `.catch(null)` swallows a bad
   // self-summary rather than failing the whole record's parse.
   selfSummary: EpisodeSelfSummary.nullable().default(null).catch(null),
@@ -334,7 +363,7 @@ export const IndexGenerationManifest = z.object({
   indexerVersion: z.string().min(1),
   batchCount: z.number().int().positive(),
   fileCount: z.number().int().nonnegative(),
-  contentHash: z.string().min(1),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest'),
   deletions: z.array(RepoPath).default([]),
   createdAt: z.string().datetime(),
 });
@@ -351,6 +380,33 @@ export const IndexBatch = z.object({
   batchHash: z.string().min(1),
 });
 export type IndexBatch = z.infer<typeof IndexBatch>;
+
+/**
+ * One decoded JSONL row in an index batch. This is a vendored Runner/server wire contract for
+ * the transport shape. Types remain non-empty strings here because staged generations retain
+ * malformed entities for validation/projection diagnostics; MemoryNodeType/MemoryEdgeType are
+ * enforced at that later boundary. `content` defaults to null so indexers may omit it for node
+ * kinds without searchable text.
+ */
+export const StagedEntityRow = z.object({
+  kind: z.literal('node'),
+  uri: z.string().min(1),
+  type: z.string().min(1),
+  label: z.string().min(1),
+  content: z.string().nullable().default(null),
+});
+export type StagedEntityRow = z.infer<typeof StagedEntityRow>;
+
+export const StagedEdgeRow = z.object({
+  kind: z.literal('edge'),
+  type: z.string().min(1),
+  from: z.string().min(1),
+  to: z.string().min(1),
+});
+export type StagedEdgeRow = z.infer<typeof StagedEdgeRow>;
+
+export const StagedRow = z.discriminatedUnion('kind', [StagedEntityRow, StagedEdgeRow]);
+export type StagedRow = z.infer<typeof StagedRow>;
 
 // ---------------------------------------------------------------------------
 // Runner-reachable index cursor + checkout association (§4/§6/§7, PLNR-306)
@@ -483,6 +539,9 @@ export const ContextPackMemoryExcerpt = z.object({
   id: z.string(),
   memoryKind: MemoryKind,
   statement: z.string(),
+  /** True only when a bounded presentation surface shortened the canonical statement. The
+   * canonical memory row is untouched; consumers must present this as an excerpt. */
+  statementTruncated: z.boolean().optional(),
   authority: AuthorityLevel,
   confidence: z.number().min(0).max(1).nullable(),
   validity: z.string(),
@@ -725,6 +784,7 @@ export const ProjectMemoryStaleWarning = z.object({
   memoryItemId: z.string(),
   kind: MemoryKind.nullable(),
   statement: z.string().nullable(),
+  statementTruncated: z.boolean().optional(),
   validity: z.string(),
   reason: z.string().nullable(),
   at: z.string().datetime(),
