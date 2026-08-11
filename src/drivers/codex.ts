@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
+import { DEFAULT_CODEX_HOME, ensurePrivateAgentHome } from '../agent-homes';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { killProcessTree, treeSpawnOptions } from '../proc';
@@ -99,6 +100,8 @@ export interface CodexSpawnOptions {
   kind: RunKind;
   /** The supervisor-sanitized process env (RUN-109). Absent only in tests → `sanitizedAgentEnv()`. */
   env?: NodeJS.ProcessEnv;
+  /** Runner's Codex-specific home. Never inherit the operator's global ~/.codex. */
+  codexHome?: string;
 }
 export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 
@@ -139,6 +142,9 @@ export interface CodexDriverDeps {
   /** Injectable for tests; defaults to spawning the real `codex app-server`. */
   spawnCodex?: SpawnCodex;
   logger?: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
+  /** Injectable so tests never create or chmod the operator's real ~/.noriq/codex. */
+  codexHome?: string;
+  prepareCodexHome?: (home: string) => void;
 }
 
 /**
@@ -177,13 +183,18 @@ export class CodexDriver implements AgentDriver {
   };
   private readonly spawnCodex: SpawnCodex;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
+  private readonly codexHome: string;
+  private readonly prepareCodexHome: (home: string) => void;
 
   constructor(deps: CodexDriverDeps = {}) {
     this.spawnCodex = deps.spawnCodex ?? defaultSpawnCodex;
     this.log = deps.logger ?? { debug() {}, info() {}, warn() {}, error() {} };
+    this.codexHome = deps.codexHome ?? DEFAULT_CODEX_HOME;
+    this.prepareCodexHome = deps.prepareCodexHome ?? ensurePrivateAgentHome;
   }
 
   start(opts: DriverStartOptions): DriverSession {
+    this.prepareCodexHome(this.codexHome);
     const transport = this.spawnCodex({
       cwd: opts.cwd,
       model: opts.model,
@@ -194,6 +205,7 @@ export class CodexDriver implements AgentDriver {
       noriqTools: opts.noriqTools,
       kind: opts.kind,
       env: opts.env,
+      codexHome: this.codexHome,
     });
     transport.sendUserTurn(opts.prompt);
 
@@ -432,6 +444,7 @@ const RPC = {
   turnStart: 'turn/start',
   turnSteer: 'turn/steer',
   turnInterrupt: 'turn/interrupt',
+  mcpServerStatusList: 'mcpServerStatus/list',
 } as const;
 const NOTIF = {
   agentMessageDelta: ['thread/agentMessageDelta', 'item/agentMessage/delta'],
@@ -501,6 +514,8 @@ export const defaultSpawnCodex = (
   opts: CodexSpawnOptions,
   spawnFn: SpawnChild = spawn as unknown as SpawnChild,
 ): CodexTransport => {
+  const codexHome = opts.codexHome ?? DEFAULT_CODEX_HOME;
+  const expectedNoriqTools = [...(opts.noriqTools ?? noriqToolNamesFor(opts.kind))];
   // Wire the agent's Noriq MCP connection (RUN-43). This was simply ABSENT: the driver
   // spawned codex with no MCP config while the prompt ordered it to register itself against
   // a server it had no connection to — so every codex agent was silently anonymous and
@@ -516,6 +531,8 @@ export const defaultSpawnCodex = (
         `mcp_servers.${NORIQ_MCP_NAME}.url=${opts.noriqMcp.url}`,
         '-c',
         `mcp_servers.${NORIQ_MCP_NAME}.bearer_token_env_var=${CODEX_MCP_TOKEN_ENV}`,
+        '-c',
+        `mcp_servers.${NORIQ_MCP_NAME}.required=true`,
         // The per-kind Noriq floor (RUN-46). `enabled_tools` is codex's per-server allowlist —
         // anything absent is not even advertised to the model. Without this line the floor was
         // a CLAUDE property: the same verify run on codex had every tool the server exposes,
@@ -526,7 +543,7 @@ export const defaultSpawnCodex = (
         // A stage actor's narrowed set (DriverStartOptions.noriqTools) replaces the kind floor —
         // same seam as the Claude driver, enforced here by the server allowlist itself, which is
         // sandbox-independent: not-enabled is not-advertised, whatever the sandbox mode.
-        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify([...(opts.noriqTools ?? noriqToolNamesFor(opts.kind))])}`,
+        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify(expectedNoriqTools)}`,
       ]
     : [];
   // Model + effort (RUN-33), per-spawn for the same reason as the MCP config above: writing
@@ -542,10 +559,29 @@ export const defaultSpawnCodex = (
   // that one token — and only when MCP is actually wired — is put back deliberately, on top of the
   // already-stripped base. See CODEX_MCP_TOKEN_ENV in security.ts for why this token is the exception.
   const base = opts.env ?? sanitizedAgentEnv();
-  const child = spawnFn('codex', ['app-server', ...mcpArgs, ...modelArgs], {
+  // RUN-290 defense in depth. CODEX_HOME below is the isolation boundary; these flags ensure a
+  // deliberate Runner-specific preference cannot turn hosted apps or plugin-delivered tools back
+  // on for an unattended session. Direct MCP config is policed by the effective-inventory gate.
+  const capabilityArgs = [
+    '--disable',
+    'apps',
+    '--disable',
+    'plugins',
+    '--disable',
+    'remote_plugin',
+    '--disable',
+    'skill_mcp_dependency_install',
+  ];
+  const child = spawnFn('codex', ['app-server', ...capabilityArgs, ...mcpArgs, ...modelArgs], {
     cwd: opts.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: opts.noriqMcp ? { ...base, [CODEX_MCP_TOKEN_ENV]: opts.noriqMcp.token } : base,
+    env: {
+      ...base,
+      // Override, never default: an inherited CODEX_HOME is the exact ambient-config leak this
+      // task closes. The directory was prepared by CodexDriver before this transport is spawned.
+      CODEX_HOME: codexHome,
+      ...(opts.noriqMcp ? { [CODEX_MCP_TOKEN_ENV]: opts.noriqMcp.token } : {}),
+    },
     // Group it with its descendants so close() can reach them all (RUN-42). POSIX-only; on
     // Windows this is a no-op and taskkill /T walks the tree instead.
     ...treeSpawnOptions(),
@@ -554,6 +590,10 @@ export const defaultSpawnCodex = (
   let nextId = 1;
   let threadId: string | null = null;
   let turnId: string | null = null;
+  let mcpAttested = false;
+  let mcpAttestationFailed = false;
+  let mcpStatusRequestId: number | null = null;
+  const mcpStatuses: Array<{ name?: unknown; tools?: unknown }> = [];
   /** A turn requested before the thread existed — flushed once thread/start answers. */
   let pendingTurn: string | null = null;
   /** Requests whose rejection must NOT kill the run: a lost steer already has a fallback
@@ -585,6 +625,58 @@ export const defaultSpawnCodex = (
 
   const userInput = (text: string) => [{ type: 'text', text }];
 
+  const failMcpAttestation = (reason: string): void => {
+    if (mcpAttestationFailed) return;
+    mcpAttestationFailed = true;
+    events.push({ type: 'error', message: `codex MCP isolation failed: ${reason}` });
+    events.close();
+    killProcessTree(child, { force: false });
+  };
+
+  const flushPendingTurn = (): void => {
+    if (!threadId || !mcpAttested || pendingTurn === null || mcpAttestationFailed) return;
+    send(RPC.turnStart, { threadId, input: userInput(pendingTurn), cwd: opts.cwd });
+    pendingTurn = null;
+  };
+
+  const requestMcpStatus = (cursor?: string): void => {
+    if (!threadId || mcpAttestationFailed) return;
+    mcpStatusRequestId = send(RPC.mcpServerStatusList, {
+      threadId,
+      detail: 'toolsAndAuthOnly',
+      limit: 100,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (mcpStatusRequestId === null) failMcpAttestation('could not request the effective server list');
+  };
+
+  const finishMcpAttestation = (): void => {
+    const expectedNames = opts.noriqMcp ? [NORIQ_MCP_NAME] : [];
+    const actualNames = mcpStatuses.map((s) => String(s.name ?? '')).sort();
+    if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+      failMcpAttestation(
+        `expected servers [${expectedNames.join(', ')}], got [${actualNames.join(', ') || 'none'}]`,
+      );
+      return;
+    }
+    if (opts.noriqMcp) {
+      const noriq = mcpStatuses.find((s) => s.name === NORIQ_MCP_NAME);
+      const actualTools =
+        noriq?.tools && typeof noriq.tools === 'object' && !Array.isArray(noriq.tools)
+          ? Object.keys(noriq.tools as Record<string, unknown>).sort()
+          : [];
+      const expectedTools = [...expectedNoriqTools].sort();
+      if (JSON.stringify(actualTools) !== JSON.stringify(expectedTools)) {
+        failMcpAttestation(
+          `noriq tool inventory differs from the stage allowlist (expected ${expectedTools.length}, got ${actualTools.length})`,
+        );
+        return;
+      }
+    }
+    mcpAttested = true;
+    flushPendingTurn();
+  };
+
   const rl = createInterface({ input: child.stdout });
   rl.on('line', (line) => {
     let msg: {
@@ -605,6 +697,10 @@ export const defaultSpawnCodex = (
     // flushed, and the run hung forever with codex idle at zero CPU. A rejected request is
     // a verdict; say so and let the driver fail the run with the reason.
     if (msg.error) {
+      if (msg.id !== undefined && msg.id === mcpStatusRequestId) {
+        failMcpAttestation(`server inventory request was rejected: ${msg.error.message ?? 'unknown error'}`);
+        return;
+      }
       if (msg.id === undefined || !nonFatalIds.delete(msg.id)) {
         events.push({
           type: 'error',
@@ -615,20 +711,40 @@ export const defaultSpawnCodex = (
     }
     // Capture ids from responses so we can steer/interrupt the active turn.
     if (msg.result) {
+      if (msg.id !== undefined && msg.id === mcpStatusRequestId) {
+        const result = msg.result as {
+          data?: Array<{ name?: unknown; tools?: unknown }>;
+          nextCursor?: unknown;
+        };
+        if (!Array.isArray(result.data)) {
+          failMcpAttestation('server inventory response had no data array');
+          return;
+        }
+        mcpStatuses.push(...result.data);
+        if (typeof result.nextCursor === 'string' && result.nextCursor) requestMcpStatus(result.nextCursor);
+        else finishMcpAttestation();
+        return;
+      }
       // 0.142.x answered thread/start with {threadId}; 0.144.x nests it as {thread:{id}}.
       const r = msg.result as { threadId?: string; thread?: { id?: string }; turn?: { id?: string } };
       const startedThread = r.threadId ?? r.thread?.id;
       if (startedThread) {
         threadId = startedThread;
-        // The thread exists now — release the turn that was requested before it did.
-        if (pendingTurn !== null) {
-          send(RPC.turnStart, { threadId, input: userInput(pendingTurn), cwd: opts.cwd });
-          pendingTurn = null;
-        }
+        // The thread exists, but model work stays held until its EFFECTIVE MCP inventory—not just
+        // the CLI args we intended—is exactly the one-server capability boundary RUN-290 promises.
+        requestMcpStatus();
       }
       if (r.turn?.id) turnId = r.turn.id;
     }
     if (msg.method) {
+      if (msg.method === 'mcpServer/startupStatus/updated') {
+        const name = String(msg.params?.name ?? '');
+        const expected = opts.noriqMcp ? NORIQ_MCP_NAME : null;
+        if (name && name !== expected) {
+          failMcpAttestation(`unexpected server started: ${name}`);
+          return;
+        }
+      }
       const ev = normalizeNotification(msg.method, msg.params ?? {});
       // Unmapped frames still push `activity` (RUN-201): every frame is proof of life.
       events.push(ev ?? { type: 'activity' });
@@ -672,12 +788,12 @@ export const defaultSpawnCodex = (
     // completing a turn'. Buffer instead, and flush when the thread actually exists.
     // (Every codex test injects a fake transport, so nothing caught this.)
     sendUserTurn: (text) => {
-      if (threadId) send(RPC.turnStart, { threadId, input: userInput(text), cwd: opts.cwd });
+      if (threadId && mcpAttested) send(RPC.turnStart, { threadId, input: userInput(text), cwd: opts.cwd });
       else pendingTurn = text;
     },
     steer: (text) => {
       // Nothing to steer until the thread + turn exist; report it rather than pretend.
-      if (!threadId) return false;
+      if (!threadId || !mcpAttested) return false;
       const id = send(RPC.turnSteer, { threadId, expectedTurnId: turnId, input: userInput(text) });
       if (id !== null) nonFatalIds.add(id); // a rejected steer must not fail the whole run
       return id !== null;

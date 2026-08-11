@@ -1,6 +1,7 @@
 import { PassThrough } from 'node:stream';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
+import { DEFAULT_CODEX_HOME } from '../src/agent-homes';
 import { AsyncQueue } from '../src/async-queue';
 import { noriqToolsFor } from '../src/drivers/claude';
 import {
@@ -61,7 +62,7 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
   };
   const telemetry: DriverTelemetry[] = [];
   const texts: string[] = [];
-  const driver = new CodexDriver({ spawnCodex });
+  const driver = new CodexDriver({ spawnCodex, prepareCodexHome: () => {} });
   const session = driver.start({
     runId: 'run_1',
     kind: 'build',
@@ -94,6 +95,31 @@ describe('driver capabilities (RUN-110)', () => {
       resumableSession: false,
       perModelTelemetry: false,
     });
+  });
+});
+
+describe('Runner-specific Codex home (RUN-290)', () => {
+  it('prepares the isolated home and passes it through the spawn boundary', () => {
+    const prepared: string[] = [];
+    let spawnedHome: string | undefined;
+    const driver = new CodexDriver({
+      codexHome: '/runner/codex',
+      prepareCodexHome: (home) => prepared.push(home),
+      spawnCodex: (opts) => {
+        spawnedHome = opts.codexHome;
+        return new FakeTransport();
+      },
+    });
+    driver.start({
+      runId: 'run_home',
+      kind: 'scope',
+      cwd: '/wt',
+      prompt: 'inspect',
+      permission: profile(),
+    });
+
+    expect(prepared).toEqual(['/runner/codex']);
+    expect(spawnedHome).toBe('/runner/codex');
   });
 });
 
@@ -498,6 +524,22 @@ function makeFakeChild(writes: string[]) {
   };
 }
 
+/** Complete RUN-290's effective-inventory gate after a fake thread/start response. */
+async function answerMcpStatus(
+  fakeChild: ReturnType<typeof makeFakeChild>,
+  writes: string[],
+  data: Array<{ name: string; tools: Record<string, unknown> }> = [],
+  nextCursor: string | null = null,
+): Promise<void> {
+  await new Promise((r) => setImmediate(r));
+  const request = writes
+    .map((line) => JSON.parse(line))
+    .findLast((frame) => frame.method === 'mcpServerStatus/list');
+  expect(request).toBeTruthy();
+  fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { data, nextCursor } }));
+  await new Promise((r) => setImmediate(r));
+}
+
 describe('defaultSpawnCodex protocol handshake (regressions)', () => {
   // These cover the REAL transport, which every other codex test replaces with a fake —
   // which is exactly why both bugs below shipped.
@@ -517,7 +559,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
 
     // thread/start's response finally arrives.
     fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_1' } }));
-    await new Promise((r) => setImmediate(r));
+    await answerMcpStatus(fakeChild, writes);
 
     const turn = writes.find((w) => w.includes('turn/start'));
     expect(turn).toBeTruthy();
@@ -575,7 +617,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     );
     t.sendUserTurn('do the work');
     fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: 'th_144' } } }));
-    await new Promise((r) => setImmediate(r));
+    await answerMcpStatus(fakeChild, writes);
     const turn = writes.find((w) => w.includes('turn/start'));
     expect(turn).toBeTruthy();
     expect(JSON.parse(turn as string).params.threadId).toBe('th_144');
@@ -594,7 +636,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     );
     t.sendUserTurn('do the work');
     fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_live' } }));
-    await new Promise((r) => setImmediate(r));
+    await answerMcpStatus(fakeChild, writes);
     const turnWrites = () => writes.filter((w) => w.includes('turn/start'));
     expect(turnWrites()).toHaveLength(1);
 
@@ -620,7 +662,7 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
       () => fakeChild as never,
     );
     fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: 'th_1' } } }));
-    await new Promise((r) => setImmediate(r));
+    await answerMcpStatus(fakeChild, writes);
     expect(t.steer('also do X')).toBe(true);
     const steerId = JSON.parse(writes.find((w) => w.includes('turn/steer')) as string).id;
     fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: steerId, error: { message: 'no active turn' } }));
@@ -645,6 +687,78 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     const seen: string[] = [];
     for await (const ev of t.events) if (ev.type === 'error') seen.push(ev.message);
     expect(seen[0]).toContain('ENOENT');
+  });
+
+  it('does not release the first turn until the effective MCP inventory is attested', async () => {
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        kind: 'verify',
+        noriqMcp: { url: 'https://noriq.example/mcp', token: 'run-token' },
+        noriqTools: ['get_task'],
+      },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('review');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: 'th_gate' } } }));
+    await new Promise((r) => setImmediate(r));
+    expect(writes.some((line) => line.includes('turn/start'))).toBe(false);
+
+    await answerMcpStatus(fakeChild, writes, [{ name: 'noriq', tools: { get_task: {} } }]);
+
+    expect(writes.some((line) => line.includes('turn/start'))).toBe(true);
+  });
+
+  it('fails closed before turn/start when an inherited server appears', async () => {
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'scope' },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('inspect');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_rogue' } }));
+    await answerMcpStatus(fakeChild, writes, [{ name: 'codex_apps', tools: {} }]);
+
+    const seen: CodexEvent[] = [];
+    for await (const ev of t.events) seen.push(ev);
+    expect(seen).toContainEqual({
+      type: 'error',
+      message: 'codex MCP isolation failed: expected servers [], got [codex_apps]',
+    });
+    expect(writes.some((line) => line.includes('turn/start'))).toBe(false);
+  });
+
+  it('fails closed when Noriq advertises anything outside the stage floor', async () => {
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        kind: 'verify',
+        noriqMcp: { url: 'https://noriq.example/mcp', token: 'run-token' },
+        noriqTools: ['get_task'],
+      },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('review');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_tools' } }));
+    await answerMcpStatus(fakeChild, writes, [{ name: 'noriq', tools: { get_task: {}, claim_task: {} } }]);
+
+    const seen: CodexEvent[] = [];
+    for await (const ev of t.events) seen.push(ev);
+    expect(seen.at(-1)).toEqual({
+      type: 'error',
+      message:
+        'codex MCP isolation failed: noriq tool inventory differs from the stage allowlist (expected 1, got 2)',
+    });
+    expect(writes.some((line) => line.includes('turn/start'))).toBe(false);
   });
 });
 
@@ -694,11 +808,44 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
     // token here is per-run and dies with the run, which is what makes this trade payable.
     expect(opts.env.NORIQ_TOKEN).toBeUndefined();
     expect(opts.env.GIT_TERMINAL_PROMPT).toBe('0');
+    expect(opts.env.CODEX_HOME).toBe(DEFAULT_CODEX_HOME);
+  });
+
+  it('overrides an inherited CODEX_HOME and disables ambient app/plugin capabilities', () => {
+    let seen!: { args: string[]; env: NodeJS.ProcessEnv };
+    defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        kind: 'scope',
+        codexHome: '/noriq/codex',
+        env: { CODEX_HOME: '/operator/codex' },
+      },
+      ((_cmd: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+        seen = { args, env: options.env };
+        return makeFakeChild([]) as never;
+      }) as never,
+    );
+
+    expect(seen.env.CODEX_HOME).toBe('/noriq/codex');
+    for (const feature of ['apps', 'plugins', 'remote_plugin', 'skill_mcp_dependency_install']) {
+      expect(seen.args).toContain(feature);
+    }
   });
 
   it('leaks no Noriq token into the env when there is no MCP to wire', () => {
     const { args, opts } = spawnArgs(undefined);
-    expect(args).toEqual(['app-server']);
+    expect(args[0]).toBe('app-server');
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '--disable',
+        'apps',
+        'plugins',
+        'remote_plugin',
+        'skill_mcp_dependency_install',
+      ]),
+    );
     expect(opts.env.NORIQ_MCP_TOKEN).toBeUndefined();
   });
 
@@ -709,6 +856,11 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
     // Same reason as the MCP wiring above: writing these to ~/.codex/config.toml would
     // reconfigure the human's own codex behind their back.
     expect(args[0]).toBe('app-server');
+  });
+
+  it('marks the injected Noriq server required so auth/startup failures stop the thread', () => {
+    const { args } = spawnArgs({ url: 'https://noriq.example/mcp', token: 'run-token' });
+    expect(args).toContain('mcp_servers.noriq.required=true');
   });
 
   it('says nothing when nobody chose — codex keeps its own default (RUN-33)', () => {

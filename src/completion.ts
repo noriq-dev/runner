@@ -48,6 +48,10 @@ export const COMMAND_TABLE: readonly CommandSpec[] = [
     flags: ['--server', '--browser', '--device'],
   },
   {
+    name: 'codex-auth',
+    summary: ['Sign Codex in under the isolated ~/.noriq/codex Runner home'],
+  },
+  {
     name: 'start',
     summary: ['Discover repos, register with Noriq, and supervise dispatched runs'],
   },

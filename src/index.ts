@@ -1,6 +1,7 @@
 // Library surface of the Noriq Runner daemon. The CLI (src/cli.ts) is the binary
 // entry point; this module re-exports the pieces so they can be imported/tested.
 export { VERSION } from './version';
+export { DEFAULT_CODEX_HOME, ensurePrivateAgentHome, loginCodex } from './agent-homes';
 export { logger, setLogLevel, type LogLevel } from './logger';
 export {
   DEFAULT_CONFIG_PATH,
