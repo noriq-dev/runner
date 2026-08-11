@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import type {
   EffortEpisode as EffortEpisodeType,
@@ -5,6 +7,7 @@ import type {
 } from '@noriq-dev/shared';
 import { UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { NoriqClient } from '../src/client';
 import { deriveEpisodeScopeId } from '../src/episode';
 import {
@@ -389,6 +392,97 @@ describe('deliverEpisode (RUN-227)', () => {
     expect(line?.fields).toMatchObject({ runId: 'run_1', reason: 'disabled' });
     expect(await pending.list()).toHaveLength(1); // still pending — a later drain retries it
   });
+
+  // RUN-249 acceptance: "a complete() returning recorded: 0 behind an HTTP 200 still retries, and
+  // a test proves the retry is not reported as delivered." `uploadEpisode`'s own "skipped-row trap"
+  // test above pins the typed outcome; this pins the effect one layer up, at the sink real code
+  // calls: the entry is never cleared from the durable spool, so a later drain still retries it.
+  it('recorded:0 behind HTTP 200 is never reported as delivered — the entry survives for a later retry', async () => {
+    const { mintFetch, ingestFetch } = router({
+      complete: () =>
+        new Response(JSON.stringify({ ok: true, batchesReceived: 1, rowCount: 1, recorded: 0, skipped: 1 }), {
+          status: 200,
+        }),
+    });
+    const pending = new EpisodePendingStore(memPendingStore());
+    const deps: EpisodeDeliveryDeps = {
+      client: new NoriqClient({ server: 'https://noriq.example', token: 'tok', fetchImpl: mintFetch }),
+      fetchImpl: ingestFetch,
+      runnerId: 'rnr_1',
+      pending,
+      maxRetryAttempts: 0,
+    };
+
+    await deliverEpisode(episode(), deps);
+
+    // Never removed — `outcome.ok` was false, so the `deps.pending.remove(scopeId)` branch never ran.
+    expect(await pending.list()).toHaveLength(1);
+  });
+});
+
+describe('exactly-once across a restart (RUN-249): die AFTER complete() succeeds, BEFORE the spool entry clears', () => {
+  it('a fresh store instance retried after a crash resolves via the already-complete conflict — exactly one canonical /complete ever lands', async () => {
+    const scopeId = 'epi_restart_scope';
+    const ep = episode({ runId: 'run_restart' });
+    let completeCalls = 0;
+    let serverComplete = false; // models server-side state: has this scope reached `complete`?
+    const { mintFetch, ingestFetch } = router({
+      begin: () =>
+        serverComplete
+          ? new Response(
+              JSON.stringify({
+                error: `episode upload ${scopeId} already complete — this purpose cannot be reopened`,
+              }),
+              { status: 409 },
+            )
+          : new Response('{}', { status: 200 }),
+      complete: () => {
+        completeCalls += 1;
+        serverComplete = true;
+        return new Response(
+          JSON.stringify({ ok: true, batchesReceived: 1, rowCount: 1, recorded: 1, skipped: 0 }),
+          { status: 200 },
+        );
+      },
+    });
+
+    // The durable backing file — persists across the simulated restart, the same "fresh store
+    // instance over the same backing" shape `episode-pending.test.ts`'s own restart test uses.
+    const backing = memPendingStore();
+
+    // Sitting 1: enqueue durably, then the upload attempt reaches `complete()` and the server
+    // records the canonical update (recorded: 1, serverComplete flips true) — modeled as the
+    // daemon dying RIGHT HERE, before `deliverEpisode`'s own `pending.remove()` ever runs. Calling
+    // `uploadEpisode` directly (never `deliverEpisode`, which would remove on success) is what lets
+    // the test stop at exactly this window.
+    const store1 = new EpisodePendingStore(backing);
+    await store1.put({ scopeId, episode: ep, mint: MINT_INPUT, enqueuedAt: '2026-08-08T00:00:00.000Z' });
+    const firstAttempt = await uploadEpisode(
+      { scopeId, mint: MINT_INPUT, episode: ep },
+      makeDeps({}, { mintFetch, ingestFetch }),
+    );
+    expect(firstAttempt).toEqual({ ok: true });
+    expect(completeCalls).toBe(1);
+    // The crash: nothing removed the entry. It is still exactly where sitting 1 left it.
+    expect(await store1.list()).toHaveLength(1);
+
+    // "Restart": a FRESH store instance over the SAME backing file, driven through the daemon's
+    // real retry entry point (`drainPendingEpisodes`, what `daemon.ts` calls on startup/reconnect).
+    const store2 = new EpisodePendingStore(backing);
+    const deps2: EpisodeDeliveryDeps = {
+      ...makeDeps({}, { mintFetch, ingestFetch }),
+      runnerId: 'rnr_1',
+      pending: store2,
+    };
+    const result = await drainPendingEpisodes(deps2);
+
+    expect(result).toEqual({ delivered: 1, remaining: 0 });
+    expect(await store2.list()).toEqual([]);
+    // The whole point: the retry resolved via the already-complete conflict at `begin` and never
+    // reached `complete` a second time — exactly ONE canonical update landed, ever. Not zero
+    // (delivery still happened), not two (no duplicate row).
+    expect(completeCalls).toBe(1);
+  });
 });
 
 describe('drainPendingEpisodes (RUN-227)', () => {
@@ -668,5 +762,47 @@ describe('toEnrichmentPayload — intelligence (RUN-284)', () => {
     const body = decodeBatchBody(calls) as Record<string, unknown>;
     expect(Object.prototype.hasOwnProperty.call(body, 'intelligence')).toBe(false);
     expect(body.filesTouched).toEqual(['a.ts']);
+  });
+});
+
+describe('forward compatibility with a server that predates `intelligence` (RUN-249)', () => {
+  // RUN-249 locked decision: no version negotiation or downgrade path exists — the protocol
+  // already handles this via zod's default unknown-key-stripping behaviour, VERIFIED here by
+  // running it rather than assumed from reading the server source.
+  it('an old server shape without an `intelligence` key accepts a payload carrying one, drops the key, and still records the base episode', () => {
+    // Mirrors the shape of `UPLOADED_EPISODE_SHAPE` BEFORE PLNR-426 widened it to add
+    // `intelligence` — a plain z.object over the base accepted keys, nothing more.
+    const OLD_SERVER_SHAPE = z.object({
+      runId: z.string(),
+      filesTouched: z.array(z.string()).optional(),
+      commands: z.array(z.string()).optional(),
+      testsRun: z.array(z.string()).optional(),
+      failures: z.array(z.string()).optional(),
+      findings: z.array(z.unknown()).optional(),
+      selfSummary: z.unknown().optional(),
+    });
+
+    const payload = toEnrichmentPayload(episode({ filesTouched: ['a.ts'] }), validIntelligence());
+    expect(payload).toHaveProperty('intelligence'); // sanity: the wire payload really does carry it
+
+    const parsed = OLD_SERVER_SHAPE.safeParse(payload);
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data).not.toHaveProperty('intelligence'); // stripped, not rejected
+      expect(parsed.data.runId).toBe('run_1'); // the base episode still records
+      expect(parsed.data.filesTouched).toEqual(['a.ts']);
+    }
+  });
+});
+
+describe('no episode delivery path over the RunnerHub WS (RUN-249 acceptance)', () => {
+  // Verified rather than guarded against: `ws-client.ts` has no episode-shaped frame or fallback
+  // to close off today. Asserted here so a future change introducing one would have to touch this
+  // test, rather than silently reopening a second delivery path this task's own locked decision
+  // says must not exist.
+  it('src/ws-client.ts contains no reference to episodes', () => {
+    const src = readFileSync(path.join(__dirname, '..', 'src', 'ws-client.ts'), 'utf8');
+    expect(src).not.toMatch(/episode/i);
   });
 });

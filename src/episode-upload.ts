@@ -160,6 +160,17 @@ export type EpisodeEnrichmentPayload = Pick<EffortEpisodeType, 'runId'> &
  * `log` defaults to the module logger so ordinary callers need not thread one through, but
  * `uploadEpisode` below passes its own so a caller-supplied logger (tests, a scoped daemon logger)
  * sees the warning too.
+ *
+ * **Forward compatibility with a server that predates `intelligence` (RUN-249): verified, not
+ * built.** This module never downgrades or negotiates a version before sending — it always ships
+ * `intelligence` when this sitting has one, regardless of which server generation is on the other
+ * end. That is safe because `UPLOADED_EPISODE_SHAPE` (`apps/api/src/do/ProjectMemory.ts`) is a
+ * plain `z.object`, and zod's default behaviour is to STRIP unknown keys rather than reject the
+ * whole body — confirmed by running it, not assumed: a body carrying `intelligence` against a shape
+ * that does not declare that key parses successfully and the key is simply dropped, so the base
+ * episode records exactly as it always did on an old server. No version negotiation or downgrade
+ * path exists here, deliberately (RUN-249 locked decision): building one for a problem the protocol
+ * already handles would add a second delivery path to keep correct for no behavioural gain.
  */
 export function toEnrichmentPayload(
   episode: EffortEpisodeType,

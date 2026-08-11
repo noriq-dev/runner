@@ -583,11 +583,13 @@ export {
   DEFAULT_PENDING_EPISODE_PATH,
   DEFAULT_MAX_PENDING,
   DEFAULT_MAX_PENDING_AGE_HOURS,
+  DEFAULT_MAX_PENDING_BYTES,
   EpisodePendingStore,
   filePendingEpisodeStore,
   trimPending,
   type PendingEpisode,
   type PendingEpisodeFileStore,
+  type PendingEvictionReason,
 } from './episode-pending';
 export {
   deliverEpisode,
