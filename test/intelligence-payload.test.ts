@@ -1,9 +1,17 @@
 import type { EpisodeStageFact, IntelligenceDurationMs } from '@noriq-dev/shared';
-import { UploadedEpisodeIntelligence } from '@noriq-dev/shared';
+import {
+  DAEMON_PROVENANCE,
+  DAEMON_SOURCES,
+  UNATTRIBUTED_MODEL_ID,
+  UploadedEpisodeIntelligence,
+} from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { buildUploadedIntelligence } from '../src/intelligence-payload';
+import type { DriverTelemetry, ModelUsage } from '../src/drivers/types';
+import { zeroTelemetry } from '../src/drivers/types';
+import { buildObservedModelUsage, buildUploadedIntelligence } from '../src/intelligence-payload';
 import { stageFactFromTelemetry } from '../src/stage-facts';
 import { completeDuration, notApplicableDuration, unavailableDuration } from '../src/stage-timing';
+import { RunTally } from '../src/supervisor';
 
 // RUN-284: `buildUploadedIntelligence` is the one place `RunTally.stageFacts()` and
 // `RunTally.verifyDurations()` become the narrow wire payload — round-tripped here against the
@@ -12,6 +20,11 @@ import { completeDuration, notApplicableDuration, unavailableDuration } from '..
 // delivery" describe block covers the other half: that a real run's tally actually feeds this.
 
 const SOURCE = { source: 'runner' as const, sourceId: 'verify' };
+
+// `runTotal` is required on every call since RUN-248 (every real caller — `settle` — always has a
+// tally). Tests that are not exercising `observedModelUsage` itself pass this spend-less snapshot,
+// same as a fresh `RunTally` would report: `modelUsage` absent, everything else zero.
+const NO_SPEND: DriverTelemetry = zeroTelemetry();
 
 function stage(over: Partial<EpisodeStageFact> = {}): EpisodeStageFact {
   return stageFactFromTelemetry('primary', {
@@ -25,14 +38,21 @@ function stage(over: Partial<EpisodeStageFact> = {}): EpisodeStageFact {
   } as never);
 }
 
-describe('buildUploadedIntelligence — omission (RUN-284)', () => {
-  it('nothing observed at all → undefined, never an empty object', () => {
-    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [] });
-    expect(payload).toBeUndefined();
+describe('buildUploadedIntelligence — omission (RUN-284, revised RUN-248)', () => {
+  it('nothing observed but a spend-less runTotal → still DEFINED, carrying only observedModelUsage:unavailable', () => {
+    // Pre-RUN-248 this returned `undefined` (nothing at all to say). Since `observedModelUsage` is
+    // now unconditional — a run's spend is either known or it is not, and "not" is itself an answer
+    // — `execution` is never actually empty for a real caller. See this module's own doc.
+    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [], runTotal: NO_SPEND });
+    expect(payload).toBeDefined();
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'unavailable', value: null });
+    expect(payload?.execution).not.toHaveProperty('stages');
+    expect(payload?.execution).not.toHaveProperty('clocks');
+    expect(payload?.execution).not.toHaveProperty('changes');
   });
 
   it('stages observed, verify never reached → execution.stages present, no clocks key at all', () => {
-    const payload = buildUploadedIntelligence({ stages: [stage()], verifyDurations: [] });
+    const payload = buildUploadedIntelligence({ stages: [stage()], verifyDurations: [], runTotal: NO_SPEND });
     expect(payload?.execution?.stages).toHaveLength(1);
     expect(payload?.execution).not.toHaveProperty('clocks');
   });
@@ -41,24 +61,27 @@ describe('buildUploadedIntelligence — omission (RUN-284)', () => {
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [completeDuration(12, SOURCE)],
+      runTotal: NO_SPEND,
     });
     expect(payload?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete', value: 12 });
     expect(payload?.execution).not.toHaveProperty('stages');
   });
 
-  it('never sends preExecution or observedModelUsage — this task assembles neither', () => {
+  it('never sends preExecution — still true (RUN-284); observedModelUsage IS sent now (RUN-248)', () => {
     const payload = buildUploadedIntelligence({
       stages: [stage()],
       verifyDurations: [completeDuration(1, SOURCE)],
+      runTotal: NO_SPEND,
     });
     expect(payload).not.toHaveProperty('preExecution');
-    expect(payload?.execution).not.toHaveProperty('observedModelUsage');
+    expect(payload?.execution).toHaveProperty('observedModelUsage');
   });
 
   it('omits execution.changes when the caller supplies nothing (RUN-245) — the same omission rule as every other field', () => {
     const payload = buildUploadedIntelligence({
       stages: [stage()],
       verifyDurations: [completeDuration(1, SOURCE)],
+      runTotal: NO_SPEND,
     });
     expect(payload?.execution).not.toHaveProperty('changes');
   });
@@ -73,6 +96,7 @@ describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [],
+      runTotal: NO_SPEND,
       changes: {
         kind: 'measured',
         backend: 'git',
@@ -95,6 +119,7 @@ describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [],
+      runTotal: NO_SPEND,
       changes: {
         kind: 'measured',
         backend: 'perforce',
@@ -115,6 +140,7 @@ describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [],
+      runTotal: NO_SPEND,
       changes: {
         kind: 'not_applicable',
         backend: 'git',
@@ -134,6 +160,7 @@ describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [],
+      runTotal: NO_SPEND,
       changes: { kind: 'not_applicable', backend: null, reason: 'verify workflow' },
     });
     expect(payload).toBeDefined();
@@ -144,13 +171,13 @@ describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
 
 describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 locked decision)', () => {
   it('a run that never reached verify omits the clock entirely (undefined field, not zero)', () => {
-    const payload = buildUploadedIntelligence({ stages: [stage()], verifyDurations: [] });
+    const payload = buildUploadedIntelligence({ stages: [stage()], verifyDurations: [], runTotal: NO_SPEND });
     expect(payload?.execution?.clocks).toBeUndefined();
   });
 
   it('a repo with no [verify].cmd sends the single not_applicable envelope as-is', () => {
     const na = notApplicableDuration(SOURCE, 'no [verify].cmd configured for this repo');
-    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [na] });
+    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [na], runTotal: NO_SPEND });
     expect(payload?.execution?.clocks?.verifyDurationMs).toEqual(na);
   });
 
@@ -158,6 +185,7 @@ describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 
     const payload = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [completeDuration(10, SOURCE), completeDuration(25, SOURCE)],
+      runTotal: NO_SPEND,
     });
     expect(payload?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete', value: 35 });
   });
@@ -170,6 +198,7 @@ describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 
         unavailableDuration(SOURCE, 'the verify command errored before it settled'),
         completeDuration(15, SOURCE),
       ],
+      runTotal: NO_SPEND,
     });
     const d = payload?.execution?.clocks?.verifyDurationMs;
     expect(d).toMatchObject({ status: 'partial', value: 25 });
@@ -186,8 +215,11 @@ describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 
       [unavailableDuration(SOURCE, 'boundary lost')],
       [unavailableDuration(SOURCE, 'boundary lost'), unavailableDuration(SOURCE, 'and again')],
     ]) {
-      const d = buildUploadedIntelligence({ stages: [], verifyDurations: events })?.execution?.clocks
-        ?.verifyDurationMs;
+      const d = buildUploadedIntelligence({
+        stages: [],
+        verifyDurations: events,
+        runTotal: NO_SPEND,
+      })?.execution?.clocks?.verifyDurationMs;
       expect(d).toMatchObject({ status: 'unavailable', value: null });
       expect((d as { reason: string }).reason).toMatch(/none could be timed/);
     }
@@ -202,19 +234,22 @@ describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 
         unavailableDuration(SOURCE, 'boundary lost'),
         notApplicableDuration(SOURCE, 'no [verify].cmd configured for this repo'),
       ],
+      runTotal: NO_SPEND,
     })?.execution?.clocks?.verifyDurationMs;
     expect(d).toMatchObject({ status: 'not_applicable', value: null });
   });
 
   it('the three named statuses are pairwise distinct, not just differently worded', () => {
-    const omitted = buildUploadedIntelligence({ stages: [], verifyDurations: [] });
+    const omitted = buildUploadedIntelligence({ stages: [], verifyDurations: [], runTotal: NO_SPEND });
     const notApplicable = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [notApplicableDuration(SOURCE, 'no cmd')],
+      runTotal: NO_SPEND,
     });
     const complete = buildUploadedIntelligence({
       stages: [],
       verifyDurations: [completeDuration(5, SOURCE)],
+      runTotal: NO_SPEND,
     });
     expect(omitted?.execution?.clocks).toBeUndefined();
     expect(notApplicable?.execution?.clocks?.verifyDurationMs?.status).toBe('not_applicable');
@@ -223,38 +258,64 @@ describe('buildUploadedIntelligence — verifyDurationMs sum semantics (RUN-284 
 });
 
 describe('buildUploadedIntelligence — round-trips against the VENDORED schema (RUN-284)', () => {
-  it('a realistic assembled payload parses clean against UploadedEpisodeIntelligence', () => {
+  it('a realistic assembled payload — including a real model mix — parses clean against UploadedEpisodeIntelligence', () => {
+    const t = new RunTally();
+    t.record('primary', {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      costUsd: 0.1,
+      numTurns: 1,
+      modelUsage: {
+        'claude-opus-4-8': {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.1,
+        },
+      },
+    });
+    t.record('review:1', {
+      inputTokens: 30,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      costUsd: 0,
+      numTurns: 1,
+    }); // codex-shaped: tokens reported, cost never set — the PLNR-417 regression case
+    const { stages, total } = t.stageFacts();
     const payload = buildUploadedIntelligence({
-      stages: [
-        stage(),
-        stageFactFromTelemetry('review:1', {
-          inputTokens: 30,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-          costUsd: 0,
-          numTurns: 1,
-        } as never), // codex-shaped: tokens reported, cost never set — the PLNR-417 regression case
-      ],
+      stages,
       verifyDurations: [completeDuration(10, SOURCE), completeDuration(5, SOURCE)],
+      runTotal: total,
     });
     const parsed = UploadedEpisodeIntelligence.safeParse(payload);
-    expect(parsed.success).toBe(true);
+    expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
     if (parsed.success) expect(parsed.data).toEqual(payload);
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'complete' });
   });
 
-  it('an all-omitted payload (undefined) is not itself a thing to validate — the caller sends no field', () => {
-    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [] });
-    expect(payload).toBeUndefined();
-    // Still legal against the schema if a caller mistakenly parsed `{}` — every field is optional —
-    // but this module never produces that shape; the omission happens one level up.
+  it('a payload with a spend-less runTotal is DEFINED (not undefined) and still parses clean', () => {
+    // Pre-RUN-248 this scenario (no stages, no verify, no changes) produced `undefined` — the
+    // caller's cue to send no `intelligence` field at all. Since `observedModelUsage` is now always
+    // answered, that all-empty state is no longer reachable from a real `runTotal`.
+    const payload = buildUploadedIntelligence({ stages: [], verifyDurations: [], runTotal: NO_SPEND });
+    expect(payload).toBeDefined();
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'unavailable', value: null });
+    // `{}` is still legal against the schema (every field optional) — a caller mistakenly parsing it
+    // would not be rejected — but this module itself now never produces that particular empty shape.
     expect(UploadedEpisodeIntelligence.safeParse({}).success).toBe(true);
+    const parsed = UploadedEpisodeIntelligence.safeParse(payload);
+    expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
   });
 
   it('a mutated payload carrying a non-daemon provenance FAILS safeParse — the exact trap this contract exists to catch', () => {
     const payload = buildUploadedIntelligence({
       stages: [stage()],
       verifyDurations: [completeDuration(10, SOURCE)],
+      runTotal: NO_SPEND,
     });
     const mutated = structuredClone(payload) as {
       execution: { stages: Array<{ tokens: { provenance: string } }> };
@@ -264,6 +325,166 @@ describe('buildUploadedIntelligence — round-trips against the VENDORED schema 
     mutated.execution.stages[0]!.tokens.provenance = 'server_observed';
     const parsed = UploadedEpisodeIntelligence.safeParse(mutated);
     expect(parsed.success).toBe(false);
+  });
+});
+
+// RUN-248: `execution.observedModelUsage` — `RunTally.total()`'s (equivalently `stageFacts().total`'s)
+// own model mix, the run's AUTHORITATIVE figure. `test/daemon-provenance.test.ts` covers the ingest
+// floor for this builder too; this file covers the fold semantics `buildObservedModelUsage` itself
+// owns — complete/unavailable, never `{}`/a zeroed mix, and never `partial`.
+describe('buildUploadedIntelligence — execution.observedModelUsage (RUN-248)', () => {
+  const mix = (over: Partial<ModelUsage> = {}): ModelUsage => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    costUSD: 0,
+    ...over,
+  });
+  const tel = (over: Partial<DriverTelemetry> = {}): DriverTelemetry => ({ ...zeroTelemetry(), ...over });
+
+  describe('buildObservedModelUsage in isolation', () => {
+    it('no mix → unavailable, value null, never {} — provenance/source still daemon-legal', () => {
+      const m = buildObservedModelUsage(NO_SPEND);
+      expect(m).toMatchObject({
+        status: 'unavailable',
+        value: null,
+        provenance: 'driver_reported',
+        source: 'driver',
+      });
+      expect(m.reason).toBeTruthy();
+      expect(DAEMON_PROVENANCE.has(m.provenance)).toBe(true);
+      expect(DAEMON_SOURCES.has(m.source)).toBe(true);
+      expect(m.acceptedAt).toBeNull(); // the server's stamp (`acceptMetric`), never ours
+    });
+
+    it('a mix present → complete, carrying the mix verbatim, provenance driver_reported not derived', () => {
+      const total = tel({
+        inputTokens: 10,
+        modelUsage: { 'claude-opus-4-8': mix({ inputTokens: 10, costUSD: 0.2 }) },
+      });
+      const m = buildObservedModelUsage(total);
+      expect(m).toMatchObject({
+        status: 'complete',
+        value: { 'claude-opus-4-8': mix({ inputTokens: 10, costUSD: 0.2 }) },
+        provenance: 'driver_reported',
+        source: 'driver',
+      });
+      expect(m.reason).toBeNull();
+      expect(DAEMON_PROVENANCE.has(m.provenance)).toBe(true);
+      expect(DAEMON_SOURCES.has(m.source)).toBe(true);
+    });
+
+    it('an unattributed-only mix (a codex-only run, RUN-86) is still `complete`, never `partial` (discretion call)', () => {
+      // The mix is complete AS A TOTAL regardless of how it splits across models — the RUN-86
+      // `(unattributed)` bucket is part of the sum, not a hole in it. `RunModelMix`'s own doc states
+      // the invariant this leans on: "every value's four token classes + cost sum … to the run's
+      // displayed totals" — true here too. `'partial'` in this contract means a real but
+      // UNDERCOUNTED figure (`stage-timing.ts`'s `partialDuration`: "known to be an undercount") —
+      // this mix is never an undercount, only coarsely attributed. A metric envelope has no field
+      // for "the total is right but the split is not", so stretching `partial` to mean that would
+      // teach a consumer the status means two different things depending on context.
+      const total = tel({
+        inputTokens: 200,
+        modelUsage: { [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }) },
+      });
+      expect(buildObservedModelUsage(total).status).toBe('complete');
+    });
+
+    it('an attributed model alongside the unattributed bucket is ALSO `complete`, not `partial`', () => {
+      const total = tel({
+        inputTokens: 220,
+        modelUsage: {
+          'claude-sonnet-4-5': mix({ inputTokens: 20 }),
+          [UNATTRIBUTED_MODEL_ID]: mix({ inputTokens: 200 }),
+        },
+      });
+      expect(buildObservedModelUsage(total).status).toBe('complete');
+    });
+  });
+
+  it('asserted against a REAL RunTally, not a hand-built fixture', () => {
+    const t = new RunTally();
+    t.record(
+      'primary',
+      tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100, costUSD: 0.5 }) } }),
+    );
+    t.record(
+      'review:1',
+      tel({ inputTokens: 20, modelUsage: { sonnet: mix({ inputTokens: 20, costUSD: 0.1 }) } }),
+    );
+    const { stages, total } = t.stageFacts();
+    const payload = buildUploadedIntelligence({ stages, verifyDurations: [], runTotal: total });
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'complete' });
+    expect(payload?.execution?.observedModelUsage?.value).toEqual(total.modelUsage);
+    // The tally's OWN accessor agrees too — `total()` and `stageFacts().total` are the same addition.
+    expect(payload?.execution?.observedModelUsage?.value).toEqual(t.total().modelUsage);
+  });
+
+  it('a fresh tally with no recorded session sends unavailable — distinct from a run that reported a real mix', () => {
+    const t = new RunTally();
+    const { stages, total } = t.stageFacts();
+    const payload = buildUploadedIntelligence({ stages, verifyDurations: [], runTotal: total });
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'unavailable', value: null });
+  });
+
+  it("summing the stage facts' token values equals observedModelUsage's token total — every stage reported telemetry", () => {
+    const t = new RunTally();
+    t.record(
+      'primary',
+      tel({
+        inputTokens: 100,
+        outputTokens: 10,
+        modelUsage: { opus: mix({ inputTokens: 100, outputTokens: 10 }) },
+      }),
+    );
+    t.record('review:1', tel({ inputTokens: 20, modelUsage: { sonnet: mix({ inputTokens: 20 }) } }));
+    const { stages, total } = t.stageFacts();
+    const payload = buildUploadedIntelligence({ stages, verifyDurations: [], runTotal: total });
+
+    const stageTokenSum = stages.reduce(
+      (a, s) => a + (s.tokens.status === 'complete' ? s.tokens.value : 0),
+      0,
+    );
+    const mixValue = payload?.execution?.observedModelUsage?.value as Record<string, ModelUsage>;
+    const mixTokenTotal = Object.values(mixValue).reduce(
+      (a, u) => a + u.inputTokens + u.outputTokens + u.cacheReadInputTokens + u.cacheCreationInputTokens,
+      0,
+    );
+    expect(stageTokenSum).toBe(mixTokenTotal);
+    expect(stageTokenSum).toBe(130);
+  });
+
+  it('a telemetry-less stage contributes zero to BOTH views — the numbers agree, never diverge', () => {
+    // RUN-248's own audit acceptance criterion describes a run with one telemetry-less stage where
+    // "the summed stage values are LESS than observedModelUsage". That is not constructible: a
+    // stage's `tokens` metric is `unavailable` EXACTLY when `hasSpend` is false (`stage-facts.ts`),
+    // which is the SAME test `RunTally.foldSnapshot` uses to decide what a slot contributes to the
+    // run total — so an unavailable-tokens stage adds ZERO to `observedModelUsage` too, by the same
+    // structural guarantee `RunTally`'s own class doc gives the sibling claim ("stage facts sum to
+    // the run total … structural, not two additions asserted to agree"). A telemetry-less stage can
+    // never be the source of a strict numeric gap in this architecture. What it DOES demonstrate,
+    // and what this test asserts instead: a per-stage `unavailable` entry sits beside a run-level
+    // `observedModelUsage` that is still a confident, correct `complete` total — the stage's own
+    // evidence is missing; the run's is not.
+    const t = new RunTally();
+    t.record('primary', tel({ inputTokens: 100, modelUsage: { opus: mix({ inputTokens: 100 }) } }));
+    t.record('conflict', tel()); // a stopped session's zero-telemetry exit — no evidence at all
+    const { stages, total } = t.stageFacts();
+    const payload = buildUploadedIntelligence({ stages, verifyDurations: [], runTotal: total });
+
+    const conflictStage = stages.find((s) => s.stage === 'conflict');
+    expect(conflictStage?.tokens).toMatchObject({ status: 'unavailable', value: null });
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'complete' });
+
+    const stageTokenSum = stages.reduce(
+      (a, s) => a + (s.tokens.status === 'complete' ? s.tokens.value : 0),
+      0,
+    );
+    const mixValue = payload?.execution?.observedModelUsage?.value as Record<string, ModelUsage>;
+    const mixTokenTotal = Object.values(mixValue).reduce((a, u) => a + u.inputTokens, 0);
+    expect(stageTokenSum).toBe(mixTokenTotal); // equal, not "less" — see the comment above
+    expect(stageTokenSum).toBe(100);
   });
 });
 

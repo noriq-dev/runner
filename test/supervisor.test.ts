@@ -6795,6 +6795,51 @@ describe('the run model mix (RUN-59)', () => {
       expect(intelligence?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete' });
       expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
     });
+
+    // RUN-248: proves the WIRING for `execution.observedModelUsage` — that `settle`'s real call
+    // (`ctx.tally.stageFacts()`, destructured for BOTH `stages` and `total`) actually reaches
+    // `buildUploadedIntelligence`'s `runTotal`, through a real `supervise()` run rather than a
+    // hand-built tally. `test/intelligence-payload.test.ts` covers the fold logic itself.
+    it("a build's terminal mix reaches execution.observedModelUsage, equal to the reported terminal telemetry's own mix", async () => {
+      const h = harness({ manifest: manifest() });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done', {
+        inputTokens: 10,
+        outputTokens: 5,
+        costUsd: 0.1,
+        modelUsage: { 'claude-opus-4-8': mix({ inputTokens: 10, outputTokens: 5, costUSD: 0.1 }) },
+      });
+      const exit = await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.observedModelUsage).toMatchObject({
+        status: 'complete',
+        provenance: 'driver_reported',
+        source: 'driver',
+      });
+      expect(intelligence?.execution?.observedModelUsage?.value).toEqual(exit.telemetry.modelUsage);
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+    });
+
+    it('a run with no recorded spend sends observedModelUsage as unavailable, never {} or a zeroed mix', async () => {
+      const h = harness({ manifest: manifest({ verify: null }) });
+      const done = h.supervisor.supervise(makeRun()); // default kind: 'scope' — no driver spend stubbed
+      await flush();
+      // The harness's `complete()` defaults to 42 output tokens (RUN-59's own default fixture) — this
+      // test is about the genuinely spend-less case, so it overrides with a real zero telemetry.
+      h.claude.complete('done', { outputTokens: 0 });
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.observedModelUsage).toMatchObject({
+        status: 'unavailable',
+        value: null,
+      });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+    });
   });
 
   // RUN-245: proves the WIRING for `execution.changes`, `episode intelligence delivery`'s own

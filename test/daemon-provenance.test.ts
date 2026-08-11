@@ -37,6 +37,8 @@
 import { DAEMON_PROVENANCE, DAEMON_SOURCES } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { backendChangeStats } from '../src/change-stats';
+import { zeroTelemetry } from '../src/drivers/types';
+import { buildObservedModelUsage } from '../src/intelligence-payload';
 import { stageFactFromTelemetry } from '../src/stage-facts';
 import { completeDuration, notApplicableDuration, unavailableDuration } from '../src/stage-timing';
 
@@ -136,5 +138,28 @@ describe('every change-stats envelope is acceptable to the ingest (PLNR-417, RUN
     expectAcceptable(stats.additions);
     expectAcceptable(stats.deletions);
     expectAcceptable(stats.churn);
+  });
+});
+
+describe('the observedModelUsage envelope is acceptable to the ingest (RUN-248)', () => {
+  it('a run with no mix keeps the unavailable envelope uploadable', () => {
+    expectAcceptable(buildObservedModelUsage(zeroTelemetry()));
+  });
+
+  it('a run with a real per-model mix keeps the complete envelope uploadable', () => {
+    const total = {
+      ...zeroTelemetry(),
+      inputTokens: 10,
+      modelUsage: {
+        'claude-opus-4-8': {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.2,
+        },
+      },
+    };
+    expectAcceptable(buildObservedModelUsage(total));
   });
 });

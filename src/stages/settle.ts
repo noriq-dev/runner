@@ -295,10 +295,15 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     // KEPT since this task). Wrapped in the SAME try as `buildEpisode` above: a throw here must
     // cost only the intelligence half of this sitting's episode, never the run's own outcome,
     // exactly like the episode assembly it rides alongside.
+    // `stages` and the run-wide `total` come off ONE call (RUN-248) — the same addition
+    // (`RunTally.stageFacts()`'s own doc: "structural, not asserted to agree"), so `observedModelUsage`
+    // and the per-stage breakdown can never read two different tallies of the same run.
+    const { stages, total: runTotal } = ctx.tally.stageFacts();
     const intelligence = buildUploadedIntelligence({
-      stages: ctx.tally.stageFacts().stages,
+      stages,
       verifyDurations: ctx.tally.verifyDurations(),
       changes,
+      runTotal,
     });
     host.recordEpisode?.(episode, intelligence);
   } catch (err) {

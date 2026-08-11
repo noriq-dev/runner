@@ -130,6 +130,31 @@ const COST_NOT_REPORTED =
   'the driver reported tokens but no cost for this session — booking $0 would assert it was free';
 
 /**
+ * `costReported` (below) is an INFERENCE, not a read of a capability flag: it must agree with each
+ * driver's declared `DriverCapabilities.perModelTelemetry` (`drivers/types.ts`) — a driver that
+ * declares per-model telemetry but sometimes ships tokens with neither `modelUsage` nor a positive
+ * `costUsd` would silently mis-book a real cost as `unavailable`, and the reverse (declaring it false
+ * while still setting `costUsd`) would silently claim more than the driver promises.
+ * `test/driver-asymmetry.test.ts` (RUN-248) is what holds this equivalence for both shipped drivers —
+ * a future third driver whose declaration and telemetry disagree fails THERE rather than reporting a
+ * wrong status here with nothing to catch it. Threading a capability through `RunTally.record`'s
+ * seven call sites was considered and rejected (RUN-248 locked decision): the inference is correct
+ * for both shipped drivers today, so that would be churn ahead of a need.
+ *
+ * One narrow, PRE-EXISTING gap the conformance test also pins rather than silently trusting: Claude's
+ * own `telemetryFromResult` (`drivers/claude.ts`) has a fallback arm for a result with no `modelUsage`
+ * at all (an older SDK, or a result shape not yet seen) that still reports `costUsd: total_cost_usd`
+ * verbatim. If that fallback ever fired for a session that genuinely cost exactly $0 — real tokens,
+ * a real reported cost of zero — `costReported` reads `false` (no `modelUsage`, `costUsd` not `> 0`)
+ * and this function reports `unavailable`, the same as it would for Codex, even though Claude DID
+ * report a cost. This is the one case RUN-248's audit flagged as "does not arise" and found does, in
+ * this one fallback arm; it is not fixed here (the fallback is a defensive compatibility path the
+ * current SDK does not take, per `telemetryFromResult`'s own comment, so there is nothing live to
+ * repair), only named so a future SDK change that starts taking it does not resurrect a silently
+ * wrong status.
+ */
+
+/**
  * One slot's `DriverTelemetry`, read as an `EpisodeStageFact`.
  *
  * `elapsedMs` is always `unavailable`: `RunTally` charges active seconds to the RUN
