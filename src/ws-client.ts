@@ -1,4 +1,9 @@
-import { RUNNER_PROTOCOL_VERSION, RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
+import {
+  RUNNER_PROTOCOL_CAPABILITIES,
+  RUNNER_PROTOCOL_VERSION,
+  RunnerClientMessage,
+  RunnerServerMessage,
+} from '@noriq-dev/shared';
 import type {
   AgentTool,
   ExecutedConfigurationEvidence,
@@ -48,7 +53,7 @@ export interface SteerMsg {
 }
 
 export interface WsHandlers {
-  onRegistered?: (msg: { runnerId: string; protocol: number }) => void;
+  onRegistered?: (msg: { runnerId: string; protocol: number; acceptedCapabilities: string[] }) => void;
   onAssigned?: (run: Run) => void;
   onCancel?: (msg: { runId: string; hard: boolean; reason: string | null }) => void;
   /** A human's steer to inject into the running process (RUN-16). */
@@ -340,6 +345,7 @@ export class WsClient {
     this.sendRaw({
       type: 'hello',
       protocol: RUNNER_PROTOCOL_VERSION,
+      protocolCapabilities: RUNNER_PROTOCOL_CAPABILITIES,
       runnerId: this.opts.runnerId,
       label: this.opts.identity.label,
       tools: this.opts.identity.tools,
@@ -382,7 +388,11 @@ export class WsClient {
     const msg = parsed.data;
     switch (msg.type) {
       case 'registered':
-        this.opts.handlers?.onRegistered?.({ runnerId: msg.runnerId, protocol: msg.protocol });
+        this.opts.handlers?.onRegistered?.({
+          runnerId: msg.runnerId,
+          protocol: msg.protocol,
+          acceptedCapabilities: msg.acceptedCapabilities,
+        });
         return;
       case 'run.assigned':
         this.opts.handlers?.onAssigned?.(msg.run);

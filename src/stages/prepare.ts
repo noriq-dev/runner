@@ -50,6 +50,7 @@ import {
 } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
+import { type RunLineage, resolveRunLineage } from '../execution-lineage';
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
@@ -143,12 +144,16 @@ export interface PrepareHost {
     budget?: number;
   };
   readonly continuable?: Pick<ContinuableStore, 'get'>;
+  /** RUN-265's live execution binding floor, owned by the supervisor rather than module state. */
+  readonly executionRegistry?: Map<string, string>;
 }
 
 /** Everything `execute` needs, or the reason this dispatch was refused. */
 export type PrepareOutcome = { ok: false; reason: string } | ({ ok: true } & PreparedRun);
 
 export interface PreparedRun {
+  /** The validated assignment, or an explicit root for a legacy dispatch. */
+  lineage: RunLineage;
   /**
    * The anchor task, iff it is worth PLANNING (RUN-140): present, and carrying neither a spec nor
    * the server's flag that it has one nobody can read. Null otherwise, which is the `plan` stage's
@@ -354,6 +359,20 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const tool = execCoord?.tool ?? resolveAgentTool(run);
   const driver = host.driverFor(tool as AgentTool);
   if (!driver) return refuse(`no driver for tool ${tool}`);
+
+  // The frame schema rejects malformed assignments before this point. These are the remaining
+  // local facts: a node cannot parent itself, and one live execution cannot belong to two Runs.
+  const lineage = resolveRunLineage(run, host.executionRegistry ?? new Map<string, string>());
+  if (!lineage.ok) {
+    host.log.warn('execution lineage is invalid — declining to spawn', {
+      runId: run.id,
+      reason: lineage.reason,
+    });
+    return refuse(`${lineage.reason}; not spawning`);
+  }
+  if (lineage.lineage.type === 'assigned') {
+    host.executionRegistry?.set(lineage.lineage.assignment.executionId, run.id);
+  }
 
   // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
   // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
@@ -778,6 +797,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
 
   return {
     ok: true,
+    lineage: lineage.lineage,
     // The `plan` stage (RUN-140) needs two things this scope already has: the planner's own brief,
     // and the ability to rebuild the RUN's brief once a spec exists. Both are handed over rather
     // than recomputed, so a planned run's prompt is built from the same facts an unplanned one's is.

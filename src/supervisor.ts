@@ -1345,6 +1345,8 @@ export class RunSupervisor {
    *  stream — the server dedups on (runId, seq), and a restarted seq would collide with
    *  rows already written and be silently dropped. */
   private readonly transcripts = new Map<string, RunTranscript>();
+  /** RUN-265: held per supervisor so a terminal Run never poisons a later retry. */
+  private readonly executionRuns = new Map<string, string>();
 
   private transcript(runId: string): RunTranscript {
     let t = this.transcripts.get(runId);
@@ -3758,6 +3760,17 @@ export class RunSupervisor {
    * and awaited the agent are `stages/execute.ts` — which `resume` now shares rather than repeats.
    */
   async supervise(run: Run): Promise<DriverExit> {
+    try {
+      return await this.superviseRun(run);
+    } finally {
+      const executionId = run.execution?.executionId;
+      if (executionId && this.executionRuns.get(executionId) === run.id) {
+        this.executionRuns.delete(executionId);
+      }
+    }
+  }
+
+  private async superviseRun(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
@@ -4516,6 +4529,7 @@ export class RunSupervisor {
         ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
       },
       ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+      executionRegistry: this.executionRuns,
     };
   }
 

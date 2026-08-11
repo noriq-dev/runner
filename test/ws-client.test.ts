@@ -1,4 +1,4 @@
-import { RunnerClientMessage } from '@noriq-dev/shared';
+import { RUNNER_PROTOCOL_CAPABILITIES, RunnerClientMessage } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   WsClient,
@@ -120,6 +120,8 @@ describe('WsClient', () => {
     expect(hello.type).toBe('hello');
     expect(hello.runnerId).toBe('rnr_1');
     expect(hello.label).toBe('laptop');
+    expect(hello.protocolCapabilities).toEqual(RUNNER_PROTOCOL_CAPABILITIES);
+    expect(RunnerClientMessage.safeParse(hello).success).toBe(true);
     client.stop();
   });
 
@@ -311,11 +313,16 @@ describe('WsClient', () => {
         runnerId: 'rnr_1',
         protocol: 1,
         serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: ['orchestration.v1'],
       }),
     );
     s.emit('message', JSON.stringify({ type: 'run.assigned', run: RUN }));
     s.emit('message', JSON.stringify({ type: 'run.cancel', runId: 'run_1', hard: true, reason: 'stop' }));
-    expect(onRegistered).toHaveBeenCalledWith({ runnerId: 'rnr_1', protocol: 1 });
+    expect(onRegistered).toHaveBeenCalledWith({
+      runnerId: 'rnr_1',
+      protocol: 1,
+      acceptedCapabilities: ['orchestration.v1'],
+    });
     expect(onAssigned).toHaveBeenCalledWith(expect.objectContaining({ id: 'run_1', kind: 'build' }));
     expect(onCancel).toHaveBeenCalledWith({ runId: 'run_1', hard: true, reason: 'stop' });
     client.stop();

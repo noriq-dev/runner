@@ -1092,7 +1092,7 @@ export class Daemon {
       // limit exists to make room for.
       freeSlots: () => capacity.freeSlots(),
       handlers: {
-        onRegistered: (m) => this.log.debug('ws registered', m),
+        onRegistered: (m) => this.log.info('ws registered', m),
         onAssigned: (run) => {
           // The seat is claimed SYNCHRONOUSLY — the ledger and the heartbeat see this run before
           // anything yields — but supervision waits for ADMISSION (RUN-170): the advertisement

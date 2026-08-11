@@ -438,6 +438,12 @@ export {
   type WsSocket,
 } from './ws-client';
 export { Daemon, type DaemonHandle } from './daemon';
+export {
+  resolveRunLineage,
+  type ExecutionRunRegistry,
+  type RunLineage,
+  type RunLineageResolution,
+} from './execution-lineage';
 export { sanitizedAgentEnv } from './security';
 export { type ProcDeps, killProcessTree, treeSpawnOptions } from './proc';
 export {
