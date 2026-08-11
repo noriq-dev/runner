@@ -310,16 +310,22 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     let intelligence: ReturnType<typeof buildUploadedIntelligence> | undefined;
     try {
       const { stages, total: runTotal } = ctx.tally.stageFacts();
-      intelligence = buildUploadedIntelligence({
-        stages,
-        verifyDurations: ctx.tally.verifyDurations(),
-        changes,
-        runTotal,
-        // RUN-247: captured at the render point (`stages/brief.ts`), carried onto the pipeline
-        // unchanged — absent whenever this sitting made no assertion (`RunPipeline.contextConsumption`
-        // 's own doc), in which case the metric is simply omitted from the upload.
-        ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
-      });
+      intelligence = buildUploadedIntelligence(
+        {
+          stages,
+          verifyDurations: ctx.tally.verifyDurations(),
+          changes,
+          runTotal,
+          // RUN-247: captured at the render point (`stages/brief.ts`), carried onto the pipeline
+          // unchanged — absent whenever this sitting made no assertion (`RunPipeline.contextConsumption`
+          // 's own doc), in which case the metric is simply omitted from the upload.
+          ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
+        },
+        // RUN-287: the run's own logger, so a metric that degraded says so in THIS run's log rather
+        // than the module default's. The warn is the only surface a degradation has — the wire
+        // carries the `unavailable` envelope, but only the log names which field and why.
+        host.log,
+      );
     } catch (err) {
       host.log.warn('episode intelligence assembly failed — delivering the episode without it', {
         runId: run.id,

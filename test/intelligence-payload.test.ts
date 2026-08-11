@@ -488,6 +488,182 @@ describe('buildUploadedIntelligence — execution.observedModelUsage (RUN-248)',
   });
 });
 
+/**
+ * RUN-287: one bad metric must not erase every good one.
+ *
+ * The live failure this closes (RUN-286): a single fractional millisecond in `contextConsumption`
+ * failed the whole-payload `safeParse` in `toEnrichmentPayload`, which drops the ENTIRE
+ * `intelligence` field — so stages, verify clocks, change stats and the model mix were lost to it,
+ * on every episode, for the whole of RUN-247's life.
+ *
+ * Every test here drives the value from the shape a REAL producer emits rather than a hand-written
+ * fixture, because fixtures are exactly why the class survived: every round-trip test in this file
+ * built its snapshot from hand-typed integers, so all of them passed while nothing validated in
+ * production.
+ */
+describe('buildUploadedIntelligence — one bad metric never erases the rest (RUN-287)', () => {
+  const quiet = { warn: () => {} };
+  const mix = (over: Partial<ModelUsage> = {}): ModelUsage => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    costUSD: 0,
+    ...over,
+  });
+
+  /** A context metric shaped exactly like `buildContextConsumption`'s output, with one field
+   *  overridable — the only way to reach the fields it computes for itself. */
+  const contextMetric = (over: Record<string, unknown> = {}) =>
+    ({
+      status: 'complete',
+      provenance: 'runner_observed',
+      source: 'runner',
+      sourceId: null,
+      observedAt: new Date().toISOString(),
+      acceptedAt: null,
+      reason: null,
+      value: {
+        mode: 'semantic',
+        role: 'build',
+        charBudget: 40_000,
+        charsUsed: 12_000,
+        sections: [],
+        similarEpisodesConsidered: 2,
+        staleCitationsCount: 0,
+        noticesCount: 0,
+        retrievalTookMs: 143,
+        ...over,
+      },
+    }) as never;
+
+  it('a fractional token count from a driver degrades the MIX alone — every sibling still ships', () => {
+    // The real asymmetry this probe exists for: `stage-facts.ts` guards these driver numbers per
+    // component (RUN-251), and `RunTally`'s fold sums the SAME numbers into the run mix with no
+    // guard at all. So the fractional value reaches `observedModelUsage` through a real tally.
+    const t = new RunTally();
+    t.record('primary', {
+      ...zeroTelemetry(),
+      inputTokens: 100.5,
+      modelUsage: { opus: mix({ inputTokens: 100.5, costUSD: 0.5 }) },
+    });
+    const { stages, total } = t.stageFacts();
+    const payload = buildUploadedIntelligence(
+      {
+        stages,
+        verifyDurations: [completeDuration(1200, SOURCE)],
+        runTotal: total,
+        changes: { kind: 'not_applicable', backend: 'git', reason: 'the verify workflow changes nothing' },
+        contextConsumption: contextMetric(),
+      },
+      quiet,
+    );
+
+    // The offending metric withdrew its claim, and said why.
+    expect(payload?.execution?.observedModelUsage).toMatchObject({ status: 'unavailable', value: null });
+    expect(payload?.execution?.observedModelUsage?.reason).toContain('wire contract refuses');
+    // Every sibling survived it — the whole point.
+    expect(payload?.execution?.stages?.length).toBe(1);
+    expect(payload?.execution?.clocks?.verifyDurationMs?.status).toBe('complete');
+    expect(payload?.execution?.changes).toBeDefined();
+    expect(payload?.contextConsumption?.status).toBe('complete');
+    // And the payload the outer floor sees is clean, so `toEnrichmentPayload` never drops it.
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+
+  it('the RUN-286 value itself — a performance.now() delta — degrades context alone, keeping WHO measured', () => {
+    const observed = contextMetric({ retrievalTookMs: 143.28571 });
+    const payload = buildUploadedIntelligence(
+      {
+        stages: [stage()],
+        verifyDurations: [completeDuration(900, SOURCE)],
+        runTotal: NO_SPEND,
+        contextConsumption: observed,
+      },
+      quiet,
+    );
+
+    expect(payload?.contextConsumption).toMatchObject({ status: 'unavailable', value: null });
+    expect(payload?.contextConsumption?.reason).toContain('retrievalTookMs');
+    // Provenance describes who MEASURED, which is unchanged by the value being unusable.
+    expect(payload?.contextConsumption?.provenance).toBe('runner_observed');
+    expect(payload?.contextConsumption?.source).toBe('runner');
+    expect(payload?.execution?.stages?.length).toBe(1);
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+
+  it('a server-supplied charBudget of 0 degrades context alone — the field this daemon cannot vouch for', () => {
+    // Not reachable today (`client.ts` safeParses `ContextPack`, whose charBudget carries the same
+    // `int().positive()`), and asserted anyway: the guarantee lives in another module, and this is
+    // what happens the day it moves.
+    const payload = buildUploadedIntelligence(
+      {
+        stages: [stage()],
+        verifyDurations: [],
+        runTotal: NO_SPEND,
+        contextConsumption: contextMetric({ charBudget: 0 }),
+      },
+      quiet,
+    );
+    expect(payload?.contextConsumption?.status).toBe('unavailable');
+    expect(payload?.execution?.stages?.length).toBe(1);
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+
+  it('one unusable stage fact drops alone, and the warn names the slot it lost', () => {
+    const warnings: unknown[][] = [];
+    const bad = { ...stage(), stage: 'review:1', kind: 'nonsense-kind' } as never as EpisodeStageFact;
+    const payload = buildUploadedIntelligence(
+      { stages: [stage(), bad], verifyDurations: [], runTotal: NO_SPEND },
+      { warn: (...args: unknown[]) => warnings.push(args) },
+    );
+    expect(payload?.execution?.stages?.length).toBe(1);
+    expect(payload?.execution?.stages?.[0]?.stage).toBe('primary');
+    expect(JSON.stringify(warnings)).toContain('review:1');
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+
+  it('a metric whose ENVELOPE is the fault is omitted, never shipped as an invalid degradation', () => {
+    // `server_observed` is a real `MetricProvenance` the daemon may not assert (`daemonMetric`'s own
+    // refinement). Flipping `status` cannot fix that, so there is nothing honest to degrade to —
+    // and omitting preserves whatever the server already holds for this run.
+    const payload = buildUploadedIntelligence(
+      {
+        stages: [stage()],
+        verifyDurations: [],
+        runTotal: NO_SPEND,
+        contextConsumption: { ...(contextMetric() as object), provenance: 'server_observed' } as never,
+      },
+      quiet,
+    );
+    expect(payload?.contextConsumption).toBeUndefined();
+    expect(payload?.execution?.stages?.length).toBe(1);
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+
+  it('a clean run is untouched: no degradation, no omission, byte-identical to what it always sent', () => {
+    const t = new RunTally();
+    t.record('primary', {
+      ...zeroTelemetry(),
+      inputTokens: 100,
+      modelUsage: { opus: mix({ inputTokens: 100, costUSD: 0.5 }) },
+    });
+    const { stages, total } = t.stageFacts();
+    const input = {
+      stages,
+      verifyDurations: [completeDuration(1200, SOURCE)],
+      runTotal: total,
+      contextConsumption: contextMetric(),
+    };
+    const payload = buildUploadedIntelligence(input, quiet);
+    expect(payload?.execution?.observedModelUsage?.status).toBe('complete');
+    expect(payload?.execution?.observedModelUsage?.value).toEqual(total.modelUsage);
+    expect(payload?.contextConsumption?.status).toBe('complete');
+    expect(payload?.execution?.clocks?.verifyDurationMs?.status).toBe('complete');
+    expect(UploadedEpisodeIntelligence.safeParse(payload).success).toBe(true);
+  });
+});
+
 // A type-level sanity check that `IntelligenceDurationMs` is actually the envelope shape these
 // tests assume — if the vendor ever changes the discriminant, this file should fail to compile
 // before it fails at runtime.

@@ -60,12 +60,28 @@
  * module assembles is omitted when the caller has nothing to report, and `settle` is the only caller
  * that exists — it always supplies one of the two arms.
  *
- * Validation is NOT this module's job — `episode-upload.ts`'s `toEnrichmentPayload` is the one place
- * that `safeParse`s the assembled payload, immediately before it leaves the box, on every send
- * including every retry. This module only decides what the payload SAYS; that module decides whether
- * it may be SENT.
+ * **Per-metric validation lives here; whole-payload validation still does not** (RUN-287). This block
+ * used to say "validation is NOT this module's job" full stop, and pointed at
+ * `episode-upload.ts`'s `toEnrichmentPayload` as the one place anything is checked. That division was
+ * wrong in a way RUN-286 measured on a live run: `toEnrichmentPayload`'s check is whole-payload and
+ * all-or-nothing, so ONE out-of-domain number failed the parse and dropped the ENTIRE `intelligence`
+ * field — stages, verify clocks, change stats and context consumption together. Every episode this
+ * daemon shipped between RUN-247 and RUN-286 carried zero analytics because of one fractional
+ * millisecond.
+ *
+ * The line that actually holds is between ASSERTING and SENDING. A metric this module can see will
+ * not survive the wire contract is not a metric this daemon can assert, so declining to assert it —
+ * degrading it to `unavailable`, or omitting it — is an assembly decision and belongs here. Whether
+ * the assembled payload may LEAVE THE BOX is still `toEnrichmentPayload`'s call, and its
+ * all-or-nothing `safeParse` stays exactly as it is: the outer floor that catches anything this
+ * module's per-field probes did not, on every send including every retry.
+ *
+ * The two guards compose in the direction that matters. With per-field degradation in front of it,
+ * the outer parse should never fail; if it ever does, the episode still ships (RUN-251) and the log
+ * names the path (RUN-284) — the same evidence trail that made RUN-286 diagnosable in one reading.
  */
 
+import { UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import type {
   EpisodeStageFact,
   IntelligenceContextConsumptionMetric,
@@ -74,6 +90,7 @@ import type {
 } from '@noriq-dev/shared';
 import { backendChangeStats, notApplicableChangeStats } from './change-stats';
 import type { DriverTelemetry } from './drivers/types';
+import { logger as defaultLogger } from './logger';
 import { type DurationSource, completeDuration, partialDuration, unavailableDuration } from './stage-timing';
 import type { ChangeStatsResult } from './vcs/types';
 
@@ -240,6 +257,128 @@ export function buildObservedModelUsage(total: DriverTelemetry): ObservedModelUs
   };
 }
 
+// ---------------------------------------------------------------------------
+// RUN-287: per-field validation, so one bad number stops erasing every good one.
+// ---------------------------------------------------------------------------
+
+/**
+ * Does a payload carrying ONE candidate field survive the vendored contract? Returns null when it
+ * does, else `path: message` from zod's first issue.
+ *
+ * Probing a single-field payload against the EXPORTED top-level schema, rather than plucking the
+ * per-field sub-schemas, is deliberate. `UploadedEpisodeStageFact` and `UploadedBackendChangeStats`
+ * are module-private in the vendored contract (`const`, not `export const`), so reaching them means
+ * either unwrapping `.shape.execution` through its `.optional()` — a shape-walk that breaks silently
+ * the next time planar nests a field one level deeper — or asking planar to widen its exports for our
+ * convenience. A single-field probe needs neither: it validates against the same symbol
+ * `toEnrichmentPayload` validates against, so the two can never disagree about what is sendable, and
+ * it keeps working through any restructuring the contract does internally.
+ *
+ * The fault string carries zod's path and message and NOTHING from the value — the path may name a
+ * model id or a metric field, both daemon/driver bookkeeping, and no field in this payload holds
+ * pack content, source, or a credential (see `context-consumption.ts`'s counts-enums-booleans-only
+ * rule, which is structural on the contract side).
+ */
+function faultIn(candidate: UploadedEpisodeIntelligenceType): string | null {
+  const parsed = UploadedEpisodeIntelligence.safeParse(candidate);
+  if (parsed.success) return null;
+  const issue = parsed.error.issues[0];
+  const at = issue ? issue.path.join('.') || '(root)' : '(unknown)';
+  return `${at}: ${issue?.message ?? 'failed the vendored wire contract'}`;
+}
+
+/**
+ * Keep a metric, degrade it, or drop it — in that order of preference, which is the order of harms
+ * this metric family prices everywhere (`stage-facts.ts`'s own may-miss-never-invent note).
+ *
+ * A degraded envelope is re-probed before it is trusted: if the ORIGINAL fault was in the envelope
+ * itself rather than its value — a provenance this daemon should never have produced, say — then
+ * flipping `status` to `unavailable` does not fix it, and quietly returning the still-invalid
+ * envelope would hand the outer parse the same failure the degradation existed to prevent. When even
+ * the fallback will not validate, the field is omitted, which the enrichment merge reads as "this
+ * sitting has nothing to say" and therefore PRESERVES whatever the server already holds
+ * (`toEnrichmentPayload`'s own `provided ?? existing` note) — never worse than not having assembled it.
+ *
+ * `degrade: null` is for the fields with no envelope to flip (`changes`, whose four metrics are
+ * separately owned by `change-stats.ts`, and `stages`, handled per element by its caller): minting a
+ * replacement here would put provenance authorship in the module that explicitly does not own it.
+ */
+function assertable<T>(
+  value: T,
+  wrap: (v: T) => UploadedEpisodeIntelligenceType,
+  degrade: ((fault: string) => T) | null,
+  field: string,
+  log: Pick<typeof defaultLogger, 'warn'>,
+): T | undefined {
+  const fault = faultIn(wrap(value));
+  if (!fault) return value;
+  if (degrade) {
+    const fallback = degrade(fault);
+    if (!faultIn(wrap(fallback))) {
+      log.warn('an intelligence metric failed the wire contract — degraded to unavailable', { field, fault });
+      return fallback;
+    }
+  }
+  log.warn('an intelligence metric failed the wire contract — omitted', { field, fault });
+  return undefined;
+}
+
+const CONTRACT_FAULT = (fault: string): string =>
+  `this daemon assembled a value the wire contract refuses (${fault}), so it asserts nothing here rather than a repaired number`;
+
+/**
+ * **The audit this task owes its successor (RUN-287): every value in this payload, what produces it,
+ * and why it can or cannot leave its domain.** Recorded here rather than in a ticket because the
+ * question a future reader asks is "is this field safe", and a closed list is the only answer that
+ * saves them re-deriving it — or, as nearly happened while writing this, adding a guard for a case
+ * that cannot occur.
+ *
+ * **The criterion that actually predicts risk is not "is the field `int`-refined".** It is *does this
+ * daemon compute the value itself, downstream of the last parse boundary*. Everything upstream of a
+ * `safeParse` is already in domain by the time this module sees it; everything the daemon computes
+ * after one is only as good as its own arithmetic. `retrievalTookMs` (RUN-286) was the whole class:
+ * a `performance.now()` delta, computed here, fractional by construction, against `int()`.
+ *
+ * Safe because something PARSES them upstream:
+ *   - `contextConsumption.value.charBudget` / `.charsUsed` — server-supplied, and `ContextPack` carries
+ *     the IDENTICAL `int().positive()` / `int().nonnegative()` refinements
+ *     (`vendor/noriq-shared/src/memory.ts`). `client.ts`'s `getContextPack` `safeParse`s the response
+ *     and returns null on failure, which `context-consumption.ts` reads as `unavailable`. A server
+ *     sending `charBudget: 0` never reaches this module at all.
+ *
+ * Safe because a loop invariant makes them structural:
+ *   - `contextConsumption.value.staleCitationsCount` — `verification.total - verification.byState.valid`
+ *     looks like a subtraction that could go negative, and cannot:
+ *     `summarizeCitationVerification` increments `total` and exactly one `byState[state]` per citation
+ *     over a closed enum, so `byState.valid <= total` holds by construction.
+ *   - `sections[].excerptCount` / `.graphEntityCount`, `similarEpisodesConsidered`, `noticesCount` —
+ *     array lengths.
+ *   - `mode` / `role` — pack enums, parsed upstream.
+ *
+ * Safe because a domain guard already stands over them:
+ *   - `execution.stages[].tokens` / `.costUSD` — driver-reported, guarded per COMPONENT by
+ *     `stage-facts.ts` (`uploadableInt` / `uploadableNumber`, RUN-251), which degrades the one metric.
+ *   - `execution.changes.*` — backend-reported, guarded field-by-field by `change-stats.ts`
+ *     (`uploadable`, RUN-244/245), churn included.
+ *   - `execution.stages[].elapsedMs` — always `unavailable` by construction (no per-slot clock exists).
+ *
+ * Safe only because of the probe above — the asymmetry worth knowing about:
+ *   - `execution.observedModelUsage.value` — `RunTally`'s folded `RunModelMix`, whose four token
+ *     classes are `int().nonnegative()` and whose cost is `nonnegative()`. The SAME driver numbers
+ *     `stage-facts.ts` guards per component are summed into this mix by `foldSnapshot` /
+ *     `mergeModelUsage` / `addUnattributed` with no guard at all, and `buildObservedModelUsage` passes
+ *     the result straight through. So a driver reporting a fractional or NaN token count is a metric
+ *     failure here and was, before this probe, a total analytics loss — with the tell being that one
+ *     reading of one number is guarded and the other is not. `stage-facts.ts`'s own doc explains why
+ *     this is not hypothetical: that vendor's notification shape has already changed twice inside this
+ *     repo's lifetime. Degraded whole rather than per model, deliberately: `RunModelUsage`'s documented
+ *     contract is that every key's tokens and cost SUM to the run's displayed totals, so dropping one
+ *     model's entry would leave a mix that silently breaks its own invariant.
+ *   - `execution.clocks.verifyDurationMs` — a daemon-computed sum of `performance.now()` deltas, and
+ *     the near-miss of the class: it survives only because `IntelligenceDurationMs` is
+ *     `finite().nonnegative()` rather than `int()`, so fractional milliseconds are legal by design
+ *     where the identical arithmetic one field over was fatal.
+ */
 /**
  * Assemble this sitting's narrow `UploadedEpisodeIntelligence`.
  *
@@ -252,23 +391,108 @@ export function buildObservedModelUsage(total: DriverTelemetry): ObservedModelUs
  */
 export function buildUploadedIntelligence(
   input: BuildUploadedIntelligenceInput,
+  log: Pick<typeof defaultLogger, 'warn'> = defaultLogger,
 ): UploadedEpisodeIntelligenceType | undefined {
   const execution: NonNullable<UploadedEpisodeIntelligenceType['execution']> = {};
-  if (input.stages.length > 0) execution.stages = input.stages;
-  const verifyDurationMs = foldVerifyDurations(input.verifyDurations);
-  if (verifyDurationMs) execution.clocks = { verifyDurationMs };
+
+  // Per ELEMENT, not per array (RUN-287): a stage fact is one slot's accounting, and losing five
+  // sound stages to a sixth bad one is the very defect this probe exists to stop, one grain down.
+  // The cost is real and bounded — `execution.stages` is replaced wholesale server-side, so a dropped
+  // row makes the breakdown stop summing to `observedModelUsage`, which is why the warn names the
+  // slots rather than only counting them. Structurally near-unreachable in the first place:
+  // `stage-facts.ts` already guards every metric each row carries.
+  if (input.stages.length > 0) {
+    const dropped: string[] = [];
+    const kept = input.stages.filter((stage) => {
+      const fault = faultIn({ execution: { stages: [stage] } });
+      if (fault) dropped.push(`${stage.stage} (${fault})`);
+      return !fault;
+    });
+    if (dropped.length > 0) {
+      log.warn('stage facts failed the wire contract — dropped, the rest still reported', {
+        dropped,
+        kept: kept.length,
+      });
+    }
+    if (kept.length > 0) execution.stages = kept;
+  }
+
+  const folded = foldVerifyDurations(input.verifyDurations);
+  if (folded) {
+    const verifyDurationMs = assertable(
+      folded,
+      (v) => ({ execution: { clocks: { verifyDurationMs: v } } }),
+      (fault) =>
+        unavailableDuration({ source: folded.source, sourceId: folded.sourceId }, CONTRACT_FAULT(fault)),
+      'execution.clocks.verifyDurationMs',
+      log,
+    );
+    if (verifyDurationMs) execution.clocks = { verifyDurationMs };
+  }
+
   if (input.changes) {
-    execution.changes =
+    const measured =
       input.changes.kind === 'measured'
         ? backendChangeStats(input.changes.backend, input.changes.result)
         : notApplicableChangeStats(input.changes.backend, input.changes.reason);
+    // No degrade arm: the four metrics inside are `change-stats.ts`'s to author, provenance included,
+    // and minting a replacement here would move that ownership (see `assertable`'s own doc).
+    const changes = assertable(
+      measured,
+      (v) => ({ execution: { changes: v } }),
+      null,
+      'execution.changes',
+      log,
+    );
+    if (changes) execution.changes = changes;
   }
-  execution.observedModelUsage = buildObservedModelUsage(input.runTotal);
+
+  const usage = assertable(
+    buildObservedModelUsage(input.runTotal),
+    (v) => ({ execution: { observedModelUsage: v } }),
+    // Degraded WHOLE, never per model: `RunModelUsage`'s documented contract is that every key sums to
+    // the run's displayed totals, so a mix missing one model's entry breaks its own invariant silently.
+    (fault) => ({
+      status: 'unavailable' as const,
+      value: null,
+      provenance: 'driver_reported' as const,
+      source: 'driver' as const,
+      sourceId: null,
+      observedAt: null,
+      acceptedAt: null,
+      reason: CONTRACT_FAULT(fault),
+    }),
+    'execution.observedModelUsage',
+    log,
+  );
+  if (usage) execution.observedModelUsage = usage;
 
   const payload: UploadedEpisodeIntelligenceType = {};
   if (Object.keys(execution).length > 0) payload.execution = execution;
   // Top-level sibling (RUN-247 locked decision, restated in this module's own doc above) — never
   // folded into `execution`, and never asserted when the caller had nothing to report.
-  if (input.contextConsumption) payload.contextConsumption = input.contextConsumption;
+  if (input.contextConsumption) {
+    const observed = input.contextConsumption;
+    const contextConsumption = assertable(
+      observed,
+      (v) => ({ contextConsumption: v }),
+      // Provenance/source/sourceId are carried from the observation rather than re-declared: they
+      // describe WHO measured, which is unchanged by the value being unusable. Only the value's claim
+      // is withdrawn.
+      (fault) => ({
+        status: 'unavailable' as const,
+        value: null,
+        provenance: observed.provenance,
+        source: observed.source,
+        sourceId: observed.sourceId,
+        observedAt: observed.observedAt,
+        acceptedAt: observed.acceptedAt,
+        reason: CONTRACT_FAULT(fault),
+      }),
+      'contextConsumption',
+      log,
+    );
+    if (contextConsumption) payload.contextConsumption = contextConsumption;
+  }
   return Object.keys(payload).length > 0 ? payload : undefined;
 }
