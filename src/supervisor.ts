@@ -64,7 +64,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
-import { ExecutionLifecycle, resolveRunLineage } from './execution-lineage';
+import { ExecutionLifecycle, type RecoveredParkDisposition, resolveRunLineage } from './execution-lineage';
 import {
   type CheckedExecutionSpec,
   type SpecPathProbe,
@@ -1419,7 +1419,12 @@ export class RunSupervisor {
 
   constructor(private readonly deps: RunSupervisorDeps) {
     this.log = deps.logger ?? defaultLogger;
-    this.executionLifecycle = new ExecutionLifecycle(deps.parked);
+    this.executionLifecycle = new ExecutionLifecycle(deps.parked, (runId, err) => {
+      this.log.warn('terminal park cleanup failed — retaining lifecycle tombstone', {
+        runId,
+        err: String(err),
+      });
+    });
   }
 
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
@@ -3453,7 +3458,7 @@ export class RunSupervisor {
     // Resume bypasses `prepare`, but it must not bypass the same pre-spawn lineage floor. The
     // lifecycle owner has already moved this park into active state, so its fresh snapshot sees
     // both this restored run and every still-persisted peer.
-    const lineage = resolveRunLineage(run, await this.executionLifecycle.registry());
+    const lineage = resolveRunLineage(run, this.executionLifecycle.registry());
     if (!lineage.ok) {
       const reason = `${lineage.reason}; not resuming`;
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
@@ -3810,8 +3815,10 @@ export class RunSupervisor {
   }
 
   /** Hydrate the durable half before dispatch begins; no stale empty registry after restart. */
-  async restoreExecutionLifecycle(): Promise<void> {
-    await this.executionLifecycle.restore();
+  async restoreExecutionLifecycle(
+    classify?: (park: ParkedRun) => Promise<RecoveredParkDisposition>,
+  ): Promise<void> {
+    await this.executionLifecycle.restore(classify);
   }
 
   /** The daemon routes both cancellation and reconciliation through the lifecycle owner. */

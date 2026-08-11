@@ -16,6 +16,7 @@ import { ClaudeDriver } from './drivers/claude';
 import { CodexDriver } from './drivers/codex';
 import { EpisodePendingStore, filePendingEpisodeStore } from './episode-pending';
 import { type EpisodeDeliveryDeps, deliverEpisode, drainPendingEpisodes } from './episode-upload';
+import type { RecoveredParkDisposition } from './execution-lineage';
 import { IndexControlServer } from './index-control';
 import { IndexCoordinator } from './index-coordinator';
 import { IndexJournal, fileJournalStore } from './index-journal';
@@ -27,7 +28,7 @@ import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
-import { ParkedStore } from './parked';
+import { type ParkedRun, ParkedStore } from './parked';
 import { buildRegistration, repoReport } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
 import { loadState, saveState } from './state';
@@ -53,6 +54,9 @@ import { WsClient, type WsFactory } from './ws-client';
 
 /** How long shutdown waits for stopped runs to report a terminal status. */
 const SHUTDOWN_DRAIN_MS = 5_000;
+
+/** Recovery classification may delay admission, but a dead REST request must not wedge startup. */
+const PARK_RECOVERY_TIMEOUT_MS = 5_000;
 
 /**
  * How often the daemon re-runs the orphan sweep (RUN-153).
@@ -162,7 +166,7 @@ export interface SupervisorLike {
   supervise(run: Run): Promise<unknown>;
   resume(runId: string, answer: string): Promise<unknown>;
   /** Read durable parks before dispatch so lineage ownership survives a daemon restart (RUN-265). */
-  restoreExecutionLifecycle(): Promise<void>;
+  restoreExecutionLifecycle(classify?: (park: ParkedRun) => Promise<RecoveredParkDisposition>): Promise<void>;
   /** Route a terminal parked Run through the one active-plus-parked lifecycle owner (RUN-265). */
   terminalizeParkedRun(runId: string): Promise<void>;
   /** Deliver an answer to a stage holding in-process (RUN-190). True = delivered, no restore. */
@@ -543,6 +547,8 @@ export class Daemon {
   /** Where RUN-230's undelivered-verification-report queue lives — defaults to
    *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
   private readonly verificationPendingPath?: string;
+  /** Test seam for the bounded recovered-park probe; production uses PARK_RECOVERY_TIMEOUT_MS. */
+  private readonly parkRecoveryTimeoutMs: number;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -603,6 +609,8 @@ export class Daemon {
       /** Where RUN-230's undelivered-verification-report queue lives — defaults to
        *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
       verificationPendingPath?: string;
+      /** Bounded startup recovery probe. Overridden only by tests that model a hung server. */
+      parkRecoveryTimeoutMs?: number;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -624,6 +632,7 @@ export class Daemon {
     this.indexControlOverride = deps.indexControl;
     this.episodePendingPath = deps.episodePendingPath;
     this.verificationPendingPath = deps.verificationPendingPath;
+    this.parkRecoveryTimeoutMs = deps.parkRecoveryTimeoutMs ?? PARK_RECOVERY_TIMEOUT_MS;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -1065,9 +1074,38 @@ export class Daemon {
       logger: this.log,
     });
 
-    // RUN-265: a persisted blocked run owns its execution before a new WebSocket assignment can
-    // arrive. Reading it here keeps restart from briefly advertising an empty local lifecycle.
-    await supervisor.restoreExecutionLifecycle();
+    // RUN-265/294: hydrate every park, then let the durable server fact discard terminal garbage
+    // BEFORE constructing the assignment socket. Unknown state stays reserved (fail closed), and
+    // the probe is bounded so an unhealthy REST path cannot wedge daemon startup forever.
+    await supervisor.restoreExecutionLifecycle(async (park) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), this.parkRecoveryTimeoutMs);
+      });
+      const result = await Promise.race([
+        client
+          .getParkState(park.run.id)
+          .then((state) => ({ kind: 'state' as const, state }))
+          .catch((err) => ({ kind: 'error' as const, err })),
+        timeout,
+      ]);
+      if (timer) clearTimeout(timer);
+      if (result.kind === 'timeout') {
+        this.log.warn('park recovery probe timed out — retaining execution ownership', {
+          runId: park.run.id,
+          waitedMs: this.parkRecoveryTimeoutMs,
+        });
+        return 'unknown';
+      }
+      if (result.kind === 'error') {
+        this.log.debug('could not classify recovered park — retaining execution ownership', {
+          runId: park.run.id,
+          err: String(result.err),
+        });
+        return 'unknown';
+      }
+      return result.state.answer != null || result.state.blocked ? 'parked' : 'terminal';
+    });
 
     const ws = new WsClient({
       server: this.config.server,

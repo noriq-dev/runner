@@ -767,7 +767,12 @@ describe('daemon.start(), driven end to end with fake seams', () => {
 
   // A fetch that answers registration and owed-merges off-line — never a real host. Records the
   // paths it saw so a test can assert start() issued no request it did not fake.
-  function fakeFetch(calls: string[], bodies: unknown[] = [], parkState?: unknown): typeof fetch {
+  function fakeFetch(
+    calls: string[],
+    bodies: unknown[] = [],
+    parkState?: unknown,
+    parkProbe?: 'error' | 'hang',
+  ): typeof fetch {
     return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = String(input);
       calls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
@@ -790,6 +795,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       } else if (url.includes('/owed-merges')) {
         body = { owed: [] };
       } else if (new URL(url).pathname.endsWith('/park')) {
+        if (parkProbe === 'error') throw new Error('park state unavailable');
+        if (parkProbe === 'hang') return new Promise<Response>(() => {});
         body = parkState ?? {};
       }
       return new Response(JSON.stringify(body), {
@@ -813,10 +820,14 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
       parked?: ParkedStore;
       parkState?: unknown;
+      parkProbe?: 'error' | 'hang';
+      parkRecoveryTimeoutMs?: number;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
+    const startup: string[] = [];
     const connect: WsFactory = (url, headers) => {
+      startup.push('socket');
       const s = new FakeDaemonSocket(url, headers);
       sockets.push(s);
       return s;
@@ -825,14 +836,16 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const bodies: unknown[] = [];
     const supervised: string[] = [];
     const restored: string[] = [];
+    const recovered: Array<{ runId: string; disposition: string }> = [];
     const terminalized: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
+    const parked = over.parked ?? new ParkedStore(path.join(tmp, 'parked.json'));
     const daemon = new Daemon(config(over.concurrency, over.scanRoots), 'tok', {
       logger: quiet,
       connect,
-      fetchImpl: fakeFetch(calls, bodies, over.parkState),
-      parked: over.parked ?? new ParkedStore(path.join(tmp, 'parked.json')),
+      fetchImpl: fakeFetch(calls, bodies, over.parkState, over.parkProbe),
+      parked,
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
@@ -851,6 +864,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       // test in this suite, not only ones that exercise them directly.
       indexStatusPath: path.join(tmp, 'index-status.json'),
       indexControlInfoPath: path.join(tmp, 'index-control.json'),
+      parkRecoveryTimeoutMs: over.parkRecoveryTimeoutMs,
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -861,8 +875,17 @@ describe('daemon.start(), driven end to end with fake seams', () => {
             return {};
           },
           resume: async () => null,
-          restoreExecutionLifecycle: async () => {
+          restoreExecutionLifecycle: async (classify) => {
+            startup.push('restore-start');
             restored.push('restored');
+            if (classify) {
+              for (const entry of await parked.list()) {
+                const disposition = await classify(entry);
+                recovered.push({ runId: entry.run.id, disposition });
+                startup.push(`classified:${disposition}`);
+              }
+            }
+            startup.push('restore-end');
           },
           terminalizeParkedRun: async (runId) => {
             terminalized.push(runId);
@@ -876,7 +899,19 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, bodies, report, deps, supervised, restored, terminalized };
+    return {
+      handle,
+      sockets,
+      calls,
+      bodies,
+      report,
+      deps,
+      supervised,
+      restored,
+      recovered,
+      startup,
+      terminalized,
+    };
   }
 
   /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
@@ -903,23 +938,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       },
     });
 
-  it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
-    const { handle, sockets, calls } = await harness();
-    expect(handle.runnerId).toBe('rnr_test');
-    // One fake socket, constructed by the injected factory — never a real ws dial.
-    expect(sockets).toHaveLength(1);
-    expect(sockets[0]!.url).toBe('wss://noriq.example/ws/runner/rnr_test');
-    // Registration went through the fake fetch; nothing hit a real endpoint.
-    expect(calls).toContain('POST /api/runners');
-    expect(
-      calls.every(
-        (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
-      ),
-    ).toBe(true);
-  });
-
-  it('forgets a parked lineage binding when server reconciliation finds its run terminal', async () => {
-    const parked = new ParkedStore(path.join(tmp, 'parked-terminal.json'));
+  const executionParkedStore = async (name: string): Promise<ParkedStore> => {
+    const parked = new ParkedStore(path.join(tmp, name));
     await parked.park({
       run: Run.parse({
         id: 'run_parked',
@@ -963,13 +983,58 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       parkedAt: '2026-07-14T00:00:00.000Z',
       question: 'continue?',
     });
+    return parked;
+  };
 
+  it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
+    const { handle, sockets, calls } = await harness();
+    expect(handle.runnerId).toBe('rnr_test');
+    // One fake socket, constructed by the injected factory — never a real ws dial.
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.url).toBe('wss://noriq.example/ws/runner/rnr_test');
+    // Registration went through the fake fetch; nothing hit a real endpoint.
+    expect(calls).toContain('POST /api/runners');
+    expect(
+      calls.every(
+        (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
+      ),
+    ).toBe(true);
+  });
+
+  it('classifies a terminal recovered park before opening assignment admission', async () => {
+    const parked = await executionParkedStore('parked-terminal.json');
     const h = await harness({
       parked,
       parkState: { status: 'cancelled', blocked: false, signalId: null, question: null, answer: null },
     });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'terminal' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:terminal', 'restore-end', 'socket']);
     await tick();
     expect(h.terminalized).toEqual(['run_parked']);
+  });
+
+  it('retains a server-blocked recovered park before opening assignment admission', async () => {
+    const parked = await executionParkedStore('parked-blocked.json');
+    const h = await harness({
+      parked,
+      parkState: { status: 'blocked', blocked: true, signalId: 'sig_1', question: '?', answer: null },
+    });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'parked' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:parked', 'restore-end', 'socket']);
+  });
+
+  it('fails closed before admission when recovered park state cannot be fetched', async () => {
+    const parked = await executionParkedStore('parked-unknown.json');
+    const h = await harness({ parked, parkProbe: 'error' });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
+  });
+
+  it('bounds a hung recovered-park probe and still fails closed before admission', async () => {
+    const parked = await executionParkedStore('parked-hung.json');
+    const h = await harness({ parked, parkProbe: 'hang', parkRecoveryTimeoutMs: 5 });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
   });
 
   it('restores parked lineage ownership before it accepts a new assignment after restart', async () => {

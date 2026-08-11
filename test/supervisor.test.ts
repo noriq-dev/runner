@@ -3781,6 +3781,55 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.outcome).toBe('done'); // the paused round's non-verdict was discarded, as promised
   });
 
+  it('settles after a failed stage unpark without reviving its execution owner (RUN-294)', async () => {
+    const pump = async (cond: () => boolean) => {
+      for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), verifyResults: [true] });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, execution }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+    h.parkNext();
+    h.claude.emitText('I need a human answer.');
+    h.claude.complete('done');
+    await pump(() => h.reports.some((r) => r.status === 'blocked'));
+
+    const realUnpark = h.parked.unpark;
+    let oldRunDeletes = 0;
+    h.parked.unpark = async (runId) => {
+      if (runId !== 'run_1') return realUnpark(runId);
+      oldRunDeletes += 1;
+      if (oldRunDeletes === 1) throw new Error('stage answer delete failed');
+      return new Promise<ParkedRun | null>(() => {}); // terminal retry hangs forever
+    };
+
+    h.answerIt();
+    await h.supervisor.resume('run_1', 'Proceed.');
+    await pump(() => h.claude.starts.length >= 3);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done'); // never joined the hung terminal cleanup
+    expect(await h.parked.get('run_1')).not.toBeNull(); // the failed durable half still exists
+    expect(oldRunDeletes).toBe(2);
+
+    const retry = h.supervisor.supervise(makeRun({ id: 'run_retry', kind: 'scope', execution }));
+    await flush();
+    expect(h.claude.starts.at(-1)?.runId).toBe('run_retry'); // stale park is terminal, not an owner
+    h.claude.complete('done');
+    await retry;
+  });
+
   // RUN-154. The reviewer is the actor asked whether a diff looks like this repo's code, and it was
   // the one told nothing about what this repo's code looks like. Names only — its context already
   // carries the diff — and resolved at the point of use, so a run RESUMED in a later process gets

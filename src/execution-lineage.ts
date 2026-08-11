@@ -16,15 +16,25 @@ export interface ParkedExecution {
   readonly run: Pick<Run, 'id' | 'execution'>;
 }
 
+/** The server's durable answer about a park reconstructed after this process restarted. */
+export type RecoveredParkDisposition = 'parked' | 'terminal' | 'unknown';
+
+type ExecutionState<Park extends ParkedExecution> =
+  | { readonly kind: 'active'; readonly run: Pick<Run, 'id' | 'execution'>; readonly park: Park | null }
+  | { readonly kind: 'parked'; readonly park: Park }
+  | { readonly kind: 'resuming'; readonly park: Park }
+  | { readonly kind: 'terminal'; readonly park: Park | null; readonly active: boolean };
+
 /**
  * The source of truth for local execution ownership (RUN-265).
  *
- * A binding is deliberately derived when it is consulted, from work this process is supervising
- * and from parks durable enough to survive the process. Keeping a second mutable binding map made
- * restart and cancellation correctness depend on every terminal call site remembering to update it.
+ * Each run occupies exactly one explicit state. `active` may retain a durable park while a stage
+ * waits, `resuming` keeps ownership while disk deletion yields, and `terminal` suppresses a park
+ * until physical cleanup succeeds. The registry is therefore a synchronous projection of one
+ * state map rather than a join across independently sampled active and durable stores.
  */
 export class ExecutionLifecycle<Park extends ParkedExecution> {
-  private readonly active = new Map<string, Pick<Run, 'id' | 'execution'>>();
+  private readonly states = new Map<string, ExecutionState<Park>>();
 
   constructor(
     private readonly parked?: {
@@ -32,12 +42,13 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       list(): Promise<Park[]>;
       unpark(runId: string): Promise<Park | null>;
     },
+    private readonly onCleanupError?: (runId: string, err: unknown) => void,
+    private readonly cleanupWarnAfterMs = 5_000,
   ) {}
 
   /** Per-run ordering makes a terminal signal win over a park that was still being prepared. */
   private readonly transitions = new Map<string, Promise<unknown>>();
-  private readonly terminal = new Set<string>();
-
+  private readonly cleanupWatches = new Map<string, ReturnType<typeof setTimeout>>();
   private serialize<T>(runId: string, work: () => Promise<T>): Promise<T> {
     const prior = this.transitions.get(runId) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(work);
@@ -51,35 +62,98 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
     return next;
   }
 
+  private reportCleanupError(runId: string, err: unknown): void {
+    try {
+      this.onCleanupError?.(runId, err);
+    } catch {
+      // Cleanup reporting is diagnostic. It must not turn a swallowed disk failure into an
+      // unhandled rejection after the run's real terminal outcome has already been returned.
+    }
+  }
+
+  private clearCleanupWatch(runId: string): void {
+    const timer = this.cleanupWatches.get(runId);
+    if (timer) clearTimeout(timer);
+    this.cleanupWatches.delete(runId);
+  }
+
+  private cleanTerminalParkInBackground(runId: string): void {
+    const cleanup = this.removeTerminalPark(runId);
+    if (!this.cleanupWatches.has(runId)) {
+      const timer = setTimeout(() => {
+        this.cleanupWatches.delete(runId);
+        this.reportCleanupError(
+          runId,
+          new Error(`terminal park cleanup still pending after ${this.cleanupWarnAfterMs}ms`),
+        );
+      }, this.cleanupWarnAfterMs);
+      // A diagnostic watchdog must not become the reason an otherwise idle daemon stays alive.
+      timer.unref?.();
+      this.cleanupWatches.set(runId, timer);
+    }
+    void cleanup.then(
+      () => this.clearCleanupWatch(runId),
+      (err) => {
+        this.clearCleanupWatch(runId);
+        this.reportCleanupError(runId, err);
+      },
+    );
+  }
+
   begin(run: Pick<Run, 'id' | 'execution'>): void {
-    this.terminal.delete(run.id);
-    this.active.set(run.id, run);
+    const current = this.states.get(run.id);
+    // Run ids are server identities and are not re-used. Retaining a terminal state that still
+    // covers a durable record is the fail-closed answer if an invalid duplicate nevertheless lands.
+    if (current?.kind === 'terminal' && current.park) return;
+    this.states.set(run.id, { kind: 'active', run, park: null });
   }
 
   /** A successful park leaves durable ownership behind but no longer has an active supervisor. */
   inactive(runId: string): void {
-    this.active.delete(runId);
+    const current = this.states.get(runId);
+    if (current?.kind !== 'active') return;
+    if (current.park) this.states.set(runId, { kind: 'parked', park: current.park });
+    else this.states.delete(runId);
   }
 
   /** The supervising stack reached a terminal outcome (including a thrown one). */
   complete(runId: string): void {
-    // A terminal stack cannot create another park after it returns. Cancellation keeps its
-    // tombstone only while an active stack could still finish an already-started park transition.
-    this.terminal.delete(runId);
-    this.inactive(runId);
+    // Logical terminality is synchronous and cannot fail. Physical cleanup stays ordered behind
+    // any park/unpark already in flight, but this supervising stack never waits for disk I/O.
+    const current = this.states.get(runId);
+    const park =
+      current?.kind === 'active' || current?.kind === 'terminal'
+        ? current.park
+        : current?.kind === 'parked' || current?.kind === 'resuming'
+          ? current.park
+          : null;
+    this.states.set(runId, { kind: 'terminal', park, active: false });
+    this.cleanTerminalParkInBackground(runId);
   }
 
   /** Park creation belongs here so cancellation cannot race a post-probe direct store write. */
   async park(entry: Park): Promise<boolean> {
     return this.serialize(entry.run.id, async () => {
-      if (this.terminal.has(entry.run.id)) return false;
+      if (this.states.get(entry.run.id)?.kind === 'terminal') return false;
       await this.parked?.park(entry);
+      const current = this.states.get(entry.run.id);
+      if (current?.kind === 'terminal') {
+        // Terminality can arrive while the disk write yields. Preserve the just-written record so
+        // the queued cleanup removes it, and tell the caller it did not successfully park.
+        this.states.set(entry.run.id, { kind: 'terminal', park: entry, active: current.active });
+        return false;
+      }
+      if (current?.kind === 'active') {
+        this.states.set(entry.run.id, { kind: 'active', run: current.run, park: entry });
+      } else {
+        this.states.set(entry.run.id, { kind: 'parked', park: entry });
+      }
       return true;
     });
   }
 
-  /** Reads parks now rather than caching them: another daemon lifecycle may have removed one. */
-  async registry(): Promise<ExecutionRunRegistry> {
+  /** One atomic in-process snapshot; startup hydration and every transition maintain both halves. */
+  registry(): ExecutionRunRegistry {
     const registry = new Map<string, string>();
     const bind = (run: Pick<Run, 'id' | 'execution'>) => {
       const assignment = ExecutionAssignment.safeParse(run.execution);
@@ -93,11 +167,9 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       );
     };
 
-    for (const run of this.active.values()) bind(run);
-    // A terminal signal is authoritative immediately, even while its durable deletion waits for
-    // the ordered transition. An active stack remains bound above until its own finally runs.
-    for (const park of (await this.parked?.list()) ?? []) {
-      if (!this.terminal.has(park.run.id)) bind(park.run);
+    for (const state of this.states.values()) {
+      if (state.kind === 'active') bind(state.run);
+      else if (state.kind === 'parked' || state.kind === 'resuming') bind(state.park.run);
     }
     return registry;
   }
@@ -105,32 +177,112 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
   /** Read the parked record and atomically make its run active again before a resume can spawn. */
   async resume(runId: string): Promise<Park | null> {
     return this.serialize(runId, async () => {
-      if (this.terminal.has(runId)) return null;
-      const park = await this.parked?.unpark(runId);
-      if (park) this.active.set(park.run.id, park.run);
-      return park ?? null;
+      const current = this.states.get(runId);
+      if (current?.kind !== 'parked') return null;
+      const known = current.park;
+      // Claim active ownership BEFORE the durable delete yields. A registry snapshot overlapping
+      // this move therefore projects the resuming state, never neither representation.
+      this.states.set(runId, { kind: 'resuming', park: known });
+      try {
+        const park = await this.parked?.unpark(runId);
+        if (!park) {
+          if (this.states.get(runId)?.kind !== 'terminal') this.states.delete(runId);
+          return null;
+        }
+        if (this.states.get(runId)?.kind === 'terminal') {
+          // Cancellation won while deletion was in flight. The durable record is gone, and the
+          // queued terminal cleanup will release the in-memory tombstone without spawning.
+          const terminal = this.states.get(runId);
+          this.states.set(runId, {
+            kind: 'terminal',
+            park: null,
+            active: terminal?.kind === 'terminal' ? terminal.active : true,
+          });
+          return null;
+        }
+        this.states.set(runId, { kind: 'active', run: park.run, park: null });
+        return park;
+      } catch (err) {
+        if (this.states.get(runId)?.kind === 'terminal') {
+          const terminal = this.states.get(runId);
+          this.states.set(runId, {
+            kind: 'terminal',
+            park: known,
+            active: terminal?.kind === 'terminal' ? terminal.active : true,
+          });
+        } else {
+          this.states.set(runId, { kind: 'parked', park: known });
+        }
+        throw err;
+      }
     });
   }
 
   /** A non-terminal stage answer consumes its record while its supervising stack remains active. */
   async unpark(runId: string): Promise<Park | null> {
-    return this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
+    return this.serialize(runId, async () => {
+      const park = (await this.parked?.unpark(runId)) ?? null;
+      const current = this.states.get(runId);
+      if (current?.kind === 'active') {
+        this.states.set(runId, { kind: 'active', run: current.run, park: null });
+      } else if (current?.kind === 'parked' || current?.kind === 'resuming') {
+        this.states.delete(runId);
+      } else if (current?.kind === 'terminal') {
+        this.states.set(runId, { kind: 'terminal', park: null, active: current.active });
+      }
+      return park;
+    });
   }
 
   /** A server-terminal fact blocks any late park and removes the durable half in one transition. */
   async terminalizePark(runId: string): Promise<Park | null> {
-    this.terminal.add(runId);
-    const park = await this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
-    // A directly cancelled persisted park has no supervising stack that will call `complete`.
-    // Its tombstone has done its job once the ordered deletion finishes, so retaining it would
-    // make daemon memory scale with historical cancellations rather than live lifecycle state.
-    if (!this.active.has(runId)) this.terminal.delete(runId);
-    return park;
+    const current = this.states.get(runId);
+    const park =
+      current?.kind === 'active' || current?.kind === 'terminal'
+        ? current.park
+        : current?.kind === 'parked' || current?.kind === 'resuming'
+          ? current.park
+          : null;
+    // `resuming` has not spawned a replacement stack yet. If terminality wins while its delete
+    // yields, resume returns null and nobody will later call complete(), so it is detached here.
+    const active = current?.kind === 'active' ? true : current?.kind === 'terminal' ? current.active : false;
+    this.states.set(runId, { kind: 'terminal', park, active });
+    return this.removeTerminalPark(runId);
   }
 
-  /** Startup reads the durable half before the WebSocket can deliver a new assignment. */
-  async restore(): Promise<void> {
-    await this.registry();
+  private removeTerminalPark(runId: string): Promise<Park | null> {
+    return this.serialize(runId, async () => {
+      const park = (await this.parked?.unpark(runId)) ?? null;
+      // Delete only the terminal state this cleanup belongs to. A theoretically re-used run id
+      // must not let an old background cleanup erase a newer active owner.
+      const current = this.states.get(runId);
+      if (current?.kind === 'terminal') {
+        if (current.active) {
+          this.states.set(runId, { kind: 'terminal', park: null, active: true });
+        } else {
+          this.states.delete(runId);
+        }
+      }
+      return park;
+    });
+  }
+
+  /** Hydrate before admission, then classify crash-recovered parks through the durable server fact. */
+  async restore(classify?: (park: Park) => Promise<RecoveredParkDisposition>): Promise<void> {
+    const parks = (await this.parked?.list()) ?? [];
+    for (const park of parks) this.states.set(park.run.id, { kind: 'parked', park });
+    if (!classify) return;
+
+    await Promise.all(
+      parks.map(async (park) => {
+        const disposition = await classify(park).catch(() => 'unknown' as const);
+        if (disposition !== 'terminal') return;
+        this.states.set(park.run.id, { kind: 'terminal', park, active: false });
+        // Recovery only needs the logical terminal fact before admission. The disk delete is the
+        // same best-effort background cleanup as a live completion and cannot delay startup.
+        this.cleanTerminalParkInBackground(park.run.id);
+      }),
+    );
   }
 }
 
