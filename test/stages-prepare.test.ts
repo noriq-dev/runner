@@ -215,7 +215,7 @@ function harness(
     // No disk: the `[context]` seams are injected, so preparation reads nothing real. Every
     // declared path is "missing", which is the shape a repo with no `[context]` already has.
     context: { probe: async () => false, read: async () => '' },
-    ...(over.executionRegistry ? { executionRegistry: over.executionRegistry } : {}),
+    ...(over.executionRegistry ? { executionRegistry: async () => over.executionRegistry! } : {}),
   };
   return { host, rec };
 }

@@ -161,8 +161,10 @@ export function workflowRepoResolver(deps: {
 export interface SupervisorLike {
   supervise(run: Run): Promise<unknown>;
   resume(runId: string, answer: string): Promise<unknown>;
-  /** Drop a parked Run's local lineage reservation once the server has terminalized it (RUN-265). */
-  forgetExecutionBinding(runId: string): void;
+  /** Read durable parks before dispatch so lineage ownership survives a daemon restart (RUN-265). */
+  restoreExecutionLifecycle(): Promise<void>;
+  /** Route a terminal parked Run through the one active-plus-parked lifecycle owner (RUN-265). */
+  terminalizeParkedRun(runId: string): Promise<void>;
   /** Deliver an answer to a stage holding in-process (RUN-190). True = delivered, no restore. */
   deliverStageAnswer(runId: string, answer: string): boolean;
   expireStaleParks(): Promise<number>;
@@ -1063,6 +1065,10 @@ export class Daemon {
       logger: this.log,
     });
 
+    // RUN-265: a persisted blocked run owns its execution before a new WebSocket assignment can
+    // arrive. Reading it here keeps restart from briefly advertising an empty local lifecycle.
+    await supervisor.restoreExecutionLifecycle();
+
     const ws = new WsClient({
       server: this.config.server,
       runnerId: runner.id,
@@ -1117,6 +1123,11 @@ export class Daemon {
           // Hard interrupt + SIGTERM + worktree teardown (the supervisor's finally
           // removes the worktree and clears the active slot).
           this.log.info('run cancel received', { runId: m.runId, reason: m.reason });
+          void supervisor
+            .terminalizeParkedRun(m.runId)
+            .catch((err) =>
+              this.log.warn('could not terminalize a parked run', { runId: m.runId, err: String(err) }),
+            );
           void steering.cancelRun(m.runId);
         },
         onSteer: (steer) => {
@@ -1282,8 +1293,7 @@ export class Daemon {
             runId: p.run.id,
             status: state.status,
           });
-          supervisor.forgetExecutionBinding(p.run.id);
-          await parked.unpark(p.run.id);
+          await supervisor.terminalizeParkedRun(p.run.id);
         }
       }
     };

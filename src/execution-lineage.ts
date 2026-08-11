@@ -11,6 +11,74 @@ export type RunLineageResolution = { ok: true; lineage: RunLineage } | { ok: fal
 /** A live binding prevents two concurrent Runs from claiming one server execution identity. */
 export type ExecutionRunRegistry = ReadonlyMap<string, string>;
 
+/** The small persisted shape the lifecycle owner needs; the full park stays owned by `parked.ts`. */
+export interface ParkedExecution {
+  readonly run: Pick<Run, 'id' | 'execution'>;
+}
+
+/**
+ * The source of truth for local execution ownership (RUN-265).
+ *
+ * A binding is deliberately derived when it is consulted, from work this process is supervising
+ * and from parks durable enough to survive the process. Keeping a second mutable binding map made
+ * restart and cancellation correctness depend on every terminal call site remembering to update it.
+ */
+export class ExecutionLifecycle<Park extends ParkedExecution> {
+  private readonly active = new Map<string, Pick<Run, 'id' | 'execution'>>();
+
+  constructor(
+    private readonly parked?: {
+      list(): Promise<Park[]>;
+      unpark(runId: string): Promise<Park | null>;
+    },
+  ) {}
+
+  begin(run: Pick<Run, 'id' | 'execution'>): void {
+    this.active.set(run.id, run);
+  }
+
+  complete(runId: string): void {
+    this.active.delete(runId);
+  }
+
+  /** Reads parks now rather than caching them: another daemon lifecycle may have removed one. */
+  async registry(): Promise<ExecutionRunRegistry> {
+    const registry = new Map<string, string>();
+    const bind = (run: Pick<Run, 'id' | 'execution'>) => {
+      const assignment = ExecutionAssignment.safeParse(run.execution);
+      if (!assignment.success) return;
+      const prior = registry.get(assignment.data.executionId);
+      // Preserve a collision as a value no real run id can equal. Returning either owner would let
+      // that owner re-enter while the other persisted claimant was silently ignored.
+      registry.set(
+        assignment.data.executionId,
+        prior && prior !== run.id ? '<multiple-local-runs>' : (prior ?? run.id),
+      );
+    };
+
+    for (const run of this.active.values()) bind(run);
+    for (const park of (await this.parked?.list()) ?? []) bind(park.run);
+    return registry;
+  }
+
+  /** Read the parked record and atomically make its run active again before a resume can spawn. */
+  async resume(runId: string): Promise<Park | null> {
+    const park = await this.parked?.unpark(runId);
+    if (park) this.begin(park.run);
+    return park ?? null;
+  }
+
+  /** A terminal server fact removes only the durable park; a live supervisor completes itself. */
+  async discardPark(runId: string): Promise<Park | null> {
+    return (await this.parked?.unpark(runId)) ?? null;
+  }
+
+  /** Startup reads the durable half before the WebSocket can deliver a new assignment. */
+  async restore(): Promise<void> {
+    await this.registry();
+  }
+}
+
 /**
  * Validate the part of an execution assignment the Runner can know locally (RUN-265).
  *

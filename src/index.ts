@@ -439,8 +439,10 @@ export {
 } from './ws-client';
 export { Daemon, type DaemonHandle } from './daemon';
 export {
+  ExecutionLifecycle,
   resolveRunLineage,
   type ExecutionRunRegistry,
+  type ParkedExecution,
   type RunLineage,
   type RunLineageResolution,
 } from './execution-lineage';

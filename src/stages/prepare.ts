@@ -50,7 +50,7 @@ import {
 } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
-import { type RunLineage, resolveRunLineage } from '../execution-lineage';
+import { type ExecutionRunRegistry, type RunLineage, resolveRunLineage } from '../execution-lineage';
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
@@ -144,8 +144,8 @@ export interface PrepareHost {
     budget?: number;
   };
   readonly continuable?: Pick<ContinuableStore, 'get'>;
-  /** RUN-265's live execution binding floor, owned by the supervisor rather than module state. */
-  readonly executionRegistry?: Map<string, string>;
+  /** RUN-265's active-plus-parked execution ownership snapshot, owned by the supervisor. */
+  executionRegistry?(): Promise<ExecutionRunRegistry>;
 }
 
 /** Everything `execute` needs, or the reason this dispatch was refused. */
@@ -362,7 +362,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
 
   // The frame schema rejects malformed assignments before this point. These are the remaining
   // local facts: a node cannot parent itself, and one live execution cannot belong to two Runs.
-  const lineage = resolveRunLineage(run, host.executionRegistry ?? new Map<string, string>());
+  const lineage = resolveRunLineage(run, (await host.executionRegistry?.()) ?? new Map<string, string>());
   if (!lineage.ok) {
     host.log.warn('execution lineage is invalid — declining to spawn', {
       runId: run.id,
@@ -370,10 +370,6 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     });
     return refuse(`${lineage.reason}; not spawning`);
   }
-  if (lineage.lineage.type === 'assigned') {
-    host.executionRegistry?.set(lineage.lineage.assignment.executionId, run.id);
-  }
-
   // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
   // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
   // overwriting the server's totals with only what this sitting spends) and the adjudication ledger

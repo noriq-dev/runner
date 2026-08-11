@@ -824,7 +824,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const calls: string[] = [];
     const bodies: unknown[] = [];
     const supervised: string[] = [];
-    const forgotten: string[] = [];
+    const restored: string[] = [];
+    const terminalized: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
     const daemon = new Daemon(config(over.concurrency, over.scanRoots), 'tok', {
@@ -860,7 +861,12 @@ describe('daemon.start(), driven end to end with fake seams', () => {
             return {};
           },
           resume: async () => null,
-          forgetExecutionBinding: (runId) => forgotten.push(runId),
+          restoreExecutionLifecycle: async () => {
+            restored.push('restored');
+          },
+          terminalizeParkedRun: async (runId) => {
+            terminalized.push(runId);
+          },
           deliverStageAnswer: () => false, // no stage ever waits in this fake
 
           expireStaleParks: async () => 0,
@@ -870,7 +876,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, bodies, report, deps, supervised, forgotten };
+    return { handle, sockets, calls, bodies, report, deps, supervised, restored, terminalized };
   }
 
   /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
@@ -963,8 +969,25 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       parkState: { status: 'cancelled', blocked: false, signalId: null, question: null, answer: null },
     });
     await tick();
-    expect(h.forgotten).toEqual(['run_parked']);
-    expect(await parked.get('run_parked')).toBeNull();
+    expect(h.terminalized).toEqual(['run_parked']);
+  });
+
+  it('restores parked lineage ownership before it accepts a new assignment after restart', async () => {
+    const { sockets, restored, supervised } = await harness();
+    expect(restored).toEqual(['restored']);
+    sockets[0]!.emit('message', assignedFrame('run_after_restart'));
+    await tick();
+    expect(supervised).toEqual(['run_after_restart']);
+  });
+
+  it('routes direct cancellation of a parked run through the lifecycle owner', async () => {
+    const { sockets, terminalized } = await harness();
+    sockets[0]!.emit(
+      'message',
+      JSON.stringify({ type: 'run.cancel', runId: 'run_parked', hard: true, reason: 'cancelled' }),
+    );
+    await tick();
+    expect(terminalized).toEqual(['run_parked']);
   });
 
   // RUN-214, locked decision 11: `stop()` must cancel and JOIN in-flight index work, beside where

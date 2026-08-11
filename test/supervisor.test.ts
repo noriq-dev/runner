@@ -5824,7 +5824,7 @@ describe('resuming a parked run (RUN-30)', () => {
     h.claude.complete('done');
     await parked;
 
-    h.supervisor.forgetExecutionBinding('run_1');
+    await h.supervisor.terminalizeParkedRun('run_1');
     const replacement = h.supervisor.supervise(buildRun({ id: 'run_2', execution }));
     await flush();
     expect(h.claude.starts).toHaveLength(2);

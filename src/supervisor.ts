@@ -64,7 +64,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
-import { resolveRunLineage } from './execution-lineage';
+import { ExecutionLifecycle, resolveRunLineage } from './execution-lineage';
 import {
   type CheckedExecutionSpec,
   type SpecPathProbe,
@@ -1346,8 +1346,8 @@ export class RunSupervisor {
    *  stream — the server dedups on (runId, seq), and a restarted seq would collide with
    *  rows already written and be silently dropped. */
   private readonly transcripts = new Map<string, RunTranscript>();
-  /** RUN-265: held per supervisor so a terminal Run never poisons a later retry. */
-  private readonly executionRuns = new Map<string, string>();
+  /** RUN-265: the only owner of execution ownership, derived from active work plus parks. */
+  private readonly executionLifecycle: ExecutionLifecycle<ParkedRun>;
 
   private transcript(runId: string): RunTranscript {
     let t = this.transcripts.get(runId);
@@ -1419,6 +1419,7 @@ export class RunSupervisor {
 
   constructor(private readonly deps: RunSupervisorDeps) {
     this.log = deps.logger ?? defaultLogger;
+    this.executionLifecycle = new ExecutionLifecycle(deps.parked);
   }
 
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
@@ -3376,7 +3377,7 @@ export class RunSupervisor {
     if (!waiter) return false;
     this.stageWaiters.delete(runId);
     waiter(answer);
-    this.deps.parked?.unpark(runId).catch((err) => {
+    this.executionLifecycle.discardPark(runId).catch((err) => {
       this.log.warn('answered stage park could not be removed from disk — the reaper will', {
         runId,
         err: String(err),
@@ -3391,12 +3392,10 @@ export class RunSupervisor {
       const exit = await this.resumeRun(runId, answer);
       // A stage answer wakes the still-live `supervise` stack; its owner releases the binding.
       // A run that parks again remains one live execution and must retain its reservation.
-      if (exit && exit.reason !== 'parked' && exit.reason !== 'stage-answer') {
-        this.releaseExecutionBinding(runId);
-      }
+      if (exit && exit.reason !== 'stage-answer') this.executionLifecycle.complete(runId);
       return exit;
     } catch (err) {
-      this.releaseExecutionBinding(runId);
+      this.executionLifecycle.complete(runId);
       throw err;
     }
   }
@@ -3408,7 +3407,7 @@ export class RunSupervisor {
       return { outcome: 'done', isError: false, reason: 'stage-answer', telemetry: zeroTelemetry() };
     }
 
-    const entry = await this.deps.parked?.unpark(runId);
+    const entry = await this.executionLifecycle.resume(runId);
     if (!entry) return null;
     const { run } = entry;
 
@@ -3440,18 +3439,15 @@ export class RunSupervisor {
       };
     }
 
-    // A parked run can outlive this daemon process, so restore its local reservation before a
-    // resumed session can spawn. The same resolver keeps a corrupt persisted assignment from
-    // becoming an authority bypass on the resume-only path (RUN-265).
-    const lineage = resolveRunLineage(run, this.executionRuns);
+    // Resume bypasses `prepare`, but it must not bypass the same pre-spawn lineage floor. The
+    // lifecycle owner has already moved this park into active state, so its fresh snapshot sees
+    // both this restored run and every still-persisted peer.
+    const lineage = resolveRunLineage(run, await this.executionLifecycle.registry());
     if (!lineage.ok) {
       const reason = `${lineage.reason}; not resuming`;
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
       this.log.warn('execution lineage is invalid — declining to resume', { runId: run.id, reason });
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
-    }
-    if (lineage.lineage.type === 'assigned') {
-      this.executionRuns.set(lineage.lineage.assignment.executionId, run.id);
     }
 
     const fail = (reason: string): DriverExit => {
@@ -3768,7 +3764,7 @@ export class RunSupervisor {
     const all = (await this.deps.parked?.list()) ?? [];
     const stale = expiredParks(all, now, this.deps.parkTtlHours);
     for (const p of stale) {
-      await this.deps.parked?.unpark(p.run.id);
+      await this.executionLifecycle.discardPark(p.run.id);
       this.deps.report(p.run.id, {
         status: 'failed',
         exit: { outcome: 'failed', reason: 'park_expired' },
@@ -3790,29 +3786,25 @@ export class RunSupervisor {
    * and awaited the agent are `stages/execute.ts` — which `resume` now shares rather than repeats.
    */
   async supervise(run: Run): Promise<DriverExit> {
+    this.executionLifecycle.begin(run);
     try {
       const exit = await this.superviseRun(run);
-      // Parking is a live, resumable state. Its binding must remain until resume reaches a
-      // terminal exit, otherwise a second run can claim the execution while the first waits.
-      if (exit.reason !== 'parked') {
-        this.releaseExecutionBinding(run.id);
-      }
+      this.executionLifecycle.complete(run.id);
       return exit;
     } catch (err) {
-      this.releaseExecutionBinding(run.id);
+      this.executionLifecycle.complete(run.id);
       throw err;
     }
   }
 
-  private releaseExecutionBinding(runId: string): void {
-    for (const [executionId, boundRunId] of this.executionRuns) {
-      if (boundRunId === runId) this.executionRuns.delete(executionId);
-    }
+  /** Hydrate the durable half before dispatch begins; no stale empty registry after restart. */
+  async restoreExecutionLifecycle(): Promise<void> {
+    await this.executionLifecycle.restore();
   }
 
-  /** The daemon calls this when server reconciliation proves a parked Run is terminal (RUN-265). */
-  forgetExecutionBinding(runId: string): void {
-    this.releaseExecutionBinding(runId);
+  /** The daemon routes both cancellation and reconciliation through the lifecycle owner. */
+  async terminalizeParkedRun(runId: string): Promise<void> {
+    await this.executionLifecycle.discardPark(runId);
   }
 
   private async superviseRun(run: Run): Promise<DriverExit> {
@@ -4574,7 +4566,7 @@ export class RunSupervisor {
         ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
       },
       ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
-      executionRegistry: this.executionRuns,
+      executionRegistry: () => this.executionLifecycle.registry(),
     };
   }
 

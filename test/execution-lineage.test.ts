@@ -1,6 +1,6 @@
 import type { Run } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { resolveRunLineage } from '../src/execution-lineage';
+import { ExecutionLifecycle, resolveRunLineage } from '../src/execution-lineage';
 
 const run = (over: Partial<Run> = {}): Pick<Run, 'id' | 'execution'> => ({
   id: 'run_1',
@@ -61,5 +61,38 @@ describe('resolveRunLineage', () => {
   it('refuses an execution already bound to another live run', () => {
     const result = resolveRunLineage(run(), new Map([['exe_1', 'run_live']]));
     expect(result).toEqual({ ok: false, reason: 'execution exe_1 is already bound to live run run_live' });
+  });
+
+  it('reconstructs a persisted park as an owner before a restarted daemon accepts a retry', async () => {
+    const parks = new Map([['run_parked', { run: run({ id: 'run_parked' }) }]]);
+    const lifecycle = new ExecutionLifecycle({
+      list: async () => [...parks.values()],
+      unpark: async (runId) => {
+        const park = parks.get(runId) ?? null;
+        parks.delete(runId);
+        return park;
+      },
+    });
+
+    await lifecycle.restore();
+    expect(resolveRunLineage(run({ id: 'run_retry' }), await lifecycle.registry())).toEqual({
+      ok: false,
+      reason: 'execution exe_1 is already bound to live run run_parked',
+    });
+  });
+
+  it('drops a directly cancelled park from the derived registry immediately', async () => {
+    const parks = new Map([['run_parked', { run: run({ id: 'run_parked' }) }]]);
+    const lifecycle = new ExecutionLifecycle({
+      list: async () => [...parks.values()],
+      unpark: async (runId) => {
+        const park = parks.get(runId) ?? null;
+        parks.delete(runId);
+        return park;
+      },
+    });
+
+    await lifecycle.discardPark('run_parked');
+    expect(resolveRunLineage(run({ id: 'run_retry' }), await lifecycle.registry()).ok).toBe(true);
   });
 });
