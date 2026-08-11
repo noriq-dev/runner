@@ -941,6 +941,82 @@ matching `(server, repositoryKey)`, forcing the next trigger to start clean.
 just defense in depth. `index-status`/`-reindex`/`-retry`/`-cancel` all read it to reach a running
 daemon.
 
+## Project Intelligence analytics: fields legitimately missing (RUN-251)
+
+Beside the queue mechanics in the next section: an operator's actual question is usually narrower —
+"the analytics fields are missing from my episodes, why?" — and the answer is always one of a short,
+closed list of states this plan deliberately produces, never a mechanism failure to chase. No new
+CLI command or status file for this (the third scope bullet of RUN-251 says so outright, and RUN-234
+already built the one diagnostics surface this daemon has); this section is the missing operator
+answer, not a missing mechanism.
+
+**The governing rule, stated once**: analytics is enrichment, never part of the security floor or
+the run's own critical path (CLAUDE.md's own words). Every state below degrades to a MISSING field —
+never a failed run, never a corrupted or fabricated value (may-miss-never-invent). If a run itself
+failed, that is never because analytics did; look at the verify/land/review sections of this
+document and CLAUDE.md's own invariants instead.
+
+- **`contextConsumption` is absent from the episode.** Four distinct reasons collapse to the same
+  observable absence:
+  - this sitting is a RESUMED run — `resume` has no `prepare`, so nothing retrieved a context pack
+    at all this sitting (no log line; this is the ordinary case for every resumed park);
+  - the repo/task genuinely never asked (no `repositoryKey`, no task anchor) — the field would have
+    read `status: not_applicable` had anything been sent, but the omission rule (see below) means
+    even that is dropped from the wire, not merely nulled;
+  - a pack was retrieved but nothing survived to be verified and rendered (a timeout, a server
+    error, or a citation-verification crash) — `stages/prepare.ts` logs `context pack citation
+    verification failed — proceeding without verdicts` at `warn` when the crash is the cause;
+  - the metric itself failed to BUILD (RUN-251's own guard, `src/stages/brief.ts`) — logged at
+    `warn`: `context consumption metric failed to build — briefing without it`, with the run id and
+    the underlying error. This is the one state added by this task: before it, this failure mode
+    could fail the whole sitting instead of merely omitting one field (fatal for a continuation
+    resume in particular — a brief that cannot be rebuilt deliberately fails the run).
+- **`execution.stages`/`execution.clocks`/`execution.changes` are absent or thin.** A run whose
+  tally recorded no slots (a chain that failed before its first step) reports no `stages` at all —
+  no log line, nothing to report. A repo with no `[verify].cmd` reports `execution.clocks` as
+  `not_applicable` rather than omitting it (`stages/verify.ts` logs `deterministic verify: not
+  applicable` at `info`). A non-producing workflow (`scope`/`verify`) never even asks its backend for
+  change stats — `execution.changes` reads `not_applicable`, naming the workflow in `reason`, and
+  `settle` never calls `changeStats` at all (nothing to log; the omission is the point).
+- **A backend change-stat metric (`changedFiles`/`additions`/`deletions`/`churn`) individually reads
+  `unavailable`.** Either the backend refused outright (`ChangeStatsResult.ok: false` — its own
+  `detail` string rides straight into the metric's `reason`), or a count came back outside the
+  envelope's domain (NaN, negative, fractional, `Infinity` — `src/change-stats.ts`'s `uploadable()`
+  guard, RUN-244). No log line for the domain case: a well-formed `unavailable` envelope is not a
+  failure, it is the correct, silent answer to "the backend could not say."
+- **The `intelligence` field is absent from the UPLOADED episode entirely, while the base episode
+  (`filesTouched`/`commands`/`testsRun`/`failures`/`findings`/`selfSummary`) still ships.** Two
+  distinct causes, at two distinct points, both logged:
+  - assembly itself threw inside `settle` (RUN-251's own nested try around `buildUploadedIntelligence`)
+    — `warn`: `episode intelligence assembly failed — delivering the episode without it`;
+  - assembly succeeded but the assembled value failed the vendored `UploadedEpisodeIntelligence`
+    schema at send time — `episode-upload.ts`'s `toEnrichmentPayload`, run fresh on every send
+    including every retry — `warn`: `episode intelligence failed validation — dropping the field,
+    episode still delivered`, naming the failing field's path. **Measured, not merely designed
+    around** (RUN-251): `src/stage-facts.ts` has no per-field domain guard the way
+    `change-stats.ts` does, so a single stage whose recorded telemetry carries a fractional or
+    `Infinity` token count is NOT degraded to `unavailable` inline — it reaches this LAST gate and
+    costs the *whole* `intelligence` payload for that episode (every other stage, the verify clocks,
+    the change stats, `contextConsumption`), not merely the one malformed stage. Bounded and always
+    logged, never silent or run-affecting — but a coarser blast radius than the per-field
+    degradation everywhere else in this plan, worth knowing before you go looking for a missing
+    stage in an episode that has no `intelligence` at all.
+- **The whole EPISODE is absent** — no base fields either. Only when `buildEpisode` itself throws
+  (a malformed base field, not an analytics one) — `warn`: `episode assembly failed — settling
+  anyway`. Rare by construction: everything `buildEpisode` reads is state `settle` already computed
+  from closed enums and numbers already in hand.
+- **A per-stage breakdown collapses to one `__prior__` row.** Not a failure at all: a CONTINUED
+  run's earlier sitting(s) are folded into one collapsed slot rather than kept as separate rows
+  (`src/intelligence-payload.ts`'s own "cross-sitting stage-fidelity limit" note) — the run's TOTAL
+  spend (`observedModelUsage`) still includes it, only the per-stage attribution for anything before
+  the current sitting is lost. Expected on any run with a park in its history; nothing to fix.
+- **An episode never reaches the server at all, despite building successfully.** The pending-episode
+  spool (`~/.noriq/episode-pending.json`, described in the very next section) evicted it before a
+  drain ever delivered it — `warn`: `pending episode evicted from spool`, naming which axis
+  (`age`/`count`/`bytes`) and the entry's `scopeId`/`runId`/`enqueuedAt`. Only reachable on a daemon
+  offline long enough, or under sustained delivery failure, to actually hit one of those three
+  bounds — see `episode-pending.ts`'s own doc for the measured sizes behind them.
+
 ## Episode retries and verification-report retries — no CLI command, and that's deliberate
 
 Two OTHER bounded, restart-surviving queues live beside the index journal and behave differently

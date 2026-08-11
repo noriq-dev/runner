@@ -174,11 +174,28 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
   const memoryBrief = renderMemoryEvidence(pack, { audience: 'reviewer' }).text;
   // RUN-247: captured HERE, not in `prepare.ts` — this IS the point the pack is handed to the
   // agent, and `authorRendered` is the only place this process knows whether that hand-off was cut.
-  const contextConsumption = buildContextConsumption({
-    retrieval: input.contextPack,
-    verifiedContextPack: input.verifiedContextPack,
-    rendered: authorRendered,
-  });
+  //
+  // RUN-251: guarded — a throw here must cost only this one metric, never the brief itself. Unlike
+  // every other analytics capture in this codebase, this one sits on the run's CRITICAL PATH: it
+  // runs inside `buildRunBrief`, which `prepare` awaits unguarded, and `prepare` failing is fatal
+  // for a continuation resume (a brief that cannot be rebuilt deliberately fails the run — see this
+  // module's own top-of-file doc). The `settle`-stage `changeStats` catch (RUN-245) is the
+  // precedent this restates one stage earlier: an analytics bug must degrade to a missing metric,
+  // never take the run down with it.
+  let contextConsumption: IntelligenceContextConsumptionMetric | null;
+  try {
+    contextConsumption = buildContextConsumption({
+      retrieval: input.contextPack,
+      verifiedContextPack: input.verifiedContextPack,
+      rendered: authorRendered,
+    });
+  } catch (err) {
+    host.log.warn('context consumption metric failed to build — briefing without it', {
+      runId: run.id,
+      err: String(err),
+    });
+    contextConsumption = null;
+  }
 
   const buildPrompt = ((specBlock, forVerify, shape, ledger) =>
     assemblePrompt(run, repo.manifest, {

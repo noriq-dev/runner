@@ -155,6 +155,35 @@ const COST_NOT_REPORTED =
  */
 
 /**
+ * The vendored envelopes' own numeric domains, enforced here for the reason `change-stats.ts`'s
+ * identical `uploadable` guard exists (RUN-251): a value TypeScript accepts and the wire REJECTS.
+ * `IntelligenceIntegerMetric` refines to `int().nonnegative()` and `IntelligenceNumberMetric` to
+ * `finite().nonnegative()`, and a refine failure does not drop the offending metric — it fails
+ * `UploadedEpisodeIntelligence`'s parse at `toEnrichmentPayload`, which drops the WHOLE
+ * `intelligence` field: every stage, the verify clocks, the change stats and the context-consumption
+ * fact, for one bad number on one slot.
+ *
+ * Live-reachable, measured rather than assumed, which is why this guard was added after RUN-248
+ * deliberately declined to add one. `DriverTelemetry`'s token counts are not validated at their
+ * source: `drivers/codex.ts` builds its `usage` event as `total.inputTokens ?? 0` — a raw cast off
+ * the app-server's JSON notification, where `??` guards null and undefined and nothing else, so a
+ * non-integer or a string coerced into arithmetic flows straight through. That vendor's notification
+ * shape has already changed twice inside this repo's own lifetime (the 0.142.x/0.144.x split
+ * `codex.ts` documents), so a field's TYPE changing is an ordinary event here, not a hypothetical.
+ *
+ * Degrade the one metric, never repair the number and never lose its neighbours:
+ * may-miss-never-invent, the order of harms this metric family prices everywhere.
+ */
+const uploadableInt = (v: number): boolean => Number.isSafeInteger(v) && v >= 0;
+const uploadableNumber = (v: number): boolean => Number.isFinite(v) && v >= 0;
+
+/** The four token classes `totalTokens` sums — checked individually, per this guard's own doc. */
+const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens'] as const;
+
+const outOfDomain = (field: string, v: number): string =>
+  `the driver reported a ${field} of ${v}, which is not a value the metric envelope can carry`;
+
+/**
  * One slot's `DriverTelemetry`, read as an `EpisodeStageFact`.
  *
  * `elapsedMs` is always `unavailable`: `RunTally` charges active seconds to the RUN
@@ -173,12 +202,29 @@ export function stageFactFromTelemetry(slot: string, t: DriverTelemetry): Episod
   const spent = hasSpend(t);
   const costReported = t.modelUsage != null || t.costUsd > 0;
 
-  const tokens = metric(spent, totalTokens(t), slot, NO_TELEMETRY) as IntelligenceIntegerMetric;
+  // Checked per COMPONENT, never on the sum — measured, and the sum hides exactly what matters:
+  // a NaN component makes `totalTokens` NaN, which `hasSpend`'s `> 0` reads as "did not spend" and
+  // would report as `NO_TELEMETRY` ("the driver said nothing") when the driver in fact said
+  // something unusable; and a NEGATIVE component is absorbed into a positive total that then passes
+  // an integer check and books as `complete` — a wrong number wearing a measured one's clothes.
+  // Same reason `change-stats.ts` guards each of its four fields rather than their churn.
+  const badToken = TOKEN_FIELDS.find((f) => !uploadableInt(t[f]));
+  const tokenTotal = totalTokens(t);
+  const tokens = metric(
+    badToken === undefined && spent,
+    tokenTotal,
+    slot,
+    badToken !== undefined ? outOfDomain(badToken, t[badToken]) : NO_TELEMETRY,
+  ) as IntelligenceIntegerMetric;
   const costUSD = metric(
-    spent && costReported,
+    uploadableNumber(t.costUsd) && spent && costReported,
     t.costUsd,
     slot,
-    spent ? COST_NOT_REPORTED : NO_TELEMETRY,
+    !uploadableNumber(t.costUsd)
+      ? outOfDomain('costUsd', t.costUsd)
+      : spent && !costReported
+        ? COST_NOT_REPORTED
+        : NO_TELEMETRY,
   ) as IntelligenceNumberMetric;
 
   return {

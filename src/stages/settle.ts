@@ -292,23 +292,40 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     });
     // The narrow Project Intelligence payload (RUN-284) — assembled from facts the run's own
     // tally already accumulated (RUN-243's `stageFacts()`, RUN-242's verify durations, actually
-    // KEPT since this task). Wrapped in the SAME try as `buildEpisode` above: a throw here must
-    // cost only the intelligence half of this sitting's episode, never the run's own outcome,
-    // exactly like the episode assembly it rides alongside.
+    // KEPT since this task).
+    //
+    // RUN-251: in its OWN try, nested inside `episode`'s — NOT the same try as `buildEpisode`
+    // above, despite what an earlier version of this comment claimed. Sharing one try meant a
+    // throw here skipped `host.recordEpisode?.(episode, intelligence)` entirely, losing the
+    // EPISODE too — not merely "the intelligence half" the old comment promised. That is exactly
+    // the failure this task's own acceptance criterion rules out ("the episode still uploads when
+    // analytics throws, carrying its six real enrichment fields, with the analytics field simply
+    // absent"). Nesting is what makes the promise true: a throw in this block costs only
+    // `intelligence` (falls back to `undefined`, the same shape `buildUploadedIntelligence` already
+    // returns for "nothing to report"), while `episode` — already built above — still reaches
+    // `recordEpisode`.
     // `stages` and the run-wide `total` come off ONE call (RUN-248) — the same addition
     // (`RunTally.stageFacts()`'s own doc: "structural, not asserted to agree"), so `observedModelUsage`
     // and the per-stage breakdown can never read two different tallies of the same run.
-    const { stages, total: runTotal } = ctx.tally.stageFacts();
-    const intelligence = buildUploadedIntelligence({
-      stages,
-      verifyDurations: ctx.tally.verifyDurations(),
-      changes,
-      runTotal,
-      // RUN-247: captured at the render point (`stages/brief.ts`), carried onto the pipeline
-      // unchanged — absent whenever this sitting made no assertion (`RunPipeline.contextConsumption`
-      // 's own doc), in which case the metric is simply omitted from the upload.
-      ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
-    });
+    let intelligence: ReturnType<typeof buildUploadedIntelligence> | undefined;
+    try {
+      const { stages, total: runTotal } = ctx.tally.stageFacts();
+      intelligence = buildUploadedIntelligence({
+        stages,
+        verifyDurations: ctx.tally.verifyDurations(),
+        changes,
+        runTotal,
+        // RUN-247: captured at the render point (`stages/brief.ts`), carried onto the pipeline
+        // unchanged — absent whenever this sitting made no assertion (`RunPipeline.contextConsumption`
+        // 's own doc), in which case the metric is simply omitted from the upload.
+        ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
+      });
+    } catch (err) {
+      host.log.warn('episode intelligence assembly failed — delivering the episode without it', {
+        runId: run.id,
+        err: String(err),
+      });
+    }
     host.recordEpisode?.(episode, intelligence);
   } catch (err) {
     host.log.warn('episode assembly failed — settling anyway', { runId: run.id, err: String(err) });

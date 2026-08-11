@@ -736,9 +736,23 @@ export class RunTally {
   private readonly verifyDurationEvents: IntelligenceDurationMs[] = [];
 
   /** Record one verify-duration observation — every call site that used to only log `timedVerify`'s
-   *  callback now also calls this, so `settle` can read what RUN-242 was already measuring. */
+   *  callback now also calls this, so `settle` can read what RUN-242 was already measuring.
+   *
+   * RUN-251: made TOTAL rather than trusted total. An ordinary array push cannot throw today, but
+   * two of this method's three call sites run inside `timedVerify`'s own `finally` block
+   * (`verify.ts`'s doc: "onDuration always fires before it propagates, but it still propagates") —
+   * a throw THERE would not merely cost this metric, it would replace a clean PASS's return value
+   * with a fresh exception, turning a passing verify into a thrown error. Guarding at the method
+   * makes every call site total at once, rather than trusting each caller to remember the danger of
+   * the `finally` it sits in. */
   recordVerifyDuration(d: IntelligenceDurationMs): void {
-    this.verifyDurationEvents.push(d);
+    try {
+      this.verifyDurationEvents.push(d);
+    } catch {
+      // Best-effort, like every other analytics capture in this codebase: a bad push costs this one
+      // observation, never the verify result it was timing. `RunTally` carries no logger to report
+      // through — the same reason `guard`/`clockGuard` above stay silent on their own edges.
+    }
   }
 
   /** Every verify-duration envelope recorded so far, in observation order. */
