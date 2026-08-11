@@ -23,7 +23,11 @@ type ExecutionState<Park extends ParkedExecution> =
   | { readonly kind: 'active'; readonly run: Pick<Run, 'id' | 'execution'>; readonly park: Park | null }
   | { readonly kind: 'parked'; readonly park: Park }
   | { readonly kind: 'resuming'; readonly park: Park }
-  | { readonly kind: 'terminal'; readonly park: Park | null; readonly active: boolean };
+  | {
+      readonly kind: 'terminal';
+      readonly park: Park | null;
+      readonly activeRun: Pick<Run, 'id' | 'execution'> | null;
+    };
 
 /**
  * The source of truth for local execution ownership (RUN-265).
@@ -97,7 +101,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
         : current?.kind === 'parked' || current?.kind === 'resuming'
           ? current.park
           : null;
-    this.states.set(runId, { kind: 'terminal', park, active: false });
+    this.states.set(runId, { kind: 'terminal', park, activeRun: null });
     try {
       await this.removeTerminalPark(runId);
     } catch (err) {
@@ -116,7 +120,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       if (current?.kind === 'terminal') {
         // Terminality can arrive while the disk write yields. Preserve the just-written record so
         // the queued cleanup removes it, and tell the caller it did not successfully park.
-        this.states.set(entry.run.id, { kind: 'terminal', park: entry, active: current.active });
+        this.states.set(entry.run.id, { kind: 'terminal', park: entry, activeRun: current.activeRun });
         return false;
       }
       if (current?.kind === 'active') {
@@ -146,6 +150,9 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
     for (const state of this.states.values()) {
       if (state.kind === 'active') bind(state.run);
       else if (state.kind === 'parked' || state.kind === 'resuming') bind(state.park.run);
+      // A cancellation stops new parks immediately, but its process has not stopped yet. Keep that
+      // active execution reserved until its supervising stack reaches `complete()` (RUN-265).
+      else if (state.kind === 'terminal' && state.activeRun) bind(state.activeRun);
     }
     return registry;
   }
@@ -172,7 +179,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
           this.states.set(runId, {
             kind: 'terminal',
             park: null,
-            active: terminal?.kind === 'terminal' ? terminal.active : true,
+            activeRun: terminal?.kind === 'terminal' ? terminal.activeRun : null,
           });
           return null;
         }
@@ -184,7 +191,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
           this.states.set(runId, {
             kind: 'terminal',
             park: known,
-            active: terminal?.kind === 'terminal' ? terminal.active : true,
+            activeRun: terminal?.kind === 'terminal' ? terminal.activeRun : null,
           });
         } else {
           this.states.set(runId, { kind: 'parked', park: known });
@@ -204,7 +211,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       } else if (current?.kind === 'parked' || current?.kind === 'resuming') {
         this.states.delete(runId);
       } else if (current?.kind === 'terminal') {
-        this.states.set(runId, { kind: 'terminal', park: null, active: current.active });
+        this.states.set(runId, { kind: 'terminal', park: null, activeRun: current.activeRun });
       }
       return park;
     });
@@ -221,8 +228,9 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
           : null;
     // `resuming` has not spawned a replacement stack yet. If terminality wins while its delete
     // yields, resume returns null and nobody will later call complete(), so it is detached here.
-    const active = current?.kind === 'active' ? true : current?.kind === 'terminal' ? current.active : false;
-    this.states.set(runId, { kind: 'terminal', park, active });
+    const activeRun =
+      current?.kind === 'active' ? current.run : current?.kind === 'terminal' ? current.activeRun : null;
+    this.states.set(runId, { kind: 'terminal', park, activeRun });
     return this.removeTerminalPark(runId);
   }
 
@@ -233,8 +241,8 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       // must not let an old background cleanup erase a newer active owner.
       const current = this.states.get(runId);
       if (current?.kind === 'terminal') {
-        if (current.active) {
-          this.states.set(runId, { kind: 'terminal', park: null, active: true });
+        if (current.activeRun) {
+          this.states.set(runId, { kind: 'terminal', park: null, activeRun: current.activeRun });
         } else {
           this.states.delete(runId);
         }
@@ -253,7 +261,7 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       parks.map(async (park) => {
         const disposition = await classify(park).catch(() => 'unknown' as const);
         if (disposition !== 'terminal') return;
-        this.states.set(park.run.id, { kind: 'terminal', park, active: false });
+        this.states.set(park.run.id, { kind: 'terminal', park, activeRun: null });
         // Recovery joins the same durable terminal transition as a live stack. A failed deletion
         // retains its tombstone and is retried from the server's terminal fact on the next boot.
         await this.complete(park.run.id);

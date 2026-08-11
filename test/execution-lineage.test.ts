@@ -114,7 +114,7 @@ describe('resolveRunLineage', () => {
     expect(resolveRunLineage(run({ id: 'run_retry' }), lifecycle.registry()).ok).toBe(true);
   });
 
-  it('makes a terminal signal win over a late park after its server-state probe', async () => {
+  it('keeps an active cancellation reserved until its supervising stack completes', async () => {
     const parks = new Map<string, { run: Pick<Run, 'id' | 'execution'> }>();
     const lifecycle = new ExecutionLifecycle({
       park: async (park) => {
@@ -129,12 +129,16 @@ describe('resolveRunLineage', () => {
     });
 
     // The park-state probe belongs to a still-active supervisor. A directly cancelled detached
-    // park clears its tombstone immediately; this in-flight probe must keep it until completion.
+    // park releases immediately; an active process must retain ownership until completion.
     lifecycle.begin(run({ id: 'run_parked' }));
     await lifecycle.terminalizePark('run_parked');
+    expect(resolveRunLineage(run({ id: 'run_retry' }), lifecycle.registry())).toEqual({
+      ok: false,
+      reason: 'execution exe_1 is already bound to live run run_parked',
+    });
     expect(await lifecycle.park({ run: run({ id: 'run_parked' }) })).toBe(false);
     await lifecycle.complete('run_parked');
-    expect(lifecycle.registry()).toEqual(new Map());
+    expect(resolveRunLineage(run({ id: 'run_retry' }), lifecycle.registry()).ok).toBe(true);
   });
 
   it('serializes terminalization behind an already-writing park and removes it before releasing ownership', async () => {

@@ -1541,6 +1541,26 @@ describe('RunSupervisor', () => {
     await done;
   });
 
+  it('dispatches an explicit-null execution byte-identically to an older payload that omits it (RUN-265)', async () => {
+    const explicit = harness();
+    const explicitDone = explicit.supervisor.supervise(makeRun({ kind: 'scope', execution: null }));
+    await flush();
+    explicit.claude.complete('done');
+    await explicitDone;
+
+    const { execution: _legacyExecution, ...olderPayload } = makeRun({ kind: 'scope' });
+    const omitted = harness();
+    const omittedDone = omitted.supervisor.supervise(olderPayload as Run);
+    await flush();
+    omitted.claude.complete('done');
+    await omittedDone;
+
+    // Hooks are in-process closures, not dispatch data. Every serializable input to the driver
+    // must remain byte-for-byte equal when an older server has no additive execution field.
+    const dispatchBytes = ({ handlers: _handlers, ...start }: DriverStartOptions) => JSON.stringify(start);
+    expect(dispatchBytes(omitted.claude.starts[0]!)).toBe(dispatchBytes(explicit.claude.starts[0]!));
+  });
+
   it('hands a lock enforcer only to a driver with in-process hooks (RUN-110)', async () => {
     // claude declares toolHooks → gets the reactive PreToolUse enforcer (RUN-101)
     const ha = harness();
