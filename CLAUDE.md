@@ -33,6 +33,95 @@ npx vitest run -t 'merges budget per-dimension'   # one test by name
 
 Vitest has no config file — defaults, `test/*.test.ts` mirroring `src/*.ts`.
 
+## Invariants (do not regress these)
+
+These are the design, not incidental behavior — [THREAT-MODEL.md](THREAT-MODEL.md) is the authority
+and should be updated alongside any change here.
+
+- **No agent ever gets push credentials, and the daemon never merges into the protected branch.**
+  `security.ts` `sanitizedAgentEnv` strips `NORIQ_TOKEN` and cloud/git tokens from the child env and
+  disables the git credential helper/prompt — so the *agent* half is enforced by absence and is
+  absolute.
+  The *daemon* half is not, and has not been since RUN-27: with `[land].autoPush` a repo opts the
+  daemon into pushing — but only the working branch `[land].branch` names, and RUN-28 then opens a
+  **merge request** rather than merging. The human boundary moved from `git push` to *approving the
+  merge*, deliberately: freeing humans from per-run clicks is the point of the product, and a
+  boundary nobody can move is just a boundary nobody uses.
+  ~~The daemon never pushes~~ was the v1 wording and is simply false now. Do not restore it.
+- **Bare `Bash` and `danger-full-access` are never granted *uninvited*.** By default the mapping only
+  emits `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex). Since RUN-68 a repo's committed
+  manifest may opt a kind into the driver's auto mode (`[permissions.<kind>] auto = true` → Claude
+  bypass-permissions; codex `danger-full-access` for write kinds only) — the same deliberate
+  boundary-move as autoPush above. What survives auto by construction: `write` (read-only stays
+  read-only), `deny`, env credential stripping, and the server-enforced Noriq tool floor (RUN-47).
+  ~~never granted~~ was the pre-RUN-68 wording; do not restore it — see `mapPermission`, `mapSandbox`.
+- **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
+- **Model credentials, git/forge credentials, and unrelated machine secrets never leave the box —
+  one explicit, committed exception.** `sanitizedAgentEnv` strips the agent's env; `src/index-deny.ts`
+  `isDeniedIndexPath` is a second, independent, non-overridable floor under the one thing that CAN
+  cross now: on a repo's own `[index].enabled = true`, this daemon reads a bounded, deny-filtered,
+  confined slice of that repo's own SOURCE (never a credential) for Project Memory. `index-redact.ts`
+  is a THIRD floor at a different grain (RUN-218) — the deny list decides whether a path may be
+  read, that decides whether an extracted config VALUE may become searchable text, and the direction
+  of caution inverts there: unsure means withhold. **The daemon now indexes and uploads UNATTENDED**
+  (RUN-222, proven live): once per `[index].enabled` repo at startup, after every successful
+  landing/publish, and on one shared bounded poll — so source crosses the wire without an operator
+  typing anything. ~~The WRITE half has no caller~~ was the Phase-3 wording and is simply false;
+  do not restore it. Only the debug `index-repo` still cannot upload, by construction. What the
+  floors do NOT cover, measured rather than assumed: an UNMARKED secret in source. RUN-258/263
+  withhold a whole file's content on unambiguous credential markers (PEM, JWT, known issuer
+  prefixes, each requiring a real payload after the prefix), so a hardcoded `ghp_…` no longer ships
+  — but a plain password or a bare hex key carries no marker to find, and the entropy heuristics
+  that might catch it were ruled out for whole-file use because they over-redact real source.
+  Committed generated content is now excluded by an overridable default (RUN-262
+  `DEFAULT_EXCLUDE_GLOBS`, opt out with `excludeDefaults = false`), so a lockfile or checked-in
+  `dist/` is skipped unless a repo asks for it. What that does NOT mean, measured rather
+  than assumed: the daemon's own path never walks `node_modules`, because `leaseIndexSnapshot` mints
+  a DETACHED WORKTREE holding only tracked files — 243 files on this repo, against 6943 for
+  `index-repo --path .` pointed at a live working directory. Perforce reads the depot and Diversion
+  its API, so all three backends are tracked-only by construction; only the operator debug command
+  can see an untracked tree at all. "Only the OAuth token crosses the wire" was the pre-RUN-207 shorthand for this
+  line; it is narrower now, not false, and THREAT-MODEL.md's "Repository intelligence upload
+  (`[index]`)" section states the boundary — don't restate it more strongly than that there.
+- **The verify agent executes but never edits** — authorship separation is the point of the gate.
+  Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
+  `write = false` for any non-producing workflow at every permission site, so no manifest — built-in
+  kind or custom `[workflow.<name>]` — can hand a verify/scope posture the ability to edit.
+  "Every site" only became true at RUN-158: the *inline* reviewer (`runReviewer`) was handed
+  `[permissions.verify]` raw, which is the spawn that gates every build. The clamp now also runs
+  inside `startAgent`, the single spawn chokepoint, so a new call site inherits the floor instead of
+  having to remember it — clamp at the site anyway, for legibility.
+  What the floor buys, precisely: the **edit tools** are denied (Claude) and the write sandbox is
+  read-only (Codex). It is not "cannot alter a file" — `auto = true` grants unrestricted Bash in a
+  writable tree, by the same deliberate opt-in as `autoPush`. THREAT-MODEL.md states the boundary;
+  don't restate it more strongly than that.
+- **One worktree per unit of concurrent work**; never two RUNS in one checkout; never force-delete
+  work that exists nowhere else.
+  ~~One worktree per Run~~ was the wording until RUN-149, and the amendment is narrow: the rule that
+  carries the isolation is *never two runs in one checkout*, and a run's own concurrent steps do not
+  violate it — they are one run's sessions, under one identity, one budget and one lock scope.
+  A SEQUENTIAL chain still shares the run's single workspace (RUN-168), because steps that cannot
+  race need no isolating. Only steps a wave schedules to overlap take one each, and they take it for
+  a reason the declaration cannot supply: `anticipatedFiles` is briefed as "a starting point, not a
+  fence", so two steps in a wave *can* reach for the same file despite declaring otherwise. The
+  overlap check decides what is worth running together; separate workspaces are what make running
+  together safe.
+- Merging happens only into the branch `[land].branch` names, only after the gate passed *rebased onto
+  it*, and only locally.
+
+## Conventions
+
+- ESM, `type: module`, Node ≥20, strict TS with `noUncheckedIndexedAccess` and `verbatimModuleSyntax`
+  (so `import type` for types). Biome: single quotes, 2-space, 110 cols.
+- Imports are extensionless (`./worktree`) — the bundler resolves them; the package ships as one
+  `dist/cli.js` with `@anthropic-ai/claude-agent-sdk` kept external (it spawns a binary and carries its
+  own subtree).
+- **Dependency injection is the testing strategy**: drivers take a `queryFn`, worktrees a `GitRunner`,
+  verify a `VerifyExec`, ws-client a `WsFactory`. Tests never touch the real SDK, network, or git —
+  keep new subsystems injectable the same way.
+- Comments here carry design rationale and reference `RUN-xx` plan tickets. Match that register: state
+  the constraint or the trade, not what the line does.
+
 ## Architecture
 
 `src/cli.ts` is the binary entry point; `src/index.ts` is the library surface (re-exports everything, so
@@ -406,92 +495,3 @@ the clock has not started (`runCoordinate` /
   `ManifestStore` re-reads it per Run, so editing it takes effect on the next dispatch with no restart.
 - `.noriq/workflows/*.toml` / `~/.noriq/workflows/*.toml` — project and machine-local workflow
   definitions, merged and re-read by `WorkflowStore` for each dispatch.
-
-## Invariants (do not regress these)
-
-These are the design, not incidental behavior — [THREAT-MODEL.md](THREAT-MODEL.md) is the authority
-and should be updated alongside any change here.
-
-- **No agent ever gets push credentials, and the daemon never merges into the protected branch.**
-  `security.ts` `sanitizedAgentEnv` strips `NORIQ_TOKEN` and cloud/git tokens from the child env and
-  disables the git credential helper/prompt — so the *agent* half is enforced by absence and is
-  absolute.
-  The *daemon* half is not, and has not been since RUN-27: with `[land].autoPush` a repo opts the
-  daemon into pushing — but only the working branch `[land].branch` names, and RUN-28 then opens a
-  **merge request** rather than merging. The human boundary moved from `git push` to *approving the
-  merge*, deliberately: freeing humans from per-run clicks is the point of the product, and a
-  boundary nobody can move is just a boundary nobody uses.
-  ~~The daemon never pushes~~ was the v1 wording and is simply false now. Do not restore it.
-- **Bare `Bash` and `danger-full-access` are never granted *uninvited*.** By default the mapping only
-  emits `dontAsk` (Claude) / `read-only` | `workspace-write` (Codex). Since RUN-68 a repo's committed
-  manifest may opt a kind into the driver's auto mode (`[permissions.<kind>] auto = true` → Claude
-  bypass-permissions; codex `danger-full-access` for write kinds only) — the same deliberate
-  boundary-move as autoPush above. What survives auto by construction: `write` (read-only stays
-  read-only), `deny`, env credential stripping, and the server-enforced Noriq tool floor (RUN-47).
-  ~~never granted~~ was the pre-RUN-68 wording; do not restore it — see `mapPermission`, `mapSandbox`.
-- **The agent reaches Noriq via MCP, not the shell** — the token rides the MCP transport's auth header.
-- **Model credentials, git/forge credentials, and unrelated machine secrets never leave the box —
-  one explicit, committed exception.** `sanitizedAgentEnv` strips the agent's env; `src/index-deny.ts`
-  `isDeniedIndexPath` is a second, independent, non-overridable floor under the one thing that CAN
-  cross now: on a repo's own `[index].enabled = true`, this daemon reads a bounded, deny-filtered,
-  confined slice of that repo's own SOURCE (never a credential) for Project Memory. `index-redact.ts`
-  is a THIRD floor at a different grain (RUN-218) — the deny list decides whether a path may be
-  read, that decides whether an extracted config VALUE may become searchable text, and the direction
-  of caution inverts there: unsure means withhold. **The daemon now indexes and uploads UNATTENDED**
-  (RUN-222, proven live): once per `[index].enabled` repo at startup, after every successful
-  landing/publish, and on one shared bounded poll — so source crosses the wire without an operator
-  typing anything. ~~The WRITE half has no caller~~ was the Phase-3 wording and is simply false;
-  do not restore it. Only the debug `index-repo` still cannot upload, by construction. What the
-  floors do NOT cover, measured rather than assumed: an UNMARKED secret in source. RUN-258/263
-  withhold a whole file's content on unambiguous credential markers (PEM, JWT, known issuer
-  prefixes, each requiring a real payload after the prefix), so a hardcoded `ghp_…` no longer ships
-  — but a plain password or a bare hex key carries no marker to find, and the entropy heuristics
-  that might catch it were ruled out for whole-file use because they over-redact real source.
-  Committed generated content is now excluded by an overridable default (RUN-262
-  `DEFAULT_EXCLUDE_GLOBS`, opt out with `excludeDefaults = false`), so a lockfile or checked-in
-  `dist/` is skipped unless a repo asks for it. What that does NOT mean, measured rather
-  than assumed: the daemon's own path never walks `node_modules`, because `leaseIndexSnapshot` mints
-  a DETACHED WORKTREE holding only tracked files — 243 files on this repo, against 6943 for
-  `index-repo --path .` pointed at a live working directory. Perforce reads the depot and Diversion
-  its API, so all three backends are tracked-only by construction; only the operator debug command
-  can see an untracked tree at all. "Only the OAuth token crosses the wire" was the pre-RUN-207 shorthand for this
-  line; it is narrower now, not false, and THREAT-MODEL.md's "Repository intelligence upload
-  (`[index]`)" section states the boundary — don't restate it more strongly than that there.
-- **The verify agent executes but never edits** — authorship separation is the point of the gate.
-  Since RUN-118 this is code, not an honor system: `clampPermissionToWorkflow` (workflow.ts) forces
-  `write = false` for any non-producing workflow at every permission site, so no manifest — built-in
-  kind or custom `[workflow.<name>]` — can hand a verify/scope posture the ability to edit.
-  "Every site" only became true at RUN-158: the *inline* reviewer (`runReviewer`) was handed
-  `[permissions.verify]` raw, which is the spawn that gates every build. The clamp now also runs
-  inside `startAgent`, the single spawn chokepoint, so a new call site inherits the floor instead of
-  having to remember it — clamp at the site anyway, for legibility.
-  What the floor buys, precisely: the **edit tools** are denied (Claude) and the write sandbox is
-  read-only (Codex). It is not "cannot alter a file" — `auto = true` grants unrestricted Bash in a
-  writable tree, by the same deliberate opt-in as `autoPush`. THREAT-MODEL.md states the boundary;
-  don't restate it more strongly than that.
-- **One worktree per unit of concurrent work**; never two RUNS in one checkout; never force-delete
-  work that exists nowhere else.
-  ~~One worktree per Run~~ was the wording until RUN-149, and the amendment is narrow: the rule that
-  carries the isolation is *never two runs in one checkout*, and a run's own concurrent steps do not
-  violate it — they are one run's sessions, under one identity, one budget and one lock scope.
-  A SEQUENTIAL chain still shares the run's single workspace (RUN-168), because steps that cannot
-  race need no isolating. Only steps a wave schedules to overlap take one each, and they take it for
-  a reason the declaration cannot supply: `anticipatedFiles` is briefed as "a starting point, not a
-  fence", so two steps in a wave *can* reach for the same file despite declaring otherwise. The
-  overlap check decides what is worth running together; separate workspaces are what make running
-  together safe.
-- Merging happens only into the branch `[land].branch` names, only after the gate passed *rebased onto
-  it*, and only locally.
-
-## Conventions
-
-- ESM, `type: module`, Node ≥20, strict TS with `noUncheckedIndexedAccess` and `verbatimModuleSyntax`
-  (so `import type` for types). Biome: single quotes, 2-space, 110 cols.
-- Imports are extensionless (`./worktree`) — the bundler resolves them; the package ships as one
-  `dist/cli.js` with `@anthropic-ai/claude-agent-sdk` kept external (it spawns a binary and carries its
-  own subtree).
-- **Dependency injection is the testing strategy**: drivers take a `queryFn`, worktrees a `GitRunner`,
-  verify a `VerifyExec`, ws-client a `WsFactory`. Tests never touch the real SDK, network, or git —
-  keep new subsystems injectable the same way.
-- Comments here carry design rationale and reference `RUN-xx` plan tickets. Match that register: state
-  the constraint or the trade, not what the line does.

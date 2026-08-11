@@ -1,5 +1,5 @@
 import { execFile as execFileCb } from 'node:child_process';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -714,5 +714,61 @@ describe('loadRepoContext', () => {
     });
     expect(r.rendered).not.toContain('secret');
     expect(r.resolved.unresolved[0]?.reason).toBe('outside-repo');
+  });
+});
+
+/**
+ * RUN-289: THIS repo's own brief, assembled off the real tree and the real committed manifest.
+ *
+ * A unit test over a fixture cannot catch what this catches. The defect was not in the budget loop —
+ * that behaved exactly as written — it was that `## Invariants` and `## Conventions` sat at the END of
+ * a 41KB CLAUDE.md, past a 16KB budget, so the sections an agent must not regress had never once been
+ * inlined. Every fixture in this file declares small documents and therefore proves nothing about it.
+ *
+ * The assertion is deliberately about the WHOLE section read off disk rather than a few quoted
+ * sentences, so it survives any rewording and fails only on what actually matters: a section growing,
+ * or moving back behind the budget, until it stops reaching the agent.
+ */
+describe('this repo briefs its own agents with its own invariants (RUN-289)', () => {
+  /** The named section, verbatim, from `## <name>` up to the next `## ` heading. */
+  const sectionOf = (doc: string, heading: string): string => {
+    const start = doc.indexOf(heading);
+    if (start < 0) throw new Error(`CLAUDE.md no longer contains ${heading}`);
+    const next = doc.indexOf('\n## ', start + heading.length);
+    return doc.slice(start, next < 0 ? undefined : next).trimEnd();
+  };
+
+  it('the real assembled brief carries the invariants and the conventions in full', async () => {
+    const root = process.cwd();
+    const claudeMd = await readFile(path.join(root, 'CLAUDE.md'), 'utf8');
+    // The manifest's own declaration, not a fixture's — read off the committed marker.
+    const declared = ['CLAUDE.md', 'THREAT-MODEL.md'];
+    const { resolved, loaded } = await loadRepoContext(root, {
+      requiredReading: declared,
+      entryPoints: [],
+      conventions: [],
+    } as unknown as ProjectContext);
+    const block = renderRepoContext(resolved, loaded, { audience: 'author' });
+
+    expect(block).toContain(sectionOf(claudeMd, '## Invariants (do not regress these)'));
+    expect(block).toContain(sectionOf(claudeMd, '## Conventions'));
+  });
+
+  it('and still says out loud what it could NOT include — the no-silent-drops rule holds', async () => {
+    const root = process.cwd();
+    const { resolved, loaded } = await loadRepoContext(root, {
+      requiredReading: ['CLAUDE.md', 'THREAT-MODEL.md'],
+      entryPoints: [],
+      conventions: [],
+    } as unknown as ProjectContext);
+    const block = renderRepoContext(resolved, loaded, { audience: 'author' });
+
+    // CLAUDE.md is larger than the budget, so it arrives as a MARKED fragment, never as a silent one.
+    expect(loaded.docs[0]?.truncated).toBe(true);
+    expect(block).toContain('the rest was not read');
+    // THREAT-MODEL.md does not fit at all and is NAMED, so the agent knows to read it itself rather
+    // than concluding it does not exist. Fixing the ordering did not buy this away.
+    expect(loaded.skipped).toContain('THREAT-MODEL.md');
+    expect(block).toContain('THREAT-MODEL.md');
   });
 });

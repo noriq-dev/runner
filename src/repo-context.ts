@@ -371,6 +371,28 @@ export async function discoverAgentInstructions(
  * truncation by ordering its list. The file that crosses the line is cut and MARKED; everything
  * after it is skipped and named. Silence in either case would be the worst outcome: an agent that
  * believes it has read a document it only received half of will confidently apply half a rule.
+ *
+ * **First-come-spend-all is a DECISION, not an accident of the loop** (RUN-289 — recorded because it
+ * reads like one, and the alternative had to be measured before it could be declined).
+ *
+ * The tempting alternative is a fair share: `budget / n` per declared file, so the first document
+ * cannot starve every later one. Measured against this repo — two declared documents, 41KB and 68KB,
+ * against a 16KB budget — sharing is strictly WORSE. First-come delivers one coherent prefix plus a
+ * named skip; sharing delivers two fragments, neither of which is usable, and doubles the
+ * half-a-rule warning this loop exists to avoid. A document is coherent as a PREFIX and incoherent
+ * as one of n slices, so under real scarcity the fair policy converts one usable document into
+ * several unusable ones.
+ *
+ * It also destroys the only lever a repo actually has. Ordering `requiredReading` is what a repo uses
+ * to say which document matters most; under a fair share, ordering stops changing anything at all.
+ *
+ * What the scarcity DOES demand is that a repo's own most load-bearing content sit near the front of
+ * the file it lives in — which is a fact about writing the document, not about this loop. RUN-289's
+ * other half is exactly that: this repo's `## Invariants` and `## Conventions` sat at the very END of
+ * a 41KB CLAUDE.md, past a 16KB budget, so the sections an agent must not regress had never once been
+ * inlined into a brief. Moving them ahead of the long architecture prose fixed it with no code change
+ * and no duplicated copy of a rule to drift — where raising the budget could not have (110KB of
+ * declared reading does not fit any defensible ceiling) and a fair share would have made it worse.
  */
 export async function loadRepoDocs(
   root: string,
