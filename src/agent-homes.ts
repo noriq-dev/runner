@@ -10,6 +10,7 @@ import path from 'node:path';
  * under Noriq's own state directory: still user-owned and configurable, but scoped to Runner.
  */
 export const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.noriq', 'codex');
+export const DEFAULT_CLAUDE_HOME = path.join(os.homedir(), '.noriq', 'claude');
 
 /** Create a credential-bearing agent home privately, and reject the direct symlink escape hatch. */
 export function ensurePrivateAgentHome(home: string): void {
@@ -39,6 +40,22 @@ export interface CodexLoginOptions {
   spawnFn?: InteractiveSpawn;
 }
 
+export interface ClaudeLoginOptions {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  spawnFn?: InteractiveSpawn;
+}
+
+async function waitForLogin(child: Pick<ChildProcess, 'once'>, tool: 'codex' | 'claude'): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', (err: Error) => reject(new Error(`could not start ${tool} login: ${err.message}`)));
+    child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${tool} login failed (${signal ? `signal ${signal}` : `exit ${code}`})`));
+    });
+  });
+}
+
 /** Authenticate the Codex CLI inside Runner's isolated home, never the interactive global home. */
 export async function loginCodex(options: CodexLoginOptions = {}): Promise<void> {
   const home = options.home ?? DEFAULT_CODEX_HOME;
@@ -47,11 +64,16 @@ export async function loginCodex(options: CodexLoginOptions = {}): Promise<void>
     env: { ...(options.env ?? process.env), CODEX_HOME: home },
     stdio: 'inherit',
   });
-  await new Promise<void>((resolve, reject) => {
-    child.once('error', (err: Error) => reject(new Error(`could not start codex login: ${err.message}`)));
-    child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
-      if (code === 0) resolve();
-      else reject(new Error(`codex login failed (${signal ? `signal ${signal}` : `exit ${code}`})`));
-    });
+  await waitForLogin(child, 'codex');
+}
+
+/** Authenticate Claude inside Runner's isolated home, never the interactive global home. */
+export async function loginClaude(options: ClaudeLoginOptions = {}): Promise<void> {
+  const home = options.home ?? DEFAULT_CLAUDE_HOME;
+  ensurePrivateAgentHome(home);
+  const child = (options.spawnFn ?? (spawn as InteractiveSpawn))('claude', ['auth', 'login'], {
+    env: { ...(options.env ?? process.env), CLAUDE_CONFIG_DIR: home },
+    stdio: 'inherit',
   });
+  await waitForLogin(child, 'claude');
 }

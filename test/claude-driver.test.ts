@@ -1,5 +1,6 @@
 import type { PermissionProfile } from '@noriq-dev/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_CLAUDE_HOME } from '../src/agent-homes';
 import { AsyncQueue } from '../src/async-queue';
 import {
   ClaudeDriver,
@@ -62,7 +63,7 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
   };
   const telemetry: DriverTelemetry[] = [];
   const texts: string[] = [];
-  const driver = new ClaudeDriver({ queryFn });
+  const driver = new ClaudeDriver({ queryFn, prepareClaudeHome: () => {} });
   const session = driver.start({
     runId: 'run_1',
     kind: 'build',
@@ -93,6 +94,43 @@ describe('driver capabilities (RUN-110)', () => {
       resumableSession: true,
       perModelTelemetry: true,
     });
+  });
+});
+
+describe('Runner-specific Claude home (RUN-291)', () => {
+  it('prepares the isolated home and loads only its user settings source', () => {
+    const prepared: string[] = [];
+    let options: SdkQueryOptions | undefined;
+    const driver = new ClaudeDriver({
+      claudeHome: '/runner/claude',
+      prepareClaudeHome: (home) => prepared.push(home),
+      queryFn: (args) => {
+        options = args.options;
+        return new FakeQuery(args.prompt, args.options);
+      },
+    });
+    driver.start({
+      runId: 'run_home',
+      kind: 'scope',
+      cwd: '/wt',
+      prompt: 'inspect',
+      permission: profile(),
+      env: { CLAUDE_CONFIG_DIR: '/operator/claude' },
+    });
+
+    expect(prepared).toEqual(['/runner/claude']);
+    expect(options?.env?.CLAUDE_CONFIG_DIR).toBe('/runner/claude');
+    expect(options?.settingSources).toEqual(['user']);
+    expect(options?.strictMcpConfig).toBe(true);
+  });
+
+  it('keeps resumed sessions inside the same Runner-specific home', () => {
+    const h = harness({ resumeSessionId: 'session_parked' });
+    const options = h.getFake().options as SdkQueryOptions;
+
+    expect(options.resume).toBe('session_parked');
+    expect(options.env?.CLAUDE_CONFIG_DIR).toBe(DEFAULT_CLAUDE_HOME);
+    expect(options.settingSources).toEqual(['user']);
   });
 });
 
@@ -528,6 +566,14 @@ describe('Noriq MCP wiring', () => {
     // plugins — the operator's personal connectors and credentials, none of them in
     // the project manifest.
     expect(opts(harness()).strictMcpConfig).toBe(true);
+  });
+
+  it('loads only Runner-specific user settings, never workspace project/local settings', () => {
+    const options = opts(harness());
+    expect(options.env?.CLAUDE_CONFIG_DIR).toBe(DEFAULT_CLAUDE_HOME);
+    expect(options.settingSources).toEqual(['user']);
+    expect(options.settingSources).not.toContain('project');
+    expect(options.settingSources).not.toContain('local');
   });
 
   it('grants a build agent the Noriq tools it is told to use', () => {

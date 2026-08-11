@@ -1,5 +1,6 @@
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
+import { DEFAULT_CLAUDE_HOME, ensurePrivateAgentHome } from '../agent-homes';
 import { AsyncQueue } from '../async-queue';
 import type { LockEnforcer } from '../lock-hooks';
 import type { logger as Logger } from '../logger';
@@ -112,6 +113,8 @@ export interface SdkQueryOptions {
   hooks?: Partial<Record<'PreToolUse' | 'Stop' | 'SubagentStop', SdkHookMatcher[]>>;
   /** Ignore all ambient MCP config (user settings, .mcp.json, plugins). */
   strictMcpConfig?: boolean;
+  /** Filesystem settings sources. RUN-291 admits only Runner's dedicated user source. */
+  settingSources?: Array<'user' | 'project' | 'local'>;
   /**
    * Session id to resume — loads that conversation's history (RUN-30).
    *
@@ -363,6 +366,9 @@ export interface ClaudeDriverDeps {
   /** Injectable for tests; defaults to the real Agent SDK `query`. */
   queryFn?: QueryFn;
   logger?: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
+  /** Injectable so tests never create or chmod the operator's real ~/.noriq/claude. */
+  claudeHome?: string;
+  prepareClaudeHome?: (home: string) => void;
 }
 
 /**
@@ -395,13 +401,18 @@ export class ClaudeDriver implements AgentDriver {
   readonly catalog: DriverCatalog = CLAUDE_CATALOG;
   private readonly queryFn: QueryFn;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
+  private readonly claudeHome: string;
+  private readonly prepareClaudeHome: (home: string) => void;
 
   constructor(deps: ClaudeDriverDeps = {}) {
     this.queryFn = deps.queryFn ?? realSdkQuery;
     this.log = deps.logger ?? { debug() {}, info() {}, warn() {}, error() {} };
+    this.claudeHome = deps.claudeHome ?? DEFAULT_CLAUDE_HOME;
+    this.prepareClaudeHome = deps.prepareClaudeHome ?? ensurePrivateAgentHome;
   }
 
   start(opts: DriverStartOptions): DriverSession {
+    this.prepareClaudeHome(this.claudeHome);
     const input = new AsyncQueue<SdkUserMessage>();
     input.push(userTurn(opts.prompt));
 
@@ -416,7 +427,12 @@ export class ClaudeDriver implements AgentDriver {
         // git's credential paths neutered. Handed down pre-sanitized by the supervisor (RUN-109),
         // so this guarantee no longer depends on the driver remembering to do it; the `??` is the
         // test-only fallback for a start with no supervisor-provided env.
-        env: opts.env ?? sanitizedAgentEnv(),
+        env: {
+          ...(opts.env ?? sanitizedAgentEnv()),
+          // Override, never default: Runner state belongs under ~/.noriq/claude, and the user's
+          // interactive ~/.claude settings/plugins/hooks must not enter an unattended session.
+          CLAUDE_CONFIG_DIR: this.claudeHome,
+        },
         permissionMode: perm.permissionMode,
         allowedTools: perm.allowedTools,
         disallowedTools: perm.disallowedTools,
@@ -449,6 +465,11 @@ export class ClaudeDriver implements AgentDriver {
         // inherits the operator's personal MCP config (~/.claude.json, .mcp.json,
         // plugins) — their connectors, their credentials, none of it in the manifest.
         strictMcpConfig: true,
+        // The SDK defaults to user + project + local. Here "user" resolves inside the isolated
+        // CLAUDE_CONFIG_DIR above; project/local are intentionally absent, so checked-in hooks,
+        // plugins, skills, permissions, and .mcp.json cannot widen a run. Repository guidance is
+        // already carried by Runner's bounded context/required-reading path (RUN-128/129).
+        settingSources: ['user'],
         // Only when asked (RUN-33): omitting these is what lets the tool apply its own default,
         // which is what every run got before this existed.
         ...(opts.effort ? { effort: opts.effort } : {}),

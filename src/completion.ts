@@ -52,6 +52,10 @@ export const COMMAND_TABLE: readonly CommandSpec[] = [
     summary: ['Sign Codex in under the isolated ~/.noriq/codex Runner home'],
   },
   {
+    name: 'claude-auth',
+    summary: ['Sign Claude in under the isolated ~/.noriq/claude Runner home'],
+  },
+  {
     name: 'start',
     summary: ['Discover repos, register with Noriq, and supervise dispatched runs'],
   },

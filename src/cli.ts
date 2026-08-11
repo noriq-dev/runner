@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { DEFAULT_CODEX_HOME, loginCodex } from './agent-homes';
+import { DEFAULT_CLAUDE_HOME, DEFAULT_CODEX_HOME, loginClaude, loginCodex } from './agent-homes';
 import { type AuthMode, authorize, resolveMode } from './auth';
 import { completionCandidates, completionScript, formatCommandTable } from './completion';
 import { DEFAULT_CONFIG_PATH, loadRunnerConfig } from './config';
@@ -58,6 +58,10 @@ auth options:
 codex-auth:
   Runs \`codex login\` with CODEX_HOME=${DEFAULT_CODEX_HOME}. Runner-spawned Codex sessions never
   fall back to ~/.codex, so authenticate this dedicated home before dispatching Codex work.
+
+claude-auth:
+  Runs \`claude auth login\` with CLAUDE_CONFIG_DIR=${DEFAULT_CLAUDE_HOME}. Runner-spawned Claude
+  sessions never fall back to ~/.claude.
 
 init-project options:
   --advanced       Start in the advanced tier: after the quick questions (key, driver, verify
@@ -682,6 +686,10 @@ export async function run(argv: string[]): Promise<number> {
       case 'codex-auth':
         await loginCodex();
         console.log(`\n✓ Codex is authorized for Noriq Runner at ${DEFAULT_CODEX_HOME}`);
+        return 0;
+      case 'claude-auth':
+        await loginClaude();
+        console.log(`\n✓ Claude is authorized for Noriq Runner at ${DEFAULT_CLAUDE_HOME}`);
         return 0;
       case 'config':
         await cmdConfig(args.configPath);
