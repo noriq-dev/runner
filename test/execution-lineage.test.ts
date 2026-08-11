@@ -133,7 +133,7 @@ describe('resolveRunLineage', () => {
     lifecycle.begin(run({ id: 'run_parked' }));
     await lifecycle.terminalizePark('run_parked');
     expect(await lifecycle.park({ run: run({ id: 'run_parked' }) })).toBe(false);
-    lifecycle.complete('run_parked');
+    await lifecycle.complete('run_parked');
     expect(lifecycle.registry()).toEqual(new Map());
   });
 
@@ -171,7 +171,7 @@ describe('resolveRunLineage', () => {
 });
 
 describe('ExecutionLifecycle terminal ownership (RUN-294)', () => {
-  it('makes completion synchronous while a durable delete is hung, then releases bookkeeping after success', async () => {
+  it('joins durable deletion before a terminal completion releases its bookkeeping', async () => {
     const parked = { run: run({ id: 'run_parked' }) };
     const deletion = deferred<typeof parked | null>();
     let deletes = 0;
@@ -185,13 +185,13 @@ describe('ExecutionLifecycle terminal ownership (RUN-294)', () => {
     });
     await lifecycle.restore();
 
-    lifecycle.complete('run_parked');
+    const completing = lifecycle.complete('run_parked');
     expect(lifecycle.registry()).toEqual(new Map()); // logical terminality is immediate
     await turn();
-    expect(deletes).toBe(1); // cleanup started, but complete() did not join it
+    expect(deletes).toBe(1); // completion remains at the lifecycle boundary until deletion settles
 
     deletion.resolve(parked);
-    await turn();
+    await completing;
     expect(await lifecycle.park(parked)).toBe(true); // successful cleanup released the tombstone
   });
 
@@ -210,31 +210,10 @@ describe('ExecutionLifecycle terminal ownership (RUN-294)', () => {
     );
     await lifecycle.restore();
 
-    lifecycle.complete('run_parked');
-    await turn();
+    await lifecycle.complete('run_parked');
     expect(errors.map(String)).toEqual(['Error: disk offline']);
     expect(lifecycle.registry()).toEqual(new Map());
     expect(await lifecycle.park(parked)).toBe(false); // failed cleanup did not forget terminality
-  });
-
-  it('surfaces a hung terminal cleanup without releasing its suppression', async () => {
-    const parked = { run: run({ id: 'run_parked' }) };
-    const errors: unknown[] = [];
-    const lifecycle = new ExecutionLifecycle(
-      {
-        park: async () => {},
-        list: async () => [parked],
-        unpark: () => new Promise<null>(() => {}),
-      },
-      (_runId, err) => errors.push(err),
-      5,
-    );
-    await lifecycle.restore();
-
-    lifecycle.complete('run_parked');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(errors.map(String)).toEqual(['Error: terminal park cleanup still pending after 5ms']);
-    expect(lifecycle.registry()).toEqual(new Map());
   });
 
   it('projects a resuming park as owned before its durable delete yields', async () => {
@@ -280,15 +259,18 @@ describe('ExecutionLifecycle terminal ownership (RUN-294)', () => {
     expect(await lifecycle.park(parked)).toBe(true);
   });
 
-  it('restores parked ownership when the initial resume delete fails, then complete suppresses it', async () => {
+  it('joins terminal cleanup after a thrown resume delete, so a retry is not poisoned', async () => {
     const parked = { run: run({ id: 'run_parked' }) };
     const errors: unknown[] = [];
+    let deletes = 0;
     const lifecycle = new ExecutionLifecycle(
       {
         park: async () => {},
         list: async () => [parked],
         unpark: async () => {
-          throw new Error('rename failed');
+          deletes += 1;
+          if (deletes === 1) throw new Error('rename failed');
+          return parked;
         },
       },
       (_runId, err) => errors.push(err),
@@ -297,21 +279,19 @@ describe('ExecutionLifecycle terminal ownership (RUN-294)', () => {
 
     await expect(lifecycle.resume('run_parked')).rejects.toThrow('rename failed');
     expect(lifecycle.registry()).toEqual(new Map([['exe_1', 'run_parked']]));
-    lifecycle.complete('run_parked');
-    await turn();
+    await lifecycle.complete('run_parked');
     expect(lifecycle.registry()).toEqual(new Map());
-    expect(errors.map(String)).toEqual(['Error: rename failed']);
-    expect(await lifecycle.park(parked)).toBe(false);
+    expect(errors).toEqual([]);
+    expect(await lifecycle.park(parked)).toBe(true);
   });
 
   it('uses recovery classification before admission: terminal releases, blocked and unknown fail closed', async () => {
     const parked = { run: run({ id: 'run_parked' }) };
     const lifecycle = (disposition: 'terminal' | 'parked' | 'unknown') => {
-      const deletion = deferred<typeof parked | null>();
       const owner = new ExecutionLifecycle({
         park: async () => {},
         list: async () => [parked],
-        unpark: () => deletion.promise,
+        unpark: async () => parked,
       });
       return { owner, disposition };
     };

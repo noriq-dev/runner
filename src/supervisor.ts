@@ -3407,11 +3407,11 @@ export class RunSupervisor {
       // A run that parks again remains one live execution and must retain its reservation.
       if (exit && exit.reason !== 'stage-answer') {
         if (exit.reason === 'parked') this.executionLifecycle.inactive(runId);
-        else this.executionLifecycle.complete(runId);
+        else await this.executionLifecycle.complete(runId);
       }
       return exit;
     } catch (err) {
-      this.executionLifecycle.complete(runId);
+      await this.executionLifecycle.complete(runId);
       throw err;
     }
   }
@@ -3806,10 +3806,10 @@ export class RunSupervisor {
     try {
       const exit = await this.superviseRun(run);
       if (exit.reason === 'parked') this.executionLifecycle.inactive(run.id);
-      else this.executionLifecycle.complete(run.id);
+      else await this.executionLifecycle.complete(run.id);
       return exit;
     } catch (err) {
-      this.executionLifecycle.complete(run.id);
+      await this.executionLifecycle.complete(run.id);
       throw err;
     }
   }

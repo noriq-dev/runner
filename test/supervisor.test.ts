@@ -3781,7 +3781,7 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.outcome).toBe('done'); // the paused round's non-verdict was discarded, as promised
   });
 
-  it('settles after a failed stage unpark without reviving its execution owner (RUN-294)', async () => {
+  it('joins terminal cleanup after a failed stage unpark before allowing an execution retry (RUN-265)', async () => {
     const pump = async (cond: () => boolean) => {
       for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
     };
@@ -3811,7 +3811,7 @@ describe('the inline reviewer (RUN-61)', () => {
       if (runId !== 'run_1') return realUnpark(runId);
       oldRunDeletes += 1;
       if (oldRunDeletes === 1) throw new Error('stage answer delete failed');
-      return new Promise<ParkedRun | null>(() => {}); // terminal retry hangs forever
+      return realUnpark(runId); // terminal cleanup must finish before the stack settles
     };
 
     h.answerIt();
@@ -3819,13 +3819,13 @@ describe('the inline reviewer (RUN-61)', () => {
     await pump(() => h.claude.starts.length >= 3);
     h.claude.emitText('VERDICT: PASS');
     h.claude.complete('done');
-    expect((await done).outcome).toBe('done'); // never joined the hung terminal cleanup
-    expect(await h.parked.get('run_1')).not.toBeNull(); // the failed durable half still exists
+    expect((await done).outcome).toBe('done');
+    expect(await h.parked.get('run_1')).toBeNull();
     expect(oldRunDeletes).toBe(2);
 
     const retry = h.supervisor.supervise(makeRun({ id: 'run_retry', kind: 'scope', execution }));
     await flush();
-    expect(h.claude.starts.at(-1)?.runId).toBe('run_retry'); // stale park is terminal, not an owner
+    expect(h.claude.starts.at(-1)?.runId).toBe('run_retry');
     h.claude.complete('done');
     await retry;
   });

@@ -43,12 +43,10 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
       unpark(runId: string): Promise<Park | null>;
     },
     private readonly onCleanupError?: (runId: string, err: unknown) => void,
-    private readonly cleanupWarnAfterMs = 5_000,
   ) {}
 
   /** Per-run ordering makes a terminal signal win over a park that was still being prepared. */
   private readonly transitions = new Map<string, Promise<unknown>>();
-  private readonly cleanupWatches = new Map<string, ReturnType<typeof setTimeout>>();
   private serialize<T>(runId: string, work: () => Promise<T>): Promise<T> {
     const prior = this.transitions.get(runId) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(work);
@@ -71,35 +69,6 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
     }
   }
 
-  private clearCleanupWatch(runId: string): void {
-    const timer = this.cleanupWatches.get(runId);
-    if (timer) clearTimeout(timer);
-    this.cleanupWatches.delete(runId);
-  }
-
-  private cleanTerminalParkInBackground(runId: string): void {
-    const cleanup = this.removeTerminalPark(runId);
-    if (!this.cleanupWatches.has(runId)) {
-      const timer = setTimeout(() => {
-        this.cleanupWatches.delete(runId);
-        this.reportCleanupError(
-          runId,
-          new Error(`terminal park cleanup still pending after ${this.cleanupWarnAfterMs}ms`),
-        );
-      }, this.cleanupWarnAfterMs);
-      // A diagnostic watchdog must not become the reason an otherwise idle daemon stays alive.
-      timer.unref?.();
-      this.cleanupWatches.set(runId, timer);
-    }
-    void cleanup.then(
-      () => this.clearCleanupWatch(runId),
-      (err) => {
-        this.clearCleanupWatch(runId);
-        this.reportCleanupError(runId, err);
-      },
-    );
-  }
-
   begin(run: Pick<Run, 'id' | 'execution'>): void {
     const current = this.states.get(run.id);
     // Run ids are server identities and are not re-used. Retaining a terminal state that still
@@ -117,9 +86,10 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
   }
 
   /** The supervising stack reached a terminal outcome (including a thrown one). */
-  complete(runId: string): void {
-    // Logical terminality is synchronous and cannot fail. Physical cleanup stays ordered behind
-    // any park/unpark already in flight, but this supervising stack never waits for disk I/O.
+  async complete(runId: string): Promise<void> {
+    // Mark first so a concurrent cancellation or late park cannot revive the owner, then JOIN the
+    // durable deletion. A terminal Run must not report completion while an old park can recreate
+    // its execution reservation after restart (RUN-265).
     const current = this.states.get(runId);
     const park =
       current?.kind === 'active' || current?.kind === 'terminal'
@@ -128,7 +98,13 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
           ? current.park
           : null;
     this.states.set(runId, { kind: 'terminal', park, active: false });
-    this.cleanTerminalParkInBackground(runId);
+    try {
+      await this.removeTerminalPark(runId);
+    } catch (err) {
+      // A failed disk write cannot safely release the tombstone. Report it, but preserve the run's
+      // real terminal result: recovery will classify the durable record again before admission.
+      this.reportCleanupError(runId, err);
+    }
   }
 
   /** Park creation belongs here so cancellation cannot race a post-probe direct store write. */
@@ -278,9 +254,9 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
         const disposition = await classify(park).catch(() => 'unknown' as const);
         if (disposition !== 'terminal') return;
         this.states.set(park.run.id, { kind: 'terminal', park, active: false });
-        // Recovery only needs the logical terminal fact before admission. The disk delete is the
-        // same best-effort background cleanup as a live completion and cannot delay startup.
-        this.cleanTerminalParkInBackground(park.run.id);
+        // Recovery joins the same durable terminal transition as a live stack. A failed deletion
+        // retains its tombstone and is retried from the server's terminal fact on the next boot.
+        await this.complete(park.run.id);
       }),
     );
   }
