@@ -219,6 +219,96 @@ export interface PreparedRun {
  *  where — the paths themselves are already in the agent's own rendered evidence block. */
 const SUGGESTED_PATHS_SHOWN = 12;
 
+/** What acquiring a pack reaches — the narrow slice of `PrepareHost` the RESUME path can also
+ *  satisfy, so that path never has to construct a whole preparation host to fetch one. */
+export type ContextPackHost = Pick<PrepareHost, 'log' | 'transcript' | 'vcsFor' | 'getContextPack'>;
+
+/**
+ * Retrieve the task's context pack and verify its citations against the workspace actually leased
+ * (RUN-228/229) — extracted from `prepareRun`'s body by RUN-285 so the RESUME path runs the same
+ * sequence rather than a second copy of it.
+ *
+ * Extracted rather than duplicated for a reason the resume path makes concrete: the sequence carries
+ * four separate judgements that are easy to get subtly wrong twice — the CANONICAL `repositoryKey`
+ * rather than the local `repo_<sha>` checkout id, `defaultBranch` rather than the run's throwaway
+ * `workRef`, "record omissions, not just successes", and a verification failure degrading to null
+ * instead of refusing the run. A second copy would be a second place for any of those to drift.
+ *
+ * **Verification is against THIS workspace, every time, and that is what makes reuse safe on resume**
+ * (RUN-285): a park can last 72 hours, so a pack verified before the park says nothing true about the
+ * tree afterwards. Nothing here carries a previous sitting's verdicts forward — the pack is fetched
+ * fresh and re-verified against the worktree in hand, which is also the only route that can see
+ * memory recorded DURING the park (much of why the run parked in the first place).
+ *
+ * Best-effort throughout, like every other pre-execution enrichment: no fetcher, no repository key,
+ * a timeout, a server error, or a verification crash all land as `verified: null`, and the caller
+ * proceeds exactly as it does today. Memory is enrichment, never a gate.
+ */
+export async function acquireContextPack(
+  host: ContextPackHost,
+  input: { run: Run; repo: ResolvedRepo; worktree: Workspace; kind: RunKind },
+): Promise<{ retrieval: ContextPackRetrieval; verified: VerifiedContextPack | null }> {
+  const { run, repo, worktree, kind } = input;
+  const retrieval = await retrieveContextPack(host.getContextPack, {
+    projectId: run.projectId,
+    taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
+    // The CANONICAL identity (locked decision), never `repo.id`/the local `repo_<sha>` checkout
+    // id this daemon mints for itself — that id means nothing on the server.
+    repositoryKey: repo.manifest.repositoryKey,
+    // The leased workspace's own base — the opaque revision id in the backend's id-space,
+    // matching what indexing itself was taken from.
+    baseId: worktree.baseId,
+    // The repo's target/integration branch — deliberately NEVER `worktree.workRef` (the run's own
+    // throwaway `noriq/run/<id>` branch): see `ContextPackInquiry.branch`'s own doc for why that
+    // field must not become an operand here.
+    branch: repo.manifest.defaultBranch,
+    role: kind,
+  });
+  // Only when something was actually ASKED (locked decision: record omissions, not just
+  // successes) — the common case today is a repo with no `repositoryKey` at all, and a transcript
+  // line on every one of those runs would be noise nobody asked for (`summarizeContextPackRetrieval`'s
+  // own doc: the same "no note on nothing to bootstrap" posture `setupBriefNote` already takes).
+  if (retrieval.attempted) {
+    host.transcript(run.id).milestone(summarizeContextPackRetrieval(retrieval));
+  }
+
+  let verified: VerifiedContextPack | null = null;
+  if (retrieval.pack) {
+    try {
+      verified = await verifyContextPack(retrieval.pack, {
+        vcs: host.vcsFor(repo),
+        repoRoot: repo.root,
+        worktree,
+        // The CANONICAL identity, same as the request above — never the local `repo_<sha>`
+        // checkout id, and never assumed equal to the citation's own `repositoryKey` (a pack may
+        // legitimately cite a sibling repo in a multi-repo project; that citation is
+        // `unverifiable` against THIS workspace, not silently checked against the wrong tree).
+        repositoryKey: repo.manifest.repositoryKey,
+      });
+      // RUN-234: the bounded metric `CitationVerdict.agreesWithServer`'s own doc names — a
+      // closed, five-value breakdown plus a mismatch count, never a per-citation line (a
+      // memory-heavy pack can carry hundreds; see `summarizeCitationVerification`'s own doc).
+      // Skipped on a pack with nothing to verify — the common case for most tasks today — the
+      // same "no note on nothing to bootstrap" posture every other line in this function takes.
+      const verification = summarizeCitationVerification(verified);
+      if (verification.total > 0) {
+        host.log.info('context pack citations verified', {
+          runId: run.id,
+          total: verification.total,
+          states: verification.byState,
+          serverMismatches: verification.serverMismatches,
+        });
+      }
+    } catch (err) {
+      host.log.warn('context pack citation verification failed — proceeding without verdicts', {
+        runId: run.id,
+        err: String(err),
+      });
+    }
+  }
+  return { retrieval, verified };
+}
+
 export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOutcome> => {
   const refuse = (reason: string): PrepareOutcome => ({ ok: false, reason });
 
@@ -406,75 +496,18 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const milestone = setupMilestone(setup);
   if (milestone) host.transcript(run.id).milestone(milestone);
 
-  // RUN-228: fetch the task's context pack now — the worktree (its `baseId`) and the anchor's
-  // task id are both already in hand, and nothing below this line depends on the result (FETCH
-  // AND RECORD ONLY is this task's own locked decision; `.pack` reaches no prompt in this file).
-  // Sequential rather than raced against `runSetup` above: this whole function is a deliberately
-  // ordered list of what each step costs and unwinds (see the file's own top-of-file doc), and
-  // retrieval carries its own short, bounded timeout regardless of where it sits — there is no
-  // latency case here that the existing sequencing does not already tolerate just as well.
-  const contextPack = await retrieveContextPack(host.getContextPack, {
-    projectId: run.projectId,
-    taskId: run.anchor?.type === 'task' ? run.anchor.taskId : null,
-    // The CANONICAL identity (locked decision), never `repo.id`/the local `repo_<sha>` checkout
-    // id this daemon mints for itself — that id means nothing on the server.
-    repositoryKey: repo.manifest.repositoryKey,
-    // The leased workspace's own base — the opaque revision id in the backend's id-space,
-    // matching what indexing itself was taken from.
-    baseId: worktree.baseId,
-    // The repo's target/integration branch — deliberately NEVER `worktree.workRef` (the run's own
-    // throwaway `noriq/run/<id>` branch): see `ContextPackInquiry.branch`'s own doc for why that
-    // field must not become an operand here.
-    branch: repo.manifest.defaultBranch,
-    role: kind,
+  // RUN-228/229, extracted to `acquireContextPack` (RUN-285) so the RESUME path runs the identical
+  // sequence rather than a second copy of it. Sequential rather than raced against `runSetup` above:
+  // this whole function is a deliberately ordered list of what each step costs and unwinds (see the
+  // file's own top-of-file doc), and retrieval carries its own short, bounded timeout regardless of
+  // where it sits — there is no latency case here that the existing sequencing does not already
+  // tolerate just as well.
+  const { retrieval: contextPack, verified: verifiedContextPack } = await acquireContextPack(host, {
+    run,
+    repo,
+    worktree,
+    kind,
   });
-  // Only when something was actually ASKED (locked decision: record omissions, not just
-  // successes) — the common case today is a repo with no `repositoryKey` at all, and a transcript
-  // line on every one of those runs would be noise nobody asked for (`summarizeContextPackRetrieval`'s
-  // own doc: the same "no note on nothing to bootstrap" posture `setupBriefNote` already takes).
-  if (contextPack.attempted) {
-    host.transcript(run.id).milestone(summarizeContextPackRetrieval(contextPack));
-  }
-
-  // RUN-229: verify the pack's citations against the workspace this daemon actually leased —
-  // before anything downstream can read an excerpt without its verdict attached. Best-effort,
-  // like every other pre-execution enrichment in this file (`runSetup`, the pattern mapper): a
-  // verification failure degrades to null rather than refusing the run — this task classifies
-  // evidence, it does not gate on it (rendering/gating is RUN-230/231's job).
-  let verifiedContextPack: VerifiedContextPack | null = null;
-  if (contextPack.pack) {
-    try {
-      verifiedContextPack = await verifyContextPack(contextPack.pack, {
-        vcs: host.vcsFor(repo),
-        repoRoot: repo.root,
-        worktree,
-        // The CANONICAL identity, same as the request above — never the local `repo_<sha>`
-        // checkout id, and never assumed equal to the citation's own `repositoryKey` (a pack may
-        // legitimately cite a sibling repo in a multi-repo project; that citation is
-        // `unverifiable` against THIS workspace, not silently checked against the wrong tree).
-        repositoryKey: repo.manifest.repositoryKey,
-      });
-      // RUN-234: the bounded metric `CitationVerdict.agreesWithServer`'s own doc names — a
-      // closed, five-value breakdown plus a mismatch count, never a per-citation line (a
-      // memory-heavy pack can carry hundreds; see `summarizeCitationVerification`'s own doc).
-      // Skipped on a pack with nothing to verify — the common case for most tasks today — the
-      // same "no note on nothing to bootstrap" posture every other line in this function takes.
-      const verification = summarizeCitationVerification(verifiedContextPack);
-      if (verification.total > 0) {
-        host.log.info('context pack citations verified', {
-          runId: run.id,
-          total: verification.total,
-          states: verification.byState,
-          serverMismatches: verification.serverMismatches,
-        });
-      }
-    } catch (err) {
-      host.log.warn('context pack citation verification failed — proceeding without verdicts', {
-        runId: run.id,
-        err: String(err),
-      });
-    }
-  }
 
   // Resolve the anchor task's text so the agent starts knowing the job. Best-effort:
   // a lookup failure degrades to the bare id rather than sinking the run.
@@ -664,9 +697,10 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     ...(workflow ? { workflow } : {}),
     ...(diffCmd ? { diffCmd } : {}),
     verifiedContextPack,
-    // This sitting's own retrieval facts (RUN-247) — present on every path that reaches this line,
-    // since `prepareRun` is the only caller that ever fetches one; a resume never calls this
-    // function at all (`resume` has no `prepare`).
+    // This sitting's own retrieval facts (RUN-247). "`prepareRun` is the only caller that ever
+    // fetches one" was true and is not any more — RUN-285 gave the resume path its own
+    // `acquireContextPack` call, because a rebuilt brief that renders no memory is the sitting most
+    // in need of it. A resume still has no `prepare`; it now acquires directly.
     contextPack,
   });
 

@@ -17,6 +17,7 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 import type { LedgerEntry } from '../src/adjudication';
 import type { ParkState, RunAgent } from '../src/client';
+import type { ContextPackFetcher } from '../src/context-pack';
 import type { ContinuableRun } from '../src/continuable';
 import { totalTokens } from '../src/drivers/budget';
 import type {
@@ -523,6 +524,9 @@ function harness(
     contextBudget?: number;
     /** Pre-seed the continuable store (RUN-92) to model a re-dispatched "continue a failed run". */
     continuableSeed?: ContinuableRun;
+    /** RUN-285: the task context pack fetcher. Presence wires retrieval; absent is the pre-RUN-228
+     *  daemon, which is what every other test here models. */
+    getContextPack?: ContextPackFetcher;
     /** What the server says when asked whether the run parked (RUN-30). */
     parkState?: Partial<ParkState>;
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
@@ -724,6 +728,9 @@ function harness(
           },
         }
       : {}),
+    // RUN-285: presence wires retrieval at all, matching the real dep's own optionality — absent is
+    // the pre-RUN-228 daemon, which every other test in this file continues to model.
+    ...(over.getContextPack ? { getContextPack: over.getContextPack } : {}),
   });
   return {
     supervisor,
@@ -5826,6 +5833,163 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(start.prompt).toContain('ship the thing'); // the run's brief
     expect(start.prompt).toContain('Use B.'); // the human's answer
     expect(start.prompt).toContain('Approach A or B?'); // the question it had asked
+  });
+
+  // RUN-285. `buildRunBrief` acquires nothing by design, and the resume call site passed it no pack
+  // — so every rebuilt resume brief rendered an EMPTY memory frame. Silently: `renderMemoryEvidence`
+  // reads `undefined` and `null` identically, and the brief was otherwise complete.
+  //
+  // The sitting that suffers most is the one that must rebuild: `needsBrief` is true exactly when the
+  // restored session cannot carry its own context — a continuation, or a chain with steps left — and
+  // a continuation that cannot rebuild is FATAL. So the daemon considered this brief important enough
+  // to fail a run over, then built it without the half that says what was already learned here.
+  describe('a rebuilt resume brief carries project-memory evidence (RUN-285)', () => {
+    const MEMORY_MARKER = 'RESUMED-PACK-DISTINCTIVE-DECISION-TEXT';
+
+    /** The narrowest pack that renders: one active decision, no citations to verify. */
+    const pack = (): never =>
+      ({
+        taskId: 'task_9',
+        projectId: 'prj_p',
+        branch: null,
+        baseId: null,
+        tokenBudget: null,
+        verifiedDecisions: [],
+        relevantEntities: [],
+        similarEpisodes: [],
+        knownHazards: [],
+        affectedTests: [],
+        activeNeighboringWork: [],
+        staleWarnings: [],
+        generatedAt: '2026-08-11T00:00:00.000Z',
+        role: 'build',
+        mode: 'keyword',
+        charBudget: 4000,
+        charsUsed: 200,
+        taskFacts: null,
+        sections: [
+          {
+            id: 'active_decisions',
+            provenance: ['exact'],
+            notice: null,
+            charsAllotted: 500,
+            charsUsed: 120,
+            excerpts: [
+              {
+                excerptKind: 'memory',
+                id: 'mem_1',
+                memoryKind: 'decision',
+                statement: MEMORY_MARKER,
+                authority: 3,
+                confidence: 0.8,
+                validity: 'active',
+                isLead: false,
+                leadReasons: [],
+                evidence: [],
+                recordedByAgentId: null,
+                recordedAt: '2026-08-01T00:00:00.000Z',
+                supersedesMemoryId: null,
+              },
+            ],
+            graphEntities: [],
+            coverage: null,
+            items: [],
+          },
+        ],
+        notices: [],
+      }) as never;
+
+    /** Park a codex run (non-resumable → `sessionId: null` → continuation resume), then resume it.
+     *
+     *  The manifest carries a `repositoryKey` and a `defaultBranch` because retrieval genuinely
+     *  requires both — the default fixture has neither, so a pack is declined `not_applicable` before
+     *  a fetcher is ever called. Worth stating: that decline is exactly why every other test in this
+     *  file is unaffected by this change. */
+    const parkThenResume = async (over: Parameters<typeof harness>[0] = {}) => {
+      const h = harness({
+        parkState: asked,
+        verifyResults: [true],
+        // `acme-widgets`, not `acme/widgets`: the vendored `RepositoryKey` forbids a slash
+        // (`^[A-Za-z][A-Za-z0-9._-]*$`), and an invalid one fails the EPISODE's own parse at settle —
+        // which is how this fixture first showed up, as a silently unrecorded episode.
+        manifest: manifest({ repositoryKey: 'acme-widgets', defaultBranch: 'main' }),
+        ...over,
+      });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', agentTool: 'codex', anchor: { type: 'task', taskId: 'task_9' } }),
+      );
+      await flush();
+      h.codex.complete('done');
+      await done;
+      expect((await h.parked.get('run_1'))?.sessionId).toBeNull();
+      h.answerIt();
+      const resumed = h.supervisor.resume('run_1', 'Use B.');
+      await flush();
+      h.codex.complete('done');
+      await resumed;
+      return h;
+    };
+
+    it("the continuation's fresh session is told what this task already learned", async () => {
+      const h = await parkThenResume({ getContextPack: async () => pack() });
+      const prompt = h.codex.starts.at(-1)!.prompt;
+      // The memory reached the rebuilt brief — the whole defect.
+      expect(prompt).toContain(MEMORY_MARKER);
+      // Through the quoted-evidence frame (RUN-231), never as a bare line: a pack is untrusted
+      // server text, and a resume must not be the one path that forgets that.
+      const at = prompt.indexOf(MEMORY_MARKER);
+      expect(prompt.slice(0, at)).toMatch(/evidence|quoted/i);
+      // Still the continuation brief it always was — memory is added, nothing displaced.
+      expect(prompt).toContain('Use B.');
+      expect(prompt).toContain('Approach A or B?');
+    });
+
+    it('fetches FRESH on resume rather than replaying a pack the park saved', async () => {
+      const asked: Array<{ baseId?: string | null; branch?: string | null }> = [];
+      const h = await parkThenResume({
+        getContextPack: async (req) => {
+          asked.push({ baseId: req.baseId, branch: req.branch });
+          return pack();
+        },
+      });
+      // Twice: once preparing, once rebuilding on resume. A park can last 72 hours, and only a fresh
+      // fetch can see memory recorded DURING it — much of why the run parked at all.
+      expect(asked.length).toBe(2);
+      // Both against the repo's declared branch, never the run's throwaway workRef.
+      expect(asked.every((a) => a.branch === 'main')).toBe(true);
+      expect(h.codex.starts.at(-1)!.prompt).toContain(MEMORY_MARKER);
+    });
+
+    it('a resume whose retrieval FAILS still resumes, briefed exactly as it was before', async () => {
+      // Memory is enrichment, never a gate — the same posture `prepare` takes. A continuation that
+      // cannot obtain a pack must not become the fatal "could not rebuild the brief" case.
+      const h = await parkThenResume({
+        getContextPack: async () => {
+          throw new Error('server unreachable');
+        },
+      });
+      const prompt = h.codex.starts.at(-1)!.prompt;
+      expect(prompt).not.toContain(MEMORY_MARKER);
+      expect(prompt).toContain('Use B.'); // still resumed, still briefed
+      expect(prompt).toContain('ship the thing');
+    });
+
+    it('a daemon with no fetcher wired behaves exactly as it did before RUN-228', async () => {
+      const h = await parkThenResume(); // no getContextPack at all
+      const prompt = h.codex.starts.at(-1)!.prompt;
+      expect(prompt).not.toContain(MEMORY_MARKER);
+      expect(prompt).toContain('Use B.');
+    });
+
+    it('RUN-247 now reports a real contextConsumption status for the resumed sitting', async () => {
+      // It was OMITTED on this path, correctly: omission asserts nothing, where `unavailable` would
+      // claim "asked and got nothing" about a run that may well have consumed context in its first
+      // sitting. Now that the sitting really does render memory, the fact is reportable.
+      const h = await parkThenResume({ getContextPack: async () => pack() });
+      const settled = h.recordedEpisodes.at(-1);
+      expect(settled?.intelligence?.contextConsumption?.status).toBe('partial'); // keyword mode
+      expect(settled?.intelligence?.contextConsumption?.value).toMatchObject({ mode: 'keyword' });
+    });
   });
 
   it('keeps the dispatch workflow snapshot when definitions change while parked (RUN-192)', async () => {

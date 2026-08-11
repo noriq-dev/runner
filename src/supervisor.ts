@@ -111,6 +111,7 @@ import {
   type RunPipeline,
   type StageHost,
   type StageImpl,
+  acquireContextPack,
   checkPlan,
   checkerFindings,
   executeChain,
@@ -3542,6 +3543,32 @@ export class RunSupervisor {
       needsBrief && run.verifiesRunId && (this.vcsFor(repo).kind ?? 'git') === 'git'
         ? `git diff ${(await this.planBase(repo, run).catch(() => null)) ?? repo.manifest.defaultBranch ?? worktree.baseId}...HEAD`
         : undefined;
+    // The memory half of a rebuilt brief (RUN-285). `buildRunBrief` acquires nothing by design, so
+    // for as long as this call site passed it no pack, EVERY rebuilt resume brief rendered an empty
+    // memory frame — silently, since `renderMemoryEvidence` reads `undefined` and `null` identically.
+    //
+    // Fetched FRESH here rather than persisted in the park, which is the choice this makes:
+    //   - only a fresh fetch can see memory recorded DURING the park, and a park's own reason for
+    //     existing (a human was asked something) is a large part of why new memory would exist;
+    //   - a pack persisted at park time is up to 72 hours stale, and its citations would have to be
+    //     re-verified against the resumed tree anyway (RUN-164's concern exactly: the spec may have
+    //     been corrected and another run may have landed underneath it) — so persisting buys the
+    //     bytes in `ParkedRun` and saves none of the work;
+    //   - `acquireContextPack` verifies against the workspace IN HAND every time, so nothing carries
+    //     a previous sitting's verdicts forward.
+    // The cost is one bounded call (`CONTEXT_PACK_TIMEOUT_MS`), and only on the path that rebuilds —
+    // a plain session restore holds its own context and never gets here.
+    const resumedPack = needsBrief
+      ? await acquireContextPack(this.prepareHost(), { run, repo, worktree, kind }).catch((err) => {
+          // Enrichment, never a gate — the same posture `prepare` takes. A resume that cannot obtain
+          // a pack briefs exactly as it did before this change.
+          this.log.warn('could not obtain a context pack for the rebuilt brief', {
+            runId,
+            err: String(err),
+          });
+          return null;
+        })
+      : null;
     // Rebuilt from the same acquire-nothing assembler `prepare` uses (RUN-169). Never fatal for a
     // session RESTORE — it falls back to the answer-only prompt the restored session already has the
     // context for. A CONTINUATION has no such session, so a brief it cannot build IS fatal (below).
@@ -3555,6 +3582,12 @@ export class RunSupervisor {
           kind,
           ...(resumedDiffCmd ? { diffCmd: resumedDiffCmd } : {}),
           workflow: wf,
+          verifiedContextPack: resumedPack?.verified ?? null,
+          // RUN-247's retrieval facts for THIS sitting. Passed only when a retrieval actually
+          // happened: absent means "no assertion", which is the honest reading for a resume that
+          // never asked, and is why `contextConsumption` was omitted rather than reported
+          // `unavailable` on these paths (`context-consumption.ts`'s own module doc).
+          ...(resumedPack ? { contextPack: resumedPack.retrieval } : {}),
         }).catch((err) => {
           this.log.warn('could not rebuild the brief on resume', { runId, err: String(err) });
           return null;
