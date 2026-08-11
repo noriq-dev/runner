@@ -19,7 +19,9 @@ import {
   type AcceptanceReport,
   acceptanceNeedsAttention,
   acceptanceSummary,
+  describeCommandObservation,
   renderAcceptanceReport,
+  withDaemonObservations,
 } from '../acceptance';
 import { totalTokens } from '../drivers/budget';
 import { buildEpisode } from '../episode';
@@ -112,15 +114,17 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     // FAILED and then signs off PASS is taken as the FAIL it contains, rather than as whichever
     // half the parser happened to read last.
     const v = judgeWithAcceptance(ctx.sessionText, ctx.acceptance);
-    acceptanceEvidence = v.acceptance;
-    if (v.acceptance?.entries.length) {
-      host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(v.acceptance)}`);
+    acceptanceEvidence = v.acceptance
+      ? withDaemonObservations(v.acceptance, ctx.commandObservations)
+      : undefined;
+    if (acceptanceEvidence?.entries.length) {
+      host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(acceptanceEvidence)}`);
       // Posted on a PASS as well, whenever anything is short of verified: a passing run is the one
       // place a criterion nobody could evidence — or one explicitly needing a human — would
       // otherwise vanish entirely.
-      if (!v.passed || acceptanceNeedsAttention(v.acceptance)) {
+      if (!v.passed || acceptanceNeedsAttention(acceptanceEvidence)) {
         if (run.anchor?.type === 'task') {
-          host.postComment(run.projectId, run.anchor.taskId, renderAcceptanceReport(v.acceptance));
+          host.postComment(run.projectId, run.anchor.taskId, renderAcceptanceReport(acceptanceEvidence));
         }
       }
     }
@@ -132,6 +136,31 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
         host.postComment(run.projectId, run.anchor.taskId, verifyAgentComment(v));
       }
       ctx.exit = { ...ctx.exit, outcome: 'failed', isError: true, reason: 'verify_agent' };
+    }
+  }
+
+  // A landing run's deterministic floor executes after inline review. Finalize that reviewer's
+  // scorecard here, beside the daemon's later observation, without guessing which criterion the
+  // command proves or changing any outcome. `review` deliberately deferred only this comment;
+  // its verdict and the pipeline order are unchanged.
+  if (ctx.landPolicy && ctx.reviewEvidence?.acceptance?.entries.length) {
+    const finalAcceptance = withDaemonObservations(ctx.reviewEvidence.acceptance, ctx.commandObservations);
+    ctx.reviewEvidence = { ...ctx.reviewEvidence, acceptance: finalAcceptance };
+    if (finalAcceptance.daemonObservations?.length) {
+      const observations = finalAcceptance.daemonObservations.map(describeCommandObservation);
+      host.log.info('acceptance daemon observations', { runId: run.id, observations });
+      for (const observation of observations) {
+        host.transcript(run.id).milestone(`acceptance daemon: ${observation}`);
+      }
+    }
+    if (
+      ctx.commandObservations.length ||
+      ctx.exit.reason?.startsWith('review') ||
+      acceptanceNeedsAttention(finalAcceptance)
+    ) {
+      if (run.anchor?.type === 'task') {
+        host.postComment(run.projectId, run.anchor.taskId, renderAcceptanceReport(finalAcceptance));
+      }
     }
   }
 

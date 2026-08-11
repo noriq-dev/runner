@@ -58,11 +58,15 @@ import type {
   EpisodeTimelineEntry,
 } from '@noriq-dev/shared';
 import { EffortEpisode } from '@noriq-dev/shared';
-import { type AcceptanceReport, failedAcceptance, humanNeededAcceptance } from './acceptance';
+import {
+  type AcceptanceReport,
+  describeCommandObservation,
+  failedAcceptance,
+  humanNeededAcceptance,
+} from './acceptance';
 import { type LedgerEntry, effectiveStatus } from './adjudication';
 import type { RunPipeline } from './stages/types';
 import type { DeliveredSteer } from './steering';
-import type { CommandObservation } from './verify';
 
 /** Facts `buildEpisode` needs that are not on `RunPipeline` itself, because they are `settle`'s own
  *  local computations rather than pipeline state — threading them through beats re-deriving them a
@@ -327,24 +331,6 @@ function timelineOf(ctx: RunPipeline): EpisodeTimelineEntry[] {
 export function deriveEpisodeScopeId(input: { runId: string; terminalAt: string }): string {
   const material = [input.runId, input.terminalAt].join('::');
   return `epi_${createHash('sha256').update(material, 'utf8').digest('hex')}`;
-}
-
-/** How much of a command string is worth keeping (RUN-225) — the manifest's own committed text,
- *  not a secret, but nothing bounds how long a repo could write it. */
-const MAX_CMD_CHARS = 200;
-
-/**
- * Render one observed command as bounded evidence (RUN-225) — never its output. The transcript
- * already carries the failing tail (`recordVerifyOutcome`), and a verify command's stderr can echo
- * back a credential from the environment it ran against; the strictest bound that still answers
- * "did this run, and did it pass" is to carry NONE of it here. `site` is the stage attribution the
- * acceptance criterion asks for ("Test pass/fail... carry which stage produced them").
- */
-export function describeCommandObservation(o: CommandObservation): string {
-  const cmd = o.cmd.length > MAX_CMD_CHARS ? `${o.cmd.slice(0, MAX_CMD_CHARS)}…` : o.cmd;
-  const outcome = o.passed ? 'passed' : o.timedOut ? 'timed out' : `failed (exit ${o.exitCode})`;
-  const tries = o.attempts > 1 ? `, ${o.attempts} attempts` : '';
-  return `[${o.site}] ${cmd} — ${outcome}${tries}`;
 }
 
 /**

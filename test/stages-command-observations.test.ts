@@ -1,5 +1,6 @@
 import type { Run } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
+import type { AcceptanceReport } from '../src/acceptance';
 import type { RunAgent } from '../src/client';
 import { zeroTelemetry } from '../src/drivers/types';
 import type { AgentDriver, DriverExit, DriverSession, DriverTelemetry } from '../src/drivers/types';
@@ -218,6 +219,47 @@ describe("reviewStage — carries the reviewer's exact evidence and any fix-roun
     await reviewStage(host, ctx);
     expect(ctx.reviewEvidence).toEqual({ rounds: 1, acceptance: undefined });
     expect(ctx.exit.outcome).toBe('failed');
+  });
+
+  it('defers a landing scorecard until the post-review command can be attached (RUN-292)', async () => {
+    const comments: string[] = [];
+    let verifyRan: boolean | undefined;
+    const acceptance: AcceptanceReport = {
+      entries: [
+        {
+          id: 1,
+          outcome: 'behaviour-unverified',
+          evidence: 'the command has not run yet',
+          item: { id: 1, kind: 'truth', text: 'the feature behaves correctly' },
+        },
+      ],
+    };
+    const ctx = baseCtx({
+      run: { ...run, anchor: { type: 'task', taskId: 'task_1' } },
+      repo: { root: '/repo', manifest: { verify: { agent: {} } } as never },
+      landPolicy: { branch: 'main' } as never,
+    });
+    const host = baseHost({
+      postComment: (_projectId, _taskId, body) => comments.push(body),
+      reviewWithFeedback: async (reviewCtx) => {
+        verifyRan = reviewCtx.verifyRan;
+        return {
+          verdict: 'pass',
+          passed: true,
+          findings: '',
+          rounds: 0,
+          ledger: [],
+          looks: 1,
+          acceptance,
+        };
+      },
+    });
+
+    await reviewStage(host, ctx);
+
+    expect(comments).toEqual([]);
+    expect(verifyRan).toBe(false);
+    expect(ctx.reviewEvidence?.acceptance?.entries[0]!.outcome).toBe('behaviour-unverified');
   });
 });
 

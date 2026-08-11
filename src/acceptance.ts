@@ -25,6 +25,7 @@
 // into work is RUN-146's job — this is the record it reads.
 
 import type { ExecutionSpec } from '@noriq-dev/shared';
+import type { CommandObservation } from './verify';
 
 /**
  * What a gate concluded about ONE criterion.
@@ -72,6 +73,19 @@ export interface AcceptanceReport {
    *  present and `behaviour-unverified` — the report is a statement about the whole contract or
    *  it is prose again. */
   entries: AcceptanceEvidence[];
+  /** Deterministic commands the daemon itself watched exit. These are deliberately adjacent to,
+   *  but never part of, the reviewer's per-criterion verdicts: a command observation may supply
+   *  useful evidence after review, but the daemon cannot infer which criterion it proves. */
+  daemonObservations?: CommandObservation[];
+}
+
+/** Attach the daemon's current command record without inspecting or rewriting any criterion. */
+export function withDaemonObservations(
+  report: AcceptanceReport,
+  observations: readonly CommandObservation[],
+): AcceptanceReport {
+  if (!observations.length) return report;
+  return { ...report, daemonObservations: observations.map((observation) => ({ ...observation })) };
 }
 
 /**
@@ -303,6 +317,17 @@ const MARK: Record<AcceptanceOutcome, string> = {
   'human-needed': '🙋',
 };
 
+/** How much of a manifest command is useful as evidence. Command output is intentionally absent:
+ *  it may echo credentials, while the daemon-observed exit is the fact this report needs. */
+const MAX_CMD_CHARS = 200;
+
+export function describeCommandObservation(o: CommandObservation): string {
+  const cmd = o.cmd.length > MAX_CMD_CHARS ? `${o.cmd.slice(0, MAX_CMD_CHARS)}…` : o.cmd;
+  const outcome = o.passed ? 'passed' : o.timedOut ? 'timed out' : `failed (exit ${o.exitCode})`;
+  const tries = o.attempts > 1 ? `, ${o.attempts} attempts` : '';
+  return `[${o.site}] ${cmd} — ${outcome}${tries}`;
+}
+
 /**
  * The report as a human reads it, on a task comment.
  *
@@ -324,5 +349,10 @@ export function renderAcceptanceReport(report: AcceptanceReport): string {
       (e) => `- ${MARK[e.outcome]} **${e.id}.** ${e.item.text}${e.evidence ? `\n      ${e.evidence}` : ''}`,
     )
     .join('\n');
-  return `**Acceptance criteria** — ${acceptanceSummary(report)}\n\n${lines}`;
+  const observations = report.daemonObservations?.length
+    ? `\n\n**Daemon observations** — independent facts; they do not reclassify the reviewer verdicts above.\n\n${report.daemonObservations
+        .map((o) => `- ${o.passed ? '✅' : '❌'} ${describeCommandObservation(o)}`)
+        .join('\n')}`
+    : '';
+  return `**Acceptance criteria** — ${acceptanceSummary(report)}\n\n${lines}${observations}`;
 }

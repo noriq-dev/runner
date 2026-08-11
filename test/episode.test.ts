@@ -601,6 +601,31 @@ describe('buildEpisode — commands/testsRun from observed deterministic command
     expect(episode.commands).toHaveLength(2);
     expect(episode.commands.some((c) => c.startsWith('[review-fix]'))).toBe(true);
   });
+
+  it('carries a post-review landing pass without upgrading the reviewer coverage (RUN-292)', () => {
+    const acceptance: AcceptanceReport = {
+      entries: [
+        {
+          id: 1,
+          outcome: 'behaviour-unverified',
+          evidence: 'the reviewer was correctly told the landing command had not run',
+          item: { id: 1, kind: 'truth', text: 'npm run check passes' },
+        },
+      ],
+    };
+    const ctx = baseCtx({
+      reviewEvidence: { rounds: 1, acceptance },
+      commandObservations: [
+        { site: 'landing', cmd: 'npm run check', passed: true, exitCode: 0, timedOut: false, attempts: 1 },
+      ],
+    });
+
+    const episode = buildEpisode(ctx, { filesTouched: [], hasRemainingWork: false, steeringHistory: [] });
+
+    expect(episode.commands).toContain('[landing] npm run check — passed');
+    expect(episode.testsRun).toEqual(episode.commands);
+    expect(episode.acceptanceCoverage).toBe(0);
+  });
 });
 
 describe("buildEpisode — reviewRounds from the reviewer's own exact count (RUN-225)", () => {
@@ -736,12 +761,13 @@ describe("buildEpisode — steeringEvents from the daemon's own delivery record 
 interface Recorder {
   calls: string[];
   reportArgs: unknown[];
+  comments: string[];
   disposeCount: number;
   warnings: unknown[][];
 }
 
 function makeHost(over: { recordEpisode?: (e: unknown) => void } = {}): { host: StageHost; rec: Recorder } {
-  const rec: Recorder = { calls: [], reportArgs: [], disposeCount: 0, warnings: [] };
+  const rec: Recorder = { calls: [], reportArgs: [], comments: [], disposeCount: 0, warnings: [] };
   const host: StageHost = {
     log: {
       info: () => {},
@@ -755,7 +781,9 @@ function makeHost(over: { recordEpisode?: (e: unknown) => void } = {}): { host: 
       rec.calls.push('report');
       rec.reportArgs.push(frame);
     },
-    postComment: () => {},
+    postComment: (_projectId, _taskId, body) => {
+      rec.comments.push(body);
+    },
     transcript: () => ({ text: () => {}, milestone: () => {} }) as never,
     endTranscript: () => 0,
     vcsFor: () =>
@@ -812,6 +840,38 @@ describe('settleStage — episode assembly ordering (RUN-224)', () => {
     expect(reportAt).toBeGreaterThanOrEqual(0);
     expect(episodeAt).toBeGreaterThan(reportAt);
     expect(disposeAt).toBeGreaterThan(episodeAt);
+  });
+});
+
+describe('settleStage — post-review landing evidence (RUN-292)', () => {
+  it('posts one scorecard with the daemon observation beside an unchanged reviewer verdict', async () => {
+    const { host, rec } = makeHost();
+    const acceptance: AcceptanceReport = {
+      entries: [
+        {
+          id: 1,
+          outcome: 'behaviour-unverified',
+          evidence: 'the landing command had not run during review',
+          item: { id: 1, kind: 'truth', text: 'npm run check passes' },
+        },
+      ],
+    };
+    const ctx = baseCtx({
+      run: { ...run, anchor: { type: 'task', taskId: 'task_1' } },
+      landed: true,
+      landPolicy: { branch: 'main' } as never,
+      reviewEvidence: { rounds: 1, acceptance },
+      commandObservations: [
+        { site: 'landing', cmd: 'npm run check', passed: true, exitCode: 0, timedOut: false, attempts: 1 },
+      ],
+    });
+
+    await settleStage(host, ctx);
+
+    expect(rec.comments).toHaveLength(1);
+    expect(rec.comments[0]).toContain('0 verified, 0 failed, 1 unverified');
+    expect(rec.comments[0]).toContain('[landing] npm run check — passed');
+    expect(ctx.reviewEvidence?.acceptance?.entries[0]!.outcome).toBe('behaviour-unverified');
   });
 });
 

@@ -4,12 +4,14 @@ import {
   MAX_ACCEPTANCE_ITEMS,
   acceptanceOverflow,
   acceptanceSummary,
+  describeCommandObservation,
   enumerateAcceptance,
   failedAcceptance,
   reconcileAcceptance,
   renderAcceptanceChecklist,
   renderAcceptanceReport,
   unverifiedAcceptance,
+  withDaemonObservations,
 } from '../src/acceptance';
 import { judgeWithAcceptance } from '../src/verify-agent';
 
@@ -274,5 +276,29 @@ describe('the report a human reads', () => {
 
   it('renders nothing for a run that had no criteria', () => {
     expect(renderAcceptanceReport({ entries: [] })).toBe('');
+  });
+
+  it('shows a daemon command as a separate fact without reclassifying a matching criterion', () => {
+    const report = reconcileAcceptance(enumerateAcceptance(truths('npm run check passes')), 'VERDICT: PASS');
+    const before = structuredClone(report.entries);
+    const observed = {
+      site: 'landing' as const,
+      cmd: 'npm run check',
+      passed: true,
+      exitCode: 0,
+      timedOut: false,
+      attempts: 1,
+    };
+
+    const enriched = withDaemonObservations(report, [observed]);
+    const out = renderAcceptanceReport(enriched);
+
+    expect(enriched.entries).toEqual(before);
+    expect(enriched.entries[0]!.outcome).toBe('behaviour-unverified');
+    expect(acceptanceSummary(enriched)).toContain('1 unverified');
+    expect(out).toContain('**Daemon observations**');
+    expect(out).toContain('[landing] npm run check — passed');
+    expect(out).toContain('they do not reclassify the reviewer verdicts');
+    expect(describeCommandObservation(observed)).toBe('[landing] npm run check — passed');
   });
 });

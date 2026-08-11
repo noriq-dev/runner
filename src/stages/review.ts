@@ -8,7 +8,12 @@
  * that cannot change.
  */
 
-import { acceptanceNeedsAttention, acceptanceSummary, renderAcceptanceReport } from '../acceptance';
+import {
+  acceptanceNeedsAttention,
+  acceptanceSummary,
+  renderAcceptanceReport,
+  withDaemonObservations,
+} from '../acceptance';
 import { renderRequirementOutcomes, requirementOutcomes } from '../adjudication';
 import {
   reviewerEscalationComment,
@@ -56,21 +61,27 @@ export const reviewStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
   // verdict below, since a FAIL's acceptance gaps and round count are as real as a PASS's. See
   // `RunPipeline.reviewEvidence`'s own doc for why `looks` (not `rounds`) is what closes the
   // ledger-derived undercount.
-  ctx.reviewEvidence = { rounds: review.looks, acceptance: review.acceptance };
+  const acceptance = review.acceptance
+    ? withDaemonObservations(review.acceptance, ctx.commandObservations)
+    : undefined;
+  ctx.reviewEvidence = { rounds: review.looks, acceptance };
 
   // The per-criterion record (RUN-145) is posted whatever the verdict, and that is the point of
   // it: on a FAIL it is the most legible part of the report, and on a PASS it is the ONLY place a
   // criterion nobody could evidence is visible at all — a passing run is exactly where such a gap
   // would otherwise disappear. Only when there were criteria to answer; a run with no spec gets
   // no empty scorecard.
-  if (review.acceptance?.entries.length) {
-    host.log.info('acceptance criteria', { runId: run.id, summary: acceptanceSummary(review.acceptance) });
-    host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(review.acceptance)}`);
+  if (acceptance?.entries.length) {
+    host.log.info('acceptance criteria', { runId: run.id, summary: acceptanceSummary(acceptance) });
+    host.transcript(run.id).milestone(`acceptance: ${acceptanceSummary(acceptance)}`);
     // Anything that is not `verified` is worth a human's eyes, including `human-needed` — that
     // outcome's whole content is "a person has to do something", so a passing run that never says
     // so has lost the request entirely.
-    if (!review.passed || acceptanceNeedsAttention(review.acceptance)) {
-      comment(renderAcceptanceReport(review.acceptance));
+    // Landing verification runs after this stage. Its scorecard is posted by `settle`, once that
+    // daemon observation exists, so the task receives one complete report rather than a permanent
+    // pre-command report plus a contradictory-looking addendum.
+    if (!ctx.landPolicy && (!review.passed || acceptanceNeedsAttention(acceptance))) {
+      comment(renderAcceptanceReport(acceptance));
     }
   }
 

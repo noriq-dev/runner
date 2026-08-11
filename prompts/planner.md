@@ -29,6 +29,7 @@ Rules that decide whether this is worth the tokens it cost:
 
 - **Paths are repo-relative and must exist as written** (except a `create`). Check them; do not guess at a layout.
 - **`observableTruths` are truths, not steps.** "a dispatch with no spec still runs" is a truth; "run the tests" is a step and belongs nowhere.
+- **Do not restate the repository's deterministic verify command as acceptance.** The daemon enforces `[verify].cmd` independently (and, on landing repositories, may run it only after review); acceptance criteria describe the behavior and artifacts that command helps check, not “`npm run check` passes.”
 - **`lockedDecisions` are things you FOUND already decided** — in a doc, a comment, an existing pattern — not opinions you formed while reading. Cite where. An invented constraint is worse than none: the implementer will obey it.
 - **`deferred` is for work you can see and are deliberately excluding.** It is what stops the next agent's scope growing, and what stops a reviewer flagging a known gap.
 - **`discretion` is the thing only you can say.** Silence reads as an oversight, and an agent treats every gap as one.
