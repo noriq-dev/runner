@@ -304,6 +304,10 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
       verifyDurations: ctx.tally.verifyDurations(),
       changes,
       runTotal,
+      // RUN-247: captured at the render point (`stages/brief.ts`), carried onto the pipeline
+      // unchanged — absent whenever this sitting made no assertion (`RunPipeline.contextConsumption`
+      // 's own doc), in which case the metric is simply omitted from the upload.
+      ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
     });
     host.recordEpisode?.(episode, intelligence);
   } catch (err) {

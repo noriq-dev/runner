@@ -37,6 +37,7 @@
 import { DAEMON_PROVENANCE, DAEMON_SOURCES } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { backendChangeStats } from '../src/change-stats';
+import { buildContextConsumption } from '../src/context-consumption';
 import { zeroTelemetry } from '../src/drivers/types';
 import { buildObservedModelUsage } from '../src/intelligence-payload';
 import { stageFactFromTelemetry } from '../src/stage-facts';
@@ -138,6 +139,25 @@ describe('every change-stats envelope is acceptable to the ingest (PLNR-417, RUN
     expectAcceptable(stats.additions);
     expectAcceptable(stats.deletions);
     expectAcceptable(stats.churn);
+  });
+});
+
+describe('the contextConsumption envelope is acceptable to the ingest (RUN-247)', () => {
+  it('not_applicable, unavailable, complete and partial are all daemon-legal', () => {
+    const notApplicable = buildContextConsumption({
+      retrieval: { attempted: false, pack: null, omission: { reason: 'no-task' }, tookMs: 0 },
+      verifiedContextPack: null,
+      rendered: { text: '', chars: 0, truncated: false },
+    });
+    const unavailable = buildContextConsumption({
+      retrieval: { attempted: true, pack: null, omission: { reason: 'unavailable' }, tookMs: 5 },
+      verifiedContextPack: null,
+      rendered: { text: '', chars: 0, truncated: false },
+    });
+    for (const m of [notApplicable, unavailable]) {
+      expect(m).not.toBeNull();
+      expectAcceptable(m as never);
+    }
   });
 });
 

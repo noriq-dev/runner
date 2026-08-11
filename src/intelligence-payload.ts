@@ -34,6 +34,13 @@
  * already ships over the `RunReport` telemetry frame (RUN-241) and sending it again here would be a
  * second assertion of one fact.
  *
+ * `contextConsumption` (RUN-247) rides as a TOP-LEVEL sibling of `execution`, never nested under it
+ * — PLNR-433's own locked placement (`vendor/noriq-shared/src/intelligence.ts`): a disjoint key
+ * makes "reporting context facts leaves `execution.stages`/`clocks`/`changes` untouched" true by
+ * construction, rather than something this function has to work to preserve. Carried straight
+ * through from `input.contextConsumption` — `context-consumption.ts` owns the status ladder and the
+ * mapping; this module only decides WHERE it goes in the assembled payload.
+ *
  * **The cross-sitting stage-fidelity limit** (RUN-248, measured during RUN-284/245): the server
  * replaces `execution.stages` wholesale rather than merging element-wise, and a continued run seeds
  * its prior spend as one collapsed `__prior__` slot (`supervisor.ts`'s `parkIfBlocked` /
@@ -61,6 +68,7 @@
 
 import type {
   EpisodeStageFact,
+  IntelligenceContextConsumptionMetric,
   IntelligenceDurationMs,
   UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceType,
 } from '@noriq-dev/shared';
@@ -102,6 +110,13 @@ export interface BuildUploadedIntelligenceInput {
   changes?:
     | { kind: 'measured'; backend: string; result: ChangeStatsResult }
     | { kind: 'not_applicable'; backend: string | null; reason: string };
+  /**
+   * RUN-247: `RunPipeline.contextConsumption`, carried straight through — never re-derived here,
+   * same discipline `stages` above follows. Optional, matching every other field: absent means the
+   * caller has nothing to report (no retrieval this sitting), and `contextConsumption` is omitted
+   * from the payload entirely rather than sent as a fabricated `not_applicable`.
+   */
+  contextConsumption?: IntelligenceContextConsumptionMetric;
 }
 
 /**
@@ -249,5 +264,11 @@ export function buildUploadedIntelligence(
         : notApplicableChangeStats(input.changes.backend, input.changes.reason);
   }
   execution.observedModelUsage = buildObservedModelUsage(input.runTotal);
-  return Object.keys(execution).length > 0 ? { execution } : undefined;
+
+  const payload: UploadedEpisodeIntelligenceType = {};
+  if (Object.keys(execution).length > 0) payload.execution = execution;
+  // Top-level sibling (RUN-247 locked decision, restated in this module's own doc above) — never
+  // folded into `execution`, and never asserted when the caller had nothing to report.
+  if (input.contextConsumption) payload.contextConsumption = input.contextConsumption;
+  return Object.keys(payload).length > 0 ? payload : undefined;
 }

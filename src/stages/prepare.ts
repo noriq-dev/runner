@@ -24,7 +24,15 @@
  * park record rather than resolving them again, which is the whole point of parking.
  */
 
-import type { AgentTool, PermissionProfile, Run, RunBudget, RunKind, SetupSpec } from '@noriq-dev/shared';
+import type {
+  AgentTool,
+  IntelligenceContextConsumptionMetric,
+  PermissionProfile,
+  Run,
+  RunBudget,
+  RunKind,
+  SetupSpec,
+} from '@noriq-dev/shared';
 import { hasExecutionSpec } from '@noriq-dev/shared';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { foldStageCoordinate } from '../agent-coordinate';
@@ -179,6 +187,13 @@ export interface PreparedRun {
    * it does not gate a run over a verification failure). Rendering it into a prompt is RUN-230/231.
    */
   verifiedContextPack: VerifiedContextPack | null;
+  /**
+   * RUN-247: what THIS sitting's brief actually rendered from `verifiedContextPack`, captured at
+   * `buildRunBrief`'s render point — `null` when this daemon has no assertion to make (see
+   * `context-consumption.ts`'s own doc). Carried forward to `afterDriver`/`RunPipeline` the same
+   * way `checkedSpec` is, and only onto the pipeline when truthy (`settle` omits it otherwise).
+   */
+  contextConsumption: IntelligenceContextConsumptionMetric | null;
   repo: ResolvedRepo;
   driver: AgentDriver;
   workflow: Workflow;
@@ -639,7 +654,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   // failure; everything from here is a pure function of facts already in hand, which is what lets
   // `resume` build one too.
   const workflow = resolveWorkflow(run.workflow ?? run.kind, workflowSource);
-  const { checkedSpec, buildPrompt } = await buildRunBrief(host, {
+  const { checkedSpec, buildPrompt, contextConsumption } = await buildRunBrief(host, {
     run,
     repo,
     worktree,
@@ -649,6 +664,10 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     ...(workflow ? { workflow } : {}),
     ...(diffCmd ? { diffCmd } : {}),
     verifiedContextPack,
+    // This sitting's own retrieval facts (RUN-247) — present on every path that reaches this line,
+    // since `prepareRun` is the only caller that ever fetches one; a resume never calls this
+    // function at all (`resume` has no `prepare`).
+    contextPack,
   });
 
   // Findings go to the RUN'S TRANSCRIPT, not only to daemon stderr — which is what makes the two
@@ -756,6 +775,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
     checkedSpec,
     contextPack,
     verifiedContextPack,
+    contextConsumption,
     repo,
     driver,
     workflow: wf,

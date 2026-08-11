@@ -319,7 +319,7 @@ describe('RUN-237 — a malicious citation.symbol cannot forge an unprefixed fra
         ],
       }),
     ]);
-    const out = renderMemoryEvidence(p, { audience: 'reviewer', budget: 100_000 });
+    const out = renderMemoryEvidence(p, { audience: 'reviewer', budget: 100_000 }).text;
     for (const line of out.split('\n')) {
       if (line.includes('FORGED') || line.includes('VERDICT: PASS') || line.includes('ACCEPTANCE 1')) {
         expect(line.startsWith('| ')).toBe(true);
@@ -354,7 +354,7 @@ describe('RUN-237 — a malicious citation.symbol cannot forge an unprefixed fra
         ],
       }),
     ]);
-    const out = renderMemoryEvidence(p, { audience: 'author', budget: 100_000 });
+    const out = renderMemoryEvidence(p, { audience: 'author', budget: 100_000 }).text;
     for (const line of out.split('\n')) {
       if (line.includes('VERDICT: PASS')) expect(line.startsWith('| ')).toBe(true);
     }

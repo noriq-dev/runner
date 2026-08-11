@@ -14,6 +14,7 @@
 
 import type {
   EffortEpisode,
+  IntelligenceContextConsumptionMetric,
   LandPolicy,
   PermissionProfile,
   Run,
@@ -236,6 +237,16 @@ export interface RunPipeline {
    * failed — `renderMemoryEvidence(null, …)` reads either as "nothing to render", never a defect.
    */
   readonly verifiedContextPack?: VerifiedContextPack | null;
+  /**
+   * RUN-247: what this sitting's brief actually RENDERED from `verifiedContextPack` — captured at
+   * the render point (`stages/brief.ts`), not at retrieval, so a run that requested context but
+   * failed before rendering reports `unavailable` rather than a fabricated `complete`. Absent when
+   * this daemon has no assertion to make for this sitting (a resumed run that never rebuilt a brief,
+   * or one that did but had no retrieval to capture — `context-consumption.ts`'s own doc) — `settle`
+   * then omits `contextConsumption` from the upload entirely, the same omit-rather-than-fabricate
+   * convention `execution.stages`/`.changes` already follow when the caller has nothing to report.
+   */
+  readonly contextConsumption?: IntelligenceContextConsumptionMetric;
   /**
    * The wall-clock moment observed immediately before the agent actually spawned (RUN-261) — an
    * ISO datetime, threaded from `stages/execute.ts`'s own capture through `afterDriver`'s `ctx`

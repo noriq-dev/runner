@@ -19,10 +19,12 @@
  * is a brief both entry points can be given.
  */
 
-import type { ExecutionSpec, Run, RunKind } from '@noriq-dev/shared';
+import type { ExecutionSpec, IntelligenceContextConsumptionMetric, Run, RunKind } from '@noriq-dev/shared';
 import { acceptanceOverflow, enumerateAcceptance } from '../acceptance';
 import type { VerifiedContextPack } from '../citation-verify';
 import type { RunAgent } from '../client';
+import { buildContextConsumption } from '../context-consumption';
+import type { ContextPackRetrieval } from '../context-pack';
 import {
   type CheckedExecutionSpec,
   checkExecutionSpec,
@@ -65,6 +67,16 @@ export interface BriefInputs {
   /** RUN-231: the run's verified context pack — absent on a resume that never fetched one (see
    *  `RunPipeline.verifiedContextPack`'s own doc). `undefined` and `null` both render `''`. */
   verifiedContextPack?: VerifiedContextPack | null;
+  /**
+   * RUN-247: this sitting's own retrieval facts (`prepare.ts`'s `contextPack` local), so the
+   * consumption metric captured below can tell "never asked" from "asked but nothing survived to
+   * render" — a distinction `verifiedContextPack` alone cannot make (`null` means both). Absent on
+   * a resume, for the same reason `verifiedContextPack` is: `resume` has no `prepare`, so nothing
+   * retrieved one THIS sitting — and `buildContextConsumption` reads that absence as "no assertion
+   * to make" rather than guessing at `not_applicable`, which would claim knowledge of a prior
+   * sitting this process was never handed.
+   */
+  contextPack?: ContextPackRetrieval;
 }
 
 export interface BuiltBrief {
@@ -81,6 +93,15 @@ export interface BuiltBrief {
    * read the same facts and are asked a different question.
    */
   buildPrompt: BuildPrompt;
+  /**
+   * RUN-247: what this sitting actually rendered from `verifiedContextPack`, captured HERE — the
+   * render point — rather than at retrieval (`prepare.ts`), which is what lets a run that requested
+   * context but failed before rendering report `unavailable` instead of a fabricated `complete`.
+   * `null` when there is nothing this daemon may assert (see `BriefInputs.contextPack`'s own doc on
+   * when that is): a caller threads it onto `RunPipeline` only when truthy, the same
+   * omit-rather-than-fabricate convention `contextPack`/`verifiedContextPack` already follow.
+   */
+  contextConsumption: IntelligenceContextConsumptionMetric | null;
 }
 
 export type BuildPrompt = (
@@ -144,8 +165,20 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
   // on a resume that never fetched a pack (`RunPipeline`'s own doc); `renderMemoryEvidence` reads
   // `undefined` and `null` identically, both rendering `''`.
   const pack = input.verifiedContextPack ?? null;
-  const memory = renderMemoryEvidence(pack, { audience: 'author' });
-  const memoryBrief = renderMemoryEvidence(pack, { audience: 'reviewer' });
+  const authorRendered = renderMemoryEvidence(pack, { audience: 'author' });
+  const memory = authorRendered.text;
+  // RUN-247 locked decision: report the AUTHOR rendering, not the reviewer's — one metric per
+  // episode, and the analytics question behind it (did context change the WORK) is the author's
+  // question. `memoryBrief` below still renders for the actor that reads it; it just contributes
+  // nothing to `contextConsumption`.
+  const memoryBrief = renderMemoryEvidence(pack, { audience: 'reviewer' }).text;
+  // RUN-247: captured HERE, not in `prepare.ts` — this IS the point the pack is handed to the
+  // agent, and `authorRendered` is the only place this process knows whether that hand-off was cut.
+  const contextConsumption = buildContextConsumption({
+    retrieval: input.contextPack,
+    verifiedContextPack: input.verifiedContextPack,
+    rendered: authorRendered,
+  });
 
   const buildPrompt = ((specBlock, forVerify, shape, ledger) =>
     assemblePrompt(run, repo.manifest, {
@@ -169,7 +202,7 @@ export async function buildRunBrief(host: BriefHost, input: BriefInputs): Promis
       promptWarning: (message, details) => host.log.warn(message, details),
     })) as BuildPrompt;
 
-  return { repoCtx, checkedSpec, buildPrompt };
+  return { repoCtx, checkedSpec, buildPrompt, contextConsumption };
 }
 
 /** The spec block an AUTHOR sees: the whole spec, or the notice that the server holds one nobody

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { RepoPath, ExecutionSpec } from './execution-spec';
 import { ProjectIntelligenceEpisode } from './intelligence';
+import type { ContextConsumptionMode, ContextConsumptionRole, ContextConsumptionSectionId } from './intelligence';
 import { RunModelUsage } from './runner';
 
 // ---------------------------------------------------------------------------
@@ -646,6 +647,33 @@ export const ContextPackSectionId = z.enum([
   'source_excerpts',
 ]);
 export type ContextPackSectionId = z.infer<typeof ContextPackSectionId>;
+
+// PLNR-433: `intelligence.ts` declares its own `ContextConsumptionSectionId`/`Mode`/`Role` —
+// duplicates of `ContextPackSectionId`/`ContextPackMode`/`ContextPackRole` above — because
+// `intelligence.ts` cannot import from THIS file (this file already imports
+// `ProjectIntelligenceEpisode` from `intelligence.ts`; the reverse would cycle). That is NOT the
+// same situation as `ContextPackProvenance`'s mirror of the Worker-internal `RetrievalStage` a few
+// hundred lines up: `RetrievalStage` lives in `apps/api/src/memory/retrieval.ts`, outside this
+// package, where shared deliberately has no dependency and a compile-time check is genuinely
+// unavailable. Both halves of THESE three pairs live in this same package — so the guard IS
+// available, and using it is a choice, not a constraint. This is that guard: a value added,
+// removed, or renamed on EITHER side of any pair now fails `npx tsc --noEmit` right here, instead
+// of drifting silently the way a hand-maintained "keep in sync" comment allows — the same failure
+// mode PLNR-426 closed for `MetricProvenance`/`IntelligenceSource` (a drifted allowlist value that
+// passed every test and silently discarded whole episodes behind an HTTP 200).
+//
+// Mutual `extends` in both directions, not one: a one-way check misses a rename (the renamed
+// value merely becomes "extra" on one side, which a superset-only check would not catch) — trying
+// it in both directions makes any add/remove/rename fail on whichever direction it breaks.
+// The `[A]`/`[B]` tuple wrapping is load-bearing, not decorative: `A`/`B` are literal-string
+// unions, and an UNwrapped `A extends B` distributes over each member of A, collapsing the result
+// to the widened `boolean` instead of a single `true`/`false` — which would make `AssertTrue` below
+// accept the check unconditionally instead of enforcing it.
+type AssertEqualEnum<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+type AssertTrue<T extends true> = T;
+export type _ContextPackSectionIdMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackSectionId, ContextConsumptionSectionId>>;
+export type _ContextPackModeMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackMode, ContextConsumptionMode>>;
+export type _ContextPackRoleMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackRole, ContextConsumptionRole>>;
 
 export const ContextPackSection = z.object({
   id: ContextPackSectionId,

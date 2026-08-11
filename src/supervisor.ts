@@ -2,6 +2,7 @@ import type {
   AgentTool,
   EffortEpisode,
   EpisodeStageFact,
+  IntelligenceContextConsumptionMetric,
   IntelligenceDurationMs,
   LandPolicy,
   PermissionProfile,
@@ -2372,7 +2373,7 @@ export class RunSupervisor {
     const reviewerContext = await this.reviewerContext(ctx.repo, ctx.worktree);
     // Pure and synchronous (RUN-231) — nothing here touches disk or the clock, so it costs
     // nothing to compute freshly every round rather than threading a cached render.
-    const memory = renderMemoryEvidence(ctx.verifiedContextPack ?? null, { audience: 'reviewer' });
+    const memory = renderMemoryEvidence(ctx.verifiedContextPack ?? null, { audience: 'reviewer' }).text;
     const startedAt = monotonicMs();
     const session = this.startAgent(driver, {
       runId: `${ctx.run.id}:review`,
@@ -3627,6 +3628,14 @@ export class RunSupervisor {
       verifyText: outcome.sessionText,
       getSessionText: outcome.getSessionText,
       tail: outcome.tail,
+      // RUN-247: only present when `resumedBrief` actually rebuilt one (`needsBrief` above) — a
+      // plain session RESTORE never re-renders memory at all (the session already holds whatever
+      // its first sitting saw), so there is nothing this call captured to carry forward. That
+      // sitting's own consumption fact is not recoverable here: `resume` has no `prepare`, and a
+      // successful park returns before `afterDriver` ever builds a pipeline to capture it onto —
+      // the same absence this file already accepts for `contextPack`/`verifiedContextPack`
+      // themselves on every resume path.
+      contextConsumption: resumedBrief?.contextConsumption,
       // RUN-261: a resumed sitting still spawns a live session (the restored one, or the fresh
       // continuation-style one RUN-199 opens) — `outcome` only lacks this when the resumed chain
       // failed before any step ran (`sessionlessChainExit`), which carries no `agentStartedAt`.
@@ -3818,6 +3827,7 @@ export class RunSupervisor {
       executedSpec,
       contextPack: prepared.contextPack,
       verifiedContextPack: prepared.verifiedContextPack,
+      contextConsumption: prepared.contextConsumption,
       // Absent only when the chain failed before any step spawned a session (RUN-261,
       // `sessionlessChainExit`) — an ordinary undecomposed run always has one, since `executeRun`
       // is reached only past every cancellation check that could have short-circuited first.
@@ -4482,6 +4492,10 @@ export class RunSupervisor {
     /** RUN-229's verdicts over that retrieval, carried from `PreparedRun.verifiedContextPack` —
      *  same absence rule as `contextPack` above, for the same reason. */
     verifiedContextPack?: VerifiedContextPack | null;
+    /** RUN-247: captured at the render point (`stages/brief.ts`), carried from
+     *  `PreparedRun.contextConsumption` on a fresh dispatch, or from a resumed brief rebuild's own
+     *  return — absent whenever neither happened this sitting. */
+    contextConsumption?: IntelligenceContextConsumptionMetric | null;
     /** The wall-clock moment `execute` observed just before spawning (RUN-261), threaded through
      *  because the pipeline this becomes a field of does not exist until this method builds it.
      *  Absent iff no session ever spawned this sitting (`sessionlessChainExit`). */
@@ -4524,6 +4538,7 @@ export class RunSupervisor {
       requirements: ctx.executedSpec?.spec.requirementIds ?? [],
       ...(ctx.contextPack ? { contextPack: ctx.contextPack } : {}),
       ...(ctx.verifiedContextPack !== undefined ? { verifiedContextPack: ctx.verifiedContextPack } : {}),
+      ...(ctx.contextConsumption ? { contextConsumption: ctx.contextConsumption } : {}),
       ...(ctx.agentStartedAt ? { agentStartedAt: ctx.agentStartedAt } : {}),
       exit: ctx.exit,
       // Whether the DRIVER succeeded — drives worktree retention (a build with a diff is kept for

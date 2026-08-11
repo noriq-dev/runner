@@ -206,6 +206,114 @@ export const IntelligenceAlgorithmVersions = z.object({
   comparison: z.string().min(1).nullable().default(null),
 });
 
+// PLNR-433: what a run actually READ, as distinct from what it was told to do (`preExecution`) or
+// what it did (`execution`). Blocks RUN-247, which already holds every one of these facts on the
+// Runner's own `ContextPack`/`ContextPackRetrieval` (verified against the checked-out Runner
+// source, not assumed) and has had nowhere server-side to put them.
+//
+// PLACEMENT — a top-level sibling of preExecution/execution/outcome, not nested under either
+// (task's own discretion point, argued here): `preExecution` is the server's own immutable
+// commissioning snapshot — what the run was TOLD before it started; a daemon-reported fact about
+// what it actually consumed does not belong inside that server-authoritative object. `execution`
+// is scoped to the run's own clocks/stages/changes, and this task's OWN acceptance requires that
+// reporting context facts leave `execution.stages`/`clocks`/`changes` untouched — nesting under
+// `execution` would make that something the merge function has to work to preserve; a disjoint
+// top-level key makes it true by construction instead.
+//
+// THE NO-TEXT RULE IS STRUCTURAL: every field below is a count, an enum, a boolean, or a
+// `metricEnvelope` around one of those — never a bare `z.string()`. `ContextPackNotice.reason` and
+// every excerpt/citation field on the real `ContextPack` (memory.ts:704) are free text and have no
+// counterpart here; only whether a notice fired (boolean) or how many fired (count) is carried.
+//
+// REQUESTED-VS-CONSUMED lives in `metricEnvelope`'s existing four statuses, not a bespoke fact kind
+// (design point 2 — checked against the real `metricEnvelope`/`BackendChangeStats`/
+// `observedModelUsage` shapes in this same file before concluding this, not assumed): see
+// `IntelligenceContextConsumptionMetric` below. `not_applicable` (value: null) = never asked — no
+// task anchor, no repository key to assemble a pack against. `unavailable` (value: null) = asked
+// and got nothing back before anything rendered (no fetcher configured, a timeout, a server error
+// — the Runner's own `ContextPackOmission` names which, but that is Runner-side reasoning about
+// its OWN request, not a fact this analytics contract needs a parallel enum for: the four envelope
+// statuses already say everything an episode record needs to say about it, and adding
+// `ContextPackOmission` here too would just give the daemon two ways to describe one state).
+// `complete` (value populated, mode: 'semantic') = rendered in full. `partial` (value populated,
+// mode: 'keyword', and/or a section carrying `truncated`/`unanswerable`) = rendered, but bounded or
+// degraded. That is three (in fact four) states, and none of them is a raw zero: "never requested"
+// and "requested but never rendered" both carry `value: null` and are distinguished ONLY by
+// `status`, exactly as the acceptance requires.
+//
+// REVISION IDENTITY — decided HERE, not punted to the Runner (the task explicitly asks for that):
+// NOT NOW. `IntelligenceSourceWatermarks.memoryRevision` looks like it might already answer "which
+// revision of memory did this run see", but it is stamped at EPISODE-recording time
+// (`ProjectMemory.recordEpisode`'s `acceptedMemoryRevision`, read after the run finishes), not at
+// PACK-assembly time — a long build can see `memory_revision` advance while it runs, so reusing
+// that watermark for "which revision did the pack see" would be silently wrong, not merely
+// approximate. A correct id would have to originate on `ContextPack` itself (memory.ts:704), which
+// today carries only `generatedAt`, and widening that schema is explicitly out of this task's scope
+// (a follow-up task, per the execution spec's `deferred` list) — so there is nowhere honest to
+// source a pack-assembly-time revision id from in this diff. Leaving it out rather than growing a
+// second, wrong watermark that would need its own reconciliation with the first.
+//
+// Duplicated enum values below (`ContextConsumptionSectionId`/`Mode`/`Role`) mirror `memory.ts`'s
+// `ContextPackSectionId`/`ContextPackMode`/`ContextPackRole`. `memory.ts` imports
+// `ProjectIntelligenceEpisode` from THIS file (for `EffortEpisode.intelligence`), so this file
+// importing back from `memory.ts` would be a cycle — the duplication itself is forced. UNLIKE
+// `memory.ts`'s own `ContextPackProvenance`, which mirrors the Worker-internal `RetrievalStage` "by
+// convention, not by import" because a compile-time check is genuinely unavailable across that
+// package boundary, both halves of these three pairs live in this SAME package — so nothing is
+// kept in sync "by hand": `memory.ts` (which already imports from this file, so the dependency
+// direction is untouched) carries a type-level bidirectional equality assertion for all three
+// pairs, right after its own `ContextPackSectionId`/`Mode`/`Role` declarations, that fails
+// `npx tsc --noEmit` the moment either side adds, removes, or renames a value.
+export const ContextConsumptionSectionId = z.enum([
+  'active_decisions',
+  'known_hazards',
+  'failed_approaches',
+  'relevant_memories',
+  'similar_episodes',
+  'graph_neighborhood',
+  'affected_tests',
+  'active_neighboring_work',
+  'uncertainty',
+  'source_excerpts',
+]);
+export type ContextConsumptionSectionId = z.infer<typeof ContextConsumptionSectionId>;
+
+/** One rendered section's shape as it counts for analytics — never its excerpts, citations, or
+ * notice text. `ContextPackNotice.reason` is free text and stays out of this contract entirely;
+ * only whether a notice of each kind fired, as a boolean, crosses the boundary. */
+export const ContextConsumptionSectionFact = z.object({
+  id: ContextConsumptionSectionId,
+  excerptCount: z.number().int().nonnegative(),
+  graphEntityCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  unanswerable: z.boolean(),
+});
+export type ContextConsumptionSectionFact = z.infer<typeof ContextConsumptionSectionFact>;
+
+export const ContextConsumptionMode = z.enum(['semantic', 'keyword']);
+export type ContextConsumptionMode = z.infer<typeof ContextConsumptionMode>;
+export const ContextConsumptionRole = z.enum(['scope', 'build', 'verify', 'human']);
+export type ContextConsumptionRole = z.infer<typeof ContextConsumptionRole>;
+
+/** What a run's context pack looked like when it was rendered — counts, enums and booleans only
+ * (locked decision): no excerpt text, no citation path, no memory statement, no notice reason
+ * string has anywhere to go in this shape, structurally, regardless of who implements RUN-247. */
+export const ContextConsumptionSnapshot = z.object({
+  mode: ContextConsumptionMode,
+  role: ContextConsumptionRole,
+  charBudget: z.number().int().positive(),
+  charsUsed: z.number().int().nonnegative(),
+  sections: z.array(ContextConsumptionSectionFact).default([]),
+  similarEpisodesConsidered: z.number().int().nonnegative(),
+  staleCitationsCount: z.number().int().nonnegative(),
+  noticesCount: z.number().int().nonnegative(),
+  retrievalTookMs: z.number().int().nonnegative(),
+});
+export type ContextConsumptionSnapshot = z.infer<typeof ContextConsumptionSnapshot>;
+
+export const IntelligenceContextConsumptionMetric = metricEnvelope(ContextConsumptionSnapshot);
+export type IntelligenceContextConsumptionMetric = z.infer<typeof IntelligenceContextConsumptionMetric>;
+
 export const ProjectIntelligenceEpisode = z.object({
   schemaVersion: z.literal(PROJECT_INTELLIGENCE_CONTRACT_VERSION),
   identity: ProjectIntelligenceIdentity,
@@ -214,6 +322,13 @@ export const ProjectIntelligenceEpisode = z.object({
   preExecution: EpisodePreExecutionFacts,
   execution: EpisodeExecutionFacts,
   outcome: EpisodeOutcomeFacts,
+  /** PLNR-433: `.optional()`, not `.default()` — a pre-change stored episode has no key for this
+   * fact at all, and must still parse unchanged. Only a daemon upload (RUN-247) ever sets it; the
+   * server-built skeleton (`memory/episodes.ts#loadEpisodeSkeleton`) deliberately leaves it unset,
+   * since the server never sees the Runner's own `ContextPack` — setting a manufactured
+   * `not_applicable` default there would claim server knowledge of "never asked" for runs the
+   * server simply has no opinion on yet. */
+  contextConsumption: IntelligenceContextConsumptionMetric.optional(),
 });
 export type ProjectIntelligenceEpisode = z.infer<typeof ProjectIntelligenceEpisode>;
 
@@ -409,5 +524,11 @@ export const UploadedEpisodeIntelligence = z.object({
     stages: z.array(UploadedEpisodeStageFact).optional(),
     changes: UploadedBackendChangeStats.optional(),
   }).optional(),
+  /** PLNR-433: entirely daemon-observed — the Runner is the only party that ever sees its own
+   * `ContextPack`, so unlike `preExecution`/`execution` above (which mix server- and daemon-owned
+   * fields), this is asserted as one whole metric, refined by the SAME `daemonMetric` guard every
+   * other uploaded metric carries, so a Runner vendoring only packages/shared can `safeParse` its
+   * own context-facts payload before sending it (the whole point of PLNR-426). */
+  contextConsumption: daemonMetric(IntelligenceContextConsumptionMetric).optional(),
 });
 export type UploadedEpisodeIntelligence = z.infer<typeof UploadedEpisodeIntelligence>;

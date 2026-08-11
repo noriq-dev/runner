@@ -78,6 +78,26 @@ import type { ContextPackGraphEntity, ContextPackSectionId } from './memory-cont
 export type MemoryAudience = 'author' | 'reviewer';
 
 /**
+ * What `renderMemoryEvidence` actually produced (RUN-247's locked decision 2): this module applies
+ * its OWN budget (`MEMORY_AUTHOR_MAX_CHARS`/`MEMORY_REVIEWER_MAX_CHARS`), separate from the pack's
+ * own server-side `charBudget`, and slices with a trailing marker — so it is the only code in the
+ * process that knows whether the agent actually saw the whole thing. A caller that wants to know is
+ * handed this object rather than left to substring-match the cut marker back out of `text`, which
+ * would be a parser over prose, the exact class RUN-189 deleted four generations of.
+ */
+export interface RenderedMemoryEvidence {
+  /** Exactly what used to be this function's whole return value — unchanged in content. */
+  text: string;
+  /** `text.length`, carried alongside rather than left for a caller to recompute — so the two can
+   *  never drift (RUN-247's own acceptance: "a test asserts the reported count equals the length
+   *  of the text it returned"). */
+  chars: number;
+  /** Whether THIS rendering exceeded its budget and was cut — never whether the PACK itself was
+   *  bounded or degraded, which is a fact about the pack, not about what this call produced. */
+  truncated: boolean;
+}
+
+/**
  * The author budget, MEASURED (RUN-273) rather than the guess RUN-231 shipped: a real pack
  * carrying two recorded memories with three citations renders to 3759 characters, so 16k holds
  * roughly eight to ten such records — comfortable, and still the `CONTEXT_BUDGET_CHARS` precedent's
@@ -426,14 +446,15 @@ export function suggestedMemoryPaths(pack: VerifiedContextPack, declared: readon
 export function renderMemoryEvidence(
   pack: VerifiedContextPack | null,
   opts: { audience: MemoryAudience; budget?: number },
-): string {
-  if (!pack || !packHasContent(pack)) return '';
+): RenderedMemoryEvidence {
+  const empty: RenderedMemoryEvidence = { text: '', chars: 0, truncated: false };
+  if (!pack || !packHasContent(pack)) return empty;
   const body = buildBody(pack);
-  if (!body.length) return '';
+  if (!body.length) return empty;
   const budget =
     opts.budget ?? (opts.audience === 'reviewer' ? MEMORY_REVIEWER_MAX_CHARS : MEMORY_AUTHOR_MAX_CHARS);
   const full = `\n\n${frameHeader(opts.audience)}\n${body.join('\n')}`;
-  return full.length <= budget
-    ? full
-    : `${sliceWhole(full, budget)}\n[project memory evidence was longer than this and was cut off]`;
+  if (full.length <= budget) return { text: full, chars: full.length, truncated: false };
+  const text = `${sliceWhole(full, budget)}\n[project memory evidence was longer than this and was cut off]`;
+  return { text, chars: text.length, truncated: true };
 }
