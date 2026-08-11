@@ -147,6 +147,9 @@ export const DEFAULT_PARK_TTL_HOURS = 72;
 export class ParkedStore {
   private readonly file: string;
   private cache: Map<string, ParkedRun> | null = null;
+  private loading: Promise<Map<string, ParkedRun>> | null = null;
+  /** Every mutation rewrites one shared file, so the transaction boundary is the store, not a run. */
+  private mutations: Promise<void> = Promise.resolve();
 
   constructor(file: string = DEFAULT_PARKED_PATH) {
     this.file = file;
@@ -154,26 +157,27 @@ export class ParkedStore {
 
   private async load(): Promise<Map<string, ParkedRun>> {
     if (this.cache) return this.cache;
-    if (!existsSync(this.file)) {
-      this.cache = new Map();
-      return this.cache;
-    }
-    try {
-      const parsed = JSON.parse(await readFile(this.file, 'utf8')) as ParkedFile;
-      // Drop entries from a pre-RUN-50 daemon (loose worktreePath fields, no workspace):
-      // resuming one would hand the backend a workspace it cannot read. Same trade as the
-      // corrupt-file case below — the park is forgotten, the worktree survives for the human.
-      this.cache = new Map((parsed.parked ?? []).filter((p) => !!p.workspace).map((p) => [p.run.id, p]));
-    } catch {
-      // Corrupt file → start empty rather than refuse to boot. The cost is a forgotten park
-      // (whose worktree still exists for the human); the cost of throwing is a dead daemon.
-      this.cache = new Map();
-    }
+    this.loading ??= (async () => {
+      if (!existsSync(this.file)) return new Map();
+      try {
+        const parsed = JSON.parse(await readFile(this.file, 'utf8')) as ParkedFile;
+        // Drop entries from a pre-RUN-50 daemon (loose worktreePath fields, no workspace):
+        // resuming one would hand the backend a workspace it cannot read. Same trade as the
+        // corrupt-file case below — the park is forgotten, the worktree survives for the human.
+        return new Map((parsed.parked ?? []).filter((p) => !!p.workspace).map((p) => [p.run.id, p]));
+      } catch {
+        // Corrupt file → start empty rather than refuse to boot. The cost is a forgotten park
+        // (whose worktree still exists for the human); the cost of throwing is a dead daemon.
+        return new Map();
+      }
+    })();
+    this.cache = await this.loading;
+    this.loading = null;
     return this.cache;
   }
 
-  private async flush(): Promise<void> {
-    const parked = [...(this.cache ?? new Map()).values()];
+  private async flush(next: Map<string, ParkedRun>): Promise<void> {
+    const parked = [...next.values()];
     await mkdir(path.dirname(this.file), { recursive: true });
     // Write-then-rename: a crash mid-write must not leave a truncated file that reads as
     // "nothing was parked" — that would silently abandon runs with unmerged work in them.
@@ -182,9 +186,22 @@ export class ParkedStore {
     await rename(tmp, this.file);
   }
 
+  private mutate<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.mutations.then(work);
+    this.mutations = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   async park(entry: ParkedRun): Promise<void> {
-    (await this.load()).set(entry.run.id, entry);
-    await this.flush();
+    await this.mutate(async () => {
+      const next = new Map(await this.load());
+      next.set(entry.run.id, entry);
+      await this.flush(next);
+      this.cache = next;
+    });
   }
 
   async get(runId: string): Promise<ParkedRun | null> {
@@ -196,13 +213,16 @@ export class ParkedStore {
   }
 
   async unpark(runId: string): Promise<ParkedRun | null> {
-    const map = await this.load();
-    const found = map.get(runId) ?? null;
-    if (found) {
-      map.delete(runId);
-      await this.flush();
-    }
-    return found;
+    return this.mutate(async () => {
+      const current = await this.load();
+      const found = current.get(runId) ?? null;
+      if (!found) return null;
+      const next = new Map(current);
+      next.delete(runId);
+      await this.flush(next);
+      this.cache = next;
+      return found;
+    });
   }
 }
 

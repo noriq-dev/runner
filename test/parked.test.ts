@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Run } from '@noriq-dev/shared';
@@ -137,6 +137,54 @@ describe('ParkedStore survives the daemon (RUN-30)', () => {
     await store.park(entry({ run: run('run_2') }));
     const parsed = JSON.parse(await readFile(f, 'utf8'));
     expect(parsed.parked).toHaveLength(2);
+  });
+  it('does not retain an in-memory park when its durable flush fails', async () => {
+    const blocker = path.join(dir, `${Math.random().toString(36).slice(2)}-not-a-directory`);
+    await writeFile(blocker, 'not a directory');
+    const store = new ParkedStore(path.join(blocker, 'parked.json'));
+
+    await expect(store.park(entry())).rejects.toThrow();
+    // A lifecycle snapshot reads this cache before the process exits, so an entry whose write
+    // failed must not reserve an execution locally while its caller follows the terminal path.
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('keeps cache and disk on the committed park when an unpark flush fails', async () => {
+    const f = file();
+    const store = new ParkedStore(f);
+    await store.park(entry());
+    // Blocking the write-then-rename temporary path fails the next flush without touching the
+    // already-committed file, modelling the exact split-brain boundary this store must absorb.
+    await mkdir(`${f}.tmp`);
+
+    await expect(store.unpark('run_1')).rejects.toThrow();
+    expect((await store.get('run_1'))?.sessionId).toBe('sess-abc');
+    expect((await new ParkedStore(f).get('run_1'))?.sessionId).toBe('sess-abc');
+
+    await rm(`${f}.tmp`, { recursive: true });
+    expect((await store.unpark('run_1'))?.run.id).toBe('run_1');
+    expect(await new ParkedStore(f).list()).toEqual([]);
+  });
+
+  it('serializes concurrent mutations of the shared parked file', async () => {
+    const f = file();
+    const store = new ParkedStore(f);
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        store.park(entry({ run: run(`run_${i}`), sessionId: `sess-${i}` })),
+      ),
+    );
+
+    const removed = await Promise.all(Array.from({ length: 6 }, (_, i) => store.unpark(`run_${i}`)));
+    expect(removed.every(Boolean)).toBe(true);
+    expect((await new ParkedStore(f).list()).map((p) => p.run.id)).toEqual([
+      'run_6',
+      'run_7',
+      'run_8',
+      'run_9',
+      'run_10',
+      'run_11',
+    ]);
   });
 });
 
