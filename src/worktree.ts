@@ -5,7 +5,12 @@ import { chmod, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { ChangesBetweenResult, CurrentBaseResult, IgnoreQueryResult } from './vcs/types';
+import type {
+  ChangeStatsResult,
+  ChangesBetweenResult,
+  CurrentBaseResult,
+  IgnoreQueryResult,
+} from './vcs/types';
 
 const execFileP = promisify(execFile);
 
@@ -463,6 +468,150 @@ export class WorktreeManager {
     // at the base, a run branch full of commits reports no paths, and it is that BRANCH that lands.
     if (!set.size) await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
     return [...set];
+  }
+
+  /**
+   * Change statistics for THIS run's workspace (RUN-245, git's half of `VcsBackend.changeStats`) —
+   * counts only, never paths (`ChangeStats`'s own doc). Two probes, never fused into one:
+   *
+   *   1. `git diff --numstat --find-renames <baseSha>` — the BARE form, no `..HEAD`, no `--cached`.
+   *      Measured (2026-08-10, not assumed): with a committed change plus a further uncommitted
+   *      edit to the SAME file, `<base>..HEAD` reported 2 additions where the bare `<base>` form
+   *      (base against the WORKING TREE) reported 3 — the real union `changedPaths` above already
+   *      relies on from two commands, here from one.
+   *
+   *      `--find-renames`, with NO similarity number, is a CORRECTION to this task's own
+   *      determinism decision, not the decision verbatim — measured the same day the decision was
+   *      written. The decision said a repo's `diff.renames` config could change `changedFiles`;
+   *      what is actually true is worse: it changes `additions`/`deletions` too. A content-identical
+   *      rename under detection reports one record, `0␉0␉old => new`; the SAME rename with
+   *      `-c diff.renames=false` reports TWO, `5␉0␉new` and `0␉5␉old` — changedFiles 1→2 AND
+   *      additions/deletions 0/0→5/5. Passing bare `--find-renames` (git's own default 50%
+   *      threshold, not a chosen one — there is no per-repo config for the NUMBER, only for
+   *      whether detection runs at all) pins the answer to what default config already produces,
+   *      regardless of what a repo's `diff.renames` says: verified by re-running both fixtures
+   *      above under `-c diff.renames=false` WITH this flag and getting the detection-ON answer
+   *      back in both cases. This is what "no git config … could change the counts" actually
+   *      requires; leaving the flag off would make the SAME content diff report different numbers
+   *      depending on a config this method never reads.
+   *   2. `git status --porcelain -z -uall` for untracked files, which numstat never sees at all
+   *      (measured: an unadded file produces no numstat record whatsoever). `-uall`, not the
+   *      default `-u`/`normal`: git collapses an untracked DIRECTORY to one `??` entry under the
+   *      default mode, which would undercount `changedFiles` by an unknown factor.
+   *
+   * Never fused with `changedPaths` above (this task's own locked decision, restated because the
+   * temptation is real inside this very file): they answer different questions for different
+   * consumers, and sharing a command between them is this file's own business — a wrapper in
+   * common code would not be.
+   *
+   * Parsed per LINE, not `-z` (this task's own locked decision): `--numstat -z` encodes a rename as
+   * `adds␉dels␉␀old␀new␀` — an EMPTY third field, then two more NUL-terminated ones — so a naive
+   * `split('\0')` reads the two path fields as records of their own. Without `-z` the whole record
+   * (counts AND path, ` => ` for a rename included) sits on one line, C-quoted like every other git
+   * path this file reads, so taking the first two tab-separated fields and discarding the rest of
+   * the line is correct with no rename branch at all — a rename's `old => new` third field is
+   * simply more of the line this parse already ignores.
+   *
+   * A binary (or otherwise unmeasurable) record prints `-\t-\t<path>` — counted into `changedFiles`
+   * and `uncountableFiles`, NEVER coerced with `Number('-')` (`NaN`), which is exactly the value
+   * `change-stats.ts`'s domain guard exists to catch one layer up.
+   *
+   * Guarded the same way `changesBetween` guards `from`/`to` (this task's own locked decision:
+   * mirror that check rather than inventing a new one) — an empty `baseSha`, or one that fails
+   * `rev-parse --verify --quiet <id>^{commit}`, refuses rather than letting git read `<base>` as
+   * nothing and print a confident (wrong) zero.
+   *
+   * Refuses (`{ok:false, reason:'unavailable', detail}`) rather than throwing, on every probe
+   * failure — `ChangeStatsResult`'s own contract — because this is analytics, and `settle` must be
+   * able to lose it without losing the run.
+   */
+  async changeStats(info: Pick<WorktreeInfo, 'path' | 'baseSha'>): Promise<ChangeStatsResult> {
+    const base = info.baseSha.trim();
+    if (!base) {
+      return {
+        ok: false,
+        reason: 'unavailable',
+        detail: `worktree at ${info.path} has no base commit — cannot measure what it changed`,
+      };
+    }
+    const resolves = await this.git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], info.path).then(
+      () => true,
+      () => false,
+    );
+    if (!resolves) {
+      return {
+        ok: false,
+        reason: 'unavailable',
+        detail: `base ${JSON.stringify(base)} does not resolve to a commit in ${info.path}`,
+      };
+    }
+
+    let numstatOut: string;
+    try {
+      const { stdout } = await this.git(['diff', '--numstat', '--find-renames', base], info.path);
+      numstatOut = stdout;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unavailable',
+        detail: `git diff --numstat against ${base} failed: ${(err as Error).message}`,
+      };
+    }
+
+    let changedFiles = 0;
+    let additions = 0;
+    let deletions = 0;
+    let uncountableFiles = 0;
+
+    for (const line of numstatOut.split('\n')) {
+      if (!line) continue;
+      // First two TAB-separated fields only; the rest of the line (the path, C-quoted or not) is
+      // discarded here — `ChangeStats` cannot hold a path, so there is nothing to keep it for.
+      const tab1 = line.indexOf('\t');
+      const tab2 = tab1 === -1 ? -1 : line.indexOf('\t', tab1 + 1);
+      if (tab1 === -1 || tab2 === -1) continue; // not a record this format can produce
+      const addsField = line.slice(0, tab1);
+      const delsField = line.slice(tab1 + 1, tab2);
+      changedFiles += 1;
+      // Binary/unmeasurable: numstat prints '-' for both fields. Never `Number('-')` (NaN).
+      if (addsField === '-' || delsField === '-') {
+        uncountableFiles += 1;
+        continue;
+      }
+      const adds = Number(addsField);
+      const dels = Number(delsField);
+      if (!Number.isInteger(adds) || !Number.isInteger(dels) || adds < 0 || dels < 0) {
+        // Not the binary marker but not a usable count either — treat as uncountable rather than
+        // ship a value `change-stats.ts`'s domain guard would have to degrade anyway.
+        uncountableFiles += 1;
+        continue;
+      }
+      additions += adds;
+      deletions += dels;
+    }
+
+    let statusOut: string;
+    try {
+      const { stdout } = await this.git(['status', '--porcelain', '-z', '-uall'], info.path);
+      statusOut = stdout;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'unavailable',
+        detail: `git status --porcelain -uall failed in ${info.path}: ${(err as Error).message}`,
+      };
+    }
+    for (const entry of statusOut.split('\0')) {
+      if (!entry) continue;
+      // '??' is git's untracked marker; numstat never sees these files at all (measured — an
+      // unadded file produces no record), so their lines are never read, only counted as present.
+      if (entry.startsWith('??')) {
+        changedFiles += 1;
+        uncountableFiles += 1;
+      }
+    }
+
+    return { ok: true, stats: { changedFiles, lines: { additions, deletions, uncountableFiles } } };
   }
 
   /**

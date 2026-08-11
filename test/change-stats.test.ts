@@ -1,6 +1,6 @@
 import { BackendChangeStats } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { backendChangeStats } from '../src/change-stats';
+import { backendChangeStats, notApplicableChangeStats } from '../src/change-stats';
 import type { ChangeStats, ChangeStatsResult } from '../src/vcs/types';
 
 const ok = (stats: ChangeStats): ChangeStatsResult => ({ ok: true, stats });
@@ -197,6 +197,53 @@ describe('backendChangeStats — output parses against the vendored contract (RU
 
   it.each(cases.map((c, i) => [i, c] as const))('case %i parses', (_i, result) => {
     const parsed = BackendChangeStats.safeParse(backendChangeStats('git', result));
+    expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
+  });
+});
+
+describe('notApplicableChangeStats — a non-producing workflow (RUN-245)', () => {
+  it('all four metrics report not_applicable, with the given backend and reason', () => {
+    const stats = notApplicableChangeStats('git', "this run's workflow ('scope') does not produce changes");
+    expect(stats.backend).toBe('git');
+    for (const m of [stats.changedFiles, stats.additions, stats.deletions, stats.churn]) {
+      expect(m.status).toBe('not_applicable');
+      expect(m.value).toBeNull();
+      expect(m.reason).toBe("this run's workflow ('scope') does not produce changes");
+    }
+  });
+
+  it('distinct from both a measured zero and a refusal — not the same status as either', () => {
+    const notApplicable = notApplicableChangeStats('git', 'scope workflow');
+    const measuredZero = backendChangeStats(
+      'git',
+      ok({ changedFiles: 0, lines: { additions: 0, deletions: 0, uncountableFiles: 0 } }),
+    );
+    const refused = backendChangeStats('git', { ok: false, reason: 'unavailable', detail: 'no primitive' });
+    expect(notApplicable.changedFiles.status).toBe('not_applicable');
+    expect(measuredZero.changedFiles.status).toBe('complete');
+    expect(refused.changedFiles.status).toBe('unavailable');
+    // Pairwise distinct statuses, not just differently worded reasons.
+    const statuses = [notApplicable, measuredZero, refused].map((s) => s.changedFiles.status);
+    expect(new Set(statuses).size).toBe(3);
+  });
+
+  it("churn's provenance is 'derived', the count metrics 'backend_observed' — same split as a real answer", () => {
+    const stats = notApplicableChangeStats(null, 'verify workflow');
+    expect(stats.churn.provenance).toBe('derived');
+    expect(stats.changedFiles.provenance).toBe('backend_observed');
+    expect(stats.additions.provenance).toBe('backend_observed');
+    expect(stats.deletions.provenance).toBe('backend_observed');
+  });
+
+  it('a null backend is legal — settle may not always know a vcs.kind', () => {
+    const stats = notApplicableChangeStats(null, 'no backend asked');
+    expect(stats.backend).toBeNull();
+    expect(BackendChangeStats.safeParse(stats).success).toBe(true);
+  });
+
+  it('parses against the vendored contract', () => {
+    const stats = notApplicableChangeStats('git', 'scope workflow');
+    const parsed = BackendChangeStats.safeParse(stats);
     expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
   });
 });

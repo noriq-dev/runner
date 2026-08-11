@@ -44,6 +44,7 @@ export type GitOps = Pick<
   | 'changesBetween'
   | 'checkIgnored'
   | 'currentBase'
+  | 'changeStats'
 >;
 
 /**
@@ -121,6 +122,7 @@ function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLoca
  *     result shape is `ChangesBetweenResult` on both ends of the delegation)
  *   queryIgnored → checkIgnored (RUN-256, same reasoning: `IgnoreQueryResult` on both ends)
  *   currentBase → currentBase (RUN-222, same reasoning again: `CurrentBaseResult` on both ends)
+ *   changeStats → changeStats (RUN-245, same reasoning again: `ChangeStatsResult` on both ends)
  */
 export class GitBackend implements VcsBackend {
   readonly kind = 'git';
@@ -301,21 +303,13 @@ export class GitBackend implements VcsBackend {
     return this.git.currentBase(repoRoot, branch);
   }
 
-  /**
-   * An honest refusal, not a claim of incapacity (RUN-244): git CAN answer this — `git diff
-   * --numstat` against `ws.baseId` is the same primitive `changesBetween` already shells out to
-   * one verb over (`worktree.ts`'s own `changesBetween`) — implementing it is simply RUN-245's task,
-   * not this one. `changeStats` is REQUIRED on the seam (see its own doc in `types.ts`), so this
-   * method has to exist either way; what it says is "git's real answer is coming, in RUN-245," the
-   * same distinction `openReview`'s doc draws between an omitted method and a present one that
-   * names why it refuses.
-   */
-  async changeStats(ws: Workspace): Promise<ChangeStatsResult> {
-    return {
-      ok: false,
-      reason: 'unavailable',
-      detail: `git can compute change statistics for run ${ws.runId}'s workspace — RUN-245 owns the real implementation (\`git diff --numstat\` against the workspace base); this task only declares the seam`,
-    };
+  /** Pure pass-through (RUN-245), `changesBetween`'s exact posture two verbs over:
+   *  `WorktreeManager.changeStats` already speaks `ChangeStatsResult` and needs nothing from
+   *  `Workspace` beyond the two fields every other workspace-scoped verb here reads
+   *  (`localPath`/`baseId`) — see `worktree.ts`'s own doc for the measured parse and the
+   *  determinism correction it makes to this task's own locked decision. */
+  changeStats(ws: Workspace): Promise<ChangeStatsResult> {
+    return this.git.changeStats({ path: ws.localPath, baseSha: ws.baseId });
   }
 
   /**

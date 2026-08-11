@@ -55,6 +55,10 @@ function recorder() {
     changesBetween: record('changesBetween', { ok: true, changed: ['src/a.ts'], deleted: ['src/old.ts'] }),
     checkIgnored: record('checkIgnored', { ok: true, ignored: new Set(['node_modules']) } as const),
     currentBase: record('currentBase', { ok: true, baseId: 'cur0000' } as const),
+    changeStats: record('changeStats', {
+      ok: true,
+      stats: { changedFiles: 2, lines: { additions: 5, deletions: 1, uncountableFiles: 0 } },
+    } as const),
   };
   return { ops, calls };
 }
@@ -311,11 +315,11 @@ describe('GitBackend — currentBase (RUN-222)', () => {
   });
 });
 
-// RUN-244: git's changeStats is an interim, HONEST refusal — RUN-245 owns the real
-// `git diff --numstat` implementation. This pins the refusal itself (a value, not a throw, and
-// naming RUN-245) so RUN-245 has to change this test to land its real answer, rather than the
-// method silently starting to succeed with nobody noticing the seam moved.
-describe('GitBackend — changeStats (RUN-244, interim refusal ahead of RUN-245)', () => {
+// RUN-245: same pure pass-through discipline as changesBetween/queryIgnored/currentBase —
+// `WorktreeManager.changeStats` already speaks `ChangeStatsResult` and needs nothing from
+// `Workspace` beyond `localPath`/`baseId`, so this pins only the delegation. Real git behaviour
+// (numstat parsing, binary/rename/untracked handling, determinism) is worktree.test.ts's job.
+describe('GitBackend — changeStats (RUN-245)', () => {
   const ws: Workspace = {
     runId: 'run_1',
     localPath: '/wt/run_1',
@@ -325,14 +329,14 @@ describe('GitBackend — changeStats (RUN-244, interim refusal ahead of RUN-245)
     location: { repoRoot: '/repo', branch: 'noriq/run/run_1' },
   };
 
-  it('refuses with reason "unavailable" and a detail naming RUN-245, never a throw', async () => {
-    const { ops } = recorder();
+  it('passes {path, baseSha} straight through and returns the result verbatim', async () => {
+    const { ops, calls } = recorder();
     const res = await new GitBackend(ops).changeStats(ws);
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error('unreachable');
-    expect(res.reason).toBe('unavailable');
-    expect(res.detail).toContain('RUN-245');
-    expect(res.detail).toContain(ws.runId);
+    expect(res).toEqual({
+      ok: true,
+      stats: { changedFiles: 2, lines: { additions: 5, deletions: 1, uncountableFiles: 0 } },
+    });
+    expect(calls).toEqual([{ method: 'changeStats', args: [{ path: '/wt/run_1', baseSha: 'base0000' }] }]);
   });
 });
 

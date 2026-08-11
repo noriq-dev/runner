@@ -46,14 +46,99 @@ describe('buildUploadedIntelligence — omission (RUN-284)', () => {
     expect(payload?.execution).not.toHaveProperty('stages');
   });
 
-  it('never sends preExecution, changes, or observedModelUsage — this task assembles none of them', () => {
+  it('never sends preExecution or observedModelUsage — this task assembles neither', () => {
     const payload = buildUploadedIntelligence({
       stages: [stage()],
       verifyDurations: [completeDuration(1, SOURCE)],
     });
     expect(payload).not.toHaveProperty('preExecution');
-    expect(payload?.execution).not.toHaveProperty('changes');
     expect(payload?.execution).not.toHaveProperty('observedModelUsage');
+  });
+
+  it('omits execution.changes when the caller supplies nothing (RUN-245) — the same omission rule as every other field', () => {
+    const payload = buildUploadedIntelligence({
+      stages: [stage()],
+      verifyDurations: [completeDuration(1, SOURCE)],
+    });
+    expect(payload?.execution).not.toHaveProperty('changes');
+  });
+});
+
+// RUN-245: `execution.changes` — mapped through `change-stats.ts`'s one provenance-owning mapper,
+// per `settle`'s own choice of which arm applies (measured vs. not_applicable). This file covers
+// the WIRING (that `input.changes` reaches `execution.changes` in the right shape); the mapping
+// logic itself — refusal/domain-guard/status-derivation — is `test/change-stats.test.ts`'s job.
+describe('buildUploadedIntelligence — execution.changes (RUN-245)', () => {
+  it('a measured, ok:true result maps through backendChangeStats into execution.changes', () => {
+    const payload = buildUploadedIntelligence({
+      stages: [],
+      verifyDurations: [],
+      changes: {
+        kind: 'measured',
+        backend: 'git',
+        result: {
+          ok: true,
+          stats: { changedFiles: 2, lines: { additions: 5, deletions: 1, uncountableFiles: 0 } },
+        },
+      },
+    });
+    expect(payload?.execution?.changes).toMatchObject({
+      backend: 'git',
+      changedFiles: { status: 'complete', value: 2 },
+      additions: { status: 'complete', value: 5 },
+      deletions: { status: 'complete', value: 1 },
+      churn: { status: 'complete', value: 6 },
+    });
+  });
+
+  it('a refusing backend still reaches execution.changes as unavailable, with its own detail as the reason', () => {
+    const payload = buildUploadedIntelligence({
+      stages: [],
+      verifyDurations: [],
+      changes: {
+        kind: 'measured',
+        backend: 'perforce',
+        result: { ok: false, reason: 'unavailable', detail: 'p4 diff2 -q reports per-path status only' },
+      },
+    });
+    expect(payload?.execution?.changes).toMatchObject({
+      backend: 'perforce',
+      changedFiles: {
+        status: 'unavailable',
+        value: null,
+        reason: 'p4 diff2 -q reports per-path status only',
+      },
+    });
+  });
+
+  it('not_applicable reports all four metrics not_applicable, naming the workflow', () => {
+    const payload = buildUploadedIntelligence({
+      stages: [],
+      verifyDurations: [],
+      changes: {
+        kind: 'not_applicable',
+        backend: 'git',
+        reason: "this run's workflow ('scope') does not produce changes",
+      },
+    });
+    expect(payload?.execution?.changes).toMatchObject({
+      backend: 'git',
+      changedFiles: { status: 'not_applicable', value: null },
+      additions: { status: 'not_applicable', value: null },
+      deletions: { status: 'not_applicable', value: null },
+      churn: { status: 'not_applicable', value: null },
+    });
+  });
+
+  it('a payload carrying only changes (no stages, no verify) still parses against the vendored schema', () => {
+    const payload = buildUploadedIntelligence({
+      stages: [],
+      verifyDurations: [],
+      changes: { kind: 'not_applicable', backend: null, reason: 'verify workflow' },
+    });
+    expect(payload).toBeDefined();
+    const parsed = UploadedEpisodeIntelligence.safeParse(payload);
+    expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
   });
 });
 

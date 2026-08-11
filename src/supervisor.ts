@@ -197,6 +197,10 @@ export type SupervisorVcs = Pick<
   // itself as `SupervisorVcs` in the first place (every existing test fake casts `as never` at
   // its `vcsFor` call site instead).
   | 'changesBetween'
+  // RUN-245: `settle`'s own analytics read of the same workspace — required for the identical
+  // reason `changesBetween` is (every real backend already implements it; `changeStats`'s own doc
+  // in `vcs/types.ts` states it plainly: "REQUIRED, not optional").
+  | 'changeStats'
 > &
   // Optional so every existing fake keeps compiling; absent reads as git, the machine default.
   // The reviewer (RUN-61) keys its diff instruction off this — `git diff` is a lie on Perforce.

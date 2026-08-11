@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CHANGES_BETWEEN_MAX_PATHS, WorktreeManager, runBranch } from '../src/worktree';
+import { CHANGES_BETWEEN_MAX_PATHS, WorktreeManager, defaultGit, runBranch } from '../src/worktree';
 
 const execFileP = promisify(execFile);
 const git = (args: string[], cwd: string) => execFileP('git', args, { cwd });
@@ -1249,5 +1249,246 @@ describe('currentBase (RUN-222, real git)', () => {
     } finally {
       await rm(notARepo, { recursive: true, force: true }).catch(() => {});
     }
+  });
+});
+
+// RUN-245: git's real `changeStats` — own repo, like every other real-git describe block above,
+// so committing on the shared primary checkout cannot leak into another block's assumptions.
+describe('changeStats (RUN-245, real git)', () => {
+  let csRepo: string;
+  let csWm: WorktreeManager;
+  const gitc = (args: string[]) => git(['-c', 'user.email=t@t', '-c', 'user.name=T', ...args], csRepo);
+
+  beforeAll(async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'noriq-wt-cs-'));
+    csRepo = path.join(tmp, 'repo');
+    await execFileP('git', ['init', '-q', '-b', 'main', csRepo]);
+    csWm = new WorktreeManager({ baseDir: path.join(tmp, 'worktrees') });
+    await writeFile(path.join(csRepo, 'README.md'), 'line1\n');
+    // Present at every worktree's BASE, deliberately — a rename needs its OLD path to already
+    // exist at the base for git's detector to have anything to pair with the new one; committing
+    // it only inside a worktree's own branch (after the fork point) means the base never saw a
+    // delete to pair against, so the diff base→current would just show a plain add.
+    await writeFile(path.join(csRepo, 'old-name.ts'), 'a\nb\nc\nd\ne\n');
+    await gitc(['add', '.']);
+    await gitc(['commit', '-q', '-m', 'init']);
+  }, 30000);
+
+  afterAll(async () => {
+    await rm(path.dirname(csRepo), { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('measures the UNION of a committed change and a further uncommitted edit to the SAME file, one command', async () => {
+    const wt = await csWm.create(csRepo, 'csUnion');
+    // Committed: base has 1 line, this sitting commits a 2nd.
+    await writeFile(path.join(wt.path, 'README.md'), 'line1\nline2\n');
+    await csWm.commitWork(wt, 'commit one more line');
+    // Then a further, UNCOMMITTED edit on top — the case the locked decision measured: `<base>..HEAD`
+    // alone would only see the committed line.
+    await writeFile(path.join(wt.path, 'README.md'), 'line1\nline2\nline3\n');
+
+    // Prove the undercount independently before asserting changeStats avoids it. Run INSIDE the
+    // worktree, not the shared repo checkout — `HEAD` must resolve to the run's own branch.
+    const { stdout: rangeOnly } = await git(['diff', '--numstat', `${wt.baseSha}..HEAD`], wt.path);
+    expect(rangeOnly.trim()).toBe('1\t0\tREADME.md'); // misses the uncommitted 3rd line
+
+    const res = await csWm.changeStats(wt);
+    expect(res).toEqual({
+      ok: true,
+      stats: { changedFiles: 1, lines: { additions: 2, deletions: 0, uncountableFiles: 0 } },
+    });
+    await csWm.remove(wt);
+  });
+
+  it("a binary file's '-\\t-' record counts as a changed, uncountable file — never NaN", async () => {
+    const wt = await csWm.create(csRepo, 'csBinary');
+    await writeFile(path.join(wt.path, 'blob.bin'), Buffer.from([0, 1, 2, 3, 0, 255, 254, 0, 9, 9]));
+    await csWm.commitWork(wt, 'add a binary file');
+
+    const res = await csWm.changeStats(wt);
+    if (!res.ok) throw new Error(`expected ok:true, got: ${res.detail}`);
+    expect(res.stats.changedFiles).toBe(1);
+    expect(res.stats.lines).not.toBeNull();
+    expect(res.stats.lines).toEqual({ additions: 0, deletions: 0, uncountableFiles: 1 });
+    // Never fabricated: nothing here is NaN, which `Number('-')` would have been.
+    for (const n of [res.stats.changedFiles, res.stats.lines?.additions, res.stats.lines?.deletions]) {
+      expect(Number.isFinite(n)).toBe(true);
+    }
+    await csWm.remove(wt);
+  });
+
+  it('a pure rename (content unchanged) counts as ONE changed file via the 0/0 shape, no rename branch', async () => {
+    const wt = await csWm.create(csRepo, 'csRename');
+    // old-name.ts already exists at wt.baseSha (the shared init commit) — renaming it here gives
+    // git's detector a real delete-at-old-path to pair with the add-at-new-path.
+    await git(['mv', 'old-name.ts', 'new-name.ts'], wt.path);
+    await csWm.commitWork(wt, 'rename it, no content change');
+
+    // Confirm this repo's own numstat really does emit the 0/0 shape the parser relies on.
+    const { stdout: raw } = await git(['diff', '--numstat', '--find-renames', wt.baseSha], wt.path);
+    expect(raw.trim()).toBe('0\t0\told-name.ts => new-name.ts');
+
+    const res = await csWm.changeStats(wt);
+    expect(res).toEqual({
+      ok: true,
+      stats: { changedFiles: 1, lines: { additions: 0, deletions: 0, uncountableFiles: 0 } },
+    });
+    await csWm.remove(wt);
+  });
+
+  it('an untracked file AND an untracked directory are both counted individually, never collapsed', async () => {
+    const wt = await csWm.create(csRepo, 'csUntracked');
+    await writeFile(path.join(wt.path, 'loose.ts'), 'export const l = 1;\n');
+    await mkdir(path.join(wt.path, 'untrackeddir'));
+    await writeFile(path.join(wt.path, 'untrackeddir', 'x.ts'), 'export const x = 1;\n');
+    await writeFile(path.join(wt.path, 'untrackeddir', 'y.ts'), 'export const y = 1;\n');
+
+    const res = await csWm.changeStats(wt);
+    if (!res.ok) throw new Error(`expected ok:true, got: ${res.detail}`);
+    // Three untracked files, not one collapsed `??` entry for the directory (the default
+    // `-u`/`normal` mode's behaviour, which `-uall` exists to avoid).
+    expect(res.stats.changedFiles).toBe(3);
+    expect(res.stats.lines).toEqual({ additions: 0, deletions: 0, uncountableFiles: 3 });
+    await csWm.remove(wt);
+  });
+
+  it('a mix of a text edit, a binary add, and an untracked file aggregates correctly', async () => {
+    const wt = await csWm.create(csRepo, 'csMixed');
+    await writeFile(path.join(wt.path, 'README.md'), 'line1\nline2\nline3\n'); // +2 lines, tracked
+    await writeFile(path.join(wt.path, 'blob.bin'), Buffer.from([0, 1, 2, 0]));
+    await csWm.commitWork(wt, 'text edit + binary add');
+    await writeFile(path.join(wt.path, 'new.ts'), 'export const n = 1;\n'); // untracked
+
+    const res = await csWm.changeStats(wt);
+    if (!res.ok) throw new Error(`expected ok:true, got: ${res.detail}`);
+    expect(res.stats.changedFiles).toBe(3); // README.md, blob.bin, new.ts
+    expect(res.stats.lines).toEqual({ additions: 2, deletions: 0, uncountableFiles: 2 }); // blob.bin + new.ts
+    await csWm.remove(wt);
+  });
+
+  it('empty/unresolvable base refuses rather than measuring a confident (wrong) zero', async () => {
+    const wt = await csWm.create(csRepo, 'csBadBase');
+    await writeFile(path.join(wt.path, 'x.ts'), 'export const x = 1;\n');
+    await csWm.commitWork(wt, 'work that must not be reported as zero');
+
+    const emptyBase = await csWm.changeStats({ path: wt.path, baseSha: '' });
+    expect(emptyBase.ok).toBe(false);
+    if (!emptyBase.ok) expect(emptyBase.detail).toMatch(/no base commit/);
+
+    const unresolvable = await csWm.changeStats({
+      path: wt.path,
+      baseSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    });
+    expect(unresolvable.ok).toBe(false);
+    if (!unresolvable.ok) expect(unresolvable.detail).toMatch(/does not resolve to a commit/);
+
+    await csWm.remove(wt);
+  });
+
+  // Verified against the REAL binary, not merely asserted: a `-c diff.renames=false` GitRunner
+  // wrapping every call, pointed at the SAME workspace `csWm`'s default runner just measured,
+  // must report identical counts. This is this task's own determinism correction — the locked
+  // decision undersold what a repo's `diff.renames` config could do (it changes `additions`/
+  // `deletions`, not just `changedFiles`), and `--find-renames` (bare, no threshold) is what pins
+  // the answer regardless of it.
+  it("a repo's own diff.renames config cannot change the counts (RUN-245's correction to the locked decision)", async () => {
+    const wt = await csWm.create(csRepo, 'csDeterminism');
+    // old-name.ts already exists at wt.baseSha (the shared init commit) — see the setup comment above.
+    await git(['mv', 'old-name.ts', 'new-name.ts'], wt.path);
+    await csWm.commitWork(wt, 'rename it, no content change');
+
+    const withRenamesOff = new WorktreeManager({
+      baseDir: path.dirname(wt.path),
+      git: (args, cwd, stdin) => defaultGit(['-c', 'diff.renames=false', ...args], cwd, stdin),
+    });
+    const withRenamesOn = new WorktreeManager({
+      baseDir: path.dirname(wt.path),
+      git: (args, cwd, stdin) => defaultGit(['-c', 'diff.renames=true', ...args], cwd, stdin),
+    });
+
+    const [defaultRes, offRes, onRes] = await Promise.all([
+      csWm.changeStats(wt),
+      withRenamesOff.changeStats(wt),
+      withRenamesOn.changeStats(wt),
+    ]);
+    expect(offRes).toEqual(defaultRes);
+    expect(onRes).toEqual(defaultRes);
+    expect(defaultRes).toEqual({
+      ok: true,
+      stats: { changedFiles: 1, lines: { additions: 0, deletions: 0, uncountableFiles: 0 } },
+    });
+
+    await csWm.remove(wt);
+  });
+});
+
+describe('changeStats cannot answer with a fabricated result for "could not tell" (RUN-245)', () => {
+  const withGit = (git: (args: string[]) => Promise<{ stdout: string; stderr: string }>) =>
+    new WorktreeManager({ baseDir: base, git });
+  const wt = { path: '/wt/run_1', baseSha: 'base0000' };
+
+  it('the same fake output produces identical stats across repeated calls (determinism)', async () => {
+    const wm2 = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'ok\n', stderr: '' };
+      if (args[0] === 'diff') return { stdout: '3\t1\tsrc/a.ts\n-\t-\tsrc/b.bin\n', stderr: '' };
+      return { stdout: '?? src/c.ts\0', stderr: '' }; // status
+    });
+    const first = await wm2.changeStats(wt);
+    const second = await wm2.changeStats(wt);
+    expect(first).toEqual(second);
+    expect(first).toEqual({
+      ok: true,
+      stats: { changedFiles: 3, lines: { additions: 3, deletions: 1, uncountableFiles: 2 } },
+    });
+  });
+
+  it('refuses (never throws) when the numstat probe fails', async () => {
+    const wm2 = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'ok\n', stderr: '' };
+      if (args[0] === 'diff') throw new Error('fatal: bad object base0000');
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm2.changeStats(wt);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('unavailable');
+      expect(res.detail).toContain('bad object');
+    }
+  });
+
+  it('refuses (never throws) when the untracked-files probe fails', async () => {
+    const wm2 = withGit(async (args) => {
+      if (args[0] === 'rev-parse') return { stdout: 'ok\n', stderr: '' };
+      if (args[0] === 'diff') return { stdout: '1\t0\tsrc/a.ts\n', stderr: '' };
+      throw new Error('fatal: index file corrupt'); // status
+    });
+    const res = await wm2.changeStats(wt);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('unavailable');
+      expect(res.detail).toContain('index file corrupt');
+    }
+  });
+
+  it('refuses when the base cannot be verified as a commit, never a confident zero', async () => {
+    const wm2 = withGit(async (args) => {
+      if (args[0] === 'rev-parse') throw new Error('fatal: needed a single revision');
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm2.changeStats(wt);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.detail).toMatch(/does not resolve to a commit/);
+  });
+
+  it('refuses on an empty base without ever shelling out', async () => {
+    const calls: string[][] = [];
+    const wm2 = withGit(async (args) => {
+      calls.push(args);
+      return { stdout: '', stderr: '' };
+    });
+    const res = await wm2.changeStats({ path: '/wt/run_1', baseSha: '' });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.detail).toMatch(/no base commit/);
+    expect(calls).toHaveLength(0);
   });
 });

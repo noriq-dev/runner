@@ -50,7 +50,13 @@ import {
   resolveModel,
   telemetryFromSpent,
 } from '../src/supervisor';
-import type { ChangesBetweenResult, LockContext, LockOutcome, Workspace } from '../src/vcs/types';
+import type {
+  ChangeStatsResult,
+  ChangesBetweenResult,
+  LockContext,
+  LockOutcome,
+  Workspace,
+} from '../src/vcs/types';
 import { BUILTIN_WORKFLOWS } from '../src/workflow';
 import type { WorkflowCatalog } from '../src/workflow-store';
 
@@ -364,6 +370,23 @@ class FakeWorktrees {
   // widening this Pick free for every real backend).
   changesBetween = async (): Promise<ChangesBetweenResult> => ({ ok: true, changed: [], deleted: [] });
 
+  // RUN-245: `settle`'s own analytics read of the same workspace — required for the same reason
+  // `changesBetween` is (see its own doc above). A real measurement by default, so a test that
+  // doesn't care about it (nearly all of them) is unaffected; `over.changeStatsResult` scripts it.
+  changeStatsResult: ChangeStatsResult = {
+    ok: true,
+    stats: { changedFiles: 1, lines: { additions: 3, deletions: 1, uncountableFiles: 0 } },
+  };
+  /** When set, `changeStats` THROWS instead of answering — the "a backend bug must cost only this
+   *  one metric, never the run" case (RUN-245). */
+  changeStatsError: string | null = null;
+  changeStatsCalls: Workspace[] = [];
+  changeStats = async (ws: Workspace): Promise<ChangeStatsResult> => {
+    this.changeStatsCalls.push(ws);
+    if (this.changeStatsError) throw new Error(this.changeStatsError);
+    return this.changeStatsResult;
+  };
+
   // ── waves (RUN-170) ────────────────────────────────────────────────────────
   /** Opt a test into overlapping leases. False (the default) is the pool-of-1 posture, so every
    *  existing test keeps the sequential chain it always modelled — the conservative reading the
@@ -537,6 +560,10 @@ function harness(
     leasesOverlap?: boolean;
     /** Mutable dispatch catalog, so a park test can model workflow files changing while it waits. */
     workflowCatalog?: WorkflowCatalog;
+    /** What `changeStats` answers (RUN-245); default is a real measurement. */
+    changeStatsResult?: ChangeStatsResult;
+    /** Makes `changeStats` throw instead of answering (RUN-245). */
+    changeStatsError?: string;
   } = {},
 ) {
   // Mutable, because a park can last 72 hours and a human may correct the spec while it waits
@@ -553,6 +580,8 @@ function harness(
   if (over.changedFiles) worktrees.changedFiles = over.changedFiles;
   if (over.lockConflicts) worktrees.lockConflicts = over.lockConflicts;
   if (over.hangRelease) worktrees.hangRelease = true;
+  if (over.changeStatsResult) worktrees.changeStatsResult = over.changeStatsResult;
+  if (over.changeStatsError) worktrees.changeStatsError = over.changeStatsError;
   const reports: Array<{ runId: string } & RunReport> = [];
   const transcript: Array<{
     seq: number;
@@ -6764,6 +6793,116 @@ describe('the run model mix (RUN-59)', () => {
       const { intelligence } = h.recordedEpisodes[0]!;
       // Two attempts, both actually timed — the sum is real and complete, not an undercount.
       expect(intelligence?.execution?.clocks?.verifyDurationMs).toMatchObject({ status: 'complete' });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+    });
+  });
+
+  // RUN-245: proves the WIRING for `execution.changes`, `episode intelligence delivery`'s own
+  // reasoning one field over — that a real `supervise()` run's workflow decision (`wf.produces`)
+  // actually reaches `settle`'s choice of which arm to build, and that a refusing backend costs
+  // only the metric, never the run. `test/change-stats.test.ts` and
+  // `test/intelligence-payload.test.ts` cover the mapping logic itself.
+  describe('episode intelligence delivery — execution.changes (RUN-245)', () => {
+    it("a build run's payload carries a real measurement, backend 'git'", async () => {
+      const h = harness();
+      h.worktrees.changeStatsResult = {
+        ok: true,
+        stats: { changedFiles: 2, lines: { additions: 8, deletions: 3, uncountableFiles: 0 } },
+      };
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done');
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.changes).toMatchObject({
+        backend: 'git',
+        changedFiles: { status: 'complete', value: 2 },
+        additions: { status: 'complete', value: 8 },
+        deletions: { status: 'complete', value: 3 },
+        churn: { status: 'complete', value: 11 },
+      });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+      // Asked exactly once, with the run's own workspace — never synthesized from changedPaths.
+      expect(h.worktrees.changeStatsCalls).toHaveLength(1);
+    });
+
+    it('a scope run never asks the backend at all — not_applicable, naming the workflow', async () => {
+      const h = harness();
+      const done = h.supervisor.supervise(makeRun()); // default kind: 'scope'
+      await flush();
+      h.claude.complete('done');
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.changes).toMatchObject({
+        changedFiles: { status: 'not_applicable', value: null },
+        additions: { status: 'not_applicable', value: null },
+        deletions: { status: 'not_applicable', value: null },
+        churn: { status: 'not_applicable', value: null },
+      });
+      expect(intelligence?.execution?.changes?.changedFiles?.reason).toContain('scope');
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+      expect(h.worktrees.changeStatsCalls).toHaveLength(0); // never asked — it changed nothing BY CONSTRUCTION
+    });
+
+    it('a verify run never asks the backend either — same not_applicable treatment as scope', async () => {
+      const h = harness();
+      const done = h.supervisor.supervise(makeRun({ kind: 'verify' }));
+      await flush();
+      h.claude.complete('done');
+      await done;
+
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.changes?.changedFiles).toMatchObject({ status: 'not_applicable' });
+      expect(intelligence?.execution?.changes?.changedFiles?.reason).toContain('verify');
+      expect(h.worktrees.changeStatsCalls).toHaveLength(0);
+    });
+
+    it('a backend refusal reaches the episode as unavailable, with the backend detail as the reason — the run still completes', async () => {
+      const h = harness({ verifyPasses: true });
+      h.worktrees.changeStatsResult = {
+        ok: false,
+        reason: 'unavailable',
+        detail: 'p4 diff2 -q reports per-path status only',
+      };
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done');
+      const exit = await done;
+
+      expect(exit.outcome).toBe('done'); // analytics never costs the run
+      const { intelligence } = h.recordedEpisodes[0]!;
+      expect(intelligence?.execution?.changes).toMatchObject({
+        changedFiles: {
+          status: 'unavailable',
+          value: null,
+          reason: 'p4 diff2 -q reports per-path status only',
+        },
+      });
+      expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
+    });
+
+    it('a THROWING backend still completes the run and still delivers stages/clocks — only changes is lost', async () => {
+      const h = harness({ verifyPasses: true, changeStatsError: 'ECONNRESET talking to the depot' });
+      const done = h.supervisor.supervise(
+        makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_1' } }),
+      );
+      await flush();
+      h.claude.complete('done', { inputTokens: 10, outputTokens: 5, costUsd: 0.1 });
+      const exit = await done;
+
+      expect(exit.outcome).toBe('done'); // a throwing backend never costs the run
+      const { intelligence } = h.recordedEpisodes[0]!;
+      // The rest of the episode's intelligence survives the throw — absorbed at the point of the
+      // call, never inside buildUploadedIntelligence's own try (which would have cost everything).
+      expect(intelligence?.execution?.stages?.some((s) => s.stage === 'primary')).toBe(true);
+      expect(intelligence?.execution?.changes?.changedFiles).toMatchObject({ status: 'unavailable' });
+      expect(intelligence?.execution?.changes?.changedFiles?.reason).toContain('ECONNRESET');
       expect(UploadedEpisodeIntelligenceSchema.safeParse(intelligence).success).toBe(true);
     });
   });

@@ -4,8 +4,10 @@
  * `provenance`/`source` for a change-stat metric. This is RUN-243's defect made structurally
  * impossible: that bug was one wrong provenance value, legal in `MetricProvenance` but absent from
  * the server's `DAEMON_PROVENANCE`, which passed typecheck, lint and 3068 tests and would have
- * discarded whole episode rows behind an HTTP 200 (`test/daemon-provenance.test.ts` is the pinned
- * copy of that remote allowlist). Three backends each hand-building four envelopes is three places
+ * discarded whole episode rows behind an HTTP 200. That allowlist was a hand-copied Set here when
+ * this module was written; since RUN-284 it is VENDORED and imported, and
+ * `test/daemon-provenance.test.ts` checks against the real thing — the copy had already drifted by
+ * one value before it was replaced. Three backends each hand-building four envelopes is three places
  * to reintroduce it; one mapper is one place. Backends return RAW COUNTS through
  * `VcsBackend.changeStats` and never construct a `BackendChangeStats` themselves.
  *
@@ -74,6 +76,46 @@ function unavailable(provenance: 'backend_observed' | 'derived', reason: string)
     observedAt: null,
     acceptedAt: null,
     reason,
+  };
+}
+
+/** `unavailable`'s exact shape, `not_applicable` instead — the third status this file's metrics can
+ *  carry, and the ONLY one of the three that is true of a non-producing workflow's diff. */
+function notApplicable(
+  provenance: 'backend_observed' | 'derived',
+  reason: string,
+): IntelligenceIntegerMetric {
+  return {
+    status: 'not_applicable',
+    value: null,
+    provenance,
+    source: 'vcs_backend',
+    sourceId: null,
+    observedAt: null,
+    acceptedAt: null,
+    reason,
+  };
+}
+
+/**
+ * The not-applicable arm (RUN-245): a non-producing workflow (`Workflow.produces` false — scope and
+ * verify both) cannot have changed anything BY CONSTRUCTION, since `clampPermissionToWorkflow`
+ * forces its worktree read-only. `settle` calls this DIRECTLY, never asking the backend at all
+ * (RUN-244's own deferred note: "the CALLER at settle, with knowledge of the workflow, not the
+ * backend") — a measured zero would assert something was measured, and an omission would read as
+ * "we did not look"; `not_applicable` is the only one of the three that is honest here.
+ *
+ * `backend` is informational only (never a metric, never provenance-checked) — `settle` passes the
+ * workspace's own `vcs.kind` so a human reading the episode later still knows which backend this
+ * WOULD have measured, even though nothing asked it to.
+ */
+export function notApplicableChangeStats(backend: string | null, reason: string): BackendChangeStats {
+  return {
+    backend,
+    changedFiles: notApplicable('backend_observed', reason),
+    additions: notApplicable('backend_observed', reason),
+    deletions: notApplicable('backend_observed', reason),
+    churn: notApplicable('derived', reason),
   };
 }
 

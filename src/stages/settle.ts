@@ -24,8 +24,9 @@ import {
 import { totalTokens } from '../drivers/budget';
 import { buildEpisode } from '../episode';
 import { requestSelfSummary } from '../episode-summary';
-import { buildUploadedIntelligence } from '../intelligence-payload';
+import { type BuildUploadedIntelligenceInput, buildUploadedIntelligence } from '../intelligence-payload';
 import { clearSetupMarker } from '../setup';
+import type { ChangeStatsResult } from '../vcs/types';
 import { judgeWithAcceptance, verifyAgentComment } from '../verify-agent';
 import type { RunPipeline, StageHost } from './types';
 
@@ -207,6 +208,36 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     .then((p) => p)
     .catch(() => [] as string[]);
 
+  // RUN-245: this sitting's change-stat measurement, read ONCE while the workspace still exists —
+  // the same discipline `changedPaths` above follows, for the same reason (`dispose` below may reap
+  // it). A non-producing workflow (scope/verify — `wf.produces` false) never asks the backend: it
+  // changed nothing BY CONSTRUCTION (the write floor forces it), so a measured zero would assert
+  // something was measured and an omission would read as "we did not look" — `not_applicable` is
+  // the only honest answer, built directly rather than by asking and overriding (RUN-244's own
+  // deferred note: "the CALLER at settle, with knowledge of the workflow, not the backend").
+  //
+  // A throw from the backend is absorbed into an `unavailable` result HERE, not inside the
+  // `buildUploadedIntelligence` try below — a bug in one backend's analytics probe must cost only
+  // this one metric, never the stage facts and verify-duration clocks the same episode carries.
+  const vcsKind = vcs.kind ?? 'git';
+  const changes: BuildUploadedIntelligenceInput['changes'] = wf.produces
+    ? {
+        kind: 'measured',
+        backend: vcsKind,
+        result: await vcs.changeStats(worktree).catch(
+          (err): ChangeStatsResult => ({
+            ok: false,
+            reason: 'unavailable',
+            detail: `changeStats threw: ${err instanceof Error ? err.message : String(err)}`,
+          }),
+        ),
+      }
+    : {
+        kind: 'not_applicable',
+        backend: vcsKind,
+        reason: `this run's workflow ('${wf.id}') does not produce changes`,
+      };
+
   const nextLogSeq = host.endTranscript(
     run.id,
     `${ctx.exit.outcome}${ctx.exit.reason ? ` — ${ctx.exit.reason}` : ''}`,
@@ -267,6 +298,7 @@ export const settleStage = async (host: StageHost, ctx: RunPipeline): Promise<vo
     const intelligence = buildUploadedIntelligence({
       stages: ctx.tally.stageFacts().stages,
       verifyDurations: ctx.tally.verifyDurations(),
+      changes,
     });
     host.recordEpisode?.(episode, intelligence);
   } catch (err) {

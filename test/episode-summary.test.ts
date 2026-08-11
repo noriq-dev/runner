@@ -458,6 +458,10 @@ function makeHost(): StageHost {
         share: async () => ({}) as never,
         disposePreservesWork: false,
         changedPaths: async () => [],
+        changeStats: async () => ({
+          ok: true,
+          stats: { changedFiles: 0, lines: { additions: 0, deletions: 0, uncountableFiles: 0 } },
+        }),
       }) as never,
     lockScopeBranch: () => null,
     withRepoLock: async (_root, fn) => fn(),

@@ -18,9 +18,16 @@
  *
  * NOT assembled here, on purpose, because each has its own reason to wait: `preExecution.configuration`
  * already ships over the `RunReport` telemetry frame (RUN-241) and sending it again here would be a
- * second assertion of one fact; `execution.changes` is RUN-245's to attach; `execution.observedModelUsage`
+ * second assertion of one fact; `execution.observedModelUsage`
  * is accepted by the contract but nothing in this daemon assembles it yet, and inventing a value here
  * would be exactly the guessed field this plan's locked decisions forbid.
+ *
+ * `execution.changes` (RUN-245) IS assembled here, from `input.changes` — mapped through
+ * `change-stats.ts`'s one provenance-owning mapper (`backendChangeStats` for a real measurement or a
+ * refusal, `notApplicableChangeStats` for a non-producing workflow `settle` never even asked), never
+ * re-derived in this file. Optional on the input, not on principle but on precedent: every field this
+ * module assembles is omitted when the caller has nothing to report, and `settle` is the only caller
+ * that exists — it always supplies one of the two arms.
  *
  * Validation is NOT this module's job — `episode-upload.ts`'s `toEnrichmentPayload` is the one place
  * that `safeParse`s the assembled payload, immediately before it leaves the box, on every send
@@ -33,7 +40,9 @@ import type {
   IntelligenceDurationMs,
   UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceType,
 } from '@noriq-dev/shared';
+import { backendChangeStats, notApplicableChangeStats } from './change-stats';
 import { type DurationSource, completeDuration, partialDuration, unavailableDuration } from './stage-timing';
+import type { ChangeStatsResult } from './vcs/types';
 
 export interface BuildUploadedIntelligenceInput {
   /** `RunTally.stageFacts().stages` for this run — carried straight through, never re-derived. */
@@ -42,6 +51,23 @@ export interface BuildUploadedIntelligenceInput {
    *  in observation order (one per `timedVerify` call this sitting made, or the single
    *  `not_applicable` envelope when the repo configured no `[verify].cmd`). */
   verifyDurations: readonly IntelligenceDurationMs[];
+  /**
+   * This sitting's change-stat measurement (RUN-245) — `settle`'s own choice of which of the two
+   * arms applies, made BEFORE this function ever runs (this module owns provenance mapping, not the
+   * workflow judgement that picks the arm):
+   *
+   *   - `measured`: a producing workflow asked its backend — `result` is the raw `ChangeStatsResult`
+   *     (an `ok:true` measurement or an `ok:false` refusal, both legal, both mapped through
+   *     `backendChangeStats`) and `backend` is the `VcsBackend.kind` that answered.
+   *   - `not_applicable`: a non-producing workflow (scope/verify) never asked at all — it changed
+   *     nothing BY CONSTRUCTION, and `reason` names the workflow for the episode.
+   *
+   * Optional, matching every other field here: absent means the caller has nothing to report, and
+   * `execution.changes` is omitted entirely rather than sent as an empty or fabricated shape.
+   */
+  changes?:
+    | { kind: 'measured'; backend: string; result: ChangeStatsResult }
+    | { kind: 'not_applicable'; backend: string | null; reason: string };
 }
 
 /**
@@ -106,5 +132,11 @@ export function buildUploadedIntelligence(
   if (input.stages.length > 0) execution.stages = input.stages;
   const verifyDurationMs = foldVerifyDurations(input.verifyDurations);
   if (verifyDurationMs) execution.clocks = { verifyDurationMs };
+  if (input.changes) {
+    execution.changes =
+      input.changes.kind === 'measured'
+        ? backendChangeStats(input.changes.backend, input.changes.result)
+        : notApplicableChangeStats(input.changes.backend, input.changes.reason);
+  }
   return Object.keys(execution).length > 0 ? { execution } : undefined;
 }
