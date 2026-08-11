@@ -7,18 +7,19 @@
  * returns a discriminated result — a refusal with a reason, or everything the run needs to start —
  * instead of narrowing a context it was handed.
  *
- * Seven things can refuse a dispatch here, and they are ordered by what each one costs:
+ * Eight things can refuse a dispatch here, and they are ordered by what each one costs:
  *
  *   1. the repo, and 2. the driver — pure lookups, so they run first;
  *   3. a SELECTED workflow that no longer resolves (RUN-196) — a pure lookup against the catalog
  *      pinned at dispatch, so it sits with the other costless gates;
- *   4. claimability (RUN-81) — one server read, deliberately BEFORE the lease so a declined run
+ *   4. lineage ownership (RUN-265) — one synchronous lifecycle snapshot;
+ *   5. claimability (RUN-81) — one server read, deliberately BEFORE the lease so a declined run
  *      leaves nothing behind;
- *   5. the workspace lease;
- *   6. the Noriq identity — no identity, no prompt worth sending;
- *   7. the predictive lock (RUN-103) — last, because it needs the identity's token.
+ *   6. the workspace lease;
+ *   7. the Noriq identity — no identity, no prompt worth sending;
+ *   8. the predictive lock (RUN-103) — last, because it needs the identity's token.
  *
- * Everything from 5 on has something to unwind, and each of those paths says so where it happens.
+ * Everything from 6 on has something to unwind, and each of those paths says so where it happens.
  *
  * `resume` has no prepare: a parked run RESTORES its repo, workspace, identity and session from the
  * park record rather than resolving them again, which is the whole point of parking.
@@ -50,6 +51,7 @@ import {
 } from '../context-pack';
 import type { ContinuableRun, ContinuableStore } from '../continuable';
 import type { AgentDriver, DriverStartOptions, NoriqMcp } from '../drivers/types';
+import { type ExecutionRunRegistry, type RunLineage, resolveRunLineage } from '../execution-lineage';
 import { type CheckedExecutionSpec, type SpecPathProbe, renderExecutionSpec } from '../execution-spec';
 import { type LockEnforcer, lockFloorComment } from '../lock-hooks';
 import type { logger as defaultLogger } from '../logger';
@@ -143,12 +145,16 @@ export interface PrepareHost {
     budget?: number;
   };
   readonly continuable?: Pick<ContinuableStore, 'get'>;
+  /** RUN-265's active-plus-parked execution ownership snapshot, owned by the supervisor. */
+  executionRegistry?(): ExecutionRunRegistry;
 }
 
 /** Everything `execute` needs, or the reason this dispatch was refused. */
 export type PrepareOutcome = { ok: false; reason: string } | ({ ok: true } & PreparedRun);
 
 export interface PreparedRun {
+  /** The validated assignment, or an explicit root for a legacy dispatch. */
+  lineage: RunLineage;
   /**
    * The anchor task, iff it is worth PLANNING (RUN-140): present, and carrying neither a spec nor
    * the server's flag that it has one nobody can read. Null otherwise, which is the `plan` stage's
@@ -355,6 +361,16 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
   const driver = host.driverFor(tool as AgentTool);
   if (!driver) return refuse(`no driver for tool ${tool}`);
 
+  // The frame schema rejects malformed assignments before this point. These are the remaining
+  // local facts: a node cannot parent itself, and one live execution cannot belong to two Runs.
+  const lineage = resolveRunLineage(run, host.executionRegistry?.() ?? new Map<string, string>());
+  if (!lineage.ok) {
+    host.log.warn('execution lineage is invalid — declining to spawn', {
+      runId: run.id,
+      reason: lineage.reason,
+    });
+    return refuse(`${lineage.reason}; not spawning`);
+  }
   // Continue a failed run (RUN-92): the two things git cannot carry across the fail→continue
   // boundary — the prior spend (so this sitting's reported figures stay CUMULATIVE rather than
   // overwriting the server's totals with only what this sitting spends) and the adjudication ledger
@@ -778,6 +794,7 @@ export const prepareRun = async (host: PrepareHost, run: Run): Promise<PrepareOu
 
   return {
     ok: true,
+    lineage: lineage.lineage,
     // The `plan` stage (RUN-140) needs two things this scope already has: the planner's own brief,
     // and the ability to rebuild the RUN's brief once a spec exists. Both are handed over rather
     // than recomputed, so a planned run's prompt is built from the same facts an unplanned one's is.

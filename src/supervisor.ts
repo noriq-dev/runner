@@ -64,6 +64,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
+import { ExecutionLifecycle, type RecoveredParkDisposition, resolveRunLineage } from './execution-lineage';
 import {
   type CheckedExecutionSpec,
   type SpecPathProbe,
@@ -1345,6 +1346,8 @@ export class RunSupervisor {
    *  stream — the server dedups on (runId, seq), and a restarted seq would collide with
    *  rows already written and be silently dropped. */
   private readonly transcripts = new Map<string, RunTranscript>();
+  /** RUN-265: the only owner of execution ownership, derived from active work plus parks. */
+  private readonly executionLifecycle: ExecutionLifecycle<ParkedRun>;
 
   private transcript(runId: string): RunTranscript {
     let t = this.transcripts.get(runId);
@@ -1416,6 +1419,12 @@ export class RunSupervisor {
 
   constructor(private readonly deps: RunSupervisorDeps) {
     this.log = deps.logger ?? defaultLogger;
+    this.executionLifecycle = new ExecutionLifecycle(deps.parked, (runId, err) => {
+      this.log.warn('terminal park cleanup failed — retaining lifecycle tombstone', {
+        runId,
+        err: String(err),
+      });
+    });
   }
 
   /** The repo's own backend when the daemon routed one (RUN-60), else the machine default. */
@@ -3156,7 +3165,7 @@ export class RunSupervisor {
     });
 
     const runSpend = ctx.tally.total();
-    await this.deps.parked.park({
+    const persisted = await this.executionLifecycle.park({
       run,
       sessionId: null, // an in-process wait has no session to restore — `stage` is the record
       stage: ctx.stage,
@@ -3173,6 +3182,13 @@ export class RunSupervisor {
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
+    if (!persisted) {
+      // A cancel/reconciliation terminalized this run while the park probe was in flight. The
+      // lifecycle owner refused the late write, so this stack follows its terminal path instead.
+      this.stageWaiters.delete(run.id);
+      if (poll) clearInterval(poll);
+      return null;
+    }
     this.deps.report(run.id, {
       status: 'blocked',
       telemetry: runSpend,
@@ -3265,7 +3281,7 @@ export class RunSupervisor {
     // every session that billed. Persisting the mix keeps a resume's breakdown summing to its total.
     const runSpend = ctx.tally.total();
     try {
-      await this.deps.parked.park({
+      const persisted = await this.executionLifecycle.park({
         run,
         // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
         // editing a workflow while the question is open affects the next dispatch only, including
@@ -3293,6 +3309,7 @@ export class RunSupervisor {
         parkedAt: new Date().toISOString(),
         question: state.question,
       });
+      if (!persisted) return null;
     } catch (err) {
       // The park could not be PERSISTED (a disk failure). Without the record the run can never be
       // resumed, so parking it would be a promise the daemon cannot keep — finalize instead, its
@@ -3373,7 +3390,7 @@ export class RunSupervisor {
     if (!waiter) return false;
     this.stageWaiters.delete(runId);
     waiter(answer);
-    this.deps.parked?.unpark(runId).catch((err) => {
+    this.executionLifecycle.unpark(runId).catch((err) => {
       this.log.warn('answered stage park could not be removed from disk — the reaper will', {
         runId,
         err: String(err),
@@ -3384,13 +3401,29 @@ export class RunSupervisor {
   }
 
   async resume(runId: string, answer: string): Promise<DriverExit | null> {
+    try {
+      const exit = await this.resumeRun(runId, answer);
+      // A stage answer wakes the still-live `supervise` stack; its owner releases the binding.
+      // A run that parks again remains one live execution and must retain its reservation.
+      if (exit && exit.reason !== 'stage-answer') {
+        if (exit.reason === 'parked') this.executionLifecycle.inactive(runId);
+        else await this.executionLifecycle.complete(runId);
+      }
+      return exit;
+    } catch (err) {
+      await this.executionLifecycle.complete(runId);
+      throw err;
+    }
+  }
+
+  private async resumeRun(runId: string, answer: string): Promise<DriverExit | null> {
     // A STAGE park first (RUN-190): the stage's stack is holding in this very process, so the
     // answer is delivered rather than restored.
     if (this.deliverStageAnswer(runId, answer)) {
       return { outcome: 'done', isError: false, reason: 'stage-answer', telemetry: zeroTelemetry() };
     }
 
-    const entry = await this.deps.parked?.unpark(runId);
+    const entry = await this.executionLifecycle.resume(runId);
     if (!entry) return null;
     const { run } = entry;
 
@@ -3420,6 +3453,17 @@ export class RunSupervisor {
         reason: 'stage park lost across restart',
         telemetry: zeroTelemetry(),
       };
+    }
+
+    // Resume bypasses `prepare`, but it must not bypass the same pre-spawn lineage floor. The
+    // lifecycle owner has already moved this park into active state, so its fresh snapshot sees
+    // both this restored run and every still-persisted peer.
+    const lineage = resolveRunLineage(run, this.executionLifecycle.registry());
+    if (!lineage.ok) {
+      const reason = `${lineage.reason}; not resuming`;
+      this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
+      this.log.warn('execution lineage is invalid — declining to resume', { runId: run.id, reason });
+      return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
     }
 
     const fail = (reason: string): DriverExit => {
@@ -3736,7 +3780,7 @@ export class RunSupervisor {
     const all = (await this.deps.parked?.list()) ?? [];
     const stale = expiredParks(all, now, this.deps.parkTtlHours);
     for (const p of stale) {
-      await this.deps.parked?.unpark(p.run.id);
+      await this.executionLifecycle.terminalizePark(p.run.id);
       this.deps.report(p.run.id, {
         status: 'failed',
         exit: { outcome: 'failed', reason: 'park_expired' },
@@ -3758,6 +3802,31 @@ export class RunSupervisor {
    * and awaited the agent are `stages/execute.ts` — which `resume` now shares rather than repeats.
    */
   async supervise(run: Run): Promise<DriverExit> {
+    this.executionLifecycle.begin(run);
+    try {
+      const exit = await this.superviseRun(run);
+      if (exit.reason === 'parked') this.executionLifecycle.inactive(run.id);
+      else await this.executionLifecycle.complete(run.id);
+      return exit;
+    } catch (err) {
+      await this.executionLifecycle.complete(run.id);
+      throw err;
+    }
+  }
+
+  /** Hydrate the durable half before dispatch begins; no stale empty registry after restart. */
+  async restoreExecutionLifecycle(
+    classify?: (park: ParkedRun) => Promise<RecoveredParkDisposition>,
+  ): Promise<void> {
+    await this.executionLifecycle.restore(classify);
+  }
+
+  /** The daemon routes both cancellation and reconciliation through the lifecycle owner. */
+  async terminalizeParkedRun(runId: string): Promise<void> {
+    await this.executionLifecycle.terminalizePark(runId);
+  }
+
+  private async superviseRun(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
       return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
@@ -4516,6 +4585,7 @@ export class RunSupervisor {
         ...(this.deps.contextBudget !== undefined ? { budget: this.deps.contextBudget } : {}),
       },
       ...(this.deps.continuable ? { continuable: this.deps.continuable } : {}),
+      executionRegistry: () => this.executionLifecycle.registry(),
     };
   }
 

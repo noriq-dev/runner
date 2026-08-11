@@ -130,6 +130,7 @@ function harness(
     hasWork?: boolean | 'throws';
     /** The run's ceiling (RUN-133). Absent = unbounded, which is every other test here. */
     ceiling?: RunBudget;
+    executionRegistry?: Map<string, string>;
   } = {},
 ) {
   const rec: Recorder = {
@@ -214,6 +215,7 @@ function harness(
     // No disk: the `[context]` seams are injected, so preparation reads nothing real. Every
     // declared path is "missing", which is the shape a repo with no `[context]` already has.
     context: { probe: async () => false, read: async () => '' },
+    ...(over.executionRegistry ? { executionRegistry: () => over.executionRegistry! } : {}),
   };
   return { host, rec };
 }
@@ -232,6 +234,55 @@ describe('prepare refuses a dispatch, and says so instead of throwing', () => {
     const out = await prepareRun(host, makeRun());
     expect(out.ok === false && out.reason).toMatch(/no driver for tool claude/);
     expect(rec.leases).toBe(0);
+  });
+
+  it('a legacy dispatch prepares unchanged and carries a local root lineage', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(host, makeRun({ execution: null }));
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.lineage).toEqual({ type: 'legacy-root', assignment: null });
+    expect(rec.leases).toBe(1);
+    expect(rec.identities).toBe(1);
+  });
+
+  it('a self-parenting execution assignment refuses before anything is acquired', async () => {
+    const { host, rec } = harness();
+    const out = await prepareRun(
+      host,
+      makeRun({
+        execution: {
+          schemaVersion: 1,
+          orchestrationId: 'orc_1',
+          executionId: 'exe_1',
+          parentExecutionId: 'exe_1',
+          role: 'worker',
+          lineageStatus: 'complete',
+        },
+      }),
+    );
+    expect(out.ok === false && out.reason).toMatch(/names itself as its parent/);
+    expect(rec.leases).toBe(0);
+    expect(rec.identities).toBe(0);
+  });
+
+  it('an execution already bound to another live run refuses before anything is acquired', async () => {
+    const { host, rec } = harness({ executionRegistry: new Map([['exe_1', 'run_live']]) });
+    const out = await prepareRun(
+      host,
+      makeRun({
+        execution: {
+          schemaVersion: 1,
+          orchestrationId: 'orc_1',
+          executionId: 'exe_1',
+          parentExecutionId: null,
+          role: 'worker',
+          lineageStatus: 'complete',
+        },
+      }),
+    );
+    expect(out.ok === false && out.reason).toMatch(/already bound to live run run_live/);
+    expect(rec.leases).toBe(0);
+    expect(rec.identities).toBe(0);
   });
 
   // The ordering RUN-81 depends on: the phase gate is consulted BEFORE the lease, so a run the

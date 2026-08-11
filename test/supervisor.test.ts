@@ -529,6 +529,8 @@ function harness(
     getContextPack?: ContextPackFetcher;
     /** What the server says when asked whether the run parked (RUN-30). */
     parkState?: Partial<ParkState>;
+    /** A persisted park from a prior supervisor process, for restart-lifecycle regressions. */
+    parked?: FakeParked;
     /** true → asking the server throws, modelling a server the daemon cannot reach. */
     parkStateFails?: boolean;
     parkTtlHours?: number;
@@ -605,7 +607,7 @@ function harness(
   const codex = new FakeDriver('codex');
   let verifyRan = false;
   let verifyCalls = 0;
-  const parked = new FakeParked();
+  const parked = over.parked ?? new FakeParked();
   const continuable = new FakeContinuable();
   if (over.continuableSeed) continuable.entries.set(over.continuableSeed.runId, over.continuableSeed);
   const parkChecks: string[] = [];
@@ -1537,6 +1539,26 @@ describe('RunSupervisor', () => {
     expect(h.codex.opts?.effort).toBe('low');
     h.codex.complete('done');
     await done;
+  });
+
+  it('dispatches an explicit-null execution byte-identically to an older payload that omits it (RUN-265)', async () => {
+    const explicit = harness();
+    const explicitDone = explicit.supervisor.supervise(makeRun({ kind: 'scope', execution: null }));
+    await flush();
+    explicit.claude.complete('done');
+    await explicitDone;
+
+    const { execution: _legacyExecution, ...olderPayload } = makeRun({ kind: 'scope' });
+    const omitted = harness();
+    const omittedDone = omitted.supervisor.supervise(olderPayload as Run);
+    await flush();
+    omitted.claude.complete('done');
+    await omittedDone;
+
+    // Hooks are in-process closures, not dispatch data. Every serializable input to the driver
+    // must remain byte-for-byte equal when an older server has no additive execution field.
+    const dispatchBytes = ({ handlers: _handlers, ...start }: DriverStartOptions) => JSON.stringify(start);
+    expect(dispatchBytes(omitted.claude.starts[0]!)).toBe(dispatchBytes(explicit.claude.starts[0]!));
   });
 
   it('hands a lock enforcer only to a driver with in-process hooks (RUN-110)', async () => {
@@ -3779,6 +3801,55 @@ describe('the inline reviewer (RUN-61)', () => {
     expect(exit.outcome).toBe('done'); // the paused round's non-verdict was discarded, as promised
   });
 
+  it('joins terminal cleanup after a failed stage unpark before allowing an execution retry (RUN-265)', async () => {
+    const pump = async (cond: () => boolean) => {
+      for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ manifest: REVIEWED('npm test'), verifyResults: [true] });
+    const done = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, execution }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await onReviewTurn(h);
+    h.parkNext();
+    h.claude.emitText('I need a human answer.');
+    h.claude.complete('done');
+    await pump(() => h.reports.some((r) => r.status === 'blocked'));
+
+    const realUnpark = h.parked.unpark;
+    let oldRunDeletes = 0;
+    h.parked.unpark = async (runId) => {
+      if (runId !== 'run_1') return realUnpark(runId);
+      oldRunDeletes += 1;
+      if (oldRunDeletes === 1) throw new Error('stage answer delete failed');
+      return realUnpark(runId); // terminal cleanup must finish before the stack settles
+    };
+
+    h.answerIt();
+    await h.supervisor.resume('run_1', 'Proceed.');
+    await pump(() => h.claude.starts.length >= 3);
+    h.claude.emitText('VERDICT: PASS');
+    h.claude.complete('done');
+    expect((await done).outcome).toBe('done');
+    expect(await h.parked.get('run_1')).toBeNull();
+    expect(oldRunDeletes).toBe(2);
+
+    const retry = h.supervisor.supervise(makeRun({ id: 'run_retry', kind: 'scope', execution }));
+    await flush();
+    expect(h.claude.starts.at(-1)?.runId).toBe('run_retry');
+    h.claude.complete('done');
+    await retry;
+  });
+
   // RUN-154. The reviewer is the actor asked whether a diff looks like this repo's code, and it was
   // the one told nothing about what this repo's code looks like. Names only — its context already
   // carries the diff — and resolved at the point of use, so a run RESUMED in a later process gets
@@ -5771,10 +5842,43 @@ describe('parking a run on a human (RUN-30)', () => {
     expect(h.reports.at(-1)?.status).not.toBe('blocked');
     expect(h.abandons).toEqual([{ runId: 'run_1', signalId: 'sig_1' }]);
   });
+
+  it('releases an execution after a failed park write so a retry can start', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const realPark = h.parked.park;
+    h.parked.park = async () => {
+      throw new Error('disk full');
+    };
+    const failed = h.supervisor.supervise(
+      makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, execution }),
+    );
+    await flush();
+    h.claude.complete('done');
+    await failed;
+
+    h.parked.park = realPark;
+    h.answerIt();
+    const retry = h.supervisor.supervise(
+      makeRun({ id: 'run_retry', kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, execution }),
+    );
+    await flush();
+    expect(h.claude.starts).toHaveLength(2);
+    h.claude.complete('done');
+    await retry;
+  });
 });
 
 describe('resuming a parked run (RUN-30)', () => {
-  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const buildRun = (over: Partial<Run> = {}) =>
+    makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, ...over });
   const asked = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
 
   /** Park a run, then hand back a harness whose store holds it. */
@@ -5786,6 +5890,73 @@ describe('resuming a parked run (RUN-30)', () => {
     await done;
     return h;
   };
+
+  it('retains an execution binding across a park, refusing a concurrent duplicate before it spawns', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const parked = h.supervisor.supervise(buildRun({ execution }));
+    await flush();
+    h.claude.complete('done');
+    await parked;
+
+    const duplicate = await h.supervisor.supervise(buildRun({ id: 'run_2', execution }));
+    expect(duplicate).toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/already bound/) });
+    expect(h.claude.starts).toHaveLength(1);
+    expect(h.worktrees.created).toHaveLength(1);
+  });
+
+  it('reconstructs a persisted park after restart and refuses its execution before a driver starts', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const first = harness({ parkState: asked, verifyResults: [true] });
+    const parking = first.supervisor.supervise(buildRun({ execution }));
+    await flush();
+    first.claude.complete('done');
+    await parking;
+
+    const restarted = harness({ parked: first.parked });
+    await restarted.supervisor.restoreExecutionLifecycle();
+    const retry = await restarted.supervisor.supervise(buildRun({ id: 'run_retry', execution }));
+    expect(retry).toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/already bound/) });
+    expect(restarted.claude.starts).toHaveLength(0);
+    expect(restarted.worktrees.created).toHaveLength(0);
+  });
+
+  it('releases a parked execution when server reconciliation terminalizes its run', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const parked = h.supervisor.supervise(buildRun({ execution }));
+    await flush();
+    h.claude.complete('done');
+    await parked;
+
+    await h.supervisor.terminalizeParkedRun('run_1');
+    const replacement = h.supervisor.supervise(buildRun({ id: 'run_2', execution }));
+    await flush();
+    expect(h.claude.starts).toHaveLength(2);
+    h.claude.complete('done');
+    await replacement;
+  });
 
   it('comes back in the SAME session and the SAME worktree — the whole point', async () => {
     // Not a fresh run re-reading the repo: the agent returns with everything it had already

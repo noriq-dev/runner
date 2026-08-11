@@ -2,8 +2,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ExecutionSpec, ProjectManifest, RunnerConfig } from '@noriq-dev/shared';
-import type { ExecutedConfigurationEvidence, Run } from '@noriq-dev/shared';
+import { ExecutionSpec, ProjectManifest, Run, RunnerConfig } from '@noriq-dev/shared';
+import type { ExecutedConfigurationEvidence } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
@@ -767,7 +767,12 @@ describe('daemon.start(), driven end to end with fake seams', () => {
 
   // A fetch that answers registration and owed-merges off-line — never a real host. Records the
   // paths it saw so a test can assert start() issued no request it did not fake.
-  function fakeFetch(calls: string[], bodies: unknown[] = []): typeof fetch {
+  function fakeFetch(
+    calls: string[],
+    bodies: unknown[] = [],
+    parkState?: unknown,
+    parkProbe?: 'error' | 'hang',
+  ): typeof fetch {
     return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = String(input);
       calls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
@@ -789,6 +794,10 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         };
       } else if (url.includes('/owed-merges')) {
         body = { owed: [] };
+      } else if (new URL(url).pathname.endsWith('/park')) {
+        if (parkProbe === 'error') throw new Error('park state unavailable');
+        if (parkProbe === 'hang') return new Promise<Response>(() => {});
+        body = parkState ?? {};
       }
       return new Response(JSON.stringify(body), {
         status: 200,
@@ -809,10 +818,16 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       workflows?: WorkflowStore;
       indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
       indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
+      parked?: ParkedStore;
+      parkState?: unknown;
+      parkProbe?: 'error' | 'hang';
+      parkRecoveryTimeoutMs?: number;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
+    const startup: string[] = [];
     const connect: WsFactory = (url, headers) => {
+      startup.push('socket');
       const s = new FakeDaemonSocket(url, headers);
       sockets.push(s);
       return s;
@@ -820,13 +835,17 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const calls: string[] = [];
     const bodies: unknown[] = [];
     const supervised: string[] = [];
+    const restored: string[] = [];
+    const recovered: Array<{ runId: string; disposition: string }> = [];
+    const terminalized: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
+    const parked = over.parked ?? new ParkedStore(path.join(tmp, 'parked.json'));
     const daemon = new Daemon(config(over.concurrency, over.scanRoots), 'tok', {
       logger: quiet,
       connect,
-      fetchImpl: fakeFetch(calls, bodies),
-      parked: new ParkedStore(path.join(tmp, 'parked.json')),
+      fetchImpl: fakeFetch(calls, bodies, over.parkState, over.parkProbe),
+      parked,
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
@@ -845,6 +864,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       // test in this suite, not only ones that exercise them directly.
       indexStatusPath: path.join(tmp, 'index-status.json'),
       indexControlInfoPath: path.join(tmp, 'index-control.json'),
+      parkRecoveryTimeoutMs: over.parkRecoveryTimeoutMs,
       createSupervisor: (d) => {
         deps = d;
         report = d.report;
@@ -855,6 +875,21 @@ describe('daemon.start(), driven end to end with fake seams', () => {
             return {};
           },
           resume: async () => null,
+          restoreExecutionLifecycle: async (classify) => {
+            startup.push('restore-start');
+            restored.push('restored');
+            if (classify) {
+              for (const entry of await parked.list()) {
+                const disposition = await classify(entry);
+                recovered.push({ runId: entry.run.id, disposition });
+                startup.push(`classified:${disposition}`);
+              }
+            }
+            startup.push('restore-end');
+          },
+          terminalizeParkedRun: async (runId) => {
+            terminalized.push(runId);
+          },
           deliverStageAnswer: () => false, // no stage ever waits in this fake
 
           expireStaleParks: async () => 0,
@@ -864,7 +899,19 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, bodies, report, deps, supervised };
+    return {
+      handle,
+      sockets,
+      calls,
+      bodies,
+      report,
+      deps,
+      supervised,
+      restored,
+      recovered,
+      startup,
+      terminalized,
+    };
   }
 
   /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
@@ -891,6 +938,54 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       },
     });
 
+  const executionParkedStore = async (name: string): Promise<ParkedStore> => {
+    const parked = new ParkedStore(path.join(tmp, name));
+    await parked.park({
+      run: Run.parse({
+        id: 'run_parked',
+        projectId: 'prj_a',
+        runnerId: 'rnr_test',
+        agentId: 'agt_1',
+        execution: {
+          schemaVersion: 1,
+          orchestrationId: 'orc_1',
+          executionId: 'exe_1',
+          parentExecutionId: null,
+          role: 'worker',
+          lineageStatus: 'complete',
+        },
+        kind: 'build',
+        anchor: null,
+        brief: 'go',
+        repoRef: 'repo_a',
+        agentTool: 'claude',
+        budget: {},
+        status: 'blocked',
+        exit: null,
+        createdBy: 'usr_1',
+        createdAt: '2026-07-14T00:00:00.000Z',
+        updatedAt: '2026-07-14T00:00:00.000Z',
+      }),
+      sessionId: 'session_1',
+      agentId: 'agt_1',
+      agentLabel: 'build-parked',
+      mcpToken: 'tok_1',
+      workspace: {
+        runId: 'run_parked',
+        localPath: '/wt/run_parked',
+        readOnly: false,
+        workRef: 'noriq/run/run_parked',
+        baseId: 'base_1',
+        location: { branch: 'noriq/run/run_parked' },
+      },
+      spent: { tokens: 0, usd: 0 },
+      activeSeconds: 0,
+      parkedAt: '2026-07-14T00:00:00.000Z',
+      question: 'continue?',
+    });
+    return parked;
+  };
+
   it('drives start() to completion with a fake WsFactory and no real socket or HTTP', async () => {
     const { handle, sockets, calls } = await harness();
     expect(handle.runnerId).toBe('rnr_test');
@@ -904,6 +999,60 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  it('classifies a terminal recovered park before opening assignment admission', async () => {
+    const parked = await executionParkedStore('parked-terminal.json');
+    const h = await harness({
+      parked,
+      parkState: { status: 'cancelled', blocked: false, signalId: null, question: null, answer: null },
+    });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'terminal' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:terminal', 'restore-end', 'socket']);
+    await tick();
+    expect(h.terminalized).toEqual(['run_parked']);
+  });
+
+  it('retains a server-blocked recovered park before opening assignment admission', async () => {
+    const parked = await executionParkedStore('parked-blocked.json');
+    const h = await harness({
+      parked,
+      parkState: { status: 'blocked', blocked: true, signalId: 'sig_1', question: '?', answer: null },
+    });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'parked' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:parked', 'restore-end', 'socket']);
+  });
+
+  it('fails closed before admission when recovered park state cannot be fetched', async () => {
+    const parked = await executionParkedStore('parked-unknown.json');
+    const h = await harness({ parked, parkProbe: 'error' });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
+  });
+
+  it('bounds a hung recovered-park probe and still fails closed before admission', async () => {
+    const parked = await executionParkedStore('parked-hung.json');
+    const h = await harness({ parked, parkProbe: 'hang', parkRecoveryTimeoutMs: 5 });
+    expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
+    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
+  });
+
+  it('restores parked lineage ownership before it accepts a new assignment after restart', async () => {
+    const { sockets, restored, supervised } = await harness();
+    expect(restored).toEqual(['restored']);
+    sockets[0]!.emit('message', assignedFrame('run_after_restart'));
+    await tick();
+    expect(supervised).toEqual(['run_after_restart']);
+  });
+
+  it('routes direct cancellation of a parked run through the lifecycle owner', async () => {
+    const { sockets, terminalized } = await harness();
+    sockets[0]!.emit(
+      'message',
+      JSON.stringify({ type: 'run.cancel', runId: 'run_parked', hard: true, reason: 'cancelled' }),
+    );
+    await tick();
+    expect(terminalized).toEqual(['run_parked']);
   });
 
   // RUN-214, locked decision 11: `stop()` must cancel and JOIN in-flight index work, beside where
