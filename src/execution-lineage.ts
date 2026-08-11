@@ -63,7 +63,9 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
 
   /** The supervising stack reached a terminal outcome (including a thrown one). */
   complete(runId: string): void {
-    this.terminal.add(runId);
+    // A terminal stack cannot create another park after it returns. Cancellation keeps its
+    // tombstone only while an active stack could still finish an already-started park transition.
+    this.terminal.delete(runId);
     this.inactive(runId);
   }
 
@@ -118,7 +120,12 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
   /** A server-terminal fact blocks any late park and removes the durable half in one transition. */
   async terminalizePark(runId: string): Promise<Park | null> {
     this.terminal.add(runId);
-    return this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
+    const park = await this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
+    // A directly cancelled persisted park has no supervising stack that will call `complete`.
+    // Its tombstone has done its job once the ordered deletion finishes, so retaining it would
+    // make daemon memory scale with historical cancellations rather than live lifecycle state.
+    if (!this.active.has(runId)) this.terminal.delete(runId);
+    return park;
   }
 
   /** Startup reads the durable half before the WebSocket can deliver a new assignment. */

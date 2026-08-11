@@ -116,8 +116,12 @@ describe('resolveRunLineage', () => {
       },
     });
 
+    // The park-state probe belongs to a still-active supervisor. A directly cancelled detached
+    // park clears its tombstone immediately; this in-flight probe must keep it until completion.
+    lifecycle.begin(run({ id: 'run_parked' }));
     await lifecycle.terminalizePark('run_parked');
     expect(await lifecycle.park({ run: run({ id: 'run_parked' }) })).toBe(false);
+    lifecycle.complete('run_parked');
     expect(await lifecycle.registry()).toEqual(new Map());
   });
 
