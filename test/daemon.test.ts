@@ -2,8 +2,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ExecutionSpec, ProjectManifest, RunnerConfig } from '@noriq-dev/shared';
-import type { ExecutedConfigurationEvidence, Run } from '@noriq-dev/shared';
+import { ExecutionSpec, ProjectManifest, Run, RunnerConfig } from '@noriq-dev/shared';
+import type { ExecutedConfigurationEvidence } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
@@ -767,7 +767,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
 
   // A fetch that answers registration and owed-merges off-line — never a real host. Records the
   // paths it saw so a test can assert start() issued no request it did not fake.
-  function fakeFetch(calls: string[], bodies: unknown[] = []): typeof fetch {
+  function fakeFetch(calls: string[], bodies: unknown[] = [], parkState?: unknown): typeof fetch {
     return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = String(input);
       calls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
@@ -789,6 +789,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         };
       } else if (url.includes('/owed-merges')) {
         body = { owed: [] };
+      } else if (new URL(url).pathname.endsWith('/park')) {
+        body = parkState ?? {};
       }
       return new Response(JSON.stringify(body), {
         status: 200,
@@ -809,6 +811,8 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       workflows?: WorkflowStore;
       indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
       indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
+      parked?: ParkedStore;
+      parkState?: unknown;
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = [];
@@ -820,13 +824,14 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const calls: string[] = [];
     const bodies: unknown[] = [];
     const supervised: string[] = [];
+    const forgotten: string[] = [];
     let report!: (runId: string, rep: RunReport) => void;
     let deps!: RunSupervisorDeps;
     const daemon = new Daemon(config(over.concurrency, over.scanRoots), 'tok', {
       logger: quiet,
       connect,
-      fetchImpl: fakeFetch(calls, bodies),
-      parked: new ParkedStore(path.join(tmp, 'parked.json')),
+      fetchImpl: fakeFetch(calls, bodies, over.parkState),
+      parked: over.parked ?? new ParkedStore(path.join(tmp, 'parked.json')),
       continuable: new ContinuableStore(path.join(tmp, 'continuable.json')),
       stateFile: path.join(tmp, 'state.json'),
       workflows: over.workflows,
@@ -855,6 +860,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
             return {};
           },
           resume: async () => null,
+          forgetExecutionBinding: (runId) => forgotten.push(runId),
           deliverStageAnswer: () => false, // no stage ever waits in this fake
 
           expireStaleParks: async () => 0,
@@ -864,7 +870,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     const handle = await daemon.start();
     handles.push(handle);
     await tick(); // let WsClient.open() resolve the token and set its socket
-    return { handle, sockets, calls, bodies, report, deps, supervised };
+    return { handle, sockets, calls, bodies, report, deps, supervised, forgotten };
   }
 
   /** A schema-valid run.assigned frame — an invalid run would be dropped by the wire contract and
@@ -904,6 +910,61 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         (c) => c.startsWith('POST /api/runners') || c.includes('/owed-merges') || c.includes('/heartbeat'),
       ),
     ).toBe(true);
+  });
+
+  it('forgets a parked lineage binding when server reconciliation finds its run terminal', async () => {
+    const parked = new ParkedStore(path.join(tmp, 'parked-terminal.json'));
+    await parked.park({
+      run: Run.parse({
+        id: 'run_parked',
+        projectId: 'prj_a',
+        runnerId: 'rnr_test',
+        agentId: 'agt_1',
+        execution: {
+          schemaVersion: 1,
+          orchestrationId: 'orc_1',
+          executionId: 'exe_1',
+          parentExecutionId: null,
+          role: 'worker',
+          lineageStatus: 'complete',
+        },
+        kind: 'build',
+        anchor: null,
+        brief: 'go',
+        repoRef: 'repo_a',
+        agentTool: 'claude',
+        budget: {},
+        status: 'blocked',
+        exit: null,
+        createdBy: 'usr_1',
+        createdAt: '2026-07-14T00:00:00.000Z',
+        updatedAt: '2026-07-14T00:00:00.000Z',
+      }),
+      sessionId: 'session_1',
+      agentId: 'agt_1',
+      agentLabel: 'build-parked',
+      mcpToken: 'tok_1',
+      workspace: {
+        runId: 'run_parked',
+        localPath: '/wt/run_parked',
+        readOnly: false,
+        workRef: 'noriq/run/run_parked',
+        baseId: 'base_1',
+        location: { branch: 'noriq/run/run_parked' },
+      },
+      spent: { tokens: 0, usd: 0 },
+      activeSeconds: 0,
+      parkedAt: '2026-07-14T00:00:00.000Z',
+      question: 'continue?',
+    });
+
+    const h = await harness({
+      parked,
+      parkState: { status: 'cancelled', blocked: false, signalId: null, question: null, answer: null },
+    });
+    await tick();
+    expect(h.forgotten).toEqual(['run_parked']);
+    expect(await parked.get('run_parked')).toBeNull();
   });
 
   // RUN-214, locked decision 11: `stop()` must cancel and JOIN in-flight index work, beside where

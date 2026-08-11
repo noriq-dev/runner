@@ -3810,6 +3810,11 @@ export class RunSupervisor {
     }
   }
 
+  /** The daemon calls this when server reconciliation proves a parked Run is terminal (RUN-265). */
+  forgetExecutionBinding(runId: string): void {
+    this.releaseExecutionBinding(runId);
+  }
+
   private async superviseRun(run: Run): Promise<DriverExit> {
     const fail = (reason: string): DriverExit => {
       this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });

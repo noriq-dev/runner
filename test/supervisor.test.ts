@@ -5809,6 +5809,29 @@ describe('resuming a parked run (RUN-30)', () => {
     expect(h.worktrees.created).toHaveLength(1);
   });
 
+  it('releases a parked execution when server reconciliation terminalizes its run', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const parked = h.supervisor.supervise(buildRun({ execution }));
+    await flush();
+    h.claude.complete('done');
+    await parked;
+
+    h.supervisor.forgetExecutionBinding('run_1');
+    const replacement = h.supervisor.supervise(buildRun({ id: 'run_2', execution }));
+    await flush();
+    expect(h.claude.starts).toHaveLength(2);
+    h.claude.complete('done');
+    await replacement;
+  });
+
   it('comes back in the SAME session and the SAME worktree — the whole point', async () => {
     // Not a fresh run re-reading the repo: the agent returns with everything it had already
     // worked out still in context. That is the difference between collaborating and starting over.

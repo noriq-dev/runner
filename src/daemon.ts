@@ -161,6 +161,8 @@ export function workflowRepoResolver(deps: {
 export interface SupervisorLike {
   supervise(run: Run): Promise<unknown>;
   resume(runId: string, answer: string): Promise<unknown>;
+  /** Drop a parked Run's local lineage reservation once the server has terminalized it (RUN-265). */
+  forgetExecutionBinding(runId: string): void;
   /** Deliver an answer to a stage holding in-process (RUN-190). True = delivered, no restore. */
   deliverStageAnswer(runId: string, answer: string): boolean;
   expireStaleParks(): Promise<number>;
@@ -1280,6 +1282,7 @@ export class Daemon {
             runId: p.run.id,
             status: state.status,
           });
+          supervisor.forgetExecutionBinding(p.run.id);
           await parked.unpark(p.run.id);
         }
       }
