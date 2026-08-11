@@ -56,7 +56,7 @@ export interface PatternMapHost {
   readonly log: typeof defaultLogger;
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
-  startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  startAgent(driver: AgentDriver, opts: DriverStartOptions, stage?: string): BudgetRun;
   /** The clock this stage times its own wall-clock stretch against (RUN-242) — see
    *  `PlanHost.clock`'s doc; optional, defaults to `performance.now()`. */
   clock?: Clock;
@@ -156,16 +156,20 @@ export const mapPatterns = async (
   // that throws still charges the run for the stretch it actually ran.
   const clock = host.clock ?? defaultClock;
   const startedAt = clock();
-  const budgetRun = host.startAgent(input.driver, {
-    ...input.start,
-    prompt: input.prompt,
-    handlers: {
-      onText: (t) => {
-        text = (text + t).slice(-64_000);
-        host.transcript(input.run.id).text('agent', t);
+  const budgetRun = host.startAgent(
+    input.driver,
+    {
+      ...input.start,
+      prompt: input.prompt,
+      handlers: {
+        onText: (t) => {
+          text = (text + t).slice(-64_000);
+          host.transcript(input.run.id).text('agent', t);
+        },
       },
     },
-  });
+    'pattern-map',
+  );
   host.steering?.register(input.run.id, budgetRun.session, budgetRun.stop);
 
   let exit: Awaited<BudgetRun['done']>;

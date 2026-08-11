@@ -161,7 +161,21 @@ export function buildContextConsumption(
     similarEpisodesConsidered: pack.similarEpisodes.length,
     staleCitationsCount: verification.total - verification.byState.valid,
     noticesCount: pack.notices.length,
-    retrievalTookMs: retrieval.tookMs,
+    // ROUNDED, and this is not optional (RUN-286, found on the first live run): the contract's
+    // `retrievalTookMs` is `z.number().int()`, while `ContextPackRetrieval.tookMs` comes from
+    // `elapsedMs` → `performance.now()` deltas, which are FRACTIONAL by construction. So this field
+    // could never validate, and because a refine failure drops the WHOLE `intelligence` payload it
+    // took every other analytics fact down with it — stages, clocks and change stats included. The
+    // live episode logged exactly that: `issuePath: contextConsumption.value.retrievalTookMs,
+    // "expected int, received number"`.
+    //
+    // Rounding here is NOT the "never repair a number" rule (RUN-244) being broken. That rule is
+    // about garbage — a NaN or a negative, where any repair fabricates a measurement that was never
+    // taken. This is a real measurement in a FINER unit than the contract carries, and converting it
+    // to the contract's own unit loses sub-millisecond precision nobody asked for. Every unit test
+    // missed it because they all built snapshots from hand-written integers; only the real retrieval
+    // path produces a float.
+    retrievalTookMs: Math.round(retrieval.tookMs),
   };
 
   // `complete` requires ALL of: semantic mode, no section notice, and the renderer itself did not

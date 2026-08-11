@@ -43,7 +43,7 @@ export interface PlanHost {
   readonly log: typeof defaultLogger;
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
-  startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  startAgent(driver: AgentDriver, opts: DriverStartOptions, stage?: string): BudgetRun;
   /** The clock `abandon`/`close` time this stage's stretch against (RUN-242). Optional — defaults
    *  to `performance.now()` — so a test can drive elapsed time without a real timer, and so this
    *  stage's duration is measured against the SAME clock the budget-supervision layer uses rather
@@ -175,33 +175,37 @@ export const planRun = async (host: PlanHost, plan: PlanInput): Promise<PlanOutc
   // negative or inflated stretch on a wall-clock step.
   const clock = host.clock ?? defaultClock;
   const startedAt = clock();
-  const budgetRun = host.startAgent(plan.driver, {
-    ...plan.start,
-    prompt: plan.prompt,
-    // Kept open so the checker can hand revisions back into the context that wrote the plan
-    // (RUN-141). `close` below is the only thing that shuts it, and every path reaches one.
-    multiTurn: true,
-    handlers: {
-      onTelemetry: (t) => {
-        // Its own slot, so the run's total shows what planning cost rather than folding it into
-        // the builder's (RUN-59's per-slot ledger).
-        tally.record('plan', t);
-        host.report(run.id, { status: 'running', telemetry: tally.total() });
-      },
-      onText: (t) => {
-        // Bounded. The answer is one JSON object and a sentence; a model that produces megabytes
-        // has gone wrong, and accumulating all of it would spend memory to parse something that
-        // will not be a spec. Keeping the TAIL rather than the head is deliberate — the block the
-        // parser wants is the last one.
-        text = (text + t).slice(-PLANNER_OUTPUT_CAP);
-        // The repair turn's own accumulator (RUN-197). A length snapshot into `text` cannot
-        // isolate a turn: the tail cap SLIDES once the buffer is full, so `slice(before)` would
-        // drop the head of the re-emission by however much the first attempt overflowed.
-        if (repairBuf !== null) repairBuf = (repairBuf + t).slice(-PLANNER_OUTPUT_CAP);
-        host.transcript(run.id).text('agent', t);
+  const budgetRun = host.startAgent(
+    plan.driver,
+    {
+      ...plan.start,
+      prompt: plan.prompt,
+      // Kept open so the checker can hand revisions back into the context that wrote the plan
+      // (RUN-141). `close` below is the only thing that shuts it, and every path reaches one.
+      multiTurn: true,
+      handlers: {
+        onTelemetry: (t) => {
+          // Its own slot, so the run's total shows what planning cost rather than folding it into
+          // the builder's (RUN-59's per-slot ledger).
+          tally.record('plan', t);
+          host.report(run.id, { status: 'running', telemetry: tally.total() });
+        },
+        onText: (t) => {
+          // Bounded. The answer is one JSON object and a sentence; a model that produces megabytes
+          // has gone wrong, and accumulating all of it would spend memory to parse something that
+          // will not be a spec. Keeping the TAIL rather than the head is deliberate — the block the
+          // parser wants is the last one.
+          text = (text + t).slice(-PLANNER_OUTPUT_CAP);
+          // The repair turn's own accumulator (RUN-197). A length snapshot into `text` cannot
+          // isolate a turn: the tail cap SLIDES once the buffer is full, so `slice(before)` would
+          // drop the head of the re-emission by however much the first attempt overflowed.
+          if (repairBuf !== null) repairBuf = (repairBuf + t).slice(-PLANNER_OUTPUT_CAP);
+          host.transcript(run.id).text('agent', t);
+        },
       },
     },
-  });
+    'plan',
+  );
 
   host.steering?.register(run.id, budgetRun.session, budgetRun.stop);
 

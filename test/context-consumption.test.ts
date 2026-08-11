@@ -1,4 +1,4 @@
-import { IntelligenceContextConsumptionMetric } from '@noriq-dev/shared';
+import { IntelligenceContextConsumptionMetric, UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type {
   VerifiedCitation,
@@ -437,5 +437,26 @@ describe('buildContextConsumption — validates against the vendored schema (RUN
       expect(m?.source).toBe('runner');
       expect(m?.acceptedAt).toBeNull();
     }
+  });
+});
+
+describe('the snapshot validates against the vendored contract with REAL measured values (RUN-286)', () => {
+  // The defect the first live run found. Every earlier test here built a snapshot from hand-written
+  // integers, so none of them exercised the one field the real path feeds from `performance.now()`:
+  // `retrievalTookMs` was fractional by construction and could never satisfy `z.number().int()`.
+  // Because a refine failure drops the WHOLE `intelligence` payload, this single float took the
+  // stages, clocks and change stats down with it on every run.
+  it('a fractional retrieval duration still validates, rounded to the contract’s own unit', () => {
+    const p = pack([section({ excerpts: [memoryExcerpt()] })], { mode: 'semantic' });
+    const metric = buildContextConsumption({
+      // The exact shape `elapsedMs` produces: a `performance.now()` delta, not a whole millisecond.
+      retrieval: { ...retrieval(), tookMs: 143.2857 },
+      verifiedContextPack: p,
+      rendered: rendered({ text: 'x'.repeat(50), chars: 50, truncated: false }),
+    });
+    expect(metric?.value?.retrievalTookMs).toBe(143);
+    expect(Number.isInteger(metric?.value?.retrievalTookMs)).toBe(true);
+    const parsed = UploadedEpisodeIntelligence.safeParse({ contextConsumption: metric });
+    expect(parsed.success, parsed.success ? '' : JSON.stringify(parsed.error?.issues)).toBe(true);
   });
 });

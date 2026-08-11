@@ -43,7 +43,7 @@ export interface PlanCheckHost {
   readonly log: typeof defaultLogger;
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
-  startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  startAgent(driver: AgentDriver, opts: DriverStartOptions, stage?: string): BudgetRun;
   /** The clock a checker round times its own wall-clock stretch against (RUN-242) — see
    *  `PlanHost.clock`'s doc; optional, defaults to `performance.now()`. */
   clock?: Clock;
@@ -98,18 +98,22 @@ async function checkOnce(
     return null;
   }
   let text = '';
-  const budgetRun = host.startAgent(input.driver, {
-    ...input.start,
-    prompt: input.prompt(input.checked.spec, renderLedger(ledger)),
-    ...(reservation.budget ? { budget: reservation.budget } : {}),
-    ...host.guards(`plan-check:${round}`),
-    handlers: {
-      onText: (t) => {
-        text += t;
-        host.transcript(input.run.id).text('agent', t);
+  const budgetRun = host.startAgent(
+    input.driver,
+    {
+      ...input.start,
+      prompt: input.prompt(input.checked.spec, renderLedger(ledger)),
+      ...(reservation.budget ? { budget: reservation.budget } : {}),
+      ...host.guards(`plan-check:${round}`),
+      handlers: {
+        onText: (t) => {
+          text += t;
+          host.transcript(input.run.id).text('agent', t);
+        },
       },
     },
-  });
+    `plan-check:${round}`,
+  );
   // Monotonic (RUN-242), and consumed in `finally` below so a round that THROWS (budgetRun.done
   // rejecting) still charges the run for the stretch it actually ran, rather than losing it.
   const clock = host.clock ?? defaultClock;

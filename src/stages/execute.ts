@@ -36,7 +36,7 @@ export interface ExecuteHost {
   report(runId: string, frame: RunReport): void;
   transcript(runId: string): RunTranscript;
   /** The supervisor's single spawn point — it is what applies the sanitized env (RUN-109). */
-  startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun;
+  startAgent(driver: AgentDriver, opts: DriverStartOptions, stage?: string): BudgetRun;
   /** Makes the live session steerable + cancellable while it runs (RUN-16/18). `key` names WHICH
    *  of the run's sessions this is — a wave runs a run's steps concurrently (RUN-170), and two
    *  sessions registered under the bare runId clobber each other. */
@@ -148,29 +148,33 @@ export const executeRun = async (host: ExecuteHost, plan: ExecutePlan): Promise<
   // by this. This is telemetry only: the moment `episode.ts`'s "agent started" timeline entry names,
   // which had no source anywhere on `RunPipeline` until this line.
   const agentStartedAt = new Date().toISOString();
-  const budgetRun = host.startAgent(plan.driver, {
-    ...plan.start,
-    handlers: {
-      // Each telemetry tick carries the current spend AND the latest log tail, so the dashboard
-      // sees burn + output without a status transition per tick. The primary session — including
-      // its fix turns, which stream through these same handlers — records into the tally, and the
-      // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
-      // knows the split), so the mix appears when the result lands, not before.
-      onTelemetry: (t) => {
-        tally.record(plan.slot ?? 'primary', t);
-        host.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
-      },
-      onText: (t) => {
-        sessionText += t;
-        tail = (tail + t).slice(-LOG_TAIL_CAP);
-        // Labelled by THIS session's own step (RUN-150), not by a "current step" the transcript
-        // holds: the moment two steps overlap, a shared label relabels whichever one did not move
-        // it last, and the result is a transcript that reads plausibly and attributes the wrong
-        // work to the wrong step.
-        host.transcript(run.id).text('agent', t, null, plan.stepId ?? null);
+  const budgetRun = host.startAgent(
+    plan.driver,
+    {
+      ...plan.start,
+      handlers: {
+        // Each telemetry tick carries the current spend AND the latest log tail, so the dashboard
+        // sees burn + output without a status transition per tick. The primary session — including
+        // its fix turns, which stream through these same handlers — records into the tally, and the
+        // reported figure is the RUN total (RUN-59). A live tick carries no mix (only a result
+        // knows the split), so the mix appears when the result lands, not before.
+        onTelemetry: (t) => {
+          tally.record(plan.slot ?? 'primary', t);
+          host.report(run.id, { status: 'running', telemetry: tally.total(), logTail: tail });
+        },
+        onText: (t) => {
+          sessionText += t;
+          tail = (tail + t).slice(-LOG_TAIL_CAP);
+          // Labelled by THIS session's own step (RUN-150), not by a "current step" the transcript
+          // holds: the moment two steps overlap, a shared label relabels whichever one did not move
+          // it last, and the result is a transcript that reads plausibly and attributes the wrong
+          // work to the wrong step.
+          host.transcript(run.id).text('agent', t, null, plan.stepId ?? null);
+        },
       },
     },
-  });
+    plan.slot ?? 'primary',
+  );
   // Steerable + cancellable while it runs (RUN-16/18). The steering key IS the tally slot — the
   // slot is already unique per concurrent session (last-writer-wins forces that), so reusing it
   // keeps one "which session am I" name rather than two that can disagree (RUN-170).

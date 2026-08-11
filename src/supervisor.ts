@@ -1477,7 +1477,33 @@ export class RunSupervisor {
    * to its base via `effectiveKind`), so clamping by it here is exactly what the sites compute —
    * idempotent where they got it right, and the floor where a future one forgets.
    */
-  private startAgent(driver: AgentDriver, opts: DriverStartOptions): BudgetRun {
+  /**
+   * The single spawn chokepoint (RUN-158 put the permission clamp here for this reason), and since
+   * RUN-286 the single place a spawn is ANNOUNCED.
+   *
+   * `stage` is the tally slot the caller will record under — deliberately the same vocabulary
+   * (`primary`, `plan`, `plan-check:N`, `review:N`, `pattern-map`, `conflict`, `step:<id>`), so a log
+   * line joins directly to the episode's own `execution.stages` fact rather than needing a second
+   * mapping. It defaults to `'unlabelled'` rather than being required: a future call site that
+   * forgets it still logs, and the word itself is the signal that one did.
+   *
+   * Logged at INFO, not DEBUG: this is the operational record of what a run actually did, and its
+   * absence is what made a 28-minute live run unreadable — a plan stage, two plan-check rounds and a
+   * driver switch all happened between two log lines, and reconstructing them afterwards meant
+   * reading `/proc` for the child's argv. A per-stage model choice that cannot be seen after the fact
+   * is a configuration taken on faith.
+   */
+  private startAgent(driver: AgentDriver, opts: DriverStartOptions, stage = 'unlabelled'): BudgetRun {
+    this.log.info('stage agent spawning', {
+      runId: opts.runId,
+      stage,
+      tool: driver.tool,
+      // Null rather than omitted when unset — "the driver's own default" is a fact worth seeing,
+      // and an omitted key reads as "not logged" instead.
+      model: opts.model ?? null,
+      effort: opts.effort ?? null,
+      kind: opts.kind,
+    });
     return superviseBudget(driver, {
       env: sanitizedAgentEnv(),
       ...opts,
@@ -2389,62 +2415,66 @@ export class RunSupervisor {
     // nothing to compute freshly every round rather than threading a cached render.
     const memory = renderMemoryEvidence(ctx.verifiedContextPack ?? null, { audience: 'reviewer' }).text;
     const startedAt = monotonicMs();
-    const session = this.startAgent(driver, {
-      runId: `${ctx.run.id}:review`,
-      kind: 'verify', // the reviewer IS a verify actor: executes but never edits
-      cwd: ctx.worktree.localPath,
-      prompt:
-        assembleReviewerPrompt({
-          intent: ctx.intent,
-          diffCmd,
-          // Split in two (RUN-177) because the two states are different facts and only one of them
-          // was ever told. A landing run's deterministic command runs AFTER this review, against the
-          // rebased result — telling the reviewer it "already passed" is false there, and it is
-          // instructed not to re-run it, so it cannot find out.
-          verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
-          verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
-          ledger: ctx.ledger,
-          repoContext: reviewerContext,
-          memory,
-          ...(ctx.acceptance?.length
-            ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
-            : {}),
-          ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
-        }) + (ctx.stageAnswer ?? ''),
-      // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
-      // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
-      // a committed manifest handed the reviewer Edit/Write over the very diff it is judging, which
-      // it could then "fix" and PASS. RUN-118's floor was described as applying at every permission
-      // site; this was the site it missed — and the one that matters most, because a dispatched
-      // verify run is opt-in while the inline reviewer gates every build that configures one.
-      permission: clampPermissionToWorkflow(manifest.permissions.verify, BUILTIN_WORKFLOWS.verify),
-      // The ESCALATION PAIR only. The reviewer had NO noriqMcp for two reasons that both still
-      // hold for everything except these two tools: one run holds one non-reissuable credential
-      // (RUN-43), so a second inline identity cannot exist; and authorship separation means the
-      // reviewer must not claim, move, or comment as anyone. `raise_alert` and `request_input`
-      // move no work — the first notifies, the second PAUSES the run — so the separation
-      // survives, and a reviewer that genuinely cannot judge without a human's answer ("is this
-      // legacy surface load-bearing?") finally has a move that is not guessing a verdict. The
-      // reviewer's output is still its report; the daemon still posts the findings itself.
-      noriqMcp: ctx.noriqMcp,
-      noriqTools: STAGE_NORIQ_TOOLS,
-      ...(model ? { model } : {}),
-      ...(effort ? { effort } : {}),
-      budget: reservation.budget,
-      // …and the live check, so a reviewer cannot outspend the RUN even inside its own allowance.
-      spendGuard: ctx.tally.guard(`review:${ctx.round}`),
-      clockGuard: ctx.tally.clockGuard(),
-      handlers: {
-        onText: (t) => {
-          text += t;
-          this.transcript(ctx.run.id).text('reviewer', t, ctx.round);
+    const session = this.startAgent(
+      driver,
+      {
+        runId: `${ctx.run.id}:review`,
+        kind: 'verify', // the reviewer IS a verify actor: executes but never edits
+        cwd: ctx.worktree.localPath,
+        prompt:
+          assembleReviewerPrompt({
+            intent: ctx.intent,
+            diffCmd,
+            // Split in two (RUN-177) because the two states are different facts and only one of them
+            // was ever told. A landing run's deterministic command runs AFTER this review, against the
+            // rebased result — telling the reviewer it "already passed" is false there, and it is
+            // instructed not to re-run it, so it cannot find out.
+            verifyPassed: ctx.verifyRan === false ? null : (cmdVerify(manifest.verify)?.cmd ?? null),
+            verifyPending: ctx.verifyRan === false ? (cmdVerify(manifest.verify)?.cmd ?? null) : null,
+            ledger: ctx.ledger,
+            repoContext: reviewerContext,
+            memory,
+            ...(ctx.acceptance?.length
+              ? { acceptance: ctx.acceptance, acceptanceOverflow: ctx.acceptanceOverflow ?? 0 }
+              : {}),
+            ...(ctx.requirements?.length ? { requirements: ctx.requirements } : {}),
+          }) + (ctx.stageAnswer ?? ''),
+        // CLAMPED, not raw (RUN-158). The line above says this actor executes but never edits, and
+        // until now that was the only thing enforcing it here: `[permissions.verify] write = true` in
+        // a committed manifest handed the reviewer Edit/Write over the very diff it is judging, which
+        // it could then "fix" and PASS. RUN-118's floor was described as applying at every permission
+        // site; this was the site it missed — and the one that matters most, because a dispatched
+        // verify run is opt-in while the inline reviewer gates every build that configures one.
+        permission: clampPermissionToWorkflow(manifest.permissions.verify, BUILTIN_WORKFLOWS.verify),
+        // The ESCALATION PAIR only. The reviewer had NO noriqMcp for two reasons that both still
+        // hold for everything except these two tools: one run holds one non-reissuable credential
+        // (RUN-43), so a second inline identity cannot exist; and authorship separation means the
+        // reviewer must not claim, move, or comment as anyone. `raise_alert` and `request_input`
+        // move no work — the first notifies, the second PAUSES the run — so the separation
+        // survives, and a reviewer that genuinely cannot judge without a human's answer ("is this
+        // legacy surface load-bearing?") finally has a move that is not guessing a verdict. The
+        // reviewer's output is still its report; the daemon still posts the findings itself.
+        noriqMcp: ctx.noriqMcp,
+        noriqTools: STAGE_NORIQ_TOOLS,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        budget: reservation.budget,
+        // …and the live check, so a reviewer cannot outspend the RUN even inside its own allowance.
+        spendGuard: ctx.tally.guard(`review:${ctx.round}`),
+        clockGuard: ctx.tally.clockGuard(),
+        handlers: {
+          onText: (t) => {
+            text += t;
+            this.transcript(ctx.run.id).text('reviewer', t, ctx.round);
+          },
+          // The reviewer's LIVE ticks are deliberately NOT folded into the run frame (RUN-59). Its
+          // mix is only known at its result, so folding a live tick (tokens, no mix) would strand a
+          // climbing total next to a stale primary-only mix under the server's COALESCE. Its spend
+          // joins the run at its result instead — see the tally.record below, reported as one jump.
         },
-        // The reviewer's LIVE ticks are deliberately NOT folded into the run frame (RUN-59). Its
-        // mix is only known at its result, so folding a live tick (tokens, no mix) would strand a
-        // climbing total next to a stale primary-only mix under the server's COALESCE. Its spend
-        // joins the run at its result instead — see the tally.record below, reported as one jump.
       },
-    });
+      `review:${ctx.round}`,
+    );
     // Killable while it reviews, same as the conflict resolver — and unregistered after, for the
     // same leak (see resolveConflict).
     this.deps.steering?.register(ctx.run.id, session.session, session.stop);
@@ -2994,30 +3024,34 @@ export class RunSupervisor {
 
     let text = '';
     const startedAt = monotonicMs();
-    const session = this.startAgent(ctx.driver, {
-      runId: `${ctx.run.id}:conflict`,
-      kind: 'build', // it is editing its own diff — the build floor, nothing wider
-      cwd: ctx.worktree.localPath,
-      prompt: assembleConflictPrompt({
-        conflicts,
-        landBranch: ctx.policy.branch,
-        task: ctx.task,
-        verifyCmd: ctx.repo.manifest.verify?.cmd ?? null,
-      }),
-      permission: ctx.permission,
-      noriqMcp: ctx.noriqMcp,
-      budget: reservation.budget,
-      spendGuard: ctx.tally.guard('conflict'),
-      clockGuard: ctx.tally.clockGuard(),
-      handlers: {
-        onText: (t) => {
-          text += t;
+    const session = this.startAgent(
+      ctx.driver,
+      {
+        runId: `${ctx.run.id}:conflict`,
+        kind: 'build', // it is editing its own diff — the build floor, nothing wider
+        cwd: ctx.worktree.localPath,
+        prompt: assembleConflictPrompt({
+          conflicts,
+          landBranch: ctx.policy.branch,
+          task: ctx.task,
+          verifyCmd: ctx.repo.manifest.verify?.cmd ?? null,
+        }),
+        permission: ctx.permission,
+        noriqMcp: ctx.noriqMcp,
+        budget: reservation.budget,
+        spendGuard: ctx.tally.guard('conflict'),
+        clockGuard: ctx.tally.clockGuard(),
+        handlers: {
+          onText: (t) => {
+            text += t;
+          },
+          // Like the reviewer (RUN-59): live ticks are not folded (mix unknown until the result), so
+          // the run frame never shows a total climbing past a stale mix. The conflict turn's whole
+          // spend joins the run at its result — recorded below and reported as one step.
         },
-        // Like the reviewer (RUN-59): live ticks are not folded (mix unknown until the result), so
-        // the run frame never shows a total climbing past a stale mix. The conflict turn's whole
-        // spend joins the run at its result — recorded below and reported as one step.
       },
-    });
+      'conflict',
+    );
     // Still killable while it works — and unregistered when it stops. supervise()'s own
     // `finally` already ran for this runId before landing began, so nothing else will
     // clean this up: without the finally below, SteeringBridge would hold a dead session
@@ -4232,7 +4266,7 @@ export class RunSupervisor {
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       transcript: (runId) => this.transcript(runId),
-      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      startAgent: (driver, opts, stage) => this.startAgent(driver, opts, stage),
       ...(this.deps.steering
         ? {
             steering: {
@@ -4324,7 +4358,7 @@ export class RunSupervisor {
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       transcript: (runId) => this.transcript(runId),
-      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      startAgent: (driver, opts, stage) => this.startAgent(driver, opts, stage),
       revise: (feedback) => planned.revise(feedback),
       reserve: () => {
         // Two ceilings, and the tighter wins: what the RUN has left (so the builder is not starved
@@ -4357,7 +4391,7 @@ export class RunSupervisor {
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       transcript: (runId) => this.transcript(runId),
-      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      startAgent: (driver, opts, stage) => this.startAgent(driver, opts, stage),
       // The planner is a live session like any other: cancellable, and stopped by shutdown. It
       // used to be outside this, so `run.cancel` during planning found no target and answered
       // false while the planner — and then the build — carried on.
@@ -4459,7 +4493,7 @@ export class RunSupervisor {
       log: this.log,
       report: (runId, frame) => this.deps.report(runId, frame),
       transcript: (runId) => this.transcript(runId),
-      startAgent: (driver, opts) => this.startAgent(driver, opts),
+      startAgent: (driver, opts, stage) => this.startAgent(driver, opts, stage),
       ...(this.deps.steering ? { steering: this.deps.steering } : {}),
       parkIfBlocked: (ctx) => this.parkIfBlocked(ctx),
     };
