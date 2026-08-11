@@ -64,6 +64,7 @@ import type {
   NoriqMcp,
 } from './drivers/types';
 import { zeroTelemetry } from './drivers/types';
+import { resolveRunLineage } from './execution-lineage';
 import {
   type CheckedExecutionSpec,
   type SpecPathProbe,
@@ -3386,6 +3387,21 @@ export class RunSupervisor {
   }
 
   async resume(runId: string, answer: string): Promise<DriverExit | null> {
+    try {
+      const exit = await this.resumeRun(runId, answer);
+      // A stage answer wakes the still-live `supervise` stack; its owner releases the binding.
+      // A run that parks again remains one live execution and must retain its reservation.
+      if (exit && exit.reason !== 'parked' && exit.reason !== 'stage-answer') {
+        this.releaseExecutionBinding(runId);
+      }
+      return exit;
+    } catch (err) {
+      this.releaseExecutionBinding(runId);
+      throw err;
+    }
+  }
+
+  private async resumeRun(runId: string, answer: string): Promise<DriverExit | null> {
     // A STAGE park first (RUN-190): the stage's stack is holding in this very process, so the
     // answer is delivered rather than restored.
     if (this.deliverStageAnswer(runId, answer)) {
@@ -3422,6 +3438,20 @@ export class RunSupervisor {
         reason: 'stage park lost across restart',
         telemetry: zeroTelemetry(),
       };
+    }
+
+    // A parked run can outlive this daemon process, so restore its local reservation before a
+    // resumed session can spawn. The same resolver keeps a corrupt persisted assignment from
+    // becoming an authority bypass on the resume-only path (RUN-265).
+    const lineage = resolveRunLineage(run, this.executionRuns);
+    if (!lineage.ok) {
+      const reason = `${lineage.reason}; not resuming`;
+      this.deps.report(run.id, { status: 'failed', exit: { outcome: 'failed', reason } });
+      this.log.warn('execution lineage is invalid — declining to resume', { runId: run.id, reason });
+      return { outcome: 'failed', isError: true, reason, telemetry: zeroTelemetry() };
+    }
+    if (lineage.lineage.type === 'assigned') {
+      this.executionRuns.set(lineage.lineage.assignment.executionId, run.id);
     }
 
     const fail = (reason: string): DriverExit => {
@@ -3761,12 +3791,22 @@ export class RunSupervisor {
    */
   async supervise(run: Run): Promise<DriverExit> {
     try {
-      return await this.superviseRun(run);
-    } finally {
-      const executionId = run.execution?.executionId;
-      if (executionId && this.executionRuns.get(executionId) === run.id) {
-        this.executionRuns.delete(executionId);
+      const exit = await this.superviseRun(run);
+      // Parking is a live, resumable state. Its binding must remain until resume reaches a
+      // terminal exit, otherwise a second run can claim the execution while the first waits.
+      if (exit.reason !== 'parked') {
+        this.releaseExecutionBinding(run.id);
       }
+      return exit;
+    } catch (err) {
+      this.releaseExecutionBinding(run.id);
+      throw err;
+    }
+  }
+
+  private releaseExecutionBinding(runId: string): void {
+    for (const [executionId, boundRunId] of this.executionRuns) {
+      if (boundRunId === runId) this.executionRuns.delete(executionId);
     }
   }
 

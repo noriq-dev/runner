@@ -5774,7 +5774,8 @@ describe('parking a run on a human (RUN-30)', () => {
 });
 
 describe('resuming a parked run (RUN-30)', () => {
-  const buildRun = () => makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' } });
+  const buildRun = (over: Partial<Run> = {}) =>
+    makeRun({ kind: 'build', anchor: { type: 'task', taskId: 'task_9' }, ...over });
   const asked = { blocked: true, signalId: 'sig_1', question: 'Approach A or B?' };
 
   /** Park a run, then hand back a harness whose store holds it. */
@@ -5786,6 +5787,27 @@ describe('resuming a parked run (RUN-30)', () => {
     await done;
     return h;
   };
+
+  it('retains an execution binding across a park, refusing a concurrent duplicate before it spawns', async () => {
+    const execution = {
+      schemaVersion: 1 as const,
+      orchestrationId: 'orc_1',
+      executionId: 'exe_1',
+      parentExecutionId: null,
+      role: 'worker' as const,
+      lineageStatus: 'complete' as const,
+    };
+    const h = harness({ parkState: asked, verifyResults: [true] });
+    const parked = h.supervisor.supervise(buildRun({ execution }));
+    await flush();
+    h.claude.complete('done');
+    await parked;
+
+    const duplicate = await h.supervisor.supervise(buildRun({ id: 'run_2', execution }));
+    expect(duplicate).toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/already bound/) });
+    expect(h.claude.starts).toHaveLength(1);
+    expect(h.worktrees.created).toHaveLength(1);
+  });
 
   it('comes back in the SAME session and the SAME worktree — the whole point', async () => {
     // Not a fresh run re-reading the repo: the agent returns with everything it had already
