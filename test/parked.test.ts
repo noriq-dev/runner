@@ -148,7 +148,6 @@ describe('ParkedStore survives the daemon (RUN-30)', () => {
     // failed must not reserve an execution locally while its caller follows the terminal path.
     expect(await store.list()).toEqual([]);
   });
-
   it('keeps cache and disk on the committed park when an unpark flush fails', async () => {
     const f = file();
     const store = new ParkedStore(f);

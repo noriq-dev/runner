@@ -28,17 +28,52 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
 
   constructor(
     private readonly parked?: {
+      park(entry: Park): Promise<void>;
       list(): Promise<Park[]>;
       unpark(runId: string): Promise<Park | null>;
     },
   ) {}
 
+  /** Per-run ordering makes a terminal signal win over a park that was still being prepared. */
+  private readonly transitions = new Map<string, Promise<unknown>>();
+  private readonly terminal = new Set<string>();
+
+  private serialize<T>(runId: string, work: () => Promise<T>): Promise<T> {
+    const prior = this.transitions.get(runId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(work);
+    this.transitions.set(runId, next);
+    void next
+      .finally(() => {
+        if (this.transitions.get(runId) === next) this.transitions.delete(runId);
+      })
+      // `next` still carries the write error to its caller; this side branch only tidies the queue.
+      .catch(() => undefined);
+    return next;
+  }
+
   begin(run: Pick<Run, 'id' | 'execution'>): void {
+    this.terminal.delete(run.id);
     this.active.set(run.id, run);
   }
 
-  complete(runId: string): void {
+  /** A successful park leaves durable ownership behind but no longer has an active supervisor. */
+  inactive(runId: string): void {
     this.active.delete(runId);
+  }
+
+  /** The supervising stack reached a terminal outcome (including a thrown one). */
+  complete(runId: string): void {
+    this.terminal.add(runId);
+    this.inactive(runId);
+  }
+
+  /** Park creation belongs here so cancellation cannot race a post-probe direct store write. */
+  async park(entry: Park): Promise<boolean> {
+    return this.serialize(entry.run.id, async () => {
+      if (this.terminal.has(entry.run.id)) return false;
+      await this.parked?.park(entry);
+      return true;
+    });
   }
 
   /** Reads parks now rather than caching them: another daemon lifecycle may have removed one. */
@@ -57,20 +92,33 @@ export class ExecutionLifecycle<Park extends ParkedExecution> {
     };
 
     for (const run of this.active.values()) bind(run);
-    for (const park of (await this.parked?.list()) ?? []) bind(park.run);
+    // A terminal signal is authoritative immediately, even while its durable deletion waits for
+    // the ordered transition. An active stack remains bound above until its own finally runs.
+    for (const park of (await this.parked?.list()) ?? []) {
+      if (!this.terminal.has(park.run.id)) bind(park.run);
+    }
     return registry;
   }
 
   /** Read the parked record and atomically make its run active again before a resume can spawn. */
   async resume(runId: string): Promise<Park | null> {
-    const park = await this.parked?.unpark(runId);
-    if (park) this.begin(park.run);
-    return park ?? null;
+    return this.serialize(runId, async () => {
+      if (this.terminal.has(runId)) return null;
+      const park = await this.parked?.unpark(runId);
+      if (park) this.active.set(park.run.id, park.run);
+      return park ?? null;
+    });
   }
 
-  /** A terminal server fact removes only the durable park; a live supervisor completes itself. */
-  async discardPark(runId: string): Promise<Park | null> {
-    return (await this.parked?.unpark(runId)) ?? null;
+  /** A non-terminal stage answer consumes its record while its supervising stack remains active. */
+  async unpark(runId: string): Promise<Park | null> {
+    return this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
+  }
+
+  /** A server-terminal fact blocks any late park and removes the durable half in one transition. */
+  async terminalizePark(runId: string): Promise<Park | null> {
+    this.terminal.add(runId);
+    return this.serialize(runId, async () => (await this.parked?.unpark(runId)) ?? null);
   }
 
   /** Startup reads the durable half before the WebSocket can deliver a new assignment. */

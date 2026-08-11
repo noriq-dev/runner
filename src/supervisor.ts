@@ -3160,7 +3160,7 @@ export class RunSupervisor {
     });
 
     const runSpend = ctx.tally.total();
-    await this.deps.parked.park({
+    const persisted = await this.executionLifecycle.park({
       run,
       sessionId: null, // an in-process wait has no session to restore — `stage` is the record
       stage: ctx.stage,
@@ -3177,6 +3177,13 @@ export class RunSupervisor {
       parkedAt: new Date().toISOString(),
       question: state.question,
     });
+    if (!persisted) {
+      // A cancel/reconciliation terminalized this run while the park probe was in flight. The
+      // lifecycle owner refused the late write, so this stack follows its terminal path instead.
+      this.stageWaiters.delete(run.id);
+      if (poll) clearInterval(poll);
+      return null;
+    }
     this.deps.report(run.id, {
       status: 'blocked',
       telemetry: runSpend,
@@ -3269,7 +3276,7 @@ export class RunSupervisor {
     // every session that billed. Persisting the mix keeps a resume's breakdown summing to its total.
     const runSpend = ctx.tally.total();
     try {
-      await this.deps.parked.park({
+      const persisted = await this.executionLifecycle.park({
         run,
         // A resumed run is the same dispatch, not a new one (RUN-192). Persist the loaded catalog so
         // editing a workflow while the question is open affects the next dispatch only, including
@@ -3297,6 +3304,7 @@ export class RunSupervisor {
         parkedAt: new Date().toISOString(),
         question: state.question,
       });
+      if (!persisted) return null;
     } catch (err) {
       // The park could not be PERSISTED (a disk failure). Without the record the run can never be
       // resumed, so parking it would be a promise the daemon cannot keep — finalize instead, its
@@ -3377,7 +3385,7 @@ export class RunSupervisor {
     if (!waiter) return false;
     this.stageWaiters.delete(runId);
     waiter(answer);
-    this.executionLifecycle.discardPark(runId).catch((err) => {
+    this.executionLifecycle.unpark(runId).catch((err) => {
       this.log.warn('answered stage park could not be removed from disk — the reaper will', {
         runId,
         err: String(err),
@@ -3392,7 +3400,10 @@ export class RunSupervisor {
       const exit = await this.resumeRun(runId, answer);
       // A stage answer wakes the still-live `supervise` stack; its owner releases the binding.
       // A run that parks again remains one live execution and must retain its reservation.
-      if (exit && exit.reason !== 'stage-answer') this.executionLifecycle.complete(runId);
+      if (exit && exit.reason !== 'stage-answer') {
+        if (exit.reason === 'parked') this.executionLifecycle.inactive(runId);
+        else this.executionLifecycle.complete(runId);
+      }
       return exit;
     } catch (err) {
       this.executionLifecycle.complete(runId);
@@ -3764,7 +3775,7 @@ export class RunSupervisor {
     const all = (await this.deps.parked?.list()) ?? [];
     const stale = expiredParks(all, now, this.deps.parkTtlHours);
     for (const p of stale) {
-      await this.executionLifecycle.discardPark(p.run.id);
+      await this.executionLifecycle.terminalizePark(p.run.id);
       this.deps.report(p.run.id, {
         status: 'failed',
         exit: { outcome: 'failed', reason: 'park_expired' },
@@ -3789,7 +3800,8 @@ export class RunSupervisor {
     this.executionLifecycle.begin(run);
     try {
       const exit = await this.superviseRun(run);
-      this.executionLifecycle.complete(run.id);
+      if (exit.reason === 'parked') this.executionLifecycle.inactive(run.id);
+      else this.executionLifecycle.complete(run.id);
       return exit;
     } catch (err) {
       this.executionLifecycle.complete(run.id);
@@ -3804,7 +3816,7 @@ export class RunSupervisor {
 
   /** The daemon routes both cancellation and reconciliation through the lifecycle owner. */
   async terminalizeParkedRun(runId: string): Promise<void> {
-    await this.executionLifecycle.discardPark(runId);
+    await this.executionLifecycle.terminalizePark(runId);
   }
 
   private async superviseRun(run: Run): Promise<DriverExit> {

@@ -66,6 +66,9 @@ describe('resolveRunLineage', () => {
   it('reconstructs a persisted park as an owner before a restarted daemon accepts a retry', async () => {
     const parks = new Map([['run_parked', { run: run({ id: 'run_parked' }) }]]);
     const lifecycle = new ExecutionLifecycle({
+      park: async (park) => {
+        parks.set(park.run.id, park);
+      },
       list: async () => [...parks.values()],
       unpark: async (runId) => {
         const park = parks.get(runId) ?? null;
@@ -84,6 +87,9 @@ describe('resolveRunLineage', () => {
   it('drops a directly cancelled park from the derived registry immediately', async () => {
     const parks = new Map([['run_parked', { run: run({ id: 'run_parked' }) }]]);
     const lifecycle = new ExecutionLifecycle({
+      park: async (park) => {
+        parks.set(park.run.id, park);
+      },
       list: async () => [...parks.values()],
       unpark: async (runId) => {
         const park = parks.get(runId) ?? null;
@@ -92,7 +98,58 @@ describe('resolveRunLineage', () => {
       },
     });
 
-    await lifecycle.discardPark('run_parked');
+    await lifecycle.terminalizePark('run_parked');
     expect(resolveRunLineage(run({ id: 'run_retry' }), await lifecycle.registry()).ok).toBe(true);
+  });
+
+  it('makes a terminal signal win over a late park after its server-state probe', async () => {
+    const parks = new Map<string, { run: Pick<Run, 'id' | 'execution'> }>();
+    const lifecycle = new ExecutionLifecycle({
+      park: async (park) => {
+        parks.set(park.run.id, park);
+      },
+      list: async () => [...parks.values()],
+      unpark: async (runId) => {
+        const park = parks.get(runId) ?? null;
+        parks.delete(runId);
+        return park;
+      },
+    });
+
+    await lifecycle.terminalizePark('run_parked');
+    expect(await lifecycle.park({ run: run({ id: 'run_parked' }) })).toBe(false);
+    expect(await lifecycle.registry()).toEqual(new Map());
+  });
+
+  it('serializes terminalization behind an already-writing park and removes it before releasing ownership', async () => {
+    const parks = new Map<string, { run: Pick<Run, 'id' | 'execution'> }>();
+    let releaseWrite!: () => void;
+    let writing!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      writing = resolve;
+    });
+    const lifecycle = new ExecutionLifecycle({
+      park: async (park) => {
+        writing();
+        await new Promise<void>((resolve) => {
+          releaseWrite = resolve;
+        });
+        parks.set(park.run.id, park);
+      },
+      list: async () => [...parks.values()],
+      unpark: async (runId) => {
+        const park = parks.get(runId) ?? null;
+        parks.delete(runId);
+        return park;
+      },
+    });
+
+    const parking = lifecycle.park({ run: run({ id: 'run_parked' }) });
+    await writeStarted;
+    const terminalizing = lifecycle.terminalizePark('run_parked');
+    releaseWrite();
+    expect(await parking).toBe(true);
+    await terminalizing;
+    expect(await lifecycle.registry()).toEqual(new Map());
   });
 });
