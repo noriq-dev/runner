@@ -524,6 +524,23 @@ child cancellation cannot release those resources after merely sending a signal.
 remain an explicit capability-negotiated path: it must not infer a mission from legacy stage fields
 or silently fall back to the old pipeline after accepting one.
 
+## Git mission canary
+
+The retained deterministic-agent canary exercises the real mission service, durable JSONL journal,
+Git workspace adapter, exact checkpoints, independent review, one low-severity repair loop, cleanup,
+and preserved accepted-revision handoff against disposable clones of one or more repositories:
+
+```sh
+npm run test:canary:git -- \
+  runner=/absolute/path/to/runner \
+  noriq=/absolute/path/to/noriq
+```
+
+The command emits a JSON result for every repository and removes its temporary clone. It does not
+invoke Codex or Claude and therefore does not prove provider authentication, model quality, MCP
+inventory, network isolation, or hard provider-token enforcement. Those require an operational
+commissioned execution broker; the canary must never replace or weaken that activation gate.
+
 ## Code map
 
 - `src/mission/protocol.ts`, `action-schema.ts`, `event-schema.ts` — durable wire-neutral model.

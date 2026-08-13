@@ -39,6 +39,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test": "vitest run",
+    "test:canary:git": "tsx scripts/git-mission-canary.ts",
     "test:watch": "vitest",
     "vendor:shared": "node scripts/vendor-shared.mjs",
     "vendor:check": "node scripts/vendor-check.mjs",
