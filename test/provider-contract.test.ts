@@ -25,16 +25,47 @@ async function fakeCodex(root: string): Promise<string> {
   await writeFile(
     path,
     `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 const args = process.argv.slice(2);
 if (process.env.FAKE_ENV_LOG) appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({ home: process.env.CODEX_HOME, claude: process.env.CLAUDE_CONFIG_DIR }) + '\\n');
 if (args.includes('--version')) { console.log('fake-codex 1.0'); process.exit(0); }
 if (args.includes('--help')) { console.log('--output-schema --json'); process.exit(0); }
 if (args[0] === 'login' && args[1] === 'status') { console.log('logged in'); process.exit(0); }
-if (args[0] === 'mcp' && args[1] === 'list') { console.log(process.env.OMIT_CONTROL ? '[]' : '[{"name":"noriq_runner","enabled":true}]'); process.exit(0); }
+if (args[0] === 'mcp' && args[1] === 'list') {
+  if (!process.env.OMIT_CONTROL) console.log('noriq_runner enabled');
+  if (existsSync(join(process.cwd(), '.mcp.json'))) console.log('project_echo enabled');
+  process.exit(0);
+}
+if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
 const outputIndex = args.indexOf('--output-last-message');
 if (process.env.MALFORMED !== '1' && outputIndex >= 0) writeFileSync(args[outputIndex + 1], JSON.stringify({ summary: 'built', findings: [] }));
 console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 12, cached_input_tokens: 3, output_tokens: 4 } }));
+`,
+    { mode: 0o700 },
+  );
+  await chmod(path, 0o700);
+  return path;
+}
+
+async function fakeClaude(root: string): Promise<string> {
+  const path = join(root, "fake-claude.mjs");
+  await writeFile(
+    path,
+    `#!/usr/bin/env node
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+if (args.includes('--version')) { console.log('fake-claude 1.0'); process.exit(0); }
+if (args.includes('--help')) { console.log('--output-format --json-schema'); process.exit(0); }
+if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
+if (args.includes('mcp') && args.includes('list')) {
+  console.log('noriq_runner enabled');
+  if (existsSync(join(process.cwd(), '.mcp.json'))) console.log('project_echo enabled');
+  process.exit(0);
+}
+if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
+console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'built', findings: [] }, usage: { input_tokens: 8, cache_read_input_tokens: 2, output_tokens: 3 } }));
 `,
     { mode: 0o700 },
   );
@@ -126,5 +157,57 @@ describe("CLI provider contract", () => {
         projectConfig,
       }),
     ).rejects.toThrow();
+  });
+
+  it("leaves a project-native MCP visible and usable to both vendor processes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-project-mcp-"));
+    await writeFile(
+      join(root, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: { project_echo: { command: "project-echo" } },
+      }),
+    );
+    const state = join(root, "state");
+    const adapters = [
+      new CliProviderAdapter(
+        "codex",
+        {
+          command: await fakeCodex(root),
+          args: [],
+          home: join(root, "codex-home"),
+          env: { REQUIRE_PROJECT_MCP: "1" },
+        },
+        state,
+      ),
+      new CliProviderAdapter(
+        "claude",
+        {
+          command: await fakeClaude(root),
+          args: [],
+          home: join(root, "claude-home"),
+          env: { REQUIRE_PROJECT_MCP: "1" },
+        },
+        state,
+      ),
+    ];
+
+    for (const adapter of adapters) {
+      await expect(adapter.preflight(root, true)).resolves.toMatchObject({
+        runnerControlVisible: true,
+        projectTools: ["project_echo enabled"],
+      });
+      await expect(
+        adapter.invoke({
+          invocationId: `project-mcp-${adapter.name}`,
+          role: "guide",
+          taskId: "task",
+          taskKey: "RUN-3",
+          workspace: root,
+          prompt: "use project echo",
+          outputSchema: { type: "object" },
+          projectConfig,
+        }),
+      ).resolves.toMatchObject({ summary: "built" });
+    }
   });
 });
