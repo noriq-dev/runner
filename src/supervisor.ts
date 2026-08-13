@@ -129,6 +129,7 @@ export class RunnerJobSupervisor {
   >();
   private readonly earlyAnswers = new Map<string, string>();
   private recordTail: Promise<void> = Promise.resolve();
+  private emitTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly options: {
@@ -266,6 +267,12 @@ export class RunnerJobSupervisor {
   }
 
   private async emit(payload: RunnerJobEventPayload): Promise<void> {
+    const operation = this.emitTail.then(() => this.emitSerialized(payload));
+    this.emitTail = operation.catch(() => {});
+    await operation;
+  }
+
+  private async emitSerialized(payload: RunnerJobEventPayload): Promise<void> {
     const seq = this.state.nextEventSeq;
     await this.record("event.queued", { seq, payload });
     try {

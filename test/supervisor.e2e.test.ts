@@ -220,21 +220,18 @@ describe("RunnerJobSupervisor", () => {
       key,
       title: key,
       body: "",
-      executionSpec:
-        order === 0
-          ? {
-              anticipatedFiles: [
-                {
-                  path: "shared.txt",
-                  change: "modify" as const,
-                  why: "Apply the commissioned first edit",
-                },
-              ],
-              acceptance: {
-                observableTruths: ["shared.txt contains the accepted change"],
-              },
-            }
-          : null,
+      executionSpec: {
+        anticipatedFiles: [
+          {
+            path: "shared.txt",
+            change: "modify" as const,
+            why: "Apply the commissioned edit",
+          },
+        ],
+        acceptance: {
+          observableTruths: ["shared.txt contains the accepted change"],
+        },
+      },
       status: "todo" as const,
       retry: false,
       order,
@@ -258,6 +255,7 @@ describe("RunnerJobSupervisor", () => {
         dependencies: [],
       },
     });
+    const sink = new MemoryEventSink();
     const output = await new RunnerJobSupervisor({
       assignment,
       repository,
@@ -265,17 +263,13 @@ describe("RunnerJobSupervisor", () => {
       projectConfig: config,
       backend: new GitWorkspaceBackend(),
       drivers: { fake, codex: undefined, claude: undefined },
-      sink: new MemoryEventSink(),
+      sink,
     }).run();
     expect(output.summary).toContain("2 task(s) accepted");
     expect(fake.calls.filter((call) => call.role === "repairer")).toHaveLength(
       1,
     );
-    expect(
-      fake.calls
-        .filter((call) => call.role === "guide")
-        .map((call) => call.taskKey),
-    ).toEqual(["RUN-11"]);
+    expect(fake.calls.filter((call) => call.role === "guide")).toEqual([]);
     expect(
       await readFile(
         join(root, "state", "worktrees", "job-plan", "job", "shared.txt"),
@@ -289,6 +283,9 @@ describe("RunnerJobSupervisor", () => {
         `${base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("2");
+    expect(sink.events.map((event) => event.seq)).toEqual(
+      sink.events.map((_, index) => index + 1),
+    );
   });
 
   it("preserves changes and removes the child worktree when a builder crashes", async () => {
