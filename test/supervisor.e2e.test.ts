@@ -388,6 +388,119 @@ describe("RunnerJobSupervisor", () => {
     ).not.toContain("task-run-20");
   });
 
+  it("cancels an active builder without publishing a post-cancel task failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-cancel-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    let builderStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      builderStarted = resolve;
+    });
+    const fake = new FakeAgentDriver(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "builder") {
+          await writeFile(
+            join(request.workspace, "cancelled.txt"),
+            "evidence\n",
+          );
+          builderStarted();
+          const signal = request.signal!;
+          await new Promise<void>((_resolve, reject) => {
+            const abort = () => reject(signal.reason);
+            if (signal.aborted) abort();
+            else signal.addEventListener("abort", abort, { once: true });
+          });
+        }
+        return { summary: "unused", findings: [] };
+      },
+    );
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      workspace: { mode: "isolated", baseBranch: "main" },
+      harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
+      agents: {
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: [], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-cancel",
+      assignmentId: "assignment-cancel",
+      snapshotDigest: "9".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "cancelled-task",
+          key: "RUN-23",
+          title: "Cancel active builder",
+          body: "",
+          executionSpec: {
+            anticipatedFiles: [
+              {
+                path: "cancelled.txt",
+                change: "create",
+                why: "exercise cancellation preservation",
+              },
+            ],
+          },
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const sink = new MemoryEventSink();
+    const supervisor = new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory: join(root, "state"),
+      projectConfig: config,
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
+      sink,
+    });
+    const running = supervisor.run();
+    await started;
+    supervisor.cancel();
+    const output = await running;
+    expect(output.summary).toContain("cancelled");
+    expect(output.retainedLocation.label).toMatch(/^noriq\/recovery\//);
+    expect(sink.events.at(-1)?.payload).toMatchObject({
+      type: "terminal",
+      status: "cancelled",
+    });
+    expect(
+      sink.events.filter(
+        (event) =>
+          event.payload.type === "task.result" &&
+          event.payload.status === "failed",
+      ),
+    ).toEqual([]);
+  });
+
   it("reviews the working diff and creates one checkpoint in direct mode", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-direct-e2e-"));
     const repository = join(root, "repository");

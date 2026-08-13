@@ -777,17 +777,19 @@ export class RunnerJobSupervisor {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      await this.retainFailedTask(built, reason).catch(
+      const cancelled = this.abort.signal.aborted;
+      await this.retainFailedTask(built, reason, !cancelled).catch(
         async (preservationError) => {
           await this.record("warning", {
             message: `failed to preserve ${task.key}: ${String(preservationError)}`,
           });
         },
       );
-      await this.record("task.failed", {
+      await this.record(cancelled ? "task.cancelled" : "task.failed", {
         taskId: task.taskId,
         reason,
       });
+      if (cancelled) return false;
       await this.emit({
         type: "task.result",
         at: now(),
@@ -804,6 +806,7 @@ export class RunnerJobSupervisor {
   private async retainFailedTask(
     built: BuiltTask,
     reason: string,
+    publishWarning = true,
   ): Promise<void> {
     const location = await this.options.backend.preserveFailedWork({
       workspace: this.workspace,
@@ -818,12 +821,13 @@ export class RunnerJobSupervisor {
       });
       const message = `${built.task.key} failed; work preserved at ${location.label}`;
       await this.record("warning", { message });
-      await this.emit({
-        type: "warning",
-        at: now(),
-        code: "failed-work-retained",
-        message,
-      });
+      if (publishWarning)
+        await this.emit({
+          type: "warning",
+          at: now(),
+          code: "failed-work-retained",
+          message,
+        });
     }
     await this.options.backend.releaseTask(this.workspace, built.workspace);
   }
@@ -831,6 +835,7 @@ export class RunnerJobSupervisor {
   private async cleanupFailedBuildTask(
     task: RunnerTaskSnapshot,
     reason: string,
+    publishWarning = true,
   ): Promise<void> {
     const retained = this.state.tasks[task.taskId];
     if (!retained?.workspace) return;
@@ -844,12 +849,13 @@ export class RunnerJobSupervisor {
       await this.record("task.retained", { taskId: task.taskId, location });
       const message = `${task.key} build failed; work preserved at ${location.label}`;
       await this.record("warning", { message });
-      await this.emit({
-        type: "warning",
-        at: now(),
-        code: "failed-work-retained",
-        message,
-      });
+      if (publishWarning)
+        await this.emit({
+          type: "warning",
+          at: now(),
+          code: "failed-work-retained",
+          message,
+        });
     }
     await this.options.backend.releaseTask(this.workspace, retained.workspace);
   }
@@ -1002,17 +1008,19 @@ export class RunnerJobSupervisor {
         if (result.status === "fulfilled") successful.push(result.value);
         else {
           const reason = String(result.reason);
-          await this.cleanupFailedBuildTask(task, reason).catch(
+          const cancelled = this.abort.signal.aborted;
+          await this.cleanupFailedBuildTask(task, reason, !cancelled).catch(
             async (preservationError) => {
               await this.record("warning", {
                 message: `failed to clean up ${task.key}: ${String(preservationError)}`,
               });
             },
           );
-          await this.record("task.failed", {
+          await this.record(cancelled ? "task.cancelled" : "task.failed", {
             taskId: task.taskId,
             reason,
           });
+          if (cancelled) continue;
           await this.emit({
             type: "task.result",
             at: now(),
@@ -1030,6 +1038,19 @@ export class RunnerJobSupervisor {
           left.task.order - right.task.order ||
           left.task.key.localeCompare(right.task.key),
       )) {
+        if (this.abort.signal.aborted) {
+          await this.retainFailedTask(task, "job cancelled", false).catch(
+            async (preservationError) => {
+              await this.record("warning", {
+                message: `failed to preserve ${task.task.key}: ${String(preservationError)}`,
+              });
+            },
+          );
+          await this.record("task.cancelled", {
+            taskId: task.task.taskId,
+          });
+          continue;
+        }
         await this.settleTask(task);
       }
     }
@@ -1075,17 +1096,22 @@ export class RunnerJobSupervisor {
                   (candidate) => candidate.taskId === task.taskId,
                 );
           if (snapshot)
-            await this.cleanupFailedBuildTask(snapshot, message).catch(
-              async (preservationError) => {
-                await this.record("warning", {
-                  message: `failed to clean up ${snapshot.key}: ${String(preservationError)}`,
-                });
-              },
-            );
-          await this.record("task.failed", {
-            taskId: task.taskId,
-            reason: message,
-          });
+            await this.cleanupFailedBuildTask(
+              snapshot,
+              message,
+              !this.abort.signal.aborted,
+            ).catch(async (preservationError) => {
+              await this.record("warning", {
+                message: `failed to clean up ${snapshot.key}: ${String(preservationError)}`,
+              });
+            });
+          await this.record(
+            this.abort.signal.aborted ? "task.cancelled" : "task.failed",
+            {
+              taskId: task.taskId,
+              reason: message,
+            },
+          );
         }
       }
       const accepted = Object.values(this.state.tasks).some(
