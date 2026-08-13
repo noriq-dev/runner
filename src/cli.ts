@@ -605,6 +605,23 @@ async function cmdIndexForgetJournal(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+/** First-signal shutdown boundary: false means supervision must remain alive for an explicit force. */
+export async function stopDaemonFailClosed(stop: () => Promise<void>): Promise<boolean> {
+  try {
+    await stop();
+    return true;
+  } catch (err) {
+    // A failed stop can mean a model/tool process tree is still live. Keep this supervisor alive
+    // so budget authority is not abandoned; the second-signal path remains the explicit operator
+    // escape hatch when immediate orphaning is preferred.
+    logger.error('shutdown failed closed — still supervising; signal again to force exit', {
+      err: String(err),
+    });
+    process.exitCode = 1;
+    return false;
+  }
+}
+
 async function cmdStart(configPath?: string): Promise<void> {
   const { config } = await loadRunnerConfig(configPath ?? DEFAULT_CONFIG_PATH);
   logger.info('runner starting', {
@@ -623,21 +640,26 @@ async function cmdStart(configPath?: string): Promise<void> {
   // Long-lived: the WS connection + heartbeat keep the event loop alive. Stop
   // cleanly on signals. Process supervision on run.assigned lands in RUN-12+.
   let shuttingDown = false;
-  const shutdown = async (sig: string): Promise<void> => {
+  const shutdown = async (reason: string, exitCode = 0): Promise<void> => {
     if (shuttingDown) {
       // Second signal: the operator is insisting. Go now, orphans and all.
-      logger.warn(`received ${sig} again — exiting immediately`);
+      logger.warn(`received ${reason} again — exiting immediately`);
       process.exit(1);
     }
     shuttingDown = true;
-    logger.info(`received ${sig} — stopping live runs, then shutting down`);
+    logger.info(`received ${reason} — stopping live runs, then shutting down`);
     // MUST await: exiting first orphans every spawned agent, which keeps burning tokens
     // against the worktree with no budget enforcer left alive to stop it.
-    await handle.stop().catch((err) => logger.warn('shutdown had trouble', { err: String(err) }));
-    process.exit(0);
+    if (!(await stopDaemonFailClosed(() => handle.stop()))) return;
+    process.exit(exitCode);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  void handle.fatal.then((error) => {
+    if (shuttingDown) return;
+    logger.error('runner control plane failed — shutting down', { error: error.message });
+    return shutdown('mission control failure', 1);
+  });
   logger.info('runner online — waiting for dispatches (Ctrl-C to stop)', { runnerId: handle.runnerId });
 }
 

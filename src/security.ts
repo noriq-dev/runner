@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
 import type { RunKind } from '@noriq-dev/shared';
 
 // Security hardening for the "autonomous agent with a shell on a user machine"
@@ -47,6 +49,70 @@ export function sanitizedAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS
   env.GIT_CONFIG_KEY_0 = 'credential.helper';
   env.GIT_CONFIG_VALUE_0 = '';
   return env;
+}
+
+const MISSION_ENV_ALLOWLIST = [
+  'PATH',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TZ',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'SYSTEMROOT',
+  'WINDIR',
+  'COMSPEC',
+  'PATHEXT',
+] as const;
+
+/**
+ * Minimal environment for the mission execution plane. Provider/project credentials belong in
+ * broker handles or driver-owned transports, never in an agent-readable inherited environment.
+ * `HOME` and vendor config roots are deliberately absent; drivers add their private managed home
+ * explicitly where needed.
+ */
+export function missionAgentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const selected: NodeJS.ProcessEnv = {};
+  for (const key of MISSION_ENV_ALLOWLIST) {
+    const value = base[key];
+    if (value !== undefined) selected[key] = value;
+  }
+  return sanitizedAgentEnv(selected);
+}
+
+/**
+ * Project MCP processes are less trusted than the vendor parent. Give them the already-sanitized
+ * execution environment but never the provider/Noriq homes or bearer-token variable. Their
+ * writable state belongs to the containment tmpfs and disappears with the attempt.
+ */
+export function projectMcpProcessEnv(
+  base: NodeJS.ProcessEnv,
+  declared: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  const env = sanitizedAgentEnv({ ...base, ...declared });
+  // This table is serialized into vendor MCP configuration before the outer containment provider
+  // canonicalizes the vendor process environment. Canonicalize it independently so a nested
+  // launcher does not inherit an unreachable host alias such as /home -> /var/home.
+  if (env.PATH !== undefined) {
+    env.PATH = env.PATH.split(path.delimiter)
+      .map((entry) => {
+        if (!path.isAbsolute(entry)) return entry;
+        try {
+          return realpathSync(entry);
+        } catch {
+          return entry;
+        }
+      })
+      .join(path.delimiter);
+  }
+  env.HOME = '/tmp/noriq-project-mcp';
+  env.CODEX_HOME = '/tmp/noriq-project-mcp/codex-denied';
+  env.CLAUDE_CONFIG_DIR = '/tmp/noriq-project-mcp/claude-denied';
+  env[CODEX_MCP_TOKEN_ENV] = '';
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
 }
 
 /**

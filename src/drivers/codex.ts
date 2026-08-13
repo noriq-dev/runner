@@ -1,11 +1,14 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
-import { DEFAULT_CODEX_HOME, ensurePrivateAgentHome } from '../agent-homes';
+import { DEFAULT_CODEX_HOME, createEphemeralAgentHome, ensurePrivateAgentHome } from '../agent-homes';
 import { AsyncQueue } from '../async-queue';
 import type { logger as Logger } from '../logger';
 import { killProcessTree, treeSpawnOptions } from '../proc';
-import { CODEX_MCP_TOKEN_ENV, noriqToolNamesFor, sanitizedAgentEnv } from '../security';
+import { type AgentProcessContainment, isCommissionedAgentProcessContainment } from '../process-containment';
+import { reattestProjectMcpExecutablesSync } from '../project-mcp';
+import { CODEX_MCP_TOKEN_ENV, noriqToolNamesFor, projectMcpProcessEnv, sanitizedAgentEnv } from '../security';
 import { VERSION } from '../version';
 import { NORIQ_MCP_NAME } from './claude';
 import {
@@ -17,6 +20,8 @@ import {
   type DriverSession,
   type DriverStartOptions,
   type NoriqMcp,
+  type ProjectMcpSession,
+  validateDriverMcpAuthority,
   zeroTelemetry,
 } from './types';
 
@@ -55,6 +60,12 @@ export type CodexEvent =
 export interface CodexTransport {
   events: AsyncIterable<CodexEvent>;
   /**
+   * Resolves only when the directly-owned process has actually exited. `close()` is deliberately
+   * bounded and may reject first; this separate acknowledgement lets the driver finish a durable
+   * attempt if the process dies later instead of memoizing the timeout forever.
+   */
+  processExit?: Promise<void>;
+  /**
    * Start a turn on the thread: the first with the initial prompt, and — under `multiTurn`
    * (RUN-200) — any later hand-back turn too. The real transport posts `turn/start` against
    * whatever `threadId` already exists (buffering only until the thread itself has started), so
@@ -71,8 +82,8 @@ export interface CodexTransport {
   steer(text: string): boolean;
   /** Interrupt the active turn. */
   interrupt(): void;
-  /** Terminate the process. */
-  close(): void;
+  /** Terminate the process and resolve only after the directly-owned process has exited. */
+  close(): Promise<void>;
 }
 
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -83,7 +94,17 @@ export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access
 export type CodexEffort = 'minimal' | 'low' | 'medium' | 'high';
 
 export interface CodexSpawnOptions {
+  /** Supplied by CodexDriver; optional only for legacy direct transport tests/callers. */
+  runId?: string;
   cwd: string;
+  /** Exact workspace authority for an outer containment provider. */
+  workspaceRoot?: string;
+  workspaceWrite?: boolean;
+  containmentReadOnlyRoots?: readonly string[];
+  protectedWorkspaceReadOnlyPaths?: readonly string[];
+  containmentWriteRoots?: readonly string[];
+  /** Exact quota passed to a commissioned provider/broker before Codex is launched. */
+  tokenEnvelope?: DriverStartOptions['tokenEnvelope'];
   model?: string;
   /** Tool-agnostic intent (RUN-33); mapEffort turns it into codex's own scale. */
   effort?: RunEffort;
@@ -92,6 +113,8 @@ export interface CodexSpawnOptions {
   approvalPolicy: 'never';
   /** The agent's Noriq connection. Omitted → it cannot report its own work at all. */
   noriqMcp?: NoriqMcp;
+  /** Explicit project-owned servers; ambient Codex config remains disabled and separately policed. */
+  projectMcp?: ProjectMcpSession;
   /** A stage actor's narrowed Noriq tool set — replaces the kind floor in `enabled_tools`. */
   noriqTools?: readonly string[];
   /** The run kind, so the per-kind Noriq tool floor applies HERE too (RUN-46) — without it
@@ -102,6 +125,8 @@ export interface CodexSpawnOptions {
   env?: NodeJS.ProcessEnv;
   /** Runner's Codex-specific home. Never inherit the operator's global ~/.codex. */
   codexHome?: string;
+  /** Trusted outer process/mount boundary. Never sourced from repository configuration. */
+  containment?: AgentProcessContainment;
 }
 export type SpawnCodex = (opts: CodexSpawnOptions) => CodexTransport;
 
@@ -145,6 +170,10 @@ export interface CodexDriverDeps {
   /** Injectable so tests never create or chmod the operator's real ~/.noriq/codex. */
   codexHome?: string;
   prepareCodexHome?: (home: string) => void;
+  /** Required for mission execution; ordinary legacy Runs may continue without it. */
+  containment?: AgentProcessContainment;
+  /** Test seam; production re-attests local MCP executables immediately before provider spawn. */
+  reattestProjectMcpExecutables?: typeof reattestProjectMcpExecutablesSync;
 }
 
 /**
@@ -162,6 +191,14 @@ export interface CodexDriverDeps {
 /** The session liveness deadline (RUN-201): no transport event for this long → torn down as a
  *  normal failure. Generous — deep reasoning still ticks usage well inside it. */
 export const CODEX_SILENCE_TEARDOWN_MS = 20 * 60_000;
+/** Initialization/MCP inventory is a pre-model authority gate, so it gets its own short deadline. */
+export const CODEX_MCP_ATTESTATION_TIMEOUT_MS = 10_000;
+export const CODEX_MCP_ATTESTATION_MAX_PAGES = 16;
+export const CODEX_MCP_ATTESTATION_MAX_RESULTS = 256;
+/** Graceful tree shutdown window before Codex is force-killed. */
+export const CODEX_GRACEFUL_STOP_MS = 2_000;
+/** Final wait for the directly-owned process to acknowledge the force kill. */
+export const CODEX_FORCE_STOP_MS = 5_000;
 
 export const CODEX_CATALOG: DriverCatalog = {
   models: ['gpt-5.6-sol', 'gpt-5.3-codex'],
@@ -174,38 +211,103 @@ export class CodexDriver implements AgentDriver {
   // Codex steers and interrupts over JSON-RPC, but has NO in-process tool hooks (locks fall to the
   // hard floor, RUN-102), no per-model telemetry (spend → the (unattributed) bucket, RUN-86), and
   // no session resume — a parked codex run restarts rather than reloading context (RUN-110).
-  readonly capabilities: DriverCapabilities = {
-    toolHooks: false,
-    steer: true,
-    interrupt: true,
-    resumableSession: false,
-    perModelTelemetry: false,
-  };
+  readonly capabilities: DriverCapabilities;
   private readonly spawnCodex: SpawnCodex;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
   private readonly codexHome: string;
   private readonly prepareCodexHome: (home: string) => void;
+  private readonly containment?: AgentProcessContainment;
+  private readonly reattestProjectMcpExecutables: typeof reattestProjectMcpExecutablesSync;
 
   constructor(deps: CodexDriverDeps = {}) {
+    // A custom transport is opaque to Runner. Do not claim the separately supplied containment
+    // protects it; only the built-in spawn path is wired through this boundary.
+    const containedBuiltin = deps.containment !== undefined && deps.spawnCodex === undefined;
+    this.containment = containedBuiltin ? deps.containment : undefined;
     this.spawnCodex = deps.spawnCodex ?? defaultSpawnCodex;
     this.log = deps.logger ?? { debug() {}, info() {}, warn() {}, error() {} };
     this.codexHome = deps.codexHome ?? DEFAULT_CODEX_HOME;
     this.prepareCodexHome = deps.prepareCodexHome ?? ensurePrivateAgentHome;
+    this.reattestProjectMcpExecutables =
+      deps.reattestProjectMcpExecutables ?? reattestProjectMcpExecutablesSync;
+    this.capabilities = Object.freeze({
+      toolHooks: false,
+      steer: true,
+      interrupt: true,
+      resumableSession: false,
+      perModelTelemetry: false,
+      toolFreeSession: false,
+      workspaceIsolatedSession: true,
+      projectMcpProcessContainment: containedBuiltin,
+      ...(isCommissionedAgentProcessContainment(this.containment)
+        ? { commissionedExecutionBoundary: true as const }
+        : {}),
+      ...(this.containment?.capabilities.providerTokenEnvelope === true
+        ? { hardTokenEnvelope: true as const }
+        : {}),
+      // Codex's own sandbox confines ordinary file operations, but only the outer PID namespace
+      // turns terminal process exit into proof that every tool and MCP descendant is gone.
+      terminationAcknowledgement: containedBuiltin ? 'process-tree' : 'main-process',
+    });
   }
 
   start(opts: DriverStartOptions): DriverSession {
+    if (opts.tokenEnvelope) {
+      if (
+        !Number.isSafeInteger(opts.tokenEnvelope.totalTokens) ||
+        opts.tokenEnvelope.totalTokens < 1 ||
+        !Number.isSafeInteger(opts.tokenEnvelope.maxTurns) ||
+        opts.tokenEnvelope.maxTurns < 1
+      ) {
+        throw new Error('Codex token envelope must contain positive safe-integer limits');
+      }
+      if (
+        !isCommissionedAgentProcessContainment(this.containment) ||
+        this.containment.capabilities.providerTokenEnvelope !== true
+      ) {
+        throw new Error('Codex driver has no commissioned hard token-envelope authority');
+      }
+    }
     this.prepareCodexHome(this.codexHome);
+    if (opts.toolAccess === 'none') {
+      throw new Error('Codex driver cannot attest a tool-free session');
+    }
+    const projectMcpNames = validateDriverMcpAuthority(opts.noriqMcp, opts.projectMcp);
+    const sandbox = mapSandbox(opts.permission);
+    if (opts.workspaceRoot) {
+      if (
+        !path.isAbsolute(opts.workspaceRoot) ||
+        path.resolve(opts.cwd) !== path.resolve(opts.workspaceRoot)
+      ) {
+        throw new Error('Codex mission cwd must exactly match its absolute workspace root');
+      }
+      if (sandbox === 'danger-full-access' && !this.containment) {
+        throw new Error('Codex danger-full-access cannot enforce mission workspace isolation');
+      }
+    }
+    if (opts.projectMcp) {
+      this.reattestProjectMcpExecutables(opts.projectMcp.bundle, projectMcpNames);
+    }
     const transport = this.spawnCodex({
+      runId: opts.runId,
       cwd: opts.cwd,
+      workspaceRoot: opts.workspaceRoot,
+      workspaceWrite: opts.permission.write,
+      containmentReadOnlyRoots: opts.containmentReadOnlyRoots,
+      protectedWorkspaceReadOnlyPaths: opts.protectedWorkspaceReadOnlyPaths,
+      containmentWriteRoots: opts.containmentWriteRoots,
+      tokenEnvelope: opts.tokenEnvelope,
       model: opts.model,
       effort: opts.effort,
-      sandbox: mapSandbox(opts.permission),
+      sandbox,
       approvalPolicy: 'never',
       noriqMcp: opts.noriqMcp,
+      projectMcp: opts.projectMcp,
       noriqTools: opts.noriqTools,
       kind: opts.kind,
       env: opts.env,
       codexHome: this.codexHome,
+      containment: this.containment,
     });
     transport.sendUserTurn(opts.prompt);
 
@@ -220,36 +322,70 @@ export class CodexDriver implements AgentDriver {
     // instant a fix round would have needed it.
     let finished = false;
     let torndown = false;
+    let teardownPromise: Promise<void> | null = null;
     // The first turn's own outcome, kept so a LATER continueWith can tell a thread that never
     // successfully started from one merely idle between turns (RUN-200 discretion: a continueWith
     // on a thread whose foundation never completed must be an honest failure, not a multi-minute
     // hang waiting on a turn/completed that will never arrive).
     let firstOutcome: DriverOutcome | null = null;
+    let stopRequested = false;
     /** Armed by continueWith: the next terminal event belongs to THAT turn, not to done(). */
     let awaitingTurn: ((exit: DriverExit) => void) | null = null;
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
-    const teardown = () => {
-      if (torndown) return;
+    const teardown = (): Promise<void> => {
+      if (teardownPromise) return teardownPromise;
       torndown = true;
       if (silenceTimer) clearTimeout(silenceTimer);
-      try {
-        transport.close();
-      } catch {
-        /* already gone */
-      }
+      // Promise.resolve().then also converts a synchronously throwing injected transport into the
+      // same rejected acknowledgement as an asynchronous shutdown failure.
+      const attempt = Promise.resolve().then(() => transport.close());
+      teardownPromise = attempt;
+      void attempt.catch(() => {
+        // A bounded close rejection reports immediate ambiguity, but is not a permanent fact about
+        // the process. Permit a later observed exit to retry the acknowledgement path.
+        if (teardownPromise === attempt) teardownPromise = null;
+      });
+      return attempt;
     };
-    const finish = (exit: DriverExit) => {
-      if (finished) return;
-      finished = true;
-      firstOutcome = exit.outcome;
-      // multiTurn keeps the process alive past its first terminal event so the caller can hand
-      // work back (RUN-200, mirroring claude.ts's own multiTurn/continueWith). The caller then
-      // owns it and must stop() — settle's stopSession is that caller, and nothing else ever
-      // closes a multiTurn codex session.
-      if (!opts.multiTurn) teardown();
-      opts.handlers?.onExit?.(exit);
-      settle(exit);
+    let finishing: Promise<void> | null = null;
+    let pendingFinishExit: DriverExit | null = null;
+    const rememberFinishExit = (exit: DriverExit): DriverExit => {
+      pendingFinishExit ??= exit;
+      return pendingFinishExit;
     };
+    const finish = (exit: DriverExit): Promise<void> => {
+      if (finished) return Promise.resolve();
+      if (finishing) return finishing;
+      const terminalExit = rememberFinishExit(exit);
+      const attempt = (async () => {
+        // A single-turn result is not terminal authority until codex itself has exited. If the
+        // bounded graceful/force shutdown cannot prove that, this promise rejects and `done()`
+        // intentionally remains unsettled so a caller cannot release the worktree underneath a
+        // possibly-live writer.
+        if (!opts.multiTurn) await teardown();
+        finished = true;
+        firstOutcome = terminalExit.outcome;
+        pendingFinishExit = null;
+        opts.handlers?.onExit?.(terminalExit);
+        settle(terminalExit);
+      })();
+      finishing = attempt;
+      void attempt.catch(() => {
+        // Keep the first terminal result, but do not retain a rejected promise as the only route to
+        // `done()`. The transport's later process-exit acknowledgement retries this exact result.
+        if (finishing === attempt) finishing = null;
+      });
+      return attempt;
+    };
+
+    // `close()` has a bounded ambiguity deadline; process death does not. If Codex survives that
+    // deadline but exits later, retry the rejected teardown/finish promises and settle `done()`.
+    // Do not invent a terminal result here: normal stream consumption still owns the outcome.
+    void transport.processExit?.then(() => {
+      const pending = pendingFinishExit;
+      if (!pending || finished) return;
+      void finish(pending).catch((error) => opts.handlers?.onError?.(error as Error));
+    });
 
     const live = zeroTelemetry();
     // RUN-201: liveness is a transport question, one layer below RUN-176's socket deadline —
@@ -273,13 +409,19 @@ export class CodexDriver implements AgentDriver {
           reason: 'driver went silent — torn down (RUN-201)',
           telemetry: { ...live },
         };
-        teardown();
-        // A wedge mid-hand-back must fail the turn awaiting it, not the (already-settled) run —
-        // the same split `stop()` makes below. With nobody awaiting, it is the ordinary case.
-        const pending = awaitingTurn;
-        awaitingTurn = null;
-        if (pending) pending(exit);
-        else finish(exit);
+        void (async () => {
+          try {
+            await teardown();
+            // A wedge mid-hand-back must fail the turn awaiting it, not the (already-settled) run —
+            // the same split `stop()` makes below. With nobody awaiting, it is the ordinary case.
+            const pending = awaitingTurn;
+            awaitingTurn = null;
+            if (pending) pending(exit);
+            else await finish(exit);
+          } catch (error) {
+            opts.handlers?.onError?.(error as Error);
+          }
+        })();
       }, CODEX_SILENCE_TEARDOWN_MS);
       silenceTimer.unref?.();
     };
@@ -321,7 +463,7 @@ export class CodexDriver implements AgentDriver {
             if (turn) {
               turn(exit);
             } else {
-              finish(exit);
+              await finish(exit);
               // Single-turn: the process was just torn down by finish() above, so there is
               // nothing left to read. Under multiTurn the loop keeps going — a hand-back turn's
               // events (deltas, usage, its own turn_complete) still have to reach this consumer,
@@ -341,7 +483,7 @@ export class CodexDriver implements AgentDriver {
             if (turn) {
               turn(exit);
             } else {
-              finish(exit);
+              await finish(exit);
               if (!opts.multiTurn) return;
             }
           }
@@ -353,14 +495,14 @@ export class CodexDriver implements AgentDriver {
         const exit: DriverExit = {
           outcome: 'failed',
           isError: true,
-          reason: 'codex stream ended without completing a turn',
+          reason: stopRequested ? 'stopped' : 'codex stream ended without completing a turn',
           telemetry: { ...live },
         };
-        teardown();
+        await teardown();
         const pending = awaitingTurn;
         awaitingTurn = null;
         if (pending) pending(exit);
-        else finish(exit);
+        else await finish(exit);
       } catch (err) {
         const exit: DriverExit = {
           outcome: 'failed',
@@ -369,11 +511,15 @@ export class CodexDriver implements AgentDriver {
           telemetry: { ...live },
         };
         opts.handlers?.onError?.(err as Error);
-        teardown();
-        const pending = awaitingTurn;
-        awaitingTurn = null;
-        if (pending) pending(exit);
-        else finish(exit);
+        try {
+          await teardown();
+          const pending = awaitingTurn;
+          awaitingTurn = null;
+          if (pending) pending(exit);
+          else await finish(exit);
+        } catch (teardownError) {
+          opts.handlers?.onError?.(teardownError as Error);
+        }
       }
     };
     void consume();
@@ -406,8 +552,15 @@ export class CodexDriver implements AgentDriver {
         transport.interrupt();
       },
       stop: async () => {
-        teardown();
-        finish({ outcome: 'failed', isError: true, reason: 'stopped', telemetry: { ...live } });
+        stopRequested = true;
+        const exit = rememberFinishExit({
+          outcome: 'failed',
+          isError: true,
+          reason: 'stopped',
+          telemetry: { ...live },
+        });
+        await teardown();
+        await finish(exit);
         // Settle a turn that was IN FLIGHT. `finish` is one-shot and was already consumed by the
         // session's first result under multiTurn, so it does nothing here — and continueWith's
         // promise has its own resolver, which only the event stream ever calls. Without this a
@@ -509,13 +662,34 @@ export type SpawnChild = (
   args: string[],
   opts: Record<string, unknown>,
 ) => ChildProcessWithoutNullStreams;
+type KillCodexProcessTree = typeof killProcessTree;
 
 export const defaultSpawnCodex = (
   opts: CodexSpawnOptions,
   spawnFn: SpawnChild = spawn as unknown as SpawnChild,
+  killTree: KillCodexProcessTree = killProcessTree,
 ): CodexTransport => {
-  const codexHome = opts.codexHome ?? DEFAULT_CODEX_HOME;
+  const durableCodexHome = opts.codexHome ?? DEFAULT_CODEX_HOME;
+  const tomlString = (value: string): string => JSON.stringify(value);
+  const tomlStringArray = (value: readonly string[]): string =>
+    `[${value.map((item) => tomlString(item)).join(',')}]`;
+  const tomlStringTable = (value: Readonly<Record<string, string>>): string =>
+    `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${tomlString(key)}=${tomlString(item)}`)
+      .join(',')}}`;
   const expectedNoriqTools = [...(opts.noriqTools ?? noriqToolNamesFor(opts.kind))];
+  const projectMcpNames = validateDriverMcpAuthority(opts.noriqMcp, opts.projectMcp);
+  const expectedProjectTools: Record<string, readonly string[]> = {};
+  for (const name of projectMcpNames) {
+    expectedProjectTools[name] = [...(opts.projectMcp?.toolGrants[name] ?? [])];
+  }
+  const reservedProjectNames = projectMcpNames.filter((name) =>
+    [NORIQ_MCP_NAME, 'codex_apps'].includes(name),
+  );
+  if (reservedProjectNames.length > 0) {
+    throw new Error(`project MCP server name '${reservedProjectNames[0]}' is reserved by Codex Runner`);
+  }
   // Wire the agent's Noriq MCP connection (RUN-43). This was simply ABSENT: the driver
   // spawned codex with no MCP config while the prompt ordered it to register itself against
   // a server it had no connection to — so every codex agent was silently anonymous and
@@ -528,7 +702,7 @@ export const defaultSpawnCodex = (
   const mcpArgs = opts.noriqMcp
     ? [
         '-c',
-        `mcp_servers.${NORIQ_MCP_NAME}.url=${opts.noriqMcp.url}`,
+        `mcp_servers.${NORIQ_MCP_NAME}.url=${tomlString(opts.noriqMcp.url)}`,
         '-c',
         `mcp_servers.${NORIQ_MCP_NAME}.bearer_token_env_var=${CODEX_MCP_TOKEN_ENV}`,
         '-c',
@@ -543,14 +717,52 @@ export const defaultSpawnCodex = (
         // A stage actor's narrowed set (DriverStartOptions.noriqTools) replaces the kind floor —
         // same seam as the Claude driver, enforced here by the server allowlist itself, which is
         // sandbox-independent: not-enabled is not-advertised, whatever the sandbox mode.
-        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${JSON.stringify(expectedNoriqTools)}`,
+        `mcp_servers.${NORIQ_MCP_NAME}.enabled_tools=${tomlStringArray(expectedNoriqTools)}`,
       ]
     : [];
+  const projectMcpArgs = projectMcpNames.flatMap((name): string[] => {
+    const server = opts.projectMcp?.bundle.servers[name];
+    if (!server) return [];
+    const prefix = `mcp_servers.${name}`;
+    const enabledTools = expectedProjectTools[name] ?? [];
+    if (server.transport === 'stdio') {
+      const authorization = opts.projectMcp?.bundle.launcherAuthorizations[name];
+      if (!authorization) throw new Error(`project MCP server '${name}' lacks launcher authorization`);
+      const serverEnv = projectMcpProcessEnv(opts.env ?? sanitizedAgentEnv(), server.env);
+      return [
+        '-c',
+        `${prefix}.command=${tomlString(authorization.resolvedCommand)}`,
+        '-c',
+        `${prefix}.args=${tomlStringArray(server.args)}`,
+        '-c',
+        `${prefix}.env=${tomlStringTable(
+          Object.fromEntries(
+            Object.entries(serverEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
+          ),
+        )}`,
+        '-c',
+        `${prefix}.required=true`,
+        '-c',
+        `${prefix}.enabled_tools=${tomlStringArray(enabledTools)}`,
+      ];
+    }
+    return [
+      '-c',
+      `${prefix}.url=${tomlString(server.url)}`,
+      ...(Object.keys(server.headers).length
+        ? ['-c', `${prefix}.http_headers=${tomlStringTable(server.headers)}`]
+        : []),
+      '-c',
+      `${prefix}.required=true`,
+      '-c',
+      `${prefix}.enabled_tools=${tomlStringArray(enabledTools)}`,
+    ];
+  });
   // Model + effort (RUN-33), per-spawn for the same reason as the MCP config above: writing
   // them to ~/.codex/config.toml would reconfigure the human's own codex behind their back.
   // Both omitted unless asked for, so an unset Run gets codex's own default exactly as before.
   const modelArgs = [
-    ...(opts.model ? ['-c', `model=${opts.model}`] : []),
+    ...(opts.model ? ['-c', `model=${tomlString(opts.model)}`] : []),
     ...(opts.effort ? ['-c', `model_reasoning_effort=${mapEffort(opts.effort)}`] : []),
   ];
   // Sanitized env (RUN-24): strip secrets + block git push/credential prompts. Since RUN-109 the
@@ -572,21 +784,123 @@ export const defaultSpawnCodex = (
     '--disable',
     'skill_mcp_dependency_install',
   ];
-  const child = spawnFn('codex', ['app-server', ...capabilityArgs, ...mcpArgs, ...modelArgs], {
-    cwd: opts.cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      ...base,
-      // Override, never default: an inherited CODEX_HOME is the exact ambient-config leak this
-      // task closes. The directory was prepared by CodexDriver before this transport is spawned.
-      CODEX_HOME: codexHome,
-      ...(opts.noriqMcp ? { [CODEX_MCP_TOKEN_ENV]: opts.noriqMcp.token } : {}),
-    },
-    // Group it with its descendants so close() can reach them all (RUN-42). POSIX-only; on
-    // Windows this is a no-op and taskkill /T walks the tree instead.
-    ...treeSpawnOptions(),
+  // Legacy Runs keep their existing durable Runner-specific home. A contained mission gets a
+  // fresh credential-only home per attempt, so Codex cannot persist config, hooks, plugins,
+  // sessions, or MCP authority into a later child. The durable auth home is copied by Runner and
+  // never mounted into the mission process tree.
+  const attemptHome =
+    opts.workspaceRoot && opts.containment ? createEphemeralAgentHome('codex', durableCodexHome) : null;
+  const codexHome = attemptHome?.home ?? durableCodexHome;
+  const childEnv = {
+    ...base,
+    // Keep package-manager caches and project MCP environment state inside the managed vendor
+    // home. MissionAgentEnv deliberately removes the operator's HOME.
+    HOME: codexHome,
+    // Override, never default: an inherited CODEX_HOME is the exact ambient-config leak this
+    // task closes. The directory was prepared by CodexDriver before this transport is spawned.
+    CODEX_HOME: codexHome,
+    ...(opts.noriqMcp ? { [CODEX_MCP_TOKEN_ENV]: opts.noriqMcp.token } : {}),
+  };
+  const codexArgs = ['app-server', ...capabilityArgs, ...mcpArgs, ...projectMcpArgs, ...modelArgs];
+  const projectMcpReadOnlyRoots = projectMcpNames.flatMap((name) => {
+    const authorization = opts.projectMcp?.bundle.launcherAuthorizations[name];
+    return authorization ? [authorization.resolvedCommand, ...authorization.readOnlyRoots] : [];
   });
+  let contained: ReturnType<AgentProcessContainment['spawn']> | null = null;
+  try {
+    contained = opts.containment
+      ? opts.containment.spawn({
+          runId: opts.runId ?? 'codex-transport',
+          command: 'codex',
+          args: codexArgs,
+          cwd: opts.cwd,
+          workspaceRoot: opts.workspaceRoot ?? opts.cwd,
+          workspaceWrite: opts.workspaceWrite ?? opts.sandbox !== 'read-only',
+          env: childEnv,
+          providerCredentialRoots: [codexHome],
+          ...(opts.tokenEnvelope ? { providerTokenEnvelope: opts.tokenEnvelope } : {}),
+          additionalReadOnlyRoots: [...projectMcpReadOnlyRoots, ...(opts.containmentReadOnlyRoots ?? [])],
+          protectedWorkspaceReadOnlyPaths: opts.protectedWorkspaceReadOnlyPaths,
+          additionalWriteRoots: opts.containmentWriteRoots,
+        })
+      : null;
+  } catch (error) {
+    // No process was launched, so there is no process tree to await before removing the seed.
+    attemptHome?.cleanup();
+    throw error;
+  }
+  const child =
+    contained?.child ??
+    spawnFn('codex', codexArgs, {
+      cwd: opts.cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: childEnv,
+      // Group it with its descendants so close() can reach them all (RUN-42). POSIX-only; on
+      // Windows this is a no-op and taskkill /T walks the tree instead.
+      ...treeSpawnOptions(),
+    });
   const events = new AsyncQueue<CodexEvent>();
+  let processExitObserved = child.exitCode !== null || child.signalCode !== null;
+  let acknowledgeProcessExit!: () => void;
+  const processExit = new Promise<void>((resolve) => {
+    acknowledgeProcessExit = () => {
+      if (processExitObserved) return;
+      processExitObserved = true;
+      resolve();
+    };
+    if (processExitObserved) resolve();
+  });
+  if (contained) {
+    const cleanupAttemptHome = (): Error | null => {
+      try {
+        attemptHome?.cleanup();
+        return null;
+      } catch (error) {
+        return error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    void contained.exited.then(
+      () => {
+        // `ContainedAgentProcess.exited` is the process-tree authority boundary. Never remove the
+        // mounted home from a direct-child event while an MCP/tool descendant may still use it.
+        const cleanupError = cleanupAttemptHome();
+        if (cleanupError) {
+          events.push({
+            type: 'error',
+            message: `codex attempt-home cleanup failed: ${cleanupError.message}`,
+          });
+        }
+        acknowledgeProcessExit();
+      },
+      (error) => {
+        events.push({
+          type: 'error',
+          // A rejected containment acknowledgement does not prove the complete process tree is
+          // gone. Retain the attempt home instead of removing a mount a possibly-live descendant
+          // may still use.
+          message: `codex containment failed: ${String(error)}; attempt home retained`,
+        });
+      },
+    );
+  }
+  const waitForProcessExit = (timeoutMs: number): Promise<boolean> => {
+    if (processExitObserved || child.exitCode !== null || child.signalCode !== null) {
+      acknowledgeProcessExit();
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (exited: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(exited);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+      processExit.then(() => finish(true));
+    });
+  };
   let nextId = 1;
   let threadId: string | null = null;
   let turnId: string | null = null;
@@ -594,6 +908,14 @@ export const defaultSpawnCodex = (
   let mcpAttestationFailed = false;
   let mcpStatusRequestId: number | null = null;
   const mcpStatuses: Array<{ name?: unknown; tools?: unknown }> = [];
+  let mcpStatusPages = 0;
+  const mcpStatusCursors = new Set<string>();
+  let mcpAttestationTimer: NodeJS.Timeout | null = null;
+  const stopMcpAttestationDeadline = (): void => {
+    if (!mcpAttestationTimer) return;
+    clearTimeout(mcpAttestationTimer);
+    mcpAttestationTimer = null;
+  };
   /** A turn requested before the thread existed — flushed once thread/start answers. */
   let pendingTurn: string | null = null;
   /** Requests whose rejection must NOT kill the run: a lost steer already has a fallback
@@ -605,6 +927,10 @@ export const defaultSpawnCodex = (
   // supervised Claude run down with it, none of them reporting a terminal status. Turn it
   // into a normal run failure instead.
   child.on('error', (err) => {
+    // A failed spawn has no process to reap and emits no exit. Later process errors with a pid do
+    // not prove death and deliberately leave the acknowledgement pending.
+    if (!child.pid) acknowledgeProcessExit();
+    stopMcpAttestationDeadline();
     events.push({ type: 'error', message: `codex process error: ${err.message}` });
     events.close();
   });
@@ -628,9 +954,10 @@ export const defaultSpawnCodex = (
   const failMcpAttestation = (reason: string): void => {
     if (mcpAttestationFailed) return;
     mcpAttestationFailed = true;
+    stopMcpAttestationDeadline();
     events.push({ type: 'error', message: `codex MCP isolation failed: ${reason}` });
     events.close();
-    killProcessTree(child, { force: false });
+    killTree(child, { force: false });
   };
 
   const flushPendingTurn = (): void => {
@@ -641,6 +968,17 @@ export const defaultSpawnCodex = (
 
   const requestMcpStatus = (cursor?: string): void => {
     if (!threadId || mcpAttestationFailed) return;
+    const cursorKey = cursor ?? '<initial>';
+    if (mcpStatusPages >= CODEX_MCP_ATTESTATION_MAX_PAGES) {
+      failMcpAttestation(`server inventory exceeded ${CODEX_MCP_ATTESTATION_MAX_PAGES} pages`);
+      return;
+    }
+    if (mcpStatusCursors.has(cursorKey)) {
+      failMcpAttestation(`server inventory repeated cursor '${cursorKey}'`);
+      return;
+    }
+    mcpStatusCursors.add(cursorKey);
+    mcpStatusPages += 1;
     mcpStatusRequestId = send(RPC.mcpServerStatusList, {
       threadId,
       detail: 'toolsAndAuthOnly',
@@ -651,7 +989,7 @@ export const defaultSpawnCodex = (
   };
 
   const finishMcpAttestation = (): void => {
-    const expectedNames = opts.noriqMcp ? [NORIQ_MCP_NAME] : [];
+    const expectedNames = [...projectMcpNames, ...(opts.noriqMcp ? [NORIQ_MCP_NAME] : [])].sort();
     const actualNames = mcpStatuses.map((s) => String(s.name ?? '')).sort();
     if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
       failMcpAttestation(
@@ -673,9 +1011,30 @@ export const defaultSpawnCodex = (
         return;
       }
     }
+    for (const name of projectMcpNames) {
+      const project = mcpStatuses.find((status) => status.name === name);
+      const actualTools =
+        project?.tools && typeof project.tools === 'object' && !Array.isArray(project.tools)
+          ? Object.keys(project.tools as Record<string, unknown>).sort()
+          : [];
+      const expectedTools = [...(expectedProjectTools[name] ?? [])].sort();
+      if (JSON.stringify(actualTools) !== JSON.stringify(expectedTools)) {
+        failMcpAttestation(
+          `${name} tool inventory differs from its exact grant (expected [${expectedTools.join(', ')}], got [${actualTools.join(', ')}])`,
+        );
+        return;
+      }
+    }
     mcpAttested = true;
+    stopMcpAttestationDeadline();
     flushPendingTurn();
   };
+
+  mcpAttestationTimer = setTimeout(
+    () => failMcpAttestation(`attestation exceeded ${CODEX_MCP_ATTESTATION_TIMEOUT_MS}ms`),
+    CODEX_MCP_ATTESTATION_TIMEOUT_MS,
+  );
+  mcpAttestationTimer.unref?.();
 
   const rl = createInterface({ input: child.stdout });
   rl.on('line', (line) => {
@@ -720,9 +1079,18 @@ export const defaultSpawnCodex = (
           failMcpAttestation('server inventory response had no data array');
           return;
         }
+        if (mcpStatuses.length + result.data.length > CODEX_MCP_ATTESTATION_MAX_RESULTS) {
+          failMcpAttestation(`server inventory exceeded ${CODEX_MCP_ATTESTATION_MAX_RESULTS} results`);
+          return;
+        }
         mcpStatuses.push(...result.data);
-        if (typeof result.nextCursor === 'string' && result.nextCursor) requestMcpStatus(result.nextCursor);
-        else finishMcpAttestation();
+        if (result.nextCursor !== undefined && result.nextCursor !== null && result.nextCursor !== '') {
+          if (typeof result.nextCursor !== 'string') {
+            failMcpAttestation('server inventory returned an invalid cursor');
+            return;
+          }
+          requestMcpStatus(result.nextCursor);
+        } else finishMcpAttestation();
         return;
       }
       // 0.142.x answered thread/start with {threadId}; 0.144.x nests it as {thread:{id}}.
@@ -739,8 +1107,8 @@ export const defaultSpawnCodex = (
     if (msg.method) {
       if (msg.method === 'mcpServer/startupStatus/updated') {
         const name = String(msg.params?.name ?? '');
-        const expected = opts.noriqMcp ? NORIQ_MCP_NAME : null;
-        if (name && name !== expected) {
+        const expected = new Set([...projectMcpNames, ...(opts.noriqMcp ? [NORIQ_MCP_NAME] : [])]);
+        if (name && !expected.has(name)) {
           failMcpAttestation(`unexpected server started: ${name}`);
           return;
         }
@@ -750,22 +1118,75 @@ export const defaultSpawnCodex = (
       events.push(ev ?? { type: 'activity' });
     }
   });
-  child.on('exit', () => events.close());
+  child.on('exit', () => {
+    acknowledgeProcessExit();
+    stopMcpAttestationDeadline();
+    events.close();
+  });
   // RUN-201 belt: twice live, a dead child's exit never surfaced as a closed stream. 'close'
   // (stdio drained) is a second signal, and the reaper polls the one fact that cannot be missed:
   // a reaped process has a non-null exitCode. Both funnel into the same idempotent close, and
   // the reaper dies on every path out — exit, close, or the transport's own close().
   const reaper = setInterval(() => {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      acknowledgeProcessExit();
       stopReaper();
       events.close();
     }
   }, 30_000);
   reaper.unref?.();
   const stopReaper = () => clearInterval(reaper);
-  child.on('exit', stopReaper);
-  child.on('close', stopReaper);
-  child.on('close', () => events.close());
+  child.on('exit', () => {
+    // `exit` is the direct-child death acknowledgement. Do not wait for `close`: inherited stdio
+    // can keep that later event open after Codex itself is gone, and the capability promised by
+    // this transport is deliberately only main-process termination.
+    acknowledgeProcessExit();
+    stopReaper();
+  });
+  child.on('close', () => {
+    // Node emits close only after exit and all stdio close, so it is also process-death evidence.
+    acknowledgeProcessExit();
+    stopReaper();
+    stopMcpAttestationDeadline();
+    events.close();
+  });
+
+  let closePromise: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    const attempt = (async () => {
+      stopMcpAttestationDeadline();
+      if (processExitObserved || child.exitCode !== null || child.signalCode !== null) {
+        acknowledgeProcessExit();
+        stopReaper();
+        return;
+      }
+
+      // Reach the ordinary agent/tool/MCP tree first, then escalate. This proves only the direct
+      // codex process: process groups and taskkill /T are best-effort reachability mechanisms, not
+      // non-escapable containment, which is why the driver capability remains `main-process`.
+      killTree(child, { force: false });
+      if (await waitForProcessExit(CODEX_GRACEFUL_STOP_MS)) {
+        stopReaper();
+        return;
+      }
+      killTree(child, { force: true });
+      if (await waitForProcessExit(CODEX_FORCE_STOP_MS)) {
+        stopReaper();
+        return;
+      }
+      throw new Error(
+        `codex process did not exit within ${CODEX_GRACEFUL_STOP_MS}ms graceful plus ${CODEX_FORCE_STOP_MS}ms forced shutdown`,
+      );
+    })();
+    closePromise = attempt;
+    void attempt.catch(() => {
+      // The caller must see the bounded failure now, but a late real exit can make a subsequent
+      // acknowledgement succeed. Never leave the rejected attempt memoized forever.
+      if (closePromise === attempt) closePromise = null;
+    });
+    return attempt;
+  };
 
   // Handshake → start the thread with the requested sandbox. clientInfo.version became
   // MANDATORY in codex 0.144.x — without it initialize is rejected outright (and that
@@ -781,6 +1202,7 @@ export const defaultSpawnCodex = (
 
   return {
     events,
+    processExit,
     // The driver calls this synchronously the instant spawnCodex() returns, long before
     // thread/start's response has been read off stdout — so `threadId` is still null and
     // every real run posted `turn/start {threadId: null}`, which the app-server rejects:
@@ -799,15 +1221,6 @@ export const defaultSpawnCodex = (
       return id !== null;
     },
     interrupt: () => send(RPC.turnInterrupt, { threadId, turnId }, true),
-    close: () => {
-      // The tree, not just codex (RUN-42): codex spawns tools of its own, and a stop that leaves
-      // them running leaves the run's worktree locked and its CPU burning under a run the daemon
-      // has already reported terminal. `force: false` keeps the POSIX contract the budget/steering
-      // code was written against — SIGTERM, a chance to clean up. Windows has no equivalent (see
-      // proc.ts): "ask nicely" is a WM_CLOSE a console app may ignore, and kill('SIGTERM') there
-      // is already a hard TerminateProcess, so graceful-then-force is a POSIX-only idea.
-      stopReaper(); // the liveness poll dies with the transport, whatever the child does (RUN-201)
-      killProcessTree(child, { force: false });
-    },
+    close,
   };
 };

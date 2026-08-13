@@ -467,6 +467,8 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   agent: null,
   // No custom workflow by default (RUN-121): the run's kind selects the built-in.
   workflow: null,
+  // No commissioned machine-local mission environment on legacy supervisor fixtures.
+  executionProfile: null,
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,

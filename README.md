@@ -6,6 +6,11 @@ repos, spawns and supervises coding-agent processes (Claude / Codex) inside
 isolated git worktrees, and streams status back so you can dispatch, watch,
 steer, and approve work entirely from the dashboard.
 
+That describes the established legacy Git Run path. The additive agent-led v2 mission harness is
+recovery-compatible but is **not yet eligible for fresh dispatch**, and it must not be read as an
+already-active replacement for the legacy path. Its separate authority and cutover gates are
+summarized below and specified in [`MISSION-HARNESS.md`](MISSION-HARNESS.md).
+
 This is a **standalone repo** (separate runtime/trust/distribution boundary from
 the Noriq server). It imports only the runtime-neutral slice of `@noriq-dev/shared`
 (pure zod, the wire contract), currently **vendored** under `vendor/noriq-shared`
@@ -187,6 +192,92 @@ noriq-runner discover    # list the repos found under your scan roots
 
 The KEY in `.noriq/project.toml` is resolved to a `prj_…` id per configured server
 at registration, so a checkout stays portable across instances and forks.
+
+### Agent-led mission harness (v2; fresh dispatch withheld)
+
+The intended replacement orchestration core is documented in
+[`MISSION-HARNESS.md`](MISSION-HARNESS.md). It uses a bounded guide agent to choose work while a
+deterministic, journaled kernel owns authority, budgets, restart behavior, VCS evidence, and final
+completion. A mission snapshots its objective, ordered task plan and dependencies, execution
+catalog, budgets, resources, base revision, and exact execution-profile identity. The guide may
+propose bounded work; only the kernel can admit it, reserve an attempt, consume budget, accept
+review evidence, advance a VCS revision, or declare completion.
+
+Repositories declare available environments as strict JSON files under
+`.noriq/execution-profiles/*.json`. Each declaration names the guide/build/review catalog, mission
+budget, resource capacities, generation, and concurrency limit. Runner fingerprints and privately
+snapshots the exact declaration plus the repository `.mcp.json` and the `.mcp.json` from each
+referenced Noriq Codex/Claude environment. Those generic sources are composed collision-free and
+then reduced by exact per-profile server/tool grants. The driver's effective server **and tool**
+inventory must equal those grants: a missing or unexpected entry fails activation. The default
+daemon posture denies every local stdio launcher. Deployment must inject a machine-owned generic
+policy that proves both the selected entry executable and its complete immutable runtime closure,
+or routes execution through a policy-owned broker. Merely finding and hashing an installed wrapper
+or package frontend is insufficient, so Runner exposes no online `npx` convenience policy. There is
+no Unreal-, Project NOD-, or other domain-specific worker/configuration path in Runner.
+
+Relative paths in the repository declaration follow each leased checkout. Agent-environment MCP
+declarations must use an explicit confined `${workspace}` token for project paths. Runner does not
+guess whether another argument is a filename: machine policy must authorize the complete exact argv
+identity and reject unresolved cwd-relative values instead of silently retargeting them into
+repository-controlled bytes.
+
+Each Codex or Claude mission child gets a unique vendor-control home, so settings, histories, and
+MCP authority cannot persist into another child. That staging is not itself a secret boundary.
+Activation additionally requires a machine-owned execution boundary which exposes the copied
+credential only to the vendor controller and hides it from every model-selected shell, tool, hook,
+skill, and MCP descendant. The same boundary must enforce each launch's total-token envelope before
+provider spend, hard PID/memory/CPU/I/O/storage ceilings, broker egress including localhost, and bind
+the vendor/tool/MCP/VCS closure to one immutable authority fingerprint. Telemetry and SDK task-budget
+pacing are not substitutes for that quota. Stock bubblewrap provides useful PID/mount isolation for
+legacy execution, but cannot make those stronger claims and therefore cannot commission a v2 profile
+by itself.
+
+The local implementation includes strict plan/build/review/repair protocols, independent stronger
+review for writable steps, durable mission and Noriq-coordination journals, exact begin/settle
+acknowledgements, restart inventory/adoption primitives, machine-wide resource leases, a generic
+commissioned-execution-boundary contract, Linux PID/mount containment, and a concrete Git evidence
+adapter. A successful Git mission preserves
+and journals its accepted immutable revision; it does **not** rebase, merge, push, or call that
+handoff “landed.” A project-neutral Diversion adapter remains an internal, unexported prototype;
+it is not selectable until its deadline/cancellation, durable registration cleanup, exact commit
+proof, path/hard-lock authority, identity pinning, consumed-handoff acknowledgement, and live
+mutation certification gaps are closed.
+
+The daemon's `mission.v2` protocol path opens immediately after REST registration so it can recover
+already-durable roots: it buffers ordinary frames, inventories/quarantines mission roots, resolves
+exact historical profile snapshots, and includes mission workspaces in orphan ownership. Protocol
+compatibility is not fresh-dispatch eligibility. Runner deliberately advertises no execution
+profiles and no eligible mission workflow for a new commission. Dedicated build workflows may
+declare `capabilities = ["mission.v2"]`, but that declaration is filtered from fresh-dispatch
+advertising until Noriq can send the complete authority below **and** a subsequent Runner
+commissioning change safely enables the offers and assignment route. Runner must never infer a
+mission from legacy stages or fall back after accepting mission authority. Noriq cutover is
+currently withheld on **PLNR-488** through **PLNR-496**:
+
+- **PLNR-488:** exact authorized consumed-handoff acknowledgement before VCS reference retirement;
+- **PLNR-489:** immutable commissioned task/dependency snapshot for a single-root plan Run;
+- **PLNR-490:** start the adoption deadline only after the negotiated mission WebSocket can answer;
+- **PLNR-491:** expose the `single_root` dispatch strategy in the Plans UI;
+- **PLNR-492:** durable lease/restart semantics for an individually dispatched task-root mission;
+- **PLNR-493:** require an exact non-null commissioned execution profile for `single_root`;
+- **PLNR-494:** plan cancellation must interrupt mission task attempts and release their claims;
+- **PLNR-495:** `gate = "landed"` must recognize exact successful mission-task execution/consumption;
+- **PLNR-496:** durable, lease-fenced mission human-question publication and answer delivery.
+
+The immutable execution-profile catalog is the sole source of mission validation authority; v2 does
+not inherit a daemon mapping from the legacy `[verify]` setting. After the Noriq contracts land,
+Runner still needs an explicit commissioning follow-up with an operational credential/resource/
+network/runtime broker to publish attested profile offers, enable eligible workflows, and route
+fresh assignments into the mission coordinator. It also must expose
+consumed handoff only through the authorized Noriq contract. It fails closed on a missing or
+mismatched commission, profile fingerprint, lease epoch, acknowledgement, human-question identity,
+effective MCP inventory, or startup buffer.
+
+Project NOD is therefore **not runnable through v2 today**. Its project-owned configuration must
+provide compatible sealed or brokered MCP commands accepted by a machine-owned generic policy and an
+immutable execution profile with its validation and editor-resource authority. That project work
+does not add an Unreal worker, Unreal feature flag, or Unreal-specific branch to Runner.
 
 An optional `board = "…"` in the same marker locks the repo's work to one **board** within
 that project — the same idea as the key, one level down. Tasks this repo's agents create

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import type { MissionRepositoryAuthority } from './types';
 
 const execFileP = promisify(execFile);
 
@@ -38,6 +39,12 @@ export interface VcsDetection {
   repoId?: string;
   /** Why this repo got this backend — for the discover log, so routing is never silent. */
   reason: string;
+  /**
+   * Separate mission-plane authority. Legacy routing may default to Git, but only an explicit
+   * marker at this root or an exact canonical Diversion registration proves repository scope.
+   * Omission by a legacy/custom detector is treated exactly like `unavailable`.
+   */
+  missionAuthority?: MissionRepositoryAuthority;
 }
 
 export interface DetectDeps {
@@ -104,7 +111,11 @@ export async function detectVcs(roots: string[], deps: DetectDeps = {}): Promise
   for (const root of roots) {
     if (exists(path.join(root, '.git'))) {
       // Explicit .git wins even inside a Diversion workspace — see the precedence note above.
-      out.set(root, { kind: 'git', reason: '.git present at the root' });
+      out.set(root, {
+        kind: 'git',
+        reason: '.git present at the root',
+        missionAuthority: 'exact-root',
+      });
       continue;
     }
     // Perforce (RUN-52): a client workspace root conventionally carries a `.p4config` file
@@ -113,7 +124,11 @@ export async function detectVcs(roots: string[], deps: DetectDeps = {}): Promise
     // the directory as Perforce, even if a client maps it: probing a p4d per repo would put a
     // network round-trip in discovery and hang on a dead server.
     if (exists(path.join(root, '.p4config'))) {
-      out.set(root, { kind: 'perforce', reason: '.p4config present at the root' });
+      out.set(root, {
+        kind: 'perforce',
+        reason: '.p4config present at the root',
+        missionAuthority: 'exact-root',
+      });
       continue;
     }
     const registry = await dvRegistry();
@@ -123,6 +138,7 @@ export async function detectVcs(roots: string[], deps: DetectDeps = {}): Promise
         kind: 'diversion',
         repoId,
         reason: `no .git, and the dv registry names this exact path (${repoId})`,
+        missionAuthority: 'exact-root',
       });
       continue;
     }
@@ -132,6 +148,7 @@ export async function detectVcs(roots: string[], deps: DetectDeps = {}): Promise
         registry === null
           ? 'no .git; dv registry unreachable — defaulting to git'
           : 'no .git; not in the dv registry — defaulting to git',
+      missionAuthority: 'unavailable',
     });
   }
   return out;

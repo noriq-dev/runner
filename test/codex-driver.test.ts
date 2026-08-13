@@ -1,3 +1,6 @@
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import type { PermissionProfile, RunEffort, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
@@ -5,6 +8,10 @@ import { DEFAULT_CODEX_HOME } from '../src/agent-homes';
 import { AsyncQueue } from '../src/async-queue';
 import { noriqToolsFor } from '../src/drivers/claude';
 import {
+  CODEX_FORCE_STOP_MS,
+  CODEX_GRACEFUL_STOP_MS,
+  CODEX_MCP_ATTESTATION_MAX_RESULTS,
+  CODEX_MCP_ATTESTATION_TIMEOUT_MS,
   CODEX_SILENCE_TEARDOWN_MS,
   CodexDriver,
   type CodexEvent,
@@ -15,7 +22,13 @@ import {
   mapSandbox,
   normalizeNotification,
 } from '../src/drivers/codex';
-import type { DriverStartOptions, DriverTelemetry } from '../src/drivers/types';
+import type { DriverStartOptions, DriverTelemetry, ProjectMcpSession } from '../src/drivers/types';
+import type {
+  AgentProcessContainment,
+  AgentProcessLaunch,
+  ContainedAgentProcess,
+} from '../src/process-containment';
+import { type ProjectMcpBundle, bindProjectMcpBundle, loadProjectMcpBundle } from '../src/project-mcp';
 
 class FakeTransport implements CodexTransport {
   readonly events = new AsyncQueue<CodexEvent>();
@@ -36,7 +49,7 @@ class FakeTransport implements CodexTransport {
   interrupt(): void {
     this.interrupted += 1;
   }
-  close(): void {
+  async close(): Promise<void> {
     this.closed = true;
     this.events.close();
   }
@@ -44,6 +57,12 @@ class FakeTransport implements CodexTransport {
     this.events.push(ev);
   }
 }
+
+const testCodexDriver = (deps: ConstructorParameters<typeof CodexDriver>[0] = {}): CodexDriver =>
+  new CodexDriver({
+    reattestProjectMcpExecutables: () => Object.freeze([]),
+    ...deps,
+  });
 
 const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -62,7 +81,7 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
   };
   const telemetry: DriverTelemetry[] = [];
   const texts: string[] = [];
-  const driver = new CodexDriver({ spawnCodex, prepareCodexHome: () => {} });
+  const driver = testCodexDriver({ spawnCodex, prepareCodexHome: () => {} });
   const session = driver.start({
     runId: 'run_1',
     kind: 'build',
@@ -76,6 +95,61 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+};
+
+const projectMcp = (
+  servers: ProjectMcpBundle['servers'],
+  toolGrants: ProjectMcpSession['toolGrants'],
+): ProjectMcpSession => ({
+  bundle: {
+    source: '/wt/.mcp.json',
+    declarationFingerprint: 'declared',
+    effectiveFingerprint: 'effective',
+    launcherAuthorizations: Object.fromEntries(
+      Object.entries(servers).flatMap(([name, server]) =>
+        server.transport === 'stdio'
+          ? [
+              [
+                name,
+                {
+                  policyId: 'test-policy',
+                  executableIdentity: `test:${name}`,
+                  runtimeClosureIdentity: `test:runtime:${name}`,
+                  authorizedArgvIdentity: `sha256:${'a'.repeat(64)}`,
+                  resolvedCommand: process.execPath,
+                  readOnlyRoots: [],
+                },
+              ],
+            ]
+          : [],
+      ),
+    ),
+    endpointAuthorizations: Object.fromEntries(
+      Object.entries(servers).flatMap(([name, server]) =>
+        server.transport !== 'stdio'
+          ? [
+              [
+                name,
+                {
+                  policyId: 'test-endpoint-policy',
+                  endpointIdentity: `test:${name}`,
+                  resolvedUrl: server.url,
+                },
+              ],
+            ]
+          : [],
+      ),
+    ),
+    servers,
+  },
+  toolGrants,
+});
 
 describe('mapSandbox', () => {
   it('maps write→workspace-write, read-only otherwise', () => {
@@ -86,7 +160,7 @@ describe('mapSandbox', () => {
 
 describe('driver capabilities (RUN-110)', () => {
   it('codex declares NO in-process hooks, no resume, no per-model telemetry', () => {
-    const driver = new CodexDriver({ spawnCodex: (() => ({})) as never });
+    const driver = testCodexDriver({ spawnCodex: (() => ({})) as never });
     expect(driver.tool).toBe('codex');
     expect(driver.capabilities).toEqual({
       toolHooks: false,
@@ -94,6 +168,10 @@ describe('driver capabilities (RUN-110)', () => {
       interrupt: true,
       resumableSession: false,
       perModelTelemetry: false,
+      toolFreeSession: false,
+      workspaceIsolatedSession: true,
+      projectMcpProcessContainment: false,
+      terminationAcknowledgement: 'main-process',
     });
   });
 });
@@ -102,7 +180,7 @@ describe('Runner-specific Codex home (RUN-290)', () => {
   it('prepares the isolated home and passes it through the spawn boundary', () => {
     const prepared: string[] = [];
     let spawnedHome: string | undefined;
-    const driver = new CodexDriver({
+    const driver = testCodexDriver({
       codexHome: '/runner/codex',
       prepareCodexHome: (home) => prepared.push(home),
       spawnCodex: (opts) => {
@@ -120,6 +198,103 @@ describe('Runner-specific Codex home (RUN-290)', () => {
 
     expect(prepared).toEqual(['/runner/codex']);
     expect(spawnedHome).toBe('/runner/codex');
+  });
+
+  it('gives every contained mission a credential-only home and deletes it after tree exit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-codex-attempt-home-'));
+    const exits: Array<ReturnType<typeof deferred<void>>> = [];
+    const attemptHomes: string[] = [];
+    try {
+      const durableHome = path.join(root, 'durable');
+      const workspace = path.join(root, 'workspace');
+      await Promise.all([mkdir(path.join(durableHome, 'sessions'), { recursive: true }), mkdir(workspace)]);
+      await Promise.all([
+        writeFile(path.join(durableHome, 'auth.json'), '{"token":"codex-secret"}', { mode: 0o600 }),
+        writeFile(path.join(durableHome, 'config.toml'), 'model = "ambient"'),
+        writeFile(path.join(durableHome, 'sessions', 'prior.jsonl'), 'prior session'),
+      ]);
+
+      const launches: AgentProcessLaunch[] = [];
+      const children: ReturnType<typeof makeFakeChild>[] = [];
+      const containment: AgentProcessContainment = {
+        capabilities: {
+          processTreeTermination: true,
+          ownerDeathTermination: true,
+          workspaceIsolation: true,
+          protectedWorkspaceSubpaths: true,
+          projectMcpProcessContainment: true,
+          providerCredentialIsolation: true,
+          hostResourceIsolation: true,
+          networkEgressIsolation: true,
+          immutableRuntimeAuthority: true,
+          providerTokenEnvelope: true,
+        },
+        authorityFingerprint: `sha256:${'c'.repeat(64)}`,
+        assertAuthority: async () => undefined,
+        probe: async () => {},
+        spawn(request): ContainedAgentProcess {
+          launches.push(request);
+          const child = makeFakeChild([]);
+          const exit = deferred();
+          children.push(child);
+          exits.push(exit);
+          return {
+            child: child as never,
+            exited: exit.promise,
+            terminate: () => {},
+          };
+        },
+      };
+
+      for (const runId of ['mission-attempt-1', 'mission-attempt-2']) {
+        defaultSpawnCodex({
+          runId,
+          cwd: workspace,
+          workspaceRoot: workspace,
+          workspaceWrite: true,
+          sandbox: 'workspace-write',
+          approvalPolicy: 'never',
+          kind: 'build',
+          codexHome: durableHome,
+          containment,
+          tokenEnvelope: { totalTokens: 2_048, maxTurns: 8 },
+        });
+      }
+
+      const homes = launches.map((launch) => launch.providerCredentialRoots?.[0]);
+      expect(homes).toHaveLength(2);
+      expect(homes[0]).toBeTruthy();
+      expect(homes[1]).toBeTruthy();
+      expect(homes[0]).not.toBe(homes[1]);
+      expect(launches.every((launch) => launch.privateWriteRoots === undefined)).toBe(true);
+      for (const [index, launch] of launches.entries()) {
+        const attemptHome = homes[index] as string;
+        attemptHomes.push(attemptHome);
+        expect(launch.providerCredentialRoots).toEqual([attemptHome]);
+        expect(launch.providerCredentialRoots).not.toContain(durableHome);
+        expect(launch.privateWriteRoots).toBeUndefined();
+        expect(launch.providerTokenEnvelope).toEqual({ totalTokens: 2_048, maxTurns: 8 });
+        expect(launch.env.HOME).toBe(attemptHome);
+        expect(launch.env.CODEX_HOME).toBe(attemptHome);
+        expect(await readdir(attemptHome)).toEqual(['auth.json']);
+        expect(await readFile(path.join(attemptHome, 'auth.json'), 'utf8')).toBe('{"token":"codex-secret"}');
+
+        // Direct-child death is not enough: cleanup is owned by the containment tree boundary.
+        children[index]?.emitProcessExit();
+        await expect(stat(attemptHome)).resolves.toBeTruthy();
+      }
+
+      for (const exit of exits) exit.resolve();
+      await tick();
+      for (const attemptHome of homes) {
+        await expect(stat(attemptHome as string)).rejects.toMatchObject({ code: 'ENOENT' });
+      }
+    } finally {
+      for (const exit of exits) exit.resolve();
+      await tick();
+      await Promise.all(attemptHomes.map((home) => rm(home, { recursive: true, force: true })));
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -177,6 +352,116 @@ describe('normalizeNotification (real app-server shapes)', () => {
 });
 
 describe('CodexDriver', () => {
+  it('refuses a tool-free turn before starting an app-server process', () => {
+    let spawned = false;
+    const driver = testCodexDriver({
+      prepareCodexHome: () => {},
+      spawnCodex: () => {
+        spawned = true;
+        return new FakeTransport();
+      },
+    });
+
+    expect(() =>
+      driver.start({
+        runId: 'guide',
+        kind: 'scope',
+        cwd: '/private',
+        prompt: 'choose one proposal',
+        permission: profile(),
+        toolAccess: 'none',
+      }),
+    ).toThrow('cannot attest a tool-free session');
+    expect(spawned).toBe(false);
+  });
+
+  it('enforces an exact workspace root and refuses danger-full-access for mission children', () => {
+    const driver = testCodexDriver({
+      prepareCodexHome: () => {},
+      spawnCodex: () => new FakeTransport(),
+    });
+    const base = {
+      runId: 'child',
+      kind: 'build' as const,
+      cwd: '/leases/mission',
+      workspaceRoot: '/leases/mission',
+      prompt: 'work',
+      permission: profile({ write: true }),
+    };
+    expect(() => driver.start({ ...base, cwd: '/leases/other' })).toThrow('must exactly match');
+    expect(() => driver.start({ ...base, permission: profile({ write: true, auto: true }) })).toThrow(
+      'danger-full-access cannot enforce',
+    );
+    expect(() => driver.start(base)).not.toThrow();
+  });
+
+  it('rejects combining project and Noriq MCP authority before spawning', () => {
+    const driver = testCodexDriver({
+      prepareCodexHome: () => {},
+      spawnCodex: () => new FakeTransport(),
+    });
+    expect(() =>
+      driver.start({
+        runId: 'combined',
+        kind: 'build',
+        cwd: '/wt',
+        prompt: 'work',
+        permission: profile({ write: true }),
+        noriqMcp: { url: 'https://noriq.test/mcp', token: 'token' },
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          { simulator: ['inspect'] },
+        ),
+      }),
+    ).toThrow('may not combine project MCP authority with Noriq MCP authority');
+  });
+
+  it('refuses a replaced project MCP executable before spawning Codex', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-codex-mcp-attest-'));
+    try {
+      const executable = path.join(root, 'mcp-launcher');
+      await writeFile(executable, '#!/bin/sh\nexit 0\n');
+      await chmod(executable, 0o755);
+      await writeFile(
+        path.join(root, '.mcp.json'),
+        `${JSON.stringify({ mcpServers: { project: { command: 'custom', args: [] } } })}\n`,
+      );
+      const bundle = bindProjectMcpBundle(
+        await loadProjectMcpBundle(root, {
+          launcherPolicy: {
+            policyId: 'codex-test-launcher-v1',
+            authorize: ({ argvIdentity }) => ({
+              policyId: 'codex-test-launcher-v1',
+              executableIdentity: 'codex-test-launcher/revision-1',
+              runtimeClosureIdentity: 'codex-test-runtime/revision-1',
+              authorizedArgvIdentity: argvIdentity,
+              resolvedCommand: executable,
+              readOnlyRoots: [],
+            }),
+          },
+        }),
+        root,
+      );
+      await writeFile(executable, '#!/bin/sh\nexit 9\n');
+      const spawnCodex = vi.fn(() => new FakeTransport());
+      const driver = new CodexDriver({ spawnCodex, prepareCodexHome: () => {} });
+
+      expect(() =>
+        driver.start({
+          runId: 'mutated-project-mcp',
+          kind: 'build',
+          cwd: root,
+          prompt: 'must never launch',
+          permission: profile({ write: true }),
+          projectMcp: { bundle, toolGrants: { project: ['inspect'] } },
+        }),
+      ).toThrow(/executable re-attestation failed: resolved command digest changed/);
+      expect(spawnCodex).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   // RUN-201: twice in one live evening a codex child died without its exit reaching the event
   // loop, and the run showed "running" for half an hour with no process behind it. Silence past
   // the deadline settles the session as an ordinary failure the continuation flow recovers.
@@ -315,6 +600,108 @@ describe('CodexDriver', () => {
     const h = harness();
     await h.session.stop();
     expect(await h.session.done()).toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('does not settle a completed run until transport process death is acknowledged', async () => {
+    const fake = new FakeTransport();
+    const closeStarted = deferred();
+    const processExited = deferred();
+    fake.close = async () => {
+      fake.closed = true;
+      closeStarted.resolve();
+      await processExited.promise;
+      fake.events.close();
+    };
+    const driver = testCodexDriver({ spawnCodex: () => fake, prepareCodexHome: () => {} });
+    const session = driver.start({
+      runId: 'run_exit_ack',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'do the thing',
+      permission: profile({ write: true }),
+    });
+    fake.push({ type: 'turn_complete' });
+    await closeStarted.promise;
+
+    const beforeExit = await Promise.race([
+      session.done().then(() => 'settled'),
+      tick().then(() => 'pending'),
+    ]);
+    expect(beforeExit).toBe('pending');
+    processExited.resolve();
+    await expect(session.done()).resolves.toMatchObject({ outcome: 'done' });
+  });
+
+  it('does not resolve stop until transport process death is acknowledged', async () => {
+    const fake = new FakeTransport();
+    const closeStarted = deferred();
+    const processExited = deferred();
+    fake.close = async () => {
+      fake.closed = true;
+      closeStarted.resolve();
+      await processExited.promise;
+      fake.events.close();
+    };
+    const driver = testCodexDriver({ spawnCodex: () => fake, prepareCodexHome: () => {} });
+    const session = driver.start({
+      runId: 'run_stop_ack',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'do the thing',
+      permission: profile({ write: true }),
+    });
+    const stopping = session.stop();
+    await closeStarted.promise;
+
+    const beforeExit = await Promise.race([stopping.then(() => 'settled'), tick().then(() => 'pending')]);
+    expect(beforeExit).toBe('pending');
+    processExited.resolve();
+    await expect(stopping).resolves.toBeUndefined();
+    await expect(session.done()).resolves.toMatchObject({ outcome: 'failed', reason: 'stopped' });
+  });
+
+  it('rejects stop at its bounded deadline but settles done after a later process exit', async () => {
+    vi.useFakeTimers();
+    try {
+      const fakeChild = makeFakeChild([]);
+      const driver = testCodexDriver({
+        prepareCodexHome: () => {},
+        spawnCodex: (opts) =>
+          defaultSpawnCodex(
+            opts,
+            () => fakeChild as never,
+            () => {
+              // Simulate a process that ignores both graceful and forced tree termination, then
+              // finally exits after stop() has already reported its bounded ambiguity.
+            },
+          ),
+      });
+      const session = driver.start({
+        runId: 'run_late_exit_ack',
+        kind: 'build',
+        cwd: '/wt',
+        prompt: 'do the thing',
+        permission: profile({ write: true }),
+      });
+
+      const stopping = session.stop();
+      const rejection = expect(stopping).rejects.toThrow(
+        'codex process did not exit within 2000ms graceful plus 5000ms forced shutdown',
+      );
+      await vi.advanceTimersByTimeAsync(CODEX_GRACEFUL_STOP_MS + CODEX_FORCE_STOP_MS);
+      await rejection;
+
+      const beforeLateExit = await Promise.race([
+        session.done().then(() => 'settled'),
+        Promise.resolve('pending'),
+      ]);
+      expect(beforeLateExit).toBe('pending');
+
+      fakeChild.emitProcessExit(null, 'SIGKILL');
+      await expect(session.done()).resolves.toMatchObject({ outcome: 'failed', reason: 'stopped' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('sets cumulative usage (not accumulated) from repeated usage events', async () => {
@@ -498,9 +885,11 @@ describe('CodexDriver multiTurn / continueWith (RUN-200)', () => {
  *  needs one), a recording stdin, and hand-fired lifecycle events. */
 function makeFakeChild(writes: string[]) {
   const stdout = new PassThrough();
-  const handlers = new Map<string, (a: unknown) => void>();
+  const handlers = new Map<string, Set<(...args: unknown[]) => void>>();
   return {
     pid: 4242,
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
     stdout,
     stderr: new PassThrough(),
     stdin: {
@@ -510,8 +899,10 @@ function makeFakeChild(writes: string[]) {
       },
       end: () => {},
     },
-    on(event: string, cb: (a: unknown) => void) {
-      handlers.set(event, cb);
+    on(event: string, cb: (...args: unknown[]) => void) {
+      const listeners = handlers.get(event) ?? new Set();
+      listeners.add(cb);
+      handlers.set(event, listeners);
       return this;
     },
     kill: () => true,
@@ -519,7 +910,16 @@ function makeFakeChild(writes: string[]) {
       stdout.write(`${line}\n`);
     },
     emitError(err: Error) {
-      handlers.get('error')?.(err);
+      for (const handler of handlers.get('error') ?? []) handler(err);
+    },
+    emitProcessExit(code: number | null = 0, signal: NodeJS.Signals | null = null) {
+      this.exitCode = code;
+      this.signalCode = signal;
+      for (const handler of handlers.get('exit') ?? []) handler(code, signal);
+    },
+    emitExit(code: number | null = 0, signal: NodeJS.Signals | null = null) {
+      this.emitProcessExit(code, signal);
+      for (const handler of handlers.get('close') ?? []) handler(code, signal);
     },
   };
 }
@@ -689,6 +1089,53 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     expect(seen[0]).toContain('ENOENT');
   });
 
+  it('waits for direct process exit, escalating graceful tree stop to force', async () => {
+    vi.useFakeTimers();
+    try {
+      const fakeChild = makeFakeChild([]);
+      const forceCalls: boolean[] = [];
+      const transport = defaultSpawnCodex(
+        { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'verify' },
+        () => fakeChild as never,
+        (_child, options) => {
+          const force = options?.force ?? true;
+          forceCalls.push(force);
+          if (force) fakeChild.emitExit(null, 'SIGKILL');
+        },
+      );
+
+      const closing = transport.close();
+      expect(forceCalls).toEqual([false]);
+      await vi.advanceTimersByTimeAsync(CODEX_GRACEFUL_STOP_MS);
+      expect(forceCalls).toEqual([false, true]);
+      await expect(closing).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects shutdown acknowledgement when the main process survives forced escalation', async () => {
+    vi.useFakeTimers();
+    try {
+      const fakeChild = makeFakeChild([]);
+      const forceCalls: boolean[] = [];
+      const transport = defaultSpawnCodex(
+        { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'verify' },
+        () => fakeChild as never,
+        (_child, options) => forceCalls.push(options?.force ?? true),
+      );
+
+      const rejection = expect(transport.close()).rejects.toThrow(
+        'codex process did not exit within 2000ms graceful plus 5000ms forced shutdown',
+      );
+      await vi.advanceTimersByTimeAsync(CODEX_GRACEFUL_STOP_MS + CODEX_FORCE_STOP_MS);
+      await rejection;
+      expect(forceCalls).toEqual([false, true]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not release the first turn until the effective MCP inventory is attested', async () => {
     const writes: string[] = [];
     const fakeChild = makeFakeChild(writes);
@@ -711,6 +1158,103 @@ describe('defaultSpawnCodex protocol handshake (regressions)', () => {
     await answerMcpStatus(fakeChild, writes, [{ name: 'noriq', tools: { get_task: {} } }]);
 
     expect(writes.some((line) => line.includes('turn/start'))).toBe(true);
+  });
+
+  it('fails the MCP gate on a bounded deadline and never releases model work', async () => {
+    vi.useFakeTimers();
+    try {
+      const writes: string[] = [];
+      const fakeChild = makeFakeChild(writes);
+      const t = defaultSpawnCodex(
+        { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'scope' },
+        () => fakeChild as never,
+      );
+      t.sendUserTurn('inspect');
+      await vi.advanceTimersByTimeAsync(CODEX_MCP_ATTESTATION_TIMEOUT_MS);
+
+      const seen: CodexEvent[] = [];
+      for await (const event of t.events) seen.push(event);
+      expect(seen.at(-1)).toEqual({
+        type: 'error',
+        message: expect.stringContaining('attestation exceeded'),
+      });
+      expect(writes.some((line) => line.includes('turn/start'))).toBe(false);
+      t.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects repeated MCP cursors and oversized result sets', async () => {
+    const cycleWrites: string[] = [];
+    const cycleChild = makeFakeChild(cycleWrites);
+    const cycle = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'scope' },
+      () => cycleChild as never,
+    );
+    cycle.sendUserTurn('inspect');
+    cycleChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_cycle' } }));
+    await answerMcpStatus(cycleChild, cycleWrites, [], 'same');
+    await answerMcpStatus(cycleChild, cycleWrites, [], 'same');
+    const cycleEvents: CodexEvent[] = [];
+    for await (const event of cycle.events) cycleEvents.push(event);
+    expect(cycleEvents.at(-1)).toEqual({
+      type: 'error',
+      message: expect.stringContaining('repeated cursor'),
+    });
+
+    const resultWrites: string[] = [];
+    const resultChild = makeFakeChild(resultWrites);
+    const result = defaultSpawnCodex(
+      { cwd: '/wt', sandbox: 'read-only', approvalPolicy: 'never', kind: 'scope' },
+      () => resultChild as never,
+    );
+    result.sendUserTurn('inspect');
+    resultChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_many' } }));
+    await answerMcpStatus(
+      resultChild,
+      resultWrites,
+      Array.from({ length: CODEX_MCP_ATTESTATION_MAX_RESULTS + 1 }, (_, index) => ({
+        name: `server-${index}`,
+        tools: {},
+      })),
+    );
+    const resultEvents: CodexEvent[] = [];
+    for await (const event of result.events) resultEvents.push(event);
+    expect(resultEvents.at(-1)).toEqual({
+      type: 'error',
+      message: expect.stringContaining('results'),
+    });
+  });
+
+  it('fails closed when a project server exposes tools outside its exact grant', async () => {
+    const writes: string[] = [];
+    const fakeChild = makeFakeChild(writes);
+    const t = defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'workspace-write',
+        approvalPolicy: 'never',
+        kind: 'build',
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          { simulator: ['inspect'] },
+        ),
+      },
+      () => fakeChild as never,
+    );
+    t.sendUserTurn('build');
+    fakeChild.emitLine(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { threadId: 'th_project_extra' } }));
+    await answerMcpStatus(fakeChild, writes, [{ name: 'simulator', tools: { inspect: {}, mutate: {} } }]);
+
+    const seen: CodexEvent[] = [];
+    for await (const event of t.events) seen.push(event);
+    expect(seen).toContainEqual({
+      type: 'error',
+      message:
+        'codex MCP isolation failed: simulator tool inventory differs from its exact grant (expected [inspect], got [inspect, mutate])',
+    });
+    expect(writes.some((line) => line.includes('turn/start'))).toBe(false);
   });
 
   it('fails closed before turn/start when an inherited server appears', async () => {
@@ -794,7 +1338,7 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
     const { cmd, args } = spawnArgs({ url: 'https://noriq.example/mcp', token: 'plnrt_run_bound' });
     expect(cmd).toBe('codex');
     expect(args[0]).toBe('app-server');
-    expect(args).toContain('mcp_servers.noriq.url=https://noriq.example/mcp');
+    expect(args).toContain('mcp_servers.noriq.url="https://noriq.example/mcp"');
     expect(args).toContain('mcp_servers.noriq.bearer_token_env_var=NORIQ_MCP_TOKEN');
     // `codex mcp add` writes into the human's own ~/.codex/config.toml — the daemon must not
     // reconfigure their codex behind their back, so the wiring stays per-spawn.
@@ -851,16 +1395,119 @@ describe('codex Noriq MCP wiring (RUN-43)', () => {
 
   it('passes model + effort as per-spawn -c overrides too (RUN-33)', () => {
     const { args } = spawnArgs(undefined, { model: 'gpt-5.3-codex', effort: 'low' });
-    expect(args).toContain('model=gpt-5.3-codex');
+    expect(args).toContain('model="gpt-5.3-codex"');
     expect(args).toContain('model_reasoning_effort=low');
     // Same reason as the MCP wiring above: writing these to ~/.codex/config.toml would
     // reconfigure the human's own codex behind their back.
     expect(args[0]).toBe('app-server');
   });
 
+  it('TOML-quotes model and Noriq URL values instead of allowing config injection', () => {
+    const { args } = spawnArgs(
+      { url: 'https://noriq.example/mcp\nrequired=false', token: 'run-token' },
+      { model: 'safe\nmodel="escape"' },
+    );
+    expect(args).toContain('mcp_servers.noriq.url="https://noriq.example/mcp\\nrequired=false"');
+    expect(args).toContain('model="safe\\nmodel=\\"escape\\""');
+    expect(args).not.toContain('model=safe\nmodel="escape"');
+  });
+
   it('marks the injected Noriq server required so auth/startup failures stop the thread', () => {
     const { args } = spawnArgs({ url: 'https://noriq.example/mcp', token: 'run-token' });
     expect(args).toContain('mcp_servers.noriq.required=true');
+  });
+
+  it('translates generic project servers through safe per-spawn TOML values', () => {
+    let seen!: { args: string[] };
+    defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'workspace-write',
+        approvalPolicy: 'never',
+        kind: 'build',
+        projectMcp: projectMcp(
+          {
+            simulator: {
+              transport: 'stdio',
+              command: 'node',
+              args: ['tool with space.js', 'quote"value'],
+              env: { PROJECT_PATH: '/wt/a project' },
+            },
+            docs: {
+              transport: 'http',
+              url: 'https://docs.test/mcp?x=one two',
+              headers: { 'X-Profile': 'project one' },
+            },
+          },
+          { simulator: ['inspect', 'mutate'], docs: ['search'] },
+        ),
+      },
+      ((_cmd: string, args: string[]) => {
+        seen = { args };
+        return makeFakeChild([]) as never;
+      }) as never,
+    );
+
+    expect(seen.args).toContain(`mcp_servers.simulator.command=${JSON.stringify(process.execPath)}`);
+    expect(seen.args).toContain('mcp_servers.simulator.args=["tool with space.js","quote\\"value"]');
+    const projectEnv = seen.args.find((arg) => arg.startsWith('mcp_servers.simulator.env='));
+    expect(projectEnv).toContain('"PROJECT_PATH"="/wt/a project"');
+    expect(projectEnv).toContain('"HOME"="/tmp/noriq-project-mcp"');
+    expect(projectEnv).toContain('"NORIQ_MCP_TOKEN"=""');
+    expect(seen.args).toContain('mcp_servers.simulator.required=true');
+    expect(seen.args).toContain('mcp_servers.simulator.enabled_tools=["inspect","mutate"]');
+    expect(seen.args).toContain('mcp_servers.docs.url="https://docs.test/mcp?x=one two"');
+    expect(seen.args).toContain('mcp_servers.docs.http_headers={"X-Profile"="project one"}');
+    expect(seen.args).toContain('mcp_servers.docs.required=true');
+    expect(seen.args).toContain('mcp_servers.docs.enabled_tools=["search"]');
+  });
+
+  it.each([
+    ['empty', { simulator: [] }],
+    ['mismatched', { other: ['inspect'] }],
+  ])('rejects %s project tool grants before spawning codex', (_case, toolGrants) => {
+    expect(() =>
+      defaultSpawnCodex(
+        {
+          cwd: '/wt',
+          sandbox: 'workspace-write',
+          approvalPolicy: 'never',
+          kind: 'build',
+          projectMcp: projectMcp(
+            { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+            toolGrants,
+          ),
+        },
+        (() => {
+          throw new Error('must not spawn');
+        }) as never,
+      ),
+    ).toThrow('invalid project MCP session');
+  });
+
+  it('configures only the project servers granted to this codex session', () => {
+    let seen: string[] = [];
+    defaultSpawnCodex(
+      {
+        cwd: '/wt',
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        kind: 'verify',
+        projectMcp: projectMcp(
+          {
+            editor: { transport: 'stdio', command: 'edit', args: [], env: {} },
+            inspector: { transport: 'stdio', command: 'inspect', args: [], env: {} },
+          },
+          { inspector: ['read_state'] },
+        ),
+      },
+      ((_cmd: string, args: string[]) => {
+        seen = args;
+        return makeFakeChild([]);
+      }) as never,
+    );
+    expect(seen.some((arg) => arg.startsWith('mcp_servers.editor.'))).toBe(false);
+    expect(seen).toContain('mcp_servers.inspector.enabled_tools=["read_state"]');
   });
 
   it('says nothing when nobody chose — codex keeps its own default (RUN-33)', () => {

@@ -12,6 +12,14 @@ import type {
   LeaseOptions,
   LockContext,
   LockOutcome,
+  MissionCheckpointEvidence,
+  MissionCheckpointOptions,
+  MissionVcsEvidence,
+  MissionWorkspaceInspection,
+  MissionWorkspaceReconciliationEvidence,
+  MissionWorkspaceReconciliationOptions,
+  MissionWorkspaceReleaseOptions,
+  MissionWorkspaceRestorationEvidence,
   ReviewRequest,
   ReviewResult,
   VcsBackend,
@@ -28,9 +36,14 @@ export type GitOps = Pick<
   WorktreeManager,
   | 'create'
   | 'remove'
+  | 'removePreservingBranch'
   | 'hasChanges'
   | 'changedPaths'
   | 'commitWork'
+  | 'inspectExact'
+  | 'checkpointExact'
+  | 'reconcileExact'
+  | 'restoreExact'
   | 'refExists'
   | 'createBranch'
   | 'rebaseOnto'
@@ -74,6 +87,20 @@ function gitLocation(ws: Workspace): GitLocation {
   throw new Error(
     `workspace for run ${ws.runId} does not carry a git location — it was minted by another backend or an incompatible daemon version`,
   );
+}
+
+/** The stronger provenance check used only by the mission capability. Legacy parked workspaces
+ * retain their existing behavior, while mission evidence refuses a hand-edited location that
+ * points at any branch other than the one this exact run id is allowed to own. */
+function missionGitLocation(ws: Workspace): GitLocation {
+  const loc = gitLocation(ws);
+  const expectedBranch = runBranch(ws.runId);
+  if (loc.branch !== expectedBranch || ws.workRef !== expectedBranch) {
+    throw new Error(
+      `refusing mission Git operation for run ${ws.runId}: workspace branch provenance does not match ${expectedBranch}`,
+    );
+  }
+  return loc;
 }
 
 /**
@@ -124,7 +151,7 @@ function gitIndexSnapshotLocation(snapshot: IndexSnapshot): GitIndexSnapshotLoca
  *   currentBase → currentBase (RUN-222, same reasoning again: `CurrentBaseResult` on both ends)
  *   changeStats → changeStats (RUN-245, same reasoning again: `ChangeStatsResult` on both ends)
  */
-export class GitBackend implements VcsBackend {
+export class GitBackend implements VcsBackend, MissionVcsEvidence {
   readonly kind = 'git';
   /** Git isolates in SPACE — every lease mints its own worktree — so a wave's steps may hold
    *  one each, concurrently (RUN-170). The live pool-of-1 backends leave this absent. */
@@ -178,6 +205,68 @@ export class GitBackend implements VcsBackend {
 
   checkpoint(ws: Workspace, message: string): Promise<boolean> {
     return this.git.commitWork({ path: ws.localPath }, message);
+  }
+
+  async inspectWorkspace(ws: Workspace): Promise<MissionWorkspaceInspection> {
+    const loc = missionGitLocation(ws);
+    return this.git.inspectExact({
+      repoRoot: loc.repoRoot,
+      path: ws.localPath,
+      branch: loc.branch,
+    });
+  }
+
+  async checkpointExact(
+    ws: Workspace,
+    message: string,
+    opts: MissionCheckpointOptions,
+  ): Promise<MissionCheckpointEvidence> {
+    const loc = missionGitLocation(ws);
+    return this.git.checkpointExact(
+      { repoRoot: loc.repoRoot, path: ws.localPath, branch: loc.branch },
+      message,
+      opts,
+    );
+  }
+
+  async reconcileWorkspace(
+    ws: Workspace,
+    opts: MissionWorkspaceReconciliationOptions,
+  ): Promise<MissionWorkspaceReconciliationEvidence> {
+    const loc = missionGitLocation(ws);
+    return this.git.reconcileExact(
+      {
+        runId: ws.runId,
+        repoRoot: loc.repoRoot,
+        path: ws.localPath,
+        branch: loc.branch,
+      },
+      opts,
+    );
+  }
+
+  async restoreWorkspace(
+    ws: Workspace,
+    expectedRevisionId: string,
+  ): Promise<MissionWorkspaceRestorationEvidence> {
+    const loc = missionGitLocation(ws);
+    return this.git.restoreExact(
+      {
+        runId: ws.runId,
+        repoRoot: loc.repoRoot,
+        path: ws.localPath,
+        branch: loc.branch,
+      },
+      expectedRevisionId,
+    );
+  }
+
+  async releaseWorkspace(ws: Workspace, opts: MissionWorkspaceReleaseOptions): Promise<void> {
+    const loc = missionGitLocation(ws);
+    await this.git.removePreservingBranch(
+      { repoRoot: loc.repoRoot, path: ws.localPath, branch: loc.branch },
+      opts.preserveRevisionId,
+    );
   }
 
   targetExists(repoRoot: string, target: string): Promise<boolean> {

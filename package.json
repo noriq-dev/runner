@@ -8,7 +8,23 @@
   "bin": {
     "noriq-runner": "./dist/cli.js"
   },
-  "files": ["dist"],
+  "main": "./dist/index.js",
+  "types": "./dist/types/src/mission-library.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/src/mission-library.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./mission": {
+      "types": "./dist/types/src/mission-library.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./cli": "./dist/cli.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "MISSION-HARNESS.md"],
   "publishConfig": {
     "access": "public"
   },

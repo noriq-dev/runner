@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { invokedDirectly, renderIndexStatusText, run } from '../src/cli';
+import { invokedDirectly, renderIndexStatusText, run, stopDaemonFailClosed } from '../src/cli';
 import { COMMANDS } from '../src/completion';
 import { VERSION } from '../src/version';
 import { buildIndexRepoFixture } from './fixtures/index-repo-fixtures';
@@ -21,6 +21,21 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('cli', () => {
+  it('keeps first-signal shutdown fail-closed when daemon stop cannot prove quiescence', async () => {
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await expect(
+        stopDaemonFailClosed(async () => {
+          throw new Error('process tree is still live');
+        }),
+      ).resolves.toBe(false);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
+
   it('version prints the version and exits 0', async () => {
     expect(await run(['version'])).toBe(0);
     expect(out.join('\n')).toContain(VERSION);

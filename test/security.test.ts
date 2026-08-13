@@ -1,8 +1,16 @@
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { PermissionProfile, RunKind } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import { mapPermission } from '../src/drivers/claude';
 import { mapSandbox } from '../src/drivers/codex';
-import { STAGE_NORIQ_TOOLS, noriqToolNamesFor, sanitizedAgentEnv } from '../src/security';
+import {
+  STAGE_NORIQ_TOOLS,
+  noriqToolNamesFor,
+  projectMcpProcessEnv,
+  sanitizedAgentEnv,
+} from '../src/security';
 
 const perm = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -38,6 +46,25 @@ describe('sanitizedAgentEnv', () => {
     expect(env.GIT_CONFIG_COUNT).toBe('1');
     expect(env.GIT_CONFIG_KEY_0).toBe('credential.helper');
     expect(env.GIT_CONFIG_VALUE_0).toBe('');
+  });
+});
+
+describe('projectMcpProcessEnv', () => {
+  it('canonicalizes nested launcher PATH aliases independently of the parent process environment', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-mcp-env-'));
+    const runtime = path.join(root, 'runtime');
+    const alias = path.join(root, 'runtime-alias');
+    try {
+      await mkdir(runtime);
+      await symlink(runtime, alias, 'dir');
+
+      const env = projectMcpProcessEnv({ PATH: alias });
+
+      expect(env.PATH).toBe(runtime);
+      expect(env.HOME).toBe('/tmp/noriq-project-mcp');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

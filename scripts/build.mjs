@@ -1,10 +1,86 @@
-import { chmod, readFile, readdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { chmod, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 // Bundle the CLI into a single self-contained ESM file. Bundling inlines the
 // vendored @noriq-dev/shared, smol-toml, ws, and zod so the published package needs no
 // runtime dependency resolution and `npx @noriq-dev/runner` just works.
 import { build } from 'esbuild';
 
-const outfile = 'dist/cli.js';
+const cliOutfile = 'dist/cli.js';
+const libraryOutfile = 'dist/index.js';
+const declarationOutdir = path.resolve('dist/types');
+const declarationEntry = path.join(declarationOutdir, 'src/mission-library.d.ts');
+const sharedDeclarationEntry = path.join(declarationOutdir, 'vendor/noriq-shared/src/index.d.ts');
+const exec = promisify(execFile);
+
+async function listDeclarationFiles(directory) {
+  const files = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listDeclarationFiles(absolute)));
+    } else if (entry.isFile() && entry.name.endsWith('.d.ts')) {
+      files.push(absolute);
+    }
+  }
+  return files;
+}
+
+function declarationRuntimeSpecifier(fromFile, targetFile) {
+  const runtimeTarget = targetFile.replace(/\.d\.ts$/, '.js');
+  const relative = path.relative(path.dirname(fromFile), runtimeTarget).split(path.sep).join('/');
+  return relative.startsWith('.') ? relative : `./${relative}`;
+}
+
+function normalizeDeclarationSpecifier(specifier, declarationFile) {
+  if (specifier === '@noriq-dev/shared') {
+    return declarationRuntimeSpecifier(declarationFile, sharedDeclarationEntry);
+  }
+  if (!specifier.startsWith('./') && !specifier.startsWith('../')) return specifier;
+  return path.posix.extname(specifier) ? specifier : `${specifier}.js`;
+}
+
+function rewriteDeclarationSpecifiers(source, declarationFile) {
+  return source
+    .replace(
+      /(\bfrom\s+)(['"])([^'"]+)\2/g,
+      (_match, prefix, quote, specifier) =>
+        `${prefix}${quote}${normalizeDeclarationSpecifier(specifier, declarationFile)}${quote}`,
+    )
+    .replace(
+      /(\bimport\s*\(\s*)(['"])([^'"]+)\2(\s*\))/g,
+      (_match, prefix, quote, specifier, suffix) =>
+        `${prefix}${quote}${normalizeDeclarationSpecifier(specifier, declarationFile)}${quote}${suffix}`,
+    )
+    .replace(
+      /(\bimport\s+)(['"])([^'"]+)\2/g,
+      (_match, prefix, quote, specifier) =>
+        `${prefix}${quote}${normalizeDeclarationSpecifier(specifier, declarationFile)}${quote}`,
+    );
+}
+
+async function emitDeclarations() {
+  await rm(declarationOutdir, { recursive: true, force: true });
+  const tsc = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
+  const config = fileURLToPath(new URL('../tsconfig.package-types.json', import.meta.url));
+  await exec(process.execPath, [tsc, '--project', config], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    maxBuffer: 16 * 1024 * 1024,
+  });
+
+  for (const declarationFile of await listDeclarationFiles(declarationOutdir)) {
+    const source = await readFile(declarationFile, 'utf8');
+    const rewritten = rewriteDeclarationSpecifiers(source, declarationFile);
+    if (rewritten.includes('@noriq-dev/shared')) {
+      throw new Error(`unshipped @noriq-dev/shared reference in ${declarationFile}`);
+    }
+    await writeFile(declarationFile, rewritten, 'utf8');
+  }
+
+  await readFile(declarationEntry);
+}
 
 // package.json is the single source of truth for the version (RUN-36). src/version.ts used to
 // hardcode it under a "bump in lockstep" comment while this script injected nothing — so the
@@ -59,9 +135,7 @@ for (const [id, file] of Object.entries(grammarFiles)) {
 // unlike @vscode/tree-sitter-wasm, whose grammar BYTES are inlined above instead.
 const external = ['@anthropic-ai/claude-agent-sdk', 'web-tree-sitter'];
 
-await build({
-  entryPoints: ['src/cli.ts'],
-  outfile,
+const commonBuildOptions = {
   bundle: true,
   platform: 'node',
   format: 'esm',
@@ -85,7 +159,25 @@ await build({
     ].join('\n'),
   },
   logLevel: 'info',
+};
+
+await build({
+  ...commonBuildOptions,
+  entryPoints: ['src/cli.ts'],
+  outfile: cliOutfile,
 });
 
-await chmod(outfile, 0o755);
-console.log(`built ${outfile}`);
+// The import surface is intentionally mission-only rather than a second build of `src/index.ts`.
+// That historical barrel exports the grammar-backed indexing stack, whose inlined WASM already
+// rides inside the CLI. Mission consumers need the durable harness and generic MCP preparation
+// boundary, not a duplicate copy of every daemon subsystem and grammar in their package import.
+await build({
+  ...commonBuildOptions,
+  entryPoints: ['src/mission-library.ts'],
+  outfile: libraryOutfile,
+});
+
+await emitDeclarations();
+
+await chmod(cliOutfile, 0o755);
+console.log(`built ${cliOutfile}, ${libraryOutfile}, and ${path.relative('.', declarationEntry)}`);

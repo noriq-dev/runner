@@ -1,4 +1,4 @@
-import { RUNNER_PROTOCOL_CAPABILITIES, RunnerClientMessage } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, RUNNER_PROTOCOL_CAPABILITIES, RunnerClientMessage } from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   WsClient,
@@ -67,6 +67,7 @@ const RUN = {
   projectId: 'prj_a',
   runnerId: 'rnr_1',
   agentId: null,
+  executionProfile: null,
   kind: 'build',
   anchor: null,
   brief: 'go',
@@ -79,6 +80,8 @@ const RUN = {
   createdAt: '2026-07-14T00:00:00.000Z',
   updatedAt: '2026-07-14T00:00:00.000Z',
 };
+const FIRST_GENERATION = 1;
+const NEXT_GENERATION = 2;
 
 let sockets: FakeSocket[];
 let factory: WsFactory;
@@ -302,7 +305,9 @@ describe('WsClient', () => {
     const onRegistered = vi.fn();
     const onAssigned = vi.fn();
     const onCancel = vi.fn();
-    const client = makeClient({ handlers: { onRegistered, onAssigned, onCancel } });
+    const client = makeClient({
+      handlers: { onRegistered, onAssigned, onCancel },
+    });
     client.start();
     const s = sockets[0]!;
     s.emit('open');
@@ -317,14 +322,323 @@ describe('WsClient', () => {
       }),
     );
     s.emit('message', JSON.stringify({ type: 'run.assigned', run: RUN }));
-    s.emit('message', JSON.stringify({ type: 'run.cancel', runId: 'run_1', hard: true, reason: 'stop' }));
-    expect(onRegistered).toHaveBeenCalledWith({
-      runnerId: 'rnr_1',
-      protocol: 1,
-      acceptedCapabilities: ['orchestration.v1'],
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'run.cancel',
+        runId: 'run_1',
+        hard: true,
+        reason: 'stop',
+      }),
+    );
+    expect(onRegistered).toHaveBeenCalledWith(
+      {
+        runnerId: 'rnr_1',
+        protocol: 1,
+        acceptedCapabilities: ['orchestration.v1'],
+      },
+      FIRST_GENERATION,
+    );
+    expect(onAssigned).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'run_1', kind: 'build' }),
+      null,
+      FIRST_GENERATION,
+    );
+    expect(onCancel).toHaveBeenCalledWith(
+      {
+        runId: 'run_1',
+        hard: true,
+        reason: 'stop',
+      },
+      FIRST_GENERATION,
+    );
+    expect(client.hasAcceptedCapability('orchestration.v1')).toBe(true);
+    expect(client.hasAcceptedCapability('mission.v2')).toBe(false);
+    client.stop();
+  });
+
+  it('clears negotiated capabilities when the owning socket closes', () => {
+    const client = makeClient();
+    client.start();
+    const s = sockets[0]!;
+    s.emit('open');
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: ['mission.v2'],
+      }),
+    );
+    expect(client.hasAcceptedCapability('mission.v2')).toBe(true);
+    s.emit('close');
+    expect(client.hasAcceptedCapability('mission.v2')).toBe(false);
+    client.stop();
+  });
+
+  it('routes mission leases, task acknowledgements, and reconciliation frames', () => {
+    const onAssigned = vi.fn();
+    const onMissionTaskAck = vi.fn();
+    const onMissionReconcileRequest = vi.fn();
+    const onMissionReconcileResult = vi.fn();
+    const client = makeClient({
+      handlers: {
+        onAssigned,
+        onMissionTaskAck,
+        onMissionReconcileRequest,
+        onMissionReconcileResult,
+      },
     });
-    expect(onAssigned).toHaveBeenCalledWith(expect.objectContaining({ id: 'run_1', kind: 'build' }));
-    expect(onCancel).toHaveBeenCalledWith({ runId: 'run_1', hard: true, reason: 'stop' });
+    client.start();
+    const s = sockets[0]!;
+    s.emit('open');
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: [MISSION_CAPABILITY],
+      }),
+    );
+    const lease = { sitting: 2, executionId: 'exe_root', epoch: 3 };
+    s.emit('message', JSON.stringify({ type: 'run.assigned', run: RUN, missionLease: lease }));
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.task.ack',
+        ack: {
+          reportId: 'begin:1',
+          attemptId: 'attempt:1',
+          phase: 'begin',
+          accepted: true,
+          taskId: 'task_1',
+          claimId: 'claim_1',
+          executionId: 'exe_child',
+          taskStatus: 'in_progress',
+          error: null,
+        },
+      }),
+    );
+    const inventory = [{ runId: 'run_1', lease, attempts: [] }];
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.reconcile.request',
+        deadline: '2026-07-14T00:00:30.000Z',
+        items: inventory,
+      }),
+    );
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.reconcile.result',
+        results: [{ runId: 'run_1', decision: 'adopt', lease, reason: null }],
+      }),
+    );
+
+    expect(onAssigned).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'run_1' }),
+      lease,
+      FIRST_GENERATION,
+    );
+    expect(onMissionTaskAck).toHaveBeenCalledWith(
+      expect.objectContaining({ reportId: 'begin:1', accepted: true }),
+      FIRST_GENERATION,
+    );
+    expect(onMissionReconcileRequest).toHaveBeenCalledWith(
+      {
+        deadline: '2026-07-14T00:00:30.000Z',
+        items: inventory,
+      },
+      FIRST_GENERATION,
+    );
+    expect(onMissionReconcileResult).toHaveBeenCalledWith(
+      [expect.objectContaining({ runId: 'run_1', decision: 'adopt', lease })],
+      FIRST_GENERATION,
+    );
+    client.stop();
+  });
+
+  it('refuses outbound mission frames until mission.v2 is accepted on the current socket', () => {
+    const client = makeClient();
+    const lease = { sitting: 2, executionId: 'exe_root', epoch: 3 };
+    const begin = {
+      reportId: 'begin:1',
+      attemptId: 'attempt:1',
+      taskId: 'task_1',
+      childKey: 'step_1',
+      observedAt: '2026-07-14T00:00:00.000Z',
+    };
+    const settle = {
+      reportId: 'settle:1',
+      attemptId: 'attempt:1',
+      claimId: 'claim_1',
+      outcome: 'done' as const,
+      reason: null,
+      observedAt: '2026-07-14T00:00:01.000Z',
+    };
+    client.start();
+    const first = sockets[0]!;
+    first.emit('open');
+
+    expect(client.sendMissionTaskBegin('run_1', lease, begin, FIRST_GENERATION)).toBe(false);
+    first.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: ['orchestration.v1'],
+      }),
+    );
+    expect(client.sendMissionTaskSettle('run_1', lease, settle, FIRST_GENERATION)).toBe(false);
+    expect(
+      client.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION),
+    ).toBe(false);
+    expect(first.msgs().filter((message) => String(message.type).startsWith('mission.'))).toEqual([]);
+
+    first.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:01.000Z',
+        acceptedCapabilities: [MISSION_CAPABILITY],
+      }),
+    );
+    expect(client.sendMissionTaskBegin('run_1', lease, begin, FIRST_GENERATION)).toBe(true);
+    expect(client.sendMissionTaskSettle('run_1', lease, settle, FIRST_GENERATION)).toBe(true);
+    expect(
+      client.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION),
+    ).toBe(true);
+
+    first.emit('close');
+    vi.advanceTimersByTime(1000);
+    const second = sockets[1]!;
+    second.emit('open');
+    expect(client.sendMissionTaskBegin('run_1', lease, begin, FIRST_GENERATION)).toBe(false);
+    expect(second.msgs().filter((message) => String(message.type).startsWith('mission.'))).toEqual([]);
+    second.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:02.000Z',
+        acceptedCapabilities: [MISSION_CAPABILITY],
+      }),
+    );
+    expect(client.sendMissionTaskBegin('run_1', lease, begin, FIRST_GENERATION)).toBe(false);
+    expect(client.sendMissionTaskBegin('run_1', lease, begin, NEXT_GENERATION)).toBe(true);
+    client.stop();
+  });
+
+  it.each([
+    ['before registration', null],
+    ['when registration omitted mission.v2', ['orchestration.v1']],
+  ] as const)(
+    'rejects every inbound mission frame %s and restarts that connection generation',
+    (_case, acceptedCapabilities) => {
+      const frames = [
+        {
+          type: 'mission.task.ack',
+          ack: {
+            reportId: 'begin:1',
+            attemptId: 'attempt:1',
+            phase: 'begin',
+            accepted: true,
+            taskId: 'task_1',
+            claimId: 'claim_1',
+            executionId: 'exe_child',
+            taskStatus: 'in_progress',
+            error: null,
+          },
+        },
+        {
+          type: 'mission.reconcile.request',
+          deadline: '2026-07-14T00:00:30.000Z',
+          items: [],
+        },
+        { type: 'mission.reconcile.result', results: [] },
+      ];
+
+      for (const frame of frames) {
+        const onMissionTaskAck = vi.fn();
+        const onMissionReconcileRequest = vi.fn();
+        const onMissionReconcileResult = vi.fn();
+        const client = makeClient({
+          handlers: {
+            onMissionTaskAck,
+            onMissionReconcileRequest,
+            onMissionReconcileResult,
+          },
+        });
+        client.start();
+        const socket = sockets.at(-1)!;
+        socket.emit('open');
+        if (acceptedCapabilities) {
+          socket.emit(
+            'message',
+            JSON.stringify({
+              type: 'registered',
+              runnerId: 'rnr_1',
+              protocol: 1,
+              serverTime: '2026-07-14T00:00:00.000Z',
+              acceptedCapabilities,
+            }),
+          );
+        }
+
+        socket.emit('message', JSON.stringify(frame));
+
+        expect(onMissionTaskAck).not.toHaveBeenCalled();
+        expect(onMissionReconcileRequest).not.toHaveBeenCalled();
+        expect(onMissionReconcileResult).not.toHaveBeenCalled();
+        expect(socket.closed).toBe(true);
+        client.stop();
+      }
+    },
+  );
+
+  it('rejects a leased assignment without mission.v2 and abandons that socket generation', () => {
+    const onAssigned = vi.fn();
+    const onDisconnect = vi.fn();
+    const client = makeClient({ handlers: { onAssigned, onDisconnect } });
+    client.start();
+    const socket = sockets[0]!;
+    socket.emit('open');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: ['orchestration.v1'],
+      }),
+    );
+
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'run.assigned',
+        run: RUN,
+        missionLease: { sitting: 2, executionId: 'exe_root', epoch: 3 },
+      }),
+    );
+
+    expect(onAssigned).not.toHaveBeenCalled();
+    expect(onDisconnect).toHaveBeenCalledWith(
+      'received run.assigned without accepted mission.v2',
+      FIRST_GENERATION,
+    );
+    expect(socket.closed).toBe(true);
     client.stop();
   });
 
@@ -357,7 +671,13 @@ describe('WsClient', () => {
       sourceMessageId: null,
       noticeCursor: 42,
     });
-    client.sendSteerAck({ runId: 'run_1', steerId: 's1', delivered: true, via: 'runtime', noticeCursor: 42 });
+    client.sendSteerAck({
+      runId: 'run_1',
+      steerId: 's1',
+      delivered: true,
+      via: 'runtime',
+      noticeCursor: 42,
+    });
     const ack = s.msgs().find((m) => m.type === 'steer.ack');
     expect(ack).toMatchObject({
       runId: 'run_1',
@@ -374,9 +694,18 @@ describe('WsClient', () => {
     client.start();
     const s0 = sockets[0]!;
     s0.emit('open');
-    client.sendTelemetry('run_1', { tokensUsed: 4200, usdSpent: 0.19, logTail: 'compiling...' });
+    client.sendTelemetry('run_1', {
+      tokensUsed: 4200,
+      usdSpent: 0.19,
+      logTail: 'compiling...',
+    });
     const tel = s0.msgs().find((m) => m.type === 'run.telemetry');
-    expect(tel).toMatchObject({ runId: 'run_1', tokensUsed: 4200, usdSpent: 0.19, logTail: 'compiling...' });
+    expect(tel).toMatchObject({
+      runId: 'run_1',
+      tokensUsed: 4200,
+      usdSpent: 0.19,
+      logTail: 'compiling...',
+    });
     expect(typeof tel!.at).toBe('string');
     // A tick that doesn't know the mix sends null, not a wiped field (RUN-59): the server COALESCEs.
     expect(tel!.modelUsage).toBeNull();
@@ -420,6 +749,7 @@ describe('WsClient', () => {
     const s1 = sockets[1]!;
     s1.emit('open');
     expect(onReconnect).toHaveBeenCalledOnce();
+    expect(onReconnect).toHaveBeenCalledWith(NEXT_GENERATION);
     const msgs = s1.msgs();
     expect(msgs[0]!.type).toBe('hello'); // re-hello first
     const reassert = msgs.find((m) => m.type === 'run.status' && m.runId === 'run_1');
@@ -442,12 +772,61 @@ describe('WsClient', () => {
     client.stop();
   });
 
-  // RUN-195. Manifests and workflow files are read-at-use daemon-side, so what a hello advertises
-  // must be resolved for THIS connection — a reconnect after a workflow edit re-advertising the
-  // startup snapshot would show the server a list a dispatch can no longer resolve.
-  describe('repo reports are re-resolved per connection (RUN-195)', () => {
-    // The provider resolves through microtasks only (no timer is involved), so a few turns of the
-    // queue are all openAsync needs to reach the dial.
+  it('does not re-assert a gated run because gated is terminal', () => {
+    const client = makeClient();
+    client.start();
+    const s0 = sockets[0]!;
+    s0.emit('open');
+    client.sendRunStatus('run_1', 'running');
+    client.sendRunStatus('run_1', 'gated', { exit: { outcome: 'gated' } });
+    s0.emit('close');
+    vi.advanceTimersByTime(1000);
+    const s1 = sockets[1]!;
+    s1.emit('open');
+    expect(s1.msgs().some((message) => message.type === 'run.status')).toBe(false);
+    client.stop();
+  });
+
+  it('never re-asserts a leased mission status before adoption', () => {
+    const client = makeClient();
+    client.start();
+    const s0 = sockets[0]!;
+    s0.emit('open');
+    const lease = { sitting: 1, executionId: 'exe_root', epoch: 1 };
+    expect(
+      client.sendRunStatus('run_1', 'running', {
+        missionLease: lease,
+        connectionGeneration: FIRST_GENERATION,
+      }),
+    ).toBe(false);
+    expect(client.sendTelemetry('run_1', { tokensUsed: 1, missionLease: lease })).toBe(false);
+    s0.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: [MISSION_CAPABILITY],
+      }),
+    );
+    expect(
+      client.sendRunStatus('run_1', 'running', {
+        missionLease: lease,
+        connectionGeneration: FIRST_GENERATION,
+      }),
+    ).toBe(true);
+    s0.emit('close');
+    vi.advanceTimersByTime(1000);
+    const s1 = sockets[1]!;
+    s1.emit('open');
+    expect(s1.msgs().some((message) => message.type === 'run.status')).toBe(false);
+    client.stop();
+  });
+
+  // RUN-195/mission.v2. Registration provides the initial current snapshot; later filesystem and
+  // attestation refreshes must update it without delaying the control socket or adoption window.
+  describe('repo reports are refreshed behind the live control channel', () => {
     const flush = async () => {
       for (let i = 0; i < 4; i++) await Promise.resolve();
     };
@@ -463,7 +842,7 @@ describe('WsClient', () => {
       },
     ];
 
-    it('the initial hello advertises what the provider resolves, contract-valid', async () => {
+    it('the initial hello is immediate, then a successful refresh publishes the new snapshot', async () => {
       const fresh = reportWith([
         { name: 'build', base: 'build' },
         { name: 'docs', base: 'scope', description: 'survey the repo' },
@@ -472,15 +851,16 @@ describe('WsClient', () => {
       ]);
       const client = makeClient({ refreshRepos: async () => fresh });
       client.start();
-      await flush();
       const s = sockets[0]!;
       s.emit('open');
       const hello = s.msgs()[0]!;
       expect(hello.type).toBe('hello');
-      expect(hello.repos).toEqual(fresh);
+      expect(hello.repos).toEqual(IDENTITY.repos);
       // The object workflow entries must satisfy the refreshed vendored contract — an off-contract
       // hello is dropped server-side without a word back.
       expect(RunnerClientMessage.safeParse(hello).success).toBe(true);
+      await flush();
+      expect(s.msgs().find((message) => message.type === 'heartbeat' && message.repos)?.repos).toEqual(fresh);
       client.stop();
     });
 
@@ -493,20 +873,25 @@ describe('WsClient', () => {
         },
       });
       client.start();
-      await flush();
       const s0 = sockets[0]!;
       s0.emit('open');
-      expect((s0.msgs()[0]!.repos as Array<{ workflows: unknown }>)[0]!.workflows).toEqual([
-        { name: 'docs', base: 'scope', description: 'v1' },
-      ]);
+      await flush();
+      expect(calls).toBe(1);
 
       s0.emit('close'); // the files changed while the socket was down
       vi.advanceTimersByTime(1000);
-      await flush();
       expect(sockets).toHaveLength(2);
       const s1 = sockets[1]!;
       s1.emit('open');
+      // The reconnect hello carries the last successful snapshot without waiting for the next
+      // observation; the immediate follow-up publishes v2 once it resolves.
       expect((s1.msgs()[0]!.repos as Array<{ workflows: unknown }>)[0]!.workflows).toEqual([
+        { name: 'docs', base: 'scope', description: 'v1' },
+      ]);
+      await flush();
+      expect(calls).toBe(2);
+      const refreshed = s1.msgs().find((message) => message.type === 'heartbeat' && message.repos);
+      expect((refreshed!.repos as Array<{ workflows: unknown }>)[0]!.workflows).toEqual([
         { name: 'docs', base: 'scope', description: 'v2' },
       ]);
       client.stop();
@@ -522,19 +907,21 @@ describe('WsClient', () => {
         },
       });
       client.start();
-      await flush();
       sockets[0]!.emit('open');
-      expect(sockets[0]!.msgs()[0]!.repos).toEqual(fresh);
+      await flush();
+      expect(
+        sockets[0]!.msgs().find((message) => message.type === 'heartbeat' && message.repos)?.repos,
+      ).toEqual(fresh);
 
       fail = true;
       sockets[0]!.emit('close');
       vi.advanceTimersByTime(1000);
-      await flush();
       expect(sockets).toHaveLength(2); // the broken refresh did not keep the daemon offline
       sockets[1]!.emit('open');
       const hello = sockets[1]!.msgs()[0]!;
       expect(hello.type).toBe('hello');
       expect(hello.repos).toEqual(fresh); // the last good set, not [] and not a crash
+      await flush();
       client.stop();
     });
 
@@ -548,9 +935,7 @@ describe('WsClient', () => {
       client.stop();
     });
 
-    it('stop() landing during a pending refresh never dials', async () => {
-      // The stale-guard the async provider needs: stop() can land while the refresh is pending,
-      // and resolving afterwards must not open a socket for a shut-down daemon.
+    it('stop() landing during a pending refresh never publishes the late result', async () => {
       let resolveRepos!: (r: WsIdentity['repos']) => void;
       const client = makeClient({
         refreshRepos: () =>
@@ -559,11 +944,48 @@ describe('WsClient', () => {
           }),
       });
       client.start();
+      expect(sockets).toHaveLength(1);
+      sockets[0]!.emit('open');
       client.stop();
       resolveRepos([]);
       await flush();
       vi.advanceTimersByTime(60_000);
-      expect(sockets).toHaveLength(0); // never dialled, never rescheduled
+      expect(sockets).toHaveLength(1);
+      expect(
+        sockets[0]!.msgs().some((message) => message.repos !== undefined && message.type === 'heartbeat'),
+      ).toBe(false);
+    });
+
+    it('re-attests repo/profile offers on heartbeats without overlapping refreshes', async () => {
+      let calls = 0;
+      let resolveHeartbeat!: (reports: WsIdentity['repos']) => void;
+      const fresh = reportWith([{ name: 'build', base: 'build' }]);
+      const client = makeClient({
+        refreshRepos: async () => {
+          calls += 1;
+          if (calls === 1)
+            return new Promise((resolve) => {
+              resolveHeartbeat = resolve;
+            });
+          return new Promise((resolve) => {
+            resolveHeartbeat = resolve;
+          });
+        },
+      });
+      client.start();
+      const s = sockets[0]!;
+      s.emit('open');
+      expect(calls).toBe(1);
+      s.emit('message', JSON.stringify({ type: 'pong' }));
+      vi.advanceTimersByTime(1000);
+      expect(calls).toBe(1); // the still-pending attestation was not duplicated
+
+      resolveHeartbeat(fresh);
+      await flush();
+      expect(s.msgs().some((message) => message.type === 'heartbeat' && message.repos !== undefined)).toBe(
+        true,
+      );
+      client.stop();
     });
   });
 
@@ -588,6 +1010,16 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
     c.start();
     const s = sockets[0]!;
     s.emit('open');
+    s.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: 'rnr_1',
+        protocol: 1,
+        serverTime: '2026-07-14T00:00:00.000Z',
+        acceptedCapabilities: [MISSION_CAPABILITY],
+      }),
+    );
     return () => s.msgs();
   };
 
@@ -595,7 +1027,9 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
     const c = makeClient();
     const frames = framesFrom(c);
     // Exactly what the supervisor reports on a gated build: outcome + reason, no clock.
-    c.sendRunStatus('run_1', 'failed', { exit: { outcome: 'failed', reason: 'verify' } });
+    c.sendRunStatus('run_1', 'failed', {
+      exit: { outcome: 'failed', reason: 'verify' },
+    });
 
     const status = frames().find((f) => f.type === 'run.status')!;
     const parsed = RunnerClientMessage.safeParse(status);
@@ -608,7 +1042,11 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
     const c = makeClient();
     const frames = framesFrom(c);
     c.sendRunStatus('run_1', 'done', {
-      exit: { outcome: 'done', reason: null, finishedAt: '2026-07-14T00:00:00.000Z' },
+      exit: {
+        outcome: 'done',
+        reason: null,
+        finishedAt: '2026-07-14T00:00:00.000Z',
+      },
     });
     const status = frames().find((f) => f.type === 'run.status')!;
     expect((status?.exit as Record<string, unknown>).finishedAt).toBe('2026-07-14T00:00:00.000Z');
@@ -618,14 +1056,78 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
     const c = makeClient();
     const frames = framesFrom(c);
     c.sendRunStatus('run_1', 'running', { worktreePath: '/wt/run_1' });
-    c.sendRunStatus('run_1', 'done', { exit: { outcome: 'done', reason: null } });
+    c.sendRunStatus('run_1', 'done', {
+      exit: { outcome: 'done', reason: null },
+    });
     c.sendTelemetry('run_1', { tokensUsed: 10, usdSpent: 0.01, logTail: 'x' });
-    c.sendSteerAck({ runId: 'run_1', steerId: 's1', delivered: true, via: 'runtime' });
+    c.sendSteerAck({
+      runId: 'run_1',
+      steerId: 's1',
+      delivered: true,
+      via: 'runtime',
+    });
 
     for (const f of frames()) {
       const parsed = RunnerClientMessage.safeParse(f);
       expect(parsed.success, `frame ${String(f.type)} violates the contract`).toBe(true);
     }
+  });
+
+  it('sends contract-valid mission lifecycle, task, and reconciliation frames with the exact lease', () => {
+    const c = makeClient();
+    const frames = framesFrom(c);
+    const lease = { sitting: 1, executionId: 'exe_root', epoch: 4 };
+    c.sendRunStatus('run_1', 'running', {
+      missionLease: lease,
+      connectionGeneration: FIRST_GENERATION,
+    });
+    c.sendTelemetry('run_1', {
+      tokensUsed: 10,
+      missionLease: lease,
+      connectionGeneration: FIRST_GENERATION,
+    });
+    c.sendMissionTaskBegin(
+      'run_1',
+      lease,
+      {
+        reportId: 'begin:attempt_1',
+        attemptId: 'attempt_1',
+        taskId: 'task_1',
+        childKey: 'step_1',
+        observedAt: '2026-07-14T00:00:00.000Z',
+      },
+      FIRST_GENERATION,
+    );
+    c.sendMissionTaskSettle(
+      'run_1',
+      lease,
+      {
+        reportId: 'settle:attempt_1',
+        attemptId: 'attempt_1',
+        claimId: 'claim_1',
+        outcome: 'done',
+        reason: null,
+        observedAt: '2026-07-14T00:00:01.000Z',
+      },
+      FIRST_GENERATION,
+    );
+    c.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION);
+
+    const missionFrames = frames().filter((frame) =>
+      [
+        'run.status',
+        'run.telemetry',
+        'mission.task.begin',
+        'mission.task.settle',
+        'mission.reconcile',
+      ].includes(String(frame.type)),
+    );
+    expect(missionFrames).toHaveLength(5);
+    for (const frame of missionFrames) {
+      expect(RunnerClientMessage.safeParse(frame).success, String(frame.type)).toBe(true);
+    }
+    expect(missionFrames.find((frame) => frame.type === 'run.status')?.missionLease).toEqual(lease);
+    expect(missionFrames.find((frame) => frame.type === 'run.telemetry')?.missionLease).toEqual(lease);
   });
 
   it('carries a real per-model mix on the telemetry frame, contract-valid (RUN-59)', () => {

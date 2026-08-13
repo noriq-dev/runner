@@ -1,0 +1,555 @@
+import { z } from 'zod';
+import {
+  MAX_MISSION_CHILD_INSTRUCTION_CHARS,
+  MAX_MISSION_GUIDE_TURNS,
+  MAX_MISSION_OBJECTIVE_CHARS,
+  MAX_MISSION_PLAN_ACCEPTANCE_CHARS,
+  MAX_MISSION_PLAN_ACCEPTANCE_ITEMS,
+  MAX_MISSION_PLAN_INSTRUCTION_CHARS,
+  MAX_MISSION_PLAN_STEPS,
+  MAX_MISSION_PLAN_SUMMARY_CHARS,
+  MAX_MISSION_REVIEW_SUMMARY_CHARS,
+  MAX_MISSION_VALIDATION_OUTPUT_BYTES,
+} from './protocol';
+import type { MissionAction } from './protocol';
+
+const MAX_RESOURCE_KEYS = 128;
+const UNSAFE_OBJECT_KEYS = new Set([...Object.getOwnPropertyNames(Object.prototype), 'prototype']);
+
+const boundedText = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .refine((value) => value.trim().length > 0, 'must contain non-whitespace text');
+const boundedRecordKey = (max: number) =>
+  boundedText(max).refine((key) => !UNSAFE_OBJECT_KEYS.has(key), 'reserved object key is not allowed');
+
+const safeNonNegativeInteger = z
+  .number()
+  .refine((value) => Number.isSafeInteger(value) && value >= 0, 'must be a non-negative safe integer');
+const finiteNonNegativeNumber = z.number().finite().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
+const nullableBudgetInteger = z.union([safeNonNegativeInteger, z.null()]);
+const nullableBudgetNumber = z.union([finiteNonNegativeNumber, z.null()]);
+
+const budgetSchema = z.strictObject({
+  tokens: nullableBudgetInteger,
+  usd: nullableBudgetNumber,
+  activeSeconds: nullableBudgetNumber,
+});
+
+const usageSchema = z.strictObject({
+  tokens: nullableBudgetInteger,
+  usd: nullableBudgetNumber,
+  activeSeconds: nullableBudgetNumber,
+});
+
+const resourceKeySchema = boundedRecordKey(128);
+
+function resourcesSchema(allowZero: boolean) {
+  const units = z
+    .number()
+    .refine(
+      (value) => Number.isSafeInteger(value) && (allowZero ? value >= 0 : value > 0),
+      allowZero ? 'must be a non-negative safe integer' : 'must be a positive safe integer',
+    );
+  return z
+    .record(resourceKeySchema, units)
+    .refine((resources) => Object.keys(resources).length <= MAX_RESOURCE_KEYS, {
+      message: `must contain at most ${MAX_RESOURCE_KEYS} resource keys`,
+    });
+}
+
+const objectiveSchema = z.strictObject({
+  brief: boundedText(MAX_MISSION_OBJECTIVE_CHARS),
+  taskId: boundedText(256).optional(),
+  runId: boundedText(256).optional(),
+  repositoryKey: boundedText(256).optional(),
+  baseRevision: boundedText(512).optional(),
+});
+
+const completionPolicySchema = z.strictObject({
+  requireCheckpoint: z.boolean(),
+  requireReview: z.boolean(),
+});
+
+const validationPolicySchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('command'),
+    policyId: boundedRecordKey(256),
+    command: boundedText(16_384),
+    timeoutSeconds: z.number().int().positive().max(86_400),
+    shell: z.union([boundedText(512), z.null()]),
+  }),
+  z.strictObject({
+    kind: z.literal('none'),
+    policyId: boundedRecordKey(256),
+    reason: boundedText(16_384),
+  }),
+]);
+
+const agentSelectionSchema = z.strictObject({
+  driver: boundedText(128),
+  model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/),
+  effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+});
+
+const uniqueBoundedRules = z
+  .array(boundedText(512))
+  .max(256)
+  .refine((rules) => new Set(rules).size === rules.length, 'permission rules must be unique');
+
+const driverPostureSchema = z.strictObject({
+  kind: z.enum(['scope', 'build', 'verify']),
+  permission: z.strictObject({
+    write: z.boolean(),
+    allow: uniqueBoundedRules,
+    deny: uniqueBoundedRules,
+    auto: z.boolean(),
+  }),
+  lineageRole: z.enum(['planner', 'worker', 'reviewer', 'verifier', 'repair', 'system']),
+});
+
+const projectMcpGrantSchema = z.strictObject({
+  server: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+  tools: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(256)
+        .refine((tool) => tool === tool.trim() && !tool.includes('*'), 'must be an exact tool name'),
+    )
+    .min(1)
+    .max(256)
+    .refine((tools) => new Set(tools).size === tools.length, 'tool grants must be unique'),
+});
+
+const projectMcpGrantsSchema = z
+  .array(projectMcpGrantSchema)
+  .max(16)
+  .refine(
+    (grants) => new Set(grants.map((grant) => grant.server)).size === grants.length,
+    'project MCP server grants must be unique',
+  );
+
+const guideProfileSchema = z.strictObject({
+  profileId: boundedRecordKey(256),
+  agent: agentSelectionSchema,
+  budget: budgetSchema,
+  turnLimit: z.number().int().positive().max(MAX_MISSION_GUIDE_TURNS),
+});
+
+const reviewAssuranceSchema = z.strictObject({
+  rank: z.number().refine((value) => Number.isSafeInteger(value) && value > 0, {
+    message: 'assurance rank must be a positive safe integer',
+  }),
+  independenceClass: boundedRecordKey(128),
+});
+
+const projectMcpFingerprintSchema = z.union([z.string().regex(/^[a-f0-9]{64}$/), z.null()]);
+
+const executionProfileSchema = z.strictObject({
+  profileId: boundedRecordKey(256),
+  role: boundedText(128),
+  permission: z.enum(['read', 'write']),
+  agent: agentSelectionSchema,
+  assurance: reviewAssuranceSchema,
+  driverPosture: driverPostureSchema,
+  budget: budgetSchema,
+  resources: resourcesSchema(false),
+  projectMcp: projectMcpGrantsSchema,
+});
+
+const executionProfilesSchema = z
+  .array(executionProfileSchema)
+  .min(1)
+  .max(64)
+  .refine(
+    (profiles) => new Set(profiles.map((profile) => profile.profileId)).size === profiles.length,
+    'execution profile ids must be unique',
+  );
+
+const cleanupSchema = z
+  .array(boundedRecordKey(256))
+  .max(128)
+  .refine((cleanup) => new Set(cleanup).size === cleanup.length, 'cleanup ids must be unique');
+
+const guideEpochSchema = safeNonNegativeInteger;
+const childIdSchema = boundedRecordKey(256);
+const planStepIdSchema = boundedRecordKey(128);
+const checkpointIdSchema = boundedRecordKey(512);
+const turnIdSchema = boundedRecordKey(256);
+const questionIdSchema = boundedRecordKey(256);
+const reviewIdSchema = boundedRecordKey(256);
+const cleanupIdSchema = boundedRecordKey(256);
+const validationIdSchema = boundedRecordKey(256);
+const policyIdSchema = boundedRecordKey(256);
+const nullableCheckpointIdSchema = z.union([checkpointIdSchema, z.null()]);
+const nullableRevisionIdSchema = z.union([boundedText(512), z.null()]);
+const exitCodeSchema = z.union([z.number().safe().int(), z.null()]);
+const validationOutputTailSchema = z
+  .string()
+  .refine(
+    (value) => Buffer.byteLength(value, 'utf8') <= MAX_MISSION_VALIDATION_OUTPUT_BYTES,
+    `must be at most ${MAX_MISSION_VALIDATION_OUTPUT_BYTES} UTF-8 bytes`,
+  );
+const reviewArtifactSchema = z.strictObject({
+  type: z.literal('review'),
+  checkpointId: checkpointIdSchema,
+  revisionId: checkpointIdSchema,
+  verdict: z.enum(['passed', 'changes-requested']),
+  highestSeverity: z.enum(['none', 'low', 'medium', 'high', 'critical']),
+  summary: boundedText(MAX_MISSION_REVIEW_SUMMARY_CHARS),
+});
+const executionPlanStepSchema = z.strictObject({
+  id: boundedRecordKey(128),
+  title: boundedText(256),
+  profileId: boundedRecordKey(256),
+  reviewProfileId: boundedRecordKey(256).optional(),
+  instruction: boundedText(MAX_MISSION_PLAN_INSTRUCTION_CHARS),
+  acceptance: z
+    .array(boundedText(MAX_MISSION_PLAN_ACCEPTANCE_CHARS))
+    .min(1)
+    .max(MAX_MISSION_PLAN_ACCEPTANCE_ITEMS),
+});
+const executionPlanArtifactSchema = z.strictObject({
+  type: z.literal('execution-plan'),
+  summary: boundedText(MAX_MISSION_PLAN_SUMMARY_CHARS),
+  steps: z
+    .array(executionPlanStepSchema)
+    .min(1)
+    .max(MAX_MISSION_PLAN_STEPS)
+    .refine(
+      (steps) => new Set(steps.map((step) => step.id)).size === steps.length,
+      'plan step ids must be unique',
+    ),
+});
+const childArtifactSchema = z.discriminatedUnion('type', [reviewArtifactSchema, executionPlanArtifactSchema]);
+
+const spawnChildActionSchema = z.strictObject({
+  type: z.literal('spawn-child'),
+  guideEpoch: guideEpochSchema,
+  childId: childIdSchema,
+  role: boundedText(128),
+  instruction: boundedText(MAX_MISSION_CHILD_INSTRUCTION_CHARS),
+  permission: z.enum(['read', 'write']),
+  agent: agentSelectionSchema,
+  driverPosture: driverPostureSchema,
+  profileId: boundedRecordKey(256),
+  budget: budgetSchema,
+  resources: resourcesSchema(false),
+  projectMcp: projectMcpGrantsSchema,
+  subjectCheckpointId: z.union([checkpointIdSchema, z.null()]).optional(),
+  planStepId: z.union([planStepIdSchema, z.null()]).optional(),
+});
+
+const requestChildCancelActionSchema = z.strictObject({
+  type: z.literal('request-child-cancel'),
+  guideEpoch: guideEpochSchema,
+  childId: childIdSchema,
+  reason: boundedText(16_384),
+});
+
+const raiseQuestionActionSchema = z.strictObject({
+  type: z.literal('raise-question'),
+  guideEpoch: guideEpochSchema,
+  questionId: questionIdSchema,
+  prompt: boundedText(32_000),
+});
+
+const completeMissionActionSchema = z.strictObject({
+  type: z.literal('complete-mission'),
+  guideEpoch: guideEpochSchema,
+  outcome: z.enum(['succeeded', 'failed', 'cancelled']),
+  reason: boundedText(64_000),
+  checkpointId: z.union([checkpointIdSchema, z.null()]).optional(),
+});
+
+const adoptExecutionPlanActionSchema = z.strictObject({
+  type: z.literal('adopt-execution-plan'),
+  guideEpoch: guideEpochSchema,
+  plannerChildId: childIdSchema,
+  planFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+const guideProposalSchema = z.discriminatedUnion('type', [
+  spawnChildActionSchema,
+  adoptExecutionPlanActionSchema,
+  requestChildCancelActionSchema,
+  raiseQuestionActionSchema,
+  completeMissionActionSchema,
+]);
+
+/** Strict runtime schema for every action admitted by the model-free mission kernel. */
+const missionActionBaseSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('create-mission'),
+    objective: objectiveSchema.optional(),
+    projectMcpDeclarationFingerprint: projectMcpFingerprintSchema,
+    budget: budgetSchema,
+    resources: resourcesSchema(true),
+    guide: guideProfileSchema,
+    profiles: executionProfilesSchema,
+    validationPolicy: validationPolicySchema,
+    completion: completionPolicySchema.optional(),
+    cleanup: cleanupSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal('begin-guide-turn'),
+    guideEpoch: guideEpochSchema,
+    turnId: turnIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal('complete-guide-turn'),
+    turnId: turnIdSchema,
+    outcome: z.enum(['proposed', 'failed', 'cancelled', 'lost']),
+    summary: boundedText(64_000),
+    usage: usageSchema,
+    proposal: z.union([guideProposalSchema, z.null()]),
+  }),
+  z.strictObject({
+    type: z.literal('apply-guide-proposal'),
+    turnId: turnIdSchema,
+  }),
+  adoptExecutionPlanActionSchema,
+  spawnChildActionSchema,
+  z.strictObject({
+    type: z.literal('start-child'),
+    childId: childIdSchema,
+    attemptId: boundedText(256),
+    sessionId: z.union([boundedText(512), z.null()]).optional(),
+  }),
+  z.strictObject({
+    type: z.literal('observe-child-usage'),
+    childId: childIdSchema,
+    usage: usageSchema,
+  }),
+  requestChildCancelActionSchema,
+  z.strictObject({
+    type: z.literal('complete-child'),
+    childId: childIdSchema,
+    outcome: z.enum(['succeeded', 'failed', 'cancelled', 'lost']),
+    summary: boundedText(64_000),
+    usage: usageSchema,
+    artifact: childArtifactSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal('record-checkpoint'),
+    checkpointId: checkpointIdSchema,
+    revisionId: checkpointIdSchema,
+    authorChildId: z.union([childIdSchema, z.null()]),
+    changed: z.boolean().optional(),
+    parentCheckpointId: z.union([checkpointIdSchema, z.null()]).optional(),
+    clean: z.boolean(),
+    description: boundedText(16_384).optional(),
+  }),
+  z.strictObject({
+    type: z.literal('record-workspace-reconciled'),
+    childId: childIdSchema,
+    revisionId: checkpointIdSchema,
+    disposition: z.enum(['restored', 'quarantined']),
+    summary: boundedText(16_384),
+  }),
+  z.strictObject({
+    type: z.literal('record-review'),
+    reviewId: reviewIdSchema,
+    reviewerChildId: childIdSchema,
+    checkpointId: checkpointIdSchema,
+    revisionId: checkpointIdSchema,
+    verdict: z.enum(['passed', 'changes-requested']),
+    highestSeverity: z.enum(['none', 'low', 'medium', 'high', 'critical']),
+    summary: boundedText(MAX_MISSION_REVIEW_SUMMARY_CHARS),
+  }),
+  z.strictObject({
+    type: z.literal('begin-validation'),
+    validationId: validationIdSchema,
+    checkpointId: checkpointIdSchema,
+    revisionId: boundedText(512),
+    policyId: policyIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal('record-validation'),
+    validationId: validationIdSchema,
+    checkpointId: nullableCheckpointIdSchema,
+    revisionId: nullableRevisionIdSchema,
+    policyId: policyIdSchema,
+    disposition: z.enum(['passed', 'failed', 'not-applicable']),
+    exitCode: exitCodeSchema,
+    timedOut: z.boolean(),
+    workspaceChanged: z.boolean(),
+    outputTail: validationOutputTailSchema,
+  }),
+  raiseQuestionActionSchema,
+  z.strictObject({
+    type: z.literal('answer-question'),
+    questionId: questionIdSchema,
+    answer: boundedText(64_000),
+  }),
+  z.strictObject({
+    type: z.literal('replace-guide'),
+    guideEpoch: guideEpochSchema,
+    reason: boundedText(16_384),
+  }),
+  completeMissionActionSchema,
+  z.strictObject({
+    type: z.literal('complete-cleanup'),
+    cleanupId: cleanupIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal('fail-cleanup'),
+    cleanupId: cleanupIdSchema,
+    error: boundedText(16_384),
+  }),
+  z.strictObject({
+    type: z.literal('record-accepted-revision-handoff'),
+    backend: boundedText(128),
+    repositoryKey: boundedText(256),
+    checkpointId: checkpointIdSchema,
+    revisionId: boundedText(512),
+    reference: boundedText(2_048),
+    status: z.literal('preserved'),
+  }),
+]);
+
+/** Strict runtime schema for every action admitted by the model-free mission kernel. */
+export const missionActionSchema = missionActionBaseSchema.superRefine((action, context) => {
+  if (action.type === 'create-mission') {
+    const hasProjectGrants = action.profiles.some((profile) => profile.projectMcp.length > 0);
+    if (hasProjectGrants !== (action.projectMcpDeclarationFingerprint !== null)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'project MCP grants require exactly one trusted declaration fingerprint',
+      });
+    }
+    return;
+  }
+  if (action.type === 'record-validation') {
+    if ((action.checkpointId === null) !== (action.revisionId === null)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'validation checkpoint and revision must either both be null or both be present',
+      });
+    }
+    if (action.disposition === 'passed' && (action.exitCode !== 0 || action.timedOut)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'passed validation requires exit code zero' });
+    }
+    if (action.disposition === 'passed' && action.workspaceChanged) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'changed workspace cannot pass validation' });
+    }
+    if (action.disposition === 'not-applicable' && (action.exitCode !== null || action.timedOut)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'not-applicable validation cannot have an exit code or timeout',
+      });
+    }
+    if (action.disposition === 'not-applicable' && action.workspaceChanged) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'not-applicable validation has no workspace effect',
+      });
+    }
+    if (
+      action.disposition === 'failed' &&
+      action.exitCode === 0 &&
+      !action.timedOut &&
+      !action.workspaceChanged
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'failed validation requires process failure, timeout, or quarantined workspace changes',
+      });
+    }
+  }
+});
+
+export class MissionActionValidationError extends Error {
+  override readonly name = 'MissionActionValidationError';
+}
+
+export type MissionActionValidationResult =
+  | { success: true; action: MissionAction }
+  | { success: false; error: MissionActionValidationError };
+
+function inspectPlainData(value: unknown, path: string, seen: WeakSet<object>): string | null {
+  if (value === undefined) return `${path} contains undefined`;
+  if (typeof value === 'number' && !Number.isFinite(value)) return `${path} contains a non-finite number`;
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return null;
+  }
+  if (typeof value !== 'object') return `${path} is not JSON data`;
+  if (seen.has(value)) return `${path} contains a cycle`;
+  seen.add(value);
+  try {
+    const expectedPrototype = Array.isArray(value) ? Array.prototype : Object.prototype;
+    if (Object.getPrototypeOf(value) !== expectedPrototype) return `${path} has a custom prototype`;
+
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (Object.getOwnPropertySymbols(value).length > 0) return `${path} contains a symbol key`;
+
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const key = String(index);
+        if (!Object.hasOwn(descriptors, key)) return `${path} contains a sparse array`;
+        const descriptor = descriptors[key];
+        if (!descriptor || !('value' in descriptor)) return `${path}[${index}] is an accessor`;
+        const issue = inspectPlainData(descriptor.value, `${path}[${index}]`, seen);
+        if (issue) return issue;
+      }
+      const allowedKeys = new Set(['length']);
+      for (let index = 0; index < value.length; index += 1) allowedKeys.add(String(index));
+      for (const key of Object.keys(descriptors)) {
+        if (!allowedKeys.has(key)) return `${path} contains a non-index array key`;
+      }
+      return null;
+    }
+
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (UNSAFE_OBJECT_KEYS.has(key)) return `${path} contains a reserved object key`;
+      if (!descriptor.enumerable) return `${path}.${key} is not enumerable`;
+      if (!('value' in descriptor)) return `${path}.${key} is an accessor`;
+      const issue = inspectPlainData(descriptor.value, `${path}.${key}`, seen);
+      if (issue) return issue;
+    }
+    return null;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/**
+ * Validate an unknown action before it is fingerprinted, persisted, or admitted by `decideMission`.
+ * Validation never invokes accessors and returns a parsed plain action on success.
+ */
+export function validateMissionAction(candidate: unknown): MissionActionValidationResult {
+  let structuralIssue: string | null;
+  try {
+    structuralIssue = inspectPlainData(candidate, 'action', new WeakSet());
+  } catch {
+    structuralIssue = 'action cannot be safely inspected';
+  }
+  if (structuralIssue) {
+    return { success: false, error: new MissionActionValidationError(structuralIssue) };
+  }
+
+  const parsed = missionActionSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return {
+      success: false,
+      error: new MissionActionValidationError('action does not match the strict mission action schema'),
+    };
+  }
+  return { success: true, action: parsed.data as MissionAction };
+}
+
+/** Parse an unknown action, throwing `MissionActionValidationError` when it is malformed. */
+export function parseMissionAction(candidate: unknown): MissionAction {
+  const result = validateMissionAction(candidate);
+  if (!result.success) throw result.error;
+  return result.action;
+}

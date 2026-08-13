@@ -2,10 +2,10 @@ import type { RunBudget } from '@noriq-dev/shared';
 import type { AgentDriver, DriverExit, DriverSession, DriverStartOptions, DriverTelemetry } from './types';
 import { zeroTelemetry } from './types';
 
-// The daemon polices spend — never the agent. superviseBudget wraps a driver run,
-// watches token/USD telemetry from the stream + a wall-clock deadline against the
-// Run budget, and on breach SIGTERMs the process (session.stop()) and forces the
-// terminal exit to failed{reason:'budget:<dim>'}. A hard ceiling, never unbounded.
+// Legacy Runs retain reactive token/USD supervision plus a wall-clock deadline: on an observed
+// breach the wrapper stops the process and forces failed{reason:'budget:<dim>'}. Mission launches
+// additionally require DriverStartOptions.tokenEnvelope at a commissioned provider boundary;
+// telemetry cannot retroactively make already-consumed tokens a hard ceiling.
 
 export type BudgetBreach = 'budget:tokens' | 'budget:usd' | 'budget:duration';
 
@@ -136,10 +136,15 @@ export function superviseBudget(driver: AgentDriver, startOpts: DriverStartOptio
   // session (to stop it) but the session is produced by driver.start(handlers).
   const userHandlers = startOpts.handlers;
   const held: { session?: DriverSession } = {};
+  const requestStop = (session: DriverSession | undefined): void => {
+    // A rejected stop means shutdown was not acknowledged. Swallow only the detached rejection;
+    // the driver's done/registry boundary remains responsible for keeping the attempt unsettled.
+    void session?.stop().catch(() => undefined);
+  };
   const trip = (which: BudgetBreach) => {
     if (breach) return;
     breach = which;
-    void held.session?.stop(); // SIGTERM → driver finish → onExit → finalize overrides the reason
+    requestStop(held.session); // SIGTERM → driver finish → onExit → finalize overrides the reason
   };
   const checkSpend = (t: DriverTelemetry) => {
     if (breach) return;
@@ -196,7 +201,7 @@ export function superviseBudget(driver: AgentDriver, startOpts: DriverStartOptio
   // A telemetry/exit callback delivered SYNCHRONOUSLY from inside start() sets `breach` before
   // there is a session to stop — `trip` runs against an empty `held`. The driver contract permits
   // that (claude's consumer is async, but nothing requires it), so settle the debt here.
-  if (breach) void session.stop();
+  if (breach) requestStop(session);
 
   // A hand-back turn is on the clock too (RUN-159).
   //

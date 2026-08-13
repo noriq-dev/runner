@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { chmod, mkdir, readdir } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +10,11 @@ import type {
   ChangesBetweenResult,
   CurrentBaseResult,
   IgnoreQueryResult,
+  MissionCheckpointEvidence,
+  MissionCheckpointOptions,
+  MissionWorkspaceInspection,
+  MissionWorkspaceReconciliationEvidence,
+  MissionWorkspaceReconciliationOptions,
 } from './vcs/types';
 
 const execFileP = promisify(execFile);
@@ -189,6 +194,7 @@ export const setWritable = (dir: string): Promise<void> => chmodTree(dir, true);
 export class WorktreeManager {
   private readonly baseDir: string;
   private readonly git: GitRunner;
+  private readonly exactOperationTails = new Map<string, Promise<void>>();
 
   constructor(opts: { baseDir: string; git?: GitRunner }) {
     this.baseDir = opts.baseDir;
@@ -227,6 +233,563 @@ export class WorktreeManager {
       );
   }
 
+  /** Serialize exact checkpoint/release operations for one checkout inside this process. Git's
+   * own index/ref locks remain the cross-process floor; the mission workspace lease is what
+   * excludes another writer process. This lock prevents two callers sharing this manager from
+   * interleaving the before/after evidence window. */
+  private async withExactOperation<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+    const key = comparableWorktreePath(dir);
+    const previous = this.exactOperationTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.exactOperationTails.set(key, tail);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.exactOperationTails.get(key) === tail) this.exactOperationTails.delete(key);
+    }
+  }
+
+  private exactObjectId(stdout: string, operation: string): string {
+    const id = stdout.trim();
+    // Git supports SHA-1 and SHA-256 repositories. An empty, abbreviated, multi-line, or otherwise
+    // malformed answer is not immutable revision evidence and must never reach mission state.
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)) {
+      throw new Error(`${operation} returned no exact Git object id: ${JSON.stringify(stdout)}`);
+    }
+    return id;
+  }
+
+  private async exactBranchRevision(repoRoot: string, branch: string): Promise<string> {
+    return this.exactRefRevision(repoRoot, `refs/heads/${branch}`);
+  }
+
+  private async exactRefRevision(repoRoot: string, ref: string): Promise<string> {
+    const { stdout } = await this.git(['show-ref', '--verify', '--hash', ref], repoRoot);
+    return this.exactObjectId(stdout, `git show-ref for ${ref}`);
+  }
+
+  private async exactCommit(pathname: string, revisionId: string, label: string): Promise<string> {
+    if (typeof revisionId !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revisionId)) {
+      throw new Error(`${label} is not an exact Git object id`);
+    }
+    const { stdout } = await this.git(['rev-parse', '--verify', `${revisionId}^{commit}`], pathname);
+    const resolved = this.exactObjectId(stdout, `git rev-parse for ${label}`);
+    if (resolved !== revisionId) {
+      throw new Error(`${label} resolved to ${resolved}, not the supplied exact id ${revisionId}`);
+    }
+    return resolved;
+  }
+
+  private async operationState(pathname: string): Promise<{ labels: string[]; heads: string[] }> {
+    const labels: string[] = [];
+    const heads: string[] = [];
+    // A clean-looking worktree may still be poised to create a merge/revert/cherry-pick commit.
+    // Exit 1 is rev-parse's documented "missing ref" answer; every other failure means Git could
+    // not establish the state and is therefore a rejection, not "none".
+    for (const ref of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD']) {
+      try {
+        const { stdout } = await this.git(['rev-parse', '--verify', '--quiet', ref], pathname);
+        const head = this.exactObjectId(stdout, `git rev-parse for ${ref}`);
+        labels.push(ref);
+        heads.push(head);
+      } catch (err) {
+        if ((err as { code?: unknown }).code === 1) continue;
+        throw err;
+      }
+    }
+
+    // Rebase state is directory-backed and REBASE_HEAD is not present at every point in a rebase.
+    for (const marker of ['rebase-merge', 'rebase-apply']) {
+      const { stdout } = await this.git(['rev-parse', '--git-path', marker], pathname);
+      const candidate = stdout.trim();
+      if (!candidate) throw new Error(`git returned no path while checking ${marker}`);
+      const markerPath = path.isAbsolute(candidate) ? candidate : path.resolve(pathname, candidate);
+      const exists = await lstat(markerPath)
+        .then(() => true)
+        .catch((err: NodeJS.ErrnoException) => {
+          if (err.code === 'ENOENT') return false;
+          throw err;
+        });
+      if (exists) labels.push(marker);
+    }
+    return { labels: [...new Set(labels)], heads: [...new Set(heads)] };
+  }
+
+  private async assertNoGitOperation(pathname: string): Promise<void> {
+    const operation = await this.operationState(pathname);
+    if (operation.labels.length > 0) {
+      throw new Error(`workspace has an in-progress Git operation (${operation.labels.join(', ')})`);
+    }
+  }
+
+  private async assertAncestor(pathname: string, ancestor: string, descendant: string): Promise<void> {
+    if (ancestor === descendant) return;
+    try {
+      await this.git(['merge-base', '--is-ancestor', ancestor, descendant], pathname);
+    } catch (err) {
+      throw new Error(
+        `refusing exact Git evidence: expected parent ${ancestor} is not a proven ancestor of ${descendant}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  private async inspectExactUnlocked(
+    info: Pick<WorktreeInfo, 'repoRoot' | 'path' | 'branch'>,
+  ): Promise<MissionWorkspaceInspection> {
+    if (!(await this.worktreeRegistered(info.repoRoot, info.path))) {
+      throw new Error(`refusing exact Git inspection: ${info.path} is not a registered worktree`);
+    }
+
+    const { stdout: symbolicRef } = await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path);
+    const expectedRef = `refs/heads/${info.branch}`;
+    if (symbolicRef.trim() !== expectedRef) {
+      throw new Error(
+        `refusing exact Git inspection: workspace HEAD is ${JSON.stringify(symbolicRef.trim())}, expected ${expectedRef}`,
+      );
+    }
+    await this.assertNoGitOperation(info.path);
+
+    const { stdout: headOutput } = await this.git(['rev-parse', '--verify', 'HEAD^{commit}'], info.path);
+    const revisionId = this.exactObjectId(headOutput, 'git rev-parse HEAD');
+    const branchRevision = await this.exactBranchRevision(info.repoRoot, info.branch);
+    if (branchRevision !== revisionId) {
+      throw new Error(
+        `refusing exact Git inspection: ${info.branch} names ${branchRevision}, but workspace HEAD is ${revisionId}`,
+      );
+    }
+
+    const { stdout: status } = await this.git(
+      // `--untracked-files=all` still hides ignored paths. Mission exactness cannot: an ignored
+      // executable, generated config, or cache may affect a later reviewer/validation command
+      // while remaining absent from the immutable revision. Exact boundaries therefore require
+      // a checkout with no ignored child-controlled residue either.
+      ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'],
+      info.path,
+    );
+    return { revisionId, clean: status.length === 0 };
+  }
+
+  /** Inspect an attached run branch without interpreting a dirty tree as an error. A detached,
+   * foreign, missing, or operation-in-progress checkout rejects because it cannot name exact
+   * mission evidence. */
+  async inspectExact(
+    info: Pick<WorktreeInfo, 'repoRoot' | 'path' | 'branch'>,
+  ): Promise<MissionWorkspaceInspection> {
+    return this.inspectExactUnlocked(info);
+  }
+
+  /** Commit loose work and return exact before/after evidence as one serialized operation. */
+  async checkpointExact(
+    info: Pick<WorktreeInfo, 'repoRoot' | 'path' | 'branch'>,
+    message: string,
+    opts: MissionCheckpointOptions,
+  ): Promise<MissionCheckpointEvidence> {
+    return this.withExactOperation(info.path, async () => {
+      const expectedParentRevisionId = await this.exactCommit(
+        info.path,
+        opts.expectedParentRevisionId,
+        'expected parent revision',
+      );
+      const before = await this.inspectExactUnlocked(info);
+      const createdCommit = await this.commitWork({ path: info.path }, message);
+      // Ignored products are deliberately absent from the commit. Remove them before publishing
+      // the checkpoint as exact so reviewers and validation can depend only on the named tree.
+      await this.git(['clean', '-ffdx'], info.path);
+      const after = await this.inspectExactUnlocked(info);
+      if (!after.clean) {
+        throw new Error('exact Git checkpoint left the workspace dirty');
+      }
+
+      if (!createdCommit && before.revisionId !== after.revisionId) {
+        throw new Error(
+          `exact Git checkpoint moved from ${before.revisionId} to ${after.revisionId} without creating a commit`,
+        );
+      }
+      if (createdCommit) {
+        const { stdout } = await this.git(
+          ['rev-list', '--parents', '--max-count=1', after.revisionId],
+          info.path,
+        );
+        const parts = stdout.trim().split(/\s+/);
+        if (parts.length !== 2 || parts[0] !== after.revisionId || parts[1] !== before.revisionId) {
+          throw new Error(
+            `exact Git checkpoint did not create one ordinary commit directly on ${before.revisionId}`,
+          );
+        }
+      }
+      await this.assertAncestor(info.path, expectedParentRevisionId, after.revisionId);
+
+      return {
+        beforeRevisionId: before.revisionId,
+        revisionId: after.revisionId,
+        changed: expectedParentRevisionId !== after.revisionId,
+        clean: true,
+      };
+    });
+  }
+
+  private quarantineRef(runId: string, quarantineId: string, expectedRevisionId: string): string {
+    if (typeof quarantineId !== 'string' || !/^[\x20-\x7e]{1,128}$/.test(quarantineId)) {
+      throw new Error('quarantineId must be 1-128 printable ASCII characters');
+    }
+    const digest = (value: string, length: number) =>
+      createHash('sha256').update(value, 'utf8').digest('hex').slice(0, length);
+    return `refs/noriq/quarantine/${digest(runId, 24)}/${digest(`${quarantineId}\0${expectedRevisionId}`, 32)}`;
+  }
+
+  /**
+   * Durable witness that the deterministic quarantine was verified against the pre-restoration
+   * workspace. It deliberately survives successful restoration: the caller cannot journal its
+   * reconciliation fact atomically with Git, so deleting this witness before that journal commit
+   * would reopen the same crash window on retry.
+   */
+  private reconciliationMarkerRef(runId: string, quarantineId: string, expectedRevisionId: string): string {
+    const digest = (value: string, length: number) =>
+      createHash('sha256').update(value, 'utf8').digest('hex').slice(0, length);
+    return `refs/noriq/reconciliation/${digest(runId, 24)}/${digest(`${quarantineId}\0${expectedRevisionId}`, 32)}`;
+  }
+
+  private async optionalExactRefRevision(repoRoot: string, ref: string): Promise<string | null> {
+    try {
+      const { stdout } = await this.git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], repoRoot);
+      return this.exactObjectId(stdout, `git rev-parse for ${ref}`);
+    } catch (err) {
+      if ((err as { code?: unknown }).code === 1) return null;
+      throw err;
+    }
+  }
+
+  private async exactReconciliationMarker(repoRoot: string, markerRef: string): Promise<string | null> {
+    const resolved = await this.optionalExactRefRevision(repoRoot, markerRef);
+    if (resolved === null) return null;
+    const direct = await this.exactRefRevision(repoRoot, markerRef);
+    if (direct !== resolved) {
+      throw new Error(`refusing reconciliation marker ${markerRef}: it does not directly name a commit`);
+    }
+    return direct;
+  }
+
+  private async ensureReconciliationMarker(
+    repoRoot: string,
+    markerRef: string,
+    quarantineRevisionId: string,
+  ): Promise<void> {
+    const zero = '0'.repeat(quarantineRevisionId.length);
+    await this.git(['update-ref', markerRef, quarantineRevisionId, zero], repoRoot).catch(async (err) => {
+      const raced = await this.exactReconciliationMarker(repoRoot, markerRef);
+      if (raced === null) throw err;
+    });
+    const markerRevisionId = await this.exactReconciliationMarker(repoRoot, markerRef);
+    if (markerRevisionId !== quarantineRevisionId) {
+      throw new Error(
+        `refusing reconciliation marker ${markerRef}: it names ${String(markerRevisionId)}, expected ${quarantineRevisionId}`,
+      );
+    }
+  }
+
+  private async verifyQuarantine(
+    pathname: string,
+    repoRoot: string,
+    ref: string,
+    expectedTree: string,
+    preservedHeads: string[],
+  ): Promise<string> {
+    const quarantineRevisionId = await this.exactRefRevision(repoRoot, ref);
+    await this.exactCommit(pathname, quarantineRevisionId, 'quarantine revision');
+    const { stdout: treeOutput } = await this.git(
+      ['rev-parse', '--verify', `${quarantineRevisionId}^{tree}`],
+      pathname,
+    );
+    const tree = this.exactObjectId(treeOutput, `tree for ${ref}`);
+    if (tree !== expectedTree) {
+      throw new Error(`refusing to reuse quarantine ${ref}: its tree does not match current residue`);
+    }
+    for (const head of preservedHeads) {
+      await this.assertAncestor(pathname, head, quarantineRevisionId).catch((err) => {
+        throw new Error(
+          `refusing to reuse quarantine ${ref}: it does not preserve ${head}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    return quarantineRevisionId;
+  }
+
+  /** Preserve a failed writer's complete Git-visible tree and divergent commit ancestry, then
+   * restore the mission branch/worktree to the pinned revision. The deterministic quarantine ref
+   * makes a restart after `update-ref` but before reset idempotent without ever overwriting an
+   * earlier record. */
+  async reconcileExact(
+    info: Pick<WorktreeInfo, 'runId' | 'repoRoot' | 'path' | 'branch'>,
+    opts: MissionWorkspaceReconciliationOptions,
+  ): Promise<MissionWorkspaceReconciliationEvidence> {
+    return this.withExactOperation(info.path, async () => {
+      const expectedRevisionId = await this.exactCommit(
+        info.path,
+        opts.expectedRevisionId,
+        'expected reconciliation revision',
+      );
+      if (
+        typeof opts.message !== 'string' ||
+        !opts.message.trim() ||
+        opts.message.length > 512 ||
+        opts.message.includes('\0')
+      ) {
+        throw new Error('quarantine message must be 1-512 characters and contain no NUL');
+      }
+      if (!(await this.worktreeRegistered(info.repoRoot, info.path))) {
+        throw new Error(`refusing Git reconciliation: ${info.path} is not a registered worktree`);
+      }
+
+      const ref = this.quarantineRef(info.runId, opts.quarantineId, expectedRevisionId);
+      const markerRef = this.reconciliationMarkerRef(info.runId, opts.quarantineId, expectedRevisionId);
+      const existingQuarantine = await this.optionalExactRefRevision(info.repoRoot, ref);
+      const existingMarker = await this.exactReconciliationMarker(info.repoRoot, markerRef);
+      if (existingMarker !== null && existingMarker !== existingQuarantine) {
+        throw new Error(
+          `refusing reconciliation marker ${markerRef}: quarantine ${ref} is missing or names another revision`,
+        );
+      }
+      if (existingQuarantine !== null) {
+        await this.exactCommit(info.path, existingQuarantine, 'existing quarantine revision');
+        await this.assertAncestor(info.path, expectedRevisionId, existingQuarantine).catch((err) => {
+          throw new Error(
+            `refusing to reuse quarantine ${ref}: it is not bound to expected revision ${expectedRevisionId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+      const { stdout: headOutput } = await this.git(['rev-parse', '--verify', 'HEAD^{commit}'], info.path);
+      const headRevision = this.exactObjectId(headOutput, 'git rev-parse reconciliation HEAD');
+      const branchRevision = await this.exactBranchRevision(info.repoRoot, info.branch);
+      const operation = await this.operationState(info.path);
+      const { stdout: symbolicOutput } = await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path).catch(
+        (err: { code?: unknown }) => {
+          if (err.code === 1) return { stdout: '', stderr: '' };
+          throw err;
+        },
+      );
+      const attached = symbolicOutput.trim() === `refs/heads/${info.branch}`;
+      const { stdout: status } = await this.git(
+        ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        info.path,
+      );
+      const residue =
+        status.length > 0 ||
+        operation.labels.length > 0 ||
+        !attached ||
+        headRevision !== expectedRevisionId ||
+        branchRevision !== expectedRevisionId;
+
+      if (!residue && existingQuarantine === null) {
+        // `status` intentionally excludes ignored cache/build files from durable evidence. They
+        // are nevertheless child-controlled and must not cross this failed-attempt boundary.
+        await this.git(['clean', '-ffdx'], info.path);
+        return { revisionId: expectedRevisionId, clean: true, disposition: 'restored' };
+      }
+
+      let quarantineRevisionId = existingQuarantine;
+      // Before the restoration witness exists, an already-present quarantine may be a first-writer
+      // race and must still match the complete current residue. Once the witness exists, that exact
+      // comparison has already succeeded durably; the current tree may be only a partially restored
+      // checkout left by owner death and must not be mistaken for a competing quarantine payload.
+      if (existingMarker === null) {
+        // Force-add only Git-visible untracked paths. Ignored build caches stay outside mission
+        // evidence by design; normal untracked files and every tracked deletion are retained.
+        await this.git(['add', '-A'], info.path);
+        const { stdout: treeOutput } = await this.git(['write-tree'], info.path);
+        const tree = this.exactObjectId(treeOutput, 'git write-tree for quarantine');
+        const preservedHeads = [expectedRevisionId, headRevision, branchRevision, ...operation.heads].filter(
+          (value, index, all) => all.indexOf(value) === index,
+        );
+
+        if (quarantineRevisionId === null) {
+          const parentArgs = preservedHeads.flatMap((revision) => ['-p', revision]);
+          const { stdout: commitOutput } = await this.git(
+            [...NO_HOOKS, ...AUTHOR, 'commit-tree', tree, ...parentArgs, '-m', opts.message],
+            info.path,
+          );
+          const candidate = this.exactObjectId(commitOutput, 'git commit-tree for quarantine');
+          const zero = '0'.repeat(candidate.length);
+          await this.git(['update-ref', ref, candidate, zero], info.repoRoot).catch(async (err) => {
+            const raced = await this.optionalExactRefRevision(info.repoRoot, ref);
+            if (raced === null) throw err;
+          });
+          quarantineRevisionId = await this.verifyQuarantine(
+            info.path,
+            info.repoRoot,
+            ref,
+            tree,
+            preservedHeads,
+          );
+        } else {
+          quarantineRevisionId = await this.verifyQuarantine(
+            info.path,
+            info.repoRoot,
+            ref,
+            tree,
+            preservedHeads,
+          );
+        }
+        await this.ensureReconciliationMarker(info.repoRoot, markerRef, quarantineRevisionId);
+      }
+
+      // Once the quarantine ref is durable it is safe to discard operation metadata and restore
+      // the reusable checkout. Each abort is best-effort; the forced checkout/reset below owns the
+      // postcondition and the final exact inspection rejects if any operation survived.
+      for (const args of [
+        ['rebase', '--abort'],
+        ['merge', '--abort'],
+        ['cherry-pick', '--abort'],
+        ['revert', '--abort'],
+      ]) {
+        await this.git(args, info.path).catch(() => {});
+      }
+      await this.git([...NO_HOOKS, 'checkout', '--force', '-B', info.branch, expectedRevisionId], info.path);
+      await this.git(['reset', '--hard', expectedRevisionId], info.path);
+      // Ignored files are deliberately not promoted into mission evidence: doing so would retain
+      // dependency trees, editor caches, credentials, and build products under a durable ref.
+      // They are still child-controlled residue, however, and must not bleed into a later agent
+      // after a failed/cancelled/lost writer. Remove them together with ordinary untracked files.
+      await this.git(['clean', '-ffdx'], info.path);
+
+      const restored = await this.inspectExactUnlocked(info);
+      if (!restored.clean || restored.revisionId !== expectedRevisionId) {
+        throw new Error(`Git reconciliation did not restore a clean ${expectedRevisionId} workspace`);
+      }
+      if (quarantineRevisionId === null) {
+        throw new Error('Git reconciliation found residue but did not retain a quarantine revision');
+      }
+      return {
+        revisionId: restored.revisionId,
+        clean: true,
+        disposition: 'quarantined',
+        quarantineRef: ref,
+        quarantineRevisionId,
+      };
+    });
+  }
+
+  /**
+   * Restore after deterministic validation. Validator writes are observations about a failed
+   * gate, not candidate source changes, so they are discarded rather than retained under a
+   * quarantine ref. The operation is idempotent and also repairs a crash between command launch
+   * and result journaling.
+   */
+  async restoreExact(
+    info: Pick<WorktreeInfo, 'runId' | 'repoRoot' | 'path' | 'branch'>,
+    requestedRevisionId: string,
+  ): Promise<import('./vcs/types').MissionWorkspaceRestorationEvidence> {
+    return this.withExactOperation(info.path, async () => {
+      const expectedRevisionId = await this.exactCommit(
+        info.path,
+        requestedRevisionId,
+        'expected validation restoration revision',
+      );
+      if (!(await this.worktreeRegistered(info.repoRoot, info.path))) {
+        throw new Error(`refusing Git validation restoration: ${info.path} is not a registered worktree`);
+      }
+      const { stdout: headOutput } = await this.git(['rev-parse', '--verify', 'HEAD^{commit}'], info.path);
+      const headRevision = this.exactObjectId(headOutput, 'git rev-parse validation restoration HEAD');
+      const branchRevision = await this.exactBranchRevision(info.repoRoot, info.branch);
+      const operation = await this.operationState(info.path);
+      const { stdout: symbolicOutput } = await this.git(['symbolic-ref', '--quiet', 'HEAD'], info.path).catch(
+        (err: { code?: unknown }) => {
+          if (err.code === 1) return { stdout: '', stderr: '' };
+          throw err;
+        },
+      );
+      const { stdout: status } = await this.git(
+        ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'],
+        info.path,
+      );
+      const symbolicBranch = symbolicOutput.trim();
+      if (
+        operation.labels.length > 0 ||
+        symbolicBranch !== `refs/heads/${info.branch}` ||
+        headRevision !== expectedRevisionId ||
+        branchRevision !== expectedRevisionId
+      ) {
+        throw new Error(
+          `refusing Git validation restoration across authoritative drift: expected refs/heads/${info.branch} and HEAD at ${expectedRevisionId}, observed branch ${branchRevision}, HEAD ${headRevision}, symbolic ref '${symbolicBranch || '<detached>'}', operations ${operation.labels.join(',') || '<none>'}`,
+        );
+      }
+
+      const changed = status.length > 0;
+      await this.git(['reset', '--hard', expectedRevisionId], info.path);
+      await this.git(['clean', '-ffdx'], info.path);
+      const restored = await this.inspectExactUnlocked(info);
+      if (!restored.clean || restored.revisionId !== expectedRevisionId) {
+        throw new Error(`Git validation restoration did not restore clean ${expectedRevisionId}`);
+      }
+      return { revisionId: expectedRevisionId, clean: true, changed };
+    });
+  }
+
+  /** Remove only the physical checkout after proving its accepted branch/revision is clean and
+   * exact. The branch is deliberately retained. A second call succeeds only while that branch
+   * still names the same preserved revision. */
+  async removePreservingBranch(
+    info: Pick<WorktreeInfo, 'repoRoot' | 'path' | 'branch'>,
+    preserveRevisionId: string,
+  ): Promise<void> {
+    await this.withExactOperation(info.path, async () => {
+      const branchRevision = await this.exactBranchRevision(info.repoRoot, info.branch);
+      if (branchRevision !== preserveRevisionId) {
+        throw new Error(
+          `refusing Git workspace release: ${info.branch} names ${branchRevision}, expected preserved revision ${preserveRevisionId}`,
+        );
+      }
+
+      const registered = await this.worktreeRegistered(info.repoRoot, info.path);
+      if (!registered) {
+        const stillExists = await lstat(info.path)
+          .then(() => true)
+          .catch((err: NodeJS.ErrnoException) => {
+            if (err.code === 'ENOENT') return false;
+            throw err;
+          });
+        if (stillExists) {
+          throw new Error(`refusing Git workspace release: unregistered path still exists at ${info.path}`);
+        }
+        return;
+      }
+
+      const inspection = await this.inspectExactUnlocked(info);
+      if (!inspection.clean) {
+        throw new Error(`refusing Git workspace release: ${info.path} has uncheckpointed changes`);
+      }
+      if (inspection.revisionId !== preserveRevisionId) {
+        throw new Error(
+          `refusing Git workspace release: workspace is at ${inspection.revisionId}, expected ${preserveRevisionId}`,
+        );
+      }
+
+      // No --force and no branch deletion: Git itself re-checks cleanliness while removing the
+      // checkout, and the accepted revision remains addressable by the run branch.
+      await this.git(['worktree', 'remove', info.path], info.repoRoot);
+      if (await this.worktreeRegistered(info.repoRoot, info.path)) {
+        throw new Error(`Git reported success but ${info.path} is still a registered worktree`);
+      }
+      const remains = await lstat(info.path)
+        .then(() => true)
+        .catch((err: NodeJS.ErrnoException) => {
+          if (err.code === 'ENOENT') return false;
+          throw err;
+        });
+      if (remains) throw new Error(`Git reported success but workspace path remains at ${info.path}`);
+
+      const preserved = await this.exactBranchRevision(info.repoRoot, info.branch);
+      if (preserved !== preserveRevisionId) {
+        throw new Error(`Git workspace release did not preserve ${info.branch} at ${preserveRevisionId}`);
+      }
+    });
+  }
+
   /** Create the Run's isolated worktree + throwaway branch. */
   async create(repoRoot: string, runId: string, opts: CreateWorktreeOptions = {}): Promise<WorktreeInfo> {
     await mkdir(this.baseDir, { recursive: true });
@@ -241,7 +804,26 @@ export class WorktreeManager {
     // The fork point is recovered as the branch's merge-base with the target, so the diff still
     // spans the WHOLE accumulated change rather than only what this sitting adds.
     if (await this.branchExists(repoRoot, branch)) {
-      if (!(await this.worktreeRegistered(repoRoot, dir))) {
+      let registered = await this.worktreeRegistered(repoRoot, dir);
+      if (registered) {
+        const pathMissing = await lstat(dir)
+          .then(() => false)
+          .catch((err: NodeJS.ErrnoException) => {
+            if (err.code === 'ENOENT') return true;
+            throw err;
+          });
+        if (pathMissing) {
+          // A killed `git worktree remove` or external filesystem loss can leave a `prunable`
+          // registration behind. Remove only this exact deterministic entry; a repository-wide
+          // prune could retire another process's temporarily unavailable worktree.
+          await this.git(['worktree', 'remove', '--force', dir], repoRoot);
+          registered = await this.worktreeRegistered(repoRoot, dir);
+          if (registered) {
+            throw new Error(`Git retained stale worktree registration for missing path ${dir}`);
+          }
+        }
+      }
+      if (!registered) {
         await this.git(['worktree', 'add', dir, branch], repoRoot); // branch kept, worktree pruned
       }
       const { stdout: forkSha } = await this.git(['merge-base', branch, baseRef], repoRoot);
@@ -827,9 +1409,10 @@ export class WorktreeManager {
     await this.git(['add', '-A'], info.path);
     await this.git(
       [
+        ...NO_HOOKS,
         ...AUTHOR,
         'commit',
-        '--no-verify', // hooks are the operator's, not this Run's to trigger
+        '--no-verify', // defense in depth; core.hooksPath=/dev/null also suppresses post-commit
         '-m',
         message,
       ],

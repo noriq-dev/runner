@@ -79,19 +79,20 @@ export type RunModelUsage = z.infer<typeof RunModelUsage>;
 export type RunEffort = z.infer<typeof RunEffort>;
 
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
-// terminal ∈ {done, failed, cancelled}. `blocked` = agent parked on request_input.
+// terminal ∈ {done, gated, failed, cancelled}. `blocked` = agent parked on request_input.
 export const RunStatus = z.enum([
   'queued', // created server-side, not yet handed to a runner
   'dispatched', // sent to a runner over /ws/runner, process not yet up
   'running', // agent process live
   'blocked', // parked awaiting a human decision (request_input); resumable → running
   'done', // completed; artifact landed (proposed plan / review diff / verify verdict)
+  'gated', // review blockers stand over preserved work; a human decides whether to continue
   'failed', // process error, budget breach, or verify gate rejection
   'cancelled', // killed by a human
 ]);
 export type RunStatus = z.infer<typeof RunStatus>;
 
-const TERMINAL_RUN_STATUSES = ['done', 'failed', 'cancelled'] as const;
+const TERMINAL_RUN_STATUSES = ['done', 'gated', 'failed', 'cancelled'] as const;
 export const isTerminalRunStatus = (s: RunStatus): boolean =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(s);
 
@@ -139,15 +140,81 @@ export const RunBudget = z.object({
 });
 export type RunBudget = z.infer<typeof RunBudget>;
 
-// Terminal outcome detail, set when the Run reaches done|failed|cancelled.
+// Terminal outcome detail, set when the Run reaches done|gated|failed|cancelled.
 export const RunExit = z.object({
-  outcome: z.enum(['done', 'failed', 'cancelled']),
+  outcome: z.enum(['done', 'gated', 'failed', 'cancelled']),
   code: z.number().int().nullable().default(null), // process exit code, if any
   signal: z.string().nullable().default(null), // e.g. "SIGTERM" on budget breach
   reason: z.string().nullable().default(null), // human-readable cause
   finishedAt: z.string().datetime(),
 });
 export type RunExit = z.infer<typeof RunExit>;
+
+/**
+ * A review follow-up the daemon files through POST /api/runner-spinoffs (PLNR-478).
+ *
+ * Unlike the agent-only spin_off_task tool, provenance is explicit on this wire because the
+ * daemon has no Noriq agent identity. The server validates all three pointers as one fact: the
+ * source run belongs to runnerId, is live, and is anchored to sourceTaskId in projectId. The
+ * product remains a proposed task until a human accepts or rejects it.
+ */
+export const RunnerSpinoffTaskRequest = z.object({
+  projectId: z.string().min(1),
+  runnerId: z.string().min(1),
+  sourceRunId: z.string().min(1),
+  sourceTaskId: z.string().min(1),
+  title: z.string().min(1),
+  body: z.string().optional(),
+  finding: z.string().min(1),
+  /** Optional override. Omit to inherit the source task's existing vocabulary. */
+  tags: z.array(z.string().min(1)).min(1).optional(),
+  allowNewTags: z.boolean().optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+});
+export type RunnerSpinoffTaskRequest = z.infer<typeof RunnerSpinoffTaskRequest>;
+
+export const RunnerSpinoffTaskResponse = z.object({
+  id: z.string(),
+  key: z.string(),
+  status: z.literal('proposed'),
+});
+export type RunnerSpinoffTaskResponse = z.infer<typeof RunnerSpinoffTaskResponse>;
+
+/** An opaque, repo-scoped machine-local execution environment offer (PLNR-487). The strict,
+ * closed shape is a privacy boundary: Noriq can route on identity, fingerprints, state and
+ * capacity, but executable configuration, URLs, credentials, paths and probe detail do not fit
+ * this contract and make registration fail instead of being silently persisted. */
+export const ExecutionProfileId = z.string().min(1).max(80).regex(/^[A-Za-z0-9._:-]+$/);
+const ExecutionProfileFingerprint = z.string().min(1).max(200).regex(/^[A-Za-z0-9._:+\-=]+$/);
+export const ExecutionProfileResolution = z.enum(['resolved', 'unresolved', 'drifted']);
+export const ExecutionProfileHealth = z.enum(['healthy', 'degraded', 'unavailable']);
+export const ExecutionProfileOffer = z.object({
+  id: ExecutionProfileId,
+  declarationFingerprint: ExecutionProfileFingerprint,
+  effectiveFingerprint: ExecutionProfileFingerprint.nullable(),
+  resolution: ExecutionProfileResolution,
+  health: ExecutionProfileHealth,
+  attestationCapable: z.boolean(),
+  observedAt: z.string().datetime(),
+  generation: z.number().int().positive(),
+  capacity: z.object({
+    maxConcurrency: z.number().int().positive(),
+    freeSlots: z.number().int().nonnegative(),
+  }).strict(),
+}).strict();
+export type ExecutionProfileOffer = z.infer<typeof ExecutionProfileOffer>;
+
+/** Immutable identity commissioned into one Run sitting. Mutable freshness/health/capacity are
+ * intentionally absent; the exact declaration and effective inventory that won dispatch stay. */
+export const CommissionedExecutionProfile = z.object({
+  id: ExecutionProfileId,
+  declarationFingerprint: ExecutionProfileFingerprint,
+  effectiveFingerprint: ExecutionProfileFingerprint,
+  generation: z.number().int().positive(),
+  attestationCapable: z.literal(true),
+}).strict();
+export type CommissionedExecutionProfile = z.infer<typeof CommissionedExecutionProfile>;
 
 export const Run = z.object({
   id: z.string(),
@@ -204,6 +271,9 @@ export const Run = z.object({
   // prompt nobody chose. A definition whose FILE is broken still resolves — the runner keeps a
   // scope-posture tombstone for it — so that is a working selection, not a stale name.
   workflow: z.string().nullable().default(null),
+  // Optional, repo-scoped machine environment commissioned by opaque identity/fingerprints.
+  // Null preserves the legacy/default Runner environment selection.
+  executionProfile: CommissionedExecutionProfile.nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
   // model names are the vendor's and they change weekly, so pinning them in a wire contract (or
@@ -256,6 +326,10 @@ export const AdvertisedWorkflow = z.object({
   name: z.string().min(1),
   base: RunKind,
   description: z.string().nullable().default(null),
+  // Additive, opaque workflow protocol capabilities. `mission.v2` means a build-posture
+  // workflow can own child scheduling for a single-root plan dispatch. Older advertisements
+  // omit this and remain valid ordinary workflows.
+  capabilities: z.array(z.string().min(1).max(80)).max(16).default([]),
 });
 export type AdvertisedWorkflow = z.infer<typeof AdvertisedWorkflow>;
 
@@ -287,6 +361,7 @@ export const RunnerRepo = z.object({
   // the workflow's posture and show a human line. Prompt/stages stay in the committed manifest —
   // the daemon resolves a selected name locally (resolveWorkflow); the wire carries the choice.
   workflows: z.array(z.union([z.string(), AdvertisedWorkflow])).default([]),
+  executionProfiles: z.array(ExecutionProfileOffer).max(64).default([]),
 });
 export type RunnerRepo = z.infer<typeof RunnerRepo>;
 

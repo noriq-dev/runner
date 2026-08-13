@@ -1,3 +1,7 @@
+import { realpathSync, writeFileSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { PermissionProfile } from '@noriq-dev/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CLAUDE_HOME } from '../src/agent-homes';
@@ -11,8 +15,15 @@ import {
   type SdkUserMessage,
   mapPermission,
   noriqToolsFor,
+  resolveClaudeAgentSdkInstallation,
 } from '../src/drivers/claude';
-import type { DriverStartOptions, DriverTelemetry } from '../src/drivers/types';
+import type { DriverStartOptions, DriverTelemetry, ProjectMcpSession } from '../src/drivers/types';
+import type {
+  AgentProcessContainment,
+  AgentProcessLaunch,
+  ContainedAgentProcess,
+} from '../src/process-containment';
+import { type ProjectMcpBundle, bindProjectMcpBundle, loadProjectMcpBundle } from '../src/project-mcp';
 
 // A controllable stand-in for the Agent SDK Query: captures the streamed input
 // turns + options, lets the test push scripted stream-json messages, and records
@@ -23,6 +34,7 @@ class FakeQuery {
   closed = false;
   options: unknown;
   private readonly emit = new AsyncQueue<SdkMessage>();
+  private streamFailure: Error | null = null;
   constructor(prompt: AsyncIterable<SdkUserMessage>, options: unknown) {
     this.options = options;
     void (async () => {
@@ -35,6 +47,10 @@ class FakeQuery {
   endStream(): void {
     this.emit.close();
   }
+  failStream(error: Error): void {
+    this.streamFailure = error;
+    this.emit.close();
+  }
   async interrupt(): Promise<unknown> {
     this.interrupted += 1;
     return undefined;
@@ -42,10 +58,38 @@ class FakeQuery {
   close(): void {
     this.closed = true;
   }
-  [Symbol.asyncIterator](): AsyncIterator<SdkMessage> {
-    return this.emit[Symbol.asyncIterator]();
+  async initializationResult(): Promise<unknown> {
+    return {};
+  }
+  async mcpServerStatus(): Promise<
+    Array<{
+      name: string;
+      status: 'connected' | 'failed' | 'needs-auth' | 'pending' | 'disabled';
+      tools?: Array<{ name: string }>;
+    }>
+  > {
+    const servers = (this.options as SdkQueryOptions | undefined)?.mcpServers ?? {};
+    const allowed = (this.options as SdkQueryOptions | undefined)?.allowedTools ?? [];
+    return Object.keys(servers).map((name) => ({
+      name,
+      status: 'connected',
+      tools: allowed
+        .filter((tool) => tool.startsWith(`mcp__${name}__`))
+        .map((tool) => ({ name: tool.slice(`mcp__${name}__`.length) })),
+    }));
+  }
+  async *[Symbol.asyncIterator](): AsyncIterator<SdkMessage> {
+    yield* this.emit;
+    if (this.streamFailure) throw this.streamFailure;
   }
 }
+
+const testClaudeDriver = (deps: ConstructorParameters<typeof ClaudeDriver>[0] = {}): ClaudeDriver =>
+  new ClaudeDriver({
+    reattestProjectMcpExecutables: () => Object.freeze([]),
+    createAttemptHome: () => ({ home: '/tmp/noriq-test-claude-attempt', cleanup() {} }),
+    ...deps,
+  });
 
 const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   write: false,
@@ -55,6 +99,34 @@ const profile = (over: Partial<PermissionProfile> = {}): PermissionProfile => ({
   ...over,
 });
 
+const unusedTestContainment: AgentProcessContainment = {
+  capabilities: {
+    processTreeTermination: true,
+    ownerDeathTermination: true,
+    workspaceIsolation: true,
+    protectedWorkspaceSubpaths: true,
+    projectMcpProcessContainment: true,
+  },
+  async probe() {},
+  spawn() {
+    throw new Error('this settings-source test must not invoke the SDK process seam');
+  },
+};
+
+const commissionedTokenContainment: AgentProcessContainment = {
+  ...unusedTestContainment,
+  capabilities: {
+    ...unusedTestContainment.capabilities,
+    providerCredentialIsolation: true,
+    hostResourceIsolation: true,
+    networkEgressIsolation: true,
+    immutableRuntimeAuthority: true,
+    providerTokenEnvelope: true,
+  },
+  authorityFingerprint: `sha256:${'b'.repeat(64)}`,
+  assertAuthority: async () => undefined,
+};
+
 function harness(startOver: Partial<DriverStartOptions> = {}) {
   let fake!: FakeQuery;
   const queryFn: QueryFn = (args) => {
@@ -63,7 +135,7 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
   };
   const telemetry: DriverTelemetry[] = [];
   const texts: string[] = [];
-  const driver = new ClaudeDriver({ queryFn, prepareClaudeHome: () => {} });
+  const driver = testClaudeDriver({ queryFn, prepareClaudeHome: () => {} });
   const session = driver.start({
     runId: 'run_1',
     kind: 'build',
@@ -80,12 +152,67 @@ function harness(startOver: Partial<DriverStartOptions> = {}) {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+};
+
+const projectMcp = (
+  servers: ProjectMcpBundle['servers'],
+  toolGrants: ProjectMcpSession['toolGrants'],
+): ProjectMcpSession => ({
+  bundle: {
+    source: '/wt/.mcp.json',
+    declarationFingerprint: 'declared',
+    effectiveFingerprint: 'effective',
+    launcherAuthorizations: Object.fromEntries(
+      Object.entries(servers).flatMap(([name, server]) =>
+        server.transport === 'stdio'
+          ? [
+              [
+                name,
+                {
+                  policyId: 'test-policy',
+                  executableIdentity: `test:${name}`,
+                  runtimeClosureIdentity: `test:runtime:${name}`,
+                  authorizedArgvIdentity: `sha256:${'a'.repeat(64)}`,
+                  resolvedCommand: process.execPath,
+                  readOnlyRoots: [],
+                },
+              ],
+            ]
+          : [],
+      ),
+    ),
+    endpointAuthorizations: Object.fromEntries(
+      Object.entries(servers).flatMap(([name, server]) =>
+        server.transport !== 'stdio'
+          ? [
+              [
+                name,
+                {
+                  policyId: 'test-endpoint-policy',
+                  endpointIdentity: `test:${name}`,
+                  resolvedUrl: server.url,
+                },
+              ],
+            ]
+          : [],
+      ),
+    ),
+    servers,
+  },
+  toolGrants,
+});
 
 afterEach(() => vi.restoreAllMocks());
 
 describe('driver capabilities (RUN-110)', () => {
   it('claude declares in-process hooks, steer, resume, and per-model telemetry', () => {
-    const driver = new ClaudeDriver({ queryFn: (() => undefined) as unknown as QueryFn });
+    const driver = testClaudeDriver({ queryFn: (() => undefined) as unknown as QueryFn });
     expect(driver.tool).toBe('claude');
     expect(driver.capabilities).toEqual({
       toolHooks: true,
@@ -93,6 +220,10 @@ describe('driver capabilities (RUN-110)', () => {
       interrupt: true,
       resumableSession: true,
       perModelTelemetry: true,
+      toolFreeSession: true,
+      workspaceIsolatedSession: false,
+      projectMcpProcessContainment: false,
+      terminationAcknowledgement: 'none',
     });
   });
 });
@@ -101,7 +232,7 @@ describe('Runner-specific Claude home (RUN-291)', () => {
   it('prepares the isolated home and loads only its user settings source', () => {
     const prepared: string[] = [];
     let options: SdkQueryOptions | undefined;
-    const driver = new ClaudeDriver({
+    const driver = testClaudeDriver({
       claudeHome: '/runner/claude',
       prepareClaudeHome: (home) => prepared.push(home),
       queryFn: (args) => {
@@ -132,6 +263,166 @@ describe('Runner-specific Claude home (RUN-291)', () => {
     expect(options.env?.CLAUDE_CONFIG_DIR).toBe(DEFAULT_CLAUDE_HOME);
     expect(options.settingSources).toEqual(['user']);
   });
+
+  it('loads no mutable filesystem settings for a contained mission session', () => {
+    let options: SdkQueryOptions | undefined;
+    const driver = testClaudeDriver({
+      claudeHome: '/runner/claude',
+      prepareClaudeHome: () => undefined,
+      containment: unusedTestContainment,
+      queryFn: (args) => {
+        options = args.options;
+        return new FakeQuery(args.prompt, args.options);
+      },
+    });
+    driver.start({
+      runId: 'mission_home',
+      kind: 'scope',
+      cwd: '/wt',
+      workspaceRoot: '/wt',
+      prompt: 'inspect',
+      permission: profile(),
+    });
+
+    expect(options?.settingSources).toEqual([]);
+    expect(options?.strictMcpConfig).toBe(true);
+    expect(options?.env?.HOME).toBe('/tmp/noriq-test-claude-attempt');
+    expect(options?.env?.CLAUDE_CONFIG_DIR).toBe('/tmp/noriq-test-claude-attempt');
+    expect(options?.env?.CLAUDE_CONFIG_DIR).not.toBe('/runner/claude');
+    const installation = resolveClaudeAgentSdkInstallation();
+    expect(options?.pathToClaudeCodeExecutable).toBe(installation.executablePath);
+    expect(installation.nativePackageName).toContain(`-${process.platform}-${process.arch}`);
+    expect(path.isAbsolute(installation.sdkEntryPath)).toBe(true);
+  });
+
+  it('mounts unique credential-only mission homes and cleans each only after tree exit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-claude-attempt-home-'));
+    const exits: Array<ReturnType<typeof deferred>> = [];
+    const attemptHomes: string[] = [];
+    try {
+      const durableHome = path.join(root, 'durable');
+      const workspace = path.join(root, 'workspace');
+      await Promise.all([mkdir(path.join(durableHome, 'sessions'), { recursive: true }), mkdir(workspace)]);
+      await Promise.all([
+        writeFile(path.join(durableHome, '.credentials.json'), '{"token":"claude-secret"}', {
+          mode: 0o600,
+        }),
+        writeFile(path.join(durableHome, '.claude.json'), '{"ambient":true}'),
+        writeFile(path.join(durableHome, 'sessions', 'prior.jsonl'), 'prior session'),
+      ]);
+
+      const launches: AgentProcessLaunch[] = [];
+      const children: Array<{ exitCode: number | null; signalCode: NodeJS.Signals | null }> = [];
+      const containment: AgentProcessContainment = {
+        ...commissionedTokenContainment,
+        spawn(request): ContainedAgentProcess {
+          launches.push(request);
+          const exit = deferred();
+          const child = {
+            exitCode: null as number | null,
+            signalCode: null as NodeJS.Signals | null,
+            kill: vi.fn(() => true),
+          };
+          exits.push(exit);
+          children.push(child);
+          return {
+            child: child as never,
+            exited: exit.promise,
+            terminate: () => {},
+          };
+        },
+      };
+      const queryFn: QueryFn = ({ prompt, options }) => {
+        const query = new FakeQuery(prompt, options);
+        if (!options?.spawnClaudeCodeProcess || !options.pathToClaudeCodeExecutable) {
+          throw new Error('missing managed Claude process seam');
+        }
+        options.spawnClaudeCodeProcess({
+          command: options.pathToClaudeCodeExecutable,
+          args: [],
+          cwd: workspace,
+          env: options.env ?? {},
+          signal: new AbortController().signal,
+        });
+        return query;
+      };
+      const driver = new ClaudeDriver({
+        claudeHome: durableHome,
+        containment,
+        queryFn,
+        reattestProjectMcpExecutables: () => Object.freeze([]),
+      });
+
+      for (const runId of ['claude-attempt-1', 'claude-attempt-2']) {
+        driver.start({
+          runId,
+          kind: 'build',
+          cwd: workspace,
+          workspaceRoot: workspace,
+          prompt: 'work',
+          permission: profile({ write: true }),
+          tokenEnvelope: { totalTokens: 1_024, maxTurns: 4 },
+        });
+      }
+
+      expect(launches).toHaveLength(2);
+      for (const [index, launch] of launches.entries()) {
+        const attemptHome = launch.providerCredentialRoots?.[0];
+        expect(attemptHome).toBeTruthy();
+        attemptHomes.push(attemptHome as string);
+        expect(launch.providerCredentialRoots).toEqual([attemptHome]);
+        expect(launch.privateWriteRoots).toBeUndefined();
+        expect(launch.providerTokenEnvelope).toEqual({ totalTokens: 1_024, maxTurns: 4 });
+        expect(launch.providerCredentialRoots).not.toContain(durableHome);
+        expect(launch.env.HOME).toBe(attemptHome);
+        expect(launch.env.CLAUDE_CONFIG_DIR).toBe(attemptHome);
+        expect(await readdir(attemptHome as string)).toEqual(['.credentials.json']);
+        expect(await readFile(path.join(attemptHome as string, '.credentials.json'), 'utf8')).toBe(
+          '{"token":"claude-secret"}',
+        );
+
+        // The direct vendor child may exit before the containment provider has reaped its tree.
+        children[index]!.exitCode = 0;
+        await expect(stat(attemptHome as string)).resolves.toBeTruthy();
+      }
+      expect(attemptHomes[0]).not.toBe(attemptHomes[1]);
+
+      for (const exit of exits) exit.resolve();
+      await tick();
+      for (const attemptHome of attemptHomes) {
+        await expect(stat(attemptHome)).rejects.toMatchObject({ code: 'ENOENT' });
+      }
+    } finally {
+      for (const exit of exits) exit.resolve();
+      await tick();
+      await Promise.all(attemptHomes.map((home) => rm(home, { recursive: true, force: true })));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('cleans an attempt seed when the SDK exits before launching a contained process', async () => {
+    const cleanup = vi.fn();
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      containment: unusedTestContainment,
+      createAttemptHome: () => ({ home: '/tmp/noriq-unused-claude-attempt', cleanup }),
+      queryFn: ({ prompt, options }) => {
+        fake = new FakeQuery(prompt, options);
+        return fake;
+      },
+    });
+    driver.start({
+      runId: 'claude-no-process',
+      kind: 'scope',
+      cwd: '/wt',
+      workspaceRoot: '/wt',
+      prompt: 'inspect',
+      permission: profile(),
+    });
+
+    fake.endStream();
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+  });
 });
 
 describe('mapPermission', () => {
@@ -154,6 +445,141 @@ describe('mapPermission', () => {
 });
 
 describe('ClaudeDriver', () => {
+  it('enforces a tool-free inference turn for the mission guide', async () => {
+    const h = harness({
+      kind: 'scope',
+      permission: profile(),
+      toolAccess: 'none',
+      noriqTools: [],
+    });
+    await tick();
+
+    const options = h.getFake().options as SdkQueryOptions;
+    expect(options.tools).toEqual([]);
+    expect(options.allowedTools).toEqual([]);
+    expect(options.disallowedTools).toEqual(['mcp__*']);
+    expect(options.mcpServers).toBeUndefined();
+    expect(h.getFake().received.map((message) => message.message.content)).toEqual(['do the thing']);
+  });
+
+  it('passes a finite mission envelope to both the commissioned broker and SDK defenses', async () => {
+    let options: SdkQueryOptions | undefined;
+    let queries = 0;
+    const productionCapabilityDriver = testClaudeDriver({
+      containment: commissionedTokenContainment,
+      prepareClaudeHome: () => undefined,
+    });
+    expect(productionCapabilityDriver.capabilities).toMatchObject({
+      hardTokenEnvelope: true,
+      commissionedExecutionBoundary: true,
+    });
+    const driver = testClaudeDriver({
+      containment: commissionedTokenContainment,
+      prepareClaudeHome: () => undefined,
+      queryFn: ({ prompt, options: received }) => {
+        queries += 1;
+        options = received;
+        const query = new FakeQuery(prompt, received);
+        query.endStream();
+        return query;
+      },
+    });
+    expect(driver.capabilities.hardTokenEnvelope).toBeUndefined();
+    driver.start({
+      runId: 'mission-token-envelope',
+      kind: 'build',
+      cwd: '/wt',
+      workspaceRoot: '/wt',
+      prompt: 'bounded work',
+      permission: profile({ write: true }),
+      tokenEnvelope: { totalTokens: 1_024, maxTurns: 4 },
+    });
+    await tick();
+
+    expect(queries).toBe(1);
+    expect(options).toMatchObject({
+      maxTurns: 4,
+      taskBudget: { total: 1_024 },
+      disallowedTools: expect.arrayContaining(['Agent', 'Task']),
+    });
+
+    expect(() =>
+      driver.start({
+        runId: 'mission-native-delegation',
+        kind: 'build',
+        cwd: '/wt',
+        workspaceRoot: '/wt',
+        prompt: 'must not launch',
+        permission: profile({ write: true, allow: ['Agent'] }),
+        tokenEnvelope: { totalTokens: 1_024, maxTurns: 4 },
+      }),
+    ).toThrow(/native delegation is unavailable/);
+    expect(queries).toBe(1);
+  });
+
+  it('rejects MCP authority on a tool-free inference turn before querying the model', () => {
+    expect(() =>
+      harness({
+        toolAccess: 'none',
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          { simulator: ['inspect'] },
+        ),
+      }),
+    ).toThrow('tool-free Claude sessions may not receive MCP authority');
+  });
+
+  it('refuses a requested mission workspace boundary it cannot attest', () => {
+    expect(() => harness({ workspaceRoot: '/wt' })).toThrow('cannot attest mission workspace isolation');
+  });
+
+  it('refuses an SDK spawn command that differs from the forced native mission executable', () => {
+    const containmentSpawn = vi.fn(() => {
+      throw new Error('containment must not receive an unbound executable');
+    });
+    const installation = resolveClaudeAgentSdkInstallation();
+    const driver = testClaudeDriver({
+      containment: { ...unusedTestContainment, spawn: containmentSpawn },
+      claudeCodeExecutable: installation.executablePath,
+      prepareClaudeHome: () => undefined,
+      queryFn: ({ options }) => {
+        if (!options?.spawnClaudeCodeProcess) throw new Error('missing SDK process seam');
+        options.spawnClaudeCodeProcess({
+          command: process.execPath,
+          args: [],
+          cwd: '/wt',
+          env: {},
+          signal: new AbortController().signal,
+        });
+        throw new Error('unexpected SDK callback return');
+      },
+    });
+
+    expect(() =>
+      driver.start({
+        runId: 'mission_wrong_claude',
+        kind: 'scope',
+        cwd: '/wt',
+        workspaceRoot: '/wt',
+        prompt: 'must not run',
+        permission: profile(),
+      }),
+    ).toThrow('Claude SDK changed the attested mission executable before spawn');
+    expect(containmentSpawn).not.toHaveBeenCalled();
+  });
+
+  it('rejects combining project and Noriq MCP authority before querying the model', () => {
+    expect(() =>
+      harness({
+        noriqMcp: { url: 'https://noriq.test/mcp', token: 'token' },
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          { simulator: ['inspect'] },
+        ),
+      }),
+    ).toThrow('may not combine project MCP authority with Noriq MCP authority');
+  });
+
   it('runs the brief, streams text, parses result telemetry, resolves done', async () => {
     const h = harness();
     const fake = h.getFake();
@@ -549,6 +975,8 @@ describe('terminal telemetry counts every model (RUN-34)', () => {
 
 describe('Noriq MCP wiring', () => {
   const opts = (h: ReturnType<typeof harness>) => h.getFake().options as SdkQueryOptions;
+  const bareNoriqToolsFor = (kind: 'scope' | 'build' | 'verify') =>
+    noriqToolsFor(kind).map((tool) => tool.replace(/^mcp__noriq__/, ''));
 
   it('injects the Noriq MCP server with the token on the transport, not the env', () => {
     const h = harness({ noriqMcp: { url: 'https://noriq.example/mcp', token: 'plnrt_secret' } });
@@ -559,6 +987,116 @@ describe('Noriq MCP wiring', () => {
       url: 'https://noriq.example/mcp',
       headers: { Authorization: 'Bearer plnrt_secret' },
     });
+  });
+
+  it('holds a Noriq-only first prompt until its effective server inventory is connected', async () => {
+    let release!: () => void;
+    const initialized = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.initializationResult = () => initialized;
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_noriq_attest',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'do not spend before attestation',
+      permission: profile({ write: true }),
+      noriqMcp: { url: 'https://noriq.example/mcp', token: 'run-token' },
+    });
+
+    await tick();
+    expect(fake.received).toEqual([]);
+    release();
+    await vi.waitFor(() =>
+      expect(fake.received.map((message) => message.message.content)).toEqual([
+        'do not spend before attestation',
+      ]),
+    );
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {},
+    });
+    await session.done();
+  });
+
+  it('fails a Noriq-only session before the prompt when its effective tool inventory widens', async () => {
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => [
+          {
+            name: NORIQ_MCP_NAME,
+            status: 'connected',
+            tools: [...bareNoriqToolsFor('build'), 'ambient_admin'].map((name) => ({ name })),
+          },
+        ];
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_noriq_widened',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'must not run',
+      permission: profile({ write: true }),
+      noriqMcp: { url: 'https://noriq.example/mcp', token: 'run-token' },
+    });
+
+    const exit = await session.done();
+    expect(exit.reason).toContain('noriq tool inventory differs from Runner authority');
+    expect(fake.received).toEqual([]);
+  });
+
+  it('accepts a known shared Run catalogue for a narrowly granted stage actor', async () => {
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => [
+          {
+            name: NORIQ_MCP_NAME,
+            status: 'connected',
+            tools: bareNoriqToolsFor('build').map((name) => ({ name })),
+          },
+        ];
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_noriq_stage',
+      kind: 'verify',
+      cwd: '/wt',
+      prompt: 'review the parent run',
+      permission: profile({ write: false }),
+      noriqMcp: { url: 'https://noriq.example/mcp', token: 'run-token' },
+      noriqTools: ['raise_alert', 'request_input'],
+    });
+
+    await vi.waitFor(() => expect(fake.received).toHaveLength(1));
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {},
+    });
+    await session.done();
   });
 
   it("ignores the operator's ambient MCP config", () => {
@@ -649,6 +1187,416 @@ describe('Noriq MCP wiring', () => {
 
   it('omits mcpServers entirely when no connection is supplied', () => {
     expect(opts(harness()).mcpServers).toBeUndefined();
+  });
+});
+
+describe('project MCP wiring', () => {
+  it('refuses a replaced project MCP executable before invoking the Claude SDK', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-claude-mcp-attest-'));
+    try {
+      const executable = path.join(root, 'mcp-launcher');
+      await writeFile(executable, '#!/bin/sh\nexit 0\n');
+      await chmod(executable, 0o755);
+      await writeFile(
+        path.join(root, '.mcp.json'),
+        `${JSON.stringify({ mcpServers: { project: { command: 'custom', args: [] } } })}\n`,
+      );
+      const bundle = bindProjectMcpBundle(
+        await loadProjectMcpBundle(root, {
+          launcherPolicy: {
+            policyId: 'claude-test-launcher-v1',
+            authorize: ({ argvIdentity }) => ({
+              policyId: 'claude-test-launcher-v1',
+              executableIdentity: 'claude-test-launcher/revision-1',
+              runtimeClosureIdentity: 'claude-test-runtime/revision-1',
+              authorizedArgvIdentity: argvIdentity,
+              resolvedCommand: executable,
+              readOnlyRoots: [],
+            }),
+          },
+        }),
+        root,
+      );
+      await writeFile(executable, '#!/bin/sh\nexit 9\n');
+      const queryFn = vi.fn((() => undefined) as unknown as QueryFn);
+      const driver = new ClaudeDriver({ queryFn, prepareClaudeHome: () => {} });
+
+      expect(() =>
+        driver.start({
+          runId: 'mutated-project-mcp',
+          kind: 'build',
+          cwd: root,
+          prompt: 'must never launch',
+          permission: profile({ write: true }),
+          projectMcp: { bundle, toolGrants: { project: ['inspect'] } },
+        }),
+      ).toThrow(/executable re-attestation failed: resolved command digest changed/);
+      expect(queryFn).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('re-attests again inside the SDK process callback before containment spawn', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'noriq-claude-mcp-late-attest-'));
+    try {
+      const executable = path.join(root, 'mcp-launcher');
+      await writeFile(executable, '#!/bin/sh\nexit 0\n');
+      await chmod(executable, 0o755);
+      await writeFile(
+        path.join(root, '.mcp.json'),
+        `${JSON.stringify({ mcpServers: { project: { command: 'custom', args: [] } } })}\n`,
+      );
+      const bundle = bindProjectMcpBundle(
+        await loadProjectMcpBundle(root, {
+          launcherPolicy: {
+            policyId: 'claude-late-launcher-v1',
+            authorize: ({ argvIdentity }) => ({
+              policyId: 'claude-late-launcher-v1',
+              executableIdentity: 'claude-late-launcher/revision-1',
+              runtimeClosureIdentity: 'claude-late-runtime/revision-1',
+              authorizedArgvIdentity: argvIdentity,
+              resolvedCommand: executable,
+              readOnlyRoots: [],
+            }),
+          },
+        }),
+        root,
+      );
+      const containmentSpawn = vi.fn(() => {
+        throw new Error('containment spawn must not be reached');
+      });
+      const containment: AgentProcessContainment = {
+        capabilities: {
+          processTreeTermination: true,
+          ownerDeathTermination: true,
+          workspaceIsolation: true,
+          protectedWorkspaceSubpaths: true,
+          projectMcpProcessContainment: true,
+        },
+        async probe() {},
+        spawn: containmentSpawn,
+      };
+      const queryFn: QueryFn = ({ options }) => {
+        writeFileSync(executable, '#!/bin/sh\nexit 9\n');
+        if (!options?.spawnClaudeCodeProcess) throw new Error('SDK process callback was not configured');
+        if (!options.pathToClaudeCodeExecutable) throw new Error('SDK native CLI path was not configured');
+        options.spawnClaudeCodeProcess({
+          command: options.pathToClaudeCodeExecutable,
+          args: [],
+          cwd: root,
+          env: {},
+          signal: new AbortController().signal,
+        });
+        throw new Error('SDK process callback unexpectedly returned');
+      };
+      const driver = new ClaudeDriver({
+        queryFn,
+        containment,
+        prepareClaudeHome: () => {},
+        createAttemptHome: () => ({ home: '/tmp/noriq-test-claude-attempt', cleanup() {} }),
+      });
+
+      expect(() =>
+        driver.start({
+          runId: 'late-mutated-project-mcp',
+          kind: 'build',
+          cwd: root,
+          workspaceRoot: root,
+          prompt: 'must never launch',
+          permission: profile({ write: true }),
+          projectMcp: { bundle, toolGrants: { project: ['inspect'] } },
+        }),
+      ).toThrow(/executable re-attestation failed: resolved command digest changed/);
+      expect(containmentSpawn).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('maps a generic bundle explicitly and grants only exact profile tools', async () => {
+    const h = harness({
+      env: { PATH: '/bin', GIT_TERMINAL_PROMPT: '0' },
+      projectMcp: projectMcp(
+        {
+          simulator: {
+            transport: 'stdio',
+            command: 'npx',
+            args: ['sim-mcp'],
+            env: { PROJECT: '/wt' },
+          },
+          docs: { transport: 'http', url: 'https://docs.test/mcp', headers: {} },
+        },
+        { simulator: ['inspect', 'mutate'], docs: ['search'] },
+      ),
+    });
+    await tick();
+    const options = h.getFake().options as SdkQueryOptions;
+
+    expect(options.mcpServers?.simulator).toEqual({
+      type: 'stdio',
+      command: process.execPath,
+      args: ['sim-mcp'],
+      env: {
+        PATH: realpathSync('/bin'),
+        GIT_TERMINAL_PROMPT: '0',
+        PROJECT: '/wt',
+        GIT_ASKPASS: '/bin/false',
+        SSH_ASKPASS: '/bin/false',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'credential.helper',
+        GIT_CONFIG_VALUE_0: '',
+        HOME: '/tmp/noriq-project-mcp',
+        CODEX_HOME: '/tmp/noriq-project-mcp/codex-denied',
+        CLAUDE_CONFIG_DIR: '/tmp/noriq-project-mcp/claude-denied',
+        NORIQ_MCP_TOKEN: '',
+      },
+    });
+    expect(options.mcpServers?.docs).toEqual({
+      type: 'http',
+      url: 'https://docs.test/mcp',
+      headers: {},
+    });
+    expect(options.allowedTools).toEqual(
+      expect.arrayContaining(['mcp__simulator__inspect', 'mcp__simulator__mutate', 'mcp__docs__search']),
+    );
+    expect(options.allowedTools).not.toEqual(expect.arrayContaining(['mcp__simulator__*', 'mcp__docs__*']));
+    expect(h.getFake().received).toEqual([
+      { type: 'user', message: { role: 'user', content: 'do the thing' }, parent_tool_use_id: null },
+    ]);
+  });
+
+  it('holds the first prompt until the exact effective inventory is connected', async () => {
+    let release!: () => void;
+    const initialized = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.initializationResult = () => initialized;
+        return fake;
+      },
+    });
+    driver.start({
+      runId: 'run_attest',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'do not spend yet',
+      permission: profile({ write: true }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect'] },
+      ),
+    });
+
+    await tick();
+    expect(fake.received).toEqual([]);
+    release();
+    await tick();
+    expect(fake.received.map((message) => message.message.content)).toEqual(['do not spend yet']);
+  });
+
+  it('polls a pending project server without loading its whole tool catalogue into turn one', async () => {
+    let fake!: FakeQuery;
+    let polls = 0;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => {
+          polls += 1;
+          return [
+            {
+              name: 'simulator',
+              status: polls === 1 ? 'pending' : 'connected',
+              tools: [{ name: 'inspect' }],
+            },
+          ];
+        };
+        return fake;
+      },
+    });
+    driver.start({
+      runId: 'run_pending_mcp',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'wait for the server',
+      permission: profile({ write: true }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect'] },
+      ),
+    });
+
+    await tick();
+    expect(fake.received).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(fake.received.map((message) => message.message.content)).toEqual(['wait for the server']);
+    expect((fake.options as SdkQueryOptions).mcpServers?.simulator).not.toHaveProperty('alwaysLoad');
+  });
+
+  it('fails before the prompt when the SDK reports an unexpected effective server', async () => {
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => [{ name: 'ambient', status: 'connected' }];
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_bad_inventory',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'must not run',
+      permission: profile({ write: true }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect'] },
+      ),
+    });
+
+    const exit = await session.done();
+    expect(exit.reason).toContain('expected servers [simulator], got [ambient]');
+    expect(fake.received).toEqual([]);
+  });
+
+  it('forces dontAsk when an auto profile receives project MCP authority', async () => {
+    const h = harness({
+      permission: profile({ write: true, auto: true }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect'] },
+      ),
+    });
+    await tick();
+
+    expect((h.getFake().options as SdkQueryOptions).permissionMode).toBe('dontAsk');
+  });
+
+  it('rejects a permission rule that would widen an exact project grant', () => {
+    expect(() =>
+      harness({
+        permission: profile({ write: true, allow: ['mcp__simulator__*'] }),
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          { simulator: ['inspect'] },
+        ),
+      }),
+    ).toThrow('permission allowlist may not widen exact project MCP grants');
+  });
+
+  it('fails before the prompt when a granted tool is absent', async () => {
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => [
+          { name: 'simulator', status: 'connected', tools: [{ name: 'inspect' }] },
+        ];
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_missing_tool',
+      kind: 'build',
+      cwd: '/wt',
+      prompt: 'must not run',
+      permission: profile({ write: true }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect', 'mutate'] },
+      ),
+    });
+
+    const exit = await session.done();
+    expect(exit.reason).toContain(
+      'simulator tool inventory differs from its exact grant (missing [mutate], unexpected [], available [inspect])',
+    );
+    expect(fake.received).toEqual([]);
+  });
+
+  it('fails before the prompt when a server exposes tools outside the exact grant', async () => {
+    let fake!: FakeQuery;
+    const driver = testClaudeDriver({
+      prepareClaudeHome: () => {},
+      queryFn: (args) => {
+        fake = new FakeQuery(args.prompt, args.options);
+        fake.mcpServerStatus = async () => [
+          {
+            name: 'simulator',
+            status: 'connected',
+            tools: [{ name: 'inspect' }, { name: 'mutate' }, { name: 'shell' }],
+          },
+        ];
+        return fake;
+      },
+    });
+    const session = driver.start({
+      runId: 'run_subset_tool_grant',
+      kind: 'verify',
+      cwd: '/wt',
+      prompt: 'inspect only',
+      permission: profile({ write: false }),
+      projectMcp: projectMcp(
+        { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+        { simulator: ['inspect'] },
+      ),
+    });
+
+    const exit = await session.done();
+    expect(exit.reason).toContain(
+      'simulator tool inventory differs from its exact grant (missing [], unexpected [mutate, shell], available [inspect, mutate, shell])',
+    );
+    expect(fake.received).toEqual([]);
+    const allowedTools = (fake.options as SdkQueryOptions).allowedTools ?? [];
+    expect(allowedTools).toContain('mcp__simulator__inspect');
+    expect(allowedTools).not.toContain('mcp__simulator__mutate');
+    expect(allowedTools).not.toContain('mcp__simulator__shell');
+  });
+
+  it.each([
+    ['empty', { simulator: [] }],
+    ['mismatched', { other: ['inspect'] }],
+  ])('rejects %s project tool grants before starting the SDK', (_case, toolGrants) => {
+    expect(() =>
+      harness({
+        projectMcp: projectMcp(
+          { simulator: { transport: 'stdio', command: 'sim', args: [], env: {} } },
+          toolGrants,
+        ),
+      }),
+    ).toThrow('invalid project MCP session');
+  });
+
+  it('launches only the project servers granted to this session', async () => {
+    const { getFake, session } = harness({
+      projectMcp: projectMcp(
+        {
+          editor: { transport: 'stdio', command: 'edit', args: [], env: {} },
+          inspector: { transport: 'stdio', command: 'inspect', args: [], env: {} },
+        },
+        { inspector: ['read_state'] },
+      ),
+    });
+    const fake = getFake();
+    await vi.waitFor(() => expect(fake.received).toHaveLength(1));
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    await session.done();
+    expect(Object.keys((fake.options as SdkQueryOptions).mcpServers ?? {})).toEqual(['inspector']);
   });
 });
 
@@ -760,5 +1708,44 @@ describe('stopping a multiTurn session settles the turn in flight (RUN-133)', ()
     firstResult(h.getFake());
     await h.session.done();
     await expect(h.session.stop()).resolves.toBeUndefined();
+  });
+});
+
+describe('losing a multiTurn SDK stream settles the turn in flight', () => {
+  const beginHandBack = async () => {
+    const h = harness({ multiTurn: true });
+    const fake = h.getFake();
+    fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: { input_tokens: 10, output_tokens: 10 },
+    });
+    await h.session.done();
+    return { ...h, fake, turn: h.session.continueWith!('address the review finding') };
+  };
+
+  it('fails a pending hand-back when the SDK stream ends', async () => {
+    const { fake, turn } = await beginHandBack();
+
+    fake.endStream();
+
+    await expect(turn).resolves.toMatchObject({
+      outcome: 'failed',
+      reason: 'stream ended without a result',
+    });
+  });
+
+  it('fails a pending hand-back with the SDK stream error', async () => {
+    const { fake, turn } = await beginHandBack();
+
+    fake.failStream(new Error('SDK transport disconnected'));
+
+    await expect(turn).resolves.toMatchObject({
+      outcome: 'failed',
+      reason: 'SDK transport disconnected',
+    });
   });
 });

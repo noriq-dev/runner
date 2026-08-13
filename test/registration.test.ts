@@ -1,3 +1,4 @@
+import { type ExecutionProfileOffer, RUNNER_PROTOCOL_CAPABILITIES } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
 import type { DiscoveredRepo } from '../src/discovery';
 import { buildRegistration, repoReport } from '../src/registration';
@@ -51,6 +52,7 @@ describe('buildRegistration', () => {
         defaultBranch: 'main',
         repositoryKey: null,
         workflows: builtins,
+        executionProfiles: [],
       },
       {
         id: 'repo_b',
@@ -60,9 +62,40 @@ describe('buildRegistration', () => {
         defaultBranch: null,
         repositoryKey: null,
         workflows: builtins,
+        executionProfiles: [],
       },
     ]);
+    expect(reg.protocolCapabilities).toEqual(RUNNER_PROTOCOL_CAPABILITIES);
+    expect(reg.protocolCapabilities).toContain('mission.v2');
     expect('runnerId' in reg).toBe(false); // omitted on first registration
+  });
+
+  it('serializes current opaque execution-profile offers per repo without leaking configuration', () => {
+    const offer: ExecutionProfileOffer = {
+      id: 'project-nod.codex-build',
+      declarationFingerprint: 'sha256:declaration',
+      effectiveFingerprint: 'sha256:effective',
+      resolution: 'resolved',
+      health: 'healthy',
+      attestationCapable: true,
+      observedAt: '2026-08-13T00:00:00.000Z',
+      generation: 3,
+      capacity: { maxConcurrency: 2, freeSlots: 1 },
+    };
+    const reg = buildRegistration(
+      { label: 'l', concurrency: 2, tools: ['codex'] },
+      repos,
+      new Map(),
+      new Map([['/x/a', [offer]]]),
+    );
+
+    expect(reg.repos[0]?.executionProfiles).toEqual([offer]);
+    expect(reg.repos[1]?.executionProfiles).toEqual([]);
+    expect(JSON.parse(JSON.stringify(reg)).repos[0].executionProfiles).toEqual([offer]);
+    const serialized = JSON.stringify(reg.repos[0]?.executionProfiles);
+    expect(serialized).not.toContain('/home/');
+    expect(serialized).not.toContain('command');
+    expect(serialized).not.toContain('credential');
   });
 
   it('includes runnerId on re-registration and honors explicit kinds', () => {
@@ -170,6 +203,49 @@ describe('buildRegistration', () => {
       { name: 'scope', base: 'scope' },
       { name: 'verify', base: 'verify' },
     ]);
+  });
+
+  it('withholds declared workflow capabilities until daemon activation explicitly enables them', () => {
+    const catalogs = new Map([
+      [
+        '/x/a',
+        {
+          definitions: {
+            mission: {
+              base: 'build' as const,
+              prompt: null,
+              promptSource: null,
+              stages: null,
+              description: 'agent-led mission',
+              capabilities: ['mission.v2'],
+              source: '/x/a/.noriq/workflows/mission.toml',
+              tier: 'project-file' as const,
+            },
+          },
+        },
+      ],
+    ]);
+
+    const withheld = buildRegistration({ label: 'l', concurrency: 1, tools: [] }, repos, catalogs);
+    expect(withheld.repos[0]?.workflows).toContainEqual({
+      name: 'mission',
+      base: 'build',
+      description: 'agent-led mission',
+    });
+
+    const enabled = buildRegistration(
+      { label: 'l', concurrency: 1, tools: [] },
+      repos,
+      catalogs,
+      new Map(),
+      new Map([['/x/a', ['mission.v2']]]),
+    );
+    expect(enabled.repos[0]?.workflows).toContainEqual({
+      name: 'mission',
+      base: 'build',
+      description: 'agent-led mission',
+      capabilities: ['mission.v2'],
+    });
   });
 
   it('advertises the coordinate catalog per installed tool (RUN-115)', () => {

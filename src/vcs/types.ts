@@ -69,6 +69,136 @@ export interface Workspace {
 }
 
 /**
+ * Exact, backend-owned evidence about a mission workspace. Revision ids remain opaque to common
+ * code: they may be a Git object id, a Diversion commit id, or another backend's immutable token.
+ * A successful inspection proves only the workspace's current revision and whether its complete
+ * tracked/untracked work surface is clean; it does not imply that the revision has been published.
+ */
+export interface MissionWorkspaceInspection {
+  revisionId: string;
+  clean: boolean;
+}
+
+/**
+ * The result of one exact checkpoint operation. `changed` compares the final revision with the
+ * child attempt's pinned `expectedParentRevisionId`, so work an agent committed itself is still
+ * reported as changed. `beforeRevisionId` records what HEAD named immediately before the Runner
+ * checkpointed loose files. A successful exact checkpoint is always clean and its final revision
+ * is proven to descend from (or equal) the expected parent. Backends reject rather than returning
+ * partial or guessed evidence.
+ */
+export interface MissionCheckpointEvidence {
+  beforeRevisionId: string;
+  revisionId: string;
+  changed: boolean;
+  clean: true;
+}
+
+/** Authority pinned before a child process starts; never inferred from its post-run HEAD. */
+export interface MissionCheckpointOptions {
+  expectedParentRevisionId: string;
+}
+
+export interface MissionWorkspaceReconciliationOptions {
+  /** Exact revision the next child is authorized to inherit. */
+  expectedRevisionId: string;
+  /** Stable, attempt-derived id used to address one idempotent quarantine record. */
+  quarantineId: string;
+  /** Bounded human-readable explanation stored on a quarantine commit when residue exists. */
+  message: string;
+}
+
+/** Proof that a failed/cancelled/lost writer's workspace is clean at the authorized revision. */
+export type MissionWorkspaceReconciliationEvidence =
+  | {
+      revisionId: string;
+      clean: true;
+      disposition: 'restored';
+    }
+  | {
+      revisionId: string;
+      clean: true;
+      disposition: 'quarantined';
+      /** Backend-owned durable ref/change name retained for recovery or human inspection. */
+      quarantineRef: string;
+      /** Immutable revision containing the quarantined tree and divergent ancestry. */
+      quarantineRevisionId: string;
+    };
+
+/** Exact post-validation restoration. Validation output is evidence, never candidate project work. */
+export interface MissionWorkspaceRestorationEvidence {
+  revisionId: string;
+  clean: true;
+  /** Whether tracked, untracked, ignored, operation, HEAD, or branch state had to be discarded. */
+  changed: boolean;
+}
+
+/** The immutable revision that must remain available after a mission releases its workspace. */
+export interface MissionWorkspaceReleaseOptions {
+  preserveRevisionId: string;
+}
+
+/**
+ * Optional VCS capability used by the mission harness. It is separate from `VcsBackend` so a
+ * backend cannot accidentally appear mission-safe merely by satisfying the legacy run pipeline.
+ * Consumers must fail closed when this capability is absent.
+ */
+export interface MissionVcsEvidence {
+  /** Inspect the exact backend revision and complete workspace cleanliness. */
+  inspectWorkspace(ws: Workspace): Promise<MissionWorkspaceInspection>;
+
+  /** Make loose work durable and return one coherent before/after evidence record. */
+  checkpointExact(
+    ws: Workspace,
+    message: string,
+    opts: MissionCheckpointOptions,
+  ): Promise<MissionCheckpointEvidence>;
+
+  /**
+   * Quarantine all Git-visible residue, discard ignored cache/build residue, then restore a clean
+   * workspace before any later child may start.
+   */
+  reconcileWorkspace(
+    ws: Workspace,
+    opts: MissionWorkspaceReconciliationOptions,
+  ): Promise<MissionWorkspaceReconciliationEvidence>;
+
+  /**
+   * Discard every side effect of a trusted validation command and restore one exact revision.
+   * Unlike failed-agent reconciliation, validator side effects are not retained as project work.
+   */
+  restoreWorkspace(ws: Workspace, expectedRevisionId: string): Promise<MissionWorkspaceRestorationEvidence>;
+
+  /**
+   * Release the physical workspace while retaining its accepted immutable revision. Unlike
+   * `VcsBackend.dispose`, this must never delete the durable branch/change that names that
+   * revision. It rejects if the workspace is dirty or no longer names `preserveRevisionId`.
+   */
+  releaseWorkspace(ws: Workspace, opts: MissionWorkspaceReleaseOptions): Promise<void>;
+}
+
+export type MissionVcsBackend = VcsBackend & MissionVcsEvidence;
+
+/**
+ * Repository-root authority available to the mission execution plane. Legacy VCS routing may
+ * still choose a best-effort backend when discovery is inconclusive, but that fallback must never
+ * be mistaken for proof that the configured directory itself is the backend's repository root.
+ */
+export type MissionRepositoryAuthority = 'exact-root' | 'unavailable';
+
+/** Runtime capability check for callers holding only the legacy backend seam. */
+export function hasMissionVcsEvidence(backend: VcsBackend): backend is MissionVcsBackend {
+  const candidate = backend as VcsBackend & Partial<MissionVcsEvidence>;
+  return (
+    typeof candidate.inspectWorkspace === 'function' &&
+    typeof candidate.checkpointExact === 'function' &&
+    typeof candidate.reconcileWorkspace === 'function' &&
+    typeof candidate.restoreWorkspace === 'function' &&
+    typeof candidate.releaseWorkspace === 'function'
+  );
+}
+
+/**
  * A read-only lease over the repo's tree for BACKGROUND INDEXING (RUN-211) — never for an agent.
  * Repeats `Workspace`'s type discipline exactly, for the reason `Workspace`'s own comment gives:
  * `localPath` is the only field here that is EVER a filesystem path (and is now optional — see

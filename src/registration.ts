@@ -1,4 +1,12 @@
-import type { AgentTool, ProjectManifest, RunEffort, RunKind } from '@noriq-dev/shared';
+import {
+  type AgentTool,
+  type ExecutionProfileOffer,
+  type ProjectManifest,
+  RUNNER_PROTOCOL_CAPABILITIES,
+  type RunEffort,
+  type RunKind,
+  type RunnerProtocolCapability,
+} from '@noriq-dev/shared';
 import type { DiscoveredRepo } from './discovery';
 import { CLAUDE_CATALOG } from './drivers/claude';
 import { CODEX_CATALOG } from './drivers/codex';
@@ -56,6 +64,8 @@ export interface AdvertisedWorkflowEntry {
   base: RunKind;
   /** Present only when the definition declares one — an absent line is omitted, not sent null. */
   description?: string;
+  /** Additive protocol offer, emitted only after daemon activation proves it is usable. */
+  capabilities?: string[];
 }
 
 /**
@@ -69,19 +79,24 @@ export interface AdvertisedWorkflowEntry {
 export function advertisedWorkflows(
   catalog: WorkflowCatalog | undefined,
   manifestWorkflows?: ProjectManifest['workflows'],
+  enabledCapabilities: readonly string[] = [],
 ): AdvertisedWorkflowEntry[] {
   const entries = new Map<string, AdvertisedWorkflowEntry>();
   for (const kind of DEFAULT_KINDS) entries.set(kind, { name: kind, base: kind });
   // Built-in descriptions are deliberately absent: `description` is optional and the repo has no
   // canonical text for them — the dashboard already knows what scope/build/verify are.
-  const custom: Array<[string, { base: RunKind; description: string | null }]> = catalog
-    ? Object.entries(catalog.definitions)
-    : Object.entries(manifestWorkflows ?? {});
+  const custom: Array<
+    [string, { base: RunKind; description: string | null; capabilities?: readonly string[] }]
+  > = catalog ? Object.entries(catalog.definitions) : Object.entries(manifestWorkflows ?? {});
   for (const [name, def] of custom) {
+    const capabilities = (def.capabilities ?? []).filter((capability) =>
+      enabledCapabilities.includes(capability),
+    );
     entries.set(name, {
       name,
       base: def.base,
       ...(def.description !== null && def.description !== '' ? { description: def.description } : {}),
+      ...(capabilities.length > 0 ? { capabilities } : {}),
     });
   }
   return [...entries.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -118,6 +133,13 @@ export interface RepoReport {
    * source paths never cross.
    */
   workflows: AdvertisedWorkflowEntry[];
+  /**
+   * Opaque, repo-scoped environments this runner has resolved and attested locally (PLNR-487).
+   * Executable configuration, paths, credentials and probe output never cross this boundary.
+   * An empty array is the legacy/default posture: this checkout offers no commissioned mission
+   * environment and ordinary runs continue to use the existing manifest-selected environment.
+   */
+  executionProfiles?: ExecutionProfileOffer[];
 }
 
 /**
@@ -154,6 +176,8 @@ export function repoReport(
   manifest: Pick<ProjectManifest, 'board' | 'workflows' | 'repositoryKey'>,
   catalog: WorkflowCatalog | undefined,
   log: Pick<typeof defaultLogger, 'error'> = defaultLogger,
+  executionProfiles: readonly ExecutionProfileOffer[] = [],
+  enabledWorkflowCapabilities: readonly string[] = [],
 ): RepoReport {
   return {
     id: repo.id,
@@ -164,7 +188,10 @@ export function repoReport(
     repositoryKey: resolveReportedRepositoryKey(manifest.repositoryKey, log),
     // Built-ins + the merged custom catalog (RUN-195): exactly the list dispatch can resolve,
     // post-precedence — a definition shadowing a bundled name replaces that entry's metadata.
-    workflows: advertisedWorkflows(catalog, manifest.workflows),
+    workflows: advertisedWorkflows(catalog, manifest.workflows, enabledWorkflowCapabilities),
+    // Copy the current snapshot so a later capacity refresh cannot mutate an already-built REST
+    // body while it is in flight. The strict shared offer shape is the privacy boundary.
+    executionProfiles: [...executionProfiles],
   };
 }
 
@@ -183,6 +210,11 @@ export interface RunnerRegistration {
   kinds: RunKind[];
   maxConcurrency: number;
   repos: RepoReport[];
+  /**
+   * Runtime features advertised during REST registration. The server uses this before the WS
+   * hello exists to choose reconnect/reconciliation policy, so it must match the hello's set.
+   */
+  protocolCapabilities?: RunnerProtocolCapability[];
 }
 
 const DEFAULT_KINDS: RunKind[] = ['scope', 'build', 'verify'];
@@ -192,6 +224,8 @@ export function buildRegistration(
   params: RegistrationParams,
   discovered: DiscoveredRepo[],
   workflowCatalogs: ReadonlyMap<string, WorkflowCatalog> = new Map(),
+  executionProfiles: ReadonlyMap<string, readonly ExecutionProfileOffer[]> = new Map(),
+  enabledWorkflowCapabilities: ReadonlyMap<string, readonly string[]> = new Map(),
 ): RunnerRegistration {
   return {
     ...(params.runnerId ? { runnerId: params.runnerId } : {}),
@@ -206,6 +240,19 @@ export function buildRegistration(
     agents: agentCatalog(params.tools),
     kinds: params.kinds ?? DEFAULT_KINDS,
     maxConcurrency: params.concurrency,
-    repos: discovered.map((r) => repoReport(r, r.manifest, workflowCatalogs.get(r.root))),
+    repos: discovered.map((r) =>
+      repoReport(
+        r,
+        r.manifest,
+        workflowCatalogs.get(r.root),
+        defaultLogger,
+        executionProfiles.get(r.root),
+        enabledWorkflowCapabilities.get(r.root),
+      ),
+    ),
+    // Registration controls restart policy before the socket is connected. Advertise the exact
+    // same bounded set as RunnerHello; a copy keeps this payload mutable/JSON-shaped rather than
+    // leaking the shared constant's readonly tuple type.
+    protocolCapabilities: [...RUNNER_PROTOCOL_CAPABILITIES],
   };
 }

@@ -10,6 +10,7 @@ import type { ContinuableRun } from '../src/continuable';
 import {
   Daemon,
   continuationLockScope,
+  missionAssignmentRefusal,
   orphanSweep,
   owedMergeReconciler,
   shouldForwardRunStatus,
@@ -87,6 +88,35 @@ describe('telemetryFrame', () => {
   it('sends null (no news) only for a phase-only tick with no telemetry', () => {
     const f = telemetryFrame({ telemetry: undefined });
     expect(f).toEqual({ tokensUsed: null, usdSpent: null, modelUsage: null });
+  });
+});
+
+describe('missionAssignmentRefusal', () => {
+  it('refuses a leased root before legacy supervision can discard mission authority', () => {
+    expect(
+      missionAssignmentRefusal({ executionProfile: null }, { sitting: 1, executionId: 'exe_root', epoch: 1 }),
+    ).toMatch(/task and dependency snapshot/);
+  });
+
+  it('refuses an exact execution profile on the unprofiled legacy route', () => {
+    expect(
+      missionAssignmentRefusal(
+        {
+          executionProfile: {
+            id: 'profile',
+            generation: 1,
+            declarationFingerprint: `sha256:${'a'.repeat(64)}`,
+            effectiveFingerprint: `sha256:${'b'.repeat(64)}`,
+            attestationCapable: true,
+          },
+        },
+        null,
+      ),
+    ).toMatch(/legacy Run supervision/);
+  });
+
+  it('leaves an ordinary legacy assignment unchanged', () => {
+    expect(missionAssignmentRefusal({ executionProfile: null }, null)).toBeNull();
   });
 });
 
@@ -307,6 +337,21 @@ describe('waveCapacity', () => {
     l.cap.release('run_a'); // the wave's run settled
     await gate;
     expect(admitted).toBe(true);
+  });
+
+  it('cancels a queued admission without leaving its lifecycle promise hanging', async () => {
+    const l = ledger({ concurrency: 1, active: ['run_a'] });
+    expect(l.cap.waveLimit('run_a')).toBe(1);
+    l.active.add('run_b');
+    let settled = false;
+    const gate = l.cap.admit('run_b').then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    l.cap.cancelAdmission('run_b');
+    await gate;
+    expect(settled).toBe(true);
   });
 
   it('waiters take seats FIFO — a queued run holds no seat, and two waiters cannot deadlock', async () => {
@@ -709,6 +754,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
   class FakeDaemonSocket implements WsSocket {
     sent: string[] = [];
     deliver = true;
+    closeCalls = 0;
     private readonly listeners = new Map<string, Array<(...a: unknown[]) => void>>();
     constructor(
       readonly url: string,
@@ -724,6 +770,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       this.sent.push(data);
     }
     close(): void {
+      this.closeCalls += 1;
       for (const cb of this.listeners.get('close') ?? []) cb();
     }
     emit(event: string, ...args: unknown[]): void {
@@ -818,13 +865,16 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       workflows?: WorkflowStore;
       indexCoordinator?: Pick<IndexCoordinator, 'cancelAll' | 'trigger'>;
       indexTriggers?: Pick<IndexTriggerHub, 'reconcileOnStartup' | 'startPolling' | 'stop' | 'onLanded'>;
+      indexControl?: { start(): Promise<{ port: number }>; stop(): Promise<void> };
       parked?: ParkedStore;
       parkState?: unknown;
       parkProbe?: 'error' | 'hang';
       parkRecoveryTimeoutMs?: number;
+      restoreError?: Error;
+      socketSink?: FakeDaemonSocket[];
     } = {},
   ) {
-    const sockets: FakeDaemonSocket[] = [];
+    const sockets: FakeDaemonSocket[] = over.socketSink ?? [];
     const startup: string[] = [];
     const connect: WsFactory = (url, headers) => {
       startup.push('socket');
@@ -851,6 +901,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       workflows: over.workflows,
       indexCoordinator: over.indexCoordinator,
       indexTriggers: over.indexTriggers,
+      indexControl: over.indexControl,
       // RUN-222: a REAL IndexCoordinator/IndexTriggerHub is constructed whenever a test does not
       // override them (most tests here don't) — and `sweepOrphanedStaging`/the journal are read on
       // every `start()` regardless, so without this every daemon test in this suite would touch
@@ -864,6 +915,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       // test in this suite, not only ones that exercise them directly.
       indexStatusPath: path.join(tmp, 'index-status.json'),
       indexControlInfoPath: path.join(tmp, 'index-control.json'),
+      missionPrivateRoot: path.join(tmp, 'mission-harness-v2'),
       parkRecoveryTimeoutMs: over.parkRecoveryTimeoutMs,
       createSupervisor: (d) => {
         deps = d;
@@ -878,6 +930,12 @@ describe('daemon.start(), driven end to end with fake seams', () => {
           restoreExecutionLifecycle: async (classify) => {
             startup.push('restore-start');
             restored.push('restored');
+            if (over.restoreError) {
+              // Let WsClient's async token/open continuation publish the socket first: this seam
+              // specifically exercises rollback after ws.start(), not a pre-transport rejection.
+              await tick();
+              throw over.restoreError;
+            }
             if (classify) {
               for (const entry of await parked.list()) {
                 const disposition = await classify(entry);
@@ -1001,40 +1059,73 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     ).toBe(true);
   });
 
-  it('classifies a terminal recovered park before opening assignment admission', async () => {
+  it('treats a post-start mission control failure as daemon-fatal and shuts down automatically', async () => {
+    const cancelAll = vi.fn().mockResolvedValue(undefined);
+    const { handle, sockets } = await harness({
+      indexCoordinator: { cancelAll, trigger: async () => {} },
+    });
+    const socket = sockets[0]!;
+    socket.emit('open');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: handle.runnerId,
+        protocol: 2,
+        serverTime: '2026-08-12T00:00:00.000Z',
+        acceptedCapabilities: ['orchestration.v1', 'mission.v2'],
+      }),
+    );
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.reconcile.request',
+        deadline: '2000-01-01T00:00:00.000Z',
+        items: [],
+      }),
+    );
+
+    await expect(handle.fatal).resolves.toMatchObject({
+      code: 'MISSION_RECONCILIATION_EXPIRED',
+    });
+    await vi.waitFor(() => expect(cancelAll).toHaveBeenCalledOnce());
+    expect(socket.sent.some((frame) => JSON.parse(frame).type === 'hello')).toBe(true);
+  });
+
+  it('opens the control socket before classifying a terminal recovered park, but keeps assignment admission buffered', async () => {
     const parked = await executionParkedStore('parked-terminal.json');
     const h = await harness({
       parked,
       parkState: { status: 'cancelled', blocked: false, signalId: null, question: null, answer: null },
     });
     expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'terminal' }]);
-    expect(h.startup).toEqual(['restore-start', 'classified:terminal', 'restore-end', 'socket']);
+    expect(h.startup).toEqual(['socket', 'restore-start', 'classified:terminal', 'restore-end']);
     await tick();
     expect(h.terminalized).toEqual(['run_parked']);
   });
 
-  it('retains a server-blocked recovered park before opening assignment admission', async () => {
+  it('retains a server-blocked recovered park while the early control socket is live', async () => {
     const parked = await executionParkedStore('parked-blocked.json');
     const h = await harness({
       parked,
       parkState: { status: 'blocked', blocked: true, signalId: 'sig_1', question: '?', answer: null },
     });
     expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'parked' }]);
-    expect(h.startup).toEqual(['restore-start', 'classified:parked', 'restore-end', 'socket']);
+    expect(h.startup).toEqual(['socket', 'restore-start', 'classified:parked', 'restore-end']);
   });
 
-  it('fails closed before admission when recovered park state cannot be fetched', async () => {
+  it('fails closed behind the startup buffer when recovered park state cannot be fetched', async () => {
     const parked = await executionParkedStore('parked-unknown.json');
     const h = await harness({ parked, parkProbe: 'error' });
     expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
-    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
+    expect(h.startup).toEqual(['socket', 'restore-start', 'classified:unknown', 'restore-end']);
   });
 
-  it('bounds a hung recovered-park probe and still fails closed before admission', async () => {
+  it('bounds a hung recovered-park probe while keeping the control socket available', async () => {
     const parked = await executionParkedStore('parked-hung.json');
     const h = await harness({ parked, parkProbe: 'hang', parkRecoveryTimeoutMs: 5 });
     expect(h.recovered).toEqual([{ runId: 'run_parked', disposition: 'unknown' }]);
-    expect(h.startup).toEqual(['restore-start', 'classified:unknown', 'restore-end', 'socket']);
+    expect(h.startup).toEqual(['socket', 'restore-start', 'classified:unknown', 'restore-end']);
   });
 
   it('restores parked lineage ownership before it accepts a new assignment after restart', async () => {
@@ -1118,6 +1209,37 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       'indexTriggers.stop',
       'indexCoordinator.cancelAll',
     ]);
+  });
+
+  it('rolls back the live socket and every partial subsystem when startup rejects after ws.start()', async () => {
+    const sockets: FakeDaemonSocket[] = [];
+    const cancelAll = vi.fn(async () => {});
+    const stopTriggers = vi.fn(() => {});
+    const startControl = vi.fn(async () => ({ port: 43_210 }));
+    const stopControl = vi.fn(async () => {});
+    const failure = new Error('restore failed after transport publication');
+
+    await expect(
+      harness({
+        restoreError: failure,
+        socketSink: sockets,
+        indexCoordinator: { cancelAll, trigger: async () => {} },
+        indexTriggers: {
+          reconcileOnStartup: async () => {},
+          startPolling: () => {},
+          stop: stopTriggers,
+          onLanded: async () => {},
+        },
+        indexControl: { start: startControl, stop: stopControl },
+      }),
+    ).rejects.toBe(failure);
+
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.closeCalls).toBe(1);
+    expect(startControl).toHaveBeenCalledOnce();
+    expect(stopControl).toHaveBeenCalledOnce();
+    expect(stopTriggers).toHaveBeenCalledOnce();
+    expect(cancelAll).toHaveBeenCalledOnce();
   });
 
   // RUN-222 locked decision 8: the orphaned-staging sweep runs at STARTUP, for real, through the
@@ -1238,6 +1360,34 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     await tick();
     await tick();
     expect(supervised).toEqual(['run_a', 'run_b']);
+  });
+
+  it('closes legacy admission before shutdown can wake a queued or receive a fresh assignment', async () => {
+    let settle!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const { handle, deps, sockets, supervised } = await harness({ concurrency: 1, superviseGate: gate });
+    const socket = sockets[0]!;
+    socket.emit('message', assignedFrame('run_active'));
+    await tick();
+    expect(supervised).toEqual(['run_active']);
+    expect(deps.waveLimit?.('run_active')).toBe(1);
+    socket.emit('message', assignedFrame('run_queued'));
+    await tick();
+    expect(supervised).toEqual(['run_active']);
+
+    handles.pop();
+    const stopped = handle.stop();
+    // stop() revokes admission synchronously, before its first awaited cancellation/sweep.
+    socket.emit('message', assignedFrame('run_after_stop'));
+    await tick();
+    expect(supervised).toEqual(['run_active']);
+
+    settle();
+    await stopped;
+    await tick();
+    expect(supervised).toEqual(['run_active']);
   });
 
   // RUN-191: PLNR-237's own closing note is that a `blocking: false` request_input answer, when
@@ -1369,6 +1519,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
         concurrencyStrategy: null,
       },
       configuration: [],
+      executionProfile: null,
     };
 
     it('retains the record when the frame does not leave, then delivers and clears it on a live send', async () => {
@@ -1430,10 +1581,9 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     });
   });
 
-  // RUN-195. The hello's repo reports are recomputed per CONNECTION, never pinned at startup:
-  // workflow files are read-at-use (RUN-192) and the task's staleness contract is "the next
-  // report" — so a reconnect after an edit is exactly when the server's list must change, with
-  // no watcher and no restart.
+  // RUN-195. A connection publishes its last-good repo report in hello immediately, then performs
+  // a real read-at-use refresh on a heartbeat. This keeps the control channel/adoption deadline
+  // independent of a slow project filesystem while still making edits visible without restart.
   describe('repo workflow reports are recomputed per connection (RUN-195)', () => {
     const catalogWith = (description: string): WorkflowCatalog => ({
       definitions: {
@@ -1470,7 +1620,16 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       return hello.repos[0]!.workflows;
     };
 
-    it('registration and the initial hello advertise the current catalog; a reconnect advertises the changed one', async () => {
+    const refreshed = (socket: FakeDaemonSocket): Array<Record<string, unknown>> | undefined => {
+      const beat = socket.sent
+        .map((frame) => JSON.parse(frame) as Record<string, unknown>)
+        .find((frame) => frame.type === 'heartbeat' && Array.isArray(frame.repos)) as
+        | { repos: Array<{ workflows: Array<Record<string, unknown>> }> }
+        | undefined;
+      return beat?.repos[0]?.workflows;
+    };
+
+    it('registration/hello use the last good catalog and reconnect refresh publishes a changed one', async () => {
       let catalog = catalogWith('v1');
       const workflows = { current: async () => catalog } as unknown as WorkflowStore;
       const repoDir = await markRepo();
@@ -1480,7 +1639,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       const reg = bodies[0] as { repos: Array<{ workflows: unknown }> };
       expect(reg.repos[0]!.workflows).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
 
-      // The initial hello resolves the same current view — the refresh provider's first run.
+      // The initial hello uses the just-registered current view and never waits on another read.
       await vi.waitFor(() => expect(sockets).toHaveLength(1));
       sockets[0]!.emit('open');
       expect(advertised(sockets[0]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
@@ -1488,12 +1647,16 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       // Prompt bytes are daemon-local — they must never cross the socket.
       expect(sockets[0]!.sent[0]).not.toContain('SECRET PROMPT BYTES');
 
-      // The workflow files change while the daemon runs; the next connection re-reads them.
+      // The workflow files change while the daemon runs. Reconnect hello remains immediate and
+      // therefore carries v1; the following repo heartbeat publishes the successfully re-read v2.
       catalog = catalogWith('v2');
       sockets[0]!.emit('close');
       await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 5000 });
       sockets[1]!.emit('open');
-      expect(advertised(sockets[1]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v2' });
+      expect(advertised(sockets[1]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v1' });
+      await vi.waitFor(() =>
+        expect(refreshed(sockets[1]!)).toContainEqual({ name: 'docs', base: 'scope', description: 'v2' }),
+      );
     });
 
     it('a broken refresh falls back to the last good report and never blocks the reconnect', async () => {

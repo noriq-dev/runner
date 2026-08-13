@@ -4,6 +4,11 @@ import { ProjectIntelligenceEpisode } from './intelligence';
 import type { ContextConsumptionMode, ContextConsumptionRole, ContextConsumptionSectionId } from './intelligence';
 import { RunModelUsage } from './runner';
 
+/** PLNR-474: one resident-graph ceiling shared by the 2D fallback response and the 3D continuous
+ * space. Consumers may impose representation-specific edge/page bounds around this node budget,
+ * but neither visualization gets a smaller universe merely because it uses a different renderer. */
+export const CONSTELLATION_RESIDENT_NODE_BUDGET = 12_000;
+
 // ---------------------------------------------------------------------------
 // Project Memory — shared entities, stable URIs, and wire contracts (PLNR-244,
 // Phase 1 of the Project Memory plan; see the "Project Memory — settled
@@ -308,6 +313,29 @@ export type EpisodeSelfSummary = z.infer<typeof EpisodeSelfSummary>;
 export const EpisodeLandingOutcome = z.enum(['landed', 'not_landed', 'failed', 'pending']);
 export type EpisodeLandingOutcome = z.infer<typeof EpisodeLandingOutcome>;
 
+export const WorkEpisodeSource = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('runner_run'), runId: z.string().min(1), sitting: z.number().int().positive() }),
+  z.object({
+    kind: z.literal('copilot_claim'),
+    claimId: z.string().min(1),
+    executionId: z.string().min(1).nullable().default(null),
+  }),
+]);
+export type WorkEpisodeSource = z.infer<typeof WorkEpisodeSource>;
+
+/** Optional IDE testimony. It is retained for inspection but never promoted into the canonical
+ * files/tests fields or server-observed analytics without independent verification. */
+export const CopilotReportedEvidence = z.object({
+  provenance: z.literal('driver_reported'),
+  source: z.literal('driver'),
+  sourceId: z.string().min(1),
+  reportedAt: z.string().datetime(),
+  filesTouched: z.array(RepoPath).default([]),
+  testsRun: z.array(z.string()).default([]),
+  outcomeSummary: z.string().max(4_000).nullable().default(null),
+});
+export type CopilotReportedEvidence = z.infer<typeof CopilotReportedEvidence>;
+
 /**
  * Every terminal run produces one of these (§14). The skeleton
  * (everything but `selfSummary`) is REQUIRED and built entirely from
@@ -318,6 +346,8 @@ export const EffortEpisode = z.object({
   id: z.string(),
   projectId: z.string(),
   runId: z.string(),
+  /** Explicit source identity. Absent legacy episodes are Runner-run sourced. */
+  workSource: WorkEpisodeSource.optional(),
   taskId: z.string().nullable().default(null),
   repositoryKey: RepositoryKey.nullable().default(null),
   baseId: BaseId.nullable().default(null),
@@ -334,6 +364,7 @@ export const EffortEpisode = z.object({
   steeringEvents: z.array(z.string()).default([]),
   landingOutcome: EpisodeLandingOutcome.default('pending'),
   remainingWork: z.array(z.string()).default([]),
+  reportedEvidence: CopilotReportedEvidence.nullable().optional(),
   // PLNR-290: additive analytics-grade facts. Absence is permanent backwards compatibility,
   // not a legacy error — old Runners/episodes remain valid and later extraction reports the
   // corresponding metrics as unavailable.

@@ -671,6 +671,15 @@ export type {
   LeaseOptions,
   LockContext,
   LockOutcome,
+  MissionCheckpointEvidence,
+  MissionCheckpointOptions,
+  MissionRepositoryAuthority,
+  MissionVcsBackend,
+  MissionVcsEvidence,
+  MissionWorkspaceInspection,
+  MissionWorkspaceReconciliationEvidence,
+  MissionWorkspaceReconciliationOptions,
+  MissionWorkspaceReleaseOptions,
   PublishResult,
   ReviewRequest,
   ReviewResult,
@@ -678,6 +687,7 @@ export type {
   VcsBackend,
   Workspace,
 } from './vcs/types';
+export { hasMissionVcsEvidence } from './vcs/types';
 export { backendChangeStats } from './change-stats';
 export {
   LockClient,
@@ -803,3 +813,5 @@ export {
   suggestedMemoryPaths,
   type MemoryAudience,
 } from './memory-render';
+export * from './project-mcp';
+export * from './mission/index';

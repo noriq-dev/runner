@@ -56,7 +56,10 @@ describe('detectVcs', () => {
         return '';
       },
     });
-    expect(map.get('/repos/app')?.kind).toBe('git');
+    expect(map.get('/repos/app')).toMatchObject({
+      kind: 'git',
+      missionAuthority: 'exact-root',
+    });
     // A machine full of git repos must not pay a dv spawn (or a warning) for detection.
     expect(dvAsked).toBe(false);
   });
@@ -66,6 +69,7 @@ describe('detectVcs', () => {
     expect(map.get('/home/mtuska/Diversion/ThirdParty')).toMatchObject({
       kind: 'diversion',
       repoId: 'dv.repo.3c9a67f5-eeb1-4819-8bc2-8048bfae16e9',
+      missionAuthority: 'exact-root',
     });
   });
 
@@ -87,12 +91,32 @@ describe('detectVcs', () => {
     expect(map.get('/home/mtuska/Diversion/ThirdParty')).toMatchObject({
       kind: 'git',
       reason: expect.stringContaining('.git'),
+      missionAuthority: 'exact-root',
+    });
+  });
+
+  it('.p4config at the root supplies exact-root authority without ancestor inference', async () => {
+    const root = '/repos/perforce-app';
+    const map = await detectVcs([root], {
+      exists: (candidate) => candidate === path.join(root, '.p4config'),
+      realpath: (candidate) => candidate,
+      dvRepoList: async () => {
+        throw new Error('dv must not be consulted for an explicit Perforce root');
+      },
+    });
+
+    expect(map.get(root)).toMatchObject({
+      kind: 'perforce',
+      missionAuthority: 'exact-root',
     });
   });
 
   it('a sibling with a shared prefix is NOT claimed — exact paths only', async () => {
     const map = await detectVcs(['/home/mtuska/Diversion/ThirdParty2'], deps({ dv: DV_REPO_OUTPUT }));
-    expect(map.get('/home/mtuska/Diversion/ThirdParty2')?.kind).toBe('git');
+    expect(map.get('/home/mtuska/Diversion/ThirdParty2')).toMatchObject({
+      kind: 'git',
+      missionAuthority: 'unavailable',
+    });
   });
 
   it('dv missing or its agent dead → git fallback, and the reason says the registry was unreachable', async () => {
@@ -100,6 +124,7 @@ describe('detectVcs', () => {
     expect(map.get('/anywhere')).toMatchObject({
       kind: 'git',
       reason: expect.stringContaining('unreachable'),
+      missionAuthority: 'unavailable',
     });
   });
 

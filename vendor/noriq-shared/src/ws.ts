@@ -4,6 +4,13 @@ import { ExecutionSpec } from './execution-spec';
 import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
+  MissionTaskAck,
+  MissionTaskBeginReport,
+  MissionTaskSettleReport,
+  MissionAdoptionResult,
+  MissionInventoryItem,
+  MissionLeaseRef,
+  MISSION_CAPABILITY,
   ORCHESTRATION_CAPABILITY,
   RunnerExecutionDeclaration,
   RunnerExecutionEventReport,
@@ -29,7 +36,7 @@ import {
 // Bump when the envelope shape changes incompatibly; sent in `hello` so the
 // server can reject or adapt to an out-of-date daemon.
 export const RUNNER_PROTOCOL_VERSION = 1;
-export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY] as const;
+export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY] as const;
 
 // How a steer is injected into the live CLI session:
 //   soft — queue as the next user turn (the agent finishes its current thought)
@@ -60,7 +67,10 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
 
   // A Run has been dispatched to this runner. Carries the full server-authored
   // Run entity; the daemon prepares a worktree and spawns the agent process.
-  z.object({ type: z.literal('run.assigned'), run: Run }),
+  z.object({
+    type: z.literal('run.assigned'), run: Run,
+    missionLease: MissionLeaseRef.nullable().default(null),
+  }),
 
   // A plan finished, so its working branch is ready to become a merge request (RUN-28).
   //
@@ -119,6 +129,16 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('pong') }),
 
   z.object({ type: z.literal('execution.ack'), ack: ExecutionReportAck }),
+  z.object({ type: z.literal('mission.task.ack'), ack: MissionTaskAck }),
+  z.object({
+    type: z.literal('mission.reconcile.request'),
+    deadline: z.string().datetime(),
+    items: z.array(MissionInventoryItem).max(128),
+  }),
+  z.object({
+    type: z.literal('mission.reconcile.result'),
+    results: z.array(MissionAdoptionResult).max(128),
+  }),
 ]);
 export type RunnerServerMessage = z.infer<typeof RunnerServerMessage>;
 
@@ -165,6 +185,7 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     // The Run's worktree path, reported once the daemon prepares the checkout —
     // gives the server/dashboard visibility into where the Run is executing.
     worktreePath: z.string().nullable().default(null),
+    missionLease: MissionLeaseRef.nullable().default(null),
     at: z.string().datetime(),
   }),
 
@@ -172,24 +193,36 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     type: z.literal('execution.declare'),
     runId: z.string(),
     declaration: RunnerExecutionDeclaration,
+    missionLease: MissionLeaseRef.nullable().default(null),
   }),
 
   z.object({
     type: z.literal('execution.relation'),
     runId: z.string(),
     relation: RunnerExecutionRelationReport,
+    missionLease: MissionLeaseRef.nullable().default(null),
   }),
 
   z.object({
     type: z.literal('execution.event'),
     runId: z.string(),
     event: RunnerExecutionEventReport,
+    missionLease: MissionLeaseRef.nullable().default(null),
   }),
 
   z.object({
     type: z.literal('execution.reconcile'),
     runId: z.string(),
     reconciliation: RunnerExecutionReconciliation,
+    missionLease: MissionLeaseRef.nullable().default(null),
+  }),
+
+  z.object({ type: z.literal('mission.task.begin'), runId: z.string(), lease: MissionLeaseRef, begin: MissionTaskBeginReport }),
+  z.object({ type: z.literal('mission.task.settle'), runId: z.string(), lease: MissionLeaseRef, settle: MissionTaskSettleReport }),
+  z.object({
+    type: z.literal('mission.reconcile'),
+    inventory: z.array(MissionInventoryItem).max(128),
+    observedAt: z.string().datetime(),
   }),
 
   // Live run telemetry (RUN-22): a high-frequency, non-transitional heartbeat of
@@ -203,6 +236,7 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('run.telemetry'),
     runId: z.string(),
+    missionLease: MissionLeaseRef.nullable().default(null),
     tokensUsed: z.number().int().nonnegative().nullable().default(null),
     usdSpent: z.number().nonnegative().nullable().default(null),
     // Tail of the agent's combined output, tail-capped by the daemon (last wins).

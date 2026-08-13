@@ -1,4 +1,5 @@
 import {
+  MISSION_CAPABILITY,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
   RunnerClientMessage,
@@ -8,6 +9,12 @@ import type {
   AgentTool,
   ExecutedConfigurationEvidence,
   ExecutionSpec,
+  MissionAdoptionResult,
+  MissionInventoryItem,
+  MissionLeaseRef,
+  MissionTaskAck,
+  MissionTaskBeginReport,
+  MissionTaskSettleReport,
   Run,
   RunKind,
   RunModelUsage,
@@ -32,6 +39,9 @@ export interface WsSocket {
 }
 export type WsFactory = (url: string, headers: Record<string, string>) => WsSocket;
 
+/** Monotonic, process-local identity for one concrete WebSocket connection. */
+export type WsConnectionGeneration = number;
+
 export interface WsIdentity {
   label: string;
   tools: AgentTool[];
@@ -53,21 +63,62 @@ export interface SteerMsg {
 }
 
 export interface WsHandlers {
-  onRegistered?: (msg: { runnerId: string; protocol: number; acceptedCapabilities: string[] }) => void;
-  onAssigned?: (run: Run) => void;
-  onCancel?: (msg: { runId: string; hard: boolean; reason: string | null }) => void;
+  onRegistered?: (
+    msg: {
+      runnerId: string;
+      protocol: number;
+      acceptedCapabilities: string[];
+    },
+    generation: WsConnectionGeneration,
+  ) => void;
+  onAssigned?: (run: Run, missionLease: MissionLeaseRef | null, generation: WsConnectionGeneration) => void;
+  /** Acknowledged task admission/settlement for a negotiated mission.v2 root. */
+  onMissionTaskAck?: (ack: MissionTaskAck, generation: WsConnectionGeneration) => void;
+  /** Server-authored adoption request. Inventory construction must be read-only. */
+  onMissionReconcileRequest?: (
+    request: {
+      deadline: string;
+      items: readonly MissionInventoryItem[];
+    },
+    generation: WsConnectionGeneration,
+  ) => void;
+  /** Exact server decision after Runner submitted its durable local inventory. */
+  onMissionReconcileResult?: (
+    results: readonly MissionAdoptionResult[],
+    generation: WsConnectionGeneration,
+  ) => void;
+  onCancel?: (
+    msg: {
+      runId: string;
+      hard: boolean;
+      reason: string | null;
+    },
+    generation: WsConnectionGeneration,
+  ) => void;
   /** A human's steer to inject into the running process (RUN-16). */
   onSteer?: (steer: SteerMsg) => void;
   /** A plan finished — its working branch is ready to become a merge request (RUN-28). The FAST
    *  path only: the server also records it, and the daemon reconciles on connect, because a plan
    *  can complete while nothing is listening. */
-  onPlanCompleted?: (msg: { planId: string; planKey: string; planTitle: string; projectId: string }) => void;
+  onPlanCompleted?: (msg: {
+    planId: string;
+    planKey: string;
+    planTitle: string;
+    projectId: string;
+  }) => void;
   /** A human answered the question a run parked on (RUN-30) — bring its agent back. The fast
    *  path only: the answer is durable server-side, and the daemon re-asks on reconnect, because
    *  a question answered while the box was off is the normal case rather than the edge one. */
-  onResume?: (msg: { runId: string; signalId: string; question: string | null; answer: string }) => void;
+  onResume?: (msg: {
+    runId: string;
+    signalId: string;
+    question: string | null;
+    answer: string;
+  }) => void;
   /** Fired on every reconnect (not the first connect) — a hook for supervision reconcile. */
-  onReconnect?: () => void;
+  onReconnect?: (generation: WsConnectionGeneration) => void;
+  /** The current socket generation ended. Authority-bearing work must stop until adoption. */
+  onDisconnect?: (reason: string, generation: WsConnectionGeneration) => void;
 }
 
 export interface WsClientOptions {
@@ -78,12 +129,10 @@ export interface WsClientOptions {
   token: string | (() => Promise<string>);
   identity: WsIdentity;
   /**
-   * Re-resolved on every (re)connect, before the hello, for the same reason the token is (RUN-195):
-   * manifests and workflow files are read-at-use daemon-side, so a reconnect must advertise the
-   * catalogs as they are NOW, not the snapshot the daemon started with. Non-gating by design —
-   * advertising is legibility for the dispatch surface, never what connectivity or dispatch
-   * resolution rests on — so a failed refresh logs, keeps the last good set (initially
-   * `identity.repos`), and the connection proceeds.
+   * Re-resolved immediately after every socket opens and on heartbeats. The dial and hello use the
+   * last successfully observed snapshot (initially the just-registered identity) so filesystem,
+   * driver, or MCP attestation can never delay the control channel. A successful refresh follows
+   * on a heartbeat frame; a failed one keeps the last good set.
    */
   refreshRepos?: () => Promise<RepoReport[]>;
   /** Current free capacity, sampled on each heartbeat. */
@@ -127,13 +176,19 @@ export class WsClient {
   private readonly connect: WsFactory;
   private readonly log: Pick<typeof Logger, 'debug' | 'info' | 'warn' | 'error'>;
   private sock: WsSocket | undefined;
+  private sockGeneration: WsConnectionGeneration | null = null;
+  private nextSockGeneration = 1;
   private stopped = false;
   private everConnected = false;
   private reconnectAttempt = 0;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  /** At most one filesystem/attestation refresh may run at a time. */
+  private heartbeatRepoRefresh: Promise<void> | undefined;
   /** Heartbeat intervals since the last INBOUND frame (RUN-176). Reset by any received frame;
    *  crossing the deadline means the socket is half-open and gets terminated. */
   private silentBeats = 0;
+  /** Accepted only for the current socket; cleared before any reconnect can dispatch work. */
+  private acceptedCapabilities = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   // Runs the daemon believes are live (non-terminal) — re-asserted on reconnect.
   private readonly liveRuns = new Map<string, Record<string, unknown>>();
@@ -150,7 +205,12 @@ export class WsClient {
       ...options,
     };
     this.connect = options.connect ?? defaultConnect;
-    this.log = options.logger ?? { debug() {}, info() {}, warn() {}, error() {} };
+    this.log = options.logger ?? {
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+    };
     this.repos = options.identity.repos;
   }
 
@@ -162,6 +222,7 @@ export class WsClient {
   stop(): void {
     this.stopped = true;
     this.stopHeartbeat();
+    this.acceptedCapabilities.clear();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     try {
@@ -170,6 +231,30 @@ export class WsClient {
       /* already gone */
     }
     this.sock = undefined;
+    this.sockGeneration = null;
+  }
+
+  /**
+   * Fail the current transport generation and enter the normal reconnect ladder. Durable mission
+   * state remains outside this client; callers use this when an authority-bearing frame could not
+   * be sent and continuing on the same generation would pretend the server observed it.
+   */
+  restartConnection(reason: string, expectedGeneration?: WsConnectionGeneration): void {
+    if (this.stopped) return;
+    if (expectedGeneration !== undefined && !this.isCurrentGeneration(expectedGeneration)) return;
+    const sock = this.sock;
+    const generation = this.sockGeneration;
+    if (!sock || generation === null) return;
+    this.log.warn('ws connection generation abandoned', { reason });
+    // Publish revocation before asking the transport to close. Some WebSocket implementations
+    // emit `close` synchronously, which would otherwise replace the authority-bearing reason with
+    // a generic one before mission control can quiesce the generation.
+    this.handleClose(sock, generation, reason);
+    try {
+      if (sock) (sock.terminate ?? sock.close).call(sock);
+    } catch {
+      /* the authoritative transition already happened above */
+    }
   }
 
   /** Report a Run status transition upstream (the DO is the authority). Terminal
@@ -181,8 +266,19 @@ export class WsClient {
       agentId?: string | null;
       exit?: Record<string, unknown> | null;
       worktreePath?: string | null;
+      missionLease?: MissionLeaseRef | null;
+      /** Required locally for mission-owned writes; never serialized onto the wire. */
+      connectionGeneration?: WsConnectionGeneration;
     } = {},
-  ): void {
+  ): boolean {
+    if (
+      extra.missionLease &&
+      (extra.connectionGeneration === undefined ||
+        !this.hasAcceptedCapability(MISSION_CAPABILITY, extra.connectionGeneration))
+    ) {
+      this.liveRuns.delete(runId);
+      return false;
+    }
     const at = new Date().toISOString();
     // RunExit.finishedAt is REQUIRED by the wire contract and has no default. Callers
     // report the outcome, not the clock, so stamp it here — the server silently drops
@@ -195,14 +291,21 @@ export class WsClient {
       agentId: extra.agentId ?? null,
       exit,
       worktreePath: extra.worktreePath ?? null,
+      missionLease: extra.missionLease ?? null,
       at,
     };
-    const terminal = status === 'done' || status === 'failed' || status === 'cancelled';
+    const terminal = status === 'done' || status === 'gated' || status === 'failed' || status === 'cancelled';
     // Send FIRST, then decide what to remember. Dropping the run from liveRuns before the
     // send meant a terminal frame emitted while the socket was down vanished: reconnect
     // re-asserts only liveRuns, which no longer held it, so the Run sat 'running' forever
     // — exactly the stranding this class exists to prevent.
     const sent = this.sendRaw(msg);
+    if (extra.missionLease) {
+      // Mission replay belongs to the durable coordinator. Retaining this frame here would replay
+      // its old lease immediately after reconnect, before server adoption advances the epoch.
+      this.liveRuns.delete(runId);
+      return sent;
+    }
     if (terminal && sent) this.liveRuns.delete(runId);
     // A parked run must NOT be re-asserted (RUN-30). liveRuns exists to say "this box still has a
     // live process for this run" after a blip; a parked run has no process, and its durable record
@@ -212,6 +315,24 @@ export class WsClient {
     // would silently re-park a run that was just answered.
     else if (status === 'blocked') this.liveRuns.delete(runId);
     else this.liveRuns.set(runId, msg); // keep it: a reconnect must re-assert it
+    return sent;
+  }
+
+  /** True only after this exact live socket negotiated the capability. */
+  hasAcceptedCapability(capability: string, generation?: WsConnectionGeneration): boolean {
+    return (
+      (generation === undefined || this.isCurrentGeneration(generation)) &&
+      this.acceptedCapabilities.has(capability)
+    );
+  }
+
+  /** Exact current connection identity, or null while disconnected. */
+  currentGeneration(): WsConnectionGeneration | null {
+    return this.sockGeneration;
+  }
+
+  isCurrentGeneration(generation: WsConnectionGeneration): boolean {
+    return this.sock !== undefined && this.sockGeneration === generation;
   }
 
   /** Report live spend + a log tail for a Run (RUN-22). Non-transitional: this is a
@@ -234,8 +355,19 @@ export class WsClient {
       /** The coordinate this run actually resolved and started under (RUN-241) — once, then
        *  null. Mirrors `executedSpec` exactly; see `RunReport.executedConfiguration`'s doc. */
       executedConfiguration?: ExecutedConfigurationEvidence | null;
+      /** Required by the server for every mission-owned lifecycle/telemetry write. */
+      missionLease?: MissionLeaseRef | null;
+      /** Required locally for mission-owned writes; never serialized onto the wire. */
+      connectionGeneration?: WsConnectionGeneration;
     },
   ): boolean {
+    if (
+      t.missionLease &&
+      (t.connectionGeneration === undefined ||
+        !this.hasAcceptedCapability(MISSION_CAPABILITY, t.connectionGeneration))
+    ) {
+      return false;
+    }
     return this.sendRaw({
       type: 'run.telemetry',
       runId,
@@ -253,7 +385,43 @@ export class WsClient {
       // Write-once server-side too (RUN-241/PLNR-291): late Runner evidence about the resolved
       // configuration, not permission to rewrite the server's commissioning snapshot.
       executedConfiguration: t.executedConfiguration ?? null,
+      missionLease: t.missionLease ?? null,
       at: new Date().toISOString(),
+    });
+  }
+
+  /** Submit an idempotent server-authorized plan-task admission report. */
+  sendMissionTaskBegin(
+    runId: string,
+    lease: MissionLeaseRef,
+    begin: MissionTaskBeginReport,
+    generation: WsConnectionGeneration,
+  ): boolean {
+    if (!this.hasAcceptedCapability(MISSION_CAPABILITY, generation)) return false;
+    return this.sendRaw({ type: 'mission.task.begin', runId, lease, begin });
+  }
+
+  /** Submit an idempotent terminal plan-task settlement report. */
+  sendMissionTaskSettle(
+    runId: string,
+    lease: MissionLeaseRef,
+    settle: MissionTaskSettleReport,
+    generation: WsConnectionGeneration,
+  ): boolean {
+    if (!this.hasAcceptedCapability(MISSION_CAPABILITY, generation)) return false;
+    return this.sendRaw({ type: 'mission.task.settle', runId, lease, settle });
+  }
+
+  /** Reply to reconciliation from a read-only snapshot of durable local mission state. */
+  sendMissionReconciliation(
+    inventory: readonly MissionInventoryItem[],
+    generation: WsConnectionGeneration,
+  ): boolean {
+    if (!this.hasAcceptedCapability(MISSION_CAPABILITY, generation)) return false;
+    return this.sendRaw({
+      type: 'mission.reconcile',
+      inventory: [...inventory],
+      observedAt: new Date().toISOString(),
     });
   }
 
@@ -262,7 +430,13 @@ export class WsClient {
    *  and logTail remains the fallback surface. */
   sendRunLog(
     runId: string,
-    segments: Array<{ seq: number; role: string; round: number | null; text: string; at: string }>,
+    segments: Array<{
+      seq: number;
+      role: string;
+      round: number | null;
+      text: string;
+      at: string;
+    }>,
   ): void {
     if (!segments.length) return;
     this.sendRaw({ type: 'run.log', runId, segments });
@@ -298,22 +472,6 @@ export class WsClient {
     }
     // stop() may have landed while we were awaiting the token.
     if (this.stopped) return;
-    // Refresh what the hello will advertise (RUN-195) BEFORE dialling: the frame goes out inside
-    // the synchronous 'open' handler, so this is the one moment the current catalogs can be read
-    // without racing the socket. Failure is absorbed here, not propagated — a repo report is
-    // legibility, and a daemon that cannot re-read a manifest must still reconnect (dispatch
-    // resolution reads its own catalog at dispatch time regardless of what was advertised).
-    if (this.opts.refreshRepos) {
-      try {
-        this.repos = await this.opts.refreshRepos();
-      } catch (err) {
-        this.log.warn('could not refresh the repo reports — advertising the last good set', {
-          err: String(err),
-        });
-      }
-      // Same stale-guard as the token above: stop() may have landed while the refresh was pending.
-      if (this.stopped) return;
-    }
     let sock: WsSocket;
     try {
       sock = this.connect(url, { Authorization: `Bearer ${token}` });
@@ -322,23 +480,33 @@ export class WsClient {
       this.scheduleReconnect();
       return;
     }
+    // Negotiation belongs to one socket generation. Clear it before publishing the replacement
+    // socket so even an accidental overlapping start cannot borrow the prior generation's grant.
+    this.acceptedCapabilities.clear();
+    const generation = this.nextSockGeneration;
+    this.nextSockGeneration += 1;
     this.sock = sock;
+    this.sockGeneration = generation;
     // Every handler is SCOPED to the socket that registered it (RUN-176). Sockets outlive their
     // tenure — a terminated one can still emit a late 'close', a slow one a late 'message' — and
     // an unscoped handler would let a dead socket stop the live one's heartbeat, clear its slot,
     // stack a second reconnect timer, or reset its liveness counter. A stale event now simply
     // finds it is not the current socket and does nothing.
     sock.on('open', () => {
-      if (this.sock === sock) this.handleOpen();
+      if (this.sock === sock && this.sockGeneration === generation) this.handleOpen(generation);
     });
     sock.on('message', (data: unknown) => {
-      if (this.sock === sock) this.handleMessage(data);
+      if (this.sock === sock && this.sockGeneration === generation) this.handleMessage(data, generation);
     });
-    sock.on('close', () => this.handleClose(sock));
-    sock.on('error', (err: unknown) => this.log.warn('ws error', { err: String(err) }));
+    sock.on('close', () => this.handleClose(sock, generation, 'socket closed'));
+    sock.on('error', (err: unknown) => {
+      if (this.sock === sock && this.sockGeneration === generation) {
+        this.log.warn('ws error', { err: String(err) });
+      }
+    });
   }
 
-  private handleOpen(): void {
+  private handleOpen(generation: WsConnectionGeneration): void {
     const isReconnect = this.everConnected;
     this.everConnected = true;
     this.reconnectAttempt = 0;
@@ -357,22 +525,29 @@ export class WsClient {
       repos: this.repos,
     });
     this.startHeartbeat();
-    this.log.info(isReconnect ? 'ws reconnected' : 'ws connected', { runnerId: this.opts.runnerId });
+    // Registration has already produced a fresh initial snapshot. Re-attest after the control
+    // channel is live so a slow project filesystem or vendor probe can never consume Noriq's
+    // post-registration adoption window. The helper is single-flight and socket-scoped.
+    this.refreshReposOnHeartbeat(this.sock, generation);
+    this.log.info(isReconnect ? 'ws reconnected' : 'ws connected', {
+      runnerId: this.opts.runnerId,
+    });
     if (isReconnect) {
-      this.opts.handlers?.onReconnect?.();
+      this.opts.handlers?.onReconnect?.(generation);
       // Re-assert everything the server may have missed. A TERMINAL frame in here is one
       // that failed to send while the socket was down; once it lands, forget it —-
       // otherwise it would replay on every future reconnect.
       for (const [runId, msg] of this.liveRuns) {
         const sent = this.sendRaw(msg);
         const status = String(msg.status ?? '');
-        const terminal = status === 'done' || status === 'failed' || status === 'cancelled';
+        const terminal =
+          status === 'done' || status === 'gated' || status === 'failed' || status === 'cancelled';
         if (sent && terminal) this.liveRuns.delete(runId);
       }
     }
   }
 
-  private handleMessage(data: unknown): void {
+  private handleMessage(data: unknown, generation: WsConnectionGeneration): void {
     // ANY inbound frame is proof of life (RUN-176) — before parsing, deliberately: a frame this
     // client's contract version cannot parse still travelled the wire, and liveness is a transport
     // question. Requiring a pong specifically would tear down a healthy connection busy with run
@@ -388,18 +563,48 @@ export class WsClient {
     const msg = parsed.data;
     switch (msg.type) {
       case 'registered':
-        this.opts.handlers?.onRegistered?.({
-          runnerId: msg.runnerId,
-          protocol: msg.protocol,
-          acceptedCapabilities: msg.acceptedCapabilities,
-        });
+        this.acceptedCapabilities = new Set(msg.acceptedCapabilities);
+        this.opts.handlers?.onRegistered?.(
+          {
+            runnerId: msg.runnerId,
+            protocol: msg.protocol,
+            acceptedCapabilities: msg.acceptedCapabilities,
+          },
+          generation,
+        );
         return;
       case 'run.assigned':
-        this.opts.handlers?.onAssigned?.(msg.run);
+        if (msg.missionLease && !this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onAssigned?.(msg.run, msg.missionLease, generation);
+        return;
+      case 'mission.task.ack':
+        if (!this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onMissionTaskAck?.(msg.ack, generation);
+        return;
+      case 'mission.reconcile.request':
+        if (!this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onMissionReconcileRequest?.(
+          {
+            deadline: msg.deadline,
+            items: msg.items,
+          },
+          generation,
+        );
+        return;
+      case 'mission.reconcile.result':
+        if (!this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onMissionReconcileResult?.(msg.results, generation);
         return;
       case 'run.cancel':
         this.liveRuns.delete(msg.runId);
-        this.opts.handlers?.onCancel?.({ runId: msg.runId, hard: msg.hard, reason: msg.reason });
+        this.opts.handlers?.onCancel?.(
+          {
+            runId: msg.runId,
+            hard: msg.hard,
+            reason: msg.reason,
+          },
+          generation,
+        );
         return;
       case 'plan.completed':
         this.opts.handlers?.onPlanCompleted?.({
@@ -433,6 +638,22 @@ export class WsClient {
     }
   }
 
+  /**
+   * Mission authority is valid only after the current socket's `registered` frame explicitly
+   * accepts mission.v2. Receiving an authority-bearing mission frame before that handshake (or
+   * after a server declined the capability) is a protocol violation, not a message to ignore:
+   * abandon the generation so no later frame on it can be mistaken for negotiated authority.
+   */
+  private acceptMissionFrame(type: string): boolean {
+    if (this.hasAcceptedCapability(MISSION_CAPABILITY)) return true;
+    this.log.error('ws received an unnegotiated mission frame', {
+      type,
+      requiredCapability: MISSION_CAPABILITY,
+    });
+    this.restartConnection(`received ${type} without accepted ${MISSION_CAPABILITY}`);
+    return false;
+  }
+
   /** Ack a steer back to Noriq (dedup guard: `via='runtime'` suppresses the
    *  notices fallback so the same steer isn't double-delivered). */
   sendSteerAck(ack: {
@@ -461,10 +682,17 @@ export class WsClient {
    * the transition even on a transport whose close never completes) while the real 'close' event —
    * arriving later, or twice — finds the work already done and does nothing.
    */
-  private handleClose(sock?: WsSocket): void {
-    if (sock && this.sock !== sock) return; // a past life's echo — the current socket is not yours
+  private handleClose(
+    sock: WsSocket,
+    generation: WsConnectionGeneration,
+    reason = 'connection generation ended',
+  ): void {
+    if (this.sock !== sock || this.sockGeneration !== generation) return;
     this.stopHeartbeat();
+    this.acceptedCapabilities.clear();
     this.sock = undefined;
+    this.sockGeneration = null;
+    this.opts.handlers?.onDisconnect?.(reason, generation);
     if (!this.stopped) this.scheduleReconnect();
   }
 
@@ -476,7 +704,10 @@ export class WsClient {
     if (this.stopped || this.reconnectTimer) return;
     const delay = Math.min(this.opts.reconnectBaseMs * 2 ** this.reconnectAttempt, this.opts.reconnectMaxMs);
     this.reconnectAttempt += 1;
-    this.log.debug('ws reconnect scheduled', { delayMs: delay, attempt: this.reconnectAttempt });
+    this.log.debug('ws reconnect scheduled', {
+      delayMs: delay,
+      attempt: this.reconnectAttempt,
+    });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       this.open();
@@ -505,6 +736,7 @@ export class WsClient {
           heartbeatMs: this.opts.heartbeatMs,
         });
         const sock = this.sock;
+        const generation = this.sockGeneration;
         // TERMINATE, not close: a half-open socket will never complete the closing handshake, and
         // a `close()` that waits for one would leave us exactly where we started. The transition
         // itself is GUARANTEED by the finally — handleClose is idempotent and socket-scoped, so
@@ -516,16 +748,51 @@ export class WsClient {
         } catch {
           /* the transition below is the part that matters */
         } finally {
-          this.handleClose(sock);
+          if (sock && generation !== null) {
+            this.handleClose(sock, generation, 'socket liveness deadline exceeded');
+          }
         }
         return;
       }
       this.sendRaw({ type: 'heartbeat', freeSlots: this.opts.freeSlots() });
+      if (this.sockGeneration !== null) {
+        this.refreshReposOnHeartbeat(this.sock, this.sockGeneration);
+      }
       // The probe the deadline depends on: the server answers `ping` with `pong` (deployed), so a
       // healthy connection hears SOMETHING every interval even when no runs are moving. The
       // heartbeat alone cannot serve — the server records it and deliberately says nothing back.
       this.sendRaw({ type: 'ping' });
     }, this.opts.heartbeatMs);
+  }
+
+  /**
+   * Execution-profile offers expire server-side, so a healthy long-lived socket must perform a
+   * real bounded refresh and resend repo offers. Merely copying an old snapshot with a new clock
+   * would turn stale local authority into a lie. The immediate heartbeat above preserves liveness;
+   * this second frame carries only a successfully re-observed snapshot and never overlaps probes.
+   */
+  private refreshReposOnHeartbeat(sock: WsSocket | undefined, generation: WsConnectionGeneration): void {
+    if (!sock || !this.opts.refreshRepos || this.heartbeatRepoRefresh) return;
+    this.heartbeatRepoRefresh = this.opts
+      .refreshRepos()
+      .then((repos) => {
+        if (this.stopped || this.sock !== sock || this.sockGeneration !== generation) return;
+        this.repos = repos;
+        this.sendRaw({
+          type: 'heartbeat',
+          freeSlots: this.opts.freeSlots(),
+          repos,
+        });
+      })
+      .catch((err) => {
+        if (this.stopped || this.sock !== sock || this.sockGeneration !== generation) return;
+        this.log.warn('could not refresh repo/profile attestations for heartbeat', {
+          err: String(err),
+        });
+      })
+      .finally(() => {
+        this.heartbeatRepoRefresh = undefined;
+      });
   }
 
   private stopHeartbeat(): void {

@@ -88,6 +88,18 @@ describe('WorkflowStore (RUN-192)', () => {
     expect(odd.definitions.odd).toMatchObject({ base: 'build', description: null });
   });
 
+  it('accepts mission.v2 only on a build-posture file workflow and keeps it locally gated', async () => {
+    const { repo, user } = await fixture();
+    const dir = path.join(repo, '.noriq', 'workflows');
+    await writeFile(path.join(dir, 'mission.toml'), 'base = "build"\ncapabilities = ["mission.v2"]\n');
+    await writeFile(path.join(dir, 'unsafe.toml'), 'base = "scope"\ncapabilities = ["mission.v2"]\n');
+
+    const catalog = await new WorkflowStore({ userDir: user }).current(repo, { workflows: {} });
+
+    expect(catalog.definitions.mission?.capabilities).toEqual(['mission.v2']);
+    expect(catalog.definitions.unsafe?.capabilities).toEqual([]);
+  });
+
   it('re-reads definition and prompt bytes on every dispatch snapshot', async () => {
     const { repo, user } = await fixture();
     const dir = path.join(repo, '.noriq', 'workflows');

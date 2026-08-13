@@ -5,8 +5,9 @@ import { z } from 'zod';
 // Runner that predates orchestration continues to parse the frames it already understands.
 
 export const ORCHESTRATION_CAPABILITY = 'orchestration.v1' as const;
+export const MISSION_CAPABILITY = 'mission.v2' as const;
 export const MCP_SESSION_LINEAGE_META = 'io.noriq/sessionLineage' as const;
-export const RunnerProtocolCapability = z.enum([ORCHESTRATION_CAPABILITY]);
+export const RunnerProtocolCapability = z.enum([ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY]);
 export type RunnerProtocolCapability = z.infer<typeof RunnerProtocolCapability>;
 
 export const McpSessionLineageHint = z.object({
@@ -100,3 +101,61 @@ export const ExecutionReportAck = z.object({
   error: z.string().nullable().default(null),
 });
 export type ExecutionReportAck = z.infer<typeof ExecutionReportAck>;
+
+export const MissionTaskBeginReport = z.object({
+  reportId: z.string().min(1).max(160),
+  attemptId: z.string().min(1).max(160),
+  taskId: z.string().min(1),
+  childKey: z.string().min(1).max(160),
+  observedAt: z.string().datetime(),
+});
+export type MissionTaskBeginReport = z.infer<typeof MissionTaskBeginReport>;
+
+export const MissionTaskSettleReport = z.object({
+  reportId: z.string().min(1).max(160),
+  attemptId: z.string().min(1).max(160),
+  claimId: z.string().min(1),
+  outcome: z.enum(['done', 'gated', 'failed', 'cancelled']),
+  reason: z.string().max(2_000).nullable().default(null),
+  observedAt: z.string().datetime(),
+});
+export type MissionTaskSettleReport = z.infer<typeof MissionTaskSettleReport>;
+
+export const MissionTaskAck = z.object({
+  reportId: z.string(),
+  attemptId: z.string(),
+  phase: z.enum(['begin', 'settle']),
+  accepted: z.boolean(),
+  taskId: z.string().nullable().default(null),
+  claimId: z.string().nullable().default(null),
+  executionId: z.string().nullable().default(null),
+  taskStatus: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+export type MissionTaskAck = z.infer<typeof MissionTaskAck>;
+
+export const MissionLeaseRef = z.object({
+  sitting: z.number().int().positive(),
+  executionId: z.string().min(1),
+  epoch: z.number().int().positive(),
+});
+export type MissionLeaseRef = z.infer<typeof MissionLeaseRef>;
+
+export const MissionInventoryItem = z.object({
+  runId: z.string().min(1),
+  lease: MissionLeaseRef,
+  attempts: z.array(z.object({
+    attemptId: z.string().min(1),
+    executionId: z.string().min(1),
+    epoch: z.number().int().positive(),
+  })).max(256).default([]),
+});
+export type MissionInventoryItem = z.infer<typeof MissionInventoryItem>;
+
+export const MissionAdoptionResult = z.object({
+  runId: z.string(),
+  decision: z.enum(['adopt', 'already_terminal', 'cancel', 'unknown']),
+  lease: MissionLeaseRef.nullable().default(null),
+  reason: z.string().nullable().default(null),
+});
+export type MissionAdoptionResult = z.infer<typeof MissionAdoptionResult>;

@@ -33,6 +33,11 @@ export interface LoadedWorkflowDefinition {
   /** One human line for the dispatch surface (RUN-195/PLNR-240). Cosmetic — nothing executes it;
    *  it rides the repo report so a workflow picker can say what a name is for. Null = undeclared. */
   description: string | null;
+  /**
+   * Locally declared protocol opt-ins. They are not advertised automatically: daemon activation
+   * must separately prove the complete capability is available for this repo.
+   */
+  capabilities?: readonly string[];
   /** The TOML source that declared this workflow. */
   source: string;
   tier: WorkflowSourceTier;
@@ -60,7 +65,10 @@ interface RawDefinition {
   prompt?: unknown;
   description?: unknown;
   stages?: unknown;
+  capabilities?: unknown;
 }
+
+const MISSION_WORKFLOW_CAPABILITY = 'mission.v2';
 
 const escapes = (root: string, abs: string): boolean => {
   const rel = path.relative(root, abs);
@@ -142,6 +150,7 @@ export class WorkflowStore {
         // name check so an inline typo warns like a file one, then carry it (RUN-193).
         stages: this.parseStages(definition.stages, name, marker),
         description: definition.description,
+        capabilities: [],
         source: marker,
         tier: 'project-manifest',
       });
@@ -195,6 +204,7 @@ export class WorkflowStore {
         promptSource: null,
         stages: null,
         description: null,
+        capabilities: [],
         source,
         tier,
       };
@@ -214,6 +224,7 @@ export class WorkflowStore {
         promptSource: null,
         stages: null,
         description: null,
+        capabilities: [],
         source,
         tier,
       };
@@ -224,6 +235,7 @@ export class WorkflowStore {
     // `stages` costs the declaration its pipeline, never its posture, the same rule the whole store
     // runs on. `resolveWorkflow` does the clamp; this only validates the shape and the names.
     const stages = this.parseStages(raw.stages, name, source);
+    const capabilities = this.parseCapabilities(raw.capabilities, parsedBase.data, name, source);
 
     // One human line for the dispatch surface (RUN-195). Cosmetic, so a wrong TYPE degrades to
     // "undeclared" with a warn rather than costing the definition its declared posture.
@@ -233,7 +245,16 @@ export class WorkflowStore {
     }
 
     if (raw.prompt === undefined || raw.prompt === null) {
-      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
+      return {
+        base: parsedBase.data,
+        prompt: null,
+        promptSource: null,
+        stages,
+        description,
+        capabilities,
+        source,
+        tier,
+      };
     }
     if (typeof raw.prompt === 'string') {
       return {
@@ -242,6 +263,7 @@ export class WorkflowStore {
         promptSource: source,
         stages,
         description,
+        capabilities,
         source,
         tier,
       };
@@ -253,7 +275,16 @@ export class WorkflowStore {
         workflow: name,
         source,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
+      return {
+        base: parsedBase.data,
+        prompt: null,
+        promptSource: null,
+        stages,
+        description,
+        capabilities,
+        source,
+        tier,
+      };
     }
 
     const abs = path.resolve(path.dirname(source), prompt.file);
@@ -264,7 +295,16 @@ export class WorkflowStore {
         promptFile: prompt.file,
         root: confinementRoot,
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
+      return {
+        base: parsedBase.data,
+        prompt: null,
+        promptSource: null,
+        stages,
+        description,
+        capabilities,
+        source,
+        tier,
+      };
     }
     try {
       // The production reader opens first, validates that descriptor with openConfined, and reads
@@ -272,7 +312,16 @@ export class WorkflowStore {
       // repository context without moving confinement into a pathname-only pre-check.
       const text = await this.read(abs, WORKFLOW_TEMPLATE_MAX_CHARS, confinementRoot);
       if (text.length > WORKFLOW_TEMPLATE_MAX_CHARS) throw new Error('prompt template is too large');
-      return { base: parsedBase.data, prompt: text, promptSource: abs, stages, description, source, tier };
+      return {
+        base: parsedBase.data,
+        prompt: text,
+        promptSource: abs,
+        stages,
+        description,
+        capabilities,
+        source,
+        tier,
+      };
     } catch (err) {
       this.log.error('workflow prompt file could not be read safely — using the base prompt', {
         workflow: name,
@@ -280,8 +329,53 @@ export class WorkflowStore {
         promptFile: abs,
         err: String(err),
       });
-      return { base: parsedBase.data, prompt: null, promptSource: null, stages, description, source, tier };
+      return {
+        base: parsedBase.data,
+        prompt: null,
+        promptSource: null,
+        stages,
+        description,
+        capabilities,
+        source,
+        tier,
+      };
     }
+  }
+
+  private parseCapabilities(
+    raw: unknown,
+    base: RunKind,
+    workflow: string,
+    source: string,
+  ): readonly string[] {
+    if (raw === undefined || raw === null) return [];
+    if (
+      !Array.isArray(raw) ||
+      raw.length > 16 ||
+      raw.some((value) => typeof value !== 'string' || value !== MISSION_WORKFLOW_CAPABILITY)
+    ) {
+      this.log.error('workflow capabilities are invalid — advertising no protocol opt-in', {
+        workflow,
+        source,
+      });
+      return [];
+    }
+    if (new Set(raw).size !== raw.length) {
+      this.log.error('workflow capabilities contain duplicates — advertising no protocol opt-in', {
+        workflow,
+        source,
+      });
+      return [];
+    }
+    if (raw.includes(MISSION_WORKFLOW_CAPABILITY) && base !== 'build') {
+      this.log.error('mission.v2 requires a build-posture workflow — capability ignored', {
+        workflow,
+        source,
+        base,
+      });
+      return [];
+    }
+    return Object.freeze([...raw]);
   }
 
   /**

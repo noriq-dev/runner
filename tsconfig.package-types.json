@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "declaration": true,
+    "declarationMap": false,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "noEmitOnError": true,
+    "outDir": "./dist/types",
+    "rootDir": "."
+  },
+  "files": ["src/mission-library.ts", "vendor/noriq-shared/src/index.ts"],
+  "include": []
+}

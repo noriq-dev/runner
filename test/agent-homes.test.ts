@@ -1,9 +1,16 @@
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, rm, stat, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { type InteractiveSpawn, ensurePrivateAgentHome, loginClaude, loginCodex } from '../src/agent-homes';
+import {
+  type AgentHomeVendor,
+  type InteractiveSpawn,
+  createEphemeralAgentHome,
+  ensurePrivateAgentHome,
+  loginClaude,
+  loginCodex,
+} from '../src/agent-homes';
 
 const dirs: string[] = [];
 
@@ -18,6 +25,42 @@ afterEach(async () => {
 });
 
 describe('Runner-specific agent homes', () => {
+  it.each([
+    ['codex', 'auth.json'],
+    ['claude', '.credentials.json'],
+  ] as const)(
+    'creates unique private %s attempt homes containing only its minimum credential',
+    async (vendor, credential) => {
+      const root = await tempDir();
+      const durable = path.join(root, `${vendor}-durable`);
+      await mkdir(path.join(durable, 'sessions'), { recursive: true });
+      await Promise.all([
+        writeFile(path.join(durable, credential), `${vendor}-token`, { mode: 0o600 }),
+        writeFile(path.join(durable, vendor === 'codex' ? 'config.toml' : '.claude.json'), 'settings'),
+        writeFile(path.join(durable, 'sessions', 'history.jsonl'), 'history'),
+      ]);
+
+      const first = createEphemeralAgentHome(vendor as AgentHomeVendor, durable, root);
+      const second = createEphemeralAgentHome(vendor as AgentHomeVendor, durable, root);
+      try {
+        expect(first.home).not.toBe(second.home);
+        expect(await readdir(first.home)).toEqual([credential]);
+        expect(await readdir(second.home)).toEqual([credential]);
+        expect(await readFile(path.join(first.home, credential), 'utf8')).toBe(`${vendor}-token`);
+        expect(await readFile(path.join(second.home, credential), 'utf8')).toBe(`${vendor}-token`);
+        if (process.platform !== 'win32') {
+          expect((await stat(first.home)).mode & 0o777).toBe(0o700);
+          expect((await stat(path.join(first.home, credential))).mode & 0o777).toBe(0o600);
+        }
+      } finally {
+        first.cleanup();
+        second.cleanup();
+      }
+      await expect(stat(first.home)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(second.home)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+
   it.skipIf(process.platform === 'win32')(
     'creates a private directory and tightens an existing broad mode',
     async () => {

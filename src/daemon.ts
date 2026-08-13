@@ -1,12 +1,16 @@
-import type {
-  AgentTool,
-  ExecutedConfigurationEvidence,
-  ExecutionSpec,
-  ProjectManifest,
-  Run,
-  RunKind,
-  RunModelUsage,
-  RunnerConfig,
+import os from 'node:os';
+import path from 'node:path';
+import {
+  type AgentTool,
+  type ExecutedConfigurationEvidence,
+  type ExecutionSpec,
+  MISSION_CAPABILITY,
+  type MissionLeaseRef,
+  type ProjectManifest,
+  type Run,
+  type RunKind,
+  type RunModelUsage,
+  type RunnerConfig,
 } from '@noriq-dev/shared';
 import { NoriqClient, type OwedMerge } from './client';
 import { type ContinuableRun, ContinuableStore } from './continuable';
@@ -28,6 +32,11 @@ import { resolveLandBranch } from './land';
 import { LockClient } from './lock-client';
 import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
+import { MissionDaemonControl } from './mission/daemon-control';
+import { createDaemonMissionProfileRegistry } from './mission/daemon-runtime';
+import { NoriqMissionCoordinator } from './mission/noriq-coordinator';
+import { JsonlNoriqCoordinatorStore } from './mission/noriq-coordinator-store';
+import { WsMissionCoordinatorTransport } from './mission/noriq-transport';
 import { type ParkedRun, ParkedStore } from './parked';
 import { buildRegistration, repoReport } from './registration';
 import { RepoIntel, fileIntelStore } from './repo-intel';
@@ -50,7 +59,8 @@ import {
 } from './verification-report';
 import { type WorkflowCatalog, WorkflowStore } from './workflow-store';
 import { DEFAULT_WORKTREES_DIR, WorktreeManager } from './worktree';
-import { WsClient, type WsFactory } from './ws-client';
+import { WsClient, type WsFactory, type WsHandlers } from './ws-client';
+import { BufferedWsHandlers } from './ws-handler-buffer';
 
 /** How long shutdown waits for stopped runs to report a terminal status. */
 const SHUTDOWN_DRAIN_MS = 5_000;
@@ -120,8 +130,28 @@ export function telemetryFrame(rep: Pick<RunReport, 'telemetry'>): {
   };
 }
 
+/**
+ * Legacy supervision cannot consume a server-commissioned mission environment. Falling through
+ * would acknowledge one authority shape while actually launching another, so these assignments
+ * are terminally refused until the complete immutable commission is present on the wire.
+ */
+export function missionAssignmentRefusal(
+  run: Pick<Run, 'executionProfile'>,
+  missionLease: MissionLeaseRef | null,
+): string | null {
+  if (missionLease) {
+    return 'mission assignment refused: Noriq did not provide the immutable commissioned task and dependency snapshot required by mission.v2';
+  }
+  if (run.executionProfile) {
+    return 'execution-profile assignment refused: legacy Run supervision cannot honor the exact commissioned mission environment';
+  }
+  return null;
+}
+
 export interface DaemonHandle {
   runnerId: string;
+  /** Resolves exactly once if the authority-bearing control plane fails after startup. */
+  fatal: Promise<Error>;
   /** Stop live agents, let them report, then close the socket. Await it before exiting. */
   stop(): Promise<void>;
 }
@@ -333,6 +363,7 @@ export function waveCapacity(deps: {
   waveLimit: (runId: string) => number;
   freeSlots: () => number;
   release: (runId: string) => void;
+  cancelAdmission: (runId: string) => void;
   admit: (runId: string) => Promise<void>;
 } {
   const grants = new Map<string, number>();
@@ -397,6 +428,17 @@ export function waveCapacity(deps: {
     release: (runId) => {
       grants.delete(runId);
       poke();
+    },
+    cancelAdmission: (runId) => {
+      for (let i = waiters.length - 1; i >= 0; i -= 1) {
+        const waiter = waiters[i]!;
+        if (waiter.runId !== runId) continue;
+        waiters.splice(i, 1);
+        waiting.delete(runId);
+        // Resolve instead of leaving the assignment's lifecycle promise hanging. The daemon's
+        // admission gate decides whether supervision may begin once this wake-up runs.
+        waiter.resolve();
+      }
     },
     admit: (runId) => {
       if (fits(runId)) return Promise.resolve();
@@ -547,6 +589,8 @@ export class Daemon {
   /** Where RUN-230's undelivered-verification-report queue lives — defaults to
    *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
   private readonly verificationPendingPath?: string;
+  /** Private durable root for mission profile snapshots, journals, leases, and reconciliation. */
+  private readonly missionPrivateRoot: string;
   /** Test seam for the bounded recovered-park probe; production uses PARK_RECOVERY_TIMEOUT_MS. */
   private readonly parkRecoveryTimeoutMs: number;
 
@@ -609,6 +653,8 @@ export class Daemon {
       /** Where RUN-230's undelivered-verification-report queue lives — defaults to
        *  `~/.noriq/verification-pending.json`; same `episodePendingPath` reasoning. */
       verificationPendingPath?: string;
+      /** Mission v2 machine-private state. Tests point this away from the operator's home. */
+      missionPrivateRoot?: string;
       /** Bounded startup recovery probe. Overridden only by tests that model a hung server. */
       parkRecoveryTimeoutMs?: number;
     } = {},
@@ -632,6 +678,8 @@ export class Daemon {
     this.indexControlOverride = deps.indexControl;
     this.episodePendingPath = deps.episodePendingPath;
     this.verificationPendingPath = deps.verificationPendingPath;
+    this.missionPrivateRoot =
+      deps.missionPrivateRoot ?? path.join(os.homedir(), '.noriq', 'mission-harness-v2');
     this.parkRecoveryTimeoutMs = deps.parkRecoveryTimeoutMs ?? PARK_RECOVERY_TIMEOUT_MS;
   }
 
@@ -674,6 +722,132 @@ export class Daemon {
       this.log.info(`repo ${r.name} → ${d?.kind ?? 'git'}`, { root: r.root, why: d?.reason });
     }
 
+    // Read-at-use project authority is constructed before registration because execution-profile
+    // offers are part of that same repo report. A profile is advertised only after its complete
+    // generic runtime (catalog, MCP inputs, driver/auth, containment, resources, and VCS evidence)
+    // has been locally resolved. There is deliberately no project- or Unreal-specific branch here.
+    const workflows = this.workflowStore ?? new WorkflowStore({ logger: this.log });
+    const manifests = new ManifestStore({ logger: this.log });
+    for (const r of repos) manifests.seed(r.root, r.manifest);
+    const missionProfileRegistries = new Map(
+      repos.map((repo) => {
+        const detected = detections.get(repo.root);
+        return [
+          repo.root,
+          createDaemonMissionProfileRegistry({
+            repo,
+            // The published mission evidence surface is Git only. Diversion/Perforce are not
+            // silently treated as Git even when a mirror happens to exist beside the checkout.
+            backend: detected?.kind === 'git' && detected.missionAuthority === 'exact-root' ? vcs : null,
+            privateRoot: this.missionPrivateRoot,
+            globalResourceDirectory: path.join(this.missionPrivateRoot, 'global-resources'),
+            worktreeDirectory: DEFAULT_WORKTREES_DIR,
+          }),
+        ] as const;
+      }),
+    );
+
+    // Mission authority is durable before either source-control cleanup or network admission. A
+    // recovered root must reserve its workspace even while Noriq is offline, and no model may be
+    // reached until the server advances the exact root lease during reconciliation.
+    const held: { ws?: WsClient } = {};
+    const missionHeld: { control?: MissionDaemonControl } = {};
+    const missionTransport = new WsMissionCoordinatorTransport({
+      sendBegin: (rootRunId, lease, report) => {
+        const generation = missionHeld.control?.authorizedTransportGeneration(rootRunId);
+        return generation === null || generation === undefined
+          ? false
+          : (held.ws?.sendMissionTaskBegin(rootRunId, lease, report, generation) ?? false);
+      },
+      sendSettle: (rootRunId, lease, report) => {
+        const generation = missionHeld.control?.authorizedTransportGeneration(rootRunId);
+        return generation === null || generation === undefined
+          ? false
+          : (held.ws?.sendMissionTaskSettle(rootRunId, lease, report, generation) ?? false);
+      },
+    });
+    const missionCoordinator = new NoriqMissionCoordinator({
+      store: new JsonlNoriqCoordinatorStore(path.join(this.missionPrivateRoot, 'noriq-coordinator')),
+      transport: missionTransport,
+      resolveRuntime: async ({ executionProfile, repositoryKey }) => {
+        const matches = repos.filter((repo) => repo.repositoryKey === repositoryKey);
+        if (matches.length !== 1) {
+          throw new Error(
+            `mission repository '${repositoryKey}' resolved to ${matches.length} local checkouts`,
+          );
+        }
+        const repo = matches[0]!;
+        const registry = missionProfileRegistries.get(repo.root);
+        if (!registry) throw new Error(`mission execution profiles are unavailable for '${repositoryKey}'`);
+
+        // Current declarations are useful when they still match, but recovery authority comes from
+        // the immutable private snapshot. A broken new declaration cannot erase an unsettled old
+        // commission, and neither path receives permission to relax an exact fingerprint.
+        await registry.refresh().catch((error) => {
+          this.log.warn('current mission execution profiles could not be attested during recovery', {
+            repositoryKey,
+            err: String(error),
+          });
+        });
+        const lease = await registry.acquireSnapshot(executionProfile);
+        if (!lease) {
+          throw new Error(
+            `commissioned execution profile '${executionProfile.id}' is unavailable or no longer attests exactly`,
+          );
+        }
+        return {
+          executionProfile,
+          repositoryKey,
+          missionBudget: lease.declaration.missionBudget,
+          runtime: lease.runtime,
+          release: lease.release,
+        };
+      },
+    });
+    let missionControlFailure: Error | null = null;
+    // One process-local admission authority for every legacy entry point. It is revoked
+    // synchronously by either mission poisoning or shutdown, before either path can yield to a
+    // cleanup sweep. Buffered and in-flight frames may still arrive, but none may start work.
+    let acceptingLegacyWork = true;
+    let resolveDaemonFatal!: (error: Error) => void;
+    const daemonFatal = new Promise<Error>((resolve) => {
+      resolveDaemonFatal = resolve;
+    });
+    let stopDaemon: (() => Promise<void>) | null = null;
+    const poisonMissionControl = (error: Error): void => {
+      if (missionControlFailure) return;
+      missionControlFailure = error;
+      acceptingLegacyWork = false;
+      resolveDaemonFatal(error);
+      this.log.error('mission control plane stopped fail-closed', {
+        error: error.message,
+      });
+      held.ws?.stop();
+      // A post-start control-plane failure is a daemon-fatal event. Merely dropping the socket
+      // would leave model processes, timers, and the local control server alive as a zombie.
+      const stop = stopDaemon;
+      if (stop) {
+        void stop().catch((stopError) =>
+          this.log.error('automatic daemon shutdown after mission failure rejected', {
+            err: String(stopError),
+          }),
+        );
+      }
+    };
+    const missionControl = new MissionDaemonControl({
+      coordinator: missionCoordinator,
+      transport: missionTransport,
+      sendReconciliation: (inventory, generation) =>
+        held.ws?.sendMissionReconciliation(inventory, generation) ?? false,
+      fatal: poisonMissionControl,
+      restartTransportGeneration: (reason, generation) => held.ws?.restartConnection(reason, generation),
+      logger: this.log,
+    });
+    missionHeld.control = missionControl;
+    // Validate the complete WAL inventory explicitly. The orphan sweep itself is intentionally
+    // best-effort and skips on a reservation read error; mission authority cannot take that route.
+    await missionControl.reservedRootRunIds();
+
     // Runs parked on a human (RUN-30). On disk, because that is the point: the answer may come
     // tomorrow, and a daemon that forgot across a restart would strand both the run and the
     // worktree holding its work.
@@ -693,14 +867,17 @@ export class Daemon {
       vcsFor: (root) => backendFor.get(root) ?? vcs,
       // `this.active` is exact for a LIVE run: added before `supervise`, removed in its `finally`.
       isActive: (runId) => this.active.has(runId),
-      reserved: async () => [...(await parked.list()).map((p) => p.run.id), ...(await continuable.runIds())],
+      reserved: async () => [
+        ...(await parked.list()).map((p) => p.run.id),
+        ...(await continuable.runIds()),
+        ...(await missionControl.reservedRootRunIds()),
+      ],
       logger: this.log,
     });
     await sweepOrphans(false);
 
     const state = await loadState(this.stateFile);
     const tools = this.config.tools ?? detectTools();
-    const workflows = this.workflowStore ?? new WorkflowStore({ logger: this.log });
     const registrationCatalogs = new Map(
       await Promise.all(
         repos.map(async (repo) => [repo.root, await workflows.current(repo.root, repo.manifest)] as const),
@@ -710,6 +887,10 @@ export class Daemon {
       { label: this.config.label, concurrency: this.config.concurrency, tools, runnerId: state.runnerId },
       repos,
       registrationCatalogs,
+      // Do not invite an ordinary legacy Run to commission an environment it cannot honor. Profile
+      // advertising and mission.v2 workflow advertising turn on together only after Noriq supplies
+      // the immutable task/dependency commission and individual-task lease contract (PLNR-489/492).
+      new Map(),
     );
     const runner = await client.registerRunner(registration);
     await saveState({ runnerId: runner.id }, this.stateFile);
@@ -719,394 +900,72 @@ export class Daemon {
       repos: runner.repos.map((r) => `${r.projectKey}→${r.projectId ?? 'unresolved'}`),
     });
 
-    // RUN-227's undelivered-episode queue, and the delivery deps every enqueue/retry site below
-    // shares. Built here, once `runner.id` exists — `EpisodeDeliveryDeps.runnerId` is captured into
-    // every `PendingEpisode.mint` at enqueue time (locked decision 8's identity half), and this is
-    // the daemon's own registration id, stable across a restart (`saveState` above persists it).
-    const episodePending = new EpisodePendingStore(filePendingEpisodeStore(this.episodePendingPath));
-    const episodeDeliveryDeps: EpisodeDeliveryDeps = {
-      client,
-      runnerId: runner.id,
-      pending: episodePending,
-      logger: this.log,
-    };
-    // Retry whatever a prior process left pending, once, at startup — mirrors the orphaned-staging
-    // sweep just below: a daemon that crashed or was simply off holds episodes nothing has retried
-    // since, and "the box just came up" is exactly the moment worth spending one drain pass on.
-    void drainPendingEpisodes(episodeDeliveryDeps)
-      .then(({ delivered }) => {
-        if (delivered) this.log.info(`delivered ${delivered} previously pending episode(s)`);
-      })
-      .catch((err) => this.log.warn('startup episode delivery retry failed', { err: String(err) }));
-
-    // RUN-230's undelivered-verification-report queue, and its own delivery deps — a SEPARATE
-    // store from the episode one above (`verification-pending.ts`'s own doc on why: no shared
-    // `mint`-style identity, and a retry here can go permanently dead in a way an episode retry
-    // never does).
-    const verificationPending = new VerificationPendingStore(
-      filePendingVerificationStore(this.verificationPendingPath),
-    );
-    const verificationReportDeliveryDeps: VerificationReportDeliveryDeps = {
-      client,
-      pending: verificationPending,
-      logger: this.log,
-    };
-    // Same startup-drain reasoning as episodes just above: a daemon that crashed or was simply off
-    // holds reports nothing has retried since.
-    void drainPendingVerificationReports(verificationReportDeliveryDeps)
-      .then(({ delivered, dropped }) => {
-        if (delivered) this.log.info(`delivered ${delivered} previously pending verification report(s)`);
-        if (dropped)
-          this.log.warn(`dropped ${dropped} undeliverable verification report(s) (run agent token revoked)`);
-      })
-      .catch((err) =>
-        this.log.warn('startup verification report delivery retry failed', { err: String(err) }),
-      );
-
-    // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
-    // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
-    // this file stays wiring-only. `resolveIndexConfigForRoot` is the ONE enabled/off gate both
-    // the coordinator and the trigger layer below consult — never two copies of it. Built here,
-    // before the supervisor, because the landing/publish trigger site (RUN-222) is a supervisor
-    // dep (`onLanded`) that needs the trigger hub to already exist.
-    const resolveIndexConfigForRoot = (root: string) => loadIndexConfig(root, this.log);
-    const indexJournal = new IndexJournal(fileJournalStore(this.indexJournalPath));
-    // RUN-223's operator-status recorder — built before the coordinator so its `onStatus` dep can
-    // close over it. Persists to disk on every mutation (best-effort; a write failure costs the
-    // next CLI read staleness, never an index attempt) — the CLI's offline fallback when no live
-    // daemon answers the control server's `/status` below.
-    const indexStatus = new IndexStatusStore({
-      persist: fileIndexStatusPersist(this.indexStatusPath),
-      logger: this.log,
-    });
-    // Locked decision 8: the orphaned-staging sweep runs EXACTLY here — startup only, before the
-    // coordinator's first trigger, never on a timer. `sweepOrphanedStaging`'s own doc: a snapshot
-    // mid-write or mid-upload looks identical, by inspection, to one a crashed process left behind,
-    // and only "nothing survived the last exit" (true right here, true nowhere later) makes every
-    // directory with no live journal entry unreachable BY CONSTRUCTION rather than unlucky timing.
-    await sweepOrphanedStaging(indexJournal, this.indexStagingRoot)
-      .then(({ removed }) => {
-        if (removed.length) this.log.info(`swept ${removed.length} orphaned index-staging dir(s)`);
-      })
-      .catch((err) => this.log.warn('index staging sweep failed', { err: String(err) }));
-    const indexCoordinator: IndexCoordinatorLike =
-      this.indexCoordinatorOverride ??
-      new IndexCoordinator({
-        vcsFor: (root) => backendFor.get(root) ?? vcs,
-        resolveConfig: resolveIndexConfigForRoot,
-        getCursor: (target) =>
-          client.getIndexCursor(runner.id, {
-            projectId: target.projectId,
-            repositoryKey: target.repositoryKey,
-            checkoutId: target.checkoutId,
-          }),
-        runWork: createIndexWorkStep({
-          client,
-          runnerId: runner.id,
-          vcsFor: (root) => backendFor.get(root) ?? vcs,
-          staging: fileStagingStore(this.indexStagingRoot),
-          logger: this.log,
-        }),
-        journal: indexJournal,
-        // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
-        // (`this.active`) — one honest definition of busy, not a second one invented here.
-        isRunBusy: () => this.active.size > 0,
-        // RUN-223: every reconcile/phase/success/failure this coordinator decides also lands in
-        // the status recorder above — the ONLY feed `IndexStatusStore` has, so the CLI surface can
-        // never show a state this coordinator did not itself observe.
-        onStatus: (event) => indexStatus.record(event),
-        logger: this.log,
-      });
-
-    // RUN-222's trigger layer: turns startup, a landing, and a periodic poll into debounced calls
-    // to the coordinator above. `projectIdFor` closes over the registration response — the server
-    // resolves a repo's projectId at registration, and re-deriving it per trigger would be a
-    // second source of truth for a fact that does not change over this daemon's lifetime.
-    const projectIdFor = new Map(runner.repos.map((r) => [r.id, r.projectId] as const));
-    const indexTriggerRepos: IndexTriggerRepo[] = repos
-      .filter((r): r is typeof r & { repositoryKey: string } => r.repositoryKey !== null)
-      .map((r) => ({
-        repoRoot: r.root,
-        repositoryKey: r.repositoryKey,
-        checkoutId: r.id,
-        projectId: projectIdFor.get(r.id) ?? null,
-        projectKey: r.manifest.key,
-        defaultBranch: r.manifest.defaultBranch ?? r.defaultBranch,
-      }));
-    const indexTriggers: IndexTriggerHubLike =
-      this.indexTriggersOverride ??
-      new IndexTriggerHub({
-        server: this.config.server,
-        coordinator: indexCoordinator,
-        vcsFor: (root) => backendFor.get(root) ?? vcs,
-        resolveConfig: resolveIndexConfigForRoot,
-        repos: indexTriggerRepos,
-        logger: this.log,
-      });
-
-    // RUN-223's operator control surface — a loopback HTTP server (see index-control.ts's own doc
-    // for why this shape over a status file the daemon merely writes) so a live CLI command can
-    // read `/status`, or ask for a manual reindex/retry/cancel, without minting anything or
-    // touching `[index].enabled` itself: every route here is a thin ask onto the coordinator and
-    // trigger hub above, which already enforce their own gates. Started unconditionally — there is
-    // no config knob, the same posture the leak sweep and update check already take — because the
-    // one thing worse than a control surface nobody asked for is indexing running unattended with
-    // no way to see it at all, which is exactly the gap this task exists to close.
-    const indexControl: Pick<IndexControlServer, 'start' | 'stop'> =
-      this.indexControlOverride ??
-      new IndexControlServer({
-        statusStore: indexStatus,
-        triggerStatuses: () => indexTriggers.allStatuses?.() ?? [],
-        repoRootFor: (repositoryKey) =>
-          indexTriggerRepos.find((r) => r.repositoryKey === repositoryKey)?.repoRoot,
-        requestManualReindex: (repoRoot) =>
-          indexTriggers.requestManualReindex?.(repoRoot) ?? Promise.resolve(),
-        cancelRepo: (repositoryKey) => {
-          // Only a repo THIS daemon actually knows about may be cancelled — an unrecognized
-          // repositoryKey never reaches the coordinator's own job-key map at all.
-          if (!indexTriggerRepos.some((r) => r.repositoryKey === repositoryKey)) return false;
-          return indexCoordinator.cancelRepo?.({ server: this.config.server, repositoryKey }) ?? false;
-        },
-        controlInfoPath: this.indexControlInfoPath,
-        logger: this.log,
-      });
-    await indexControl
-      .start()
-      .catch((err) => this.log.warn('index control server failed to start', { err: String(err) }));
-
-    // Supervisor composes worktree + driver + budget per dispatched Run. The `held`
-    // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
-    // ws's onAssigned drives the supervisor). Each Run's agent identity is created by the
-    // runner up front (RUN-43) and reached with a token bound to it alone.
-    const reposById = new Map(repos.map((repo) => [repo.id, repo]));
-    // The committed marker is re-read per Run, so editing .noriq/project.toml takes
-    // effect on the next dispatch instead of waiting for someone to restart the daemon.
-    const manifests = new ManifestStore({ logger: this.log });
-    for (const r of repos) manifests.seed(r.root, r.manifest);
-    const resolveRepo = workflowRepoResolver({
-      repos,
-      manifestFor: (root) => manifests.current(root),
-      workflowsFor: (root, manifest) => workflows.current(root, manifest),
-      vcsFor: (root) => backendFor.get(root),
-    });
-    const held: { ws?: WsClient } = {};
-    // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
-    // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
-    const lastRunStatus = new Map<string, string>();
-    /** The executed-spec record still owed to the server (RUN-172), per run — see the send below
-     *  for why a single fire-and-forget send was not enough. Cleared when a frame carrying it
-     *  actually goes out, and when the run ends, so a daemon does not hold one per run for its
-     *  whole life. */
-    const pendingSpec = new Map<string, ExecutionSpec>();
-    /** RUN-241: the same owed-until-delivered posture as `pendingSpec`, for the resolved
-     *  coordinate a run actually executes under (see `RunReport.executedConfiguration`'s doc). */
-    const pendingConfiguration = new Map<string, ExecutedConfigurationEvidence>();
-    const steering = new SteeringBridge({ logger: this.log });
-    // The session-capacity ledger (RUN-170): waveLimit RESERVES what it answers, so simultaneous
-    // chains cannot double-spend the same spare slots, and freeSlots sees a granted wave as
-    // occupied capacity. See waveCapacity's doc for the bound it holds and the deferral it keeps.
-    const capacity = waveCapacity({
-      concurrency: this.config.concurrency,
-      active: () => this.active,
-      sessionsOf: (runId) => steering.liveSessionsOf(runId),
-      liveSessions: (excludeRunId) => steering.liveSessionCount(excludeRunId),
-    });
-    const supervisor = this.createSupervisor({
-      drivers: {
-        claude: new ClaudeDriver({ logger: this.log }),
-        codex: new CodexDriver({ logger: this.log }),
-      },
-      vcs,
-      resolveRepo,
-      // Transcript segments (RUN-74) ride their own frame, same best-effort posture as
-      // telemetry: a batch the socket misses is gone, and that must never gate a run.
-      reportLog: (runId, segments) => {
-        held.ws?.sendRunLog(runId, segments);
-      },
-      report: (runId, rep) => {
-        // Spend, log tail, and phase stream on their own frame (RUN-22/31) — no transition
-        // minted. Phase belongs here and NOT on run.status for a concrete reason: the DO's
-        // transition map has no running → running edge, so a phase report sent as a status
-        // would be rejected as an illegal transition and silently dropped.
-        //
-        // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
-        // say "verifying" without claiming the spend is zero.
-        // The executed-spec record is sent ONCE by the supervisor, when the spec resolves — and
-        // telemetry is fire-and-forget, so a socket that happens to be down at that moment would
-        // lose it permanently, with nothing to correct it the way a later tick corrects a dropped
-        // spend (RUN-172). Held until a frame actually goes out on a live socket. Re-sending is
-        // free: the server appends only when the spec differs from the last one it holds.
-        if (rep.executedSpec) pendingSpec.set(runId, rep.executedSpec);
-        const spec = pendingSpec.get(runId) ?? null;
-        // RUN-241: same owed-until-delivered handling as `spec`, one frame field over — see the
-        // pendingConfiguration declaration and RunReport.executedConfiguration's doc.
-        if (rep.executedConfiguration) pendingConfiguration.set(runId, rep.executedConfiguration);
-        const configuration = pendingConfiguration.get(runId) ?? null;
-        if (rep.telemetry || rep.phase || spec || configuration) {
-          // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
-          // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
-          if (held.ws) {
-            const left = held.ws.sendTelemetry(runId, {
-              ...telemetryFrame(rep),
-              logTail: rep.logTail ?? null,
-              phase: rep.phase ?? null,
-              // Rides THIS frame because recording what a run was briefed with is not a lifecycle
-              // transition — run.status has no running → running edge, so it would be rejected
-              // there and silently dropped.
-              executedSpec: spec,
-              executedConfiguration: configuration,
-            });
-            // Clear the pending record ONLY once the frame actually LEFT the socket — that is what
-            // sendTelemetry's boolean reports. A down socket still sets `held.ws`, so keying the
-            // clear on its presence counted a dropped frame as a delivery and lost the record with
-            // nothing to correct it; retaining it lets the next live frame re-send (RUN-172/173).
-            if (spec && left) pendingSpec.delete(runId);
-            if (configuration && left) pendingConfiguration.delete(runId);
+    // Connect immediately after REST registration. Noriq starts restart reconciliation from that
+    // registration today, so indexing, pending-delivery drains, and legacy parked-run recovery must
+    // not consume the adoption window. Ordinary frames wait behind a strict bounded FIFO; protocol
+    // negotiation, mission acknowledgements, and reconciliation remain live from the first frame.
+    let advertisedFreeSlots = (): number => 0;
+    const startupHandlers = new BufferedWsHandlers({
+      maxBufferedFrames: 256,
+      maxBufferedBytes: 4 * 1024 * 1024,
+      startupHandlers: {
+        onRegistered: (message, generation) => {
+          this.log.info('ws registered', message);
+          if (!missionControl.activateTransportGeneration(generation)) {
+            held.ws?.restartConnection('invalid or stale mission transport generation', generation);
+            return;
           }
-        }
-        if (rep.status === 'done' || rep.status === 'failed') {
-          pendingSpec.delete(runId);
-          pendingConfiguration.delete(runId);
-        }
-        if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
-          lastRunStatus.set(runId, rep.status);
-          // agentId finally has a value to carry: the daemon created the identity, so it no
-          // longer has to hope the child announces itself (RUN-43).
-          held.ws?.sendRunStatus(runId, rep.status, {
-            worktreePath: rep.worktreePath,
-            agentId: rep.agentId,
-            exit: rep.exit,
+          void missionControl
+            .reservedRootRunIds()
+            .then((roots) => {
+              if (!missionControl.isCurrentTransportGeneration(generation)) return;
+              if (roots.length > 0 && !message.acceptedCapabilities.includes(MISSION_CAPABILITY)) {
+                poisonMissionControl(
+                  new Error(
+                    `Noriq did not negotiate ${MISSION_CAPABILITY} while ${roots.length} local mission root(s) remain unsettled`,
+                  ),
+                );
+              }
+            })
+            .catch((error) => {
+              if (missionControl.isCurrentTransportGeneration(generation)) {
+                poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+              }
+            });
+        },
+        onMissionTaskAck: (ack, generation) => {
+          if (!missionControl.acknowledgeTask(ack, generation)) {
+            this.log.debug('ignored unmatched mission task acknowledgement', {
+              reportId: ack.reportId,
+              attemptId: ack.attemptId,
+              phase: ack.phase,
+            });
+          }
+        },
+        onMissionReconcileRequest: (request, generation) => {
+          void missionControl.reconcile(request, generation).catch((error) => {
+            if (missionControl.isCurrentTransportGeneration(generation)) {
+              poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+            }
           });
-        }
-        if (rep.status === 'done' || rep.status === 'failed') lastRunStatus.delete(runId);
+        },
+        onMissionReconcileResult: (results, generation) => {
+          void missionControl.applyResults(results, generation).catch((error) => {
+            if (missionControl.isCurrentTransportGeneration(generation)) {
+              poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+        },
+        onDisconnect: (reason, generation) => {
+          void missionControl.transportGenerationLost(generation, reason).catch((error) => {
+            if (missionControl.isCurrentTransportGeneration(generation)) {
+              poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+        },
       },
-      postComment: (projectId, taskId, body) => {
-        void client
-          .postComment(projectId, taskId, body)
-          .catch((err) => this.log.warn('verify comment post failed', { err: String(err) }));
-      },
-      server: this.config.server,
-      // runner.toml's `[budget]` — the machine's own ceilings for dispatches that
-      // arrive without one. Otherwise such a Run would burn unbounded.
-      defaultBudget: this.config.budget,
-      // The runner creates each Run's Noriq agent and receives a token bound to it, which
-      // is injected into that agent's MCP transport (RUN-43). This replaces two things:
-      // `parentAgentId: runner.id`, which passed a RUNNER id into a field documented as an
-      // agent id and only ever surfaced as prompt text asking the model to register itself;
-      // and `getToken`, which handed every spawned process the DAEMON's own credential —
-      // the one that can register runners and reach every project this human can.
-      createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
-      resolveTask: (taskId) => client.getTask(taskId),
-      // The mechanical check behind a CONTESTED task pointer (RUN-188): the judging reviewer holds
-      // no credential (RUN-43), so the daemon looks the task up and enters the result as ledger
-      // data. Bound here for the same reason resolveLockScope is: a dep only tests supply is a
-      // feature that has never run.
-      resolveSpinOff: (ref) => client.getTask(ref),
-      // Phase-gate backstop (RUN-81): don't spawn an agent on a task the server offered but whose
-      // plan phase isn't unlocked. Read-only probe; a null answer fails open (see checkClaimable).
-      checkClaimable: (taskId) => client.checkClaimable(taskId),
-      // Parking (RUN-30). The server is the authority on whether a run asked a human something —
-      // the agent calls request_input over its own MCP transport, straight past the daemon — so
-      // the daemon asks the row rather than trying to observe the call.
-      getParkState: (runId) => client.getParkState(runId),
-      // When a run holding an open blocked question terminates without parking (a breach, a crash),
-      // tell the server the question died with the run so no signal is left standing (RUN-199).
-      abandonSignal: (runId, signalId) => client.abandonBlockedSignal(runId, signalId),
-      parked,
-      continuable,
-      // The line whose absence made RUN-103's predictive layer dead code in production: the dep
-      // existed, the supervisor consumed it, and only tests ever supplied one. See its doc above.
-      resolveLockScope: continuationLockScope(continuable),
-      // A planned spec is written BACK to the task (RUN-140) — that is what makes planning an
-      // artifact a human can correct and a retry can reuse, rather than a thought inside one run's
-      // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
-      // feature that has never run.
-      saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
-      // RUN-228's task context pack fetch — bound with this daemon's own registration id, the same
-      // closure shape `getCursor` above already uses for `getIndexCursor`. `context-pack.ts` is
-      // what adds the timeout and decides what an omission means; this is the thin wire binding.
-      getContextPack: (input) => client.getContextPack(runner.id, input),
-      // Background indexing's landing/publish trigger site (RUN-222). Fire-and-forget: `onLanded`
-      // itself never throws (it catches everything internally) and this daemon never awaits it.
-      onLanded: (repoRoot, branch, sha) => {
-        void indexTriggers.onLanded?.(repoRoot, branch, sha);
-      },
-      // RUN-227's delivery sink. Fire-and-forget, same shape as `onLanded` above: `deliverEpisode`
-      // enqueues durably before it ever touches the network (its own doc), so this dep can stay
-      // synchronous and return before any I/O settles — `settle` never awaits it.
-      recordEpisode: (episode, intelligence) => {
-        void deliverEpisode(episode, episodeDeliveryDeps, intelligence).catch((err) =>
-          this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
-        );
-      },
-      // RUN-230's delivery sink. Fire-and-forget for the identical reason `recordEpisode` above is:
-      // `deliverVerificationReport` enqueues durably before it ever touches the network, so this
-      // dep stays synchronous and returns before any I/O settles — `prepareRun` never awaits it.
-      reportVerification: (runId, agentToken, report) => {
-        void deliverVerificationReport(runId, agentToken, report, verificationReportDeliveryDeps).catch(
-          (err) =>
-            this.log.warn('verification report delivery failed unexpectedly', { runId, err: String(err) }),
-        );
-      },
-      // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
-      // third time the same lesson has been learned: a dep only tests supply is a feature that has
-      // never run.
-      repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
-      // How many of a run's wave steps may overlap (RUN-170): a RESERVING ask on the capacity
-      // ledger — the grant is recorded synchronously inside the call, which is what closes the
-      // window where two chains sample the same spare slots before either spawns (see
-      // waveCapacity). Re-asked by the chain before each wave; the floor of 1 means a saturated
-      // machine degrades a wave to sequential rather than refusing the run. Bound HERE, not only
-      // in tests: a dep only tests supply is a feature that has never run.
-      waveLimit: (runId) => {
-        const limit = capacity.waveLimit(runId);
-        // The grant just claimed slots the server's last-heard advertisement still calls free,
-        // and the server is the admission authority — this daemon has never refused an
-        // assignment, so the only enforcement that reaches dispatch is the advertisement.
-        // Pushing it NOW shrinks the stale window from a heartbeat interval to one frame's
-        // flight; a dispatch already in the air is the residual the ledger absorbs — the run
-        // lands in `active` synchronously on arrival, and every ask after that subtracts its
-        // seat.
-        held.ws?.advertiseCapacity();
-        return limit;
-      },
-      steering,
-      logger: this.log,
+      onOverflow: poisonMissionControl,
     });
-
-    // RUN-265/294: hydrate every park, then let the durable server fact discard terminal garbage
-    // BEFORE constructing the assignment socket. Unknown state stays reserved (fail closed), and
-    // the probe is bounded so an unhealthy REST path cannot wedge daemon startup forever.
-    await supervisor.restoreExecutionLifecycle(async (park) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
-        timer = setTimeout(() => resolve({ kind: 'timeout' }), this.parkRecoveryTimeoutMs);
-      });
-      const result = await Promise.race([
-        client
-          .getParkState(park.run.id)
-          .then((state) => ({ kind: 'state' as const, state }))
-          .catch((err) => ({ kind: 'error' as const, err })),
-        timeout,
-      ]);
-      if (timer) clearTimeout(timer);
-      if (result.kind === 'timeout') {
-        this.log.warn('park recovery probe timed out — retaining execution ownership', {
-          runId: park.run.id,
-          waitedMs: this.parkRecoveryTimeoutMs,
-        });
-        return 'unknown';
-      }
-      if (result.kind === 'error') {
-        this.log.debug('could not classify recovered park — retaining execution ownership', {
-          runId: park.run.id,
-          err: String(result.err),
-        });
-        return 'unknown';
-      }
-      return result.state.answer != null || result.state.blocked ? 'parked' : 'terminal';
-    });
-
     const ws = new WsClient({
       server: this.config.server,
       runnerId: runner.id,
@@ -1118,28 +977,564 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
-      // Recomputed per (re)connect (RUN-195): the same read-at-use stores dispatch resolution
-      // uses — ManifestStore falls back to the last good manifest on a broken read, and the
-      // WsClient absorbs a thrown refresh by advertising its last good set — so a workflow-file
-      // edit is visible on the next hello, and a broken one can never keep the daemon offline.
-      // Advertise-only either way: dispatch still re-reads and pins its own catalog per run.
+      // Re-observe the same read-at-use manifest/workflow state used by dispatch. Mission profile
+      // offers and workflow capability stay empty together until Noriq can send the complete
+      // immutable commission; no legacy Run may be invited into a half-activated environment.
       refreshRepos: () =>
         Promise.all(
-          repos.map(async (r) => {
-            const manifest = (await manifests.current(r.root)) ?? r.manifest;
-            return repoReport(r, manifest, await workflows.current(r.root, manifest));
+          repos.map(async (repo) => {
+            const manifest = (await manifests.current(repo.root)) ?? repo.manifest;
+            return repoReport(repo, manifest, await workflows.current(repo.root, manifest), this.log, [], []);
           }),
         ),
       connect: this.connect,
-      // The capacity ledger's view, not a run count (RUN-170): one run's wave is several live
-      // processes — and a wave the daemon just granted breadth to is occupied capacity even
-      // before its children register. A heartbeat that counted runs would advertise free slots
-      // on a machine a single decomposed run has saturated, inviting dispatches its own wave
-      // limit exists to make room for.
-      freeSlots: () => capacity.freeSlots(),
-      handlers: {
-        onRegistered: (m) => this.log.info('ws registered', m),
-        onAssigned: (run) => {
+      freeSlots: () => advertisedFreeSlots(),
+      handlers: startupHandlers,
+      logger: this.log,
+    });
+
+    // Resources below this point are created after the assignment transport exists. Keep their
+    // teardown references outside the startup block so ANY rejection between ws.start() and the
+    // returned handle can roll back what was created so far. The normal stop path uses the same
+    // function; `startupComplete` only decides whether the socket must close before the drain.
+    let startupComplete = false;
+    let stopping = false;
+    let capacityForShutdown: ReturnType<typeof waveCapacity> | null = null;
+    let steeringForShutdown: SteeringBridge | null = null;
+    let indexCoordinatorForShutdown: IndexCoordinatorLike | null = null;
+    let indexTriggersForShutdown: IndexTriggerHubLike | null = null;
+    let indexControlForShutdown: Pick<IndexControlServer, 'start' | 'stop'> | null = null;
+    let updateTimer: ReturnType<typeof setInterval> | undefined;
+    let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+    let sweepInFlight: Promise<unknown> = Promise.resolve();
+    let stopPromise: Promise<void> | null = null;
+    const stopOnce = async (): Promise<void> => {
+      // Revoke admission and advertise zero SYNCHRONOUSLY, before the first await. A frame already
+      // in flight can still reach a handler, but no assignment/resume/reconnect path may launch
+      // work after the shutdown sweep has taken its snapshot.
+      acceptingLegacyWork = false;
+      stopping = true;
+      advertisedFreeSlots = () => 0;
+      held.ws?.advertiseCapacity();
+      const activeAtShutdown = [...this.active];
+      for (const runId of activeAtShutdown) capacityForShutdown?.cancelAdmission(runId);
+
+      // A failed startup has no caller-owned handle and no useful status-drain window. Close its
+      // socket immediately so reconnect timers and heartbeat ownership cannot survive rollback.
+      if (!startupComplete) ws.stop();
+      if (sweepTimer) clearTimeout(sweepTimer);
+
+      // Revoke mission transport authority and begin nonterminal process/tool quiescence before
+      // any legacy drain. This promise is joined below without a timeout: returning while a model
+      // tree still runs would orphan both edits and spend outside the daemon's budget authority.
+      const missionStopping = missionControl.stop('runner shutdown');
+      const steering = steeringForShutdown;
+      const stoppedRuns = new Set<string>();
+      if (steering) {
+        // `cancelRun` records cancellation synchronously even if supervision has not registered a
+        // session yet. That closes the pre-session race which a one-time stopAll snapshot cannot.
+        await Promise.all(
+          activeAtShutdown.map(async (runId) => {
+            await steering.cancelRun(runId).catch((error) =>
+              this.log.warn('legacy run cancellation during shutdown failed', {
+                runId,
+                err: String(error),
+              }),
+            );
+            stoppedRuns.add(runId);
+          }),
+        );
+        for (const runId of await steering.stopAll().catch((error) => {
+          this.log.warn('legacy session shutdown failed', { err: String(error) });
+          return [] as string[];
+        })) {
+          stoppedRuns.add(runId);
+        }
+      }
+      if (stoppedRuns.size) {
+        this.log.info(`stopped ${stoppedRuns.size} live run(s)`, { runs: [...stoppedRuns] });
+      }
+
+      // Give supervisors a beat to report terminal statuses while a successfully-started daemon's
+      // socket is still open. Startup rollback closed it above and only needs local quiescence.
+      const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
+      while (this.active.size > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (this.active.size > 0) {
+        this.log.warn('shutting down with runs still settling — the server will reconcile them', {
+          runs: [...this.active],
+        });
+      }
+      // Catch a session that crossed registration while the cancellation fact was being observed.
+      if (steering) {
+        await steering
+          .stopAll()
+          .catch((error) => this.log.warn('late legacy session shutdown failed', { err: String(error) }));
+      }
+
+      if (updateTimer) clearInterval(updateTimer);
+      // Join a sweep that was already running when stop() was called — clearTimeout cancels the
+      // NEXT one, never git commands already in flight.
+      await sweepInFlight.catch(() => {});
+
+      // Each optional reference is assigned immediately when its resource is constructed. Calling
+      // stop even after a partial start is intentional: a rejecting start may already have bound
+      // a port or scheduled work before it reported failure.
+      try {
+        indexTriggersForShutdown?.stop();
+      } catch (error) {
+        this.log.warn('index trigger shutdown failed', { err: String(error) });
+      }
+      await indexCoordinatorForShutdown
+        ?.cancelAll()
+        .catch((error) => this.log.warn('index coordinator shutdown failed', { err: String(error) }));
+      await indexControlForShutdown
+        ?.stop()
+        .catch((error) => this.log.warn('index control shutdown failed', { err: String(error) }));
+      // Do not report offline or close the authority socket until every mission process tree is
+      // proved settled. A rejected quiescence leaves this daemon visibly non-offline and makes the
+      // caller keep the process alive for an operator-forced second-signal exit.
+      await missionStopping;
+      await client
+        .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
+        .catch((error) =>
+          this.log.debug('goodbye heartbeat failed (shutting down anyway)', { err: String(error) }),
+        );
+      ws.stop();
+    };
+    const stop = (): Promise<void> => {
+      stopPromise ??= stopOnce();
+      return stopPromise;
+    };
+
+    held.ws = ws;
+    try {
+      ws.start();
+
+      // RUN-227's undelivered-episode queue, and the delivery deps every enqueue/retry site below
+      // shares. Built here, once `runner.id` exists — `EpisodeDeliveryDeps.runnerId` is captured into
+      // every `PendingEpisode.mint` at enqueue time (locked decision 8's identity half), and this is
+      // the daemon's own registration id, stable across a restart (`saveState` above persists it).
+      const episodePending = new EpisodePendingStore(filePendingEpisodeStore(this.episodePendingPath));
+      const episodeDeliveryDeps: EpisodeDeliveryDeps = {
+        client,
+        runnerId: runner.id,
+        pending: episodePending,
+        logger: this.log,
+      };
+      // Retry whatever a prior process left pending, once, at startup — mirrors the orphaned-staging
+      // sweep just below: a daemon that crashed or was simply off holds episodes nothing has retried
+      // since, and "the box just came up" is exactly the moment worth spending one drain pass on.
+      void drainPendingEpisodes(episodeDeliveryDeps)
+        .then(({ delivered }) => {
+          if (delivered) this.log.info(`delivered ${delivered} previously pending episode(s)`);
+        })
+        .catch((err) => this.log.warn('startup episode delivery retry failed', { err: String(err) }));
+
+      // RUN-230's undelivered-verification-report queue, and its own delivery deps — a SEPARATE
+      // store from the episode one above (`verification-pending.ts`'s own doc on why: no shared
+      // `mint`-style identity, and a retry here can go permanently dead in a way an episode retry
+      // never does).
+      const verificationPending = new VerificationPendingStore(
+        filePendingVerificationStore(this.verificationPendingPath),
+      );
+      const verificationReportDeliveryDeps: VerificationReportDeliveryDeps = {
+        client,
+        pending: verificationPending,
+        logger: this.log,
+      };
+      // Same startup-drain reasoning as episodes just above: a daemon that crashed or was simply off
+      // holds reports nothing has retried since.
+      void drainPendingVerificationReports(verificationReportDeliveryDeps)
+        .then(({ delivered, dropped }) => {
+          if (delivered) this.log.info(`delivered ${delivered} previously pending verification report(s)`);
+          if (dropped)
+            this.log.warn(
+              `dropped ${dropped} undeliverable verification report(s) (run agent token revoked)`,
+            );
+        })
+        .catch((err) =>
+          this.log.warn('startup verification report delivery retry failed', { err: String(err) }),
+        );
+
+      // RUN-214's index job coordinator, now with the real work step (RUN-222 locked decision 5):
+      // the leased snapshot's source → runIndexer → uploadGeneration, wired in `index-work.ts` so
+      // this file stays wiring-only. `resolveIndexConfigForRoot` is the ONE enabled/off gate both
+      // the coordinator and the trigger layer below consult — never two copies of it. Built here,
+      // before the supervisor, because the landing/publish trigger site (RUN-222) is a supervisor
+      // dep (`onLanded`) that needs the trigger hub to already exist.
+      const resolveIndexConfigForRoot = (root: string) => loadIndexConfig(root, this.log);
+      const indexJournal = new IndexJournal(fileJournalStore(this.indexJournalPath));
+      // RUN-223's operator-status recorder — built before the coordinator so its `onStatus` dep can
+      // close over it. Persists to disk on every mutation (best-effort; a write failure costs the
+      // next CLI read staleness, never an index attempt) — the CLI's offline fallback when no live
+      // daemon answers the control server's `/status` below.
+      const indexStatus = new IndexStatusStore({
+        persist: fileIndexStatusPersist(this.indexStatusPath),
+        logger: this.log,
+      });
+      // Locked decision 8: the orphaned-staging sweep runs EXACTLY here — startup only, before the
+      // coordinator's first trigger, never on a timer. `sweepOrphanedStaging`'s own doc: a snapshot
+      // mid-write or mid-upload looks identical, by inspection, to one a crashed process left behind,
+      // and only "nothing survived the last exit" (true right here, true nowhere later) makes every
+      // directory with no live journal entry unreachable BY CONSTRUCTION rather than unlucky timing.
+      await sweepOrphanedStaging(indexJournal, this.indexStagingRoot)
+        .then(({ removed }) => {
+          if (removed.length) this.log.info(`swept ${removed.length} orphaned index-staging dir(s)`);
+        })
+        .catch((err) => this.log.warn('index staging sweep failed', { err: String(err) }));
+      const indexCoordinator: IndexCoordinatorLike =
+        this.indexCoordinatorOverride ??
+        new IndexCoordinator({
+          vcsFor: (root) => backendFor.get(root) ?? vcs,
+          resolveConfig: resolveIndexConfigForRoot,
+          getCursor: (target) =>
+            client.getIndexCursor(runner.id, {
+              projectId: target.projectId,
+              repositoryKey: target.repositoryKey,
+              checkoutId: target.checkoutId,
+            }),
+          runWork: createIndexWorkStep({
+            client,
+            runnerId: runner.id,
+            vcsFor: (root) => backendFor.get(root) ?? vcs,
+            staging: fileStagingStore(this.indexStagingRoot),
+            logger: this.log,
+          }),
+          journal: indexJournal,
+          // "Busy with runs" reads the same live set the capacity ledger and the orphan sweep read
+          // (`this.active`) — one honest definition of busy, not a second one invented here.
+          isRunBusy: () => this.active.size > 0,
+          // RUN-223: every reconcile/phase/success/failure this coordinator decides also lands in
+          // the status recorder above — the ONLY feed `IndexStatusStore` has, so the CLI surface can
+          // never show a state this coordinator did not itself observe.
+          onStatus: (event) => indexStatus.record(event),
+          logger: this.log,
+        });
+      indexCoordinatorForShutdown = indexCoordinator;
+
+      // RUN-222's trigger layer: turns startup, a landing, and a periodic poll into debounced calls
+      // to the coordinator above. `projectIdFor` closes over the registration response — the server
+      // resolves a repo's projectId at registration, and re-deriving it per trigger would be a
+      // second source of truth for a fact that does not change over this daemon's lifetime.
+      const projectIdFor = new Map(runner.repos.map((r) => [r.id, r.projectId] as const));
+      const indexTriggerRepos: IndexTriggerRepo[] = repos
+        .filter((r): r is typeof r & { repositoryKey: string } => r.repositoryKey !== null)
+        .map((r) => ({
+          repoRoot: r.root,
+          repositoryKey: r.repositoryKey,
+          checkoutId: r.id,
+          projectId: projectIdFor.get(r.id) ?? null,
+          projectKey: r.manifest.key,
+          defaultBranch: r.manifest.defaultBranch ?? r.defaultBranch,
+        }));
+      const indexTriggers: IndexTriggerHubLike =
+        this.indexTriggersOverride ??
+        new IndexTriggerHub({
+          server: this.config.server,
+          coordinator: indexCoordinator,
+          vcsFor: (root) => backendFor.get(root) ?? vcs,
+          resolveConfig: resolveIndexConfigForRoot,
+          repos: indexTriggerRepos,
+          logger: this.log,
+        });
+      indexTriggersForShutdown = indexTriggers;
+
+      // RUN-223's operator control surface — a loopback HTTP server (see index-control.ts's own doc
+      // for why this shape over a status file the daemon merely writes) so a live CLI command can
+      // read `/status`, or ask for a manual reindex/retry/cancel, without minting anything or
+      // touching `[index].enabled` itself: every route here is a thin ask onto the coordinator and
+      // trigger hub above, which already enforce their own gates. Started unconditionally — there is
+      // no config knob, the same posture the leak sweep and update check already take — because the
+      // one thing worse than a control surface nobody asked for is indexing running unattended with
+      // no way to see it at all, which is exactly the gap this task exists to close.
+      const indexControl: Pick<IndexControlServer, 'start' | 'stop'> =
+        this.indexControlOverride ??
+        new IndexControlServer({
+          statusStore: indexStatus,
+          triggerStatuses: () => indexTriggers.allStatuses?.() ?? [],
+          repoRootFor: (repositoryKey) =>
+            indexTriggerRepos.find((r) => r.repositoryKey === repositoryKey)?.repoRoot,
+          requestManualReindex: (repoRoot) =>
+            indexTriggers.requestManualReindex?.(repoRoot) ?? Promise.resolve(),
+          cancelRepo: (repositoryKey) => {
+            // Only a repo THIS daemon actually knows about may be cancelled — an unrecognized
+            // repositoryKey never reaches the coordinator's own job-key map at all.
+            if (!indexTriggerRepos.some((r) => r.repositoryKey === repositoryKey)) return false;
+            return indexCoordinator.cancelRepo?.({ server: this.config.server, repositoryKey }) ?? false;
+          },
+          controlInfoPath: this.indexControlInfoPath,
+          logger: this.log,
+        });
+      indexControlForShutdown = indexControl;
+      await indexControl
+        .start()
+        .catch((err) => this.log.warn('index control server failed to start', { err: String(err) }));
+
+      // Supervisor composes worktree + driver + budget per dispatched Run. The `held`
+      // holder breaks the ws↔supervisor reference cycle (supervisor reports via ws;
+      // ws's onAssigned drives the supervisor). Each Run's agent identity is created by the
+      // runner up front (RUN-43) and reached with a token bound to it alone.
+      const reposById = new Map(repos.map((repo) => [repo.id, repo]));
+      // The committed marker is re-read per Run, so editing .noriq/project.toml takes
+      // effect on the next dispatch instead of waiting for someone to restart the daemon.
+      const resolveRepo = workflowRepoResolver({
+        repos,
+        manifestFor: (root) => manifests.current(root),
+        workflowsFor: (root, manifest) => workflows.current(root, manifest),
+        vcsFor: (root) => backendFor.get(root),
+      });
+      // Dedup run.status: the supervisor re-reports status:'running' on every telemetry
+      // tick, but the DO only wants genuine transitions. Telemetry rides its own frame.
+      const lastRunStatus = new Map<string, string>();
+      /** The executed-spec record still owed to the server (RUN-172), per run — see the send below
+       *  for why a single fire-and-forget send was not enough. Cleared when a frame carrying it
+       *  actually goes out, and when the run ends, so a daemon does not hold one per run for its
+       *  whole life. */
+      const pendingSpec = new Map<string, ExecutionSpec>();
+      /** RUN-241: the same owed-until-delivered posture as `pendingSpec`, for the resolved
+       *  coordinate a run actually executes under (see `RunReport.executedConfiguration`'s doc). */
+      const pendingConfiguration = new Map<string, ExecutedConfigurationEvidence>();
+      const steering = new SteeringBridge({ logger: this.log });
+      steeringForShutdown = steering;
+      // The session-capacity ledger (RUN-170): waveLimit RESERVES what it answers, so simultaneous
+      // chains cannot double-spend the same spare slots, and freeSlots sees a granted wave as
+      // occupied capacity. See waveCapacity's doc for the bound it holds and the deferral it keeps.
+      const capacity = waveCapacity({
+        concurrency: this.config.concurrency,
+        active: () => this.active,
+        sessionsOf: (runId) => steering.liveSessionsOf(runId),
+        liveSessions: (excludeRunId) => steering.liveSessionCount(excludeRunId),
+      });
+      capacityForShutdown = capacity;
+      const supervisor = this.createSupervisor({
+        drivers: {
+          claude: new ClaudeDriver({ logger: this.log }),
+          codex: new CodexDriver({ logger: this.log }),
+        },
+        vcs,
+        resolveRepo,
+        // Transcript segments (RUN-74) ride their own frame, same best-effort posture as
+        // telemetry: a batch the socket misses is gone, and that must never gate a run.
+        reportLog: (runId, segments) => {
+          held.ws?.sendRunLog(runId, segments);
+        },
+        report: (runId, rep) => {
+          // Spend, log tail, and phase stream on their own frame (RUN-22/31) — no transition
+          // minted. Phase belongs here and NOT on run.status for a concrete reason: the DO's
+          // transition map has no running → running edge, so a phase report sent as a status
+          // would be rejected as an illegal transition and silently dropped.
+          //
+          // Each field is null-means-no-news (the server COALESCEs), so a phase-only tick can
+          // say "verifying" without claiming the spend is zero.
+          // The executed-spec record is sent ONCE by the supervisor, when the spec resolves — and
+          // telemetry is fire-and-forget, so a socket that happens to be down at that moment would
+          // lose it permanently, with nothing to correct it the way a later tick corrects a dropped
+          // spend (RUN-172). Held until a frame actually goes out on a live socket. Re-sending is
+          // free: the server appends only when the spec differs from the last one it holds.
+          if (rep.executedSpec) pendingSpec.set(runId, rep.executedSpec);
+          const spec = pendingSpec.get(runId) ?? null;
+          // RUN-241: same owed-until-delivered handling as `spec`, one frame field over — see the
+          // pendingConfiguration declaration and RunReport.executedConfiguration's doc.
+          if (rep.executedConfiguration) pendingConfiguration.set(runId, rep.executedConfiguration);
+          const configuration = pendingConfiguration.get(runId) ?? null;
+          if (rep.telemetry || rep.phase || spec || configuration) {
+            // telemetryFrame decides the mix's tri-state (mix / {} = clear / null = no news) so a
+            // stale mix can't outlive the spend it no longer sums to (RUN-59). See its doc.
+            if (held.ws) {
+              const left = held.ws.sendTelemetry(runId, {
+                ...telemetryFrame(rep),
+                logTail: rep.logTail ?? null,
+                phase: rep.phase ?? null,
+                // Rides THIS frame because recording what a run was briefed with is not a lifecycle
+                // transition — run.status has no running → running edge, so it would be rejected
+                // there and silently dropped.
+                executedSpec: spec,
+                executedConfiguration: configuration,
+              });
+              // Clear the pending record ONLY once the frame actually LEFT the socket — that is what
+              // sendTelemetry's boolean reports. A down socket still sets `held.ws`, so keying the
+              // clear on its presence counted a dropped frame as a delivery and lost the record with
+              // nothing to correct it; retaining it lets the next live frame re-send (RUN-172/173).
+              if (spec && left) pendingSpec.delete(runId);
+              if (configuration && left) pendingConfiguration.delete(runId);
+            }
+          }
+          if (rep.status === 'done' || rep.status === 'failed') {
+            pendingSpec.delete(runId);
+            pendingConfiguration.delete(runId);
+          }
+          if (shouldForwardRunStatus(lastRunStatus.get(runId), rep)) {
+            lastRunStatus.set(runId, rep.status);
+            // agentId finally has a value to carry: the daemon created the identity, so it no
+            // longer has to hope the child announces itself (RUN-43).
+            held.ws?.sendRunStatus(runId, rep.status, {
+              worktreePath: rep.worktreePath,
+              agentId: rep.agentId,
+              exit: rep.exit,
+            });
+          }
+          if (rep.status === 'done' || rep.status === 'failed') lastRunStatus.delete(runId);
+        },
+        postComment: (projectId, taskId, body) => {
+          void client
+            .postComment(projectId, taskId, body)
+            .catch((err) => this.log.warn('verify comment post failed', { err: String(err) }));
+        },
+        server: this.config.server,
+        // runner.toml's `[budget]` — the machine's own ceilings for dispatches that
+        // arrive without one. Otherwise such a Run would burn unbounded.
+        defaultBudget: this.config.budget,
+        // The runner creates each Run's Noriq agent and receives a token bound to it, which
+        // is injected into that agent's MCP transport (RUN-43). This replaces two things:
+        // `parentAgentId: runner.id`, which passed a RUNNER id into a field documented as an
+        // agent id and only ever surfaced as prompt text asking the model to register itself;
+        // and `getToken`, which handed every spawned process the DAEMON's own credential —
+        // the one that can register runners and reach every project this human can.
+        createRunAgent: (runId, opts) => client.createRunAgent(runId, opts),
+        resolveTask: (taskId) => client.getTask(taskId),
+        // The mechanical check behind a CONTESTED task pointer (RUN-188): the judging reviewer holds
+        // no credential (RUN-43), so the daemon looks the task up and enters the result as ledger
+        // data. Bound here for the same reason resolveLockScope is: a dep only tests supply is a
+        // feature that has never run.
+        resolveSpinOff: (ref) => client.getTask(ref),
+        // Phase-gate backstop (RUN-81): don't spawn an agent on a task the server offered but whose
+        // plan phase isn't unlocked. Read-only probe; a null answer fails open (see checkClaimable).
+        checkClaimable: (taskId) => client.checkClaimable(taskId),
+        // Parking (RUN-30). The server is the authority on whether a run asked a human something —
+        // the agent calls request_input over its own MCP transport, straight past the daemon — so
+        // the daemon asks the row rather than trying to observe the call.
+        getParkState: (runId) => client.getParkState(runId),
+        // When a run holding an open blocked question terminates without parking (a breach, a crash),
+        // tell the server the question died with the run so no signal is left standing (RUN-199).
+        abandonSignal: (runId, signalId) => client.abandonBlockedSignal(runId, signalId),
+        parked,
+        continuable,
+        // The line whose absence made RUN-103's predictive layer dead code in production: the dep
+        // existed, the supervisor consumed it, and only tests ever supplied one. See its doc above.
+        resolveLockScope: continuationLockScope(continuable),
+        // A planned spec is written BACK to the task (RUN-140) — that is what makes planning an
+        // artifact a human can correct and a retry can reuse, rather than a thought inside one run's
+        // prompt. Bound here for the same reason `resolveLockScope` is: a dep only tests supply is a
+        // feature that has never run.
+        saveExecutionSpec: (projectId, taskId, spec) => client.setExecutionSpec(projectId, taskId, spec),
+        // RUN-228's task context pack fetch — bound with this daemon's own registration id, the same
+        // closure shape `getCursor` above already uses for `getIndexCursor`. `context-pack.ts` is
+        // what adds the timeout and decides what an omission means; this is the thin wire binding.
+        getContextPack: (input) => client.getContextPack(runner.id, input),
+        // Background indexing's landing/publish trigger site (RUN-222). Fire-and-forget: `onLanded`
+        // itself never throws (it catches everything internally) and this daemon never awaits it.
+        onLanded: (repoRoot, branch, sha) => {
+          void indexTriggers.onLanded?.(repoRoot, branch, sha);
+        },
+        // RUN-227's delivery sink. Fire-and-forget, same shape as `onLanded` above: `deliverEpisode`
+        // enqueues durably before it ever touches the network (its own doc), so this dep can stay
+        // synchronous and return before any I/O settles — `settle` never awaits it.
+        recordEpisode: (episode, intelligence) => {
+          void deliverEpisode(episode, episodeDeliveryDeps, intelligence).catch((err) =>
+            this.log.warn('episode delivery failed unexpectedly', { runId: episode.runId, err: String(err) }),
+          );
+        },
+        // RUN-230's delivery sink. Fire-and-forget for the identical reason `recordEpisode` above is:
+        // `deliverVerificationReport` enqueues durably before it ever touches the network, so this
+        // dep stays synchronous and returns before any I/O settles — `prepareRun` never awaits it.
+        reportVerification: (runId, agentToken, report) => {
+          void deliverVerificationReport(runId, agentToken, report, verificationReportDeliveryDeps).catch(
+            (err) =>
+              this.log.warn('verification report delivery failed unexpectedly', { runId, err: String(err) }),
+          );
+        },
+        // What one run works out about a repo, kept for the next (RUN-143/144). Bound here for the
+        // third time the same lesson has been learned: a dep only tests supply is a feature that has
+        // never run.
+        repoIntel: new RepoIntel(fileIntelStore(), this.config.server),
+        // How many of a run's wave steps may overlap (RUN-170): a RESERVING ask on the capacity
+        // ledger — the grant is recorded synchronously inside the call, which is what closes the
+        // window where two chains sample the same spare slots before either spawns (see
+        // waveCapacity). Re-asked by the chain before each wave; the floor of 1 means a saturated
+        // machine degrades a wave to sequential rather than refusing the run. Bound HERE, not only
+        // in tests: a dep only tests supply is a feature that has never run.
+        waveLimit: (runId) => {
+          const limit = capacity.waveLimit(runId);
+          // The grant just claimed slots the server's last-heard advertisement still calls free,
+          // and the server is the admission authority — this daemon has never refused an
+          // assignment, so the only enforcement that reaches dispatch is the advertisement.
+          // Pushing it NOW shrinks the stale window from a heartbeat interval to one frame's
+          // flight; a dispatch already in the air is the residual the ledger absorbs — the run
+          // lands in `active` synchronously on arrival, and every ask after that subtracts its
+          // seat.
+          held.ws?.advertiseCapacity();
+          return limit;
+        },
+        steering,
+        logger: this.log,
+      });
+
+      // RUN-265/294: hydrate every park, then let the durable server fact discard terminal garbage
+      // BEFORE constructing the assignment socket. Unknown state stays reserved (fail closed), and
+      // the probe is bounded so an unhealthy REST path cannot wedge daemon startup forever.
+      await supervisor.restoreExecutionLifecycle(async (park) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+          timer = setTimeout(() => resolve({ kind: 'timeout' }), this.parkRecoveryTimeoutMs);
+        });
+        const result = await Promise.race([
+          client
+            .getParkState(park.run.id)
+            .then((state) => ({ kind: 'state' as const, state }))
+            .catch((err) => ({ kind: 'error' as const, err })),
+          timeout,
+        ]);
+        if (timer) clearTimeout(timer);
+        if (result.kind === 'timeout') {
+          this.log.warn('park recovery probe timed out — retaining execution ownership', {
+            runId: park.run.id,
+            waitedMs: this.parkRecoveryTimeoutMs,
+          });
+          return 'unknown';
+        }
+        if (result.kind === 'error') {
+          this.log.debug('could not classify recovered park — retaining execution ownership', {
+            runId: park.run.id,
+            err: String(result.err),
+          });
+          return 'unknown';
+        }
+        return result.state.answer != null || result.state.blocked ? 'parked' : 'terminal';
+      });
+
+      const ordinaryWsHandlers: WsHandlers = {
+        onAssigned: (run, missionLease, generation) => {
+          if (!acceptingLegacyWork) {
+            this.log.debug('ignored assignment after legacy admission closed', { runId: run.id });
+            return;
+          }
+          // Startup buffering can outlive the socket that supplied a frame. Never commission or
+          // refuse work from a generation that no longer owns the live connection.
+          if (!held.ws?.isCurrentGeneration(generation)) return;
+          const refusal = missionAssignmentRefusal(run, missionLease);
+          if (refusal) {
+            this.log.warn(refusal, { runId: run.id });
+            const sent =
+              held.ws?.sendRunStatus(run.id, 'failed', {
+                missionLease,
+                connectionGeneration: generation,
+                exit: {
+                  outcome: 'failed',
+                  code: null,
+                  signal: null,
+                  reason: refusal,
+                },
+              }) ?? false;
+            // Mission statuses deliberately do not enter WsClient's legacy replay set: replaying an
+            // old epoch before adoption would violate authority. Force a fresh generation when the
+            // exact refusal could not leave this one.
+            if (missionLease && !sent) {
+              held.ws?.restartConnection('mission assignment refusal was not sent', generation);
+            }
+            return;
+          }
           // The seat is claimed SYNCHRONOUSLY — the ledger and the heartbeat see this run before
           // anything yields — but supervision waits for ADMISSION (RUN-170): the advertisement
           // cannot recall a dispatch already in the air, so an assignment that lands on a machine
@@ -1149,24 +1544,49 @@ export class Daemon {
           this.active.add(run.id);
           void capacity
             .admit(run.id)
-            .then(() => supervisor.supervise(run))
+            .then(() => {
+              // Shutdown wakes queued admissions so their lifecycle promises can settle. Re-check
+              // authority after that await: a wake-up is cleanup, never permission to launch.
+              if (!acceptingLegacyWork) return;
+              return supervisor.supervise(run);
+            })
             .finally(() => {
               this.active.delete(run.id);
               // The run's wave grant dies with it (RUN-170) — a lingering grant would keep
               // reserving capacity for a run that can never spawn again.
               capacity.release(run.id);
+              steering.forget(run.id);
             });
         },
-        onCancel: (m) => {
+        onCancel: async (message, generation) => {
+          if (!held.ws?.isCurrentGeneration(generation)) return;
+          let missionOwned = false;
+          try {
+            missionOwned = await missionControl.cancelKnownRoot(
+              message.runId,
+              message.reason ?? 'cancelled by Noriq',
+              generation,
+            );
+          } catch (error) {
+            if (held.ws?.isCurrentGeneration(generation)) {
+              poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+            }
+            return;
+          }
+          // Both mission inventory and cancellation settlement cross awaits. Do not reinterpret a
+          // stale mission callback as a legacy cancellation after a newer socket took authority.
+          if (!held.ws?.isCurrentGeneration(generation)) return;
+          if (missionOwned) return;
           // Hard interrupt + SIGTERM + worktree teardown (the supervisor's finally
           // removes the worktree and clears the active slot).
-          this.log.info('run cancel received', { runId: m.runId, reason: m.reason });
-          void supervisor
-            .terminalizeParkedRun(m.runId)
-            .catch((err) =>
-              this.log.warn('could not terminalize a parked run', { runId: m.runId, err: String(err) }),
-            );
-          void steering.cancelRun(m.runId);
+          this.log.info('run cancel received', { runId: message.runId, reason: message.reason });
+          await supervisor.terminalizeParkedRun(message.runId).catch((error) =>
+            this.log.warn('could not terminalize a parked run', {
+              runId: message.runId,
+              err: String(error),
+            }),
+          );
+          await steering.cancelRun(message.runId);
         },
         onSteer: (steer) => {
           // Inject the steer into the live process, then ack so Noriq's notices
@@ -1174,6 +1594,7 @@ export class Daemon {
           void steering.applySteer(steer).then((result) => held.ws?.sendSteerAck(result));
         },
         onPlanCompleted: (m) => {
+          if (!acceptingLegacyWork) return;
           // A nudge, not the payload: go ask the server what is owed. The frame carries no repo,
           // and making it carry one would be a second source of truth to keep in sync.
           this.log.info('a plan completed', { planId: m.planId, plan: m.planTitle });
@@ -1182,13 +1603,15 @@ export class Daemon {
           );
         },
         onResume: (m) => {
+          if (!acceptingLegacyWork) return;
           // A human answered the question a run parked on (RUN-30). The fast path — the same
           // answer is durable in `signals`, and reconcileParked() below re-asks on every
           // reconnect, so this frame arriving is a bonus and never the thing correctness rests on.
           this.log.info('a parked run was answered', { runId: m.runId });
           void resumeRun(m.runId, m.answer);
         },
-        onReconnect: () => {
+        onReconnect: (generation) => {
+          if (!acceptingLegacyWork || !held.ws?.isCurrentGeneration(generation)) return;
           this.log.info('ws reconnected — reconciling live runs');
           // The durable half (RUN-28): a plan can complete while this box is off or the socket is
           // down, and the frame above would simply never arrive. Ask.
@@ -1209,218 +1632,181 @@ export class Daemon {
             this.log.warn('verification report delivery retry on reconnect failed', { err: String(err) }),
           );
         },
-      },
-      logger: this.log,
-    });
-    held.ws = ws;
-    ws.start();
-
-    // Say when this box is behind (RUN-37). A check, never a self-replace: the daemon holds the
-    // operator's token, spawns agents at a permission floor it chooses, and with [land] writes
-    // branches — so replacing its own executable is a supply-chain decision that needs
-    // provenance, not a config key. It reads the runner's own public repo; Noriq is not in the
-    // path. See src/update.ts and THREAT-MODEL.md.
-    //
-    // unref'd on purpose: a version check must never be the reason a daemon won't exit.
-    let updateTimer: ReturnType<typeof setInterval> | undefined;
-    if (this.config.update.check) {
-      const runCheck = async () => {
-        const check = await checkForUpdate();
-        if (check.behind)
-          this.log.info(updateAdvice(check), { current: check.current, latest: check.latest });
       };
-      void runCheck();
-      updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);
-      updateTimer.unref();
-    }
 
-    // The leak sweep (RUN-153). No config knob: the interval only decides how long a leaked
-    // directory sits on disk, and a default that holds beats a dial nobody tunes. `unref`'d for
-    // the same reason the update check is — disk tidying must never be why a daemon won't exit —
-    // and self-chained rather than `setInterval` so a slow sweep can never overlap itself.
-    let sweepTimer: ReturnType<typeof setTimeout> | undefined;
-    let stopping = false;
-    // The sweep currently running, so shutdown can JOIN it. `clearTimeout` cancels the next one;
-    // it cannot cancel git subprocesses already in flight, and returning from `stop()` while a
-    // reaper is mid-`worktree remove` is how a shutdown races its own cleanup.
-    let sweepInFlight: Promise<unknown> = Promise.resolve();
-    const scheduleSweep = () => {
-      sweepTimer = setTimeout(() => {
-        if (stopping) return;
-        sweepInFlight = sweepOrphans(true)
-          .catch((err) => this.log.warn('orphan sweep failed', { err: String(err) }))
-          .then(() => {
-            if (!stopping) scheduleSweep();
-          });
-      }, ORPHAN_SWEEP_INTERVAL_MS);
-      sweepTimer.unref();
-    };
-    scheduleSweep();
-
-    // RUN-222 acceptance: every enabled repo is reconciled once at startup, and the shared poll
-    // ticker starts right after — one cheap current-base check per enabled repo, never a lease, so
-    // there is nothing here worth racing the rest of startup over. Awaited so a startup that races
-    // the very first heartbeat still has this done, but never allowed to fail startup itself.
-    await indexTriggers
-      .reconcileOnStartup()
-      .catch((err) => this.log.warn('index startup reconcile failed', { err: String(err) }));
-    indexTriggers.startPolling();
-
-    /**
-     * Open a merge request for every plan that finished and still owes one (RUN-28).
-     *
-     * Driven entirely off the server's record, never off the WS frame's payload. `plan.completed`
-     * is a NUDGE — "go ask" — and reconnect asks the same question. One code path, and the
-     * durable store is the only truth: a plan can complete while this box is off, while the
-     * runner is offboarded, or mid-reconnect, and a frame-shaped fast path would drop the merge
-     * request silently and forever. This project has shipped that exact bug twice.
-     *
-     * NO REBASE, deliberately. The working branch is already PUSHED — autoPush is a hard
-     * prerequisite — so rebasing it locally would rewrite published history and need `--force`,
-     * which pushBranch categorically refuses (RUN-27). If main moved under the plan, that is a
-     * conflict the forge should show in the PR, where a human resolves it with full context. The
-     * daemon does not rewrite shared history to make its own PR openable.
-     */
-    /**
-     * Bring one parked run back (RUN-30). Takes a slot, like any other run — a resumed agent is a
-     * live process, and pretending otherwise would let parked runs quietly exceed the concurrency
-     * the operator set.
-     *
-     * Concurrency-safe against itself: the supervisor's resume() unparks before it does anything
-     * else, so if the WS frame and the reconnect sweep both fire for one answer, the second finds
-     * nothing and no-ops rather than starting a rival process in the same worktree.
-     */
-    const resumeRun = async (runId: string, answer: string): Promise<void> => {
-      // A STAGE park's run is still ACTIVE (RUN-190): its supervise stack is holding, in this
-      // process, waiting for exactly this answer — so the active-guard below must not eat it.
-      // Delivery is in-process and takes no slot; the stack it wakes already holds one.
-      if (supervisor.deliverStageAnswer(runId, answer)) return;
-      if (this.active.has(runId)) return; // already coming back
-      this.active.add(runId);
-      try {
-        await supervisor.resume(runId, answer);
-      } catch (err) {
-        this.log.error('resuming a parked run threw', { runId, err: String(err) });
-      } finally {
-        this.active.delete(runId);
-        capacity.release(runId); // same rule as onAssigned: a settled run holds no wave grant
+      // Say when this box is behind (RUN-37). A check, never a self-replace: the daemon holds the
+      // operator's token, spawns agents at a permission floor it chooses, and with [land] writes
+      // branches — so replacing its own executable is a supply-chain decision that needs
+      // provenance, not a config key. It reads the runner's own public repo; Noriq is not in the
+      // path. See src/update.ts and THREAT-MODEL.md.
+      //
+      // unref'd on purpose: a version check must never be the reason a daemon won't exit.
+      if (this.config.update.check) {
+        const runCheck = async () => {
+          const check = await checkForUpdate();
+          if (check.behind)
+            this.log.info(updateAdvice(check), { current: check.current, latest: check.latest });
+        };
+        void runCheck();
+        updateTimer = setInterval(() => void runCheck(), this.config.update.checkIntervalHours * 3600_000);
+        updateTimer.unref();
       }
-    };
 
-    /**
-     * Ask about every run this box has parked (RUN-30) — the durable half.
-     *
-     * The `run.resume` frame is fire-and-forget: a human answering a question at 9am, while the
-     * laptop that parked it was closed at 5pm, would hit a socket that does not exist. Without
-     * this sweep that run waits forever, and so does the worktree holding its work.
-     */
-    const reconcileParked = async (): Promise<void> => {
-      for (const p of await parked.list()) {
-        const state = await client.getParkState(p.run.id).catch((err) => {
-          this.log.debug('could not check a parked run', { runId: p.run.id, err: String(err) });
-          return null;
-        });
-        if (!state) continue;
-        if (state.answer) {
-          await resumeRun(p.run.id, state.answer);
-        } else if (!state.blocked) {
-          // The server no longer thinks it is parked — cancelled, or failed while we were away.
-          // Drop the entry: resuming into a run the server considers finished would report work
-          // against a lifecycle that already closed.
-          this.log.info('a parked run is no longer blocked server-side — forgetting it', {
-            runId: p.run.id,
-            status: state.status,
-          });
-          await supervisor.terminalizeParkedRun(p.run.id);
+      // The leak sweep (RUN-153). No config knob: the interval only decides how long a leaked
+      // directory sits on disk, and a default that holds beats a dial nobody tunes. `unref`'d for
+      // the same reason the update check is — disk tidying must never be why a daemon won't exit —
+      // and self-chained rather than `setInterval` so a slow sweep can never overlap itself.
+      // The sweep currently running, so shutdown can JOIN it. `clearTimeout` cancels the next one;
+      // it cannot cancel git subprocesses already in flight, and returning from `stop()` while a
+      // reaper is mid-`worktree remove` is how a shutdown races its own cleanup.
+      const scheduleSweep = () => {
+        sweepTimer = setTimeout(() => {
+          if (stopping) return;
+          sweepInFlight = sweepOrphans(true)
+            .catch((err) => this.log.warn('orphan sweep failed', { err: String(err) }))
+            .then(() => {
+              if (!stopping) scheduleSweep();
+            });
+        }, ORPHAN_SWEEP_INTERVAL_MS);
+        sweepTimer.unref();
+      };
+      scheduleSweep();
+
+      // RUN-222 acceptance: every enabled repo is reconciled once at startup, and the shared poll
+      // ticker starts right after — one cheap current-base check per enabled repo, never a lease, so
+      // there is nothing here worth racing the rest of startup over. Awaited so a startup that races
+      // the very first heartbeat still has this done, but never allowed to fail startup itself.
+      await indexTriggers
+        .reconcileOnStartup()
+        .catch((err) => this.log.warn('index startup reconcile failed', { err: String(err) }));
+      indexTriggers.startPolling();
+
+      /**
+       * Open a merge request for every plan that finished and still owes one (RUN-28).
+       *
+       * Driven entirely off the server's record, never off the WS frame's payload. `plan.completed`
+       * is a NUDGE — "go ask" — and reconnect asks the same question. One code path, and the
+       * durable store is the only truth: a plan can complete while this box is off, while the
+       * runner is offboarded, or mid-reconnect, and a frame-shaped fast path would drop the merge
+       * request silently and forever. This project has shipped that exact bug twice.
+       *
+       * NO REBASE, deliberately. The working branch is already PUSHED — autoPush is a hard
+       * prerequisite — so rebasing it locally would rewrite published history and need `--force`,
+       * which pushBranch categorically refuses (RUN-27). If main moved under the plan, that is a
+       * conflict the forge should show in the PR, where a human resolves it with full context. The
+       * daemon does not rewrite shared history to make its own PR openable.
+       */
+      /**
+       * Bring one parked run back (RUN-30). Takes a slot, like any other run — a resumed agent is a
+       * live process, and pretending otherwise would let parked runs quietly exceed the concurrency
+       * the operator set.
+       *
+       * Concurrency-safe against itself: the supervisor's resume() unparks before it does anything
+       * else, so if the WS frame and the reconnect sweep both fire for one answer, the second finds
+       * nothing and no-ops rather than starting a rival process in the same worktree.
+       */
+      const resumeRun = async (runId: string, answer: string): Promise<void> => {
+        // Reconciliation may have started before shutdown and only reach this point after a network
+        // await. The same admission authority as the frame path must be checked at point of launch.
+        if (!acceptingLegacyWork) return;
+        // A STAGE park's run is still ACTIVE (RUN-190): its supervise stack is holding, in this
+        // process, waiting for exactly this answer — so the active-guard below must not eat it.
+        // Delivery is in-process and takes no slot; the stack it wakes already holds one.
+        if (supervisor.deliverStageAnswer(runId, answer)) return;
+        if (this.active.has(runId)) return; // already coming back
+        this.active.add(runId);
+        try {
+          await supervisor.resume(runId, answer);
+        } catch (err) {
+          this.log.error('resuming a parked run threw', { runId, err: String(err) });
+        } finally {
+          this.active.delete(runId);
+          capacity.release(runId); // same rule as onAssigned: a settled run holds no wave grant
         }
+      };
+
+      /**
+       * Ask about every run this box has parked (RUN-30) — the durable half.
+       *
+       * The `run.resume` frame is fire-and-forget: a human answering a question at 9am, while the
+       * laptop that parked it was closed at 5pm, would hit a socket that does not exist. Without
+       * this sweep that run waits forever, and so does the worktree holding its work.
+       */
+      const reconcileParked = async (): Promise<void> => {
+        for (const p of await parked.list()) {
+          const state = await client.getParkState(p.run.id).catch((err) => {
+            this.log.debug('could not check a parked run', { runId: p.run.id, err: String(err) });
+            return null;
+          });
+          if (!state) continue;
+          if (state.answer) {
+            await resumeRun(p.run.id, state.answer);
+          } else if (!state.blocked) {
+            // The server no longer thinks it is parked — cancelled, or failed while we were away.
+            // Drop the entry: resuming into a run the server considers finished would report work
+            // against a lifecycle that already closed.
+            this.log.info('a parked run is no longer blocked server-side — forgetting it', {
+              runId: p.run.id,
+              status: state.status,
+            });
+            await supervisor.terminalizeParkedRun(p.run.id);
+          }
+        }
+      };
+
+      // Owed merge requests (RUN-28), routed through the detected backend since RUN-85 —
+      // `vcsFor` is the same `backendFor.get(root) ?? vcs` the share step always took, now
+      // carrying openReview too, so gh is git's business and a server-backed repo's
+      // mergeTarget yields an honest warn+report instead of a gh call that means nothing there.
+      const reconcileOwedMerges = owedMergeReconciler({
+        owed: () => client.owedMerges(runner.id),
+        repoFor: (repoRef) => reposById.get(repoRef),
+        manifestFor: (root) => manifests.current(root),
+        vcsFor: (root) => backendFor.get(root) ?? vcs,
+        report: (outcome) => client.reportMerge(runner.id, outcome),
+        logger: this.log,
+      });
+
+      // The socket has been live throughout recovery, but no ordinary assignment/cancellation/steer
+      // could cross the barrier. Drain those frames in arrival order only after every closure they
+      // can invoke exists and legacy durable ownership has been restored.
+      advertisedFreeSlots = () => capacity.freeSlots();
+      try {
+        await startupHandlers.activate(ordinaryWsHandlers);
+      } catch (error) {
+        ws.stop();
+        throw error;
       }
-    };
+      // Ask once at startup, not only on reconnect (RUN-28): the likeliest way to miss a
+      // plan.completed frame is for the box to have been OFF when it fired — and a daemon that
+      // only reconciles on RE-connect never reconciles its own first connect.
+      void reconcileOwedMerges();
 
-    // Owed merge requests (RUN-28), routed through the detected backend since RUN-85 —
-    // `vcsFor` is the same `backendFor.get(root) ?? vcs` the share step always took, now
-    // carrying openReview too, so gh is git's business and a server-backed repo's
-    // mergeTarget yields an honest warn+report instead of a gh call that means nothing there.
-    const reconcileOwedMerges = owedMergeReconciler({
-      owed: () => client.owedMerges(runner.id),
-      repoFor: (repoRef) => reposById.get(repoRef),
-      manifestFor: (root) => manifests.current(root),
-      vcsFor: (root) => backendFor.get(root) ?? vcs,
-      report: (outcome) => client.reportMerge(runner.id, outcome),
-      logger: this.log,
-    });
+      // Same reasoning for parked runs (RUN-30), plus one of its own: a park pins a worktree and a
+      // branch while the base moves under it, and its agent's token expires at 7 days — so give up
+      // on the ones nobody answered, before asking about the rest.
+      void supervisor
+        .expireStaleParks()
+        .then((n) => n && this.log.warn(`${n} parked run(s) expired unanswered`))
+        .then(() => reconcileParked())
+        .catch((err) => this.log.warn('could not reconcile parked runs', { err: String(err) }));
 
-    // Ask once at startup, not only on reconnect (RUN-28): the likeliest way to miss a
-    // plan.completed frame is for the box to have been OFF when it fired — and a daemon that
-    // only reconciles on RE-connect never reconciles its own first connect.
-    void reconcileOwedMerges();
-
-    // Same reasoning for parked runs (RUN-30), plus one of its own: a park pins a worktree and a
-    // branch while the base moves under it, and its agent's token expires at 7 days — so give up
-    // on the ones nobody answered, before asking about the rest.
-    void supervisor
-      .expireStaleParks()
-      .then((n) => n && this.log.warn(`${n} parked run(s) expired unanswered`))
-      .then(() => reconcileParked())
-      .catch((err) => this.log.warn('could not reconcile parked runs', { err: String(err) }));
-
-    const stop = async (): Promise<void> => {
-      // FIRST, before anything that takes time: the drain below is seconds long, and a sweep that
-      // starts inside it would be reaping on behalf of a daemon that is already leaving.
-      stopping = true;
-      if (sweepTimer) clearTimeout(sweepTimer);
-      // SIGTERM live agents BEFORE the socket closes. A spawned claude/codex isn't in the
-      // daemon's teardown path, so exiting first orphans it: still editing the worktree,
-      // still spending, with its only ceiling (the budget enforcer) dead.
-      const stopped = await steering.stopAll();
-      if (stopped.length) this.log.info(`stopped ${stopped.length} live run(s)`, { runs: stopped });
-      // Give the supervisors a beat to report terminal statuses while the socket is still
-      // open — otherwise the server strands those Runs 'running' until the next reconcile.
-      const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
-      while (this.active.size > 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
+      stopDaemon = stop;
+      if (missionControlFailure) {
+        await stop();
+        throw missionControlFailure;
       }
-      if (this.active.size > 0) {
-        this.log.warn('shutting down with runs still settling — the server will reconcile them', {
-          runs: [...this.active],
-        });
+      startupComplete = true;
+      return { runnerId: runner.id, fatal: daemonFatal, stop };
+    } catch (error) {
+      // A caller cannot clean up a start() that never returned a handle. Roll back every resource
+      // published since ws.start(), while preserving the original startup failure for diagnosis.
+      try {
+        await stop();
+      } catch (stopError) {
+        this.log.error('daemon startup rollback failed', { err: String(stopError) });
       }
-      // Say goodbye (RUN-35). Without a final beat, stopping on purpose and crashing look
-      // identical from the dashboard — both simply stop heartbeating and go stale — so an
-      // operator cannot tell a tidy shutdown from a box that fell over. Best-effort by
-      // definition: we are on our way out, and failing to announce it is not worth delaying
-      // or failing the shutdown over. The server still reconciles a runner that never says it.
-      if (updateTimer) clearInterval(updateTimer);
-      // Join a sweep that was already running when stop() was called — `clearTimeout` cancels the
-      // NEXT one, never git commands already in flight.
-      await sweepInFlight.catch(() => {});
-      // Stop the trigger layer FIRST (RUN-222) — clears its poll ticker and every PENDING debounce
-      // timer so no new job is handed to the coordinator after this point. A job already in flight
-      // is the coordinator's own `cancelAll`'s job, right below.
-      indexTriggers.stop();
-      // Same race, one subsystem over (RUN-214, locked decision 11): cancel and JOIN any in-flight
-      // index work before this method returns, not merely signal it — returning while a snapshot
-      // is still being read is how a shutdown races its own cleanup, exactly the orphan-sweep join
-      // above. Placed beside it on purpose: both are background maintenance holding a workspace
-      // resource that must be released before the daemon actually exits.
-      await indexCoordinator
-        .cancelAll()
-        .catch((err) => this.log.warn('index coordinator shutdown failed', { err: String(err) }));
-      // RUN-223: stop taking control requests only once nothing is left to act on — `cancelAll`
-      // sets the coordinator's own `stopping` flag SYNCHRONOUSLY at entry, so a request that
-      // sneaks in during the drain above already finds a coordinator refusing new work; this just
-      // closes the door once the drain is done. Removes the discovery file too, so a CLI call
-      // racing this shutdown reads "no daemon" rather than a port nothing answers on for longer
-      // than it has to.
-      await indexControl
-        .stop()
-        .catch((err) => this.log.warn('index control shutdown failed', { err: String(err) }));
-      await client
-        .heartbeat(runner.id, { freeSlots: 0, status: 'offline' })
-        .catch((err) =>
-          this.log.debug('goodbye heartbeat failed (shutting down anyway)', { err: String(err) }),
-        );
-      ws.stop();
-    };
-    return { runnerId: runner.id, stop };
+      throw error;
+    }
   }
 }

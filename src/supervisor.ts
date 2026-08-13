@@ -3931,6 +3931,9 @@ export class RunSupervisor {
           concurrencyStrategy: null,
         },
         configuration,
+        // The legacy supervisor does not execute a commissioned mission profile. A non-null
+        // value is emitted only by the mission runtime after effective-inventory attestation.
+        executionProfile: null,
       },
     });
 

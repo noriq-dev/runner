@@ -1,5 +1,7 @@
+import path from 'node:path';
 import type { AgentTool, PermissionProfile, RunBudget, RunEffort, RunKind } from '@noriq-dev/shared';
 import type { LockEnforcer } from '../lock-hooks';
+import type { ProjectMcpBundle } from '../project-mcp';
 
 // The common driver contract — one interface over both the Claude Agent SDK
 // (RUN-12) and the Codex protocol-mode driver (RUN-13). A driver turns a Run into
@@ -84,6 +86,149 @@ export interface NoriqMcp {
   token: string;
 }
 
+/**
+ * The executable project MCP declaration plus the exact, trusted tool authority for one agent
+ * session. The repository owns the transports in `bundle`; the mission execution profile owns
+ * `toolGrants`. Keeping those inputs separate prevents a project from granting every tool merely
+ * by declaring a server.
+ *
+ * Tool names are bare MCP names. Drivers translate them to their vendor-specific representation.
+ */
+export interface ProjectMcpSession {
+  bundle: ProjectMcpBundle;
+  toolGrants: Readonly<Record<string, readonly string[]>>;
+}
+
+// Keep exact grants safe across every vendor representation. Claude serializes `allowedTools` as
+// one comma-delimited CLI value, so punctuation outside this identifier alphabet could turn one
+// repository-supplied tool name into multiple permission entries.
+const PROJECT_MCP_TOOL_NAME = /^[A-Za-z0-9_.-]{1,256}$/;
+
+/**
+ * Validate the cross-vendor project MCP authority boundary and return its stable server order.
+ * Only granted servers launch for this session. A grant without a declared transport is invalid;
+ * ungranted project servers remain dormant.
+ */
+export function validateProjectMcpSession(projectMcp?: ProjectMcpSession): string[] {
+  if (!projectMcp) return [];
+  if (!projectMcp.bundle || !projectMcp.bundle.servers) {
+    throw new Error('invalid project MCP session: bundle is required');
+  }
+  if (
+    !projectMcp.toolGrants ||
+    typeof projectMcp.toolGrants !== 'object' ||
+    Array.isArray(projectMcp.toolGrants)
+  ) {
+    throw new Error('invalid project MCP session: toolGrants must be an object');
+  }
+
+  const declaredNames = Object.keys(projectMcp.bundle.servers).sort();
+  const authorizationNames = Object.keys(projectMcp.bundle.launcherAuthorizations ?? {}).sort();
+  const endpointAuthorizationNames = Object.keys(projectMcp.bundle.endpointAuthorizations ?? {}).sort();
+  const grantNames = Object.keys(projectMcp.toolGrants).sort();
+  for (const name of [...new Set([...declaredNames, ...grantNames])]) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) {
+      throw new Error(`invalid project MCP session: unsafe server name '${name}'`);
+    }
+    if (name === 'noriq' || name === 'codex_apps') {
+      throw new Error(`invalid project MCP session: server name '${name}' is reserved by Runner`);
+    }
+  }
+  const undeclared = grantNames.filter((name) => !declaredNames.includes(name));
+  if (undeclared.length > 0) {
+    throw new Error(`invalid project MCP session: grants name undeclared servers [${undeclared.join(', ')}]`);
+  }
+
+  const expectedAuthorizations = declaredNames.filter(
+    (name) => projectMcp.bundle.servers[name]?.transport === 'stdio',
+  );
+  if (JSON.stringify(authorizationNames) !== JSON.stringify(expectedAuthorizations)) {
+    throw new Error(
+      `invalid project MCP session: stdio launcher authorizations differ from declared servers (expected [${expectedAuthorizations.join(', ')}], got [${authorizationNames.join(', ')}])`,
+    );
+  }
+  for (const server of authorizationNames) {
+    const authorization = projectMcp.bundle.launcherAuthorizations[server];
+    if (
+      !authorization ||
+      !/^[\x21-\x7e]{1,512}$/.test(authorization.policyId) ||
+      !/^[\x21-\x7e]{1,512}$/.test(authorization.executableIdentity) ||
+      !/^[\x21-\x7e]{1,512}$/.test(authorization.runtimeClosureIdentity) ||
+      !/^sha256:[a-f0-9]{64}$/.test(authorization.authorizedArgvIdentity) ||
+      typeof authorization.resolvedCommand !== 'string' ||
+      !path.isAbsolute(authorization.resolvedCommand) ||
+      !Array.isArray(authorization.readOnlyRoots) ||
+      authorization.readOnlyRoots.some((root) => typeof root !== 'string' || !path.isAbsolute(root))
+    ) {
+      throw new Error(`invalid project MCP session: '${server}' has invalid launcher authorization`);
+    }
+  }
+  const expectedEndpointAuthorizations = declaredNames.filter(
+    (name) => projectMcp.bundle.servers[name]?.transport !== 'stdio',
+  );
+  if (JSON.stringify(endpointAuthorizationNames) !== JSON.stringify(expectedEndpointAuthorizations)) {
+    throw new Error(
+      `invalid project MCP session: endpoint authorizations differ from declared servers (expected [${expectedEndpointAuthorizations.join(', ')}], got [${endpointAuthorizationNames.join(', ')}])`,
+    );
+  }
+  for (const server of endpointAuthorizationNames) {
+    const authorization = projectMcp.bundle.endpointAuthorizations[server];
+    const declaration = projectMcp.bundle.servers[server];
+    if (
+      !authorization ||
+      !/^[\x21-\x7e]{1,512}$/.test(authorization.policyId) ||
+      !/^[\x21-\x7e]{1,512}$/.test(authorization.endpointIdentity) ||
+      typeof authorization.resolvedUrl !== 'string' ||
+      declaration?.transport === 'stdio' ||
+      authorization.resolvedUrl !== declaration?.url
+    ) {
+      throw new Error(`invalid project MCP session: '${server}' has invalid endpoint authorization`);
+    }
+  }
+
+  const flattenedAddresses = new Map<string, string>();
+  for (const server of grantNames) {
+    const tools = projectMcp.toolGrants[server];
+    if (!Array.isArray(tools) || tools.length === 0) {
+      throw new Error(`invalid project MCP session: '${server}' must grant at least one exact tool`);
+    }
+    if (tools.length > 256) {
+      throw new Error(`invalid project MCP session: '${server}' grants more than 256 tools`);
+    }
+    const seen = new Set<string>();
+    for (const tool of tools) {
+      if (typeof tool !== 'string' || !PROJECT_MCP_TOOL_NAME.test(tool)) {
+        throw new Error(`invalid project MCP session: '${server}' grants an invalid exact tool name`);
+      }
+      if (seen.has(tool)) {
+        throw new Error(`invalid project MCP session: '${server}' grants duplicate tool '${tool}'`);
+      }
+      seen.add(tool);
+      const address = `mcp__${server}__${tool}`;
+      const existing = flattenedAddresses.get(address);
+      if (existing) {
+        throw new Error(
+          `invalid project MCP session: flattened tool address '${address}' collides between '${existing}' and '${server}/${tool}'`,
+        );
+      }
+      flattenedAddresses.set(address, `${server}/${tool}`);
+    }
+  }
+  return grantNames;
+}
+
+/** Project MCP and Noriq MCP are separate authority domains and may not share one agent session. */
+export function validateDriverMcpAuthority(
+  noriqMcp: NoriqMcp | undefined,
+  projectMcp: ProjectMcpSession | undefined,
+): string[] {
+  const projectNames = validateProjectMcpSession(projectMcp);
+  if (noriqMcp && projectNames.length > 0) {
+    throw new Error('one driver session may not combine project MCP authority with Noriq MCP authority');
+  }
+  return projectNames;
+}
+
 export interface DriverStartOptions {
   /**
    * Keep the session open after its first result so the caller can hand work back (RUN-29/30).
@@ -110,6 +255,24 @@ export interface DriverStartOptions {
   prompt: string;
   /** Per-kind permission profile from the repo manifest (scope read-only; build write). */
   permission: PermissionProfile;
+  /**
+   * `none` is a privileged harness request for a pure inference turn: no built-in, MCP, app,
+   * plugin, web, or repository tools may be exposed. Drivers that cannot enforce this must reject
+   * the start before model work. Omitted means the normal permission-profile surface.
+   */
+  toolAccess?: 'none';
+  /**
+   * Exact canonical workspace root requested by the mission harness. A driver may accept this
+   * only when its declared `workspaceIsolatedSession` capability can enforce the matching
+   * read-only/workspace-write posture. It is not a prompt hint.
+   */
+  workspaceRoot?: string;
+  /** Machine-trusted host paths needed by this exact workspace view. */
+  containmentReadOnlyRoots?: readonly string[];
+  /** Workspace-relative backend control paths remounted read-only after the workspace bind. */
+  protectedWorkspaceReadOnlyPaths?: readonly string[];
+  /** Machine-trusted private state needed by this exact workspace view. */
+  containmentWriteRoots?: readonly string[];
   model?: string;
   /**
    * How hard the model should think (RUN-33) — tool-agnostic intent, mapped per driver
@@ -121,6 +284,17 @@ export interface DriverStartOptions {
   effort?: RunEffort;
   /** Ceilings for daemon-side budget enforcement (RUN-14). */
   budget?: RunBudget;
+  /**
+   * Provider-side, pre-spend mission envelope. Reactive telemetry is deliberately insufficient
+   * here: a driver advertising `hardTokenEnvelope` must pass this exact finite total to a vendor
+   * control that rejects further turns/tokens before they are consumed.
+   */
+  tokenEnvelope?: {
+    /** Total input, cache-input, reasoning, and output tokens allowed for this session. */
+    totalTokens: number;
+    /** Finite provider-side turn ceiling; one guide decision is always one turn. */
+    maxTurns: number;
+  };
   /**
    * A LIVE spend check for this session, consulted on every telemetry tick (RUN-133). Returns the
    * dimension that is gone, or null to continue; a non-null answer stops the session exactly as a
@@ -152,6 +326,12 @@ export interface DriverStartOptions {
   clockGuard?: () => number | null;
   /** Noriq access for the agent. Omit only in tests — a real Run needs it. */
   noriqMcp?: NoriqMcp;
+  /**
+   * Project-owned MCP transports plus this session's exact per-server tool grants. No vendor
+   * driver may rediscover ambient project/user MCP configuration or infer authority from the
+   * presence of a server.
+   */
+  projectMcp?: ProjectMcpSession;
   /**
    * Narrow THIS session's Noriq tool set below its kind's floor (bare names, un-prefixed).
    *
@@ -205,7 +385,11 @@ export interface DriverSession {
   pushInput(text: string): boolean;
   /** Hard interrupt the current inference. */
   interrupt(): Promise<void>;
-  /** Terminate the session/process. */
+  /**
+   * Terminate the session/process. The strength of the acknowledgement is declared by
+   * `DriverCapabilities.terminationAcknowledgement`; callers that own a worktree or another
+   * reusable resource must require the strength they need before starting the session.
+   */
   stop(): Promise<void>;
   /** Resolves when the run reaches a terminal exit. */
   done(): Promise<DriverExit>;
@@ -248,6 +432,36 @@ export interface DriverCapabilities {
   /** Per-model spend attribution (RUN-59). false → its spend lands in the `(unattributed)` bucket
    *  (RUN-86) rather than a per-model breakdown (Codex reports tokens but no split, no cost). */
   perModelTelemetry: boolean;
+  /** The driver can enforce `DriverStartOptions.toolAccess = 'none'` before model work. */
+  toolFreeSession?: boolean;
+  /** Model tools/process writes can be confined to `workspaceRoot` without unsafe fallback. */
+  workspaceIsolatedSession?: boolean;
+  /**
+   * The provider can enforce `DriverStartOptions.tokenEnvelope` before spend. Post-hoc telemetry,
+   * cancellation, and output truncation do not satisfy this capability.
+   */
+  hardTokenEnvelope?: true;
+  /**
+   * Mission launches use a commissioned boundary that separates provider credentials, enforces
+   * host/network ceilings, binds immutable runtime authority, and can re-attest that authority.
+   */
+  commissionedExecutionBoundary?: true;
+  /** Project MCP subprocesses are members of the same managed process/mount boundary. External
+   * endpoint/editor side effects require separate resource fencing and are not claimed here. */
+  projectMcpProcessContainment?: boolean;
+  /**
+   * What a resolved `DriverSession.stop()` (and a single-turn terminal `done()`) proves:
+   *
+   * - `none`: the driver requested shutdown but cannot observe even the main process exit.
+   * - `main-process`: the directly-owned agent process exited; descendants were signalled but
+   *   may have escaped the observable process group/tree.
+   * - `process-tree`: the driver owns a containment primitive that proves the agent and every
+   *   tool/MCP descendant exited.
+   *
+   * Omitted is `none`, deliberately, so older and test drivers fail closed when a mission needs
+   * to know that its workspace can be released safely.
+   */
+  terminationAcknowledgement?: 'none' | 'main-process' | 'process-tree';
 }
 
 /**

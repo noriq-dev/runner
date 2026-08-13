@@ -138,6 +138,41 @@ describe('unsaved work survives (real git)', () => {
     await wm.remove(wt);
   });
 
+  it('never runs repository hooks during a Runner-owned checkpoint commit', async () => {
+    const wt = await wm.create(repo, 'commitWithoutHooks');
+    const commonDir = (await git(['rev-parse', '--git-common-dir'], wt.path)).stdout.trim();
+    const hook = path.join(path.resolve(wt.path, commonDir), 'hooks', 'post-commit');
+    const marker = path.join(wt.path, 'post-commit-fired');
+    await writeFile(hook, '#!/bin/sh\ntouch post-commit-fired\n', { mode: 0o755 });
+    await writeFile(path.join(wt.path, 'safe.ts'), 'export const safe = true;\n');
+
+    try {
+      expect(await wm.commitWork(wt, 'checkpoint without operator hooks')).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      await rm(hook, { force: true });
+      await wm.remove(wt);
+    }
+  });
+
+  it('refuses to erase authoritative branch drift while restoring validator residue', async () => {
+    const wt = await wm.create(repo, 'validationAuthorityDrift');
+    const expectedRevision = (await git(['rev-parse', 'HEAD'], wt.path)).stdout.trim();
+    await writeFile(path.join(wt.path, 'foreign-authority.txt'), 'must remain preserved\n');
+    await git(['add', 'foreign-authority.txt'], wt.path);
+    await git(
+      ['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-q', '-m', 'foreign authority drift'],
+      wt.path,
+    );
+    const driftRevision = (await git(['rev-parse', 'HEAD'], wt.path)).stdout.trim();
+
+    await expect(wm.restoreExact(wt, expectedRevision)).rejects.toThrow(/authoritative drift/);
+    expect((await git(['rev-parse', 'HEAD'], wt.path)).stdout.trim()).toBe(driftRevision);
+    expect((await git(['rev-parse', wt.branch], repo)).stdout.trim()).toBe(driftRevision);
+
+    await wm.remove(wt);
+  });
+
   // RUN-152. `false` from hasChanges is acted on DESTRUCTIVELY — the lock-refusal guard disposes
   // the workspace (`worktree remove --force` + `branch -D` on a never-pushed branch) and the
   // no-changes gate reaps it. Substituting '0' for a failed `rev-list` made "there is no work" and
@@ -699,6 +734,10 @@ describe('continue a failed run adopts the kept worktree (RUN-91)', () => {
     // OPPOSITE slash spelling of the computed path, so the split reproduces on every OS; the
     // real-git adopt path is covered by the tests around this one.
     const dir = path.join(base, `${path.basename(repo)}-continueWin`);
+    // A registered worktree is also a materialized checkout. The stale-registration recovery path
+    // intentionally removes registrations whose directory is gone, so keep this fixture faithful
+    // to the alternate-slash case it is meant to prove.
+    await mkdir(dir, { recursive: true });
     const flipped = dir.includes('\\') ? dir.replace(/\\/g, '/') : dir.replace(/\//g, '\\');
     const calls: string[][] = [];
     const fake = new WorktreeManager({

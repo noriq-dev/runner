@@ -39,9 +39,27 @@ function recorder() {
   const ops: GitOps = {
     create: record('create', info),
     remove: record('remove', undefined),
+    removePreservingBranch: record('removePreservingBranch', undefined),
     hasChanges: record('hasChanges', true),
     changedPaths: record('changedPaths', ['src/a.ts']),
     commitWork: record('commitWork', true),
+    inspectExact: record('inspectExact', { revisionId: 'a'.repeat(40), clean: true }),
+    checkpointExact: record('checkpointExact', {
+      beforeRevisionId: 'a'.repeat(40),
+      revisionId: 'b'.repeat(40),
+      changed: true,
+      clean: true,
+    } as const),
+    reconcileExact: record('reconcileExact', {
+      revisionId: 'a'.repeat(40),
+      clean: true,
+      disposition: 'restored',
+    } as const),
+    restoreExact: record('restoreExact', {
+      revisionId: 'a'.repeat(40),
+      clean: true,
+      changed: false,
+    } as const),
     refExists: record('refExists', true),
     createBranch: record('createBranch', undefined),
     rebaseOnto: record('rebaseOnto', { ok: false, conflicts: ['a.ts'] } as const),
@@ -151,6 +169,80 @@ describe('GitBackend — the outcome→verb mapping', () => {
       { method: 'pushBranch', args: ['/repo', 'noriq/integration'] },
       { method: 'reapOrphans', args: ['/repo', undefined] },
     ]);
+  });
+
+  it('maps the opt-in mission evidence capability without using destructive dispose', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const ws = await vcs.lease('/repo', 'run_1');
+    calls.length = 0;
+
+    expect(await vcs.inspectWorkspace(ws)).toEqual({ revisionId: 'a'.repeat(40), clean: true });
+    const checkpointOptions = { expectedParentRevisionId: 'a'.repeat(40) };
+    expect(await vcs.checkpointExact(ws, 'mission checkpoint', checkpointOptions)).toEqual({
+      beforeRevisionId: 'a'.repeat(40),
+      revisionId: 'b'.repeat(40),
+      changed: true,
+      clean: true,
+    });
+    const reconciliationOptions = {
+      expectedRevisionId: 'a'.repeat(40),
+      quarantineId: 'attempt-one',
+      message: 'Quarantine attempt one.',
+    };
+    expect(await vcs.reconcileWorkspace(ws, reconciliationOptions)).toEqual({
+      revisionId: 'a'.repeat(40),
+      clean: true,
+      disposition: 'restored',
+    });
+    expect(await vcs.restoreWorkspace(ws, 'a'.repeat(40))).toEqual({
+      revisionId: 'a'.repeat(40),
+      clean: true,
+      changed: false,
+    });
+    await vcs.releaseWorkspace(ws, { preserveRevisionId: 'b'.repeat(40) });
+
+    const location = {
+      repoRoot: '/repo',
+      path: '/wt/run_1',
+      branch: 'noriq/run/run_1',
+    };
+    expect(calls).toEqual([
+      { method: 'inspectExact', args: [location] },
+      { method: 'checkpointExact', args: [location, 'mission checkpoint', checkpointOptions] },
+      { method: 'reconcileExact', args: [{ runId: 'run_1', ...location }, reconciliationOptions] },
+      { method: 'restoreExact', args: [{ runId: 'run_1', ...location }, 'a'.repeat(40)] },
+      { method: 'removePreservingBranch', args: [location, 'b'.repeat(40)] },
+    ]);
+  });
+
+  it('refuses mission evidence when persisted branch provenance was edited', async () => {
+    const { ops, calls } = recorder();
+    const vcs = new GitBackend(ops);
+    const ws = await vcs.lease('/repo', 'run_1');
+    calls.length = 0;
+    const foreign = {
+      ...ws,
+      workRef: 'main',
+      location: { repoRoot: '/repo', branch: 'main' },
+    };
+
+    await expect(vcs.inspectWorkspace(foreign)).rejects.toThrow(/branch provenance/);
+    await expect(
+      vcs.checkpointExact(foreign, 'no', { expectedParentRevisionId: 'a'.repeat(40) }),
+    ).rejects.toThrow(/branch provenance/);
+    await expect(
+      vcs.reconcileWorkspace(foreign, {
+        expectedRevisionId: 'a'.repeat(40),
+        quarantineId: 'foreign',
+        message: 'No.',
+      }),
+    ).rejects.toThrow(/branch provenance/);
+    await expect(vcs.restoreWorkspace(foreign, 'a'.repeat(40))).rejects.toThrow(/branch provenance/);
+    await expect(vcs.releaseWorkspace(foreign, { preserveRevisionId: 'a'.repeat(40) })).rejects.toThrow(
+      /branch provenance/,
+    );
+    expect(calls).toEqual([]);
   });
 
   it('share forwards an explicit remote, and withholds the arg entirely when the caller did', async () => {
