@@ -2,6 +2,7 @@ import type { MachineConfig } from "./config.js";
 import type { JobAssignment } from "./contracts.js";
 import { discoverProjects } from "./discovery.js";
 import { createDriverRegistry } from "./drivers/registry.js";
+import { registerRunner } from "./registration.js";
 import { loadDurableJobState, RunnerJobSupervisor } from "./supervisor.js";
 import { createBackendRegistry, selectBackend } from "./vcs/detect.js";
 import { RunnerSocket } from "./ws-client.js";
@@ -27,13 +28,17 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
   const byRef = new Map(
     available.map((project) => [project.config.repositoryKey, project]),
   );
+  const registration = await registerRunner(config, projects);
+  process.stdout.write(
+    `Registered Runner ${registration.id} with ${registration.repos.length} repositories\n`,
+  );
   const server = new URL(config.runner.serverUrl);
   server.protocol = server.protocol === "https:" ? "wss:" : "ws:";
-  server.pathname = `/ws/runner/${encodeURIComponent(config.runner.id)}`;
+  server.pathname = `/ws/runner/${encodeURIComponent(registration.id)}`;
   const socket = new RunnerSocket(server.toString(), config.runner.token, {
     type: "hello",
     protocolVersion: 2,
-    runnerId: config.runner.id,
+    runnerId: registration.id,
     capacity: config.runner.maxConcurrentJobs,
     repositories,
   });

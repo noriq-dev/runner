@@ -222,7 +222,8 @@ const backendSchema = z.discriminatedUnion("adapter", [
 
 const runnerMachineSchema = z
   .object({
-    id: z.string().trim().min(1),
+    id: z.string().trim().min(1).optional(),
+    label: z.string().trim().min(1).max(200).default("Noriq Runner"),
     serverUrl: z.string().url(),
     token: z.string().min(1).optional(),
     tokenEnv: environmentVariable.optional(),

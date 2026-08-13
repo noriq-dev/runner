@@ -53,7 +53,7 @@ async function main(): Promise<void> {
     process.stdout.write(
       `${JSON.stringify({
         valid: true,
-        runnerId: config.runner.id,
+        runnerId: config.runner.id ?? null,
         serverUrl: config.runner.serverUrl,
         drivers: Object.keys(config.drivers).sort(),
         backends: Object.keys(config.backends).sort(),

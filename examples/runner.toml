@@ -1,5 +1,7 @@
 [runner]
-id = "replace-with-registered-runner-id"
+# Optional for a new installation; Runner persists the server-issued ID.
+# id = "existing-registered-runner-id"
+label = "build-runner"
 serverUrl = "https://noriq.example"
 # Prefer an environment variable so this file can stay non-secret.
 tokenEnv = "NORIQ_RUNNER_TOKEN"

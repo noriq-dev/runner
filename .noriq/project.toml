@@ -1,11 +1,11 @@
 key = "RUN"
 repositoryKey = "noriq-runner"
-defaultBranch = "main"
+defaultBranch = "rebuild/runner-from-scratch"
 
 [sourceControl]
 backend = "auto"
 mode = "isolated"
-base = "main"
+base = "rebuild/runner-from-scratch"
 
 [harness]
 maxParallelTasks = 2

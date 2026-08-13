@@ -21,7 +21,7 @@ node dist/cli.js doctor --config /absolute/path/to/runner.toml
 node dist/cli.js start --config /absolute/path/to/runner.toml
 ```
 
-The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
+The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It REST-registers those project/repository associations before opening the job WebSocket, persists a server-issued Runner ID under the state directory when `runner.id` is omitted, detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
 
 See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]` and per-role `provider` project keys are normalized once with warning events.
 

@@ -5,7 +5,7 @@ import type { WorkspaceAccess } from "./drivers/types.js";
 import { createBackendRegistry, selectBackend } from "./vcs/detect.js";
 
 export interface RunnerDoctorReport {
-  runnerId: string;
+  runnerId: string | null;
   serverUrl: string;
   stateDirectory: string;
   repositories: Array<{
@@ -79,7 +79,7 @@ export async function doctorRunner(
     }
   }
   return {
-    runnerId: config.runner.id,
+    runnerId: config.runner.id ?? null,
     serverUrl: config.runner.serverUrl,
     stateDirectory: config.runner.stateDirectory,
     repositories,
