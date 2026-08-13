@@ -35,10 +35,51 @@ export class RunnerSocket implements JobEventSink {
       headers: { Authorization: `Bearer ${this.token}` },
     });
     this.socket = socket;
-    await new Promise<void>((resolve, reject) => {
-      socket.once("open", resolve);
-      socket.once("error", reject);
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          socket.off("open", opened);
+          socket.off("error", failed);
+          socket.off("close", closed);
+          socket.off("unexpected-response", unexpected);
+        };
+        const opened = () => {
+          cleanup();
+          resolve();
+        };
+        const failed = (error: Error) => {
+          cleanup();
+          reject(error);
+        };
+        const closed = (code: number, reason: Buffer) => {
+          cleanup();
+          reject(
+            new Error(
+              `Runner socket closed during handshake (${code}): ${reason.toString() || "no reason"}`,
+            ),
+          );
+        };
+        const unexpected = (
+          _request: import("node:http").ClientRequest,
+          response: import("node:http").IncomingMessage,
+        ) => {
+          cleanup();
+          response.resume();
+          reject(
+            new Error(
+              `Runner socket handshake rejected with HTTP ${response.statusCode ?? "unknown"}`,
+            ),
+          );
+        };
+        socket.once("open", opened);
+        socket.once("error", failed);
+        socket.once("close", closed);
+        socket.once("unexpected-response", unexpected);
+      });
+    } catch (error) {
+      if (this.socket === socket) this.socket = null;
+      throw error;
+    }
     this.send(this.hello);
     for (const pending of this.pending.values()) this.send(pending.message);
     const heartbeat = setInterval(() => {

@@ -71,4 +71,24 @@ describe("RunnerSocket", () => {
     expect(deliveries).toBe(2);
     client.close();
   });
+
+  it("rejects instead of hanging when the websocket handshake is refused", async () => {
+    server = new WebSocketServer({
+      port: 0,
+      verifyClient: (_info, done) => done(false, 401, "unauthorized"),
+    });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("expected TCP server");
+    const client = new RunnerSocket(`ws://127.0.0.1:${address.port}`, "token", {
+      type: "hello",
+      protocolVersion: 2,
+      runnerId: "runner",
+      capacity: 1,
+      repositories: [],
+    });
+    await expect(client.connect()).rejects.toThrow(/handshake rejected|401/);
+    client.close();
+  });
 });

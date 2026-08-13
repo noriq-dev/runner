@@ -173,7 +173,17 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
         }
         if (!active.has(message.jobId)) admit(assignment, false);
       } else if (message.type === "job.cancel") {
-        const running = active.get(message.jobId);
+        let running = active.get(message.jobId);
+        if (!running && !queued.has(message.jobId)) {
+          const durable = await loadDurableJobState(
+            config.runner.stateDirectory,
+            message.jobId,
+          );
+          if (durable?.assignment?.assignmentId === message.assignmentId) {
+            admit(durable.assignment, false);
+            running = active.get(message.jobId);
+          }
+        }
         if (running?.assignmentId === message.assignmentId)
           running.supervisor.cancel();
         if (queued.get(message.jobId)?.assignmentId === message.assignmentId)
