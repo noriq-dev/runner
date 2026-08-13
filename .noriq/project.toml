@@ -1,0 +1,35 @@
+key = "RUN"
+repositoryKey = "noriq-runner"
+defaultBranch = "main"
+
+[workspace]
+mode = "isolated"
+baseBranch = "main"
+
+[harness]
+maxParallelTasks = 2
+maxRepairRounds = 2
+maxJobMinutes = 240
+
+[agents.guide]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+
+[agents.builder]
+provider = "claude"
+model = "sonnet"
+effort = "medium"
+
+[agents.reviewer]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+
+[setup]
+commands = ["npm ci"]
+timeoutSeconds = 900
+
+[checks]
+commands = ["npm run check"]
+timeoutSeconds = 900
