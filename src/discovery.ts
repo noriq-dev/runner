@@ -1,5 +1,5 @@
 import { readdir, realpath, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadProjectConfig, type ProjectConfig } from "./config.js";
 import { discoverRepository } from "./git.js";
 
@@ -41,7 +41,7 @@ export async function discoverProjects(
   const projects = new Map<string, DiscoveredProject>();
   for (const root of scanRoots) {
     for (const configPath of await candidates(root)) {
-      const repository = await discoverRepository(configPath);
+      const repository = await discoverRepository(dirname(configPath));
       const config = await loadProjectConfig(configPath);
       const prior = projects.get(config.repositoryKey);
       if (prior && prior.repository !== repository)
