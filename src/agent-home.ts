@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   realpath,
   rm,
   stat,
@@ -17,7 +18,7 @@ export type BuiltinAgentVendor = "codex" | "claude";
 const credentialFiles: Readonly<Record<BuiltinAgentVendor, readonly string[]>> =
   {
     codex: ["auth.json"],
-    claude: [".credentials.json"],
+    claude: [".credentials.json", ".claude.json"],
   };
 
 const maximumCredentialBytes = 1024 * 1024;
@@ -83,9 +84,15 @@ export async function initializeClaudeProjectState(
   approveProjectMcp: boolean,
 ): Promise<void> {
   const project = await realpath(workspace);
+  const statePath = join(home, ".claude.json");
+  const existing = JSON.parse(await readFile(statePath, "utf8")) as Record<
+    string,
+    unknown
+  >;
   await writeFile(
-    join(home, ".claude.json"),
+    statePath,
     JSON.stringify({
+      ...existing,
       projects: {
         [project]: {
           allowedTools: [],
@@ -104,15 +111,17 @@ export async function initializeClaudeProjectState(
         },
       },
     }),
-    { flag: "wx", mode: 0o600 },
+    { flag: "w", mode: 0o600 },
   );
 }
 
 const runnerControlProjectServer = "noriq_runner";
 
 /**
- * Create a fresh vendor home containing authentication only. Unattended jobs do
- * not inherit interactive MCPs, plugins, hooks, histories, or project choices.
+ * Create a fresh vendor home containing only the files required to authenticate
+ * and initialize the CLI. Claude's copied state is stripped to the current
+ * project by initializeClaudeProjectState. Jobs do not inherit durable MCP
+ * choices, plugins, hooks, histories, or caches stored in other files.
  */
 export async function createEphemeralAgentHome(
   vendor: BuiltinAgentVendor,

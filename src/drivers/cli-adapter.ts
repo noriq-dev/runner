@@ -45,6 +45,16 @@ const runnerControlTools = [
   "run_checks",
 ] as const;
 
+function claudeSystemPrompt(role: AgentRequest["role"]): string {
+  if (role === "guide")
+    return "Act as an unattended task planner. Do not edit files. Use only the supplied Runner Control tools when needed, and return the required structured output.";
+  if (role === "reviewer")
+    return "Act as an independent read-only code reviewer. Report only concrete defects introduced by the candidate, and return the required structured output.";
+  if (role === "repairer")
+    return "Act as an unattended repository repair worker. Obey the task and project instructions, use only supplied tools, avoid source-control commands, and return the required structured output.";
+  return "Act as an unattended repository builder. Obey the task and project instructions, use only supplied tools, avoid source-control commands, and return the required structured output.";
+}
+
 function jsonLines(text: string): Record<string, unknown>[] {
   return text
     .split("\n")
@@ -274,7 +284,8 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           : help.stdout.includes("--output-format") &&
             help.stdout.includes("--json-schema") &&
             help.stdout.includes("--strict-mcp-config") &&
-            help.stdout.includes("--no-session-persistence");
+            help.stdout.includes("--no-session-persistence") &&
+            help.stdout.includes("--system-prompt");
       if (!structuredOutput)
         throw new Error(
           `${this.id} does not expose required unattended-mode flags`,
@@ -443,6 +454,8 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         "--no-chrome",
         "--prompt-suggestions",
         "false",
+        "--system-prompt",
+        claudeSystemPrompt(request.role),
         "--model",
         profile.model,
         "--effort",

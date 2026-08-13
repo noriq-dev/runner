@@ -81,7 +81,7 @@ export function builderPrompt(
   contract: TaskContract,
   guideInstructions?: string,
 ): string {
-  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Finish with a truthful summary and verification evidence.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
+  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
 }
 
 export function reviewerPrompt(
@@ -100,7 +100,7 @@ export function repairPrompt(
   checks: unknown,
   round: number,
 ): string {
-  return `You are a fresh repair worker for round ${round}. Fix only the blocking deterministic-check failures and blocker/major review findings listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
+  return `You are a fresh repair worker for round ${round}. Fix only the blocking deterministic-check failures and blocker/major review findings listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
 }
 
 export const guideOutputSchema = {

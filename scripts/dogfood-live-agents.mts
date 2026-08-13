@@ -8,7 +8,11 @@ import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
 import { ClaudeAgentDriver } from "../src/drivers/claude.js";
 import { CodexAgentDriver } from "../src/drivers/codex.js";
-import { MemoryEventSink, RunnerJobSupervisor } from "../src/supervisor.js";
+import {
+  loadDurableJobState,
+  MemoryEventSink,
+  RunnerJobSupervisor,
+} from "../src/supervisor.js";
 import { GitSourceControlBackend } from "../src/vcs/git.js";
 
 const execute = promisify(execFile);
@@ -202,6 +206,8 @@ try {
   );
   if (changed !== ".noriq-runner-live-smoke")
     throw new Error(`live agents changed unexpected paths: ${changed}`);
+  const durable = await loadDurableJobState(stateDirectory, assignment.jobId);
+  if (!durable) throw new Error("live dogfood durable state is unavailable");
   succeeded = true;
   process.stdout.write(
     `${JSON.stringify(
@@ -211,6 +217,11 @@ try {
         retained: output.retainedLocation,
         headRevision: output.headRevision,
         usage: output.usage,
+        invocations: Object.values(durable.invocations).map((invocation) => ({
+          role: invocation.role,
+          status: invocation.status,
+          usage: invocation.usage ?? null,
+        })),
         events: sink.events.length,
         changedPaths: [changed],
       },

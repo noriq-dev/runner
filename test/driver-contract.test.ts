@@ -39,6 +39,11 @@ async function credentialHome(
     join(home, vendor === "codex" ? "auth.json" : ".credentials.json"),
     "{}",
   );
+  if (vendor === "claude")
+    await writeFile(
+      join(home, ".claude.json"),
+      JSON.stringify({ machineID: "test", projects: {} }),
+    );
   return home;
 }
 
@@ -81,7 +86,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
 if (args.includes('--version')) { console.log('fake-claude 1.0'); process.exit(0); }
-if (args.includes('--help')) { console.log('--output-format --json-schema --strict-mcp-config --no-session-persistence'); process.exit(0); }
+if (args.includes('--help')) { console.log('--output-format --json-schema --strict-mcp-config --no-session-persistence --system-prompt'); process.exit(0); }
 if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
 if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
 const tools = ['ask_human', 'delegate', 'get_job_state', 'inspect_diff', 'record_task_plan', 'request_completion', 'run_checks'].map((tool) => 'mcp__noriq_runner__' + tool);
