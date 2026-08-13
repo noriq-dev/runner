@@ -17,6 +17,7 @@
     "lint": "biome check .",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run test",
+    "dogfood:git": "tsx scripts/dogfood-git.mts",
     "vendor:shared": "node scripts/vendor-shared.mjs",
     "vendor:check": "node scripts/vendor-check.mjs"
   },

@@ -1,16 +1,38 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, realpath, unlink } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import type { ProjectConfig } from "./config.js";
 import type { CheckResult } from "./contracts.js";
 import { runProcess } from "./process.js";
 
-async function git(
+const gitExecutable = new AsyncLocalStorage<string>();
+
+export function withGitExecutable<T>(
+  command: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return gitExecutable.run(command, operation);
+}
+
+export async function git(
   cwd: string,
   args: string[],
   timeoutMs = 120_000,
 ): Promise<string> {
-  const result = await runProcess({ command: "git", args, cwd, timeoutMs });
+  const result = await runProcess({
+    command: gitExecutable.getStore() ?? "git",
+    args,
+    cwd,
+    timeoutMs,
+  });
   if (result.exitCode !== 0)
     throw new Error(
       `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
@@ -58,15 +80,23 @@ async function acquireDirectLock(
   repository: string,
   stateDirectory: string,
   jobId: string,
+  backendId = "git",
 ): Promise<string> {
   const key = createHash("sha256").update(repository).digest("hex");
   const lockDirectory = resolve(stateDirectory, "locks");
-  const lockPath = join(lockDirectory, `${key}.json`);
+  const lockPath = join(lockDirectory, `${backendId}-${key}.json`);
   await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
   try {
     const handle = await open(lockPath, "wx", 0o600);
     try {
-      await handle.writeFile(JSON.stringify({ jobId, repository }));
+      await handle.writeFile(
+        JSON.stringify({
+          backend: backendId,
+          jobId,
+          repository,
+          pid: process.pid,
+        }),
+      );
       await handle.sync();
     } finally {
       await handle.close();
@@ -92,35 +122,49 @@ export async function prepareJobWorkspace(options: {
   kind: "task" | "plan";
   expectedBaseRevision: string;
   config: ProjectConfig;
+  backendId?: string;
 }): Promise<JobWorkspace> {
   const repository = await discoverRepository(options.repository);
   const actualBase = await git(repository, [
     "rev-parse",
-    `${options.config.workspace.baseBranch}^{commit}`,
+    `${options.config.sourceControl.base}^{commit}`,
   ]);
   if (actualBase !== options.expectedBaseRevision) {
     throw new Error(
       `base revision changed: expected ${options.expectedBaseRevision}, found ${actualBase}`,
     );
   }
-  if (options.config.workspace.mode === "direct") {
+  if (options.config.sourceControl.mode === "direct") {
     const directLockPath = await acquireDirectLock(
       repository,
       options.stateDirectory,
       options.jobId,
+      options.backendId,
     );
     try {
       await requireClean(repository);
       const branch = await git(repository, ["branch", "--show-current"]);
-      if (branch !== options.config.workspace.directBranch)
+      if (branch !== options.config.sourceControl.target)
         throw new Error(
-          `direct mode requires branch ${options.config.workspace.directBranch}, found ${branch}`,
+          `direct mode requires target ${options.config.sourceControl.target}, found ${branch}`,
         );
       const expectedHead = await git(repository, ["rev-parse", "HEAD"]);
       if (expectedHead !== options.expectedBaseRevision)
         throw new Error(
           `direct branch HEAD ${expectedHead} differs from dispatched base ${options.expectedBaseRevision}`,
         );
+      await writeFile(
+        directLockPath,
+        JSON.stringify({
+          backend: options.backendId ?? "git",
+          jobId: options.jobId,
+          repository,
+          pid: process.pid,
+          expectedHead,
+          branch,
+        }),
+        { mode: 0o600 },
+      );
       return {
         mode: "direct",
         sourceRepository: repository,
@@ -163,6 +207,7 @@ export async function restoreJobWorkspace(options: {
   baseRevision: string;
   expectedHead: string;
   mode: "isolated" | "direct";
+  backendId?: string;
 }): Promise<JobWorkspace> {
   const sourceRepository = await discoverRepository(options.repository);
   if (options.mode === "direct") {
@@ -170,6 +215,7 @@ export async function restoreJobWorkspace(options: {
       sourceRepository,
       options.stateDirectory,
       options.jobId,
+      options.backendId,
     );
     const branch = await git(sourceRepository, ["branch", "--show-current"]);
     if (branch !== options.branch)

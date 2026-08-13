@@ -4,6 +4,7 @@ import {
   type RunnerJobSource,
   runnerJobSourceSchema,
 } from "../src/contracts.js";
+import { runnerToServerSchema } from "../src/protocol.js";
 import { orderedTasks, readyTasks } from "../src/scheduler.js";
 
 function plan(): RunnerJobSource {
@@ -54,6 +55,24 @@ function plan(): RunnerJobSource {
 }
 
 describe("RunnerJob source and scheduler", () => {
+  it("accepts VCS-tagged hello entries with opaque revisions", () => {
+    expect(
+      runnerToServerSchema.parse({
+        type: "hello",
+        protocolVersion: 2,
+        runnerId: "runner",
+        capacity: 1,
+        repositories: [
+          {
+            repositoryKey: "perforce-project",
+            repoRef: "perforce-project",
+            vcs: "perforce",
+            baseRevision: "12345",
+          },
+        ],
+      }),
+    ).toBeTruthy();
+  });
   it("uses stable phase, task, and key order", () => {
     expect(orderedTasks(plan()).map((task) => task.key)).toEqual([
       "RUN-1",

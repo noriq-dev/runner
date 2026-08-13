@@ -1,10 +1,12 @@
 import { readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { loadProjectConfig, type ProjectConfig } from "./config.js";
-import { discoverRepository } from "./git.js";
+import { detectRepository, type VcsKind } from "./vcs/detect.js";
 
 export interface DiscoveredProject {
   repository: string;
+  vcs: VcsKind;
+  vcsReason: string;
   configPath: string;
   config: ProjectConfig;
 }
@@ -41,14 +43,21 @@ export async function discoverProjects(
   const projects = new Map<string, DiscoveredProject>();
   for (const root of scanRoots) {
     for (const configPath of await candidates(root)) {
-      const repository = await discoverRepository(dirname(configPath));
+      const detected = await detectRepository(dirname(configPath));
+      const repository = detected.root;
       const config = await loadProjectConfig(configPath);
       const prior = projects.get(config.repositoryKey);
       if (prior && prior.repository !== repository)
         throw new Error(
           `repositoryKey ${config.repositoryKey} is duplicated by ${prior.repository} and ${repository}`,
         );
-      projects.set(config.repositoryKey, { repository, configPath, config });
+      projects.set(config.repositoryKey, {
+        repository,
+        vcs: detected.kind,
+        vcsReason: detected.reason,
+        configPath,
+        config,
+      });
     }
   }
   return [...projects.values()];

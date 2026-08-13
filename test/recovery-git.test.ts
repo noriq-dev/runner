@@ -5,15 +5,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
-import {
-  createTaskWorktree,
-  prepareJobWorkspace,
-  releaseJobWorkspace,
-} from "../src/git.js";
+import { FakeAgentDriver } from "../src/drivers/fake.js";
+import { prepareJobWorkspace, releaseJobWorkspace } from "../src/git.js";
 import { ChecksummedJournal } from "../src/journal.js";
 import { runProcess } from "../src/process.js";
-import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { MemoryEventSink, RunnerJobSupervisor } from "../src/supervisor.js";
+import { GitWorkspaceBackend } from "../src/vcs/git.js";
 
 async function command(
   cwd: string,
@@ -56,9 +53,9 @@ const config = (mode: "isolated" | "direct") =>
     },
     harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
     agents: {
-      guide: { provider: "fake", model: "guide", effort: "high" },
-      builder: { provider: "fake", model: "builder", effort: "medium" },
-      reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+      guide: { driver: "fake", model: "guide", effort: "high" },
+      builder: { driver: "fake", model: "builder", effort: "medium" },
+      reviewer: { driver: "fake", model: "reviewer", effort: "high" },
     },
     setup: { commands: [], timeoutSeconds: 30 },
     checks: { commands: ["test -f recovered.txt"], timeoutSeconds: 30 },
@@ -122,7 +119,7 @@ describe("workspace durability", () => {
       },
     });
     let guideCalls = 0;
-    const fake = new FakeProviderAdapter(
+    const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
         if (request.role === "guide") {
@@ -167,7 +164,8 @@ describe("workspace durability", () => {
       repository: repo.path,
       stateDirectory: join(root, "state"),
       projectConfig: questionConfig,
-      providers: { fake, codex: undefined, claude: undefined },
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
       sink,
     });
     const running = supervisor.run();
@@ -220,7 +218,8 @@ describe("workspace durability", () => {
         },
       },
     });
-    const workspace = await prepareJobWorkspace({
+    const backend = new GitWorkspaceBackend();
+    const workspace = await backend.openJob({
       repository: repo.path,
       stateDirectory,
       jobId: assignment.jobId,
@@ -229,7 +228,7 @@ describe("workspace durability", () => {
       expectedBaseRevision: repo.base,
       config: config("isolated"),
     });
-    const child = await createTaskWorktree(workspace, "RUN-2");
+    const child = await backend.beginTask(workspace, "RUN-2");
     await writeFile(join(child.path, "recovered.txt"), "from receipt\n");
     const guideId = invocation(assignment.jobId, "task", "guide");
     const builderId = invocation(assignment.jobId, "task", "builder");
@@ -257,20 +256,13 @@ describe("workspace durability", () => {
       join(stateDirectory, "jobs", "job-recovery", "events.jsonl"),
     );
     await journal.append("job.assigned", { assignment });
-    await journal.append("workspace.ready", {
-      branch: workspace.branch,
-      path: workspace.path,
-      baseRevision: workspace.baseRevision,
-      expectedHead: workspace.expectedHead,
-      mode: workspace.mode,
-    });
+    await journal.append("workspace.opened", { workspace });
     await journal.append("job.started", {});
     await journal.append("task.started", { taskId: "task" });
     await journal.append("task.plan", { taskId: "task", plan: "recover" });
     await journal.append("task.workspace", {
       taskId: "task",
-      path: child.path,
-      branch: child.branch,
+      workspace: child,
     });
     await journal.append("invocation.started", {
       id: guideId,
@@ -295,7 +287,7 @@ describe("workspace durability", () => {
       recovered: false,
     });
 
-    const fake = new FakeProviderAdapter(artifactRoot, async (request) => {
+    const fake = new FakeAgentDriver(artifactRoot, async (request) => {
       if (request.role === "reviewer")
         return { summary: "accepted", findings: [] };
       throw new Error("completed invocation repeated");
@@ -305,7 +297,8 @@ describe("workspace durability", () => {
       repository: repo.path,
       stateDirectory,
       projectConfig: config("isolated"),
-      providers: { fake, codex: undefined, claude: undefined },
+      backend,
+      drivers: { fake, codex: undefined, claude: undefined },
       sink: new MemoryEventSink(),
     }).run();
     expect(output.summary).toContain("succeeded");
@@ -314,7 +307,7 @@ describe("workspace durability", () => {
       await command(repo.path, "git", [
         "rev-list",
         "--count",
-        `${repo.base}..${output.branch}`,
+        `${repo.base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("1");
   });
@@ -354,5 +347,70 @@ describe("workspace durability", () => {
       config: config("direct"),
     });
     await releaseJobWorkspace(second, "direct-two");
+  });
+
+  it("recovers a direct acceptance that completed before its journal acknowledgement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-direct-receipt-gap-"));
+    const repo = await repository(root);
+    const stateDirectory = join(root, "state");
+    const backend = new GitWorkspaceBackend();
+    const workspace = await backend.openJob({
+      repository: repo.path,
+      stateDirectory,
+      jobId: "direct-gap",
+      key: "RUN-9",
+      kind: "task",
+      expectedBaseRevision: repo.base,
+      config: config("direct"),
+    });
+    const durableHandle = structuredClone(workspace.handle);
+    durableHandle.state.acceptingTask = "RUN-9";
+    workspace.handle.state.acceptingTask = "RUN-9";
+    const task = await backend.beginTask(workspace, "RUN-9");
+    await writeFile(
+      join(task.path, "accepted-before-journal.txt"),
+      "accepted\n",
+    );
+    const staged = await backend.stageCandidate({
+      workspace,
+      task,
+      taskKey: "RUN-9",
+      summary: "accepted",
+      refresh: false,
+    });
+    if (staged.status !== "ready") throw new Error("candidate not ready");
+    const accepted = await backend.acceptCandidate({
+      workspace,
+      task,
+      candidate: staged.checkpoint,
+      taskKey: "RUN-9",
+    });
+    await backend.release(workspace, "direct-gap");
+
+    const restored = await backend.restoreJob({
+      repository: repo.path,
+      stateDirectory,
+      jobId: "direct-gap",
+      handle: durableHandle,
+      mode: "direct",
+      baseRevision: repo.base,
+      currentRevision: repo.base,
+    });
+    expect(restored.currentRevision).toBe(accepted.ref);
+    const replayed = await backend.acceptCandidate({
+      workspace: restored,
+      task,
+      candidate: staged.checkpoint,
+      taskKey: "RUN-9",
+    });
+    expect(replayed.ref).toBe(accepted.ref);
+    expect(
+      await command(repo.path, "git", [
+        "rev-list",
+        "--count",
+        `${repo.base}..HEAD`,
+      ]),
+    ).toBe("1");
+    await backend.release(restored, "direct-gap");
   });
 });

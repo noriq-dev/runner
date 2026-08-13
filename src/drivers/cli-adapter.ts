@@ -6,11 +6,14 @@ import type { MachineConfig } from "../config.js";
 import { findingSchema, usageSchema } from "../contracts.js";
 import { runProcess } from "../process.js";
 import type {
+  AgentDriver,
+  AgentDriverCapabilities,
   AgentRequest,
   AgentResult,
-  ProviderAdapter,
-  ProviderPreflight,
+  DriverPreflight,
+  DriverPreflightRequest,
 } from "./types.js";
+import { type AgentSession, PromiseAgentSession } from "./types.js";
 
 function parseLastObject(text: string): Record<string, unknown> {
   const lines = text
@@ -24,7 +27,7 @@ function parseLastObject(text: string): Record<string, unknown> {
         return value as Record<string, unknown>;
     } catch {}
   }
-  throw new Error("provider produced no structured JSON object");
+  throw new Error("driver produced no structured JSON object");
 }
 
 async function controlMcpCommand(): Promise<{
@@ -43,10 +46,10 @@ async function controlMcpCommand(): Promise<{
 }
 
 function configArguments(
-  provider: "codex" | "claude",
+  adapter: "codex" | "claude",
   command: { command: string; args: string[] },
 ): string[] {
-  if (provider === "codex")
+  if (adapter === "codex")
     return [
       "--config",
       `mcp_servers.noriq_runner.command=${JSON.stringify(command.command)}`,
@@ -71,19 +74,43 @@ function numberField(
   return 0;
 }
 
-export class CliProviderAdapter implements ProviderAdapter {
-  readonly name: "codex" | "claude";
-  private readonly config: NonNullable<MachineConfig["providers"]["codex"]>;
+export abstract class BuiltinCliAgentDriver implements AgentDriver {
+  readonly id: string;
+  readonly capabilities: AgentDriverCapabilities;
+  private readonly adapter: "codex" | "claude";
+  private readonly config: Extract<
+    MachineConfig["drivers"][string],
+    { adapter: "codex" | "claude" }
+  >;
   private readonly stateDirectory: string;
 
   constructor(
-    name: "codex" | "claude",
-    config: NonNullable<MachineConfig["providers"]["codex"]>,
+    adapter: "codex" | "claude",
+    config: Extract<
+      MachineConfig["drivers"][string],
+      { adapter: "codex" | "claude" }
+    >,
     stateDirectory: string,
+    id: string = adapter,
   ) {
-    this.name = name;
+    this.id = id;
+    this.adapter = adapter;
     this.config = config;
     this.stateDirectory = stateDirectory;
+    this.capabilities = {
+      structuredOutput: true,
+      workspaceAccess: ["read-only", "workspace-write"],
+      runnerControlMcpInjection: true,
+      projectNativeConfiguration: true,
+      usageAccuracy: adapter === "codex" ? "exact" : "partial",
+      hardBudget: false,
+      processTreeTermination: true,
+    };
+  }
+
+  /** @deprecated Kept for source compatibility with the first rebuild prototype. */
+  get name(): string {
+    return this.id;
   }
 
   private env(
@@ -94,7 +121,7 @@ export class CliProviderAdapter implements ProviderAdapter {
       PATH: process.env.PATH,
       ...this.config.env,
     };
-    if (this.name === "codex") env.CODEX_HOME = this.config.home;
+    if (this.adapter === "codex") env.CODEX_HOME = this.config.home;
     else env.CLAUDE_CONFIG_DIR = this.config.home;
     env.NORIQ_JOB_WORKSPACE = workspace;
     if (control) {
@@ -104,10 +131,12 @@ export class CliProviderAdapter implements ProviderAdapter {
     return env;
   }
 
-  async preflight(
-    workspace: string,
-    requireControl: boolean,
-  ): Promise<ProviderPreflight> {
+  async preflight(request: DriverPreflightRequest): Promise<DriverPreflight> {
+    const { workspace, requireControlMcp: requireControl } = request;
+    if (!this.capabilities.workspaceAccess.includes(request.access))
+      throw new Error(
+        `${this.id} cannot enforce ${request.access} workspace access`,
+      );
     const version = await runProcess({
       command: this.config.command,
       args: ["--version"],
@@ -116,30 +145,28 @@ export class CliProviderAdapter implements ProviderAdapter {
       timeoutMs: 30_000,
     });
     if (version.exitCode !== 0)
-      throw new Error(
-        `${this.name} version preflight failed: ${version.stderr}`,
-      );
+      throw new Error(`${this.id} version preflight failed: ${version.stderr}`);
     const help = await runProcess({
       command: this.config.command,
-      args: this.name === "codex" ? ["exec", "--help"] : ["--help"],
+      args: this.adapter === "codex" ? ["exec", "--help"] : ["--help"],
       cwd: workspace,
       env: this.env(workspace),
       timeoutMs: 30_000,
     });
     const structuredOutput =
-      this.name === "codex"
+      this.adapter === "codex"
         ? help.stdout.includes("--output-schema") &&
           help.stdout.includes("--json")
         : help.stdout.includes("--output-format") &&
           help.stdout.includes("--json-schema");
     if (!structuredOutput)
       throw new Error(
-        `${this.name} does not expose required structured-output flags`,
+        `${this.id} does not expose required structured-output flags`,
       );
     const auth = await runProcess({
       command: this.config.command,
       args:
-        this.name === "codex"
+        this.adapter === "codex"
           ? ["login", "status"]
           : ["auth", "status", "--json"],
       cwd: workspace,
@@ -149,7 +176,7 @@ export class CliProviderAdapter implements ProviderAdapter {
     const authenticated = auth.exitCode === 0;
     if (!authenticated)
       throw new Error(
-        `${this.name} authentication preflight failed: ${auth.stderr || auth.stdout}`,
+        `${this.id} authentication preflight failed: ${auth.stderr || auth.stdout}`,
       );
 
     let runnerControlVisible = !requireControl;
@@ -157,11 +184,11 @@ export class CliProviderAdapter implements ProviderAdapter {
     const warnings: string[] = [];
     if (requireControl) {
       const control = await controlMcpCommand();
-      const injection = configArguments(this.name, control);
+      const injection = configArguments(this.adapter, control);
       const inventory = await runProcess({
         command: this.config.command,
         args:
-          this.name === "codex"
+          this.adapter === "codex"
             ? [...this.config.args, "mcp", "list", "--json", ...injection]
             : [...this.config.args, ...injection, "--", "mcp", "list"],
         cwd: workspace,
@@ -170,12 +197,12 @@ export class CliProviderAdapter implements ProviderAdapter {
       });
       if (inventory.exitCode !== 0)
         throw new Error(
-          `${this.name} MCP inventory failed: ${inventory.stderr || inventory.stdout}`,
+          `${this.id} MCP inventory failed: ${inventory.stderr || inventory.stdout}`,
         );
       runnerControlVisible = inventory.stdout.includes("noriq_runner");
       if (!runnerControlVisible)
         throw new Error(
-          `${this.name} did not expose the injected noriq_runner MCP`,
+          `${this.id} did not expose the injected noriq_runner MCP`,
         );
       projectTools = inventory.stdout
         .split("\n")
@@ -190,15 +217,13 @@ export class CliProviderAdapter implements ProviderAdapter {
       );
     }
     return {
-      provider: this.name,
+      driver: this.id,
       version: version.stdout.trim() || version.stderr.trim(),
       authenticated,
-      structuredOutput,
+      capabilities: this.capabilities,
       runnerControlVisible,
       projectTools,
       warnings,
-      usageReporting: this.name === "codex" ? "exact" : "partial",
-      costEnforcement: false,
     };
   }
 
@@ -225,7 +250,7 @@ export class CliProviderAdapter implements ProviderAdapter {
     await mkdir(artifactDirectory, { recursive: true, mode: 0o700 });
     const schemaPath = join(artifactDirectory, "schema.json");
     const outputPath = join(artifactDirectory, "result.json");
-    const rawLogPath = join(artifactDirectory, "provider.log");
+    const rawLogPath = join(artifactDirectory, "driver.log");
     const controlStatePath = join(artifactDirectory, "control-state.json");
     const controlActionsPath = join(artifactDirectory, "control-actions.jsonl");
     await writeFile(schemaPath, JSON.stringify(request.outputSchema), {
@@ -242,7 +267,7 @@ export class CliProviderAdapter implements ProviderAdapter {
     );
     await writeFile(controlActionsPath, "", { mode: 0o600 });
     let args: string[];
-    if (this.name === "codex") {
+    if (this.adapter === "codex") {
       const profile =
         request.projectConfig.agents[
           request.role === "repairer" ? "builder" : request.role
@@ -262,8 +287,7 @@ export class CliProviderAdapter implements ProviderAdapter {
         outputPath,
         "-",
       ];
-      if (request.role === "reviewer")
-        args.splice(this.config.args.length + 2, 0, "--sandbox", "read-only");
+      args.splice(this.config.args.length + 2, 0, "--sandbox", request.access);
     } else {
       const profile =
         request.projectConfig.agents[
@@ -286,10 +310,22 @@ export class CliProviderAdapter implements ProviderAdapter {
         "--json-schema",
         JSON.stringify(request.outputSchema),
       ];
+      if (request.access === "read-only")
+        args.push(
+          "--permission-mode",
+          "plan",
+          "--disallowedTools",
+          "Write,Edit,NotebookEdit",
+        );
+      else args.push("--permission-mode", "acceptEdits");
     }
     if (request.role === "guide") {
-      const injection = configArguments(this.name, await controlMcpCommand());
-      if (this.name === "codex") args.splice(args.length - 1, 0, ...injection);
+      const injection = configArguments(
+        this.adapter,
+        await controlMcpCommand(),
+      );
+      if (this.adapter === "codex")
+        args.splice(args.length - 1, 0, ...injection);
       else args.push(...injection);
     }
     const result = await runProcess({
@@ -310,10 +346,10 @@ export class CliProviderAdapter implements ProviderAdapter {
     });
     if (result.exitCode !== 0 || result.timedOut)
       throw new Error(
-        `${this.name} invocation failed (${result.exitCode ?? result.signal}): ${result.stderr.slice(-4_000)}`,
+        `${this.id} invocation failed (${result.exitCode ?? result.signal}): ${result.stderr.slice(-4_000)}`,
       );
     let structured: Record<string, unknown>;
-    if (this.name === "codex") {
+    if (this.adapter === "codex") {
       structured = JSON.parse(await readFile(outputPath, "utf8"));
     } else {
       const frames = result.stdout
@@ -409,6 +445,27 @@ export class CliProviderAdapter implements ProviderAdapter {
       { mode: 0o600 },
     );
     return agentResult;
+  }
+
+  async start(request: AgentRequest): Promise<AgentSession> {
+    return new PromiseAgentSession(
+      request.invocationId,
+      async (signal, emit) => {
+        emit({
+          type: "status",
+          at: new Date().toISOString(),
+          message: "started",
+        });
+        const result = await this.invoke({ ...request, signal });
+        emit({
+          type: "usage",
+          at: new Date().toISOString(),
+          usage: result.usage,
+        });
+        return result;
+      },
+      request.signal,
+    );
   }
 }
 

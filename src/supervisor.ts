@@ -11,28 +11,12 @@ import type {
   RunnerTaskSnapshot,
 } from "./contracts.js";
 import { assertAcyclicSource } from "./contracts.js";
-import {
-  abortRebase,
-  amendCheckpoint,
-  checkpoint,
-  continueRebase,
-  createTaskWorktree,
-  currentRevision,
-  diffForReview,
-  dirtyPaths,
-  GitRebaseConflict,
-  integrateTask,
-  integrateWip,
-  type JobWorkspace,
-  normalizeWipCheckpoint,
-  prepareJobWorkspace,
-  rebaseTask,
-  releaseJobWorkspace,
-  removeTaskWorktree,
-  restoreJobWorkspace,
-  runCommands,
-  safeRefPart,
-} from "./git.js";
+import type {
+  AgentDriver,
+  AgentRequest,
+  AgentResult,
+  AgentRole,
+} from "./drivers/types.js";
 import { ChecksummedJournal } from "./journal.js";
 import {
   builderPrompt,
@@ -43,15 +27,15 @@ import {
   type TaskContract,
   workerOutputSchema,
 } from "./prompts.js";
-import { resultDigest } from "./providers/process-adapter.js";
-import type {
-  AgentRequest,
-  AgentResult,
-  AgentRole,
-  ProviderAdapter,
-} from "./providers/types.js";
 import { readyTasks } from "./scheduler.js";
 import { type JobState, reduceJobState } from "./state.js";
+import type {
+  JobWorkspace,
+  SourceControlBackend,
+  SourceControlCheckpoint,
+  TaskWorkspace,
+} from "./vcs/types.js";
+import { IntegrationConflict } from "./vcs/types.js";
 
 export interface JobEventSink {
   publish(
@@ -66,10 +50,29 @@ interface BuiltTask {
   task: RunnerTaskSnapshot;
   contract: TaskContract;
   plan: string;
-  path: string;
-  branch: string;
-  draftCommit: string | null;
+  workspace: TaskWorkspace;
+  candidate: SourceControlCheckpoint;
   buildSummary: string;
+}
+
+function safeIdPart(input: string): string {
+  const value = input.replace(/[^A-Za-z0-9_.-]+/g, "-").slice(0, 120);
+  if (!value || value === "." || value === "..")
+    throw new Error("identifier cannot form a safe state path");
+  return value;
+}
+
+function resultDigest(result: AgentResult): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        summary: result.summary,
+        plan: result.plan,
+        findings: result.findings,
+        structured: result.structured,
+      }),
+    )
+    .digest("hex");
 }
 
 function now(): string {
@@ -132,10 +135,8 @@ export class RunnerJobSupervisor {
       repository: string;
       stateDirectory: string;
       projectConfig: ProjectConfig;
-      providers: Record<
-        "codex" | "claude" | "fake",
-        ProviderAdapter | undefined
-      >;
+      backend: SourceControlBackend;
+      drivers: Record<string, AgentDriver | undefined>;
       sink: JobEventSink;
     },
   ) {}
@@ -177,15 +178,13 @@ export class RunnerJobSupervisor {
     await operation;
   }
 
-  private provider(role: AgentRole): ProviderAdapter {
+  private driver(role: AgentRole): AgentDriver {
     const profile =
       this.options.projectConfig.agents[role === "repairer" ? "builder" : role];
-    const adapter = this.options.providers[profile.provider];
-    if (!adapter)
-      throw new Error(
-        `provider ${profile.provider} is not configured for ${role}`,
-      );
-    return adapter;
+    const driver = this.options.drivers[profile.driver];
+    if (!driver)
+      throw new Error(`driver ${profile.driver} is not configured for ${role}`);
+    return driver;
   }
 
   private enforceBudget(): void {
@@ -219,9 +218,9 @@ export class RunnerJobSupervisor {
       role,
       round,
     );
-    const provider = this.provider(role);
+    const driver = this.driver(role);
     const completed = this.state.invocations[id];
-    const recovered = await provider.recover(id);
+    const recovered = await driver.recover(id);
     if (completed?.status === "completed" && recovered) return recovered;
     if (!completed)
       await this.record("invocation.started", {
@@ -245,12 +244,17 @@ export class RunnerJobSupervisor {
       taskId: task.taskId,
       taskKey: task.key,
       workspace,
+      access:
+        role === "guide" || role === "reviewer"
+          ? "read-only"
+          : "workspace-write",
       prompt,
       outputSchema: schema,
       projectConfig: this.options.projectConfig,
       signal: this.abort.signal,
     };
-    const result = await provider.invoke(request);
+    const session = await driver.start(request);
+    const result = await session.result();
     await this.record("invocation.completed", {
       id,
       resultDigest: resultDigest(result),
@@ -283,27 +287,34 @@ export class RunnerJobSupervisor {
     const roles: AgentRole[] = ["guide", "builder", "reviewer"];
     const checked = new Set<string>();
     for (const role of roles) {
-      const adapter = this.provider(role);
-      const key = `${adapter.name}:${role === "guide"}`;
+      const driver = this.driver(role);
+      const access =
+        role === "guide" || role === "reviewer"
+          ? "read-only"
+          : "workspace-write";
+      const key = `${driver.id}:${access}:${role === "guide"}`;
       if (checked.has(key)) continue;
       checked.add(key);
-      const result = await adapter.preflight(
-        this.workspace.path,
-        role === "guide",
-      );
-      if (!result.authenticated || !result.structuredOutput)
-        throw new Error(`${adapter.name} is not ready`);
+      const result = await driver.preflight({
+        workspace: this.workspace.path,
+        access,
+        requireControlMcp: role === "guide",
+      });
+      if (!result.authenticated) throw new Error(`${driver.id} is not ready`);
+      if (!driver.capabilities.workspaceAccess.includes(access))
+        throw new Error(`${driver.id} cannot enforce ${access} access`);
       if (role === "guide" && !result.runnerControlVisible)
-        throw new Error(`${adapter.name} cannot see the Runner Control MCP`);
+        throw new Error(`${driver.id} cannot see the Runner Control MCP`);
       const finiteBudget =
         this.options.projectConfig.harness.maxTokens !== undefined ||
         this.options.projectConfig.harness.maxCostUsd !== undefined;
       if (
         finiteBudget &&
-        (!result.costEnforcement || result.usageReporting === "none")
+        (!driver.capabilities.hardBudget ||
+          driver.capabilities.usageAccuracy === "none")
       )
         throw new Error(
-          `${adapter.name} cannot enforce the configured finite token/cost cap`,
+          `${driver.id} cannot enforce the configured finite token/cost cap`,
         );
       for (const warning of result.warnings)
         await this.record("warning", { message: warning });
@@ -317,7 +328,7 @@ export class RunnerJobSupervisor {
       at: now(),
       taskId: task.taskId,
       status: "running",
-      commit: null,
+      checkpoint: null,
       summary: `Started ${task.key}`,
       findings: [],
     });
@@ -388,26 +399,18 @@ export class RunnerJobSupervisor {
       plan,
     });
     const retained = this.state.tasks[task.taskId];
-    const taskWorkspace =
-      retained?.workspace && retained.branch
-        ? {
-            path: retained.workspace,
-            branch: retained.branch,
-            baseRevision:
-              retained.workspaceBase ??
-              (await currentRevision(retained.workspace)),
-          }
-        : await createTaskWorktree(this.workspace, task.key);
+    const taskWorkspace: TaskWorkspace =
+      retained?.workspace ??
+      (await this.options.backend.beginTask(this.workspace, task.key));
     if (!retained?.workspace)
       await this.record("task.workspace", {
         taskId: task.taskId,
-        path: taskWorkspace.path,
-        branch: taskWorkspace.branch,
-        baseRevision: taskWorkspace.baseRevision,
+        workspace: taskWorkspace,
+        jobWorkspace: this.workspace,
       });
     if (this.options.projectConfig.setup.commands.length > 0) {
       const started = Date.now();
-      const setup = await runCommands(
+      const setup = await this.options.backend.runCommands(
         taskWorkspace.path,
         this.options.projectConfig.setup.commands,
         this.options.projectConfig.setup.timeoutSeconds,
@@ -434,28 +437,34 @@ export class RunnerJobSupervisor {
       builderPrompt(task, contract, guideInstructions),
       workerOutputSchema,
     );
-    let draftCommit: string | null = null;
-    if (this.workspace.mode === "isolated") {
-      draftCommit = retained?.draftCommit ?? null;
-      if (!draftCommit) {
-        const paths = await dirtyPaths(taskWorkspace.path);
-        draftCommit =
-          paths.length > 0
-            ? await checkpoint(taskWorkspace.path, task.key, builder.summary)
-            : await currentRevision(taskWorkspace.path);
-        await this.record("task.draft", {
-          taskId: task.taskId,
-          commit: draftCommit,
-        });
-      }
+    let candidate = retained?.candidate;
+    if (!candidate) {
+      const staged = await this.options.backend.stageCandidate({
+        workspace: this.workspace,
+        task: taskWorkspace,
+        taskKey: task.key,
+        summary: builder.summary,
+        refresh: false,
+      });
+      if (staged.status === "conflict")
+        throw new IntegrationConflict(
+          "candidate staging requires conflict repair",
+          staged.detail,
+          staged.paths,
+        );
+      candidate = staged.checkpoint;
+      await this.record("task.candidate", {
+        taskId: task.taskId,
+        candidate,
+        workspace: taskWorkspace,
+      });
     }
     return {
       task,
       contract,
       plan,
-      path: taskWorkspace.path,
-      branch: taskWorkspace.branch,
-      draftCommit,
+      workspace: taskWorkspace,
+      candidate,
       buildSummary: builder.summary,
     };
   }
@@ -464,17 +473,18 @@ export class RunnerJobSupervisor {
     const { task } = built;
     let round = 0;
     try {
-      if (this.workspace.mode === "isolated") {
-        const rebaseActionId = `rebase:${task.taskId}:${built.draftCommit}`;
-        await this.record("action.intent", {
-          id: rebaseActionId,
-        });
-        try {
-          await rebaseTask(this.workspace, built.path);
-        } catch (error) {
-          if (!(error instanceof GitRebaseConflict)) throw error;
+      while (true) {
+        const integration = await this.options.backend.integrateLatest(
+          this.workspace,
+          built.workspace,
+        );
+        if (integration?.status === "conflict") {
+          if (!this.options.backend.capabilities.automatedConflictRepair)
+            throw new Error(
+              `${this.options.backend.id} integration requires human resolution: ${integration.detail}`,
+            );
           if (round >= this.options.projectConfig.harness.maxRepairRounds) {
-            await abortRebase(built.path);
+            await this.options.backend.abortConflict(built.workspace);
             throw new Error("integration conflict exceeded the repair ceiling");
           }
           round += 1;
@@ -483,25 +493,25 @@ export class RunnerJobSupervisor {
             type: "progress",
             at: now(),
             phase: "repairing",
-            message: `Repairing integration conflict for ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
+            message: `Repairing source-control conflict for ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
             progress: 0,
           });
           try {
-            await this.invoke(
+            const repair = await this.invoke(
               task,
               "repairer",
               round,
-              built.path,
+              built.workspace.path,
               repairPrompt(
                 task,
                 built.contract,
                 [],
                 [
                   {
-                    command: "git rebase",
+                    command: `${this.options.backend.id} integration`,
                     exitCode: 1,
                     durationMs: 0,
-                    output: error.output,
+                    output: integration.detail,
                     timedOut: false,
                   },
                 ],
@@ -509,25 +519,35 @@ export class RunnerJobSupervisor {
               ),
               workerOutputSchema,
             );
-            await continueRebase(built.path);
+            await this.options.backend.continueConflict(built.workspace);
+            const staged = await this.options.backend.stageCandidate({
+              workspace: this.workspace,
+              task: built.workspace,
+              taskKey: task.key,
+              summary: repair.summary,
+              refresh: true,
+            });
+            if (staged.status === "conflict") throw new Error(staged.detail);
+            built.candidate = staged.checkpoint;
+            await this.record("task.candidate", {
+              taskId: task.taskId,
+              candidate: built.candidate,
+              workspace: built.workspace,
+            });
           } catch (repairError) {
-            await abortRebase(built.path);
+            await this.options.backend.abortConflict(built.workspace);
             throw repairError;
           }
+          continue;
         }
-        built.draftCommit = await currentRevision(built.path);
-        await this.record("action.completed", {
-          id: rebaseActionId,
-          result: built.draftCommit,
-        });
-      } else {
-        const head = await currentRevision(built.path);
-        if (head !== this.workspace.expectedHead)
-          throw new Error(
-            `direct branch HEAD drifted from ${this.workspace.expectedHead} to ${head}`,
-          );
-      }
-      while (true) {
+        if (integration?.status === "ready") {
+          built.candidate = integration.checkpoint;
+          await this.record("task.candidate", {
+            taskId: task.taskId,
+            candidate: built.candidate,
+            workspace: built.workspace,
+          });
+        }
         await this.emit({
           type: "progress",
           at: now(),
@@ -536,22 +556,18 @@ export class RunnerJobSupervisor {
           progress: 0,
         });
         const checkStarted = Date.now();
-        const checks = await runCommands(
-          built.path,
+        const checks = await this.options.backend.runCommands(
+          built.workspace.path,
           this.options.projectConfig.checks.commands,
           this.options.projectConfig.checks.timeoutSeconds,
           this.abort.signal,
         );
         this.checkDurationMs += Date.now() - checkStarted;
         await this.record("task.checked", { taskId: task.taskId, checks });
-        const reviewBase =
-          this.workspace.mode === "direct"
-            ? this.workspace.expectedHead
-            : `${await currentRevision(built.path)}^`;
-        const diff = await diffForReview(
-          built.path,
-          reviewBase,
-          this.workspace.mode === "direct",
+        const diff = await this.options.backend.reviewDiff(
+          this.workspace,
+          built.workspace,
+          built.candidate,
         );
         await this.emit({
           type: "progress",
@@ -564,7 +580,7 @@ export class RunnerJobSupervisor {
           task,
           "reviewer",
           round,
-          built.path,
+          built.workspace.path,
           reviewerPrompt(task, built.contract, diff, JSON.stringify(checks)),
           workerOutputSchema,
         );
@@ -574,7 +590,119 @@ export class RunnerJobSupervisor {
         });
         const blockers = blockingFindings(reviewer.findings);
         const failures = failedChecks(checks);
-        if (blockers.length === 0 && failures.length === 0) break;
+        if (blockers.length === 0 && failures.length === 0) {
+          await this.emit({
+            type: "progress",
+            at: now(),
+            phase: "integrating",
+            message: `Accepting ${task.key}`,
+            progress: 0,
+          });
+          let acceptedCheckpoint: SourceControlCheckpoint;
+          try {
+            this.workspace.handle.state.acceptingTask = task.key;
+            await this.record("workspace.updated", {
+              workspace: this.workspace,
+            });
+            acceptedCheckpoint = await this.options.backend.acceptCandidate({
+              workspace: this.workspace,
+              task: built.workspace,
+              candidate: built.candidate,
+              taskKey: task.key,
+            });
+          } catch (error) {
+            if (!(error instanceof IntegrationConflict)) throw error;
+            const reintegration = await this.options.backend.integrateLatest(
+              this.workspace,
+              built.workspace,
+            );
+            if (!reintegration || reintegration.status === "ready") {
+              const restaged = await this.options.backend.stageCandidate({
+                workspace: this.workspace,
+                task: built.workspace,
+                taskKey: task.key,
+                summary: "candidate refreshed after target movement",
+                refresh: true,
+              });
+              if (restaged.status === "conflict")
+                throw new Error(restaged.detail);
+              built.candidate = restaged.checkpoint;
+              await this.record("task.candidate", {
+                taskId: task.taskId,
+                candidate: built.candidate,
+                workspace: built.workspace,
+              });
+              continue;
+            }
+            if (
+              !this.options.backend.capabilities.automatedConflictRepair ||
+              round >= this.options.projectConfig.harness.maxRepairRounds
+            )
+              throw error;
+            round += 1;
+            await this.record("task.repair", { taskId: task.taskId, round });
+            const repair = await this.invoke(
+              task,
+              "repairer",
+              round,
+              built.workspace.path,
+              repairPrompt(
+                task,
+                built.contract,
+                [],
+                [
+                  {
+                    command: `${this.options.backend.id} acceptance`,
+                    exitCode: 1,
+                    durationMs: 0,
+                    output: reintegration.detail,
+                    timedOut: false,
+                  },
+                ],
+                round,
+              ),
+              workerOutputSchema,
+            );
+            await this.options.backend.continueConflict(built.workspace);
+            const restaged = await this.options.backend.stageCandidate({
+              workspace: this.workspace,
+              task: built.workspace,
+              taskKey: task.key,
+              summary: repair.summary,
+              refresh: true,
+            });
+            if (restaged.status === "conflict")
+              throw new Error(restaged.detail);
+            built.candidate = restaged.checkpoint;
+            await this.record("task.candidate", {
+              taskId: task.taskId,
+              candidate: built.candidate,
+              workspace: built.workspace,
+            });
+            continue;
+          }
+          delete this.workspace.handle.state.acceptingTask;
+          await this.record("task.accepted", {
+            taskId: task.taskId,
+            checkpoint: acceptedCheckpoint,
+            currentRevision: this.workspace.currentRevision,
+            workspace: this.workspace,
+          });
+          await this.emit({
+            type: "task.result",
+            at: now(),
+            taskId: task.taskId,
+            status: "accepted",
+            checkpoint: acceptedCheckpoint,
+            summary: built.buildSummary,
+            findings: reviewer.findings,
+          });
+          await this.options.backend.releaseTask(
+            this.workspace,
+            built.workspace,
+          );
+          return true;
+        }
         if (round >= this.options.projectConfig.harness.maxRepairRounds) {
           await this.record("task.failed", {
             taskId: task.taskId,
@@ -585,12 +713,12 @@ export class RunnerJobSupervisor {
             at: now(),
             taskId: task.taskId,
             status: "failed",
-            commit: null,
+            checkpoint: null,
             summary:
               "Blocking checks or review findings remain after the repair ceiling.",
             findings: reviewer.findings,
           });
-          await this.retainFailedIsolatedTask(built, "repair rounds exhausted");
+          await this.retainFailedTask(built, "repair rounds exhausted");
           return false;
         }
         round += 1;
@@ -606,59 +734,39 @@ export class RunnerJobSupervisor {
           task,
           "repairer",
           round,
-          built.path,
+          built.workspace.path,
           repairPrompt(task, built.contract, blockers, failures, round),
           workerOutputSchema,
         );
-        if (this.workspace.mode === "isolated")
-          built.draftCommit = await amendCheckpoint(
-            built.path,
-            task.key,
-            repair.summary,
+        const staged = await this.options.backend.stageCandidate({
+          workspace: this.workspace,
+          task: built.workspace,
+          taskKey: task.key,
+          summary: repair.summary,
+          refresh: true,
+        });
+        if (staged.status === "conflict")
+          throw new IntegrationConflict(
+            "candidate refresh requires conflict repair",
+            staged.detail,
+            staged.paths,
           );
+        built.candidate = staged.checkpoint;
+        await this.record("task.candidate", {
+          taskId: task.taskId,
+          candidate: built.candidate,
+          workspace: built.workspace,
+        });
       }
-      await this.emit({
-        type: "progress",
-        at: now(),
-        phase: "integrating",
-        message: `Integrating ${task.key}`,
-        progress: 0,
-      });
-      let commit: string;
-      if (this.workspace.mode === "direct") {
-        const head = await currentRevision(built.path);
-        if (head !== this.workspace.expectedHead)
-          throw new Error(`direct branch HEAD drifted before checkpoint`);
-        commit = await checkpoint(built.path, task.key, built.buildSummary);
-        this.workspace.expectedHead = commit;
-      } else {
-        commit = await currentRevision(built.path);
-        await integrateTask(this.workspace, commit);
-      }
-      await this.record("task.accepted", { taskId: task.taskId, commit });
-      const findings = this.state.tasks[task.taskId]?.findings ?? [];
-      await this.emit({
-        type: "task.result",
-        at: now(),
-        taskId: task.taskId,
-        status: "accepted",
-        commit,
-        summary: built.buildSummary,
-        findings,
-      });
-      if (this.workspace.mode === "isolated")
-        await removeTaskWorktree(this.workspace, built.path, built.branch);
-      return true;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      if (this.workspace.mode === "isolated")
-        await this.retainFailedIsolatedTask(built, reason).catch(
-          async (preservationError) => {
-            await this.record("warning", {
-              message: `failed to preserve ${task.key}: ${String(preservationError)}`,
-            });
-          },
-        );
+      await this.retainFailedTask(built, reason).catch(
+        async (preservationError) => {
+          await this.record("warning", {
+            message: `failed to preserve ${task.key}: ${String(preservationError)}`,
+          });
+        },
+      );
       await this.record("task.failed", {
         taskId: task.taskId,
         reason,
@@ -668,7 +776,7 @@ export class RunnerJobSupervisor {
         at: now(),
         taskId: task.taskId,
         status: "failed",
-        commit: null,
+        checkpoint: null,
         summary: reason,
         findings: [],
       });
@@ -676,59 +784,68 @@ export class RunnerJobSupervisor {
     }
   }
 
-  private async retainFailedIsolatedTask(
+  private async retainFailedTask(
     built: BuiltTask,
     reason: string,
   ): Promise<void> {
-    if (this.workspace.mode !== "isolated") return;
-    const commit = await normalizeWipCheckpoint(
-      built.path,
-      built.task.key,
+    const location = await this.options.backend.preserveFailedWork({
+      workspace: this.workspace,
+      task: built.workspace,
+      taskKey: built.task.key,
       reason,
-    );
-    await integrateWip(this.workspace, commit, built.task.key, reason);
-    await this.record("warning", {
-      message: `${built.task.key} failed; WIP preserved on the output branch at ${commit}`,
     });
-    await removeTaskWorktree(this.workspace, built.path, built.branch);
+    if (location) {
+      await this.record("task.retained", {
+        taskId: built.task.taskId,
+        location,
+      });
+      const message = `${built.task.key} failed; work preserved at ${location.label}`;
+      await this.record("warning", { message });
+      await this.emit({
+        type: "warning",
+        at: now(),
+        code: "failed-work-retained",
+        message,
+      });
+    }
+    await this.options.backend.releaseTask(this.workspace, built.workspace);
   }
 
   private async cleanupFailedBuildTask(
     task: RunnerTaskSnapshot,
     reason: string,
   ): Promise<void> {
-    if (this.workspace.mode !== "isolated") return;
     const retained = this.state.tasks[task.taskId];
-    if (!retained?.workspace || !retained.branch) return;
-    const paths = await dirtyPaths(retained.workspace);
-    const head = await currentRevision(retained.workspace);
-    if (paths.length > 0 || head !== retained.workspaceBase) {
-      const commit = await normalizeWipCheckpoint(
-        retained.workspace,
-        task.key,
-        reason,
-      );
-      await integrateWip(this.workspace, commit, task.key, reason);
-      await this.record("warning", {
-        message: `${task.key} build failed; WIP preserved on the output branch at ${commit}`,
+    if (!retained?.workspace) return;
+    const location = await this.options.backend.preserveFailedWork({
+      workspace: this.workspace,
+      task: retained.workspace,
+      taskKey: task.key,
+      reason,
+    });
+    if (location) {
+      await this.record("task.retained", { taskId: task.taskId, location });
+      const message = `${task.key} build failed; work preserved at ${location.label}`;
+      await this.record("warning", { message });
+      await this.emit({
+        type: "warning",
+        at: now(),
+        code: "failed-work-retained",
+        message,
       });
     }
-    await removeTaskWorktree(
-      this.workspace,
-      retained.workspace,
-      retained.branch,
-    );
+    await this.options.backend.releaseTask(this.workspace, retained.workspace);
   }
 
   private async terminalOutput(
     status: "succeeded" | "partial" | "failed" | "cancelled",
     started: number,
   ): Promise<RunnerJobOutput> {
-    const headRevision = await currentRevision(this.workspace.path);
-    const acceptedTaskCommits = Object.fromEntries(
+    const inspection = await this.options.backend.inspect(this.workspace);
+    const acceptedTaskCheckpoints = Object.fromEntries(
       Object.values(this.state.tasks)
-        .filter((task) => task.status === "accepted" && task.commit)
-        .map((task) => [task.taskId, task.commit!]),
+        .filter((task) => task.status === "accepted" && task.checkpoint)
+        .map((task) => [task.taskId, task.checkpoint!]),
     );
     const checks = Object.values(this.state.tasks).flatMap(
       (task) => task.checks,
@@ -738,15 +855,19 @@ export class RunnerJobSupervisor {
     );
     return {
       workspaceMode: this.workspace.mode,
-      branch: this.workspace.branch,
+      retainedLocation:
+        Object.keys(acceptedTaskCheckpoints).length > 0
+          ? this.workspace.retainedLocation
+          : (this.state.recoveryLocations.at(-1) ??
+            this.workspace.retainedLocation),
       baseRevision: this.workspace.baseRevision,
-      headRevision,
-      acceptedTaskCommits,
+      headRevision: inspection.revision,
+      acceptedTaskCheckpoints,
       checks,
       findings,
       usage: this.state.usage,
-      summary: `${status}: ${Object.keys(acceptedTaskCommits).length} task(s) accepted in ${Date.now() - started}ms (setup ${this.setupDurationMs}ms, checks ${this.checkDurationMs}ms).`,
-      dirtyPaths: await dirtyPaths(this.workspace.path),
+      summary: `${status}: ${Object.keys(acceptedTaskCheckpoints).length} task(s) accepted in ${Date.now() - started}ms (setup ${this.setupDurationMs}ms, checks ${this.checkDurationMs}ms).`,
+      dirtyPaths: inspection.dirtyPaths,
     };
   }
 
@@ -755,7 +876,7 @@ export class RunnerJobSupervisor {
     const jobDirectory = join(
       this.options.stateDirectory,
       "jobs",
-      safeRefPart(this.options.assignment.jobId),
+      safeIdPart(this.options.assignment.jobId),
     );
     await mkdir(jobDirectory, { recursive: true, mode: 0o700 });
     this.journal = await ChecksummedJournal.open(
@@ -778,8 +899,12 @@ export class RunnerJobSupervisor {
       throw new Error("assignment fencing mismatch with durable state");
     const source = this.options.assignment.source;
     const outputKey = source.kind === "task" ? source.task.key : source.planKey;
-    if (!this.state.branch) {
-      this.workspace = await prepareJobWorkspace({
+    if (!this.state.workspace) {
+      const orphanWarnings = await this.options.backend.recoverOrphans(
+        this.options.repository,
+        this.options.stateDirectory,
+      );
+      this.workspace = await this.options.backend.openJob({
         repository: this.options.repository,
         stateDirectory: this.options.stateDirectory,
         jobId: this.options.assignment.jobId,
@@ -788,22 +913,28 @@ export class RunnerJobSupervisor {
         expectedBaseRevision: this.options.assignment.expectedBaseRevision,
         config: this.options.projectConfig,
       });
-      await this.record("workspace.ready", {
-        branch: this.workspace.branch,
-        path: this.workspace.path,
-        baseRevision: this.workspace.baseRevision,
-        expectedHead: this.workspace.expectedHead,
-        mode: this.workspace.mode,
-      });
+      await this.record("workspace.opened", { workspace: this.workspace });
+      for (const message of [
+        ...this.options.projectConfig.normalizationWarnings,
+        ...orphanWarnings,
+      ]) {
+        await this.record("warning", { message });
+        await this.emit({
+          type: "warning",
+          at: now(),
+          code: "configuration-or-recovery",
+          message,
+        });
+      }
     } else
-      this.workspace = await restoreJobWorkspace({
+      this.workspace = await this.options.backend.restoreJob({
         repository: this.options.repository,
         stateDirectory: this.options.stateDirectory,
         jobId: this.options.assignment.jobId,
-        branch: this.state.branch,
-        baseRevision: this.state.baseRevision!,
-        expectedHead: this.state.expectedHead ?? this.state.baseRevision!,
-        mode: this.options.projectConfig.workspace.mode,
+        handle: this.state.workspace.handle,
+        baseRevision: this.state.workspace.baseRevision,
+        currentRevision: this.state.workspace.currentRevision,
+        mode: this.options.projectConfig.sourceControl.mode,
       });
     this.workspaceReady = true;
     for (const event of this.state.outboundEvents) {
@@ -837,9 +968,11 @@ export class RunnerJobSupervisor {
           running: new Set(),
           stopScheduling: this.state.stopScheduling,
         },
-        this.workspace.mode === "direct"
+        !this.options.backend.capabilities.parallelTaskWorkspaces
           ? 1
-          : this.options.projectConfig.harness.maxParallelTasks,
+          : this.workspace.mode === "direct"
+            ? 1
+            : this.options.projectConfig.harness.maxParallelTasks,
       );
       if (ready.length === 0) break;
       const built = await Promise.allSettled(
@@ -868,7 +1001,7 @@ export class RunnerJobSupervisor {
             at: now(),
             taskId: task.taskId,
             status: "failed",
-            commit: null,
+            checkpoint: null,
             summary: reason,
             findings: [],
           });
@@ -952,7 +1085,7 @@ export class RunnerJobSupervisor {
       return output;
     } finally {
       if (this.workspaceReady)
-        await releaseJobWorkspace(
+        await this.options.backend.release(
           this.workspace,
           this.options.assignment.jobId,
         );
@@ -964,7 +1097,7 @@ export async function loadDurableJobState(
   stateDirectory: string,
   jobId: string,
 ): Promise<JobState | null> {
-  const path = join(stateDirectory, "jobs", safeRefPart(jobId), "events.jsonl");
+  const path = join(stateDirectory, "jobs", safeIdPart(jobId), "events.jsonl");
   const journal = await ChecksummedJournal.open(path);
   return journal.all().length > 0 ? reduceJobState(journal.all()) : null;
 }

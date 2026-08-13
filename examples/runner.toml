@@ -6,12 +6,39 @@ stateDirectory = "/var/lib/noriq-runner"
 scanRoots = ["/srv/projects"]
 maxConcurrentJobs = 2
 
-[providers.codex]
+[drivers.codex]
+adapter = "codex"
 command = "/usr/local/bin/codex"
 args = []
-home = "/var/lib/noriq-runner/providers/codex"
+home = "/var/lib/noriq-runner/drivers/codex"
 
-[providers.claude]
+[drivers.claude]
+adapter = "claude"
 command = "/usr/local/bin/claude"
 args = []
-home = "/var/lib/noriq-runner/providers/claude"
+home = "/var/lib/noriq-runner/drivers/claude"
+
+# Future vendors can be registered without Runner code changes:
+# [drivers.vendor]
+# adapter = "external-jsonl-v1"
+# command = "/opt/vendor/noriq-driver"
+# args = []
+# [drivers.vendor.capabilities]
+# workspaceAccess = ["read-only", "workspace-write"]
+# runnerControlMcpInjection = true
+# projectNativeConfiguration = true
+# usageAccuracy = "exact"
+# hardBudget = true
+# processTreeTermination = true
+
+[backends.git]
+adapter = "git"
+command = "/usr/bin/git"
+
+[backends.diversion]
+adapter = "diversion"
+command = "/usr/local/bin/dv"
+
+[backends.perforce]
+adapter = "perforce"
+command = "/usr/local/bin/p4"

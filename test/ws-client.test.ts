@@ -50,6 +50,7 @@ describe("RunnerSocket", () => {
         {
           repositoryKey: "repo",
           repoRef: "repo",
+          vcs: "git",
           baseRevision: "a".repeat(40),
         },
       ],

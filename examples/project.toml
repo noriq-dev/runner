@@ -2,12 +2,13 @@ key = "RUN"
 repositoryKey = "noriq-runner"
 defaultBranch = "main"
 
-[workspace]
+[sourceControl]
+backend = "auto"
 mode = "isolated"
-baseBranch = "main"
+base = "main"
 # For direct mode:
 # mode = "direct"
-# directBranch = "feature/my-branch"
+# target = "feature/my-branch"
 
 [harness]
 maxParallelTasks = 2
@@ -15,17 +16,17 @@ maxRepairRounds = 2
 maxJobMinutes = 240
 
 [agents.guide]
-provider = "codex"
+driver = "codex"
 model = "gpt-5.6-sol"
 effort = "high"
 
 [agents.builder]
-provider = "claude"
+driver = "claude"
 model = "sonnet"
 effort = "medium"
 
 [agents.reviewer]
-provider = "codex"
+driver = "codex"
 model = "gpt-5.6-sol"
 effort = "high"
 

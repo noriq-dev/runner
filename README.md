@@ -1,36 +1,54 @@
 # Noriq Runner
 
-Noriq Runner is a small, durable job harness. Noriq commissions one immutable task or plan snapshot; Runner owns the local agent loop, dependency scheduling, checks, reviews, bounded repairs, Git checkpoints, and restart recovery. It never pushes, merges another branch, or opens a pull request.
+Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, and restart recovery. It never pushes, merges into a human base, opens a review, or interprets project MCP configuration.
 
 ## Runtime boundary
 
-- Noriq selects only a Runner and repository and retains coarse progress, questions, evidence, usage, and the final Git result.
-- Committed `project.toml` selects providers/models, limits, checks, and isolated or direct Git behavior.
-- Machine-local `runner.toml` contains credentials, provider commands/homes, scan roots, and machine capacity.
-- Project-native provider configuration and MCP files remain provider-owned. Runner injects only its confined `noriq_runner` control MCP into guide invocations and does not parse project MCP schemas.
+- Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, and the final retained location.
+- Committed `project.toml` selects registered driver and backend IDs, models, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
+- Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, isolated vendor homes, credentials, scan roots, and machine capacity.
+- Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP schemas.
 
 ## Start
 
 ```bash
 npm ci
 npm run check
+npm run vendor:check
 npm run build
 node dist/cli.js start --config /absolute/path/to/runner.toml
 ```
 
-The daemon discovers `project.toml` or `.noriq/project.toml` within configured scan roots. It advertises the current configured base revision and refuses assignments whose immutable base no longer matches.
+The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
 
-See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Provider homes must already contain valid authentication. Preflight checks the installed version, auth status, structured-output flags, and injected Runner Control MCP inventory before work begins.
+See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]` and per-role `provider` project keys are normalized once with warning events.
 
-## Git outcomes
+## Source-control contract
 
-Isolated task jobs retain `noriq/task/<key>-<job>`; plan jobs retain `noriq/plan/<key>-<job>`. Plan child worktrees build concurrently but enter a stable serialized rebase/check/review/integration lane. Direct mode requires a clean configured branch, pins its expected HEAD, takes an exclusive machine-local repository lock, and runs one task at a time.
+Runner core persists only backend-tagged JSON handles, filesystem workspaces, opaque revisions, candidates, checkpoints, and retained locations. Foreign or incompatible handles fail closed.
 
-The checksummed journal under `runner.stateDirectory/jobs/<job>/events.jsonl` is authoritative. Provider receipts prevent completed calls from being repeated after a crash; unacknowledged control-plane events replay with the same sequence numbers.
+- Git isolated jobs retain an output branch and use independent task workspaces. Only accepted candidates fast-forward the output. Failed candidates move to recovery refs. Direct jobs pin the target, commit only accepted work, and restore rejected work to a recovery ref without advancing the target.
+- Diversion uses its existing checkout under an exclusive repository lease. Isolated tasks work on candidate branches and merge into the server-visible job output only after acceptance. Direct jobs pin the configured target. Failed work stays on a candidate branch or named shelf.
+- Perforce validates the client mapping and requires `allwrite`. Each task owns a numbered changelist. Isolated tasks refresh cumulative shelves; accepted work is reopened into the next task’s changelist while earlier shelves remain review checkpoints. Direct tasks submit only after acceptance. Failed work is shelved before the client is reverted.
+
+Git isolated task workspaces may build concurrently. Diversion, Perforce, and every direct job advertise a pool of one, so the supervisor clamps task execution to sequential operation. Repository lease files are scoped by backend registration plus repository identity and include crash-recovery ownership.
+
+## Agent-driver contract
+
+The supervisor selects drivers by capability, not vendor name. Guide and reviewer sessions require enforced read-only access; builder and repair sessions require workspace-write access. Runner owns schemas, receipts, usage aggregation, budgets, cancellation, and recovery. A driver owns only translation to its vendor protocol.
+
+Codex and Claude are separate built-in drivers with isolated vendor homes, explicit workspace access modes, structured output, Runner Control MCP injection, and project-native configuration discovery from the workspace.
+
+`external-jsonl-v1` is the extension seam for future vendors. Runner writes one versioned preflight or invocation object to stdin. The executable writes normalized JSONL events followed by exactly one result/error terminal frame. Malformed frames, duplicate terminals, frames after terminal, and capability drift fail closed. Cancellation targets the managed process group and escalates to a hard kill.
+
+## Durability
+
+The checksummed journal under `runner.stateDirectory/jobs/<job>/events.jsonl` is authoritative. It stores opaque workspace/task handles and complete checkpoint records. Agent receipts prevent completed calls from being repeated after a crash; unacknowledged Noriq events replay with their original sequence numbers. Backend operations are designed to rediscover already-created branches, shelves, changelists, and recovery locations before mutating again.
 
 ## Deliberate limits
 
-- No legacy Run/mission protocol, server-side plan pump, execution profiles, landing, pushing, PR creation, indexing, or Project Memory ingestion.
-- Reviewer invocations are read-only. Only blocker/major findings or deterministic check failures consume a repair round.
-- Token or cost caps fail preflight unless an adapter can honestly enforce them. Measurement without enforcement is not presented as a hard ceiling.
-- Full provider logs remain local under the Runner state directory. Noriq receives compact evidence only.
+- No legacy Run/mission protocol, server-side plan pump, execution profiles, landing, pushing, review creation, indexing, or Project Memory ingestion.
+- Only blocker/major findings or deterministic check failures consume a repair round.
+- Token or cost caps fail preflight unless a driver can honestly enforce them. Measurement without hard enforcement is not presented as a ceiling.
+- Full agent logs remain local under the Runner state directory. Noriq receives compact evidence only.
+- Runner does not create Perforce streams or interpret site-specific branch/stream policy.

@@ -44,10 +44,26 @@ export async function runProcess(options: {
   else child.stdin.end();
 
   let timedOut = false;
+  let forcedTermination: NodeJS.Timeout | undefined;
   const terminate = () => {
     if (child.exitCode !== null) return;
     if (process.platform === "win32") child.kill("SIGTERM");
-    else if (child.pid !== undefined) process.kill(-child.pid, "SIGTERM");
+    else if (child.pid !== undefined) {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      forcedTermination ??= setTimeout(() => {
+        if (child.exitCode !== null || child.pid === undefined) return;
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      }, 5_000);
+      forcedTermination.unref();
+    }
   };
   const timeout = setTimeout(() => {
     timedOut = true;
@@ -55,6 +71,7 @@ export async function runProcess(options: {
   }, options.timeoutMs);
   const abort = () => terminate();
   options.signal?.addEventListener("abort", abort, { once: true });
+  if (options.signal?.aborted) terminate();
   const result = await new Promise<{
     exitCode: number | null;
     signal: NodeJS.Signals | null;
@@ -63,6 +80,7 @@ export async function runProcess(options: {
     child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
   }).finally(() => {
     clearTimeout(timeout);
+    if (forcedTermination) clearTimeout(forcedTermination);
     options.signal?.removeEventListener("abort", abort);
   });
   return {

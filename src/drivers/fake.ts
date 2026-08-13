@@ -2,19 +2,34 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Finding } from "../contracts.js";
 import type {
+  AgentDriver,
+  AgentDriverCapabilities,
   AgentRequest,
   AgentResult,
-  ProviderAdapter,
-  ProviderPreflight,
+  DriverPreflight,
+  DriverPreflightRequest,
 } from "./types.js";
+import { type AgentSession, PromiseAgentSession } from "./types.js";
 
 export type FakeHandler = (
   request: AgentRequest,
   call: number,
 ) => Promise<Partial<AgentResult> & { structured?: Record<string, unknown> }>;
 
-export class FakeProviderAdapter implements ProviderAdapter {
-  readonly name = "fake" as const;
+export class FakeAgentDriver implements AgentDriver {
+  readonly id = "fake" as const;
+  readonly capabilities: AgentDriverCapabilities = {
+    structuredOutput: true,
+    workspaceAccess: ["read-only", "workspace-write"],
+    runnerControlMcpInjection: true,
+    projectNativeConfiguration: true,
+    usageAccuracy: "exact",
+    hardBudget: true,
+    processTreeTermination: true,
+  };
+  get name(): string {
+    return this.id;
+  }
   calls: AgentRequest[] = [];
   constructor(
     private readonly artifactRoot: string,
@@ -35,20 +50,15 @@ export class FakeProviderAdapter implements ProviderAdapter {
     }),
   ) {}
 
-  async preflight(
-    _workspace: string,
-    _requireControl: boolean,
-  ): Promise<ProviderPreflight> {
+  async preflight(_request: DriverPreflightRequest): Promise<DriverPreflight> {
     return {
-      provider: "fake",
+      driver: "fake",
       version: "fake-1",
       authenticated: true,
-      structuredOutput: true,
+      capabilities: this.capabilities,
       runnerControlVisible: true,
       projectTools: ["project.echo"],
       warnings: [],
-      usageReporting: "exact",
-      costEnforcement: true,
     };
   }
 
@@ -71,7 +81,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
     const rawLogPath = join(
       this.artifactRoot,
       request.invocationId,
-      "provider.log",
+      "driver.log",
     );
     await mkdir(join(this.artifactRoot, request.invocationId), {
       recursive: true,
@@ -104,5 +114,13 @@ export class FakeProviderAdapter implements ProviderAdapter {
       JSON.stringify(result),
     );
     return result;
+  }
+
+  async start(request: AgentRequest): Promise<AgentSession> {
+    return new PromiseAgentSession(
+      request.invocationId,
+      (signal) => this.invoke({ ...request, signal }),
+      request.signal,
+    );
   }
 }

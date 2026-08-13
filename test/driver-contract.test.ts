@@ -1,9 +1,10 @@
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type MachineConfig, projectConfigSchema } from "../src/config.js";
-import { CliProviderAdapter } from "../src/providers/process-adapter.js";
+import { ClaudeAgentDriver } from "../src/drivers/claude.js";
+import { CodexAgentDriver } from "../src/drivers/codex.js";
 
 const projectConfig = projectConfigSchema.parse({
   key: "RUN",
@@ -12,9 +13,9 @@ const projectConfig = projectConfigSchema.parse({
   workspace: { mode: "isolated", baseBranch: "main" },
   harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 1 },
   agents: {
-    guide: { provider: "codex", model: "guide", effort: "high" },
-    builder: { provider: "codex", model: "builder", effort: "medium" },
-    reviewer: { provider: "codex", model: "reviewer", effort: "high" },
+    guide: { driver: "codex", model: "guide", effort: "high" },
+    builder: { driver: "codex", model: "builder", effort: "medium" },
+    reviewer: { driver: "codex", model: "reviewer", effort: "high" },
   },
   setup: { commands: [], timeoutSeconds: 30 },
   checks: { commands: [], timeoutSeconds: 30 },
@@ -34,10 +35,10 @@ if (args.includes('--help')) { console.log('--output-schema --json'); process.ex
 if (args[0] === 'login' && args[1] === 'status') { console.log('logged in'); process.exit(0); }
 if (args[0] === 'mcp' && args[1] === 'list') {
   if (!process.env.OMIT_CONTROL) console.log('noriq_runner enabled');
-  if (existsSync(join(process.cwd(), '.mcp.json'))) console.log('project_echo enabled');
+  if (existsSync(join(process.cwd(), '.codex', 'config.toml'))) console.log('project_echo enabled');
   process.exit(0);
 }
-if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
+if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.codex', 'config.toml'))) process.exit(9);
 const outputIndex = args.indexOf('--output-last-message');
 if (process.env.MALFORMED !== '1' && outputIndex >= 0) writeFileSync(args[outputIndex + 1], JSON.stringify({ summary: 'built', findings: [] }));
 console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 12, cached_input_tokens: 3, output_tokens: 4 } }));
@@ -73,25 +74,35 @@ console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'buil
   return path;
 }
 
-describe("CLI provider contract", () => {
-  it("verifies auth/structured output/control MCP and isolates the provider home", async () => {
-    const root = await mkdtemp(join(tmpdir(), "runner-provider-"));
+describe("built-in driver contract", () => {
+  it("verifies auth/structured output/control MCP and isolates the driver home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-driver-"));
     const command = await fakeCodex(root);
     const envLog = join(root, "env.jsonl");
-    const providerConfig: NonNullable<MachineConfig["providers"]["codex"]> = {
+    const driverConfig: Extract<
+      MachineConfig["drivers"][string],
+      { adapter: "codex" }
+    > = {
+      adapter: "codex",
       command,
       args: [],
       home: join(root, "codex-home"),
       env: { FAKE_ENV_LOG: envLog },
     };
-    const adapter = new CliProviderAdapter(
+    const adapter = new CodexAgentDriver(
       "codex",
-      providerConfig,
+      driverConfig,
       join(root, "state"),
     );
-    await expect(adapter.preflight(root, true)).resolves.toMatchObject({
+    await expect(
+      adapter.preflight({
+        workspace: root,
+        access: "workspace-write",
+        requireControlMcp: true,
+      }),
+    ).resolves.toMatchObject({
       authenticated: true,
-      structuredOutput: true,
+      capabilities: { structuredOutput: true },
       runnerControlVisible: true,
     });
     const result = await adapter.invoke({
@@ -100,6 +111,7 @@ describe("CLI provider contract", () => {
       taskId: "task",
       taskKey: "RUN-1",
       workspace: root,
+      access: "workspace-write",
       prompt: "build",
       outputSchema: { type: "object" },
       projectConfig,
@@ -115,29 +127,33 @@ describe("CLI provider contract", () => {
       .map((line) => JSON.parse(line));
     expect(
       observations.every(
-        (entry) => entry.home === providerConfig.home && !entry.claude,
+        (entry) => entry.home === driverConfig.home && !entry.claude,
       ),
     ).toBe(true);
   });
 
   it("fails closed when the guide control MCP or structured result is missing", async () => {
-    const root = await mkdtemp(join(tmpdir(), "runner-provider-fail-"));
+    const root = await mkdtemp(join(tmpdir(), "runner-driver-fail-"));
     const command = await fakeCodex(root);
-    const base: NonNullable<MachineConfig["providers"]["codex"]> = {
+    const base: Extract<
+      MachineConfig["drivers"][string],
+      { adapter: "codex" }
+    > = {
+      adapter: "codex",
       command,
       args: [],
       home: join(root, "home"),
       env: { OMIT_CONTROL: "1" },
     };
-    const missing = new CliProviderAdapter(
-      "codex",
-      base,
-      join(root, "state-a"),
-    );
-    await expect(missing.preflight(root, true)).rejects.toThrow(
-      /did not expose/,
-    );
-    const malformed = new CliProviderAdapter(
+    const missing = new CodexAgentDriver("codex", base, join(root, "state-a"));
+    await expect(
+      missing.preflight({
+        workspace: root,
+        access: "read-only",
+        requireControlMcp: true,
+      }),
+    ).rejects.toThrow(/did not expose/);
+    const malformed = new CodexAgentDriver(
       "codex",
       {
         ...base,
@@ -152,6 +168,7 @@ describe("CLI provider contract", () => {
         taskId: "task",
         taskKey: "RUN-2",
         workspace: root,
+        access: "workspace-write",
         prompt: "build",
         outputSchema: { type: "object" },
         projectConfig,
@@ -161,6 +178,11 @@ describe("CLI provider contract", () => {
 
   it("leaves a project-native MCP visible and usable to both vendor processes", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-project-mcp-"));
+    await mkdir(join(root, ".codex"));
+    await writeFile(
+      join(root, ".codex", "config.toml"),
+      '[mcp_servers.project_echo]\ncommand = "project-echo"\n',
+    );
     await writeFile(
       join(root, ".mcp.json"),
       JSON.stringify({
@@ -169,9 +191,10 @@ describe("CLI provider contract", () => {
     );
     const state = join(root, "state");
     const adapters = [
-      new CliProviderAdapter(
+      new CodexAgentDriver(
         "codex",
         {
+          adapter: "codex",
           command: await fakeCodex(root),
           args: [],
           home: join(root, "codex-home"),
@@ -179,9 +202,10 @@ describe("CLI provider contract", () => {
         },
         state,
       ),
-      new CliProviderAdapter(
+      new ClaudeAgentDriver(
         "claude",
         {
+          adapter: "claude",
           command: await fakeClaude(root),
           args: [],
           home: join(root, "claude-home"),
@@ -192,7 +216,13 @@ describe("CLI provider contract", () => {
     ];
 
     for (const adapter of adapters) {
-      await expect(adapter.preflight(root, true)).resolves.toMatchObject({
+      await expect(
+        adapter.preflight({
+          workspace: root,
+          access: "read-only",
+          requireControlMcp: true,
+        }),
+      ).resolves.toMatchObject({
         runnerControlVisible: true,
         projectTools: ["project_echo enabled"],
       });
@@ -203,6 +233,7 @@ describe("CLI provider contract", () => {
           taskId: "task",
           taskKey: "RUN-3",
           workspace: root,
+          access: "read-only",
           prompt: "use project echo",
           outputSchema: { type: "object" },
           projectConfig,

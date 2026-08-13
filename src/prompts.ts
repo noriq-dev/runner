@@ -21,7 +21,7 @@ export function builderPrompt(
   contract: TaskContract,
   guideInstructions?: string,
 ): string {
-  return `You are the builder. Implement exactly one task in the current Git worktree. You may edit files and run focused checks. Do not commit, push, merge, create branches, or alter worktrees; the harness owns Git. Do not broaden scope. Finish with a truthful summary and verification evidence.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
+  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Finish with a truthful summary and verification evidence.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
 }
 
 export function reviewerPrompt(
@@ -30,7 +30,7 @@ export function reviewerPrompt(
   diff: string,
   checkSummary: string,
 ): string {
-  return `You are an independent read-only reviewer. You cannot edit files and must not implement fixes. Review the final rebased diff against the task contract and repository behavior. Report only concrete defects introduced by this diff. A blocker or major finding must name a failure scenario, evidence location, and violated acceptance condition. Minor findings are nonblocking. If no actionable defect exists, return an empty findings list.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nDeterministic checks:\n${checkSummary}\n\nFinal diff:\n${diff.slice(0, 200_000)}`;
+  return `You are an independent read-only reviewer. You cannot edit files and must not implement fixes. Review the staged candidate diff against the task contract and repository behavior. Report only concrete defects introduced by this candidate. A blocker or major finding must name a failure scenario, evidence location, and violated acceptance condition. Minor findings are nonblocking. If no actionable defect exists, return an empty findings list.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nDeterministic checks:\n${checkSummary}\n\nCandidate diff:\n${diff.slice(0, 200_000)}`;
 }
 
 export function repairPrompt(
@@ -40,7 +40,7 @@ export function repairPrompt(
   checks: unknown,
   round: number,
 ): string {
-  return `You are a fresh repair worker for round ${round}. Fix only the blocking deterministic-check failures and blocker/major review findings listed below. Work in the current worktree. Do not commit, push, merge, create branches, or alter worktrees; the harness owns Git. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
+  return `You are a fresh repair worker for round ${round}. Fix only the blocking deterministic-check failures and blocker/major review findings listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
 }
 
 export const guideOutputSchema = {

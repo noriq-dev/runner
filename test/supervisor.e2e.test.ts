@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
+import { FakeAgentDriver } from "../src/drivers/fake.js";
 import { runProcess } from "../src/process.js";
-import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { MemoryEventSink, RunnerJobSupervisor } from "../src/supervisor.js";
+import { GitWorkspaceBackend } from "../src/vcs/git.js";
 
 async function command(
   cwd: string,
@@ -35,7 +36,7 @@ describe("RunnerJobSupervisor", () => {
     await command(repository, "git", ["commit", "-m", "base"]);
     const base = await command(repository, "git", ["rev-parse", "HEAD"]);
     let reviewerCalls = 0;
-    const fake = new FakeProviderAdapter(
+    const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
         if (request.role === "guide") {
@@ -84,9 +85,9 @@ describe("RunnerJobSupervisor", () => {
       workspace: { mode: "isolated", baseBranch: "main" },
       harness: { maxParallelTasks: 2, maxRepairRounds: 2, maxJobMinutes: 5 },
       agents: {
-        guide: { provider: "fake", model: "guide", effort: "high" },
-        builder: { provider: "fake", model: "builder", effort: "medium" },
-        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
       },
       setup: { commands: [], timeoutSeconds: 30 },
       checks: { commands: ["grep -q fixed feature.txt"], timeoutSeconds: 30 },
@@ -121,12 +122,13 @@ describe("RunnerJobSupervisor", () => {
       repository,
       stateDirectory: join(root, "state"),
       projectConfig: config,
-      providers: { fake, codex: undefined, claude: undefined },
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
       sink,
     });
     const output = await supervisor.run();
     expect(output.summary).toContain("succeeded");
-    expect(output.branch).toMatch(/^noriq\/task\/run-1-/);
+    expect(output.retainedLocation.label).toMatch(/^noriq\/task\/run-1-/);
     expect(output.dirtyPaths).toEqual([]);
     expect(
       await readFile(
@@ -146,7 +148,7 @@ describe("RunnerJobSupervisor", () => {
       await command(repository, "git", [
         "rev-list",
         "--count",
-        `${base}..${output.branch}`,
+        `${base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("1");
   });
@@ -166,7 +168,7 @@ describe("RunnerJobSupervisor", () => {
     await command(repository, "git", ["add", "."]);
     await command(repository, "git", ["commit", "-m", "base"]);
     const base = await command(repository, "git", ["rev-parse", "HEAD"]);
-    const fake = new FakeProviderAdapter(
+    const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
         if (request.role === "guide")
@@ -206,9 +208,9 @@ describe("RunnerJobSupervisor", () => {
       workspace: { mode: "isolated", baseBranch: "main" },
       harness: { maxParallelTasks: 2, maxRepairRounds: 2, maxJobMinutes: 5 },
       agents: {
-        guide: { provider: "fake", model: "guide", effort: "high" },
-        builder: { provider: "fake", model: "builder", effort: "medium" },
-        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
       },
       setup: { commands: [], timeoutSeconds: 30 },
       checks: { commands: ["test -f shared.txt"], timeoutSeconds: 30 },
@@ -247,7 +249,8 @@ describe("RunnerJobSupervisor", () => {
       repository,
       stateDirectory: join(root, "state"),
       projectConfig: config,
-      providers: { fake, codex: undefined, claude: undefined },
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
       sink: new MemoryEventSink(),
     }).run();
     expect(output.summary).toContain("2 task(s) accepted");
@@ -264,7 +267,7 @@ describe("RunnerJobSupervisor", () => {
       await command(repository, "git", [
         "rev-list",
         "--count",
-        `${base}..${output.branch}`,
+        `${base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("2");
   });
@@ -284,7 +287,7 @@ describe("RunnerJobSupervisor", () => {
     await command(repository, "git", ["add", "."]);
     await command(repository, "git", ["commit", "-m", "base"]);
     const base = await command(repository, "git", ["rev-parse", "HEAD"]);
-    const fake = new FakeProviderAdapter(
+    const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
         if (request.role === "guide")
@@ -301,7 +304,7 @@ describe("RunnerJobSupervisor", () => {
           };
         if (request.role === "builder") {
           await writeFile(join(request.workspace, "failed.txt"), "evidence\n");
-          throw new Error("provider crashed after editing");
+          throw new Error("driver crashed after editing");
         }
         return { summary: "unused" };
       },
@@ -313,9 +316,9 @@ describe("RunnerJobSupervisor", () => {
       workspace: { mode: "isolated", baseBranch: "main" },
       harness: { maxParallelTasks: 1, maxRepairRounds: 2, maxJobMinutes: 5 },
       agents: {
-        guide: { provider: "fake", model: "guide", effort: "high" },
-        builder: { provider: "fake", model: "builder", effort: "medium" },
-        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
       },
       setup: { commands: [], timeoutSeconds: 30 },
       checks: { commands: [], timeoutSeconds: 30 },
@@ -350,28 +353,18 @@ describe("RunnerJobSupervisor", () => {
       repository,
       stateDirectory,
       projectConfig: config,
-      providers: { fake, codex: undefined, claude: undefined },
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
       sink: new MemoryEventSink(),
     }).run();
     expect(output.summary).toContain("failed");
     expect(output.dirtyPaths).toEqual([]);
-    expect(
-      await readFile(
-        join(
-          stateDirectory,
-          "worktrees",
-          "job-build-fail",
-          "job",
-          "failed.txt",
-        ),
-        "utf8",
-      ),
-    ).toBe("evidence\n");
+    expect(output.retainedLocation.label).toMatch(/^noriq\/recovery\//);
     expect(
       await command(repository, "git", [
         "log",
         "--format=%s",
-        `${base}..${output.branch}`,
+        `${base}..${output.retainedLocation.label}`,
       ]),
     ).toContain("WIP RUN-20");
     expect(
@@ -394,7 +387,7 @@ describe("RunnerJobSupervisor", () => {
     await command(repository, "git", ["add", "."]);
     await command(repository, "git", ["commit", "-m", "base"]);
     const base = await command(repository, "git", ["rev-parse", "HEAD"]);
-    const fake = new FakeProviderAdapter(
+    const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
         if (request.role === "guide")
@@ -424,9 +417,9 @@ describe("RunnerJobSupervisor", () => {
       workspace: { mode: "direct", baseBranch: "main", directBranch: "main" },
       harness: { maxParallelTasks: 2, maxRepairRounds: 2, maxJobMinutes: 5 },
       agents: {
-        guide: { provider: "fake", model: "guide", effort: "high" },
-        builder: { provider: "fake", model: "builder", effort: "medium" },
-        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
       },
       setup: { commands: [], timeoutSeconds: 30 },
       checks: { commands: ["grep -q direct direct.txt"], timeoutSeconds: 30 },
@@ -461,11 +454,12 @@ describe("RunnerJobSupervisor", () => {
       repository,
       stateDirectory,
       projectConfig: config,
-      providers: { fake, codex: undefined, claude: undefined },
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
       sink: new MemoryEventSink(),
     }).run();
     expect(output.summary).toContain("succeeded");
-    expect(output.branch).toBe("main");
+    expect(output.retainedLocation.label).toBe("main");
     expect(output.dirtyPaths).toEqual([]);
     expect(
       await command(repository, "git", [

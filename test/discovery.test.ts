@@ -45,12 +45,12 @@ model = "guide"
 effort = "high"
 
 [agents.builder]
-provider = "fake"
+driver = "fake"
 model = "builder"
 effort = "medium"
 
 [agents.reviewer]
-provider = "fake"
+driver = "fake"
 model = "reviewer"
 effort = "high"
 
@@ -82,5 +82,12 @@ describe("discoverProjects", () => {
       "repo-one",
       "repo-two",
     ]);
+    expect(projects[0]!.config.agents.guide.driver).toBe("fake");
+    expect(projects[0]!.config.normalizationWarnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("legacy [workspace]"),
+        expect.stringContaining("legacy provider"),
+      ]),
+    );
   });
 });

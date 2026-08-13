@@ -9,6 +9,12 @@ import type {
   Usage,
 } from "./contracts.js";
 import type { JournalRecord } from "./journal.js";
+import type {
+  JobWorkspace,
+  RetainedLocation,
+  SourceControlCheckpoint,
+  TaskWorkspace,
+} from "./vcs/types.js";
 
 export interface InvocationState {
   id: string;
@@ -23,11 +29,9 @@ export interface TaskState {
   status: RunnerJobTaskStatus;
   repairRounds: number;
   plan?: string;
-  workspace?: string;
-  branch?: string;
-  workspaceBase?: string;
-  draftCommit?: string;
-  commit?: string;
+  workspace?: TaskWorkspace;
+  candidate?: SourceControlCheckpoint;
+  checkpoint?: SourceControlCheckpoint;
   findings: Finding[];
   checks: CheckResult[];
 }
@@ -38,9 +42,8 @@ export interface JobState {
   phase: RunnerJobPhase;
   cancelled: boolean;
   stopScheduling: boolean;
-  baseRevision?: string;
-  branch?: string;
-  expectedHead?: string;
+  workspace?: JobWorkspace;
+  recoveryLocations: RetainedLocation[];
   tasks: Record<string, TaskState>;
   invocations: Record<string, InvocationState>;
   completedActions: Record<string, unknown>;
@@ -76,6 +79,7 @@ export function emptyJobState(): JobState {
       calls: 0,
     },
     warnings: [],
+    recoveryLocations: [],
   };
 }
 
@@ -129,10 +133,9 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
       case "job.terminal":
         state.status = payload.status as RunnerJobStatus;
         break;
-      case "workspace.ready":
-        state.baseRevision = payload.baseRevision as string;
-        state.branch = payload.branch as string;
-        state.expectedHead = payload.expectedHead as string;
+      case "workspace.opened":
+      case "workspace.updated":
+        state.workspace = payload.workspace as unknown as JobWorkspace;
         break;
       case "task.started":
         state.tasks[payload.taskId as string]!.status = "running";
@@ -142,15 +145,18 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         break;
       case "task.workspace": {
         const task = state.tasks[payload.taskId as string]!;
-        task.workspace = payload.path as string;
-        task.branch = payload.branch as string;
-        task.workspaceBase = payload.baseRevision as string;
+        task.workspace = payload.workspace as unknown as TaskWorkspace;
+        if (payload.jobWorkspace)
+          state.workspace = payload.jobWorkspace as unknown as JobWorkspace;
         break;
       }
-      case "task.draft":
-        state.tasks[payload.taskId as string]!.draftCommit =
-          payload.commit as string;
+      case "task.candidate": {
+        const task = state.tasks[payload.taskId as string]!;
+        task.candidate = payload.candidate as SourceControlCheckpoint;
+        if (payload.workspace)
+          task.workspace = payload.workspace as unknown as TaskWorkspace;
         break;
+      }
       case "task.checked":
         state.tasks[payload.taskId as string]!.checks.push(
           ...(payload.checks as CheckResult[]),
@@ -167,10 +173,16 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
       case "task.accepted": {
         const task = state.tasks[payload.taskId as string]!;
         task.status = "accepted";
-        task.commit = payload.commit as string;
-        state.expectedHead = payload.commit as string;
+        task.checkpoint = payload.checkpoint as SourceControlCheckpoint;
+        if (payload.workspace)
+          state.workspace = payload.workspace as unknown as JobWorkspace;
+        else if (state.workspace)
+          state.workspace.currentRevision = payload.currentRevision as string;
         break;
       }
+      case "task.retained":
+        state.recoveryLocations.push(payload.location as RetainedLocation);
+        break;
       case "task.failed":
         state.tasks[payload.taskId as string]!.status = "failed";
         state.stopScheduling = true;

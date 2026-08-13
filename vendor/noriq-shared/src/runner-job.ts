@@ -3,7 +3,21 @@ import { ExecutionSpec } from './execution-spec';
 
 const id = z.string().trim().min(1).max(128);
 const text = (maximum: number) => z.string().trim().min(1).max(maximum);
-const sha = z.string().regex(/^[0-9a-f]{40,64}$/);
+const revision = text(1_000);
+
+export const RunnerJobCheckpoint = z.object({
+  ref: revision,
+  label: text(500),
+  url: z.string().url().max(2_000).nullable(),
+}).strict();
+export type RunnerJobCheckpoint = z.infer<typeof RunnerJobCheckpoint>;
+
+export const RunnerJobRetainedLocation = z.object({
+  vcs: text(100),
+  label: text(1_000),
+  url: z.string().url().max(2_000).nullable(),
+}).strict();
+export type RunnerJobRetainedLocation = z.infer<typeof RunnerJobRetainedLocation>;
 
 export const RunnerJobTaskSnapshot = z.object({
   taskId: id,
@@ -88,10 +102,10 @@ export type RunnerJobCheck = z.infer<typeof RunnerJobCheck>;
 
 export const RunnerJobOutput = z.object({
   workspaceMode: z.enum(['isolated', 'direct']),
-  branch: text(500),
-  baseRevision: sha,
-  headRevision: sha,
-  acceptedTaskCommits: z.record(z.string(), sha),
+  retainedLocation: RunnerJobRetainedLocation,
+  baseRevision: revision,
+  headRevision: revision,
+  acceptedTaskCheckpoints: z.record(z.string(), RunnerJobCheckpoint),
   checks: z.array(RunnerJobCheck).max(1_000),
   findings: z.array(RunnerJobFinding).max(1_000),
   usage: RunnerJobUsage,
@@ -104,7 +118,7 @@ const at = z.string().datetime();
 export const RunnerJobEvent = z.discriminatedUnion('type', [
   z.object({ type: z.literal('progress'), at, phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
   z.object({ type: z.literal('task.plan'), at, taskId: id, plan: z.string().max(20_000) }).strict(),
-  z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, commit: sha.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),
+  z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, checkpoint: RunnerJobCheckpoint.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),
   z.object({ type: z.literal('question'), at, questionId: id, prompt: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('usage'), at, usage: RunnerJobUsage }).strict(),
   z.object({ type: z.literal('warning'), at, code: text(100), message: z.string().max(20_000) }).strict(),
@@ -119,7 +133,7 @@ export const RunnerJobAssignment = z.object({
   snapshotDigest: z.string().regex(/^[0-9a-f]{64}$/),
   source: RunnerJobSource,
   repoRef: text(500),
-  expectedBaseRevision: sha,
+  expectedBaseRevision: revision,
 }).strict();
 export type RunnerJobAssignment = z.infer<typeof RunnerJobAssignment>;
 
@@ -127,7 +141,7 @@ export const RunnerJobDispatch = z.object({ runnerId: id, repoRef: text(500) }).
 export type RunnerJobDispatch = z.infer<typeof RunnerJobDispatch>;
 
 export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), baseRevision: sha }).strict()).max(1_000) }).strict(),
+  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), vcs: text(100), baseRevision: revision }).strict()).max(1_000) }).strict(),
   z.object({ type: z.literal('heartbeat'), freeSlots: z.number().int().min(0).max(32), activeJobIds: z.array(id).max(32) }).strict(),
   z.object({ type: z.literal('job.accept'), jobId: id, assignmentId: id }).strict(),
   z.object({ type: z.literal('job.event'), jobId: id, assignmentId: id, seq: z.number().int().positive(), payload: RunnerJobEvent }).strict(),
