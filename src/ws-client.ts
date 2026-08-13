@@ -41,13 +41,14 @@ export class RunnerSocket implements JobEventSink {
     });
     this.send(this.hello);
     for (const pending of this.pending.values()) this.send(pending.message);
-    this.heartbeat = setInterval(() => {
+    const heartbeat = setInterval(() => {
       const status = this.getHeartbeat?.() ?? {
         freeSlots: 0,
         activeJobIds: [],
       };
       this.send({ type: "heartbeat", ...status });
     }, 15_000);
+    this.heartbeat = heartbeat;
     socket.on("message", (data) => {
       try {
         const message = serverToRunnerSchema.parse(JSON.parse(data.toString()));
@@ -76,9 +77,9 @@ export class RunnerSocket implements JobEventSink {
       }
     });
     socket.once("close", () => {
-      if (this.heartbeat) clearInterval(this.heartbeat);
-      this.heartbeat = null;
-      this.socket = null;
+      clearInterval(heartbeat);
+      if (this.heartbeat === heartbeat) this.heartbeat = null;
+      if (this.socket === socket) this.socket = null;
     });
   }
 

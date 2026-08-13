@@ -230,9 +230,13 @@ export async function releaseJobWorkspace(
 export async function createTaskWorktree(
   workspace: JobWorkspace,
   taskKey: string,
-): Promise<{ path: string; branch: string }> {
+): Promise<{ path: string; branch: string; baseRevision: string }> {
   if (workspace.mode === "direct")
-    return { path: workspace.path, branch: workspace.branch };
+    return {
+      path: workspace.path,
+      branch: workspace.branch,
+      baseRevision: workspace.expectedHead,
+    };
   const branch = `refs/noriq/tmp/${safeRefPart(workspace.branch)}-${safeRefPart(taskKey)}`;
   const path = join(workspace.worktreeRoot!, `task-${safeRefPart(taskKey)}`);
   const head = await git(workspace.path, ["rev-parse", "HEAD"]);
@@ -244,7 +248,7 @@ export async function createTaskWorktree(
     path,
     head,
   ]);
-  return { path, branch };
+  return { path, branch, baseRevision: head };
 }
 
 export async function rebaseTask(
@@ -332,6 +336,42 @@ export async function integrateTask(
   return workspace.expectedHead;
 }
 
+export async function integrateWip(
+  workspace: JobWorkspace,
+  taskCommit: string,
+  taskKey: string,
+  reason: string,
+): Promise<string> {
+  if (workspace.mode === "direct")
+    return git(workspace.path, ["rev-parse", "HEAD"]);
+  const message = `WIP ${taskKey}: ${reason.slice(0, 160)}`;
+  const merged = await runProcess({
+    command: "git",
+    args: ["merge", "--no-ff", "-m", message, taskCommit],
+    cwd: workspace.path,
+    timeoutMs: 120_000,
+  });
+  if (merged.exitCode !== 0) {
+    await runProcess({
+      command: "git",
+      args: ["merge", "--abort"],
+      cwd: workspace.path,
+      timeoutMs: 120_000,
+    });
+    await git(workspace.path, [
+      "merge",
+      "--no-ff",
+      "-s",
+      "ours",
+      "-m",
+      `${message} (conflicting tree retained in history)`,
+      taskCommit,
+    ]);
+  }
+  workspace.expectedHead = await git(workspace.path, ["rev-parse", "HEAD"]);
+  return workspace.expectedHead;
+}
+
 export async function assertDirectUndrifted(
   workspace: JobWorkspace,
 ): Promise<void> {
@@ -347,13 +387,10 @@ export async function assertDirectUndrifted(
 export async function diffForReview(
   path: string,
   base: string,
+  includeUntracked = false,
 ): Promise<string> {
-  return git(path, [
-    "diff",
-    "--no-ext-diff",
-    "--find-renames",
-    `${base}...HEAD`,
-  ]);
+  if (includeUntracked) await git(path, ["add", "--intent-to-add", "--", "."]);
+  return git(path, ["diff", "--no-ext-diff", "--find-renames", base, "--"]);
 }
 
 export async function dirtyPaths(path: string): Promise<string[]> {

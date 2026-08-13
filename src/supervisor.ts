@@ -22,6 +22,7 @@ import {
   dirtyPaths,
   GitRebaseConflict,
   integrateTask,
+  integrateWip,
   type JobWorkspace,
   normalizeWipCheckpoint,
   prepareJobWorkspace,
@@ -389,13 +390,20 @@ export class RunnerJobSupervisor {
     const retained = this.state.tasks[task.taskId];
     const taskWorkspace =
       retained?.workspace && retained.branch
-        ? { path: retained.workspace, branch: retained.branch }
+        ? {
+            path: retained.workspace,
+            branch: retained.branch,
+            baseRevision:
+              retained.workspaceBase ??
+              (await currentRevision(retained.workspace)),
+          }
         : await createTaskWorktree(this.workspace, task.key);
     if (!retained?.workspace)
       await this.record("task.workspace", {
         taskId: task.taskId,
         path: taskWorkspace.path,
         branch: taskWorkspace.branch,
+        baseRevision: taskWorkspace.baseRevision,
       });
     if (this.options.projectConfig.setup.commands.length > 0) {
       const started = Date.now();
@@ -540,7 +548,11 @@ export class RunnerJobSupervisor {
           this.workspace.mode === "direct"
             ? this.workspace.expectedHead
             : `${await currentRevision(built.path)}^`;
-        const diff = await diffForReview(built.path, reviewBase);
+        const diff = await diffForReview(
+          built.path,
+          reviewBase,
+          this.workspace.mode === "direct",
+        );
         await this.emit({
           type: "progress",
           at: now(),
@@ -674,11 +686,38 @@ export class RunnerJobSupervisor {
       built.task.key,
       reason,
     );
-    await integrateTask(this.workspace, commit);
+    await integrateWip(this.workspace, commit, built.task.key, reason);
     await this.record("warning", {
       message: `${built.task.key} failed; WIP preserved on the output branch at ${commit}`,
     });
     await removeTaskWorktree(this.workspace, built.path, built.branch);
+  }
+
+  private async cleanupFailedBuildTask(
+    task: RunnerTaskSnapshot,
+    reason: string,
+  ): Promise<void> {
+    if (this.workspace.mode !== "isolated") return;
+    const retained = this.state.tasks[task.taskId];
+    if (!retained?.workspace || !retained.branch) return;
+    const paths = await dirtyPaths(retained.workspace);
+    const head = await currentRevision(retained.workspace);
+    if (paths.length > 0 || head !== retained.workspaceBase) {
+      const commit = await normalizeWipCheckpoint(
+        retained.workspace,
+        task.key,
+        reason,
+      );
+      await integrateWip(this.workspace, commit, task.key, reason);
+      await this.record("warning", {
+        message: `${task.key} build failed; WIP preserved on the output branch at ${commit}`,
+      });
+    }
+    await removeTaskWorktree(
+      this.workspace,
+      retained.workspace,
+      retained.branch,
+    );
   }
 
   private async terminalOutput(
@@ -812,9 +851,17 @@ export class RunnerJobSupervisor {
         const task = ready[index]!;
         if (result.status === "fulfilled") successful.push(result.value);
         else {
+          const reason = String(result.reason);
+          await this.cleanupFailedBuildTask(task, reason).catch(
+            async (preservationError) => {
+              await this.record("warning", {
+                message: `failed to clean up ${task.key}: ${String(preservationError)}`,
+              });
+            },
+          );
           await this.record("task.failed", {
             taskId: task.taskId,
-            reason: String(result.reason),
+            reason,
           });
           await this.emit({
             type: "task.result",
@@ -822,7 +869,7 @@ export class RunnerJobSupervisor {
             taskId: task.taskId,
             status: "failed",
             commit: null,
-            summary: String(result.reason),
+            summary: reason,
             findings: [],
           });
         }
@@ -870,11 +917,26 @@ export class RunnerJobSupervisor {
       const message = error instanceof Error ? error.message : String(error);
       await this.record("warning", { message });
       for (const task of Object.values(this.state.tasks)) {
-        if (task.status === "running")
+        if (task.status === "running") {
+          const snapshot =
+            this.options.assignment.source.kind === "task"
+              ? this.options.assignment.source.task
+              : this.options.assignment.source.tasks.find(
+                  (candidate) => candidate.taskId === task.taskId,
+                );
+          if (snapshot)
+            await this.cleanupFailedBuildTask(snapshot, message).catch(
+              async (preservationError) => {
+                await this.record("warning", {
+                  message: `failed to clean up ${snapshot.key}: ${String(preservationError)}`,
+                });
+              },
+            );
           await this.record("task.failed", {
             taskId: task.taskId,
             reason: message,
           });
+        }
       }
       const accepted = Object.values(this.state.tasks).some(
         (task) => task.status === "accepted",

@@ -7,6 +7,7 @@ describe("RunnerSocket", () => {
   let server: WebSocketServer | undefined;
   afterEach(async () => {
     if (server) {
+      for (const client of server.clients) client.terminate();
       server.close();
       await once(server, "close");
       server = undefined;

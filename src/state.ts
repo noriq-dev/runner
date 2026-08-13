@@ -25,6 +25,7 @@ export interface TaskState {
   plan?: string;
   workspace?: string;
   branch?: string;
+  workspaceBase?: string;
   draftCommit?: string;
   commit?: string;
   findings: Finding[];
@@ -143,6 +144,7 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         const task = state.tasks[payload.taskId as string]!;
         task.workspace = payload.path as string;
         task.branch = payload.branch as string;
+        task.workspaceBase = payload.baseRevision as string;
         break;
       }
       case "task.draft":

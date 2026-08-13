@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -267,5 +267,213 @@ describe("RunnerJobSupervisor", () => {
         `${base}..${output.branch}`,
       ]),
     ).toBe("2");
+  });
+
+  it("preserves changes and removes the child worktree when a builder crashes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-build-failure-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const fake = new FakeProviderAdapter(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "guide")
+          return {
+            summary: "planned",
+            structured: {
+              objective: "write before failure",
+              constraints: [],
+              scope: ["failed.txt"],
+              acceptanceCriteria: ["retain evidence"],
+              verification: [],
+              plan: "write",
+            },
+          };
+        if (request.role === "builder") {
+          await writeFile(join(request.workspace, "failed.txt"), "evidence\n");
+          throw new Error("provider crashed after editing");
+        }
+        return { summary: "unused" };
+      },
+    );
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      workspace: { mode: "isolated", baseBranch: "main" },
+      harness: { maxParallelTasks: 1, maxRepairRounds: 2, maxJobMinutes: 5 },
+      agents: {
+        guide: { provider: "fake", model: "guide", effort: "high" },
+        builder: { provider: "fake", model: "builder", effort: "medium" },
+        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: [], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-build-fail",
+      assignmentId: "assignment-build-fail",
+      snapshotDigest: "d".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "failed-task",
+          key: "RUN-20",
+          title: "Fail after write",
+          body: "",
+          executionSpec: null,
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const stateDirectory = join(root, "state");
+    const output = await new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory,
+      projectConfig: config,
+      providers: { fake, codex: undefined, claude: undefined },
+      sink: new MemoryEventSink(),
+    }).run();
+    expect(output.summary).toContain("failed");
+    expect(output.dirtyPaths).toEqual([]);
+    expect(
+      await readFile(
+        join(
+          stateDirectory,
+          "worktrees",
+          "job-build-fail",
+          "job",
+          "failed.txt",
+        ),
+        "utf8",
+      ),
+    ).toBe("evidence\n");
+    expect(
+      await command(repository, "git", [
+        "log",
+        "--format=%s",
+        `${base}..${output.branch}`,
+      ]),
+    ).toContain("WIP RUN-20");
+    expect(
+      await command(repository, "git", ["worktree", "list", "--porcelain"]),
+    ).not.toContain("task-run-20");
+  });
+
+  it("reviews the working diff and creates one checkpoint in direct mode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-direct-e2e-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const fake = new FakeProviderAdapter(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "guide")
+          return {
+            summary: "planned",
+            structured: {
+              objective: "write direct",
+              constraints: [],
+              scope: ["direct.txt"],
+              acceptanceCriteria: ["contains direct"],
+              verification: [],
+              plan: "write",
+            },
+          };
+        if (request.role === "builder") {
+          await writeFile(join(request.workspace, "direct.txt"), "direct\n");
+          return { summary: "wrote direct" };
+        }
+        expect(request.prompt).toContain("+direct");
+        return { summary: "accepted", findings: [] };
+      },
+    );
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      workspace: { mode: "direct", baseBranch: "main", directBranch: "main" },
+      harness: { maxParallelTasks: 2, maxRepairRounds: 2, maxJobMinutes: 5 },
+      agents: {
+        guide: { provider: "fake", model: "guide", effort: "high" },
+        builder: { provider: "fake", model: "builder", effort: "medium" },
+        reviewer: { provider: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: ["grep -q direct direct.txt"], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-direct",
+      assignmentId: "assignment-direct",
+      snapshotDigest: "e".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "direct-task",
+          key: "RUN-21",
+          title: "Direct",
+          body: "",
+          executionSpec: null,
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const stateDirectory = join(root, "state");
+    const output = await new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory,
+      projectConfig: config,
+      providers: { fake, codex: undefined, claude: undefined },
+      sink: new MemoryEventSink(),
+    }).run();
+    expect(output.summary).toContain("succeeded");
+    expect(output.branch).toBe("main");
+    expect(output.dirtyPaths).toEqual([]);
+    expect(
+      await command(repository, "git", [
+        "rev-list",
+        "--count",
+        `${base}..HEAD`,
+      ]),
+    ).toBe("1");
+    expect(await readdir(join(stateDirectory, "locks"))).toEqual([]);
   });
 });
