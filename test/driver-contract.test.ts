@@ -91,6 +91,7 @@ if (args.includes('--help')) { console.log('--output-format --json-schema --stri
 if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
 if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
 if (process.env.REQUIRE_PROJECT_ALLOWED === '1' && !args.includes('mcp__project_echo')) process.exit(10);
+if (process.env.REJECT_BASH === '1' && args.some((arg) => arg.includes('Bash'))) process.exit(11);
 const tools = ['ask_human', 'delegate', 'get_job_state', 'inspect_diff', 'record_task_plan', 'request_completion', 'run_checks'].map((tool) => 'mcp__noriq_runner__' + tool);
 console.log(JSON.stringify({ type: 'system', subtype: 'init', tools: process.env.OMIT_CONTROL === '1' ? [] : tools, mcp_servers: [{ name: 'noriq_runner', status: process.env.OMIT_CONTROL === '1' ? 'failed' : 'connected' }] }));
 console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'built', findings: [] }, usage: { input_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 5, output_tokens: 3 } }));
@@ -247,6 +248,7 @@ describe("built-in driver contract", () => {
           env: {
             REQUIRE_PROJECT_MCP: "1",
             REQUIRE_PROJECT_ALLOWED: "1",
+            REJECT_BASH: "1",
           },
         },
         state,

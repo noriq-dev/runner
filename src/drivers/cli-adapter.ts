@@ -51,8 +51,8 @@ function claudeSystemPrompt(role: AgentRequest["role"]): string {
   if (role === "reviewer")
     return "Act as an independent read-only code reviewer. Report only concrete defects introduced by the candidate, and return the required structured output.";
   if (role === "repairer")
-    return "Act as an unattended repository repair worker. Obey the task and project instructions, use only supplied tools, avoid source-control commands, and return the required structured output.";
-  return "Act as an unattended repository builder. Obey the task and project instructions, use only supplied tools, avoid source-control commands, and return the required structured output.";
+    return "Act as an unattended repository repair worker. Obey the task and project instructions, use only supplied tools, do not run shell commands or source-control commands, and return the required structured output. Runner executes the configured deterministic checks after you return.";
+  return "Act as an unattended repository builder. Obey the task and project instructions, use only supplied tools, do not run shell commands or source-control commands, and return the required structured output. Runner executes the configured deterministic checks after you return.";
 }
 
 function jsonLines(text: string): Record<string, unknown>[] {
@@ -515,7 +515,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           "--setting-sources",
           "project",
           "--tools",
-          "Bash,Edit,Glob,Grep,Read,Write",
+          "Edit,Glob,Grep,Read,Write",
           "--strict-mcp-config",
         );
         const projectMcp = await claudeProjectMcpConfiguration(
