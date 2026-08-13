@@ -255,15 +255,23 @@ export class RunnerJobSupervisor {
       projectConfig: this.options.projectConfig,
       signal: this.abort.signal,
     };
-    const session = await driver.start(request);
-    const result = await session.result();
-    await this.record("invocation.completed", {
-      id,
-      resultDigest: resultDigest(result),
-      recovered: false,
-    });
-    await this.record("usage.recorded", { id, usage: result.usage });
-    return result;
+    try {
+      const session = await driver.start(request);
+      const result = await session.result();
+      await this.record("invocation.completed", {
+        id,
+        resultDigest: resultDigest(result),
+        recovered: false,
+      });
+      await this.record("usage.recorded", { id, usage: result.usage });
+      return result;
+    } catch (error) {
+      await this.record("invocation.abandoned", {
+        id,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   private async emit(payload: RunnerJobEventPayload): Promise<void> {

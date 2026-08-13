@@ -6,7 +6,11 @@ import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
 import { FakeAgentDriver } from "../src/drivers/fake.js";
 import { runProcess } from "../src/process.js";
-import { MemoryEventSink, RunnerJobSupervisor } from "../src/supervisor.js";
+import {
+  loadDurableJobState,
+  MemoryEventSink,
+  RunnerJobSupervisor,
+} from "../src/supervisor.js";
 import { GitWorkspaceBackend } from "../src/vcs/git.js";
 
 async function command(
@@ -117,10 +121,11 @@ describe("RunnerJobSupervisor", () => {
       },
     });
     const sink = new MemoryEventSink();
+    const stateDirectory = join(root, "state");
     const supervisor = new RunnerJobSupervisor({
       assignment,
       repository,
-      stateDirectory: join(root, "state"),
+      stateDirectory,
       projectConfig: config,
       backend: new GitWorkspaceBackend(),
       drivers: { fake, codex: undefined, claude: undefined },
@@ -473,10 +478,11 @@ describe("RunnerJobSupervisor", () => {
       },
     });
     const sink = new MemoryEventSink();
+    const stateDirectory = join(root, "state");
     const supervisor = new RunnerJobSupervisor({
       assignment,
       repository,
-      stateDirectory: join(root, "state"),
+      stateDirectory,
       projectConfig: config,
       backend: new GitWorkspaceBackend(),
       drivers: { fake, codex: undefined, claude: undefined },
@@ -499,6 +505,12 @@ describe("RunnerJobSupervisor", () => {
           event.payload.status === "failed",
       ),
     ).toEqual([]);
+    expect(
+      Object.values(
+        (await loadDurableJobState(stateDirectory, assignment.jobId))!
+          .invocations,
+      ),
+    ).toMatchObject([{ role: "builder", status: "abandoned" }]);
   });
 
   it("reviews the working diff and creates one checkpoint in direct mode", async () => {
