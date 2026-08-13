@@ -19,6 +19,7 @@ const RUN = {
   runnerId: 'rnr_1',
   agentId: null,
   executionProfile: null,
+  missionMode: null,
   kind: 'build',
   anchor: null,
   brief: 'build it',
@@ -55,6 +56,7 @@ const INVENTORY: MissionInventoryItem[] = [
   {
     runId: 'run_1',
     lease: LEASE,
+    commissionDigest: 'a'.repeat(64),
     attempts: [],
   },
 ];
@@ -73,6 +75,10 @@ function startupHandlers(): WsStartupHandlers {
     onRegistered: vi.fn(),
     onDisconnect: vi.fn(),
     onMissionTaskAck: vi.fn(),
+    onMissionQuestionAck: vi.fn(),
+    onMissionQuestionAnswer: vi.fn(),
+    onMissionHandoffAck: vi.fn(),
+    onMissionHandoffConsumed: vi.fn(),
     onMissionReconcileRequest: vi.fn(),
     onMissionReconcileResult: vi.fn(),
   };
@@ -102,7 +108,7 @@ describe('BufferedWsHandlers', () => {
       onReconnect: (...args) => calls.push({ name: 'reconnect', args }),
     };
 
-    buffer.onAssigned(RUN, LEASE, GENERATION);
+    buffer.onAssigned(RUN, LEASE, null, GENERATION);
     buffer.onCancel(cancelOne, GENERATION);
     buffer.onCancel(cancelTwo, GENERATION);
     buffer.onReconnect(GENERATION);
@@ -112,7 +118,7 @@ describe('BufferedWsHandlers', () => {
     await activation;
 
     expect(calls).toEqual([
-      { name: 'assigned', args: [RUN, LEASE, GENERATION] },
+      { name: 'assigned', args: [RUN, LEASE, null, GENERATION] },
       { name: 'cancel', args: [cancelOne, GENERATION] },
       { name: 'cancel', args: [cancelTwo, GENERATION] },
       { name: 'reconnect', args: [GENERATION] },
@@ -187,7 +193,7 @@ describe('BufferedWsHandlers', () => {
       onSteer: (message) => calls.push(`steer:${message.steerId}`),
     };
 
-    buffer.onAssigned(RUN, LEASE, GENERATION);
+    buffer.onAssigned(RUN, LEASE, null, GENERATION);
     const activation = buffer.activate(handlers);
     await vi.waitFor(() => expect(calls).toEqual(['assigned:start']));
 
@@ -227,7 +233,7 @@ describe('BufferedWsHandlers', () => {
     const first = { runId: RUN.id, hard: false, reason: 'one' };
     const second = { runId: RUN.id, hard: false, reason: 'two' };
 
-    buffer.onAssigned(RUN, LEASE, GENERATION);
+    buffer.onAssigned(RUN, LEASE, null, GENERATION);
     buffer.onCancel(first, GENERATION);
     buffer.onCancel(second, GENERATION);
 
@@ -276,7 +282,7 @@ describe('BufferedWsHandlers', () => {
     const second = vi.fn();
     const handlers = { onAssigned: first };
 
-    buffer.onAssigned(RUN, LEASE, GENERATION);
+    buffer.onAssigned(RUN, LEASE, null, GENERATION);
     await buffer.activate(handlers);
     await expect(buffer.activate({ onAssigned: second })).rejects.toThrow(/already been activated/);
 

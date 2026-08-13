@@ -79,6 +79,8 @@ function commission(
     executionProfile: PROFILE,
     repositoryKey: 'repo-key',
     baseRevision: 'rev-base',
+    serverCommissionDigest: 'b'.repeat(64),
+    publishHandoff: false,
     tasks: TASKS,
     budget: TOTAL_BUDGET,
     catalogFingerprint: CATALOG_FINGERPRINT,
@@ -819,6 +821,26 @@ describe('NoriqMissionCoordinator durable authority', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a completed plan root in reconciliation inventory until its handoff ack is durable', async () => {
+    const directory = await stateDirectory();
+    const local = fakeRuntime();
+    const wire = transport();
+    const value = coordinator(new JsonlNoriqCoordinatorStore(directory), local.runtime, wire.value);
+    await value.commission(commission({ tasks: [TASKS[0]!], publishHandoff: true }));
+
+    await expect(value.control('run-root')).resolves.toMatchObject({ reason: 'completed' });
+    expect(await value.reservedRootRunIds()).toEqual(['run-root']);
+    expect(await value.inventoryAll()).toEqual([
+      expect.objectContaining({ runId: 'run-root', commissionDigest: 'b'.repeat(64) }),
+    ]);
+
+    await value.recordHandoffPublication('run-root', 'report-handoff', 'handoff-root');
+    expect(await value.reservedRootRunIds()).toEqual([]);
+    await expect(
+      value.recordHandoffPublication('run-root', 'different-report', 'handoff-root'),
+    ).rejects.toThrow(/different handoff publication/);
+  });
+
   it('refuses a runtime resolver that answers for the wrong repository', async () => {
     const directory = await stateDirectory();
     const local = fakeRuntime();
@@ -970,6 +992,42 @@ describe('NoriqMissionCoordinator durable authority', () => {
       'Use the migration-safe option.',
     );
     await expect(value.answer('run-root', 'question-1', 'A different answer.')).rejects.toThrow();
+  });
+
+  it('durably records an accepted question publication across lease adoption', async () => {
+    const directory = await stateDirectory();
+    const local = fakeRuntime({
+      async control(_missionId, request) {
+        return questionStop(request);
+      },
+    });
+    const wire = transport();
+    const value = coordinator(new JsonlNoriqCoordinatorStore(directory), local.runtime, wire.value);
+    await value.commission(commission({ tasks: [TASKS[0]!] }));
+    await value.control('run-root');
+
+    await value.recordQuestionPublication('run-root', 'question-1', 'report-question-1', 'signal-question-1');
+    await value.adopt({
+      runId: 'run-root',
+      decision: 'adopt',
+      lease: { ...LEASE, epoch: LEASE.epoch + 1 },
+      reason: null,
+    });
+
+    await expect(value.inspect('run-root')).resolves.toMatchObject({
+      tasks: [
+        {
+          questionPublication: {
+            questionId: 'question-1',
+            reportId: 'report-question-1',
+            signalId: 'signal-question-1',
+          },
+        },
+      ],
+    });
+    await expect(
+      value.recordQuestionPublication('run-root', 'question-1', 'replayed-report-id', 'signal-question-1'),
+    ).resolves.toBeDefined();
   });
 
   it('cancels the admitted local mission before settling the Noriq attempt as cancelled', async () => {

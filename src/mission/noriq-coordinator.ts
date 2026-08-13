@@ -33,7 +33,7 @@ import type { MissionCreateRequest } from './service';
 import { canonicalMissionJson } from './store';
 
 const MAX_REASON_CHARS = 2_000;
-const MAX_ANSWER_CHARS = 64_000;
+const MAX_ANSWER_CHARS = 50_000;
 export const MAX_NORIQ_RECONCILIATION_ROOTS = 128;
 
 export type NoriqMissionRuntime = Pick<
@@ -83,6 +83,11 @@ export interface NoriqCoordinatorTaskState {
   readonly beginAck: MissionTaskAck | null;
   readonly missionCreated: boolean;
   readonly observation: NoriqCoordinatorControlObservation | null;
+  readonly questionPublication: {
+    readonly questionId: string;
+    readonly reportId: string;
+    readonly signalId: string;
+  } | null;
   readonly preparedAnswers: Readonly<Record<string, string>>;
   readonly settleReport: MissionTaskSettleReport | null;
   readonly settleAck: MissionTaskAck | null;
@@ -98,6 +103,7 @@ export interface NoriqMissionCoordinatorState {
   readonly adoptionCount: number;
   readonly cancelReason: string | null;
   readonly failureReason: string | null;
+  readonly handoffPublication: { readonly reportId: string; readonly handoffId: string } | null;
   readonly serverDisposition: {
     readonly decision: 'already_terminal' | 'cancel' | 'unknown';
     readonly reason: string | null;
@@ -176,6 +182,7 @@ function initialCoordinatorState(rootRunId: string): NoriqMissionCoordinatorStat
     adoptionCount: 0,
     cancelReason: null,
     failureReason: null,
+    handoffPublication: null,
     serverDisposition: null,
   };
 }
@@ -240,6 +247,7 @@ function reduceCoordinatorAction(
         beginAck: null,
         missionCreated: false,
         observation: null,
+        questionPublication: null,
         preparedAnswers: {},
         settleReport: null,
         settleAck: null,
@@ -322,10 +330,42 @@ function reduceCoordinatorAction(
     }
     let cumulativeUsage = state.cumulativeUsage;
     if (action.observation.kind === 'terminal') cumulativeUsage = action.observation.cumulativeUsage;
+    const questionPublication =
+      action.observation.kind === 'human-question' &&
+      task.questionPublication?.questionId === action.observation.questionId
+        ? task.questionPublication
+        : null;
     return replaceTask(
       { ...state, cumulativeUsage },
       action.taskIndex,
-      { ...task, observation: action.observation },
+      { ...task, observation: action.observation, questionPublication },
+      revision,
+    );
+  }
+
+  if (action.type === 'question-publication-accepted') {
+    const task = requireTask(state, action.taskIndex, revision);
+    if (
+      task.observation?.kind !== 'human-question' ||
+      task.observation.questionId !== action.questionId ||
+      !task.attemptId
+    ) {
+      corrupt(state.rootRunId, revision, 'question publication does not match the durable question');
+    }
+    if (task.questionPublication !== null) {
+      corrupt(state.rootRunId, revision, 'question publication was recorded twice');
+    }
+    return replaceTask(
+      state,
+      action.taskIndex,
+      {
+        ...task,
+        questionPublication: {
+          questionId: action.questionId,
+          reportId: action.reportId,
+          signalId: action.signalId,
+        },
+      },
       revision,
     );
   }
@@ -431,6 +471,23 @@ function reduceCoordinatorAction(
     return { ...state, revision, failureReason: action.reason };
   }
 
+  if (action.type === 'handoff-publication-accepted') {
+    if (!state.commission.publishHandoff) {
+      corrupt(state.rootRunId, revision, 'task-root mission recorded a plan handoff publication');
+    }
+    if (!finalAcceptedRevision(state)) {
+      corrupt(state.rootRunId, revision, 'handoff publication preceded accepted terminal revision');
+    }
+    if (state.handoffPublication !== null) {
+      corrupt(state.rootRunId, revision, 'handoff publication was recorded twice');
+    }
+    return {
+      ...state,
+      revision,
+      handoffPublication: { reportId: action.reportId, handoffId: action.handoffId },
+    };
+  }
+
   return action satisfies never;
 }
 
@@ -528,6 +585,9 @@ function coordinatorTerminalStop(state: NoriqMissionCoordinatorState): NoriqMiss
 /** Pure durable terminal predicate used by daemon reservation/reconciliation code. */
 export function isNoriqMissionCoordinatorTerminal(state: NoriqMissionCoordinatorState): boolean {
   const stop = coordinatorTerminalStop(state);
+  if (stop?.reason === 'completed' && state.commission?.publishHandoff && !state.handoffPublication) {
+    return false;
+  }
   return stop?.reason === 'completed' || stop?.reason === 'cancelled' || stop?.reason === 'failed';
 }
 
@@ -977,6 +1037,73 @@ export class NoriqMissionCoordinator {
     return this.load(rootRunId);
   }
 
+  /** Commit Noriq's idempotent acknowledgement before this root leaves restart inventory. */
+  async recordHandoffPublication(
+    rootRunId: string,
+    reportId: string,
+    handoffId: string,
+  ): Promise<NoriqMissionCoordinatorState> {
+    const controller = await this.store.acquireController(rootRunId);
+    try {
+      const state = await this.load(rootRunId);
+      if (state.handoffPublication) {
+        if (
+          state.handoffPublication.reportId !== reportId ||
+          state.handoffPublication.handoffId !== handoffId
+        ) {
+          throw new NoriqCoordinatorConflictError(
+            'action',
+            `root run '${rootRunId}' already recorded a different handoff publication`,
+          );
+        }
+        return state;
+      }
+      return this.append(state, `handoff-publication:${reportId}`, {
+        type: 'handoff-publication-accepted',
+        reportId,
+        handoffId,
+      });
+    } finally {
+      await controller.release();
+    }
+  }
+
+  /** Persist Noriq's acceptance so lease adoption never republishes an immutable question. */
+  async recordQuestionPublication(
+    rootRunId: string,
+    questionId: string,
+    reportId: string,
+    signalId: string,
+  ): Promise<NoriqMissionCoordinatorState> {
+    const controller = await this.store.acquireController(rootRunId);
+    try {
+      const state = await this.load(rootRunId);
+      const taskIndex = successfulSettles(state);
+      const task = state.tasks[taskIndex];
+      if (task?.questionPublication) {
+        if (
+          task.questionPublication.questionId !== questionId ||
+          task.questionPublication.signalId !== signalId
+        ) {
+          throw new NoriqCoordinatorConflictError(
+            'action',
+            `root run '${rootRunId}' already recorded a different question publication`,
+          );
+        }
+        return state;
+      }
+      return this.append(state, `question-publication:${taskIndex}:${questionId}`, {
+        type: 'question-publication-accepted',
+        taskIndex,
+        questionId,
+        reportId,
+        signalId,
+      });
+    } finally {
+      await controller.release();
+    }
+  }
+
   /** Read-only complete coordinator state; any corrupt WAL fails the whole result. */
   async inspectAll(): Promise<readonly NoriqMissionCoordinatorState[]> {
     const states: NoriqMissionCoordinatorState[] = [];
@@ -1030,6 +1157,7 @@ export class NoriqMissionCoordinator {
     return deepFreeze({
       runId: rootRunId,
       lease: state.lease,
+      commissionDigest: state.commission.serverCommissionDigest,
       attempts: state.tasks.flatMap((task) =>
         task.beginAck?.accepted === true &&
         task.settleAck?.accepted !== true &&

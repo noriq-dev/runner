@@ -216,6 +216,31 @@ export const CommissionedExecutionProfile = z.object({
 }).strict();
 export type CommissionedExecutionProfile = z.infer<typeof CommissionedExecutionProfile>;
 
+/**
+ * Secret-free identity of work preserved by a Runner mission after its execution gate passes.
+ * The strings are deliberately backend-neutral opaque identifiers: the control plane records
+ * what can be consumed, but never receives credentials, commands, or machine-local paths.
+ */
+export const AcceptedRevisionHandoff = z.object({
+  schemaVersion: z.literal(1),
+  handoffId: z.string().min(1).max(160),
+  backend: z.string().min(1).max(80),
+  repositoryKey: z.string().min(1).max(160),
+  checkpoint: z.string().min(1).max(512),
+  revision: z.string().min(1).max(512),
+  reference: z.string().min(1).max(512),
+}).strict();
+export type AcceptedRevisionHandoff = z.infer<typeof AcceptedRevisionHandoff>;
+
+export const AcceptedRevisionHandoffView = z.object({
+  identity: AcceptedRevisionHandoff,
+  state: z.enum(['preserved_unlanded', 'consumed_unlanded']),
+  preservedAt: z.string().datetime(),
+  consumedAt: z.string().datetime().nullable().default(null),
+  consumptionId: z.string().nullable().default(null),
+}).strict();
+export type AcceptedRevisionHandoffView = z.infer<typeof AcceptedRevisionHandoffView>;
+
 export const Run = z.object({
   id: z.string(),
   projectId: z.string(),
@@ -274,6 +299,8 @@ export const Run = z.object({
   // Optional, repo-scoped machine environment commissioned by opaque identity/fingerprints.
   // Null preserves the legacy/default Runner environment selection.
   executionProfile: CommissionedExecutionProfile.nullable().default(null),
+  // Explicit opt-in; null keeps every legacy task Run byte-for-byte ordinary.
+  missionMode: z.literal('task_root').nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
   // model names are the vendor's and they change weekly, so pinning them in a wire contract (or

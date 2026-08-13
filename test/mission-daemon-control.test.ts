@@ -1,4 +1,9 @@
-import type { MissionAdoptionResult, MissionInventoryItem, MissionTaskAck } from '@noriq-dev/shared';
+import type {
+  MissionAdoptionResult,
+  MissionInventoryItem,
+  MissionQuestionAck,
+  MissionTaskAck,
+} from '@noriq-dev/shared';
 import { describe, expect, it, vi } from 'vitest';
 import {
   type DaemonMissionCoordinatorLike,
@@ -6,6 +11,10 @@ import {
   MissionDaemonControl,
   MissionDaemonControlFatalError,
 } from '../src/mission/daemon-control';
+import {
+  type NoriqMissionCommission,
+  computeNoriqMissionCommissionDigest,
+} from '../src/mission/noriq-coordinator-store';
 import { WsMissionCoordinatorTransport } from '../src/mission/noriq-transport';
 
 const NOW = new Date('2026-08-13T01:00:00.000Z');
@@ -17,6 +26,7 @@ function inventory(runId: string, epoch = 1): MissionInventoryItem {
   return {
     runId,
     lease: { sitting: 3, executionId: `execution_${runId}`, epoch },
+    commissionDigest: 'a'.repeat(64),
     attempts: [
       {
         attemptId: `attempt_${runId}`,
@@ -74,7 +84,57 @@ function activate(control: MissionDaemonControl, generation = GENERATION): void 
   expect(control.activateTransportGeneration(generation)).toBe(true);
 }
 
+function freshCommission(): NoriqMissionCommission {
+  const body: Omit<NoriqMissionCommission, 'commissionDigest'> = {
+    schemaVersion: 1,
+    rootRunId: 'run-fresh',
+    lease: { sitting: 1, executionId: 'execution_fresh', epoch: 1 },
+    serverCommissionDigest: 'b'.repeat(64),
+    publishHandoff: false,
+    executionProfile: {
+      id: 'default',
+      declarationFingerprint: 'decl',
+      effectiveFingerprint: 'effective',
+      generation: 1,
+      attestationCapable: true,
+    },
+    repositoryKey: 'repo-key',
+    baseRevision: '1'.repeat(40),
+    tasks: [{ taskId: 'task-fresh', childKey: 'PLNR-1', brief: 'Build it.', dependencyIds: [] }],
+    budget: { tokens: 100, usd: null, activeSeconds: 10 },
+    catalogFingerprint: 'c'.repeat(64),
+    resources: {},
+  };
+  return { ...body, commissionDigest: computeNoriqMissionCommissionDigest(body) };
+}
+
 describe('MissionDaemonControl', () => {
+  it('commissions fresh authority durably before starting its root on that exact generation', async () => {
+    const commission = freshCommission();
+    const commissioned = vi.fn().mockResolvedValue({});
+    const controlled = vi.fn().mockResolvedValue({
+      reason: 'completed',
+      state: {
+        rootRunId: commission.rootRunId,
+        lease: commission.lease,
+        commission,
+        tasks: [],
+      },
+    });
+    const control = new MissionDaemonControl({
+      coordinator: fakeCoordinator({ commission: commissioned, control: controlled }),
+      transport: fakeTransport(),
+      sendReconciliation: () => true,
+      fatal: vi.fn(),
+    });
+    activate(control);
+
+    await expect(control.commissionFresh(commission, GENERATION)).resolves.toBe(true);
+    await vi.waitFor(() => expect(controlled).toHaveBeenCalledWith(commission.rootRunId));
+    expect(commissioned).toHaveBeenCalledWith(commission);
+    expect(control.authorizedTransportGeneration(commission.rootRunId)).toBe(GENERATION);
+  });
+
   it('delivers only an exact task acknowledgement to the transport waiter', async () => {
     const transport = new WsMissionCoordinatorTransport({
       sendBegin: () => true,
@@ -111,6 +171,58 @@ describe('MissionDaemonControl', () => {
     expect(control.acknowledgeTask({ ...exact, attemptId: 'other_attempt' }, GENERATION)).toBe(false);
     expect(control.acknowledgeTask(exact, GENERATION)).toBe(true);
     await expect(pending).resolves.toEqual(exact);
+    await control.stop();
+  });
+
+  it('persists a replayed question acknowledgement after fresh authority is admitted', async () => {
+    const commission = freshCommission();
+    const questionAck: MissionQuestionAck = {
+      reportId: 'replay:question-1',
+      questionId: 'question-1',
+      attemptId: 'attempt-question-1',
+      accepted: true,
+      signalId: 'signal-question-1',
+      state: 'open',
+      error: null,
+    };
+    const recordQuestionPublication = vi.fn().mockResolvedValue({});
+    const pendingControl = deferred<unknown>();
+    const control = new MissionDaemonControl({
+      coordinator: fakeCoordinator({
+        commission: vi.fn().mockResolvedValue({}),
+        control: vi.fn().mockReturnValue(pendingControl.promise),
+        inspect: vi.fn().mockResolvedValue({
+          rootRunId: commission.rootRunId,
+          lease: commission.lease,
+          commission,
+          tasks: [
+            {
+              task: { taskId: 'task-fresh' },
+              attemptId: 'attempt-question-1',
+              questionPublication: null,
+              observation: { kind: 'human-question', questionId: 'question-1', prompt: 'Choose.' },
+            },
+          ],
+        }),
+        recordQuestionPublication,
+      }),
+      transport: fakeTransport(),
+      sendReconciliation: () => true,
+      fatal: vi.fn(),
+    });
+    activate(control);
+    await control.commissionFresh(commission, GENERATION);
+
+    await expect(
+      control.reconcileQuestionAck(commission.rootRunId, commission.lease, questionAck, GENERATION),
+    ).resolves.toBe(true);
+    expect(recordQuestionPublication).toHaveBeenCalledWith(
+      commission.rootRunId,
+      questionAck.questionId,
+      questionAck.reportId,
+      questionAck.signalId,
+    );
+    pendingControl.resolve({ reason: 'human-question' });
     await control.stop();
   });
 

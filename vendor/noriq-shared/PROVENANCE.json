@@ -1,17 +1,18 @@
 {
-  "sourceCommit": "8e1a501f104b02ffee58c8f7cd0affdf348b1185",
+  "sourceCommit": "cf0db1730d146feac97533b069c79df31511af9c",
   "sourceDirty": false,
-  "vendoredAt": "2026-08-13T05:21:46.072Z",
+  "vendoredAt": "2026-08-13T14:07:28.638Z",
   "files": {
-    "events.ts": "4c521e2a4a280d0860dfcbaea35e5d89edd2bac4d764f448ce63654c2142beab",
+    "events.ts": "08db4e49cb321a4a0127cf23f9b4e5654cc0ab705b25311c861a6174ced3cc0b",
     "execution-spec.ts": "27432bfc454ffc6672ba34e11f8914cda517c0773fd4c9cc86c32e7a17936ca4",
-    "index.ts": "b553f481ababbd362e473331a2648de9484e57255d86239ab55e1daf5a3f3bf1",
+    "index.ts": "3d24698ecd7199528292b117f4e8794ba7019988de9a47c8c793457d0f25704a",
     "intelligence.ts": "98d7ad961b2ec8cb3cbf93f85f328ba840f127ec03c182f466aab6c96502837b",
     "manifest.ts": "d260338959fb85b9e9a786c8e497c2156a00df5ec13a3a7788690201653cb260",
     "memory.ts": "77963cd7a64910ea0542b0430e7f6ec7515255b4df5e0a9bdb51db1f0a277d7a",
     "model.ts": "81fcf491132b23a754936cac4d4efdc2ee26bcc815073be683d391e4a5ed22f6",
-    "orchestration.ts": "d4802c22c7e0153ca052153038a45abb52c0016786f1f5d2b9fa01a361ea60a4",
-    "runner.ts": "fb676498b1a1c1ed503012afd2c7786ae25f8becca1a0a24074d1819b27891ca",
-    "ws.ts": "b10ca4786168edefbb05e362d0e2ab72ad56103583f24b79cf98f8762b926561"
+    "orchestration.ts": "c7ad4395bed232417d12041e4249e2ef9cadb91ddbc24cb8c7abb5637e9ec9bf",
+    "runner-protocol.ts": "89d55e26ffe47a0ae06615bc6ce8e8db2853101419ef673c4be1e838517aede7",
+    "runner.ts": "a23deb85f3e94035e094bc60deec860aa5f2a96d616465b2ce528aaed0d59be9",
+    "ws.ts": "e4b22559953b59d6957c1a048d09b6c61daca98e379930973ba5d98241cba8b3"
   }
 }

@@ -36,7 +36,7 @@ import { canonicalMissionJson } from './store';
 export const NORIQ_MISSION_COMMISSION_SCHEMA_VERSION = 1 as const;
 export const NORIQ_COORDINATOR_WAL_SCHEMA_VERSION = 1 as const;
 export const MAX_NORIQ_COMMISSION_TASKS = 256;
-export const MAX_NORIQ_TASK_BRIEF_CHARS = 32_000;
+export const MAX_NORIQ_TASK_BRIEF_CHARS = 64_000;
 export const MAX_NORIQ_TASK_DEPENDENCIES = 256;
 export const MAX_NORIQ_COMMISSION_BYTES = 2 * 1024 * 1024;
 export const MAX_NORIQ_COORDINATOR_ACTION_BYTES = 2 * 1024 * 1024 + 64 * 1024;
@@ -47,8 +47,8 @@ export const MAX_NORIQ_COORDINATOR_ROOTS = 4_096;
 const IDENTIFIER_MAX = 1_024;
 const CHILD_KEY_MAX = 160;
 const REASON_MAX = 2_000;
-const ANSWER_MAX = 64_000;
-const QUESTION_MAX = 64_000;
+const ANSWER_MAX = 50_000;
+const QUESTION_MAX = 20_000;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const DEFAULT_LOCK_POLL_MS = 10;
 const DEFAULT_STALE_LOCK_MS = 5 * 60_000;
@@ -95,6 +95,10 @@ export interface NoriqMissionCommission {
   rootRunId: string;
   lease: MissionLeaseRef;
   commissionDigest: string;
+  /** Exact digest Noriq computed over its immutable task/plan snapshot. */
+  serverCommissionDigest: string;
+  /** Plan roots publish their accepted revision; explicit task roots intentionally do not. */
+  publishHandoff: boolean;
   executionProfile: CommissionedExecutionProfile;
   repositoryKey: string;
   baseRevision: string;
@@ -127,6 +131,8 @@ const NoriqMissionCommissionSchema = z
     rootRunId: Identifier,
     lease: MissionLeaseRefSchema,
     commissionDigest: Digest,
+    serverCommissionDigest: Digest,
+    publishHandoff: z.boolean(),
     executionProfile: CommissionedExecutionProfileSchema,
     repositoryKey: Identifier,
     baseRevision: Identifier,
@@ -229,6 +235,19 @@ const TaskControlObservedActionSchema = z
     observation: ControlObservationSchema,
   })
   .strict();
+const QuestionPublicationAcceptedActionSchema = z
+  .object({
+    type: z.literal('question-publication-accepted'),
+    taskIndex: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(MAX_NORIQ_COMMISSION_TASKS - 1),
+    questionId: Identifier,
+    reportId: Identifier,
+    signalId: Identifier,
+  })
+  .strict();
 const TaskAnswerPreparedActionSchema = z
   .object({
     type: z.literal('task-answer-prepared'),
@@ -284,6 +303,13 @@ const CancelRequestedActionSchema = z
 const CoordinatorFailedActionSchema = z
   .object({ type: z.literal('coordinator-failed'), reason: z.string().min(1).max(REASON_MAX) })
   .strict();
+const HandoffPublicationAcceptedActionSchema = z
+  .object({
+    type: z.literal('handoff-publication-accepted'),
+    reportId: Identifier,
+    handoffId: Identifier,
+  })
+  .strict();
 
 export const NoriqCoordinatorActionSchema = z.discriminatedUnion('type', [
   CommissionedActionSchema,
@@ -291,6 +317,7 @@ export const NoriqCoordinatorActionSchema = z.discriminatedUnion('type', [
   TaskBeginAcknowledgedActionSchema,
   TaskMissionCreatedActionSchema,
   TaskControlObservedActionSchema,
+  QuestionPublicationAcceptedActionSchema,
   TaskAnswerPreparedActionSchema,
   TaskSettlePreparedActionSchema,
   TaskSettleAcknowledgedActionSchema,
@@ -298,6 +325,7 @@ export const NoriqCoordinatorActionSchema = z.discriminatedUnion('type', [
   ServerDispositionRecordedActionSchema,
   CancelRequestedActionSchema,
   CoordinatorFailedActionSchema,
+  HandoffPublicationAcceptedActionSchema,
 ]);
 export type NoriqCoordinatorAction = z.infer<typeof NoriqCoordinatorActionSchema>;
 

@@ -1,5 +1,6 @@
 import {
   MISSION_CAPABILITY,
+  MISSION_HANDOFF_CAPABILITY,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
   RunnerClientMessage,
@@ -10,8 +11,15 @@ import type {
   ExecutedConfigurationEvidence,
   ExecutionSpec,
   MissionAdoptionResult,
+  MissionHandoffAck,
+  MissionHandoffConsumed,
+  MissionHandoffPublication,
   MissionInventoryItem,
   MissionLeaseRef,
+  MissionQuestionAck,
+  MissionQuestionAnswer,
+  MissionQuestionPublication,
+  MissionRootCommission,
   MissionTaskAck,
   MissionTaskBeginReport,
   MissionTaskSettleReport,
@@ -71,9 +79,23 @@ export interface WsHandlers {
     },
     generation: WsConnectionGeneration,
   ) => void;
-  onAssigned?: (run: Run, missionLease: MissionLeaseRef | null, generation: WsConnectionGeneration) => void;
+  onAssigned?: (
+    run: Run,
+    missionLease: MissionLeaseRef | null,
+    missionCommission: MissionRootCommission | null,
+    generation: WsConnectionGeneration,
+  ) => void;
   /** Acknowledged task admission/settlement for a negotiated mission.v2 root. */
   onMissionTaskAck?: (ack: MissionTaskAck, generation: WsConnectionGeneration) => void;
+  onMissionQuestionAck?: (
+    runId: string,
+    lease: MissionLeaseRef,
+    ack: MissionQuestionAck,
+    generation: WsConnectionGeneration,
+  ) => void;
+  onMissionQuestionAnswer?: (answer: MissionQuestionAnswer, generation: WsConnectionGeneration) => void;
+  onMissionHandoffAck?: (ack: MissionHandoffAck, generation: WsConnectionGeneration) => void;
+  onMissionHandoffConsumed?: (consumed: MissionHandoffConsumed, generation: WsConnectionGeneration) => void;
   /** Server-authored adoption request. Inventory construction must be read-only. */
   onMissionReconcileRequest?: (
     request: {
@@ -412,6 +434,26 @@ export class WsClient {
     return this.sendRaw({ type: 'mission.task.settle', runId, lease, settle });
   }
 
+  sendMissionQuestion(
+    runId: string,
+    lease: MissionLeaseRef,
+    question: MissionQuestionPublication,
+    generation: WsConnectionGeneration,
+  ): boolean {
+    if (!this.hasAcceptedCapability(MISSION_CAPABILITY, generation)) return false;
+    return this.sendRaw({ type: 'mission.question.publish', runId, lease, question });
+  }
+
+  sendMissionHandoff(
+    runId: string,
+    lease: MissionLeaseRef,
+    publication: MissionHandoffPublication,
+    generation: WsConnectionGeneration,
+  ): boolean {
+    if (!this.hasAcceptedCapability(MISSION_HANDOFF_CAPABILITY, generation)) return false;
+    return this.sendRaw({ type: 'mission.handoff.publish', runId, lease, publication });
+  }
+
   /** Reply to reconciliation from a read-only snapshot of durable local mission state. */
   sendMissionReconciliation(
     inventory: readonly MissionInventoryItem[],
@@ -575,11 +617,27 @@ export class WsClient {
         return;
       case 'run.assigned':
         if (msg.missionLease && !this.acceptMissionFrame(msg.type)) return;
-        this.opts.handlers?.onAssigned?.(msg.run, msg.missionLease, generation);
+        this.opts.handlers?.onAssigned?.(msg.run, msg.missionLease, msg.missionCommission, generation);
         return;
       case 'mission.task.ack':
         if (!this.acceptMissionFrame(msg.type)) return;
         this.opts.handlers?.onMissionTaskAck?.(msg.ack, generation);
+        return;
+      case 'mission.question.ack':
+        if (!this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onMissionQuestionAck?.(msg.runId, msg.lease, msg.ack, generation);
+        return;
+      case 'mission.question.answer':
+        if (!this.acceptMissionFrame(msg.type)) return;
+        this.opts.handlers?.onMissionQuestionAnswer?.(msg.answer, generation);
+        return;
+      case 'mission.handoff.ack':
+        if (!this.acceptCapabilityFrame(MISSION_HANDOFF_CAPABILITY, msg.type)) return;
+        this.opts.handlers?.onMissionHandoffAck?.(msg.ack, generation);
+        return;
+      case 'mission.handoff.consumed':
+        if (!this.acceptCapabilityFrame(MISSION_HANDOFF_CAPABILITY, msg.type)) return;
+        this.opts.handlers?.onMissionHandoffConsumed?.(msg.consumed, generation);
         return;
       case 'mission.reconcile.request':
         if (!this.acceptMissionFrame(msg.type)) return;
@@ -645,12 +703,16 @@ export class WsClient {
    * abandon the generation so no later frame on it can be mistaken for negotiated authority.
    */
   private acceptMissionFrame(type: string): boolean {
-    if (this.hasAcceptedCapability(MISSION_CAPABILITY)) return true;
+    return this.acceptCapabilityFrame(MISSION_CAPABILITY, type);
+  }
+
+  private acceptCapabilityFrame(capability: string, type: string): boolean {
+    if (this.hasAcceptedCapability(capability)) return true;
     this.log.error('ws received an unnegotiated mission frame', {
       type,
-      requiredCapability: MISSION_CAPABILITY,
+      requiredCapability: capability,
     });
-    this.restartConnection(`received ${type} without accepted ${MISSION_CAPABILITY}`);
+    this.restartConnection(`received ${type} without accepted ${capability}`);
     return false;
   }
 

@@ -6,6 +6,7 @@ import {
   type ExecutionSpec,
   MISSION_CAPABILITY,
   type MissionLeaseRef,
+  type MissionRootCommission,
   type ProjectManifest,
   type Run,
   type RunKind,
@@ -34,6 +35,7 @@ import { logger as defaultLogger } from './logger';
 import { ManifestStore } from './manifest-store';
 import { MissionDaemonControl } from './mission/daemon-control';
 import { createDaemonMissionProfileRegistry } from './mission/daemon-runtime';
+import { noriqMissionCommissionFromAssignment } from './mission/noriq-commission';
 import { NoriqMissionCoordinator } from './mission/noriq-coordinator';
 import { JsonlNoriqCoordinatorStore } from './mission/noriq-coordinator-store';
 import { WsMissionCoordinatorTransport } from './mission/noriq-transport';
@@ -138,9 +140,16 @@ export function telemetryFrame(rep: Pick<RunReport, 'telemetry'>): {
 export function missionAssignmentRefusal(
   run: Pick<Run, 'executionProfile'>,
   missionLease: MissionLeaseRef | null,
+  missionCommission: MissionRootCommission | null = null,
 ): string | null {
-  if (missionLease) {
+  if (missionLease && !missionCommission) {
     return 'mission assignment refused: Noriq did not provide the immutable commissioned task and dependency snapshot required by mission.v2';
+  }
+  if (!missionLease && missionCommission) {
+    return 'mission assignment refused: Noriq provided a commission without its authority lease';
+  }
+  if (missionLease && !run.executionProfile) {
+    return 'mission assignment refused: Noriq did not provide an exact commissioned execution profile';
   }
   if (run.executionProfile) {
     return 'execution-profile assignment refused: legacy Run supervision cannot honor the exact commissioned mission environment';
@@ -593,6 +602,7 @@ export class Daemon {
   private readonly missionPrivateRoot: string;
   /** Test seam for the bounded recovered-park probe; production uses PARK_RECOVERY_TIMEOUT_MS. */
   private readonly parkRecoveryTimeoutMs: number;
+  private readonly missionProfileRegistryFactory: typeof createDaemonMissionProfileRegistry;
 
   constructor(
     private readonly config: RunnerConfig,
@@ -657,6 +667,8 @@ export class Daemon {
       missionPrivateRoot?: string;
       /** Bounded startup recovery probe. Overridden only by tests that model a hung server. */
       parkRecoveryTimeoutMs?: number;
+      /** Machine/deployment seam for a commissioned generic execution boundary. */
+      missionProfileRegistryFactory?: typeof createDaemonMissionProfileRegistry;
     } = {},
   ) {
     this.log = deps.logger ?? defaultLogger;
@@ -681,6 +693,8 @@ export class Daemon {
     this.missionPrivateRoot =
       deps.missionPrivateRoot ?? path.join(os.homedir(), '.noriq', 'mission-harness-v2');
     this.parkRecoveryTimeoutMs = deps.parkRecoveryTimeoutMs ?? PARK_RECOVERY_TIMEOUT_MS;
+    this.missionProfileRegistryFactory =
+      deps.missionProfileRegistryFactory ?? createDaemonMissionProfileRegistry;
   }
 
   async start(): Promise<DaemonHandle> {
@@ -734,7 +748,7 @@ export class Daemon {
         const detected = detections.get(repo.root);
         return [
           repo.root,
-          createDaemonMissionProfileRegistry({
+          this.missionProfileRegistryFactory({
             repo,
             // The published mission evidence surface is Git only. Diversion/Perforce are not
             // silently treated as Git even when a mirror happens to exist beside the checkout.
@@ -746,6 +760,25 @@ export class Daemon {
         ] as const;
       }),
     );
+    const refreshMissionOffers = async (repoRoot: string) => {
+      const registry = missionProfileRegistries.get(repoRoot);
+      if (!registry) return [];
+      try {
+        return await registry.refresh();
+      } catch (error) {
+        this.log.warn('mission execution profile observation failed', {
+          repoRoot,
+          err: String(error),
+        });
+        return registry.offers();
+      }
+    };
+    const missionCapabilitiesFor = (offers: Awaited<ReturnType<typeof refreshMissionOffers>>) =>
+      offers.some(
+        (offer) => offer.health === 'healthy' && offer.resolution === 'resolved' && offer.attestationCapable,
+      )
+        ? [MISSION_CAPABILITY]
+        : [];
 
     // Mission authority is durable before either source-control cleanup or network admission. A
     // recovered root must reserve its workspace even while Noriq is offline, and no model may be
@@ -764,6 +797,18 @@ export class Daemon {
         return generation === null || generation === undefined
           ? false
           : (held.ws?.sendMissionTaskSettle(rootRunId, lease, report, generation) ?? false);
+      },
+      sendQuestion: (rootRunId, lease, question) => {
+        const generation = missionHeld.control?.authorizedTransportGeneration(rootRunId);
+        return generation === null || generation === undefined
+          ? false
+          : (held.ws?.sendMissionQuestion(rootRunId, lease, question, generation) ?? false);
+      },
+      sendHandoff: (rootRunId, lease, publication) => {
+        const generation = missionHeld.control?.authorizedTransportGeneration(rootRunId);
+        return generation === null || generation === undefined
+          ? false
+          : (held.ws?.sendMissionHandoff(rootRunId, lease, publication, generation) ?? false);
       },
     });
     const missionCoordinator = new NoriqMissionCoordinator({
@@ -883,14 +928,20 @@ export class Daemon {
         repos.map(async (repo) => [repo.root, await workflows.current(repo.root, repo.manifest)] as const),
       ),
     );
+    const registrationMissionOffers = new Map(
+      await Promise.all(
+        repos.map(async (repo) => [repo.root, await refreshMissionOffers(repo.root)] as const),
+      ),
+    );
+    const registrationMissionCapabilities = new Map(
+      [...registrationMissionOffers].map(([root, offers]) => [root, missionCapabilitiesFor(offers)]),
+    );
     const registration = buildRegistration(
       { label: this.config.label, concurrency: this.config.concurrency, tools, runnerId: state.runnerId },
       repos,
       registrationCatalogs,
-      // Do not invite an ordinary legacy Run to commission an environment it cannot honor. Profile
-      // advertising and mission.v2 workflow advertising turn on together only after Noriq supplies
-      // the immutable task/dependency commission and individual-task lease contract (PLNR-489/492).
-      new Map(),
+      registrationMissionOffers,
+      registrationMissionCapabilities,
     );
     const runner = await client.registerRunner(registration);
     await saveState({ runnerId: runner.id }, this.stateFile);
@@ -942,6 +993,52 @@ export class Daemon {
             });
           }
         },
+        onMissionQuestionAck: (runId, lease, ack, generation) => {
+          if (!missionControl.acknowledgeQuestion(runId, lease, ack, generation)) {
+            void missionControl
+              .reconcileQuestionAck(runId, lease, ack, generation)
+              .then((accepted) => {
+                if (!accepted) {
+                  this.log.debug('ignored unmatched mission question acknowledgement', {
+                    runId,
+                    reportId: ack.reportId,
+                    questionId: ack.questionId,
+                  });
+                }
+              })
+              .catch((error) => {
+                if (missionControl.isCurrentTransportGeneration(generation)) {
+                  poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+                }
+              });
+          }
+        },
+        onMissionQuestionAnswer: (answer, generation) => {
+          void missionControl.answerQuestion(answer, generation).catch((error) => {
+            if (missionControl.isCurrentTransportGeneration(generation)) {
+              poisonMissionControl(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+        },
+        onMissionHandoffAck: (ack, generation) => {
+          if (!missionControl.acknowledgeHandoff(ack, generation)) {
+            this.log.debug('ignored unmatched mission handoff acknowledgement', {
+              reportId: ack.reportId,
+              handoffId: ack.handoffId,
+            });
+          }
+        },
+        onMissionHandoffConsumed: (consumed, generation) => {
+          void missionControl.observeHandoffConsumption(consumed, generation).then((matched) => {
+            if (!matched) {
+              this.log.warn('ignored mission handoff consumption with no exact local identity', {
+                runId: consumed.runId,
+                handoffId: consumed.handoff.handoffId,
+                consumptionId: consumed.consumptionId,
+              });
+            }
+          });
+        },
         onMissionReconcileRequest: (request, generation) => {
           void missionControl.reconcile(request, generation).catch((error) => {
             if (missionControl.isCurrentTransportGeneration(generation)) {
@@ -977,14 +1074,19 @@ export class Daemon {
         maxConcurrency: this.config.concurrency,
         repos: registration.repos,
       },
-      // Re-observe the same read-at-use manifest/workflow state used by dispatch. Mission profile
-      // offers and workflow capability stay empty together until Noriq can send the complete
-      // immutable commission; no legacy Run may be invited into a half-activated environment.
       refreshRepos: () =>
         Promise.all(
           repos.map(async (repo) => {
             const manifest = (await manifests.current(repo.root)) ?? repo.manifest;
-            return repoReport(repo, manifest, await workflows.current(repo.root, manifest), this.log, [], []);
+            const offers = await refreshMissionOffers(repo.root);
+            return repoReport(
+              repo,
+              manifest,
+              await workflows.current(repo.root, manifest),
+              this.log,
+              offers,
+              missionCapabilitiesFor(offers),
+            );
           }),
         ),
       connect: this.connect,
@@ -1505,7 +1607,7 @@ export class Daemon {
       });
 
       const ordinaryWsHandlers: WsHandlers = {
-        onAssigned: (run, missionLease, generation) => {
+        onAssigned: (run, missionLease, missionCommission, generation) => {
           if (!acceptingLegacyWork) {
             this.log.debug('ignored assignment after legacy admission closed', { runId: run.id });
             return;
@@ -1513,9 +1615,8 @@ export class Daemon {
           // Startup buffering can outlive the socket that supplied a frame. Never commission or
           // refuse work from a generation that no longer owns the live connection.
           if (!held.ws?.isCurrentGeneration(generation)) return;
-          const refusal = missionAssignmentRefusal(run, missionLease);
-          if (refusal) {
-            this.log.warn(refusal, { runId: run.id });
+          const refuse = (reason: string): void => {
+            this.log.warn(reason, { runId: run.id });
             const sent =
               held.ws?.sendRunStatus(run.id, 'failed', {
                 missionLease,
@@ -1524,15 +1625,57 @@ export class Daemon {
                   outcome: 'failed',
                   code: null,
                   signal: null,
-                  reason: refusal,
+                  reason,
                 },
               }) ?? false;
-            // Mission statuses deliberately do not enter WsClient's legacy replay set: replaying an
-            // old epoch before adoption would violate authority. Force a fresh generation when the
-            // exact refusal could not leave this one.
             if (missionLease && !sent) {
               held.ws?.restartConnection('mission assignment refusal was not sent', generation);
             }
+          };
+          const refusal = missionAssignmentRefusal(run, missionLease, missionCommission);
+          if (refusal) {
+            refuse(refusal);
+            return;
+          }
+          if (missionLease && missionCommission && run.executionProfile) {
+            const executionProfile = run.executionProfile;
+            void (async () => {
+              const matches = repos.filter((repo) => repo.id === run.repoRef);
+              if (matches.length !== 1)
+                throw new Error(`mission repoRef resolved to ${matches.length} repositories`);
+              const repo = matches[0]!;
+              if (!repo.repositoryKey) throw new Error('mission repository lacks a canonical repositoryKey');
+              const registry = missionProfileRegistries.get(repo.root);
+              if (!registry) throw new Error('mission execution profile registry is unavailable');
+              await registry.refresh();
+              const profile = registry.match(executionProfile);
+              if (!profile) throw new Error('commissioned execution profile no longer attests exactly');
+              const existingCommission = await missionControl.existingCommission(run.id);
+              const baseRevision = existingCommission?.baseRevision ?? (await vcs.currentBase(repo.root));
+              if (typeof baseRevision !== 'string' && !baseRevision.ok) {
+                throw new Error(`could not pin the exact mission base revision: ${baseRevision.detail}`);
+              }
+              const commission = noriqMissionCommissionFromAssignment({
+                run,
+                lease: missionLease,
+                serverCommission: missionCommission,
+                repositoryKey: repo.repositoryKey,
+                baseRevision: typeof baseRevision === 'string' ? baseRevision : baseRevision.baseId,
+                profile,
+              });
+              const accepted = await missionControl.commissionFresh(commission, generation);
+              if (accepted) {
+                this.log.info('accepted fresh commissioned mission', {
+                  runId: run.id,
+                  tasks: commission.tasks.length,
+                  profile: commission.executionProfile.id,
+                });
+                held.ws?.advertiseCapacity();
+              }
+            })().catch((error) => {
+              if (!held.ws?.isCurrentGeneration(generation)) return;
+              refuse(`mission assignment refused: ${error instanceof Error ? error.message : String(error)}`);
+            });
             return;
           }
           // The seat is claimed SYNCHRONOUSLY — the ledger and the heartbeat see this run before

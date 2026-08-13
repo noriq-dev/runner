@@ -105,4 +105,72 @@ describe('WsMissionCoordinatorTransport', () => {
     await expect(stopped).rejects.toThrow('shutdown');
     vi.useRealTimers();
   });
+
+  it('fences question acknowledgements by root and lease and correlates exact handoffs', async () => {
+    const transport = new WsMissionCoordinatorTransport({
+      sendBegin: () => true,
+      sendSettle: () => true,
+      sendQuestion: () => true,
+      sendHandoff: () => true,
+    });
+    const question = {
+      reportId: 'question_report',
+      questionId: 'question_1',
+      attemptId: 'attempt_1',
+      prompt: 'Which option?',
+      observedAt: '2026-08-13T00:02:00.000Z',
+    };
+    const pendingQuestion = transport.question('run_1', lease, question);
+    const questionAck = {
+      reportId: question.reportId,
+      questionId: question.questionId,
+      attemptId: question.attemptId,
+      accepted: true,
+      state: 'open' as const,
+      signalId: 'signal_1',
+      error: null,
+    };
+    expect(transport.acknowledgeQuestion('run_2', lease, questionAck)).toBe(false);
+    expect(transport.acknowledgeQuestion('run_1', { ...lease, epoch: 3 }, questionAck)).toBe(false);
+    expect(transport.acknowledgeQuestion('run_1', lease, questionAck)).toBe(true);
+    await expect(pendingQuestion).resolves.toEqual(questionAck);
+
+    const publication = {
+      reportId: 'handoff_report',
+      handoff: {
+        schemaVersion: 1 as const,
+        handoffId: 'handoff_1',
+        backend: 'git',
+        repositoryKey: 'repo-key',
+        checkpoint: 'checkpoint_1',
+        revision: 'revision_1',
+        reference: 'refs/heads/noriq/run_1',
+      },
+    };
+    const pendingHandoff = transport.handoff('run_1', lease, publication);
+    expect(
+      transport.acknowledgeHandoff({
+        reportId: publication.reportId,
+        accepted: true,
+        handoffId: 'wrong',
+        state: 'preserved_unlanded',
+        preservedAt: '2026-08-13T00:03:00.000Z',
+        consumedAt: null,
+        consumptionId: null,
+        error: null,
+      }),
+    ).toBe(false);
+    const handoffAck = {
+      reportId: publication.reportId,
+      accepted: true,
+      handoffId: publication.handoff.handoffId,
+      state: 'preserved_unlanded' as const,
+      preservedAt: '2026-08-13T00:03:00.000Z',
+      consumedAt: null,
+      consumptionId: null,
+      error: null,
+    };
+    expect(transport.acknowledgeHandoff(handoffAck)).toBe(true);
+    await expect(pendingHandoff).resolves.toEqual(handoffAck);
+  });
 });

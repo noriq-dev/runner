@@ -469,6 +469,7 @@ const makeRun = (over: Partial<Run> = {}): Run => ({
   workflow: null,
   // No commissioned machine-local mission environment on legacy supervisor fixtures.
   executionProfile: null,
+  missionMode: null,
   // No per-dispatch override by default (RUN-33): the repo's [defaults], then the tool's own.
   model: null,
   effort: null,

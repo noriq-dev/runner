@@ -240,6 +240,7 @@ function makeRunFixture(): Run {
     agent: null,
     workflow: null,
     executionProfile: null,
+    missionMode: null,
     model: null,
     effort: null,
     budget: { maxTokens: null, maxUsd: null, maxDurationSeconds: null, maxRounds: null },

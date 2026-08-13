@@ -36,6 +36,8 @@ function commission() {
     },
     repositoryKey: 'repo-key',
     baseRevision: 'base-revision',
+    serverCommissionDigest: 'b'.repeat(64),
+    publishHandoff: false,
     tasks: [{ taskId: 'task-a', childKey: 'child-a', brief: 'Build A.', dependencyIds: [] }],
     budget: { tokens: 1_000, usd: null, activeSeconds: 100 },
     catalogFingerprint: 'a'.repeat(64),

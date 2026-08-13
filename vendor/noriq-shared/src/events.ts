@@ -69,6 +69,8 @@ export const EventVerb = z.enum([
   'run.created',
   'run.dispatched',
   'run.status_changed',
+  'run.handoff_preserved',
+  'run.handoff_consumed',
   // ProjectMemory's outbox delivered a canonical mutation into this project's event stream
   // (PLNR-247). One compact verb for every memory change — kind/authority/etc. ride the
   // payload's summary, never the memory body itself (§3/§4: D1 never holds memory content).

@@ -1,6 +1,12 @@
 import { z } from 'zod';
-import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage } from './runner';
+import {
+  Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage,
+  AcceptedRevisionHandoff,
+} from './runner';
 import { ExecutionSpec } from './execution-spec';
+import {
+  MissionQuestionAck, MissionQuestionAnswer, MissionQuestionPublication, MissionRootCommission,
+} from './runner-protocol';
 import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
@@ -10,6 +16,7 @@ import {
   MissionAdoptionResult,
   MissionInventoryItem,
   MissionLeaseRef,
+  MISSION_HANDOFF_CAPABILITY,
   MISSION_CAPABILITY,
   ORCHESTRATION_CAPABILITY,
   RunnerExecutionDeclaration,
@@ -36,7 +43,9 @@ import {
 // Bump when the envelope shape changes incompatibly; sent in `hello` so the
 // server can reject or adapt to an out-of-date daemon.
 export const RUNNER_PROTOCOL_VERSION = 1;
-export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY] as const;
+export const RUNNER_PROTOCOL_CAPABILITIES = [
+  ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY,
+] as const;
 
 // How a steer is injected into the live CLI session:
 //   soft — queue as the next user turn (the agent finishes its current thought)
@@ -51,6 +60,32 @@ export type SteerMode = z.infer<typeof SteerMode>;
 //   dropped  — the Run is gone/terminal; not delivered anywhere
 export const SteerDelivery = z.enum(['runtime', 'fallback', 'dropped']);
 export type SteerDelivery = z.infer<typeof SteerDelivery>;
+
+export const MissionHandoffPublication = z.object({
+  reportId: z.string().min(1).max(160),
+  handoff: AcceptedRevisionHandoff,
+});
+export type MissionHandoffPublication = z.infer<typeof MissionHandoffPublication>;
+
+export const MissionHandoffAck = z.object({
+  reportId: z.string(),
+  accepted: z.boolean(),
+  handoffId: z.string().nullable().default(null),
+  state: z.enum(['preserved_unlanded', 'consumed_unlanded']).nullable().default(null),
+  preservedAt: z.string().datetime().nullable().default(null),
+  consumedAt: z.string().datetime().nullable().default(null),
+  consumptionId: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+export type MissionHandoffAck = z.infer<typeof MissionHandoffAck>;
+
+export const MissionHandoffConsumed = z.object({
+  runId: z.string().min(1),
+  handoff: AcceptedRevisionHandoff,
+  consumptionId: z.string().min(1),
+  consumedAt: z.string().datetime(),
+});
+export type MissionHandoffConsumed = z.infer<typeof MissionHandoffConsumed>;
 
 // ---------------------------------------------------------------------------
 // server → daemon
@@ -70,6 +105,7 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('run.assigned'), run: Run,
     missionLease: MissionLeaseRef.nullable().default(null),
+    missionCommission: MissionRootCommission.nullable().default(null),
   }),
 
   // A plan finished, so its working branch is ready to become a merge request (RUN-28).
@@ -102,6 +138,9 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
     answer: z.string(),
   }),
 
+  z.object({ type: z.literal('mission.question.ack'), runId: z.string(), lease: MissionLeaseRef, ack: MissionQuestionAck }),
+  z.object({ type: z.literal('mission.question.answer'), answer: MissionQuestionAnswer }),
+
   // Kill a Run. hard=true → SIGTERM the process now; false → let it wind down.
   z.object({
     type: z.literal('run.cancel'),
@@ -130,6 +169,8 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
 
   z.object({ type: z.literal('execution.ack'), ack: ExecutionReportAck }),
   z.object({ type: z.literal('mission.task.ack'), ack: MissionTaskAck }),
+  z.object({ type: z.literal('mission.handoff.ack'), ack: MissionHandoffAck }),
+  z.object({ type: z.literal('mission.handoff.consumed'), consumed: MissionHandoffConsumed }),
   z.object({
     type: z.literal('mission.reconcile.request'),
     deadline: z.string().datetime(),
@@ -219,6 +260,14 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
 
   z.object({ type: z.literal('mission.task.begin'), runId: z.string(), lease: MissionLeaseRef, begin: MissionTaskBeginReport }),
   z.object({ type: z.literal('mission.task.settle'), runId: z.string(), lease: MissionLeaseRef, settle: MissionTaskSettleReport }),
+  z.object({
+    type: z.literal('mission.question.publish'), runId: z.string(), lease: MissionLeaseRef,
+    question: MissionQuestionPublication,
+  }),
+  z.object({
+    type: z.literal('mission.handoff.publish'), runId: z.string(), lease: MissionLeaseRef,
+    publication: MissionHandoffPublication,
+  }),
   z.object({
     type: z.literal('mission.reconcile'),
     inventory: z.array(MissionInventoryItem).max(128),

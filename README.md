@@ -246,31 +246,27 @@ mutation certification gaps are closed.
 
 The daemon's `mission.v2` protocol path opens immediately after REST registration so it can recover
 already-durable roots: it buffers ordinary frames, inventories/quarantines mission roots, resolves
-exact historical profile snapshots, and includes mission workspaces in orphan ownership. Protocol
-compatibility is not fresh-dispatch eligibility. Runner deliberately advertises no execution
-profiles and no eligible mission workflow for a new commission. Dedicated build workflows may
-declare `capabilities = ["mission.v2"]`, but that declaration is filtered from fresh-dispatch
-advertising until Noriq can send the complete authority below **and** a subsequent Runner
-commissioning change safely enables the offers and assignment route. Runner must never infer a
-mission from legacy stages or fall back after accepting mission authority. Noriq cutover is
-currently withheld on **PLNR-488** through **PLNR-496**:
+exact historical profile snapshots, and includes mission workspaces in orphan ownership. The
+PLNR-488 through PLNR-496 contracts are now consumed by Runner. A healthy, exactly attested local
+profile is advertised together with its eligible mission workflow. A fresh assignment must carry
+the exact execution-profile commission, lease, and immutable Noriq task/plan snapshot; Runner
+verifies the server digest, pins the checkout's exact Git revision, writes the combined authority to
+its private WAL, and only then starts model control. It never infers a mission from legacy stages or
+falls back to legacy supervision after accepting mission authority.
 
-- **PLNR-488:** exact authorized consumed-handoff acknowledgement before VCS reference retirement;
-- **PLNR-489:** immutable commissioned task/dependency snapshot for a single-root plan Run;
-- **PLNR-490:** start the adoption deadline only after the negotiated mission WebSocket can answer;
-- **PLNR-491:** expose the `single_root` dispatch strategy in the Plans UI;
-- **PLNR-492:** durable lease/restart semantics for an individually dispatched task-root mission;
-- **PLNR-493:** require an exact non-null commissioned execution profile for `single_root`;
-- **PLNR-494:** plan cancellation must interrupt mission task attempts and release their claims;
-- **PLNR-495:** `gate = "landed"` must recognize exact successful mission-task execution/consumption;
-- **PLNR-496:** durable, lease-fenced mission human-question publication and answer delivery.
+Plan questions are published with stable attempt/question identities and must be acknowledged
+before the control stop is considered safely parked. A successful plan root publishes its exact
+preserved Git revision through the durable handoff channel. Until that acknowledgement is recorded
+locally, the otherwise-complete root stays in reconciliation inventory and safely republishes after
+a disconnect. Explicit task-root missions use the same lease, profile, question, and settlement
+contracts but intentionally do not publish the plan-only handoff.
 
 The immutable execution-profile catalog is the sole source of mission validation authority; v2 does
-not inherit a daemon mapping from the legacy `[verify]` setting. After the Noriq contracts land,
-Runner still needs an explicit commissioning follow-up with an operational credential/resource/
-network/runtime broker to publish attested profile offers, enable eligible workflows, and route
-fresh assignments into the mission coordinator. It also must expose
-consumed handoff only through the authorized Noriq contract. It fails closed on a missing or
+not inherit a daemon mapping from the legacy `[verify]` setting. Fresh dispatch remains unavailable
+on a machine until its deployment supplies the operational credential/resource/network/runtime
+boundary required to attest a healthy profile. Unavailable or degraded declarations may be reported
+for diagnostics but have zero capacity and do not enable a mission workflow. Consumed handoffs are
+accepted only through the authorized Noriq contract. Runner fails closed on a missing or
 mismatched commission, profile fingerprint, lease epoch, acknowledgement, human-question identity,
 effective MCP inventory, or startup buffer.
 

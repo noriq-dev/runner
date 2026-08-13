@@ -12,6 +12,10 @@ type ImmediateHandlerName =
   | 'onRegistered'
   | 'onDisconnect'
   | 'onMissionTaskAck'
+  | 'onMissionQuestionAck'
+  | 'onMissionQuestionAnswer'
+  | 'onMissionHandoffAck'
+  | 'onMissionHandoffConsumed'
   | 'onMissionReconcileRequest'
   | 'onMissionReconcileResult';
 
@@ -119,6 +123,33 @@ export class BufferedWsHandlers implements WsHandlers {
     this.routeImmediate('onMissionTaskAck', [ack, generation]);
   };
 
+  readonly onMissionQuestionAck: NonNullable<WsHandlers['onMissionQuestionAck']> = (
+    runId,
+    lease,
+    ack,
+    generation,
+  ) => {
+    this.routeImmediate('onMissionQuestionAck', [runId, lease, ack, generation]);
+  };
+
+  readonly onMissionQuestionAnswer: NonNullable<WsHandlers['onMissionQuestionAnswer']> = (
+    answer,
+    generation,
+  ) => {
+    this.routeImmediate('onMissionQuestionAnswer', [answer, generation]);
+  };
+
+  readonly onMissionHandoffAck: NonNullable<WsHandlers['onMissionHandoffAck']> = (ack, generation) => {
+    this.routeImmediate('onMissionHandoffAck', [ack, generation]);
+  };
+
+  readonly onMissionHandoffConsumed: NonNullable<WsHandlers['onMissionHandoffConsumed']> = (
+    consumed,
+    generation,
+  ) => {
+    this.routeImmediate('onMissionHandoffConsumed', [consumed, generation]);
+  };
+
   readonly onMissionReconcileRequest: NonNullable<WsHandlers['onMissionReconcileRequest']> = (
     request,
     generation,
@@ -133,8 +164,13 @@ export class BufferedWsHandlers implements WsHandlers {
     this.routeImmediate('onMissionReconcileResult', [results, generation]);
   };
 
-  readonly onAssigned: NonNullable<WsHandlers['onAssigned']> = (run, missionLease, generation) => {
-    this.routeBuffered('onAssigned', [run, missionLease, generation]);
+  readonly onAssigned: NonNullable<WsHandlers['onAssigned']> = (
+    run,
+    missionLease,
+    missionCommission,
+    generation,
+  ) => {
+    this.routeBuffered('onAssigned', [run, missionLease, missionCommission, generation]);
   };
 
   readonly onCancel: NonNullable<WsHandlers['onCancel']> = (message, generation) => {

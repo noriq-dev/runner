@@ -1,4 +1,9 @@
-import { MISSION_CAPABILITY, RUNNER_PROTOCOL_CAPABILITIES, RunnerClientMessage } from '@noriq-dev/shared';
+import {
+  MISSION_CAPABILITY,
+  MISSION_HANDOFF_CAPABILITY,
+  RUNNER_PROTOCOL_CAPABILITIES,
+  RunnerClientMessage,
+} from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   WsClient,
@@ -68,6 +73,7 @@ const RUN = {
   runnerId: 'rnr_1',
   agentId: null,
   executionProfile: null,
+  missionMode: null,
   kind: 'build',
   anchor: null,
   brief: 'go',
@@ -342,6 +348,7 @@ describe('WsClient', () => {
     expect(onAssigned).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'run_1', kind: 'build' }),
       null,
+      null,
       FIRST_GENERATION,
     );
     expect(onCancel).toHaveBeenCalledWith(
@@ -381,12 +388,20 @@ describe('WsClient', () => {
   it('routes mission leases, task acknowledgements, and reconciliation frames', () => {
     const onAssigned = vi.fn();
     const onMissionTaskAck = vi.fn();
+    const onMissionQuestionAck = vi.fn();
+    const onMissionQuestionAnswer = vi.fn();
+    const onMissionHandoffAck = vi.fn();
+    const onMissionHandoffConsumed = vi.fn();
     const onMissionReconcileRequest = vi.fn();
     const onMissionReconcileResult = vi.fn();
     const client = makeClient({
       handlers: {
         onAssigned,
         onMissionTaskAck,
+        onMissionQuestionAck,
+        onMissionQuestionAnswer,
+        onMissionHandoffAck,
+        onMissionHandoffConsumed,
         onMissionReconcileRequest,
         onMissionReconcileResult,
       },
@@ -401,10 +416,60 @@ describe('WsClient', () => {
         runnerId: 'rnr_1',
         protocol: 1,
         serverTime: '2026-07-14T00:00:00.000Z',
-        acceptedCapabilities: [MISSION_CAPABILITY],
+        acceptedCapabilities: [MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY],
       }),
     );
     const lease = { sitting: 2, executionId: 'exe_root', epoch: 3 };
+    const questionAck = {
+      reportId: 'question_report',
+      questionId: 'question_1',
+      attemptId: 'attempt:1',
+      accepted: true,
+      state: 'open',
+      signalId: 'signal_1',
+      error: null,
+    };
+    s.emit(
+      'message',
+      JSON.stringify({ type: 'mission.question.ack', runId: 'run_1', lease, ack: questionAck }),
+    );
+    const answer = {
+      answerId: 'answer_1',
+      runId: 'run_1',
+      questionId: 'question_1',
+      attemptId: 'attempt:1',
+      lease,
+      answer: 'Use option A.',
+      answeredAt: '2026-07-14T00:00:10.000Z',
+    };
+    s.emit('message', JSON.stringify({ type: 'mission.question.answer', answer }));
+    const handoff = {
+      schemaVersion: 1,
+      handoffId: 'handoff_1',
+      backend: 'git',
+      repositoryKey: 'repo-key',
+      checkpoint: 'checkpoint_1',
+      revision: 'revision_1',
+      reference: 'refs/heads/noriq/run_1',
+    };
+    const handoffAck = {
+      reportId: 'handoff_report',
+      accepted: true,
+      handoffId: 'handoff_1',
+      state: 'preserved_unlanded',
+      preservedAt: '2026-07-14T00:00:11.000Z',
+      consumedAt: null,
+      consumptionId: null,
+      error: null,
+    };
+    s.emit('message', JSON.stringify({ type: 'mission.handoff.ack', ack: handoffAck }));
+    const consumed = {
+      runId: 'run_1',
+      handoff,
+      consumptionId: 'consumption_1',
+      consumedAt: '2026-07-14T00:00:12.000Z',
+    };
+    s.emit('message', JSON.stringify({ type: 'mission.handoff.consumed', consumed }));
     s.emit('message', JSON.stringify({ type: 'run.assigned', run: RUN, missionLease: lease }));
     s.emit(
       'message',
@@ -423,7 +488,7 @@ describe('WsClient', () => {
         },
       }),
     );
-    const inventory = [{ runId: 'run_1', lease, attempts: [] }];
+    const inventory = [{ runId: 'run_1', lease, commissionDigest: null, attempts: [] }];
     s.emit(
       'message',
       JSON.stringify({
@@ -443,12 +508,17 @@ describe('WsClient', () => {
     expect(onAssigned).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'run_1' }),
       lease,
+      null,
       FIRST_GENERATION,
     );
     expect(onMissionTaskAck).toHaveBeenCalledWith(
       expect.objectContaining({ reportId: 'begin:1', accepted: true }),
       FIRST_GENERATION,
     );
+    expect(onMissionQuestionAck).toHaveBeenCalledWith('run_1', lease, questionAck, FIRST_GENERATION);
+    expect(onMissionQuestionAnswer).toHaveBeenCalledWith(answer, FIRST_GENERATION);
+    expect(onMissionHandoffAck).toHaveBeenCalledWith(handoffAck, FIRST_GENERATION);
+    expect(onMissionHandoffConsumed).toHaveBeenCalledWith(consumed, FIRST_GENERATION);
     expect(onMissionReconcileRequest).toHaveBeenCalledWith(
       {
         deadline: '2026-07-14T00:00:30.000Z',
@@ -498,7 +568,10 @@ describe('WsClient', () => {
     );
     expect(client.sendMissionTaskSettle('run_1', lease, settle, FIRST_GENERATION)).toBe(false);
     expect(
-      client.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION),
+      client.sendMissionReconciliation(
+        [{ runId: 'run_1', lease, commissionDigest: null, attempts: [] }],
+        FIRST_GENERATION,
+      ),
     ).toBe(false);
     expect(first.msgs().filter((message) => String(message.type).startsWith('mission.'))).toEqual([]);
 
@@ -515,7 +588,10 @@ describe('WsClient', () => {
     expect(client.sendMissionTaskBegin('run_1', lease, begin, FIRST_GENERATION)).toBe(true);
     expect(client.sendMissionTaskSettle('run_1', lease, settle, FIRST_GENERATION)).toBe(true);
     expect(
-      client.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION),
+      client.sendMissionReconciliation(
+        [{ runId: 'run_1', lease, commissionDigest: null, attempts: [] }],
+        FIRST_GENERATION,
+      ),
     ).toBe(true);
 
     first.emit('close');
@@ -1111,7 +1187,10 @@ describe('every frame the daemon sends must satisfy the wire contract', () => {
       },
       FIRST_GENERATION,
     );
-    c.sendMissionReconciliation([{ runId: 'run_1', lease, attempts: [] }], FIRST_GENERATION);
+    c.sendMissionReconciliation(
+      [{ runId: 'run_1', lease, commissionDigest: null, attempts: [] }],
+      FIRST_GENERATION,
+    );
 
     const missionFrames = frames().filter((frame) =>
       [

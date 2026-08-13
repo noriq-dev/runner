@@ -1,12 +1,25 @@
 import { createHash } from 'node:crypto';
 import {
   MissionAdoptionResult as MissionAdoptionResultSchema,
+  MissionHandoffAck as MissionHandoffAckSchema,
+  MissionHandoffConsumed as MissionHandoffConsumedSchema,
   MissionInventoryItem as MissionInventoryItemSchema,
+  MissionQuestionAck as MissionQuestionAckSchema,
+  MissionQuestionAnswer as MissionQuestionAnswerSchema,
   MissionTaskAck as MissionTaskAckSchema,
 } from '@noriq-dev/shared';
-import type { MissionAdoptionResult, MissionInventoryItem, MissionTaskAck } from '@noriq-dev/shared';
+import type {
+  MissionAdoptionResult,
+  MissionHandoffAck,
+  MissionHandoffConsumed,
+  MissionInventoryItem,
+  MissionQuestionAck,
+  MissionQuestionAnswer,
+  MissionTaskAck,
+} from '@noriq-dev/shared';
 import { z } from 'zod';
 import type { logger as Logger } from '../logger';
+import type { NoriqMissionCommission } from './noriq-coordinator-store';
 import type { WsMissionCoordinatorTransport } from './noriq-transport';
 
 export const MAX_DAEMON_MISSION_RECONCILIATION_ROOTS = 128;
@@ -36,10 +49,20 @@ export interface MissionReconciliationRequest {
  * except the explicitly backgrounded `control` call after exact server adoption.
  */
 export interface DaemonMissionCoordinatorLike {
+  commission?(commission: NoriqMissionCommission): Promise<unknown>;
   inventoryAll(): Promise<readonly MissionInventoryItem[]>;
   reservedRootRunIds(): Promise<readonly string[]>;
   adopt(result: MissionAdoptionResult): Promise<unknown>;
   control(rootRunId: string): Promise<unknown>;
+  answer?(rootRunId: string, questionId: string, answer: string): Promise<unknown>;
+  inspect?(rootRunId: string): Promise<unknown>;
+  recordQuestionPublication?(
+    rootRunId: string,
+    questionId: string,
+    reportId: string,
+    signalId: string,
+  ): Promise<unknown>;
+  recordHandoffPublication?(rootRunId: string, reportId: string, handoffId: string): Promise<unknown>;
   cancel(rootRunId: string, reason: string): Promise<unknown>;
   /** Optional graceful process/runtime quiescence. It must not terminal-cancel the mission. */
   quiesce?(): void | Promise<void>;
@@ -47,7 +70,10 @@ export interface DaemonMissionCoordinatorLike {
   quarantineAll?(reason: string): void | Promise<void>;
 }
 
-export type DaemonMissionAckTransport = Pick<WsMissionCoordinatorTransport, 'acknowledge' | 'stop'>;
+export type DaemonMissionAckTransport = Pick<WsMissionCoordinatorTransport, 'acknowledge' | 'stop'> &
+  Partial<
+    Pick<WsMissionCoordinatorTransport, 'acknowledgeQuestion' | 'acknowledgeHandoff' | 'question' | 'handoff'>
+  >;
 
 export type MissionDaemonFatalCode =
   | 'MISSION_RECONCILIATION_INVALID'
@@ -152,10 +178,49 @@ function normalizeResults(
   return normalized;
 }
 
-function stopReason(value: unknown): string | null {
-  if (value === null || typeof value !== 'object' || !('reason' in value)) return null;
-  const reason = (value as { reason?: unknown }).reason;
-  return typeof reason === 'string' ? reason : null;
+type ControlStopView = {
+  reason: string;
+  state: {
+    rootRunId: string;
+    lease: { sitting: number; executionId: string; epoch: number } | null;
+    commission: NoriqMissionCommission | null;
+    tasks: ReadonlyArray<{
+      task: { taskId: string };
+      attemptId: string | null;
+      questionPublication?: null | {
+        questionId: string;
+        reportId: string;
+        signalId: string;
+      };
+      observation: null | {
+        kind: string;
+        questionId?: string;
+        prompt?: string;
+        handoff?: null | {
+          backend: string;
+          repositoryKey: string;
+          checkpointId: string;
+          revisionId: string;
+          reference: string;
+          status: 'preserved';
+        };
+      };
+    }>;
+  };
+  taskId?: string;
+  questionId?: string;
+  prompt?: string;
+};
+
+function controlStop(value: unknown): ControlStopView | null {
+  if (!value || typeof value !== 'object') return null;
+  const stop = value as Partial<ControlStopView>;
+  if (typeof stop.reason !== 'string' || !stop.state || typeof stop.state.rootRunId !== 'string') return null;
+  return stop as ControlStopView;
+}
+
+function stableId(prefix: string, value: unknown): string {
+  return `${prefix}_${createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex').slice(0, 56)}`;
 }
 
 /**
@@ -229,6 +294,13 @@ export class MissionDaemonControl {
     return generation !== null && this.isCurrentTransportGeneration(generation) ? generation : null;
   }
 
+  /** Read an already-durable fresh commission so duplicate assignment delivery never re-pins HEAD. */
+  async existingCommission(rootRunId: string): Promise<NoriqMissionCommission | null> {
+    if (!this.coordinator.inspect) return null;
+    const state = controlStop({ reason: 'state', state: await this.coordinator.inspect(rootRunId) })?.state;
+    return state?.commission ?? null;
+  }
+
   /** Deliver only a schema-valid, exact report/attempt/phase acknowledgement. */
   acknowledgeTask(ack: MissionTaskAck, generation: MissionTransportGeneration): boolean {
     if (!this.isCurrentTransportGeneration(generation)) return false;
@@ -238,6 +310,172 @@ export class MissionDaemonControl {
       return false;
     }
     return this.transport.acknowledge(parsed.data);
+  }
+
+  acknowledgeQuestion(
+    runId: string,
+    lease: MissionQuestionAnswer['lease'],
+    ack: MissionQuestionAck,
+    generation: MissionTransportGeneration,
+  ): boolean {
+    if (!this.isCurrentTransportGeneration(generation)) return false;
+    const parsed = MissionQuestionAckSchema.safeParse(ack);
+    if (!parsed.success || this.authorizedControlGenerations.get(runId) !== generation) return false;
+    const authorized = this.authorizedControlGenerations.get(runId) === generation;
+    return (
+      authorized &&
+      lease.epoch > 0 &&
+      (this.transport.acknowledgeQuestion?.(runId, lease, parsed.data) ?? false)
+    );
+  }
+
+  /** Durably consume Noriq's replayed question acknowledgement after lease adoption. */
+  async reconcileQuestionAck(
+    runId: string,
+    lease: MissionQuestionAnswer['lease'],
+    ack: MissionQuestionAck,
+    generation: MissionTransportGeneration,
+  ): Promise<boolean> {
+    if (!this.isCurrentTransportGeneration(generation)) return false;
+    const parsed = MissionQuestionAckSchema.safeParse(ack);
+    if (
+      !parsed.success ||
+      !parsed.data.accepted ||
+      !parsed.data.signalId ||
+      (parsed.data.state !== 'open' && parsed.data.state !== 'answered') ||
+      this.authorizedControlGenerations.get(runId) !== generation ||
+      !this.coordinator.inspect ||
+      !this.coordinator.recordQuestionPublication
+    ) {
+      return false;
+    }
+    const state = controlStop({ reason: 'state', state: await this.coordinator.inspect(runId) })?.state;
+    if (!state?.lease || JSON.stringify(state.lease) !== JSON.stringify(lease)) return false;
+    const task = state.tasks.find(
+      (candidate) =>
+        candidate.attemptId === parsed.data.attemptId &&
+        candidate.observation?.kind === 'human-question' &&
+        candidate.observation.questionId === parsed.data.questionId,
+    );
+    if (!task) return false;
+    await this.coordinator.recordQuestionPublication(
+      runId,
+      parsed.data.questionId,
+      parsed.data.reportId,
+      parsed.data.signalId,
+    );
+    return true;
+  }
+
+  acknowledgeHandoff(ack: MissionHandoffAck, generation: MissionTransportGeneration): boolean {
+    if (!this.isCurrentTransportGeneration(generation)) return false;
+    const parsed = MissionHandoffAckSchema.safeParse(ack);
+    return parsed.success && (this.transport.acknowledgeHandoff?.(parsed.data) ?? false);
+  }
+
+  /** Durably admit a fresh exact commission on the socket generation that delivered it. */
+  commissionFresh(
+    commission: NoriqMissionCommission,
+    generation: MissionTransportGeneration,
+  ): Promise<boolean> {
+    if (!this.isCurrentTransportGeneration(generation)) return Promise.resolve(false);
+    let accepted = false;
+    const operation = this.resultTail.then(async () => {
+      await this.generationTail;
+      if (!this.isCurrentTransportGeneration(generation)) return;
+      if (!this.coordinator.commission) throw new Error('fresh mission commissioning is unavailable');
+      await this.coordinator.commission(commission);
+      if (!this.isCurrentTransportGeneration(generation)) return;
+      const authority = `fresh:${commission.commissionDigest}`;
+      this.latestAppliedResult.set(commission.rootRunId, authority);
+      this.authorizedControlGenerations.set(commission.rootRunId, generation);
+      this.startControl(commission.rootRunId, authority, generation);
+      accepted = true;
+    });
+    this.resultTail = operation.catch(() => undefined);
+    return operation.then(() => accepted);
+  }
+
+  answerQuestion(answer: MissionQuestionAnswer, generation: MissionTransportGeneration): Promise<boolean> {
+    const parsed = MissionQuestionAnswerSchema.safeParse(answer);
+    if (!parsed.success || !this.isCurrentTransportGeneration(generation)) return Promise.resolve(false);
+    let accepted = false;
+    const operation = this.resultTail.then(async () => {
+      if (
+        !this.isCurrentTransportGeneration(generation) ||
+        this.authorizedControlGenerations.get(parsed.data.runId) !== generation
+      )
+        return;
+      if (!this.coordinator.inspect || !this.coordinator.answer) return;
+      const state = controlStop({
+        reason: 'state',
+        state: await this.coordinator.inspect(parsed.data.runId),
+      })?.state;
+      if (!state?.lease || JSON.stringify(state.lease) !== JSON.stringify(parsed.data.lease)) return;
+      const questionTask = state.tasks.find(
+        (task) =>
+          task.observation?.kind === 'human-question' &&
+          task.observation.questionId === parsed.data.questionId,
+      );
+      if (!questionTask || questionTask.attemptId !== parsed.data.attemptId) return;
+      const authority = this.latestAppliedResult.get(parsed.data.runId);
+      if (!authority) return;
+      const control = Promise.resolve(
+        this.coordinator.answer(parsed.data.runId, parsed.data.questionId, parsed.data.answer),
+      )
+        .then(
+          (stop) => this.handleControlStop(stop, parsed.data.runId, authority, generation),
+          () => {
+            if (
+              this.isCurrentTransportGeneration(generation) &&
+              this.authorizedControlGenerations.get(parsed.data.runId) === generation
+            ) {
+              this.abandonControlGeneration(
+                parsed.data.runId,
+                generation,
+                'mission answer control rejected before durable settlement',
+              );
+            }
+            this.log.warn('mission answer control rejected', { code: 'answer-control-rejected' });
+            return null;
+          },
+        )
+        .then(() => undefined);
+      this.activeControls.set(parsed.data.runId, control);
+      void control.finally(() => {
+        if (this.activeControls.get(parsed.data.runId) === control)
+          this.activeControls.delete(parsed.data.runId);
+      });
+      accepted = true;
+    });
+    this.resultTail = operation.catch(() => undefined);
+    return operation.then(() => accepted);
+  }
+
+  async observeHandoffConsumption(
+    consumed: MissionHandoffConsumed,
+    generation: MissionTransportGeneration,
+  ): Promise<boolean> {
+    const parsed = MissionHandoffConsumedSchema.safeParse(consumed);
+    if (!parsed.success || !this.isCurrentTransportGeneration(generation)) return false;
+    try {
+      if (!this.coordinator.inspect) return false;
+      const state = controlStop({
+        reason: 'state',
+        state: await this.coordinator.inspect(parsed.data.runId),
+      })?.state;
+      const local = state?.tasks.at(-1)?.observation?.handoff;
+      return Boolean(
+        local &&
+          local.backend === parsed.data.handoff.backend &&
+          local.repositoryKey === parsed.data.handoff.repositoryKey &&
+          local.checkpointId === parsed.data.handoff.checkpoint &&
+          local.revisionId === parsed.data.handoff.revision &&
+          local.reference === parsed.data.handoff.reference,
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -495,10 +733,11 @@ export class MissionDaemonControl {
     }
     const control = Promise.resolve()
       .then(() => this.coordinator.control(rootRunId))
+      .then((stop) => this.handleControlStop(stop, rootRunId, adoption, generation))
       .then(
-        (stop) => {
+        (reason) => {
           if (
-            RETRYABLE_CONTROL_STOPS.has(stopReason(stop) ?? '') &&
+            RETRYABLE_CONTROL_STOPS.has(reason ?? '') &&
             this.isCurrentTransportGeneration(generation) &&
             this.authorizedControlGenerations.get(rootRunId) === generation &&
             this.latestAppliedResult.get(rootRunId) === adoption
@@ -530,6 +769,97 @@ export class MissionDaemonControl {
     void control.then(() => {
       if (this.activeControls.get(rootRunId) === control) this.activeControls.delete(rootRunId);
     });
+  }
+
+  private async handleControlStop(
+    value: unknown,
+    rootRunId: string,
+    authority: string,
+    generation: MissionTransportGeneration,
+  ): Promise<string | null> {
+    const stop = controlStop(value);
+    if (!stop) {
+      return value &&
+        typeof value === 'object' &&
+        'reason' in value &&
+        typeof (value as { reason?: unknown }).reason === 'string'
+        ? (value as { reason: string }).reason
+        : 'runtime-error';
+    }
+    if (stop.state.rootRunId !== rootRunId) return 'runtime-error';
+    if (
+      !this.isCurrentTransportGeneration(generation) ||
+      this.authorizedControlGenerations.get(rootRunId) !== generation ||
+      this.latestAppliedResult.get(rootRunId) !== authority
+    )
+      return stop.reason;
+
+    if (stop.reason === 'human-question') {
+      const task = stop.state.tasks.find((candidate) => candidate.task.taskId === stop.taskId);
+      if (!task?.attemptId || !stop.questionId || !stop.prompt || !stop.state.lease) return 'runtime-error';
+      if (task.questionPublication?.questionId === stop.questionId) return stop.reason;
+      const reportId = stableId('nmq', {
+        rootRunId,
+        attemptId: task.attemptId,
+        questionId: stop.questionId,
+        lease: stop.state.lease,
+      });
+      try {
+        if (!this.transport.question) return 'transport-error';
+        const ack = await this.transport.question(rootRunId, stop.state.lease, {
+          reportId,
+          questionId: stop.questionId,
+          attemptId: task.attemptId,
+          prompt: stop.prompt,
+          observedAt: this.now().toISOString(),
+        });
+        if (!ack.accepted || (ack.state !== 'open' && ack.state !== 'answered')) {
+          return 'authority-conflict';
+        }
+        if (!ack.signalId || !this.coordinator.recordQuestionPublication) return 'runtime-error';
+        await this.coordinator.recordQuestionPublication(
+          rootRunId,
+          stop.questionId,
+          ack.reportId,
+          ack.signalId,
+        );
+      } catch {
+        return 'transport-error';
+      }
+      return stop.reason;
+    }
+
+    if (stop.reason === 'completed' && stop.state.commission?.publishHandoff) {
+      const handoff = stop.state.tasks.at(-1)?.observation?.handoff;
+      if (!handoff || !stop.state.lease) return 'runtime-error';
+      const handoffId = stableId('mho', {
+        rootRunId,
+        commissionDigest: stop.state.commission.commissionDigest,
+        handoff,
+      });
+      const publication = {
+        reportId: stableId('mhp', { rootRunId, handoffId }),
+        handoff: {
+          schemaVersion: 1 as const,
+          handoffId,
+          backend: handoff.backend,
+          repositoryKey: handoff.repositoryKey,
+          checkpoint: handoff.checkpointId,
+          revision: handoff.revisionId,
+          reference: handoff.reference,
+        },
+      };
+      try {
+        if (!this.transport.handoff) return 'transport-error';
+        const ack = await this.transport.handoff(rootRunId, stop.state.lease, publication);
+        if (!ack.accepted) return 'authority-conflict';
+        if (!this.coordinator.recordHandoffPublication) return 'runtime-error';
+        await this.coordinator.recordHandoffPublication(rootRunId, publication.reportId, handoffId);
+      } catch {
+        return 'transport-error';
+      }
+    }
+    return stop.reason;
   }
 
   private abandonControlGeneration(
