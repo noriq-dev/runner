@@ -220,7 +220,21 @@ describe("RunnerJobSupervisor", () => {
       key,
       title: key,
       body: "",
-      executionSpec: null,
+      executionSpec:
+        order === 0
+          ? {
+              anticipatedFiles: [
+                {
+                  path: "shared.txt",
+                  change: "modify" as const,
+                  why: "Apply the commissioned first edit",
+                },
+              ],
+              acceptance: {
+                observableTruths: ["shared.txt contains the accepted change"],
+              },
+            }
+          : null,
       status: "todo" as const,
       retry: false,
       order,
@@ -257,6 +271,11 @@ describe("RunnerJobSupervisor", () => {
     expect(fake.calls.filter((call) => call.role === "repairer")).toHaveLength(
       1,
     );
+    expect(
+      fake.calls
+        .filter((call) => call.role === "guide")
+        .map((call) => call.taskKey),
+    ).toEqual(["RUN-11"]);
     expect(
       await readFile(
         join(root, "state", "worktrees", "job-plan", "job", "shared.txt"),

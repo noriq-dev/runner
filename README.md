@@ -16,12 +16,16 @@ npm ci
 npm run check
 npm run vendor:check
 npm run build
+node dist/cli.js validate --config /absolute/path/to/runner.toml
+node dist/cli.js doctor --config /absolute/path/to/runner.toml
 node dist/cli.js start --config /absolute/path/to/runner.toml
 ```
 
 The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
 
 See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]` and per-role `provider` project keys are normalized once with warning events.
+
+`validate` parses the machine config without connecting. `doctor` additionally discovers repositories and runs backend/driver authentication and capability preflights without a model call or Noriq connection. `usage --state-directory <path> --job <id>` reports durable per-invocation and aggregate usage. Real-agent dogfood is deliberately opt-in: set `RUNNER_LIVE_AGENTS=yes-i-understand` and run `npm run dogfood:live-agents -- /path/to/git/repository`; it operates on a disposable clone.
 
 ## Source-control contract
 
@@ -37,7 +41,7 @@ Git isolated task workspaces may build concurrently. Diversion, Perforce, and ev
 
 The supervisor selects drivers by capability, not vendor name. Guide and reviewer sessions require enforced read-only access; builder and repair sessions require workspace-write access. Runner owns schemas, receipts, usage aggregation, budgets, cancellation, and recovery. A driver owns only translation to its vendor protocol.
 
-Codex and Claude are separate built-in drivers with isolated vendor homes, explicit workspace access modes, structured output, Runner Control MCP injection, and project-native configuration discovery from the workspace.
+Codex and Claude are separate built-in drivers with explicit workspace access modes, structured output, Runner Control MCP injection, and project-native configuration discovery from the workspace. Each invocation receives a fresh credential-only vendor home so personal histories, plugins, hooks, and account-level MCPs are not inherited. Builder and repairer roles can consume workspace-native MCP configuration; guide authority is limited to Runner Control and reviewer authority is tool-free. Trusted machine-home MCP inheritance is not implemented yet.
 
 `external-jsonl-v1` is the extension seam for future vendors. Runner writes one versioned preflight or invocation object to stdin. The executable writes normalized JSONL events followed by exactly one result/error terminal frame. Malformed frames, duplicate terminals, frames after terminal, and capability drift fail closed. Cancellation targets the managed process group and escalates to a hard kill.
 
@@ -50,5 +54,6 @@ The checksummed journal under `runner.stateDirectory/jobs/<job>/events.jsonl` is
 - No legacy Run/mission protocol, server-side plan pump, execution profiles, landing, pushing, review creation, indexing, or Project Memory ingestion.
 - Only blocker/major findings or deterministic check failures consume a repair round.
 - Token or cost caps fail preflight unless a driver can honestly enforce them. Measurement without hard enforcement is not presented as a ceiling.
+- Machine config accepts either a literal `token` or a `tokenEnv`, but the daemon does not yet refresh Noriq OAuth credentials. A long-lived production service still needs the rotating credential source before deployment.
 - Full agent logs remain local under the Runner state directory. Noriq receives compact evidence only.
 - Runner does not create Perforce streams or interpret site-specific branch/stream policy.

@@ -1,6 +1,7 @@
 import {
   type RunnerJobCheck as CheckResult,
   type RunnerJobFinding as Finding,
+  hasExecutionSpec,
   type RunnerJobAssignment as JobAssignment,
   RunnerJobAssignment,
   RunnerJobCheck,
@@ -46,6 +47,7 @@ export type {
   RunnerTaskSnapshot,
   Usage,
 };
+export { hasExecutionSpec };
 
 export function assertAcyclicSource(source: RunnerJobSourceType): void {
   if (source.kind === "task") return;

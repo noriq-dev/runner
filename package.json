@@ -12,12 +12,13 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts src/control-mcp.ts --bundle --platform=node --format=esm --target=node22 --external:ws --outdir=dist --sourcemap --legal-comments=none && node scripts/smoke-built.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run test",
     "dogfood:git": "tsx scripts/dogfood-git.mts",
+    "dogfood:live-agents": "tsx scripts/dogfood-live-agents.mts",
     "vendor:shared": "node scripts/vendor-shared.mjs",
     "vendor:check": "node scripts/vendor-check.mjs"
   },
@@ -27,10 +28,11 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@noriq-dev/shared": "file:./vendor/noriq-shared",
     "@biomejs/biome": "^2.3.13",
+    "@noriq-dev/shared": "file:./vendor/noriq-shared",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
     "tsx": "^4.19.2",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"

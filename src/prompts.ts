@@ -8,6 +8,66 @@ export interface TaskContract {
   verification: string[];
 }
 
+export function executionSpecContract(
+  task: RunnerTaskSnapshot,
+  verificationCommands: string[],
+): { contract: TaskContract; plan: string } {
+  const spec = task.executionSpec;
+  if (!spec) throw new Error("task has no execution specification");
+  const constraints = [
+    ...spec.lockedDecisions.map(
+      (item) =>
+        `Locked: ${item.decision}${item.because ? ` because ${item.because}` : ""}${item.source ? ` (${item.source})` : ""}`,
+    ),
+    ...spec.discretion.map((item) => `Builder discretion: ${item}`),
+    ...spec.deferred.map((item) => `Out of scope: ${item}`),
+  ];
+  const scope = [
+    ...spec.anticipatedFiles.map(
+      (file) =>
+        `${file.change} ${file.path}${file.why ? ` — ${file.why}` : ""}`,
+    ),
+    ...spec.requiredReading.map((item) => `Read first: ${item}`),
+  ];
+  const acceptanceCriteria = [
+    ...spec.acceptance.observableTruths,
+    ...spec.acceptance.artifacts.map(
+      (artifact) =>
+        `${artifact.path} provides ${artifact.provides || "the declared task artifact"}${artifact.exports.length > 0 ? ` and exports ${artifact.exports.join(", ")}` : ""}`,
+    ),
+    ...spec.acceptance.links.map(
+      (link) =>
+        `${link.from} reaches ${link.to}${link.via ? ` via ${link.via}` : ""}`,
+    ),
+  ];
+  const plan =
+    spec.steps.length > 0
+      ? spec.steps
+          .map(
+            (step, index) =>
+              `${index + 1}. ${step.title}${step.dependsOn.length > 0 ? ` (after ${step.dependsOn.join(", ")})` : ""}`,
+          )
+          .join("\n")
+      : [
+          ...spec.requiredReading.map((item) => `Read ${item}.`),
+          ...spec.anticipatedFiles.map(
+            (file) =>
+              `${file.change[0]!.toUpperCase()}${file.change.slice(1)} ${file.path}${file.why ? `: ${file.why}` : "."}`,
+          ),
+          ...verificationCommands.map((command) => `Verify with ${command}.`),
+        ].join("\n") || `Implement ${task.key}: ${task.title}`;
+  return {
+    contract: {
+      objective: task.title,
+      constraints,
+      scope,
+      acceptanceCriteria,
+      verification: verificationCommands,
+    },
+    plan,
+  };
+}
+
 function taskFacts(task: RunnerTaskSnapshot): string {
   return `Task: ${task.key} — ${task.title}\n\nDescription:\n${task.body || "(none)"}\n\nExecution specification:\n${task.executionSpec ? JSON.stringify(task.executionSpec, null, 2) : "(none supplied)"}`;
 }

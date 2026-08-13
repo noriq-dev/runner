@@ -22,6 +22,7 @@ export interface InvocationState {
   role: "guide" | "builder" | "reviewer" | "repairer";
   status: "started" | "completed" | "abandoned";
   resultDigest?: string;
+  usage?: Usage;
 }
 
 export interface TaskState {
@@ -239,9 +240,13 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         state.questions[payload.questionId as string] =
           payload.prompt as string;
         break;
-      case "usage.recorded":
-        state.usage = addUsage(state.usage, payload.usage as Usage);
+      case "usage.recorded": {
+        const usage = payload.usage as Usage;
+        state.usage = addUsage(state.usage, usage);
+        const invocation = state.invocations[payload.id as string];
+        if (invocation) invocation.usage = usage;
         break;
+      }
       case "warning":
         state.warnings.push(payload.message as string);
         break;

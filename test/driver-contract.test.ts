@@ -1,4 +1,11 @@
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -21,6 +28,20 @@ const projectConfig = projectConfigSchema.parse({
   checks: { commands: [], timeoutSeconds: 30 },
 });
 
+async function credentialHome(
+  root: string,
+  vendor: "codex" | "claude",
+  name = `${vendor}-home`,
+): Promise<string> {
+  const home = join(root, name);
+  await mkdir(home, { recursive: true });
+  await writeFile(
+    join(home, vendor === "codex" ? "auth.json" : ".credentials.json"),
+    "{}",
+  );
+  return home;
+}
+
 async function fakeCodex(root: string): Promise<string> {
   const path = join(root, "fake-codex.mjs");
   await writeFile(
@@ -31,11 +52,13 @@ import { join } from 'node:path';
 const args = process.argv.slice(2);
 if (process.env.FAKE_ENV_LOG) appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({ home: process.env.CODEX_HOME, claude: process.env.CLAUDE_CONFIG_DIR }) + '\\n');
 if (args.includes('--version')) { console.log('fake-codex 1.0'); process.exit(0); }
-if (args.includes('--help')) { console.log('--output-schema --json'); process.exit(0); }
+if (args.includes('--help')) { console.log('--output-schema --json --ignore-user-config'); process.exit(0); }
 if (args[0] === 'login' && args[1] === 'status') { console.log('logged in'); process.exit(0); }
 if (args[0] === 'mcp' && args[1] === 'list') {
-  if (!process.env.OMIT_CONTROL) console.log('noriq_runner enabled');
-  if (existsSync(join(process.cwd(), '.codex', 'config.toml'))) console.log('project_echo enabled');
+  const servers = [];
+  if (!process.env.OMIT_CONTROL) servers.push({ name: 'noriq_runner', enabled: true });
+  if (existsSync(join(process.cwd(), '.codex', 'config.toml'))) servers.push({ name: 'project_echo', enabled: true });
+  console.log(JSON.stringify(servers));
   process.exit(0);
 }
 if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.codex', 'config.toml'))) process.exit(9);
@@ -58,15 +81,12 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
 if (args.includes('--version')) { console.log('fake-claude 1.0'); process.exit(0); }
-if (args.includes('--help')) { console.log('--output-format --json-schema'); process.exit(0); }
+if (args.includes('--help')) { console.log('--output-format --json-schema --strict-mcp-config --no-session-persistence'); process.exit(0); }
 if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
-if (args.includes('mcp') && args.includes('list')) {
-  console.log('noriq_runner enabled');
-  if (existsSync(join(process.cwd(), '.mcp.json'))) console.log('project_echo enabled');
-  process.exit(0);
-}
 if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
-console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'built', findings: [] }, usage: { input_tokens: 8, cache_read_input_tokens: 2, output_tokens: 3 } }));
+const tools = ['ask_human', 'delegate', 'get_job_state', 'inspect_diff', 'record_task_plan', 'request_completion', 'run_checks'].map((tool) => 'mcp__noriq_runner__' + tool);
+console.log(JSON.stringify({ type: 'system', subtype: 'init', tools: process.env.OMIT_CONTROL === '1' ? [] : tools, mcp_servers: [{ name: 'noriq_runner', status: process.env.OMIT_CONTROL === '1' ? 'failed' : 'connected' }] }));
+console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'built', findings: [] }, usage: { input_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 5, output_tokens: 3 } }));
 `,
     { mode: 0o700 },
   );
@@ -79,6 +99,7 @@ describe("built-in driver contract", () => {
     const root = await mkdtemp(join(tmpdir(), "runner-driver-"));
     const command = await fakeCodex(root);
     const envLog = join(root, "env.jsonl");
+    const home = await credentialHome(root, "codex");
     const driverConfig: Extract<
       MachineConfig["drivers"][string],
       { adapter: "codex" }
@@ -86,7 +107,7 @@ describe("built-in driver contract", () => {
       adapter: "codex",
       command,
       args: [],
-      home: join(root, "codex-home"),
+      home,
       env: { FAKE_ENV_LOG: envLog },
     };
     const adapter = new CodexAgentDriver(
@@ -117,7 +138,7 @@ describe("built-in driver contract", () => {
       projectConfig,
     });
     expect(result.usage).toMatchObject({
-      inputTokens: 12,
+      inputTokens: 9,
       cachedTokens: 3,
       outputTokens: 4,
     });
@@ -127,14 +148,19 @@ describe("built-in driver contract", () => {
       .map((line) => JSON.parse(line));
     expect(
       observations.every(
-        (entry) => entry.home === driverConfig.home && !entry.claude,
+        (entry) =>
+          entry.home !== driverConfig.home &&
+          entry.home.startsWith(join(root, "state", "agent-homes")) &&
+          !entry.claude,
       ),
     ).toBe(true);
+    expect(await readdir(join(root, "state", "agent-homes"))).toEqual([]);
   });
 
   it("fails closed when the guide control MCP or structured result is missing", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-driver-fail-"));
     const command = await fakeCodex(root);
+    const home = await credentialHome(root, "codex", "home");
     const base: Extract<
       MachineConfig["drivers"][string],
       { adapter: "codex" }
@@ -142,7 +168,7 @@ describe("built-in driver contract", () => {
       adapter: "codex",
       command,
       args: [],
-      home: join(root, "home"),
+      home,
       env: { OMIT_CONTROL: "1" },
     };
     const missing = new CodexAgentDriver("codex", base, join(root, "state-a"));
@@ -190,6 +216,8 @@ describe("built-in driver contract", () => {
       }),
     );
     const state = join(root, "state");
+    const codexHome = await credentialHome(root, "codex");
+    const claudeHome = await credentialHome(root, "claude");
     const adapters = [
       new CodexAgentDriver(
         "codex",
@@ -197,7 +225,7 @@ describe("built-in driver contract", () => {
           adapter: "codex",
           command: await fakeCodex(root),
           args: [],
-          home: join(root, "codex-home"),
+          home: codexHome,
           env: { REQUIRE_PROJECT_MCP: "1" },
         },
         state,
@@ -208,7 +236,7 @@ describe("built-in driver contract", () => {
           adapter: "claude",
           command: await fakeClaude(root),
           args: [],
-          home: join(root, "claude-home"),
+          home: claudeHome,
           env: { REQUIRE_PROJECT_MCP: "1" },
         },
         state,
@@ -216,29 +244,64 @@ describe("built-in driver contract", () => {
     ];
 
     for (const adapter of adapters) {
-      await expect(
-        adapter.preflight({
-          workspace: root,
-          access: "read-only",
-          requireControlMcp: true,
-        }),
-      ).resolves.toMatchObject({
-        runnerControlVisible: true,
-        projectTools: ["project_echo enabled"],
+      const preflight = await adapter.preflight({
+        workspace: root,
+        access: "read-only",
+        requireControlMcp: true,
       });
-      await expect(
-        adapter.invoke({
-          invocationId: `project-mcp-${adapter.name}`,
-          role: "guide",
-          taskId: "task",
-          taskKey: "RUN-3",
-          workspace: root,
-          access: "read-only",
-          prompt: "use project echo",
-          outputSchema: { type: "object" },
-          projectConfig,
-        }),
-      ).resolves.toMatchObject({ summary: "built" });
+      expect(preflight).toMatchObject({
+        runnerControlVisible: true,
+      });
+      expect(preflight.projectTools).toEqual(
+        adapter.name === "codex" ? ["project_echo"] : [],
+      );
+      const result = await adapter.invoke({
+        invocationId: `project-mcp-${adapter.name}`,
+        role: "guide",
+        taskId: "task",
+        taskKey: "RUN-3",
+        workspace: root,
+        access: "read-only",
+        prompt: "use project echo",
+        outputSchema: { type: "object" },
+        projectConfig,
+      });
+      expect(result).toMatchObject({ summary: "built" });
+      if (adapter.name === "claude")
+        expect(result.usage).toMatchObject({
+          inputTokens: 8,
+          cachedTokens: 7,
+          outputTokens: 3,
+        });
     }
+  });
+
+  it("rejects a Claude guide result when the effective control MCP is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-claude-control-"));
+    const home = await credentialHome(root, "claude");
+    const adapter = new ClaudeAgentDriver(
+      "claude",
+      {
+        adapter: "claude",
+        command: await fakeClaude(root),
+        args: [],
+        home,
+        env: { OMIT_CONTROL: "1" },
+      },
+      join(root, "state"),
+    );
+    await expect(
+      adapter.invoke({
+        invocationId: "missing-claude-control",
+        role: "guide",
+        taskId: "task",
+        taskKey: "RUN-4",
+        workspace: root,
+        access: "read-only",
+        prompt: "plan",
+        outputSchema: { type: "object" },
+        projectConfig,
+      }),
+    ).rejects.toThrow(/did not connect/);
   });
 });

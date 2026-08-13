@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  createEphemeralAgentHome,
+  initializeClaudeProjectState,
+} from "../agent-home.js";
 import type { MachineConfig } from "../config.js";
 import { findingSchema, usageSchema } from "../contracts.js";
+import { controlMcpCommand } from "../control-mcp-command.js";
 import { runProcess } from "../process.js";
 import type {
   AgentDriver,
@@ -30,19 +34,89 @@ function parseLastObject(text: string): Record<string, unknown> {
   throw new Error("driver produced no structured JSON object");
 }
 
-async function controlMcpCommand(): Promise<{
-  command: string;
-  args: string[];
-}> {
-  const built = fileURLToPath(new URL("../control-mcp.js", import.meta.url));
-  try {
-    await access(built);
-    return { command: process.execPath, args: [built] };
-  } catch {
-    const source = fileURLToPath(new URL("../control-mcp.ts", import.meta.url));
-    await access(source);
-    return { command: process.execPath, args: [...process.execArgv, source] };
-  }
+const runnerControlServer = "noriq_runner";
+const runnerControlTools = [
+  "ask_human",
+  "delegate",
+  "get_job_state",
+  "inspect_diff",
+  "record_task_plan",
+  "request_completion",
+  "run_checks",
+] as const;
+
+function jsonLines(text: string): Record<string, unknown>[] {
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        const value = JSON.parse(line) as unknown;
+        return value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((value): value is Record<string, unknown> => value !== null);
+}
+
+function codexMcpInventory(text: string): Array<Record<string, unknown>> {
+  const value = JSON.parse(text) as unknown;
+  if (!Array.isArray(value))
+    throw new Error("Codex MCP inventory was not a JSON array");
+  return value.filter(
+    (entry): entry is Record<string, unknown> =>
+      entry !== null && typeof entry === "object" && !Array.isArray(entry),
+  );
+}
+
+function assertClaudeControlInventory(frames: Record<string, unknown>[]): void {
+  const init = frames.find(
+    (frame) => frame.type === "system" && frame.subtype === "init",
+  );
+  if (!init) throw new Error("Claude emitted no runtime tool inventory");
+  const servers = Array.isArray(init.mcp_servers) ? init.mcp_servers : [];
+  const control = servers.find(
+    (server) =>
+      server &&
+      typeof server === "object" &&
+      (server as Record<string, unknown>).name === runnerControlServer,
+  ) as Record<string, unknown> | undefined;
+  if (control?.status !== "connected")
+    throw new Error("Claude did not connect the injected noriq_runner MCP");
+  const tools = new Set(
+    Array.isArray(init.tools) ? init.tools.map(String) : [],
+  );
+  const missing = runnerControlTools.filter(
+    (tool) => !tools.has(`mcp__${runnerControlServer}__${tool}`),
+  );
+  if (missing.length > 0)
+    throw new Error(
+      `Claude Runner Control MCP is missing tools: ${missing.join(", ")}`,
+    );
+  const unexpectedServers = servers
+    .filter(
+      (server) =>
+        server &&
+        typeof server === "object" &&
+        (server as Record<string, unknown>).status === "connected" &&
+        (server as Record<string, unknown>).name !== runnerControlServer,
+    )
+    .map((server) => String((server as Record<string, unknown>).name));
+  const unexpectedTools = [...tools].filter(
+    (tool) =>
+      tool.startsWith("mcp__") &&
+      !tool.startsWith(`mcp__${runnerControlServer}__`),
+  );
+  if (unexpectedServers.length > 0 || unexpectedTools.length > 0)
+    throw new Error(
+      `Claude guide exposed unexpected MCP authority: ${[
+        ...unexpectedServers,
+        ...unexpectedTools,
+      ].join(", ")}`,
+    );
 }
 
 function configArguments(
@@ -115,14 +189,16 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
 
   private env(
     workspace: string,
+    home: string,
     control?: { state: string; actions: string },
   ): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,
+      HOME: home,
       ...this.config.env,
     };
-    if (this.adapter === "codex") env.CODEX_HOME = this.config.home;
-    else env.CLAUDE_CONFIG_DIR = this.config.home;
+    if (this.adapter === "codex") env.CODEX_HOME = home;
+    else env.CLAUDE_CONFIG_DIR = home;
     env.NORIQ_JOB_WORKSPACE = workspace;
     if (control) {
       env.NORIQ_CONTROL_STATE = control.state;
@@ -131,100 +207,145 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
     return env;
   }
 
+  private async restrictedCodexMcpArguments(
+    workspace: string,
+    home: string,
+  ): Promise<string[]> {
+    const inventory = await runProcess({
+      command: this.config.command,
+      args: [...this.config.args, "mcp", "list", "--json"],
+      cwd: workspace,
+      env: this.env(workspace, home),
+      timeoutMs: 30_000,
+    });
+    if (inventory.exitCode !== 0)
+      throw new Error(
+        `${this.id} MCP isolation inventory failed: ${inventory.stderr || inventory.stdout}`,
+      );
+    return codexMcpInventory(inventory.stdout).flatMap((server) => {
+      const name = String(server.name ?? "");
+      if (!name || name === runnerControlServer) return [];
+      return ["--config", `mcp_servers.${JSON.stringify(name)}.enabled=false`];
+    });
+  }
+
   async preflight(request: DriverPreflightRequest): Promise<DriverPreflight> {
     const { workspace, requireControlMcp: requireControl } = request;
     if (!this.capabilities.workspaceAccess.includes(request.access))
       throw new Error(
         `${this.id} cannot enforce ${request.access} workspace access`,
       );
-    const version = await runProcess({
-      command: this.config.command,
-      args: ["--version"],
-      cwd: workspace,
-      env: this.env(workspace),
-      timeoutMs: 30_000,
-    });
-    if (version.exitCode !== 0)
-      throw new Error(`${this.id} version preflight failed: ${version.stderr}`);
-    const help = await runProcess({
-      command: this.config.command,
-      args: this.adapter === "codex" ? ["exec", "--help"] : ["--help"],
-      cwd: workspace,
-      env: this.env(workspace),
-      timeoutMs: 30_000,
-    });
-    const structuredOutput =
-      this.adapter === "codex"
-        ? help.stdout.includes("--output-schema") &&
-          help.stdout.includes("--json")
-        : help.stdout.includes("--output-format") &&
-          help.stdout.includes("--json-schema");
-    if (!structuredOutput)
-      throw new Error(
-        `${this.id} does not expose required structured-output flags`,
-      );
-    const auth = await runProcess({
-      command: this.config.command,
-      args:
+    const attemptHome = await createEphemeralAgentHome(
+      this.adapter,
+      this.config.home,
+      this.stateDirectory,
+    );
+    try {
+      if (this.adapter === "claude")
+        await initializeClaudeProjectState(
+          attemptHome.path,
+          workspace,
+          requireControl || request.access === "workspace-write",
+        );
+      const environment = this.env(workspace, attemptHome.path);
+      const version = await runProcess({
+        command: this.config.command,
+        args: ["--version"],
+        cwd: workspace,
+        env: environment,
+        timeoutMs: 30_000,
+      });
+      if (version.exitCode !== 0)
+        throw new Error(
+          `${this.id} version preflight failed: ${version.stderr}`,
+        );
+      const help = await runProcess({
+        command: this.config.command,
+        args: this.adapter === "codex" ? ["exec", "--help"] : ["--help"],
+        cwd: workspace,
+        env: environment,
+        timeoutMs: 30_000,
+      });
+      const structuredOutput =
         this.adapter === "codex"
-          ? ["login", "status"]
-          : ["auth", "status", "--json"],
-      cwd: workspace,
-      env: this.env(workspace),
-      timeoutMs: 30_000,
-    });
-    const authenticated = auth.exitCode === 0;
-    if (!authenticated)
-      throw new Error(
-        `${this.id} authentication preflight failed: ${auth.stderr || auth.stdout}`,
-      );
-
-    let runnerControlVisible = !requireControl;
-    let projectTools: string[] = [];
-    const warnings: string[] = [];
-    if (requireControl) {
-      const control = await controlMcpCommand();
-      const injection = configArguments(this.adapter, control);
-      const inventory = await runProcess({
+          ? help.stdout.includes("--output-schema") &&
+            help.stdout.includes("--json") &&
+            help.stdout.includes("--ignore-user-config")
+          : help.stdout.includes("--output-format") &&
+            help.stdout.includes("--json-schema") &&
+            help.stdout.includes("--strict-mcp-config") &&
+            help.stdout.includes("--no-session-persistence");
+      if (!structuredOutput)
+        throw new Error(
+          `${this.id} does not expose required unattended-mode flags`,
+        );
+      const auth = await runProcess({
         command: this.config.command,
         args:
           this.adapter === "codex"
-            ? [...this.config.args, "mcp", "list", "--json", ...injection]
-            : [...this.config.args, ...injection, "--", "mcp", "list"],
+            ? ["login", "status"]
+            : ["auth", "status", "--json"],
         cwd: workspace,
-        env: this.env(workspace),
+        env: environment,
         timeoutMs: 30_000,
       });
-      if (inventory.exitCode !== 0)
+      const authenticated = auth.exitCode === 0;
+      if (!authenticated)
         throw new Error(
-          `${this.id} MCP inventory failed: ${inventory.stderr || inventory.stdout}`,
+          `${this.id} authentication preflight failed: ${auth.stderr || auth.stdout}`,
         );
-      runnerControlVisible = inventory.stdout.includes("noriq_runner");
-      if (!runnerControlVisible)
-        throw new Error(
-          `${this.id} did not expose the injected noriq_runner MCP`,
+
+      let runnerControlVisible = !requireControl;
+      let projectTools: string[] = [];
+      const warnings: string[] = [];
+      if (requireControl && this.adapter === "codex") {
+        const control = await controlMcpCommand();
+        const injection = configArguments(this.adapter, control);
+        const inventory = await runProcess({
+          command: this.config.command,
+          args: [...this.config.args, "mcp", "list", "--json", ...injection],
+          cwd: workspace,
+          env: environment,
+          timeoutMs: 30_000,
+        });
+        if (inventory.exitCode !== 0)
+          throw new Error(
+            `${this.id} MCP inventory failed: ${inventory.stderr || inventory.stdout}`,
+          );
+        const servers = codexMcpInventory(inventory.stdout);
+        runnerControlVisible = servers.some(
+          (server) =>
+            server.name === runnerControlServer && server.enabled !== false,
         );
-      projectTools = inventory.stdout
-        .split("\n")
-        .filter(
-          (line) =>
-            /mcp|connected|enabled/i.test(line) &&
-            !line.includes("noriq_runner"),
-        )
-        .slice(0, 100);
-      warnings.push(
-        "Project-native MCP inventory is diagnostic; Runner does not interpret it.",
-      );
+        if (!runnerControlVisible)
+          throw new Error(
+            `${this.id} did not expose the injected noriq_runner MCP`,
+          );
+        projectTools = servers
+          .filter((server) => server.name !== runnerControlServer)
+          .map((server) => String(server.name))
+          .slice(0, 100);
+        warnings.push(
+          "Project-native MCP inventory is diagnostic; guide and reviewer calls disable it, while builder and repair calls leave it vendor-native.",
+        );
+      } else if (requireControl) {
+        runnerControlVisible = true;
+        warnings.push(
+          "Claude cannot inspect one-shot MCP flags without a model call; the guide invocation must attest the effective server and tool inventory before its result is accepted.",
+        );
+      }
+      return {
+        driver: this.id,
+        version: version.stdout.trim() || version.stderr.trim(),
+        authenticated,
+        capabilities: this.capabilities,
+        runnerControlVisible,
+        projectTools,
+        warnings,
+      };
+    } finally {
+      await attemptHome.cleanup();
     }
-    return {
-      driver: this.id,
-      version: version.stdout.trim() || version.stderr.trim(),
-      authenticated,
-      capabilities: this.capabilities,
-      runnerControlVisible,
-      projectTools,
-      warnings,
-    };
   }
 
   async recover(invocationId: string): Promise<AgentResult | null> {
@@ -277,6 +398,22 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--disable",
+        "apps",
+        "--disable",
+        "plugins",
+        "--disable",
+        "remote_plugin",
+        "--disable",
+        "skill_mcp_dependency_install",
+        "--disable",
+        "multi_agent",
+        "--config",
+        'web_search="disabled"',
+        "--config",
+        "tools.view_image=false",
         "--model",
         profile.model,
         "--config",
@@ -287,6 +424,8 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         outputPath,
         "-",
       ];
+      if (request.role === "guide" || request.role === "reviewer")
+        args.splice(this.config.args.length + 2, 0, "--disable", "shell_tool");
       args.splice(this.config.args.length + 2, 0, "--sandbox", request.access);
     } else {
       const profile =
@@ -296,9 +435,14 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       args = [
         ...this.config.args,
         "-p",
+        "--no-session-persistence",
         "--output-format",
         "stream-json",
         "--verbose",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--prompt-suggestions",
+        "false",
         "--model",
         profile.model,
         "--effort",
@@ -310,6 +454,28 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         "--json-schema",
         JSON.stringify(request.outputSchema),
       ];
+      if (request.role === "guide" || request.role === "reviewer")
+        args.push(
+          "--strict-mcp-config",
+          "--setting-sources",
+          "user",
+          "--tools",
+          "",
+        );
+      else {
+        args.push(
+          "--setting-sources",
+          "project",
+          "--tools",
+          "Bash,Edit,Glob,Grep,Read,Write",
+          "--strict-mcp-config",
+        );
+        const projectMcp = join(request.workspace, ".mcp.json");
+        try {
+          await access(projectMcp);
+          args.push("--mcp-config", projectMcp);
+        } catch {}
+      }
       if (request.access === "read-only")
         args.push(
           "--permission-mode",
@@ -318,6 +484,18 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           "Write,Edit,NotebookEdit",
         );
       else args.push("--permission-mode", "acceptEdits");
+      if (request.role === "guide")
+        args.push(
+          "--settings",
+          JSON.stringify({ enableAllProjectMcpServers: true }),
+          "--allowedTools",
+          `mcp__${runnerControlServer}`,
+        );
+      else if (request.role === "builder" || request.role === "repairer")
+        args.push(
+          "--settings",
+          JSON.stringify({ enableAllProjectMcpServers: true }),
+        );
     }
     if (request.role === "guide") {
       const injection = configArguments(
@@ -328,19 +506,48 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         args.splice(args.length - 1, 0, ...injection);
       else args.push(...injection);
     }
-    const result = await runProcess({
-      command: this.config.command,
-      args,
-      cwd: request.workspace,
-      env: this.env(request.workspace, {
-        state: controlStatePath,
-        actions: controlActionsPath,
-      }),
-      timeoutMs: request.projectConfig.harness.maxJobMinutes * 60_000,
-      ...(request.signal ? { signal: request.signal } : {}),
-      stdin: request.prompt,
-      maxOutputBytes: 8 * 1024 * 1024,
-    });
+    const attemptHome = await createEphemeralAgentHome(
+      this.adapter,
+      this.config.home,
+      this.stateDirectory,
+    );
+    const result = await (async () => {
+      try {
+        if (this.adapter === "claude")
+          await initializeClaudeProjectState(
+            attemptHome.path,
+            request.workspace,
+            request.role !== "reviewer",
+          );
+        if (
+          this.adapter === "codex" &&
+          (request.role === "guide" || request.role === "reviewer")
+        )
+          args.splice(
+            args.length - 1,
+            0,
+            ...(await this.restrictedCodexMcpArguments(
+              request.workspace,
+              attemptHome.path,
+            )),
+          );
+        return await runProcess({
+          command: this.config.command,
+          args,
+          cwd: request.workspace,
+          env: this.env(request.workspace, attemptHome.path, {
+            state: controlStatePath,
+            actions: controlActionsPath,
+          }),
+          timeoutMs: request.projectConfig.harness.maxJobMinutes * 60_000,
+          ...(request.signal ? { signal: request.signal } : {}),
+          stdin: request.prompt,
+          maxOutputBytes: 8 * 1024 * 1024,
+        });
+      } finally {
+        await attemptHome.cleanup();
+      }
+    })();
     await writeFile(rawLogPath, `${result.stdout}\n${result.stderr}`, {
       mode: 0o600,
     });
@@ -348,21 +555,13 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       throw new Error(
         `${this.id} invocation failed (${result.exitCode ?? result.signal}): ${result.stderr.slice(-4_000)}`,
       );
+    const frames = jsonLines(result.stdout);
+    if (this.adapter === "claude" && request.role === "guide")
+      assertClaudeControlInventory(frames);
     let structured: Record<string, unknown>;
     if (this.adapter === "codex") {
       structured = JSON.parse(await readFile(outputPath, "utf8"));
     } else {
-      const frames = result.stdout
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => {
-          try {
-            return JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean) as Record<string, unknown>[];
       const final = [...frames]
         .reverse()
         .find((frame) => frame.type === "result");
@@ -376,17 +575,6 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
     const findings = Array.isArray(structured.findings)
       ? structured.findings.map((finding) => findingSchema.parse(finding))
       : [];
-    const frames = result.stdout
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean) as Record<string, unknown>[];
     const finalFrame = [...frames]
       .reverse()
       .find(
@@ -400,15 +588,29 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       typeof structured.usage === "object" && structured.usage
         ? (structured.usage as Record<string, unknown>)
         : frameUsage;
+    const reportedInput = numberField(
+      reportedUsage,
+      "inputTokens",
+      "input_tokens",
+    );
+    const cacheRead = numberField(
+      reportedUsage,
+      "cachedTokens",
+      "cached_input_tokens",
+      "cache_read_input_tokens",
+    );
+    const cacheCreation = numberField(
+      reportedUsage,
+      "cacheCreationTokens",
+      "cache_creation_input_tokens",
+    );
     const usage = usageSchema.parse({
-      inputTokens: numberField(reportedUsage, "inputTokens", "input_tokens"),
+      inputTokens:
+        this.adapter === "codex"
+          ? Math.max(0, reportedInput - cacheRead)
+          : reportedInput,
       outputTokens: numberField(reportedUsage, "outputTokens", "output_tokens"),
-      cachedTokens: numberField(
-        reportedUsage,
-        "cachedTokens",
-        "cached_input_tokens",
-        "cache_read_input_tokens",
-      ),
+      cachedTokens: cacheRead + cacheCreation,
       costUsd:
         typeof reportedUsage.costUsd === "number"
           ? reportedUsage.costUsd

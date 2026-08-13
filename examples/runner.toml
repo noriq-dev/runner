@@ -1,7 +1,8 @@
 [runner]
 id = "replace-with-registered-runner-id"
 serverUrl = "https://noriq.example"
-token = "replace-with-runner-token"
+# Prefer an environment variable so this file can stay non-secret.
+tokenEnv = "NORIQ_RUNNER_TOKEN"
 stateDirectory = "/var/lib/noriq-runner"
 scanRoots = ["/srv/projects"]
 maxConcurrentJobs = 2

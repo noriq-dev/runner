@@ -10,7 +10,7 @@ import type {
   RunnerJobOutput,
   RunnerTaskSnapshot,
 } from "./contracts.js";
-import { assertAcyclicSource } from "./contracts.js";
+import { assertAcyclicSource, hasExecutionSpec } from "./contracts.js";
 import type {
   AgentDriver,
   AgentRequest,
@@ -20,6 +20,7 @@ import type {
 import { ChecksummedJournal } from "./journal.js";
 import {
   builderPrompt,
+  executionSpecContract,
   guideOutputSchema,
   guidePrompt,
   repairPrompt,
@@ -235,7 +236,7 @@ export class RunnerJobSupervisor {
         resultDigest: resultDigest(recovered),
         recovered: true,
       });
-      await this.record("usage.recorded", { usage: recovered.usage });
+      await this.record("usage.recorded", { id, usage: recovered.usage });
       return recovered;
     }
     const request: AgentRequest = {
@@ -260,7 +261,7 @@ export class RunnerJobSupervisor {
       resultDigest: resultDigest(result),
       recovered: false,
     });
-    await this.record("usage.recorded", { usage: result.usage });
+    await this.record("usage.recorded", { id, usage: result.usage });
     return result;
   }
 
@@ -339,58 +340,67 @@ export class RunnerJobSupervisor {
       message: `Planning ${task.key}`,
       progress: 0,
     });
-    let guideRound = 0;
-    let guideContext = guidePrompt(task);
-    let guide: AgentResult;
+    let contract: TaskContract;
+    let plan: string;
     let guideInstructions: string | undefined;
-    while (true) {
-      guide = await this.invoke(
+    if (hasExecutionSpec(task.executionSpec)) {
+      ({ contract, plan } = executionSpecContract(
         task,
-        "guide",
-        guideRound,
-        this.workspace.path,
-        guideContext,
-        guideOutputSchema,
-      );
-      const planAction = guide.controlActions?.find(
-        (action) =>
-          action.name === "record_task_plan" &&
-          typeof action.args.plan === "string",
-      );
-      if (planAction) guide.plan = String(planAction.args.plan);
-      const delegation = guide.controlActions?.find(
-        (action) =>
-          action.name === "delegate" && action.args.role === "builder",
-      );
-      if (delegation && typeof delegation.args.instructions === "string")
-        guideInstructions = delegation.args.instructions;
-      const question = guide.controlActions?.find(
-        (action) =>
-          action.name === "ask_human" &&
-          typeof action.args.question === "string",
-      );
-      if (!question) break;
-      if (guideRound >= 2)
-        throw new Error(
-          "guide exceeded the three-question human input ceiling",
+        this.options.projectConfig.checks.commands,
+      ));
+    } else {
+      let guideRound = 0;
+      let guideContext = guidePrompt(task);
+      let guide: AgentResult;
+      while (true) {
+        guide = await this.invoke(
+          task,
+          "guide",
+          guideRound,
+          this.workspace.path,
+          guideContext,
+          guideOutputSchema,
         );
-      const questionId = createHash("sha256")
-        .update(
-          `${this.options.assignment.jobId}:${task.taskId}:question:${guideRound}`,
-        )
-        .digest("hex")
-        .slice(0, 24);
-      const prompt = String(question.args.question);
-      if (!this.state.questions[questionId]) {
-        await this.record("question.published", { questionId, prompt });
-        await this.emit({ type: "question", at: now(), questionId, prompt });
+        const planAction = guide.controlActions?.find(
+          (action) =>
+            action.name === "record_task_plan" &&
+            typeof action.args.plan === "string",
+        );
+        if (planAction) guide.plan = String(planAction.args.plan);
+        const delegation = guide.controlActions?.find(
+          (action) =>
+            action.name === "delegate" && action.args.role === "builder",
+        );
+        if (delegation && typeof delegation.args.instructions === "string")
+          guideInstructions = delegation.args.instructions;
+        const question = guide.controlActions?.find(
+          (action) =>
+            action.name === "ask_human" &&
+            typeof action.args.question === "string",
+        );
+        if (!question) break;
+        if (guideRound >= 2)
+          throw new Error(
+            "guide exceeded the three-question human input ceiling",
+          );
+        const questionId = createHash("sha256")
+          .update(
+            `${this.options.assignment.jobId}:${task.taskId}:question:${guideRound}`,
+          )
+          .digest("hex")
+          .slice(0, 24);
+        const prompt = String(question.args.question);
+        if (!this.state.questions[questionId]) {
+          await this.record("question.published", { questionId, prompt });
+          await this.emit({ type: "question", at: now(), questionId, prompt });
+        }
+        const answer = await this.waitForAnswer(questionId);
+        guideRound += 1;
+        guideContext = `${guidePrompt(task)}\n\nHuman answer to ${prompt}:\n${answer}`;
       }
-      const answer = await this.waitForAnswer(questionId);
-      guideRound += 1;
-      guideContext = `${guidePrompt(task)}\n\nHuman answer to ${prompt}:\n${answer}`;
+      contract = taskContract(guide);
+      plan = guide.plan ?? String(guide.structured.plan ?? guide.summary);
     }
-    const contract = taskContract(guide);
-    const plan = guide.plan ?? String(guide.structured.plan ?? guide.summary);
     await this.record("task.plan", { taskId: task.taskId, plan });
     await this.emit({
       type: "task.plan",

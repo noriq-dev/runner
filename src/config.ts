@@ -9,6 +9,10 @@ const registeredId = z
   .trim()
   .regex(/^[A-Za-z0-9_.-]{1,100}$/);
 const commandList = z.array(z.string().trim().min(1).max(4_000)).max(100);
+const environmentVariable = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]{0,199}$/);
 
 const legacyAgentProfileSchema = z
   .object({
@@ -216,22 +220,33 @@ const backendSchema = z.discriminatedUnion("adapter", [
     .strict(),
 ]);
 
-export const machineConfigSchema = z
+const runnerMachineSchema = z
   .object({
-    runner: z
-      .object({
-        id: z.string().trim().min(1),
-        serverUrl: z.string().url(),
-        token: z.string().min(1),
-        stateDirectory: z
-          .string()
-          .trim()
-          .min(1)
-          .default(resolve(homedir(), ".local/state/noriq-runner")),
-        scanRoots: z.array(z.string().trim().min(1)).min(1),
-        maxConcurrentJobs: z.number().int().min(1).max(32).default(1),
-      })
-      .strict(),
+    id: z.string().trim().min(1),
+    serverUrl: z.string().url(),
+    token: z.string().min(1).optional(),
+    tokenEnv: environmentVariable.optional(),
+    stateDirectory: z
+      .string()
+      .trim()
+      .min(1)
+      .default(resolve(homedir(), ".local/state/noriq-runner")),
+    scanRoots: z.array(z.string().trim().min(1)).min(1),
+    maxConcurrentJobs: z.number().int().min(1).max(32).default(1),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (Boolean(value.token) === Boolean(value.tokenEnv))
+      context.addIssue({
+        code: "custom",
+        path: ["token"],
+        message: "configure exactly one of token or tokenEnv",
+      });
+  });
+
+const machineConfigInputSchema = z
+  .object({
+    runner: runnerMachineSchema,
     drivers: z.record(registeredId, driverSchema),
     backends: z.record(registeredId, backendSchema).default({
       git: { adapter: "git", command: "git" },
@@ -240,6 +255,23 @@ export const machineConfigSchema = z
     }),
   })
   .strict();
+export const machineConfigSchema = machineConfigInputSchema.transform(
+  (input, context) => {
+    const token = input.runner.tokenEnv
+      ? process.env[input.runner.tokenEnv]
+      : input.runner.token;
+    if (!token) {
+      context.addIssue({
+        code: "custom",
+        path: ["runner", "tokenEnv"],
+        message: `environment variable ${input.runner.tokenEnv} is not set`,
+      });
+      return z.NEVER;
+    }
+    const { tokenEnv: _tokenEnv, ...runner } = input.runner;
+    return { ...input, runner: { ...runner, token } };
+  },
+);
 export type MachineConfig = z.infer<typeof machineConfigSchema>;
 
 async function readToml(path: string): Promise<unknown> {
