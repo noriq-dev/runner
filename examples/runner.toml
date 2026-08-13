@@ -1,0 +1,17 @@
+[runner]
+id = "replace-with-registered-runner-id"
+serverUrl = "https://noriq.example"
+token = "replace-with-runner-token"
+stateDirectory = "/var/lib/noriq-runner"
+scanRoots = ["/srv/projects"]
+maxConcurrentJobs = 2
+
+[providers.codex]
+command = "/usr/local/bin/codex"
+args = []
+home = "/var/lib/noriq-runner/providers/codex"
+
+[providers.claude]
+command = "/usr/local/bin/claude"
+args = []
+home = "/var/lib/noriq-runner/providers/claude"

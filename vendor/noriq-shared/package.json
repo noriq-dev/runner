@@ -1,0 +1,11 @@
+{
+  "name": "@noriq-dev/shared",
+  "version": "0.0.0-vendored",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
+  }
+}

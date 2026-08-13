@@ -1,0 +1,514 @@
+import { z } from 'zod';
+import { RepositoryKey } from './memory';
+import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
+
+// ---------------------------------------------------------------------------
+// The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
+// schemas validate the *parsed* object (shared stays runtime-neutral — no TOML
+// parser or fs here). Two files by design:
+//
+//   .noriq/project.toml  — COMMITTED, travels with the repo, team-shareable.
+//     Declares the project KEY (not a server-local id), the deterministic verify
+//     command, the default tool, and the per-kind permission profiles.
+//
+//   ~/.noriq/runner.toml — MACHINE-local, never committed. The daemon's own
+//     identity + wiring: label, which server to dial, where to scan for repos,
+//     concurrency, and default budget ceilings.
+// ---------------------------------------------------------------------------
+
+// A per-kind permission profile. Tool-agnostic *intent*; the driver translates
+// it to claude/codex specifics. `write` gates filesystem mutation in the Run's
+// worktree — the core scope↔build distinction.
+//
+// There is NO `network` key here, and its absence is the design (RUN-88). One existed from
+// Phase 1 — `none | restricted | full`, defaulting to `restricted` on every kind, parsed,
+// validated, written by init-project — and read by NOTHING. The comment above it claimed it was
+// "enforced by the daemon/driver … part of the load-bearing security model"; both clauses were
+// false for its entire life, and this schema IS the security model's documentation, so the lie
+// was the load-bearing part. A reader had every reason to believe `network = "none"` firewalled
+// an agent. It firewalled nothing.
+//
+// Not removed as a wontfix — removed because neither driver can honour it and a key nobody can
+// honour is a false assurance with a security-shaped name. The Claude Agent SDK exposes no egress
+// control at all (tool-gating WebFetch/WebSearch is not network-gating: bash `curl` still walks
+// out). Codex could approximate ONE bit via `sandbox_workspace_write.network_access`, but binding
+// on codex while silently no-opping on the DEFAULT driver is the same false assurance, narrower
+// and harder to notice. Real egress control needs the container boundary — RUN-53 — which is
+// where the permission model relocates anyway. Re-add it THERE, enforced on arrival.
+//
+// This is the same call as UpdatePolicy's missing `apply` key below, and RUN-38's
+// `oauth_tokens.scope` before it: a stored setting nothing consults reads as working, and is
+// worse than an absent one. Do not restore this key ahead of its enforcement.
+export const PermissionProfile = z.object({
+  write: z.boolean(),
+  allow: z.array(z.string()).default([]), // extra allow rules handed to the driver
+  deny: z.array(z.string()).default([]),
+  /**
+   * Opt this kind into the driver's own AUTO mode (RUN-68): Claude's bypass-permissions,
+   * codex's unsandboxed full access — instead of the curated allowlist. Default FALSE, and the
+   * default is the floor; this is the committed, per-kind trust escape hatch for repos whose
+   * work the allowlist fits badly. Two axes it deliberately does NOT loosen: `write` survives
+   * auto (a read-only kind stays read-only — edit-tool denials on Claude, read-only sandbox on
+   * codex), and `deny` still binds. Push credentials and the per-kind Noriq tool floor are
+   * enforced elsewhere (env stripping; server-side registration, RUN-47) and are untouched by
+   * this. See THREAT-MODEL.md — this moves a boundary that used to be absolute.
+   */
+  auto: z.boolean().default(false),
+});
+export type PermissionProfile = z.infer<typeof PermissionProfile>;
+
+export const KindPermissions = z.object({
+  scope: PermissionProfile,
+  build: PermissionProfile,
+  verify: PermissionProfile,
+});
+export type KindPermissions = z.infer<typeof KindPermissions>;
+
+/**
+ * A repo's default model + effort for one kind (RUN-33).
+ *
+ * Per KIND, because that is where the difference actually lives: a scope run is exploration and
+ * judgment, a build is execution, a verify is adversarial reasoning. One repo-wide value gets at
+ * least one of them wrong. This lets a repo say "scope with something strong, build with
+ * something cheap" once, in the commit, rather than every dispatcher remembering to.
+ *
+ * Both nullable and independent: wanting a higher effort while inheriting the tool's model is
+ * an ordinary thing to want, and so is the reverse.
+ */
+export const ModelDefault = z.object({
+  // The agent coordinate (RUN-113): `claude.opus-4_8.high` — the canonical per-kind selector.
+  // When set it WINS; `model`/`effort` below are the legacy triple, kept as the fallback for one
+  // deprecation window. A free string (the runner's coordinate parser validates it), not an enum —
+  // model ids are the vendor's and change weekly, exactly the reason `model` is a free string.
+  agent: z.string().nullable().default(null),
+  model: z.string().nullable().default(null),
+  effort: RunEffort.nullable().default(null),
+});
+export type ModelDefault = z.infer<typeof ModelDefault>;
+
+export const KindDefaults = z.object({
+  scope: ModelDefault.prefault({}),
+  build: ModelDefault.prefault({}),
+  verify: ModelDefault.prefault({}),
+});
+export type KindDefaults = z.infer<typeof KindDefaults>;
+
+// Security-model defaults: scope/verify are read-only, build gets worktree write.
+// No agent ever gets push credentials (enforced by the daemon, not expressible here).
+// A factory (not a shared literal) so each parse gets fresh, non-aliased arrays.
+const defaultPermissions = (): KindPermissions => ({
+  scope: { write: false, allow: [], deny: [], auto: false },
+  build: { write: true, allow: [], deny: [], auto: false },
+  verify: { write: false, allow: [], deny: [], auto: false },
+});
+
+/**
+ * The inline reviewer half of the verify stage (RUN-61): a FRESH agent — never the session
+ * that wrote the code — reviews the build's diff read-only and files a verdict; a FAIL report
+ * is handed back to the live builder to fix, bounded, then re-reviewed. Configurable model /
+ * effort because adversarial review is exactly where a repo may want a stronger model than it
+ * builds with; both fall back to `[defaults.verify]`, then the tool's own default.
+ */
+export const VerifyReviewer = z.object({
+  /**
+   * Run the reviewer on a DIFFERENT driver than the builder (RUN-70) — the strongest form of
+   * its independence: not just a fresh session, a different vendor's model judging the work.
+   * Null = the run's own driver, today's behavior. When set, `[defaults.verify].model` is NOT
+   * inherited (model names are vendor-specific and the repo default may name the other
+   * vendor's) — name `model` here or take the tool's own default. A tool with no driver on the
+   * machine fails the gate loudly rather than silently reviewing with the builder's vendor.
+   */
+  // The reviewer's agent coordinate (RUN-113): `codex.gpt-5_6-sol.high` names tool+model+effort in
+  // one string. When set it WINS over `tool`/`model`/`effort` below (the legacy triple), and its
+  // tool segment IS honored — a reviewer on a different vendor is the whole point of RUN-70.
+  agent: z.string().nullable().default(null),
+  tool: AgentTool.nullable().default(null),
+  model: z.string().nullable().default(null),
+  effort: RunEffort.nullable().default(null),
+  // How many FAIL→fix→re-review rounds before the run stops and a human picks it up. Same
+  // bound-by-default shape as RUN-21's K=2: an agent that cannot satisfy the reviewer in two
+  // rounds is not going to on the third — it is going to keep spending. 0 = one review, no
+  // hand-back (a pure gate).
+  maxRounds: z.number().int().min(0).max(5).default(2),
+});
+export type VerifyReviewer = z.infer<typeof VerifyReviewer>;
+
+// The verify stage, a CHOICE per repo (RUN-61) expressed by what this section contains:
+// omit `[verify]` entirely = no verify stage; `cmd` = the deterministic floor (zero tokens,
+// daemon-run — RUN-19); `[verify.agent]` = the inline reviewer; both = floor first (cheap
+// screen), then the reviewer. A section with neither is a config error, refused at parse —
+// silently meaning "none" would read as a gate that isn't there.
+export const VerifySpec = z
+  .object({
+    cmd: z.string().min(1).nullable().default(null), // e.g. "cd apps/api && npx tsc --noEmit && npm test"
+    timeoutSeconds: z.number().int().positive().nullable().default(null),
+    /**
+     * Pin the shell `cmd` runs under. Null = the platform's own: `sh` on POSIX, **cmd.exe on
+     * Windows** (RUN-42).
+     *
+     * That difference is a real cost, and this field exists to give a repo a way out of it. This
+     * manifest is COMMITTED, so `cmd` travels to teammates on other operating systems. `&&`
+     * happens to mean the same thing in both shells, so the common `npm run check && npm test`
+     * is portable by luck — but `2>&1`, `$VAR`, quoting, and globs are not. A team on mixed OSes
+     * whose verify command needs any of those can pin `shell = "bash"` (Git for Windows ships
+     * one, and this daemon already requires git) and get one behaviour everywhere.
+     *
+     * Not the default, because a pin that is absent fails the gate outright, which is worse than
+     * cmd.exe handling the common case correctly.
+     */
+    shell: z.string().min(1).nullable().default(null),
+    /**
+     * How many FAIL→fix→re-verify rounds the daemon hands a failing `cmd` back to the LIVE
+     * builder before the run stops and a human picks it up (RUN-94). The floor half of the
+     * knob `[verify.agent]` already commits: RUN-29 wired the feedback loop but hardcoded
+     * RUN-21's K=2, so a repo whose suite needs a wider bound (or a pure gate) had no say.
+     * 0 = one verify, no hand-back. The budget still applies underneath — a loop cannot
+     * outrun its ceiling. Only meaningful with `cmd`; the reviewer's loop is `agent.maxRounds`.
+     */
+    maxRounds: z.number().int().min(0).max(5).default(2),
+    agent: VerifyReviewer.nullable().default(null),
+  })
+  .refine((v) => v.cmd !== null || v.agent !== null, {
+    message: '[verify] needs `cmd`, `[verify.agent]`, or to be omitted entirely',
+  });
+export type VerifySpec = z.infer<typeof VerifySpec>;
+
+/**
+ * Where a passing build's diff goes, and whether the daemon puts it there itself.
+ *
+ * The point is to stop charging a human per run. A build that clears the gate is rebased
+ * onto `branch`, RE-VERIFIED there, then fast-forwarded in — and its worktree + throwaway
+ * branch are reaped. Work accumulates on one integration branch that a human merges
+ * onward into main/protected branches on their own schedule, reviewing a batch instead of
+ * clicking through every run.
+ *
+ * Verify runs AFTER the rebase, not before: two runs can each be green at their own fork
+ * point and broken together, and a gate that never sees the combination cannot catch it.
+ *
+ * SECURITY: the daemon merges LOCALLY and still never pushes — agent output reaches the
+ * operator's disk and nowhere else, so `git push` remains the human boundary. Pointing
+ * `branch` at something push-triggered or auto-deploying hands agents production; that is
+ * an explicit choice, never a default. Omit this section and nothing auto-lands.
+ */
+export const LandPolicy = z.object({
+  // The integration branch; created from defaultBranch if it doesn't exist. NO default,
+  // on purpose: auto-landing is opt-in per repo and must never silently choose `main`.
+  //
+  // May contain `<planKey>` (RUN-28) — e.g. "noriq/plan-<planKey>" — giving each plan its own
+  // working branch, which is what makes a merge request mean something: a human reviews one
+  // coherent plan's worth of work rather than a click per run or a surprise on main. A run with
+  // no plan (a one-off dispatch) falls back to the literal branch with the placeholder stripped,
+  // so a template never produces a branch called "plan-<planKey>".
+  branch: z.string().min(1),
+  // Where the working branch's merge request goes when its plan completes (RUN-28). NO default
+  // and null = no MR: the protected branch is named by the REPO, never inferred and never chosen
+  // by whoever dispatched. Requires autoPush — a merge request cannot exist without the branch
+  // reaching the remote.
+  mergeTarget: z.string().min(1).nullable().default(null),
+  // What a DISPATCH may override `branch` with (RUN-41). Globs: ["feature/**", "wip/*"].
+  //
+  // EMPTY MEANS NO OVERRIDE, and that default is load-bearing. Today a repo saying
+  // `branch = "agents"` can only ever be written at `agents`; if a per-dispatch branch defaulted
+  // to "anywhere", every existing repo would silently become writable at `main` by anyone who can
+  // dispatch. That is a live security envelope widening because a field appeared — the same
+  // silent widening refused in RUN-38 (a refresh must not broaden scope) and RUN-35 (an offboard
+  // must not evaporate on reconnect). The repo owner and the dispatcher are not always the same
+  // person, so the repo opts into being steerable.
+  allowedBranches: z.array(z.string().min(1)).default([]),
+  // Land only if the deterministic verify passes on the REBASED result. Off means an
+  // unverified diff reaches `branch` — permitted, never assumed.
+  onlyWhenVerifyPasses: z.boolean().default(true),
+  // Let the build agent resolve a rebase conflict in its own worktree, under the same
+  // permission floor, when the conflict is mechanical. Structural ones still fail out.
+  resolveConflicts: z.boolean().default(true),
+  // Push `branch` to its remote after a successful landing (RUN-27). DEFAULT FALSE, and the
+  // default is the point: this crosses the one boundary the daemon otherwise has. Every other
+  // defence rests on "nothing an agent writes leaves this machine" — auto-landing was
+  // defensible precisely because `git push` stayed human, and `git log origin/main..main` was
+  // the operator's "what did the agents do while I wasn't looking?" check. This removes that
+  // checkpoint, so it must be chosen, never inferred. See THREAT-MODEL.md.
+  autoPush: z.boolean().default(false),
+});
+export type LandPolicy = z.infer<typeof LandPolicy>;
+
+/**
+ * Mechanical workspace bootstrap (PLNR-242): commands the DAEMON runs, in order, to make a
+ * fresh worktree ready before any agent starts — `npm install`, codegen, submodule init.
+ *
+ * Exists because of a live dogfood cost: a fresh worktree has no node_modules, so every agent
+ * spent its first (most valuable) turns bootstrapping an environment — and sometimes failed
+ * under a restricted-network profile — doing work the machine could have done for free before
+ * the run began. Mechanical setup is not agent work.
+ *
+ * Schema half only: execution semantics (working dir, env, failure handling, caching, whether
+ * a failed setup blocks the run) are the RUNNER's own contract, defined where they are
+ * enforced. This section just carries the words. Not part of the security floor in the way
+ * `permissions` is — but note these commands run OUTSIDE any agent sandbox, daemon-privileged,
+ * from a COMMITTED file: cloning a repo and running its runner executes its [setup]. That is
+ * the same trust boundary `verify.cmd` already crosses, no wider.
+ */
+export const SetupSpec = z.object({
+  // Run in order; each must exit 0. Empty = nothing to do (same as omitting the section).
+  cmds: z.array(z.string().min(1)).default([]),
+  // Per-COMMAND ceiling, seconds. The default absorbs a cold `npm install` on a slow link;
+  // repos with heavier bootstraps (toolchain downloads, large codegen) raise it explicitly.
+  timeoutSeconds: z.number().int().positive().default(600),
+});
+export type SetupSpec = z.infer<typeof SetupSpec>;
+
+/**
+ * Per-stage configuration inside a workflow (PLNR-238 / the runner's Workflows v3 plan).
+ *
+ * `agent` is the coordinate (RUN-113: `claude.fable-5.high`) this stage's actor runs under —
+ * INCLUDING the adversary stages (plan-check, review, verify-agent), which is the point: a repo
+ * can plan with one model, build with a cheaper one, and be judged by a third. A coordinate
+ * chooses a MODEL and never a posture: the write floor (RUN-118) and the stage clamp (RUN-132)
+ * are runner-side and unreachable from here. Free string, not an enum — model ids are the
+ * vendor's and change weekly; the runner's coordinate parser validates it.
+ */
+export const WorkflowStageDef = z.object({
+  agent: z.string().min(1).nullable().default(null),
+});
+export type WorkflowStageDef = z.infer<typeof WorkflowStageDef>;
+
+/**
+ * A workflow's declared pipeline (PLNR-238). Two spellings of one fact, because TOML cannot put
+ * an array and a `[stages.<name>]` table on the same key:
+ *
+ *   stages = ["plan", "plan-check", "execute"]        — names only, nothing per-stage
+ *   [stages.plan-check] agent = "claude.fable-5.high" — the same declaration, keyed, with config
+ *
+ * A SET, not a sequence: order always comes from the machine's RUN_STAGES ("reviews before it
+ * integrates" is a security ordering, not a preference — RUN-132), so the table form's
+ * unordered keys lose nothing. The runner clamps exactly as today: (mandatory ∪ declared) ∩
+ * appliesTo — a declaration can decline an optional stage, never enable one its posture may not
+ * run, never shed a mandatory one.
+ */
+export const WorkflowStages = z.union([
+  z.array(z.string().min(1)),
+  z.record(z.string().min(1), WorkflowStageDef),
+]);
+export type WorkflowStages = z.infer<typeof WorkflowStages>;
+
+/**
+ * A repo-defined workflow (RUN-119, contract v2 in PLNR-238): a NAMED variant of a built-in run
+ * kind. Its NAME is not a field — it is the file the workflow lives in (`.noriq/workflows/<name>.toml`,
+ * Workflows v3) or its key under `[workflows.<name>]` in the project manifest. It inherits the
+ * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
+ * because scope is, and no field here can change that (the write floor is enforced in the runner,
+ * RUN-118). What a workflow may vary: the PROMPT its agents get, which OPTIONAL stages run, and
+ * which agent coordinate does each stage's work. The three built-ins (scope/build/verify) are
+ * always present and need no declaration.
+ *
+ * v1 compatibility is a hard rule: `{base, prompt: "text"}` parses byte-identically (prompt's
+ * string arm), every v2 field is optional, and unknown keys pass through un-strictly — the
+ * vendored-contract ordering (VENDORED-CONTRACT.md) means this schema must never reject a
+ * manifest an older daemon wrote.
+ */
+export const WorkflowDef = z.object({
+  // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
+  base: RunKind,
+  // The brief: inline template text / template name (the v1 string form, RUN-121), or
+  // `{ file = "plan.md" }` — a file the DAEMON resolves relative to the workflow's own
+  // directory and confines there (the same no-escaping-the-root rule as ProjectContext).
+  // Null = the base's own prompt, exactly as the built-in kind would.
+  prompt: z.union([z.string(), z.object({ file: z.string().min(1) })]).nullable().default(null),
+  // The declared pipeline (see WorkflowStages). Null = the base's own stage list, unchanged.
+  stages: WorkflowStages.nullable().default(null),
+  // One line for humans choosing a workflow at dispatch (PLNR-240 advertises {name, base,
+  // description} per repo). Cosmetic — nothing executes it.
+  description: z.string().nullable().default(null),
+});
+export type WorkflowDef = z.infer<typeof WorkflowDef>;
+
+/**
+ * What the repo knows about itself and every agent has been made to rediscover (RUN-128).
+ *
+ * A build agent's brief has carried the task and nothing else: no orientation, no conventions,
+ * no "read this first". So each run spends its most valuable early context re-deriving what the
+ * repo already knows and could simply have said — and derives it slightly differently each time.
+ * This is the repo saying it once, in the committed marker, so every teammate's runner briefs
+ * agents identically.
+ *
+ * Declarative on purpose: these are PATHS and short steers, never file contents. The daemon
+ * resolves them against the repo root and confines them there — a committed file naming
+ * `../../.ssh/id_rsa` is a repo asking the daemon to read outside itself, and the answer is no.
+ */
+export const ProjectContext = z.object({
+  // Read these before changing anything. The daemon names them here and (RUN-129) inlines their
+  // contents under a size budget, so order them by how much an agent needs them.
+  requiredReading: z.array(z.string().min(1)).default([]),
+  // Where to start reading the code — architectural entry points, not an index of the repo.
+  entryPoints: z.array(z.string().min(1)).default([]),
+  // Short, non-negotiable steers ("ESM only", "no barrel files"). Deliberately terse: anything
+  // needing a paragraph belongs in a `requiredReading` document, where it can be maintained
+  // as prose rather than rotting in a TOML array.
+  conventions: z.array(z.string().min(1)).default([]),
+  /**
+   * What to do with the repo's conventional agent-instruction files — CLAUDE.md, AGENTS.md — when
+   * this section declares no `requiredReading` of its own (RUN-155).
+   *
+   * `inline` (the default) reproduces them in the brief, which is RUN-129's behaviour and the
+   * right one for most repos: the file was written to steer a coding agent and every agent that
+   * had to go and find it spent context doing so.
+   *
+   * The other two exist because an empty `requiredReading` cannot say this. After zod defaults an
+   * empty array is indistinguishable from an absent one, so a repo had no way to decline — and two
+   * kinds of repo want to:
+   *
+   * - `name` tells the agent the file exists and leaves it to read it. For a large instructions
+   *   file aimed at humans as much as agents, pre-loading it spends more context than the agent
+   *   would have spent reading the part it needed.
+   * - `off` says nothing at all. For a repo whose CLAUDE.md is not addressed to this kind of agent.
+   *
+   * It governs ONLY the fallback. A repo that declares `requiredReading` has already said what it
+   * wants and that list is always inlined.
+   */
+  agentInstructions: z.enum(['inline', 'name', 'off']).default('inline'),
+});
+export type ProjectContext = z.infer<typeof ProjectContext>;
+
+/**
+ * Repository indexing (Project Memory §7, PLNR-244): enabled explicitly per
+ * repository — a repo the operator never opted in never has its files read
+ * for the graph. Include/exclude are confined to this repository; there is no
+ * cross-repo glob. Execution semantics (parser selection, the non-overridable
+ * sensitive-file deny list, batching) belong to the Runner indexer that reads
+ * this, not to this schema.
+ */
+export const IndexSpec = z.object({
+  enabled: z.boolean().default(false),
+  include: z.array(z.string().min(1)).default([]),
+  exclude: z.array(z.string().min(1)).default([]),
+});
+export type IndexSpec = z.infer<typeof IndexSpec>;
+
+// A committed KEY must satisfy the same shape as Project.key (short prefix).
+export const ProjectKey = z.string().min(1).max(8);
+
+export const ProjectManifest = z.object({
+  // Committed, portable identifier. Resolved to a prj_… id per configured server
+  // (see the resolution contract below) — NOT a server-local id, so the checkout
+  // is portable across instances/forks without editing this file.
+  key: ProjectKey,
+  // Lock this repo's work to one BOARD within the project (RUN-71) — `key` one level down: a
+  // project can host several repos, and without this every task a repo's agents create piles
+  // onto the default board. A NAME, not an id, for the same reason key is not a prj_… id:
+  // ids are server-local and this file is committed. Resolved per server at registration
+  // (case-insensitive); an unknown name resolves to null — visible in the dashboard, never
+  // silently rebound. Null = the project's default board, exactly as before.
+  board: z.string().min(1).max(80).nullable().default(null),
+  verify: VerifySpec.nullable().default(null),
+  // Workspace bootstrap the daemon runs before any agent (PLNR-242). Null = nothing to run,
+  // byte-identical to every manifest written before this existed.
+  setup: SetupSpec.nullable().default(null),
+  // What the repo tells every agent about itself before it starts (RUN-128). Empty = today's
+  // behaviour, a brief carrying only the task. Not part of the security floor: getting this
+  // wrong costs an agent orientation, never safety.
+  context: ProjectContext.prefault({}),
+  tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
+  defaultBranch: z.string().nullable().default(null),
+  // The canonical, project-local repository identity (Project Memory §6, PLNR-244) — distinct
+  // from any runner-local checkout id, and stable across re-clones and machine changes in a way
+  // a checkout id is not. Null on a manifest that has not opted into Project Memory yet, OR on
+  // one that has: PLNR-321 makes registration itself optional-with-a-derived-default (the
+  // server derives the project's own key, lowercased, when a caller omits the key at
+  // registration — see index.ts's deriveDefaultRepositoryKey), so a repo can start using
+  // Project Memory without ever hand-authoring a slug here. This field is NOT a secret — it is
+  // a public, stable identifier and a visible segment of every entity URI
+  // (`noriq://file/<projectKey>/<repositoryKey>/<path>`); set it explicitly only when a
+  // project spans more than one repository, or to pin the derived default in writing.
+  repositoryKey: RepositoryKey.nullable().default(null),
+  // Null = indexing off for this repo, byte-identical to every manifest written before this
+  // existed.
+  index: IndexSpec.nullable().default(null),
+  // null = no auto-landing; every run's diff waits on its own branch for a human.
+  land: LandPolicy.nullable().default(null),
+  permissions: KindPermissions.default(defaultPermissions),
+  // Per-kind model + effort (RUN-33). Empty = whatever the tool defaults to; a dispatch can
+  // still override per run. Not part of the security floor — unlike `permissions`, getting this
+  // wrong costs money or quality, never safety.
+  defaults: KindDefaults.prefault({}),
+  // Repo-defined workflows (RUN-119), keyed by name: named variants of a built-in kind with their
+  // own prompt. The three built-ins are always available and are NOT listed here; a name that
+  // collides with a built-in is ignored in favour of the built-in (a repo cannot redefine `build`).
+  workflows: z.record(z.string(), WorkflowDef).default({}),
+});
+export type ProjectManifest = z.infer<typeof ProjectManifest>;
+
+// ---------------------------------------------------------------------------
+// Machine config
+// ---------------------------------------------------------------------------
+
+/**
+ * How this machine keeps up with releases (RUN-37).
+ *
+ * There is NO `apply` / `enabled` self-replacement key here, and its absence is the design.
+ * Shipping one that did nothing would repeat exactly the mistake RUN-38 had to undo: a stored
+ * setting that reads as working while nothing consults it. An operator would set
+ * `apply = true`, believe the box self-updates, and be wrong.
+ *
+ * Self-replacement is blocked on judgement, not mechanics: @noriq-dev/runner is published, so it
+ * COULD npm-install itself. But the daemon holds the operator's OAuth token, spawns agents at a
+ * permission floor it chooses, and with [land] writes branches — so whoever controls the version
+ * feed controls all of that on every opted-in box. The package has npm's registry signatures (as
+ * every package does) but no provenance attestation, so nothing proves an artifact came from
+ * this repo's CI rather than someone's laptop. It also has to drain live runs and be restarted
+ * by something. Both are solvable; neither is solved. See THREAT-MODEL.md.
+ *
+ * So this is the checking half, which is safe and useful on its own: a public GET, and a runner
+ * that says out loud when it is behind.
+ */
+export const UpdatePolicy = z.object({
+  /** Check whether this runner is behind and say so (log + the dashboard's version badge).
+   *  Nothing is downloaded, nothing is replaced. */
+  check: z.boolean().default(true),
+  checkIntervalHours: z.number().positive().default(24),
+});
+export type UpdatePolicy = z.infer<typeof UpdatePolicy>;
+
+export const RunnerConfig = z.object({
+  label: z.string().min(1), // human name for this runner, e.g. "my-laptop"
+  server: z.string().url(), // the Noriq server this runner dials (control plane)
+  scanRoots: z.array(z.string()).min(1), // dirs walked to discover .noriq/project.toml markers
+  concurrency: z.number().int().positive().default(1), // → Runner.capabilities.maxConcurrency
+  // default ceilings applied to Runs lacking their own. zod v4: `.default({})` now
+  // wants the full OUTPUT value, so use `.prefault({})` — it parses `{}` through
+  // RunBudget, applying each field's inner default (the v3 `.default({})` behavior).
+  budget: RunBudget.prefault({}),
+  // Installed drivers. Optional — the daemon may auto-detect; when set it pins
+  // what this runner advertises (Runner.capabilities.tools).
+  tools: z.array(AgentTool).nullable().default(null),
+  // Staying current (RUN-37). Machine-local on purpose: updating the daemon is a property of
+  // the BOX, not of a repo — a repo must never be able to update the daemon supervising it.
+  update: UpdatePolicy.prefault({}),
+  // NOTE: the OAuth token is a local secret and intentionally NOT part of this
+  // schema — it lives outside the config file (credential store / token file);
+  // only the token crosses the wire, per the security model. See RUN-5/RUN-9.
+});
+export type RunnerConfig = z.infer<typeof RunnerConfig>;
+
+// ---------------------------------------------------------------------------
+// key → projectId resolution contract
+//
+// The manifest commits a KEY; the daemon never hardcodes a prj_… id. At
+// discovery/registration the daemon advertises the committed key (see
+// RunnerRepo.projectKey, RUN-1); the server maps it to a project on *that*
+// server and returns the id (RunnerRepo.projectId). Because the mapping is
+// server-local, the same committed checkout resolves correctly on a fork or a
+// different instance that has its own project under the same key — portability
+// without editing the repo. A key with no project on the server resolves to
+// null (unresolved) and yields no dispatchable target there.
+// ---------------------------------------------------------------------------
+
+// Canonical form of a committed key for comparison/lookup (keys are
+// case-insensitive prefixes; store/compare uppercased + trimmed).
+export const normalizeProjectKey = (key: string): string => key.trim().toUpperCase();
+
+// The result the server returns when resolving a repo's committed key.
+export const ProjectKeyResolution = z.object({
+  key: ProjectKey, // the committed key (normalized)
+  projectId: z.string().nullable(), // null = no project with this key on this server
+  server: z.string().url(), // which server produced this resolution (portability audit)
+});
+export type ProjectKeyResolution = z.infer<typeof ProjectKeyResolution>;

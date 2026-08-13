@@ -1,0 +1,194 @@
+import { z } from 'zod';
+import { ExecutionSpec } from './execution-spec';
+
+// ---------------------------------------------------------------------------
+// Core entities (ROADMAP §4). These schemas are the single source of truth:
+// they validate MCP tool inputs, REST bodies, and type the web app.
+// ---------------------------------------------------------------------------
+
+export const TaskStatus = z.enum([
+  'todo',
+  'claimed',
+  'in_progress',
+  'blocked',
+  'review',
+  'done',
+  'cancelled',
+  // A gate-failed task (0049). A WIRE-only status DERIVED from tasks.failed_at — the DB column
+  // stays within its CHECK (D1 cannot rebuild tasks to widen it; see 0049) — exactly as
+  // RunnerStatus carries 'offboarded', derived from offboarded_at.
+  'failed',
+  // A spun-off task awaiting human acceptance (0064 / PLNR-230). WIRE-only, derived from
+  // tasks.proposed_at while the stored status is still `todo` — same pattern as 'failed'.
+  // Inert to every agent path (claim/next_claimable/pump) until a human accepts (→ todo)
+  // or rejects (→ cancelled).
+  'proposed',
+]);
+export type TaskStatus = z.infer<typeof TaskStatus>;
+
+/**
+ * Is this task finished with — nothing further will happen to it? `done` and `cancelled`
+ * are both terminal: one succeeded, one was abandoned, and NEITHER is still owed work.
+ *
+ * This exists because "finished" was re-derived at every call site and the copies drifted
+ * (PLNR-229): the server's phase-order gate and the dispatch pump correctly read
+ * `NOT IN ('done','cancelled')`, while the Plans view asked `!== 'done'` — so one cancelled
+ * task pinned a plan to that phase forever, showing as unfinished work that could never be
+ * finished. A gate and a progress bar disagreeing about what "settled" means is exactly the
+ * bug, so the predicate lives once, beside the status it reads.
+ *
+ * NB `failed` is deliberately NOT settled: a gate-failed task is re-armable and still owed.
+ */
+export const isSettledTaskStatus = (status: string | null | undefined): boolean =>
+  status === 'done' || status === 'cancelled';
+
+export const AgentRole = z.enum(['orchestrator', 'worker']);
+export type AgentRole = z.infer<typeof AgentRole>;
+
+export const AgentStatus = z.enum(['active', 'idle', 'offline', 'revoked']);
+export type AgentStatus = z.infer<typeof AgentStatus>;
+
+export const CommentKind = z.enum(['comment', 'question', 'instruction', 'reply']);
+export type CommentKind = z.infer<typeof CommentKind>;
+
+export const CommentStatus = z.enum(['open', 'acknowledged', 'addressed', 'wont_do']);
+export type CommentStatus = z.infer<typeof CommentStatus>;
+
+export const ActorKind = z.enum(['agent', 'human', 'system']);
+export type ActorKind = z.infer<typeof ActorKind>;
+
+/** Which sort of agent (RUN-43 / migration 0026). Distinct from ActorKind above: that one
+ *  answers "agent, human, or system?"; this one answers "which sort of agent?" for a row
+ *  that is already an agent. */
+export const AgentKind = z.enum(['copilot', 'agent']);
+export type AgentKind = z.infer<typeof AgentKind>;
+
+export const Agent = z.object({
+  id: z.string(),
+  name: z.string().min(1),
+  /** copilot = a human's Claude Code / Codex session: self-created at MCP initialize, may
+   *  hop projects, heartbeat is meaningless (a human is right there). agent = spawned by a
+   *  runner for exactly one run: runner-owned, pinned to one project for life, heartbeat is
+   *  the liveness signal that matters. */
+  kind: AgentKind,
+  role: AgentRole,
+  status: AgentStatus,
+  /** The runner that created it and owns its lifecycle. Non-null iff kind='agent' — the DB
+   *  enforces that pairing with a CHECK, so it is not merely a convention here. */
+  runnerId: z.string().nullable().default(null),
+  lastSeenAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+});
+export type Agent = z.infer<typeof Agent>;
+// `scopes` lived here mirroring a column that took its '[]' default and was named in no
+// query anywhere — retired with the column in 0026, alongside api_key_hash.
+
+export const Project = z.object({
+  id: z.string(),
+  key: z.string().min(1).max(8), // short prefix for task keys, e.g. "PLN"
+  name: z.string().min(1),
+  description: z.string().default(''),
+  status: z.enum(['active', 'archived']),
+  repoUrl: z.string().url().nullable(),
+  defaultBranch: z.string().nullable(),
+  claimTtlSeconds: z.number().int().positive().default(300),
+  heartbeatSeconds: z.number().int().positive().default(60),
+  createdAt: z.string().datetime(),
+});
+export type Project = z.infer<typeof Project>;
+
+export const Milestone = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  title: z.string().min(1),
+  dueAt: z.string().datetime().nullable(),
+  order: z.number().int(),
+  closedAt: z.string().datetime().nullable(),
+});
+export type Milestone = z.infer<typeof Milestone>;
+
+export const Task = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  key: z.string(), // e.g. "PLN-142"
+  milestoneId: z.string().nullable(),
+  parentTaskId: z.string().nullable(),
+  title: z.string().min(1),
+  body: z.string().default(''),
+  status: TaskStatus,
+  // 0 = MOST urgent, 4 = least (PLNR-231). P0 means "drop everything", as it does in Jira,
+  // Linear and Google — the scale used to run the other way, which read as "P0 · someday" and
+  // sent an agent asked for "the P0" to the least important task in the project. Consequence
+  // for anything sorting by it: most-urgent-first is ORDER BY priority ASC, not DESC.
+  priority: z.number().int().min(0).max(4).default(2),
+  estimate: z.number().nullable(),
+  /** Per-task deadline (PLNR-126); overdue = dueAt < now while not done/cancelled. */
+  dueAt: z.string().datetime().nullable().optional(),
+  claimedBy: z.string().nullable(),
+  claimExpiresAt: z.string().datetime().nullable(),
+  openComments: z.number().int().nonnegative().default(0),
+  order: z.number().int(),
+  /**
+   * What a builder is told before it is allowed to spend anything (RUN-134/135).
+   *
+   * Optional as well as nullable, because the two admit different things. NULL is a fact about
+   * the task — nobody wrote a spec. ABSENT is a fact about the READ: only the detail surfaces
+   * (`get_task`, `GET /api/tasks/:id`) carry a spec, because a board snapshot ships every task in
+   * a project and renders none of this, and paying the whole feature's payload on every poll to
+   * draw a column of titles would be a poor trade.
+   */
+  executionSpec: ExecutionSpec.nullable().default(null).optional(),
+  /**
+   * The stored spec could not be read (RUN-135) — corrupt JSON, or a shape this schema no longer
+   * accepts. Absent on every healthy task.
+   *
+   * It exists so `executionSpec: null` can be trusted. Anything that PLANS reads a null spec as
+   * "nobody planned this" and writes one, so a corrupt value quietly reported as null would be
+   * overwritten by the next planner run; this is the flag that says "do not conclude that".
+   */
+  executionSpecUnreadable: z.boolean().optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export type Task = z.infer<typeof Task>;
+
+export const Dependency = z.object({
+  taskId: z.string(),
+  dependsOnTaskId: z.string(),
+});
+export type Dependency = z.infer<typeof Dependency>;
+
+export const Claim = z.object({
+  id: z.string(),
+  taskId: z.string(),
+  agentId: z.string(),
+  acquiredAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+  releasedAt: z.string().datetime().nullable(),
+});
+export type Claim = z.infer<typeof Claim>;
+
+export const Comment = z.object({
+  id: z.string(),
+  taskId: z.string(),
+  authorKind: ActorKind,
+  authorId: z.string(), // agent id, or user id for humans
+  kind: CommentKind,
+  body: z.string().min(1),
+  status: CommentStatus,
+  resolvedBy: z.string().nullable(),
+  parentCommentId: z.string().nullable(),
+  createdAt: z.string().datetime(),
+});
+export type Comment = z.infer<typeof Comment>;
+
+export const Message = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  fromAgentId: z.string(),
+  toAgentId: z.string().nullable(), // null = broadcast
+  body: z.string().min(1),
+  refTaskId: z.string().nullable(),
+  createdAt: z.string().datetime(),
+});
+export type Message = z.infer<typeof Message>;
