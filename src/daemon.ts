@@ -151,7 +151,7 @@ export function missionAssignmentRefusal(
   if (missionLease && !run.executionProfile) {
     return 'mission assignment refused: Noriq did not provide an exact commissioned execution profile';
   }
-  if (run.executionProfile) {
+  if (run.executionProfile && !missionLease) {
     return 'execution-profile assignment refused: legacy Run supervision cannot honor the exact commissioned mission environment';
   }
   return null;

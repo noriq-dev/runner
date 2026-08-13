@@ -1,9 +1,20 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { ExecutionSpec, ProjectManifest, Run, RunnerConfig } from '@noriq-dev/shared';
-import type { ExecutedConfigurationEvidence } from '@noriq-dev/shared';
+import type {
+  CommissionedExecutionProfile,
+  ExecutedConfigurationEvidence,
+  ExecutionProfileOffer,
+  MissionHandoffPublication,
+  MissionRootCommission,
+  MissionTaskBeginReport,
+  MissionTaskSettleReport,
+} from '@noriq-dev/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContinuableStore } from '../src/continuable';
 import type { ContinuableRun } from '../src/continuable';
@@ -25,10 +36,16 @@ import type { DriverExit, DriverSession } from '../src/drivers/types';
 import type { IndexCoordinator } from '../src/index-coordinator';
 import type { IndexTriggerHub } from '../src/index-triggers';
 import { suggestedMemoryPaths } from '../src/memory-render';
+import { initialMissionState } from '../src/mission/model';
+import type { NoriqMissionRuntime } from '../src/mission/noriq-coordinator';
+import type { MissionUsage } from '../src/mission/protocol';
+import type { MissionCreateRequest } from '../src/mission/service';
 import { ParkedStore } from '../src/parked';
 import type { RunReport, RunSupervisorDeps } from '../src/supervisor';
 import type { WorkflowCatalog, WorkflowStore } from '../src/workflow-store';
 import type { WsFactory, WsSocket } from '../src/ws-client';
+
+const execFileP = promisify(execFile);
 
 // The daemon's report→frame gate. Untested until now, which is how the same bug shipped
 // twice: a frame carrying new facts under an UNCHANGED status gets silently dropped, and
@@ -113,6 +130,47 @@ describe('missionAssignmentRefusal', () => {
         null,
       ),
     ).toMatch(/legacy Run supervision/);
+  });
+
+  it('accepts the exact profile only when its lease and immutable mission commission are both present', () => {
+    const executionProfile = {
+      id: 'profile',
+      generation: 1,
+      declarationFingerprint: `sha256:${'a'.repeat(64)}`,
+      effectiveFingerprint: `sha256:${'b'.repeat(64)}`,
+      attestationCapable: true as const,
+    };
+    const snapshot = {
+      schemaVersion: 1 as const,
+      commissionId: 'commission_1',
+      runId: 'run_1',
+      sitting: 1,
+      taskId: 'task_1',
+      commissionedAt: '2026-08-13T12:00:00.000Z',
+      task: {
+        taskId: 'task_1',
+        key: 'RUN-1',
+        title: 'Task',
+        body: 'Do the task.',
+        priority: 1,
+        type: 'test',
+        estimate: null,
+        dueAt: null,
+        workflow: null,
+        executionSpec: null,
+      },
+    };
+    const commission: MissionRootCommission = {
+      digest: createHash('sha256').update(JSON.stringify(snapshot), 'utf8').digest('hex'),
+      snapshot,
+    };
+    expect(
+      missionAssignmentRefusal(
+        { executionProfile },
+        { sitting: 1, executionId: 'execution_1', epoch: 1 },
+        commission,
+      ),
+    ).toBeNull();
   });
 
   it('leaves an ordinary legacy assignment unchanged', () => {
@@ -872,6 +930,9 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       parkRecoveryTimeoutMs?: number;
       restoreError?: Error;
       socketSink?: FakeDaemonSocket[];
+      missionProfileRegistryFactory?: NonNullable<
+        ConstructorParameters<typeof Daemon>[2]
+      >['missionProfileRegistryFactory'];
     } = {},
   ) {
     const sockets: FakeDaemonSocket[] = over.socketSink ?? [];
@@ -916,6 +977,7 @@ describe('daemon.start(), driven end to end with fake seams', () => {
       indexStatusPath: path.join(tmp, 'index-status.json'),
       indexControlInfoPath: path.join(tmp, 'index-control.json'),
       missionPrivateRoot: path.join(tmp, 'mission-harness-v2'),
+      missionProfileRegistryFactory: over.missionProfileRegistryFactory,
       parkRecoveryTimeoutMs: over.parkRecoveryTimeoutMs,
       createSupervisor: (d) => {
         deps = d;
@@ -1090,6 +1152,464 @@ describe('daemon.start(), driven end to end with fake seams', () => {
     });
     await vi.waitFor(() => expect(cancelAll).toHaveBeenCalledOnce());
     expect(socket.sent.some((frame) => JSON.parse(frame).type === 'hello')).toBe(true);
+  });
+
+  it('drives a fresh Noriq plan commission through the daemon to an acknowledged Git handoff', async () => {
+    const repoDir = path.join(tmp, 'qualified-git-repo');
+    await mkdir(path.join(repoDir, '.noriq'), { recursive: true });
+    await writeFile(
+      path.join(repoDir, '.noriq', 'project.toml'),
+      'key = "RUN"\nrepositoryKey = "runner-qualification"\n',
+    );
+    await execFileP('git', ['init', '-b', 'main'], { cwd: repoDir });
+    await execFileP('git', ['config', 'user.name', 'Runner Qualification'], { cwd: repoDir });
+    await execFileP('git', ['config', 'user.email', 'runner-qualification@example.invalid'], {
+      cwd: repoDir,
+    });
+    await writeFile(path.join(repoDir, 'README.md'), '# qualification\n');
+    await execFileP('git', ['add', 'README.md'], { cwd: repoDir });
+    await execFileP('git', ['commit', '-m', 'qualification base'], { cwd: repoDir });
+    const { stdout: baseOutput } = await execFileP('git', ['rev-parse', 'HEAD'], { cwd: repoDir });
+    const baseRevision = baseOutput.trim();
+    const preservedReference = 'refs/heads/noriq/accepted/qualification';
+    await execFileP('git', ['update-ref', preservedReference, baseRevision], { cwd: repoDir });
+
+    const catalogFingerprint = 'c'.repeat(64);
+    const executionProfile: CommissionedExecutionProfile = {
+      id: 'git-qualified',
+      declarationFingerprint: `sha256:${'a'.repeat(64)}`,
+      effectiveFingerprint: `sha256:${'b'.repeat(64)}`,
+      generation: 1,
+      attestationCapable: true,
+    };
+    const offer: ExecutionProfileOffer = {
+      ...executionProfile,
+      resolution: 'resolved',
+      health: 'healthy',
+      observedAt: '2026-08-13T12:00:00.000Z',
+      capacity: { maxConcurrency: 1, freeSlots: 1 },
+    };
+    const missionBudget = { tokens: 1_000, usd: null, activeSeconds: 120 } as const;
+    const requests = new Map<string, MissionCreateRequest>();
+    const release = vi.fn();
+    const runtime: NoriqMissionRuntime = {
+      catalog: { fingerprint: catalogFingerprint } as never,
+      resources: {},
+      create: vi.fn(async (request: MissionCreateRequest) => {
+        const replayed = requests.has(request.missionId);
+        requests.set(request.missionId, request);
+        const state = initialMissionState(request.missionId);
+        return {
+          accepted: true as const,
+          replayed,
+          receipt: {
+            missionId: request.missionId,
+            actionId: `create:${request.missionId}`,
+            actionFingerprint: 'd'.repeat(64),
+            previousRevision: 0,
+            revision: 1,
+            eventCount: 1,
+          },
+          state: {
+            ...state,
+            status: 'active' as const,
+            objective: request.objective ? { ...request.objective } : null,
+            budget: { ...request.budget },
+            resources: { ...request.resources },
+            completion: request.completion ? { ...request.completion } : state.completion,
+          },
+        };
+      }),
+      inspect: vi.fn(),
+      control: vi.fn(async (missionId: string) => {
+        const request = requests.get(missionId);
+        if (!request?.objective) throw new Error('control reached the runtime before durable creation');
+        const state = initialMissionState(missionId);
+        const question = {
+          questionId: 'question_git_qualification',
+          prompt: 'May the deterministic qualification continue?',
+          answer: null,
+          status: 'pending' as const,
+        };
+        return {
+          reason: 'human-question' as const,
+          guideTurns: 1,
+          question,
+          state: {
+            ...state,
+            status: 'active' as const,
+            objective: { ...request.objective },
+            budget: { ...request.budget },
+            resources: { ...request.resources },
+            completion: request.completion ? { ...request.completion } : state.completion,
+            usage: { tokens: 5, usd: null, activeSeconds: 1 },
+            questions: { [question.questionId]: question },
+            questionOrder: [question.questionId],
+          },
+        };
+      }),
+      answerAndContinue: vi.fn(async (missionId: string, questionId: string, answer: string) => {
+        const request = requests.get(missionId);
+        if (!request?.objective?.repositoryKey) throw new Error('qualification objective lost repositoryKey');
+        if (questionId !== 'question_git_qualification' || answer !== 'Continue safely.') {
+          throw new Error('qualification runtime received a cross-wired human answer');
+        }
+        const state = initialMissionState(missionId);
+        const usage: MissionUsage = { tokens: 25, usd: null, activeSeconds: 2 };
+        return {
+          reason: 'terminal' as const,
+          guideTurns: 2,
+          state: {
+            ...state,
+            status: 'succeeded' as const,
+            objective: { ...request.objective },
+            budget: { ...request.budget },
+            resources: { ...request.resources },
+            completion: request.completion ? { ...request.completion } : state.completion,
+            usage,
+            terminal: {
+              outcome: 'succeeded' as const,
+              reason: 'deterministic Git qualification completed',
+              checkpointId: `checkpoint-${missionId}`,
+            },
+            acceptedRevisionHandoff: {
+              backend: 'git',
+              repositoryKey: request.objective.repositoryKey,
+              checkpointId: `checkpoint-${missionId}`,
+              revisionId: baseRevision,
+              reference: preservedReference,
+              status: 'preserved' as const,
+            },
+          },
+        };
+      }),
+      cancel: vi.fn(async () => {
+        throw new Error('qualification mission was unexpectedly cancelled');
+      }),
+      quiesce: vi.fn(async () => {}),
+      quiesceMission: vi.fn(async () => {}),
+      resumeMission: vi.fn(),
+    };
+    const declaration = {
+      schemaVersion: 1 as const,
+      id: executionProfile.id,
+      generation: executionProfile.generation,
+      maxConcurrency: 1,
+      missionBudget,
+      externalResourceCapacities: {},
+      catalog: {},
+    };
+    const matched = {
+      declaration,
+      declarationFingerprint: executionProfile.declarationFingerprint,
+      effectiveFingerprint: executionProfile.effectiveFingerprint,
+      runtime,
+    };
+    const registry = {
+      refresh: vi.fn(async () => [offer]),
+      offers: vi.fn(() => [offer]),
+      match: vi.fn((profile: CommissionedExecutionProfile) =>
+        JSON.stringify(profile) === JSON.stringify(executionProfile) ? matched : null,
+      ),
+      acquireSnapshot: vi.fn(async (profile: CommissionedExecutionProfile) =>
+        JSON.stringify(profile) === JSON.stringify(executionProfile) ? { ...matched, release } : null,
+      ),
+    };
+    const workflows = {
+      current: async () => ({
+        definitions: {
+          mission: {
+            base: 'build',
+            prompt: 'Run the commissioned mission.',
+            promptSource: path.join(repoDir, '.noriq', 'workflows', 'mission.toml'),
+            stages: null,
+            description: 'Agent-led mission qualification',
+            capabilities: ['mission.v2'],
+            source: path.join(repoDir, '.noriq', 'workflows', 'mission.toml'),
+            tier: 'project-file',
+          },
+        },
+      }),
+    } as unknown as WorkflowStore;
+    const h = await harness({
+      scanRoots: [repoDir],
+      workflows,
+      missionProfileRegistryFactory: (() => registry) as never,
+    });
+    const socket = h.sockets[0]!;
+    socket.emit('open');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'registered',
+        runnerId: h.handle.runnerId,
+        protocol: 1,
+        serverTime: '2026-08-13T12:00:00.000Z',
+        acceptedCapabilities: ['orchestration.v1', 'mission.v2', 'mission.handoff.v1'],
+      }),
+    );
+
+    const runId = 'run_git_qualification';
+    const lease = { sitting: 1, executionId: 'execution_git_qualification', epoch: 1 };
+    const snapshot = {
+      schemaVersion: 1 as const,
+      commissionId: 'commission_git_qualification',
+      runId,
+      sitting: lease.sitting,
+      planId: 'plan_git_qualification',
+      planTitle: 'Git mission qualification',
+      planBody: 'Prove the daemon commission path against a disposable Git repository.',
+      planRevision: 'plan-revision-1',
+      commissionedAt: '2026-08-13T12:00:00.000Z',
+      tasks: [
+        {
+          taskId: 'task_git_qualification',
+          key: 'RUN-QUAL-1',
+          title: 'Qualify Git mission dispatch',
+          body: 'Complete the deterministic qualification mission.',
+          phaseId: 'phase_1',
+          phaseTitle: 'Build',
+          phaseOrder: 0,
+          taskOrder: 0,
+          priority: 1,
+          type: 'test',
+          estimate: 1,
+          dueAt: null,
+          workflow: 'mission',
+          executionSpec: null,
+        },
+      ],
+      dependencies: [],
+    };
+    const missionCommission: MissionRootCommission = {
+      digest: createHash('sha256').update(JSON.stringify(snapshot), 'utf8').digest('hex'),
+      snapshot,
+    };
+    const run = Run.parse({
+      id: runId,
+      projectId: 'project_git_qualification',
+      runnerId: h.handle.runnerId,
+      agentId: null,
+      execution: null,
+      kind: 'build',
+      anchor: { type: 'plan', planId: snapshot.planId },
+      verifiesRunId: null,
+      planKey: 'RUN-QUAL',
+      targetBranch: null,
+      brief: '',
+      repoRef: repoId(repoDir),
+      agentTool: 'claude',
+      agent: null,
+      workflow: 'mission',
+      executionProfile,
+      missionMode: null,
+      model: null,
+      effort: null,
+      budget: { maxTokens: 500, maxUsd: null, maxDurationSeconds: 60, maxRounds: null },
+      status: 'dispatched',
+      phase: null,
+      exit: null,
+      worktreePath: null,
+      tokensUsed: 0,
+      usdSpent: 0,
+      modelUsage: null,
+      createdBy: 'user_qualification',
+      createdAt: '2026-08-13T12:00:00.000Z',
+      updatedAt: '2026-08-13T12:00:00.000Z',
+      dispatchedAt: '2026-08-13T12:00:00.000Z',
+      startedAt: null,
+    });
+    socket.emit(
+      'message',
+      JSON.stringify({ type: 'run.assigned', run, missionLease: lease, missionCommission }),
+    );
+
+    const nextSent = async <T extends Record<string, unknown>>(type: string): Promise<T> => {
+      let found: T | undefined;
+      await vi.waitFor(() => {
+        found = socket.sent.map((frame) => JSON.parse(frame) as T).find((frame) => frame.type === type);
+        expect(found, `missing ${type}; sent frames: ${socket.sent.join(' | ')}`).toBeDefined();
+      });
+      return found!;
+    };
+    const begin = await nextSent<{
+      type: string;
+      runId: string;
+      lease: typeof lease;
+      begin: MissionTaskBeginReport;
+    }>('mission.task.begin');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.task.ack',
+        ack: {
+          reportId: begin.begin.reportId,
+          attemptId: begin.begin.attemptId,
+          phase: 'begin',
+          accepted: true,
+          taskId: begin.begin.taskId,
+          claimId: 'claim_git_qualification',
+          executionId: 'task_execution_git_qualification',
+          taskStatus: 'in_progress',
+          error: null,
+        },
+      }),
+    );
+    const question = await nextSent<{
+      type: string;
+      runId: string;
+      lease: typeof lease;
+      question: {
+        reportId: string;
+        questionId: string;
+        attemptId: string;
+        prompt: string;
+        observedAt: string;
+      };
+    }>('mission.question.publish');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.question.ack',
+        runId,
+        lease,
+        ack: {
+          reportId: question.question.reportId,
+          questionId: question.question.questionId,
+          attemptId: question.question.attemptId,
+          accepted: true,
+          state: 'open',
+          signalId: 'signal_git_qualification',
+          error: null,
+        },
+      }),
+    );
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.question.answer',
+        answer: {
+          answerId: 'answer_git_qualification',
+          runId,
+          questionId: question.question.questionId,
+          attemptId: question.question.attemptId,
+          lease,
+          answer: 'Continue safely.',
+          answeredAt: '2026-08-13T12:00:03.000Z',
+        },
+      }),
+    );
+    const settle = await nextSent<{
+      type: string;
+      runId: string;
+      lease: typeof lease;
+      settle: MissionTaskSettleReport;
+    }>('mission.task.settle');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.task.ack',
+        ack: {
+          reportId: settle.settle.reportId,
+          attemptId: settle.settle.attemptId,
+          phase: 'settle',
+          accepted: true,
+          taskId: snapshot.tasks[0]!.taskId,
+          claimId: settle.settle.claimId,
+          executionId: 'task_execution_git_qualification',
+          taskStatus: 'review',
+          error: null,
+        },
+      }),
+    );
+    const handoff = await nextSent<{
+      type: string;
+      runId: string;
+      lease: typeof lease;
+      publication: MissionHandoffPublication;
+    }>('mission.handoff.publish');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.handoff.ack',
+        ack: {
+          reportId: handoff.publication.reportId,
+          accepted: true,
+          handoffId: handoff.publication.handoff.handoffId,
+          state: 'preserved_unlanded',
+          preservedAt: '2026-08-13T12:00:05.000Z',
+          consumedAt: null,
+          consumptionId: null,
+          error: null,
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+    socket.emit(
+      'message',
+      JSON.stringify({ type: 'run.assigned', run, missionLease: lease, missionCommission }),
+    );
+    let replayedHandoff: {
+      type: string;
+      publication: MissionHandoffPublication;
+    } | null = null;
+    await vi.waitFor(() => {
+      const handoffs = socket.sent
+        .map((frame) => JSON.parse(frame) as { type: string; publication?: MissionHandoffPublication })
+        .filter((frame) => frame.type === 'mission.handoff.publish');
+      expect(handoffs).toHaveLength(2);
+      replayedHandoff = handoffs[1] as {
+        type: string;
+        publication: MissionHandoffPublication;
+      };
+    });
+    expect(replayedHandoff!.publication).toEqual(handoff.publication);
+    socket.emit(
+      'message',
+      JSON.stringify({
+        type: 'mission.handoff.ack',
+        ack: {
+          reportId: replayedHandoff!.publication.reportId,
+          accepted: true,
+          handoffId: replayedHandoff!.publication.handoff.handoffId,
+          state: 'preserved_unlanded',
+          preservedAt: '2026-08-13T12:00:05.000Z',
+          consumedAt: null,
+          consumptionId: null,
+          error: null,
+        },
+      }),
+    );
+    expect(runtime.create).toHaveBeenCalledOnce();
+    expect(runtime.control).toHaveBeenCalledOnce();
+    expect(runtime.answerAndContinue).toHaveBeenCalledOnce();
+    expect(h.supervised).toEqual([]);
+    expect(begin.runId).toBe(runId);
+    expect(begin.lease).toEqual(lease);
+    expect(settle.runId).toBe(runId);
+    expect(settle.settle.outcome).toBe('done');
+    expect(handoff.publication.handoff).toMatchObject({
+      backend: 'git',
+      repositoryKey: 'runner-qualification',
+      revision: baseRevision,
+      reference: preservedReference,
+    });
+    const { stdout: preserved } = await execFileP('git', ['rev-parse', preservedReference], {
+      cwd: repoDir,
+    });
+    expect(preserved.trim()).toBe(baseRevision);
+    expect(h.bodies[0]).toMatchObject({
+      repos: [
+        expect.objectContaining({
+          repositoryKey: 'runner-qualification',
+          executionProfiles: [offer],
+          workflows: expect.arrayContaining([
+            expect.objectContaining({ name: 'mission', capabilities: ['mission.v2'] }),
+          ]),
+        }),
+      ],
+    });
   });
 
   it('opens the control socket before classifying a terminal recovered park, but keeps assignment admission buffered', async () => {
