@@ -1,13 +1,13 @@
 # Noriq Runner
 
-Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, and restart recovery. It never pushes, merges into a human base, opens a review, or interprets project MCP configuration.
+Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, and restart recovery. It never pushes, merges into a human base, opens a review, or interprets project MCP commands and tool schemas.
 
 ## Runtime boundary
 
 - Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, and the final retained location.
 - Committed `project.toml` selects registered driver and backend IDs, models, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
 - Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, isolated vendor homes, credentials, scan roots, and machine capacity.
-- Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP schemas.
+- Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP commands or tool schemas. For Claude builders and repairers, it reads the project `.mcp.json` server names only so the CLI can grant those project tools noninteractively.
 
 ## Start
 

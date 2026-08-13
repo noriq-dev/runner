@@ -71,6 +71,12 @@ async function liveCandidate(
       taskKey: "LIVE-1",
     });
     expect(accepted.ref).toBeTruthy();
+    if (backend.kind === "diversion") {
+      expect(accepted.ref).not.toBe(expectedBaseRevision);
+      const inspection = await backend.inspect(workspace);
+      expect(inspection.revision).toBe(accepted.ref);
+      expect(inspection.dirtyPaths).toEqual([]);
+    }
     await backend.releaseTask(workspace, task);
   } finally {
     await backend.release(workspace, jobId);
@@ -90,7 +96,7 @@ describe.runIf(
       repository,
       process.env.RUNNER_LIVE_DIVERSION_BASE!,
     );
-  });
+  }, 120_000);
 });
 
 describe.runIf(
@@ -105,5 +111,5 @@ describe.runIf(
       repository,
       process.env.RUNNER_LIVE_PERFORCE_BASE!,
     );
-  });
+  }, 120_000);
 });

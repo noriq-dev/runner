@@ -489,4 +489,105 @@ describe("RunnerJobSupervisor", () => {
     ).toBe("1");
     expect(await readdir(join(stateDirectory, "locks"))).toEqual([]);
   });
+
+  it("preserves failed direct-mode edits without advancing the target branch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-direct-failure-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const fake = new FakeAgentDriver(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "guide")
+          return {
+            summary: "planned",
+            structured: {
+              objective: "write direct evidence before failure",
+              constraints: [],
+              scope: ["direct-failed.txt"],
+              acceptanceCriteria: ["retain failed direct evidence"],
+              verification: [],
+              plan: "write then fail",
+            },
+          };
+        if (request.role === "builder") {
+          await writeFile(
+            join(request.workspace, "direct-failed.txt"),
+            "evidence\n",
+          );
+          throw new Error("driver crashed after direct edit");
+        }
+        return { summary: "unused" };
+      },
+    );
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      workspace: { mode: "direct", baseBranch: "main", directBranch: "main" },
+      harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
+      agents: {
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: [], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-direct-fail",
+      assignmentId: "assignment-direct-fail",
+      snapshotDigest: "f".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "direct-failed-task",
+          key: "RUN-22",
+          title: "Fail after direct write",
+          body: "",
+          executionSpec: null,
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const stateDirectory = join(root, "state");
+    const output = await new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory,
+      projectConfig: config,
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
+      sink: new MemoryEventSink(),
+    }).run();
+    expect(output.summary).toContain("failed");
+    expect(output.dirtyPaths).toEqual([]);
+    expect(output.retainedLocation.label).toMatch(/^noriq\/recovery\//);
+    expect(await command(repository, "git", ["rev-parse", "HEAD"])).toBe(base);
+    expect(
+      await command(repository, "git", [
+        "show",
+        `${output.retainedLocation.label}:direct-failed.txt`,
+      ]),
+    ).toBe("evidence");
+    expect(await readdir(join(stateDirectory, "locks"))).toEqual([]);
+  });
 });

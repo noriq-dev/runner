@@ -9,6 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { runCommands } from "../git.js";
 import { runProcess } from "../process.js";
 import {
@@ -113,18 +114,51 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     return (await this.dv(path, ["status", "--commit-id-only"])).stdout.trim();
   }
 
+  private async waitForMutationRevision(
+    path: string,
+    result: { stdout: string; stderr: string },
+  ): Promise<string> {
+    const reported = `${result.stdout}\n${result.stderr}`.match(
+      /(?:New commit ID:|Commit ID:)\s*([^\s]+)/i,
+    )?.[1];
+    const expected =
+      reported ??
+      (await this.referenceRevision(path, await this.currentReference(path)));
+    const deadline = Date.now() + 30_000;
+    let actual = "<unavailable>";
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        actual = await this.currentRevision(path);
+        if (actual === expected) return expected;
+        lastError = undefined;
+      } catch (error) {
+        lastError = error;
+      }
+      await delay(100);
+    }
+    const suffix = lastError instanceof Error ? `: ${lastError.message}` : "";
+    throw new Error(
+      `Diversion workspace did not sync to ${expected}; still at ${actual}${suffix}`,
+    );
+  }
+
   private async referenceRevision(
     path: string,
     reference: string,
   ): Promise<string> {
-    const result = await this.dv(path, ["branch", reference], true);
+    const result = await this.dv(
+      path,
+      ["show", reference, "--color", "never"],
+      true,
+    );
     if (result.exitCode !== 0)
       throw new Error(`Diversion reference ${reference} does not exist`);
     const revision = `${result.stdout}\n${result.stderr}`.match(
-      /^\s*commit\s+([^\s]+)$/m,
+      /^\s*commit\s+([^\s]+)/m,
     )?.[1];
     if (!revision)
-      throw new Error(`dv branch ${reference} did not report a revision`);
+      throw new Error(`dv show ${reference} did not report a revision`);
     return revision;
   }
 
@@ -141,6 +175,16 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       .split("\n")
       .map((line) => line.split("\t").slice(1).join("\t").trim())
       .filter(Boolean);
+  }
+
+  private async settledDirtyPaths(path: string): Promise<string[]> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await this.dv(path, ["status", "--nowait"], true);
+      const paths = await this.dirtyPaths(path);
+      if (paths.length > 0 || attempt === 4) return paths;
+      await delay(100);
+    }
+    return [];
   }
 
   private async requireClean(path: string): Promise<void> {
@@ -235,13 +279,11 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         );
         const existing = await this.dv(
           repository,
-          ["branch", outputReference],
+          ["show", outputReference, "--color", "never"],
           true,
         );
         if (existing.exitCode === 0) {
-          const revision = existing.stdout.match(
-            /^\s*commit\s+([^\s]+)$/m,
-          )?.[1];
+          const revision = existing.stdout.match(/^\s*commit\s+([^\s]+)/m)?.[1];
           if (revision !== base)
             throw new Error(
               `existing Diversion output ${outputReference} is not pinned to ${base}`,
@@ -255,6 +297,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
               options.config.sourceControl.base,
             ]);
           await this.dv(repository, ["branch", "-c", outputReference]);
+          await this.dv(repository, ["status"]);
         }
       }
       return {
@@ -344,17 +387,20 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     const candidateReference = `${outputReference}/candidate-${safeName(taskKey)}`;
     const existing = await this.dv(
       workspace.path,
-      ["branch", candidateReference],
+      ["show", candidateReference, "--color", "never"],
       true,
     );
     if (existing.exitCode === 0) {
-      const revision = existing.stdout.match(/^\s*commit\s+([^\s]+)$/m)?.[1];
+      const revision = existing.stdout.match(/^\s*commit\s+([^\s]+)/m)?.[1];
       if (revision !== baseRevision)
         throw new Error(
           `existing Diversion candidate ${candidateReference} is not pinned to ${baseRevision}`,
         );
       await this.dv(workspace.path, ["checkout", candidateReference]);
-    } else await this.dv(workspace.path, ["branch", "-c", candidateReference]);
+    } else {
+      await this.dv(workspace.path, ["branch", "-c", candidateReference]);
+      await this.dv(workspace.path, ["status"]);
+    }
     return {
       handle: {
         backend: this.id,
@@ -370,7 +416,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     options: Parameters<SourceControlBackend["stageCandidate"]>[0],
   ) {
     assertBackendHandle(options.task.handle, this.id, "task workspace");
-    const changedPaths = await this.dirtyPaths(options.task.path);
+    const changedPaths = await this.settledDirtyPaths(options.task.path);
     if (options.workspace.mode === "direct")
       return {
         status: "ready" as const,
@@ -381,14 +427,17 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         changedPaths,
         backendState: options.task.handle,
       };
-    if (changedPaths.length > 0)
-      await this.dv(options.task.path, [
+    let ref: string;
+    if (changedPaths.length > 0) {
+      const result = await this.dv(options.task.path, [
         "commit",
         "-a",
+        "--no-verify",
         "-m",
         `${options.taskKey}: ${options.summary.slice(0, 200)}`,
       ]);
-    const ref = await this.currentRevision(options.task.path);
+      ref = await this.waitForMutationRevision(options.task.path, result);
+    } else ref = await this.currentRevision(options.task.path);
     return {
       status: "ready" as const,
       checkpoint: checkpoint(ref),
@@ -412,9 +461,10 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         detail: `${result.stdout}\n${result.stderr}`.trim(),
         backendState: task.handle,
       };
+    const revision = await this.waitForMutationRevision(task.path, result);
     return {
       status: "ready" as const,
-      checkpoint: checkpoint(await this.currentRevision(task.path)),
+      checkpoint: checkpoint(revision),
       changedPaths: await this.dirtyPaths(task.path),
       backendState: task.handle,
     };
@@ -456,30 +506,38 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         throw new Error(
           `direct target drifted from ${options.workspace.currentRevision} to ${actual}`,
         );
-      const paths = await this.dirtyPaths(options.task.path);
-      if (paths.length > 0)
-        await this.dv(options.task.path, [
+      const paths = await this.settledDirtyPaths(options.task.path);
+      let revision = actual;
+      if (paths.length > 0) {
+        const result = await this.dv(options.task.path, [
           "commit",
           "-a",
+          "--no-verify",
           "-m",
           `${options.taskKey}: accepted [noriq job ${stringState(options.workspace.handle, "jobId")}]`,
         ]);
-      const revision = await this.currentRevision(options.task.path);
+        revision = await this.waitForMutationRevision(
+          options.task.path,
+          result,
+        );
+      }
       options.workspace.currentRevision = revision;
       return checkpoint(revision);
     }
-    const candidateReference = stringState(
-      options.task.handle,
-      "candidateReference",
-    );
     await this.dv(options.workspace.path, ["checkout", outputReference]);
     const outputRevision = await this.currentRevision(options.workspace.path);
     if (outputRevision !== options.workspace.currentRevision)
       throw new Error(
         `Diversion output drifted from ${options.workspace.currentRevision} to ${outputRevision}`,
       );
-    await this.dv(options.workspace.path, ["merge", candidateReference]);
-    const revision = await this.currentRevision(options.workspace.path);
+    const result = await this.dv(options.workspace.path, [
+      "merge",
+      options.candidate.ref,
+    ]);
+    const revision = await this.waitForMutationRevision(
+      options.workspace.path,
+      result,
+    );
     options.workspace.currentRevision = revision;
     return checkpoint(revision);
   }
@@ -488,7 +546,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     options: Parameters<SourceControlBackend["preserveFailedWork"]>[0],
   ) {
     assertBackendHandle(options.task.handle, this.id, "task workspace");
-    const dirty = await this.dirtyPaths(options.task.path);
+    const dirty = await this.settledDirtyPaths(options.task.path);
     const current = await this.currentRevision(options.task.path);
     if (dirty.length === 0 && current === options.task.baseRevision)
       return null;
@@ -515,13 +573,16 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       options.task.handle.state.preserved = true;
       return { vcs: this.kind, label: recovery, url: null };
     }
-    if (dirty.length > 0)
-      await this.dv(options.task.path, [
+    if (dirty.length > 0) {
+      const result = await this.dv(options.task.path, [
         "commit",
         "-a",
+        "--no-verify",
         "-m",
         `WIP ${options.taskKey}: ${options.reason.slice(0, 160)}`,
       ]);
+      await this.waitForMutationRevision(options.task.path, result);
+    }
     options.task.handle.state.preserved = true;
     const candidateReference = stringState(
       options.task.handle,
@@ -572,6 +633,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       "branch",
       "-d",
       stringState(task.handle, "candidateReference"),
+      "-f",
     ]);
   }
 

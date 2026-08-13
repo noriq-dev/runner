@@ -36,12 +36,21 @@ function diversionFake() {
   let current = "main";
   let dirty = false;
   let sequence = 100;
+  let staleRevision: { reference: string; revision: string } | undefined;
   const shelves: string[] = [];
+  const calls: string[] = [];
   const cli = async (_cwd: string, args: string[]) => {
+    calls.push(args.join(" "));
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
     if (args[0] === "branch-name") return ok(`${current}\n`);
-    if (args[0] === "status" && args[1] === "--commit-id-only")
+    if (args[0] === "status" && args[1] === "--commit-id-only") {
+      if (staleRevision?.reference === current) {
+        const revision = staleRevision.revision;
+        staleRevision = undefined;
+        return ok(`${revision}\n`);
+      }
       return ok(`${revisions.get(current)}\n`);
+    }
     if (args[0] === "branch" && args[1] === "-c") {
       revisions.set(args[2]!, revisions.get(current)!);
       current = args[2]!;
@@ -51,10 +60,10 @@ function diversionFake() {
       revisions.delete(args[2]!);
       return ok();
     }
-    if (args[0] === "branch") {
+    if (args[0] === "show") {
       const revision = revisions.get(args[1]!);
       return revision
-        ? ok(`branch ${args[1]}\n  commit ${revision}\n`)
+        ? ok(`commit ${revision}\n`)
         : { exitCode: 1, stdout: "", stderr: "not found" };
     }
     if (args[0] === "checkout") {
@@ -65,15 +74,17 @@ function diversionFake() {
       return ok(dirty ? "M\tfeature.txt\n" : "");
     if (args[0] === "diff") return ok("diff -- feature.txt\n");
     if (args[0] === "commit") {
+      staleRevision = { reference: current, revision: revisions.get(current)! };
       sequence += 1;
       revisions.set(current, `dv-${sequence}`);
       dirty = false;
-      return ok();
+      return ok(`New commit ID: dv-${sequence}\n`);
     }
     if (args[0] === "merge" && args[1] !== "--abort") {
+      staleRevision = { reference: current, revision: revisions.get(current)! };
       sequence += 1;
       revisions.set(current, `dv-${sequence}`);
-      return ok();
+      return ok(`Commit ID: dv-${sequence}\n`);
     }
     if (args[0] === "shelf" && args[1] === "create") {
       shelves.push(args[2]!);
@@ -85,6 +96,7 @@ function diversionFake() {
   };
   return {
     cli,
+    calls,
     revisions,
     shelves,
     edit: () => {
@@ -217,6 +229,8 @@ describe("source-control backend contract", () => {
       refresh: false,
     });
     expect(staged.status).toBe("ready");
+    expect(staged.status === "ready" && staged.checkpoint.ref).toBe("dv-101");
+    expect(fake.calls).toContain("commit -a --no-verify -m RUN-1: candidate");
     expect(fake.revisions.get(outputReference)).toBe("dv-100");
     if (staged.status !== "ready") throw new Error("candidate not ready");
     const accepted = await backend.acceptCandidate({
@@ -226,11 +240,15 @@ describe("source-control backend contract", () => {
       taskKey: "RUN-1",
     });
     expect(accepted.ref).not.toBe("dv-100");
+    expect(accepted.ref).toBe("dv-102");
     expect(backend.capabilities.parallelTaskWorkspaces).toBe(false);
     const foreign = structuredClone(task);
     foreign.handle.backend = "git";
     await expect(backend.inspectTask(foreign)).rejects.toThrow(/refuses/);
     await backend.releaseTask(workspace, task);
+    expect(fake.calls).toContain(
+      `branch -d ${outputReference}/candidate-run-1 -f`,
+    );
     await backend.release(workspace, "job");
   });
 

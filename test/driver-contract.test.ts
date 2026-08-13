@@ -1,4 +1,5 @@
 import {
+  access,
   chmod,
   mkdir,
   mkdtemp,
@@ -89,6 +90,7 @@ if (args.includes('--version')) { console.log('fake-claude 1.0'); process.exit(0
 if (args.includes('--help')) { console.log('--output-format --json-schema --strict-mcp-config --no-session-persistence --system-prompt'); process.exit(0); }
 if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
 if (process.env.REQUIRE_PROJECT_MCP === '1' && !existsSync(join(process.cwd(), '.mcp.json'))) process.exit(9);
+if (process.env.REQUIRE_PROJECT_ALLOWED === '1' && !args.includes('mcp__project_echo')) process.exit(10);
 const tools = ['ask_human', 'delegate', 'get_job_state', 'inspect_diff', 'record_task_plan', 'request_completion', 'run_checks'].map((tool) => 'mcp__noriq_runner__' + tool);
 console.log(JSON.stringify({ type: 'system', subtype: 'init', tools: process.env.OMIT_CONTROL === '1' ? [] : tools, mcp_servers: [{ name: 'noriq_runner', status: process.env.OMIT_CONTROL === '1' ? 'failed' : 'connected' }] }));
 console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'built', findings: [] }, usage: { input_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 5, output_tokens: 3 } }));
@@ -207,7 +209,7 @@ describe("built-in driver contract", () => {
     ).rejects.toThrow();
   });
 
-  it("leaves a project-native MCP visible and usable to both vendor processes", async () => {
+  it("leaves project-native MCP configuration usable by both vendor builders", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-project-mcp-"));
     await mkdir(join(root, ".codex"));
     await writeFile(
@@ -242,7 +244,10 @@ describe("built-in driver contract", () => {
           command: await fakeClaude(root),
           args: [],
           home: claudeHome,
-          env: { REQUIRE_PROJECT_MCP: "1" },
+          env: {
+            REQUIRE_PROJECT_MCP: "1",
+            REQUIRE_PROJECT_ALLOWED: "1",
+          },
         },
         state,
       ),
@@ -262,11 +267,11 @@ describe("built-in driver contract", () => {
       );
       const result = await adapter.invoke({
         invocationId: `project-mcp-${adapter.name}`,
-        role: "guide",
+        role: "builder",
         taskId: "task",
         taskKey: "RUN-3",
         workspace: root,
-        access: "read-only",
+        access: "workspace-write",
         prompt: "use project echo",
         outputSchema: { type: "object" },
         projectConfig,
@@ -279,6 +284,26 @@ describe("built-in driver contract", () => {
           outputTokens: 3,
         });
     }
+    await expect(
+      access(join(root, ".claude", "settings.local.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(
+      join(root, ".mcp.json"),
+      JSON.stringify({ mcpServers: { "--settings": { command: "bad" } } }),
+    );
+    await expect(
+      adapters[1]!.invoke({
+        invocationId: "unsafe-project-mcp-name",
+        role: "builder",
+        taskId: "task",
+        taskKey: "RUN-3",
+        workspace: root,
+        access: "workspace-write",
+        prompt: "build",
+        outputSchema: { type: "object" },
+        projectConfig,
+      }),
+    ).rejects.toThrow(/unsafe server name/);
   });
 
   it("rejects a Claude guide result when the effective control MCP is unavailable", async () => {

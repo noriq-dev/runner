@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createEphemeralAgentHome,
@@ -80,6 +80,41 @@ function codexMcpInventory(text: string): Array<Record<string, unknown>> {
     (entry): entry is Record<string, unknown> =>
       entry !== null && typeof entry === "object" && !Array.isArray(entry),
   );
+}
+
+async function claudeProjectMcpConfiguration(
+  workspace: string,
+): Promise<{ path: string; allowedTools: string[] } | null> {
+  const path = join(workspace, ".mcp.json");
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const value = JSON.parse(raw) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Claude project .mcp.json must be a JSON object");
+  const servers = (value as Record<string, unknown>).mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers))
+    throw new Error("Claude project .mcp.json must contain mcpServers");
+  const names = Object.keys(servers);
+  if (names.length > 100)
+    throw new Error("Claude project .mcp.json exceeds 100 servers");
+  const unsafeName = names.find(
+    (name) => !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(name),
+  );
+  if (unsafeName)
+    throw new Error(
+      `Claude project .mcp.json contains an unsafe server name: ${unsafeName}`,
+    );
+  return {
+    path,
+    // Claude's CLI grants every tool on one server with mcp__<serverName>.
+    // Runner does not inspect the server commands or tool schemas.
+    allowedTools: names.map((name) => `mcp__${name}`),
+  };
 }
 
 function assertClaudeControlInventory(frames: Record<string, unknown>[]): void {
@@ -483,11 +518,14 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           "Bash,Edit,Glob,Grep,Read,Write",
           "--strict-mcp-config",
         );
-        const projectMcp = join(request.workspace, ".mcp.json");
-        try {
-          await access(projectMcp);
-          args.push("--mcp-config", projectMcp);
-        } catch {}
+        const projectMcp = await claudeProjectMcpConfiguration(
+          request.workspace,
+        );
+        if (projectMcp) {
+          args.push("--mcp-config", projectMcp.path);
+          if (projectMcp.allowedTools.length > 0)
+            args.push("--allowedTools", ...projectMcp.allowedTools);
+        }
       }
       if (request.access === "read-only")
         args.push(
@@ -503,11 +541,6 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           JSON.stringify({ enableAllProjectMcpServers: true }),
           "--allowedTools",
           `mcp__${runnerControlServer}`,
-        );
-      else if (request.role === "builder" || request.role === "repairer")
-        args.push(
-          "--settings",
-          JSON.stringify({ enableAllProjectMcpServers: true }),
         );
     }
     if (request.role === "guide") {
@@ -530,7 +563,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
           await initializeClaudeProjectState(
             attemptHome.path,
             request.workspace,
-            request.role !== "reviewer",
+            request.role === "guide",
           );
         if (
           this.adapter === "codex" &&
