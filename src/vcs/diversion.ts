@@ -16,6 +16,7 @@ import {
   assertBackendHandle,
   type BackendHandle,
   type JobWorkspace,
+  type LandingResult,
   type SourceControlBackend,
   type SourceControlCheckpoint,
   type TaskWorkspace,
@@ -540,6 +541,87 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     );
     options.workspace.currentRevision = revision;
     return checkpoint(revision);
+  }
+
+  async land(
+    options: Parameters<SourceControlBackend["land"]>[0],
+  ): Promise<LandingResult> {
+    assertBackendHandle(options.workspace.handle, this.id, "landing workspace");
+    if (options.workspace.mode === "direct")
+      return {
+        target: options.target,
+        checkpoint: checkpoint(
+          options.workspace.currentRevision,
+          options.target,
+        ),
+      };
+    const repository = await repositoryRoot(options.repository);
+    const sourceReference = stringState(
+      options.workspace.handle,
+      "outputReference",
+    );
+    const sourceRevision = await this.referenceRevision(
+      repository,
+      sourceReference,
+    );
+    if (sourceRevision !== options.workspace.currentRevision)
+      throw new Error(
+        `retained Diversion output ${sourceReference} drifted from ${options.workspace.currentRevision} to ${sourceRevision}`,
+      );
+    const targetRevision = await this.referenceRevision(
+      repository,
+      options.target,
+    );
+    if (targetRevision === sourceRevision)
+      return {
+        target: options.target,
+        checkpoint: checkpoint(sourceRevision, options.target),
+      };
+
+    const lockPath = await this.acquireLock(
+      repository,
+      options.stateDirectory,
+      options.jobId,
+    );
+    const originalReference = await this.currentReference(repository);
+    try {
+      await this.requireClean(repository);
+      if (originalReference !== options.target)
+        await this.dv(repository, ["checkout", options.target]);
+      const actualTarget = await this.currentRevision(repository);
+      if (actualTarget !== targetRevision)
+        throw new Error(
+          `Diversion target ${options.target} drifted from ${targetRevision} to ${actualTarget}`,
+        );
+      const merged = await this.dv(
+        repository,
+        ["merge", sourceReference],
+        true,
+      );
+      if (merged.exitCode !== 0) {
+        await this.dv(repository, ["merge", "--abort"], true);
+        throw new Error(
+          `Diversion could not merge retained output into ${options.target}: ${merged.stderr || merged.stdout}`,
+        );
+      }
+      const landedRevision = await this.waitForMutationRevision(
+        repository,
+        merged,
+      );
+      return {
+        target: options.target,
+        checkpoint: checkpoint(landedRevision, options.target),
+      };
+    } finally {
+      if ((await this.dirtyPaths(repository)).length === 0) {
+        if ((await this.currentReference(repository)) !== originalReference)
+          await this.dv(repository, ["checkout", originalReference]);
+      }
+      const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
+        jobId?: string;
+      };
+      if (owner.jobId === options.jobId) await unlink(lockPath);
+    }
   }
 
   async preserveFailedWork(

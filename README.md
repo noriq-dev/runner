@@ -1,10 +1,10 @@
 # Noriq Runner
 
-Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, and restart recovery. It never pushes, merges into a human base, opens a review, or interprets project MCP commands and tool schemas.
+Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, optional landing, and restart recovery. It never pushes, opens a pull request, or interprets project MCP commands and tool schemas.
 
 ## Runtime boundary
 
-- Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, and the final retained location.
+- Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, the retained location, and durable human landing intent/outcome.
 - Committed `project.toml` selects registered driver and backend IDs, models, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
 - Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, isolated vendor homes, credentials, scan roots, and machine capacity.
 - Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP commands or tool schemas. For Claude builders and repairers, it reads the project `.mcp.json` server names only so the CLI can grant those project tools noninteractively.
@@ -35,6 +35,8 @@ Runner core persists only backend-tagged JSON handles, filesystem workspaces, op
 - Diversion uses its existing checkout under an exclusive repository lease. Isolated tasks work on candidate branches and merge into the server-visible job output only after acceptance. Direct jobs pin the configured target. Failed work stays on a candidate branch or named shelf.
 - Perforce validates the client mapping and requires `allwrite`. Each task owns a numbered changelist. Isolated tasks refresh cumulative shelves; accepted work is reopened into the next task’s changelist while earlier shelves remain review checkpoints. Direct tasks submit only after acceptance. Failed work is shelved before the client is reverted.
 
+`sourceControl.landing` is `retain` by default. In isolated mode, `manual` keeps the reviewed output until a human chooses **Accept & land** in Noriq, while `auto` performs the same backend operation after every fully succeeded job. Both require an explicit `sourceControl.target`. Landing is journaled and idempotent across disconnects: Git fast-forwards the configured local branch, Diversion merges the retained branch, and Perforce submits the final cumulative shelf. A conflict leaves the output retained and reports a retryable failure. Direct mode is already landed as each task is accepted, so its landing policy remains `retain`.
+
 Git isolated task workspaces may build concurrently. Diversion, Perforce, and every direct job advertise a pool of one, so the supervisor clamps task execution to sequential operation. Repository lease files are scoped by backend registration plus repository identity and include crash-recovery ownership.
 
 ## Agent-driver contract
@@ -53,7 +55,7 @@ The checksummed journal under `runner.stateDirectory/jobs/<job>/events.jsonl` is
 
 ## Deliberate limits
 
-- No legacy Run/mission protocol, server-side plan pump, execution profiles, landing, pushing, review creation, indexing, or Project Memory ingestion.
+- No legacy Run/mission protocol, server-side plan pump, execution profiles, pushing, review creation, indexing, or Project Memory ingestion.
 - Only blocker/major findings or deterministic check failures consume a repair round.
 - Token or cost caps fail preflight unless a driver can honestly enforce them. Measurement without hard enforcement is not presented as a ceiling.
 - Machine config accepts either a literal `token` or a `tokenEnv`, but the daemon does not yet refresh Noriq OAuth credentials. A long-lived production service still needs the rotating credential source before deployment.

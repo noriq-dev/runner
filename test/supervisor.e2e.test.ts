@@ -7,7 +7,10 @@ import { jobAssignmentSchema } from "../src/contracts.js";
 import { FakeAgentDriver } from "../src/drivers/fake.js";
 import { runProcess } from "../src/process.js";
 import {
+  acknowledgeDurableLanding,
+  landDurableJob,
   loadDurableJobState,
+  loadPendingLandingResults,
   MemoryEventSink,
   RunnerJobSupervisor,
 } from "../src/supervisor.js";
@@ -86,7 +89,13 @@ describe("RunnerJobSupervisor", () => {
       key: "RUN",
       repositoryKey: "repo",
       defaultBranch: "main",
-      workspace: { mode: "isolated", baseBranch: "main" },
+      sourceControl: {
+        backend: "git",
+        mode: "isolated",
+        base: "main",
+        target: "main",
+        landing: "manual",
+      },
       harness: { maxParallelTasks: 2, maxRepairRounds: 2, maxJobMinutes: 5 },
       agents: {
         guide: { driver: "fake", model: "guide", effort: "high" },
@@ -133,6 +142,11 @@ describe("RunnerJobSupervisor", () => {
     });
     const output = await supervisor.run();
     expect(output.summary).toContain("succeeded");
+    expect(output.landing).toMatchObject({
+      policy: "manual",
+      status: "retained",
+      target: "main",
+    });
     expect(output.retainedLocation.label).toMatch(/^noriq\/task\/run-1-/);
     expect(output.dirtyPaths).toEqual([]);
     expect(
@@ -156,6 +170,146 @@ describe("RunnerJobSupervisor", () => {
         `${base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("1");
+    const landing = await landDurableJob({
+      stateDirectory,
+      repository,
+      projectConfig: config,
+      backend: new GitWorkspaceBackend(),
+      jobId: assignment.jobId,
+      assignmentId: assignment.assignmentId,
+      requestId: "landing-e2e",
+      target: "main",
+    });
+    expect(landing).toMatchObject({
+      status: "landed",
+      target: "main",
+      checkpoint: { ref: output.headRevision, label: "main" },
+    });
+    expect(await readFile(join(repository, "feature.txt"), "utf8")).toBe(
+      "fixed\n",
+    );
+    expect(
+      await landDurableJob({
+        stateDirectory,
+        repository,
+        projectConfig: config,
+        backend: new GitWorkspaceBackend(),
+        jobId: assignment.jobId,
+        assignmentId: assignment.assignmentId,
+        requestId: "landing-e2e",
+        target: "main",
+      }),
+    ).toEqual(landing);
+    expect(await loadPendingLandingResults(stateDirectory)).toHaveLength(1);
+    await acknowledgeDurableLanding(
+      stateDirectory,
+      assignment.jobId,
+      "landing-e2e",
+    );
+    expect(await loadPendingLandingResults(stateDirectory)).toEqual([]);
+  });
+
+  it("automatically lands a fully accepted isolated job when the project opts in", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-auto-land-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      sourceControl: {
+        backend: "git",
+        mode: "isolated",
+        base: "main",
+        target: "main",
+        landing: "auto",
+      },
+      harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
+      agents: {
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: ["test -f auto.txt"], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-auto-land",
+      assignmentId: "assignment-auto-land",
+      snapshotDigest: "f".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "auto-task",
+          key: "RUN-2",
+          title: "Auto land",
+          body: "",
+          executionSpec: null,
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const fake = new FakeAgentDriver(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "guide")
+          return {
+            summary: "planned",
+            plan: "write auto output",
+            structured: {
+              objective: "write auto output",
+              constraints: [],
+              scope: ["auto.txt"],
+              acceptanceCriteria: ["auto.txt exists"],
+              verification: [],
+              plan: "write auto output",
+            },
+          };
+        if (request.role === "builder")
+          await writeFile(join(request.workspace, "auto.txt"), "landed\n");
+        return { summary: "accepted", findings: [] };
+      },
+    );
+    const output = await new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory: join(root, "state"),
+      projectConfig: config,
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
+      sink: new MemoryEventSink(),
+    }).run();
+    expect(output.landing).toMatchObject({
+      policy: "auto",
+      status: "landed",
+      target: "main",
+      checkpoint: { ref: output.headRevision, label: "main" },
+    });
+    expect(await readFile(join(repository, "auto.txt"), "utf8")).toBe(
+      "landed\n",
+    );
+    expect(await command(repository, "git", ["rev-parse", "main"])).toBe(
+      output.headRevision,
+    );
   });
 
   it("serializes plan integration and delegates an integration conflict to one repair round", async () => {

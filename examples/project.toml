@@ -6,9 +6,14 @@ defaultBranch = "main"
 backend = "auto"
 mode = "isolated"
 base = "main"
-# For direct mode:
+landing = "manual"
+target = "main"
+# retain (the default) leaves accepted output for a human-managed merge.
+# manual exposes Accept & land in Noriq; auto lands every succeeded job.
+# Direct mode commits accepted work to its target immediately, so landing stays retain:
 # mode = "direct"
 # target = "feature/my-branch"
+# landing = "retain"
 
 [harness]
 maxParallelTasks = 2

@@ -71,6 +71,20 @@ export interface WorkspaceInspection {
   retainedLocation: RetainedLocation;
 }
 
+export interface LandingRequest {
+  repository: string;
+  stateDirectory: string;
+  jobId: string;
+  workspace: JobWorkspace;
+  target: string;
+  acceptedTaskCheckpoints: Record<string, SourceControlCheckpoint>;
+}
+
+export interface LandingResult {
+  target: string;
+  checkpoint: SourceControlCheckpoint;
+}
+
 export class IntegrationConflict extends Error {
   constructor(
     message: string,
@@ -131,6 +145,7 @@ export interface SourceControlBackend {
     candidate: SourceControlCheckpoint;
     taskKey: string;
   }): Promise<SourceControlCheckpoint>;
+  land(options: LandingRequest): Promise<LandingResult>;
   preserveFailedWork(options: {
     workspace: JobWorkspace;
     task: TaskWorkspace;

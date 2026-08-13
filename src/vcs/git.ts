@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, readFile, unlink } from "node:fs/promises";
+import { access, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   abortRebase,
@@ -28,7 +28,9 @@ import {
 import {
   assertBackendHandle,
   type BackendHandle,
+  IntegrationConflict,
   type JobWorkspace,
+  type LandingResult,
   type SourceControlBackend,
   type SourceControlCheckpoint,
   type TaskWorkspace,
@@ -102,6 +104,42 @@ function toGit(workspace: JobWorkspace, backend: string): GitJobWorkspace {
 function taskState(task: TaskWorkspace, backend: string): { workRef: string } {
   assertBackendHandle(task.handle, backend, "task workspace");
   return { workRef: stringState(task.handle, "workRef") };
+}
+
+async function gitReferenceExists(
+  repository: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await executeGit(repository, [
+      "merge-base",
+      "--is-ancestor",
+      ancestor,
+      descendant,
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkedOutBranchPath(
+  repository: string,
+  branchRef: string,
+): Promise<string | null> {
+  const output = await executeGit(repository, [
+    "worktree",
+    "list",
+    "--porcelain",
+  ]);
+  for (const block of output.split(/\n\n+/)) {
+    const lines = block.split("\n");
+    const path = lines.find((line) => line.startsWith("worktree "))?.slice(9);
+    const branch = lines.find((line) => line.startsWith("branch "))?.slice(7);
+    if (path && branch === branchRef) return path;
+  }
+  return null;
 }
 
 export class GitSourceControlBackend implements SourceControlBackend {
@@ -360,6 +398,101 @@ export class GitSourceControlBackend implements SourceControlBackend {
     return checkpointRecord(ref);
   }
 
+  async land(
+    options: Parameters<SourceControlBackend["land"]>[0],
+  ): Promise<LandingResult> {
+    assertBackendHandle(options.workspace.handle, this.id, "landing workspace");
+    if (options.workspace.mode === "direct")
+      return {
+        target: stringState(options.workspace.handle, "workRef"),
+        checkpoint: checkpointRecord(options.workspace.currentRevision),
+      };
+    const repository = await discoverRepository(options.repository);
+    const sourceRef = stringState(options.workspace.handle, "workRef");
+    const sourceRevision = await revisionOf(repository, sourceRef);
+    if (sourceRevision !== options.workspace.currentRevision)
+      throw new Error(
+        `retained Git output ${sourceRef} drifted from ${options.workspace.currentRevision} to ${sourceRevision}`,
+      );
+    const target = options.target.replace(/^refs\/heads\//, "");
+    await executeGit(repository, ["check-ref-format", "--branch", target]);
+    const targetRef = `refs/heads/${target}`;
+    const targetRevision = await revisionOf(repository, targetRef);
+    if (await gitReferenceExists(repository, sourceRevision, targetRevision))
+      return {
+        target,
+        checkpoint: checkpointRecord(targetRevision, target),
+      };
+    if (!(await gitReferenceExists(repository, targetRevision, sourceRevision)))
+      throw new IntegrationConflict(
+        `Git target ${target} advanced after dispatch`,
+        `${target} at ${targetRevision} is not an ancestor of retained output ${sourceRevision}; rebase or merge the retained branch before retrying`,
+      );
+
+    const key = createHash("sha256").update(repository).digest("hex");
+    const lockDirectory = resolve(options.stateDirectory, "locks");
+    const lockPath = join(lockDirectory, `${this.id}-${key}.json`);
+    await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
+    try {
+      const lock = await open(lockPath, "wx", 0o600);
+      try {
+        await lock.writeFile(
+          JSON.stringify({
+            backend: this.id,
+            operation: "landing",
+            jobId: options.jobId,
+            repository,
+            pid: process.pid,
+            targetRef,
+            expectedHead: targetRevision,
+            sourceRevision,
+          }),
+        );
+        await lock.sync();
+      } finally {
+        await lock.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
+        jobId?: string;
+      };
+      throw new Error(
+        `Git repository is locked by RunnerJob ${owner.jobId ?? "unknown"}`,
+      );
+    }
+
+    try {
+      const checkedOut = await checkedOutBranchPath(repository, targetRef);
+      if (checkedOut) {
+        const paths = await dirtyPaths(checkedOut);
+        if (paths.length > 0)
+          throw new Error(
+            `Git landing target ${target} is not clean:\n${paths.join("\n")}`,
+          );
+        const actual = await currentRevision(checkedOut);
+        if (actual !== targetRevision)
+          throw new Error(
+            `Git target ${target} drifted from ${targetRevision} to ${actual}`,
+          );
+        await executeGit(checkedOut, ["merge", "--ff-only", sourceRevision]);
+      } else {
+        await executeGit(repository, [
+          "update-ref",
+          targetRef,
+          sourceRevision,
+          targetRevision,
+        ]);
+      }
+      return {
+        target,
+        checkpoint: checkpointRecord(sourceRevision, target),
+      };
+    } finally {
+      await unlink(lockPath).catch(() => {});
+    }
+  }
+
   async preserveFailedWork(
     options: Parameters<SourceControlBackend["preserveFailedWork"]>[0],
   ) {
@@ -449,6 +582,9 @@ export class GitSourceControlBackend implements SourceControlBackend {
       pid?: number;
       jobId?: string;
       expectedHead?: string;
+      operation?: string;
+      targetRef?: string;
+      sourceRevision?: string;
     };
     if (typeof owner.pid === "number") {
       try {
@@ -460,6 +596,34 @@ export class GitSourceControlBackend implements SourceControlBackend {
       throw new Error(
         `cannot safely recover stale Git lock for ${owner.jobId ?? "unknown job"}: pinned revision is missing`,
       );
+    if (
+      owner.operation === "landing" &&
+      owner.targetRef &&
+      owner.sourceRevision
+    ) {
+      const targetRevision = await revisionOf(root, owner.targetRef);
+      if (
+        targetRevision !== owner.expectedHead &&
+        targetRevision !== owner.sourceRevision
+      )
+        throw new Error(
+          `cannot recover interrupted Git landing: ${owner.targetRef} moved to ${targetRevision}`,
+        );
+      const checkedOut = await checkedOutBranchPath(root, owner.targetRef);
+      if (checkedOut) {
+        const paths = await dirtyPaths(checkedOut);
+        if (paths.length > 0)
+          throw new Error(
+            `cannot recover interrupted Git landing with a dirty target:\n${paths.join("\n")}`,
+          );
+      }
+      await unlink(lockPath);
+      return [
+        targetRevision === owner.sourceRevision
+          ? `recovered completed Git landing for ${owner.jobId ?? "unknown job"}`
+          : `recovered interrupted Git landing for ${owner.jobId ?? "unknown job"} before target mutation`,
+      ];
+    }
     const paths = await dirtyPaths(root);
     const head = await currentRevision(root);
     const warnings: string[] = [];

@@ -3,6 +3,7 @@ import type {
   Finding,
   JobAssignment,
   RunnerJobEventPayload,
+  RunnerJobLanding,
   RunnerJobPhase,
   RunnerJobStatus,
   RunnerJobTaskStatus,
@@ -37,6 +38,20 @@ export interface TaskState {
   checks: CheckResult[];
 }
 
+export interface LandingReport {
+  status: "landed" | "failed";
+  target: string;
+  checkpoint: SourceControlCheckpoint | null;
+  error: string | null;
+}
+
+export interface LandingRequestState {
+  requestId: string;
+  target: string;
+  status: "requested" | "completed" | "acked";
+  result?: LandingReport;
+}
+
 export interface JobState {
   assignment: JobAssignment | null;
   status: RunnerJobStatus;
@@ -55,6 +70,8 @@ export interface JobState {
   questions: Record<string, string>;
   usage: Usage;
   warnings: string[];
+  automaticLanding?: RunnerJobLanding;
+  landingRequests: Record<string, LandingRequestState>;
 }
 
 export function emptyJobState(): JobState {
@@ -81,6 +98,7 @@ export function emptyJobState(): JobState {
     },
     warnings: [],
     recoveryLocations: [],
+    landingRequests: {},
   };
 }
 
@@ -250,6 +268,29 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
       case "warning":
         state.warnings.push(payload.message as string);
         break;
+      case "landing.auto.completed":
+        state.automaticLanding = payload.landing as RunnerJobLanding;
+        break;
+      case "landing.requested":
+        state.landingRequests[payload.requestId as string] = {
+          requestId: payload.requestId as string,
+          target: payload.target as string,
+          status: "requested",
+        };
+        break;
+      case "landing.completed": {
+        const request = state.landingRequests[payload.requestId as string];
+        if (request) {
+          request.status = "completed";
+          request.result = payload.result as LandingReport;
+        }
+        break;
+      }
+      case "landing.acked": {
+        const request = state.landingRequests[payload.requestId as string];
+        if (request) request.status = "acked";
+        break;
+      }
     }
   }
   return state;

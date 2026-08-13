@@ -16,6 +16,7 @@ import {
   type BackendHandle,
   IntegrationConflict,
   type JobWorkspace,
+  type LandingResult,
   type SourceControlBackend,
   type SourceControlCheckpoint,
   type TaskWorkspace,
@@ -576,6 +577,136 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       )?.[1] ?? change;
     options.workspace.currentRevision = submitted;
     return checkpoint(submitted, `submitted change ${submitted}`);
+  }
+
+  async land(
+    options: Parameters<SourceControlBackend["land"]>[0],
+  ): Promise<LandingResult> {
+    assertBackendHandle(options.workspace.handle, this.id, "landing workspace");
+    if (
+      options.workspace.mode === "direct" ||
+      options.workspace.currentRevision === options.workspace.baseRevision
+    )
+      return {
+        target: options.target,
+        checkpoint: checkpoint(
+          options.workspace.currentRevision,
+          options.workspace.mode === "direct"
+            ? `submitted change ${options.workspace.currentRevision}`
+            : "no-op",
+        ),
+      };
+    const root = await repositoryRoot(options.repository);
+    const identity = await this.repositoryIdentity(root);
+    const change = options.workspace.currentRevision;
+    if (!/^\d+$/.test(change))
+      throw new Error(
+        `retained Perforce output ${change} is not a numbered shelf`,
+      );
+    const accepted = Object.values(options.acceptedTaskCheckpoints).some(
+      (candidate) => candidate.ref === change,
+    );
+    if (!accepted)
+      throw new Error(
+        `retained Perforce shelf ${change} is not an accepted task checkpoint`,
+      );
+    const existing = await this.changeSpec(root, change);
+    if (/^Status:\s*submitted\s*$/im.test(existing)) {
+      if (!existing.includes(`[noriq job ${options.jobId}]`))
+        throw new Error(
+          `submitted changelist ${change} is not owned by this RunnerJob`,
+        );
+      return {
+        target: options.target,
+        checkpoint: checkpoint(change, `submitted change ${change}`),
+      };
+    }
+    if (!/^Status:\s*pending\s*$/im.test(existing))
+      throw new Error(`Perforce shelf ${change} is no longer pending`);
+    if (!existing.includes(`[noriq job ${options.jobId}]`))
+      throw new Error(
+        `Perforce shelf ${change} is not owned by this RunnerJob`,
+      );
+
+    const lockPath = await this.acquireLock(
+      identity,
+      root,
+      options.stateDirectory,
+      options.jobId,
+    );
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        backend: this.id,
+        operation: "landing",
+        jobId: options.jobId,
+        repository: root,
+        pid: process.pid,
+        change,
+      }),
+      { mode: 0o600 },
+    );
+    let submitted = false;
+    try {
+      await this.requireClean(root);
+      await this.p4(root, ["sync", options.target]);
+      const unshelve = await this.p4(
+        root,
+        ["unshelve", "-s", change, "-c", change],
+        { allowFailure: true },
+      );
+      if (unshelve.exitCode !== 0)
+        throw new Error(
+          `p4 unshelve -s ${change} failed: ${unshelve.stderr || unshelve.stdout}`,
+        );
+      const resolveResult = await this.p4(
+        root,
+        ["resolve", "-am", "-c", change],
+        { allowEmpty: true, allowFailure: true },
+      );
+      const detail = `${resolveResult.stdout}\n${resolveResult.stderr}`.trim();
+      if (resolveResult.exitCode !== 0 || /must resolve|conflict/i.test(detail))
+        throw new IntegrationConflict(
+          "Perforce landing requires conflict repair",
+          detail,
+          await this.opened(root, change),
+        );
+      const submit = await this.p4(root, ["submit", "-c", change], {
+        allowFailure: true,
+      });
+      if (submit.exitCode !== 0) {
+        const submitDetail = `${submit.stdout}\n${submit.stderr}`.trim();
+        if (/out of date|must resolve|resolve/i.test(submitDetail))
+          throw new IntegrationConflict(
+            "Perforce landing requires reintegration",
+            submitDetail,
+            await this.opened(root, change),
+          );
+        throw new Error(`p4 submit -c ${change} failed: ${submitDetail}`);
+      }
+      submitted = true;
+      const submittedChange =
+        `${submit.stdout}\n${submit.stderr}`.match(
+          /Change\s+(\d+)\s+submitted/i,
+        )?.[1] ?? change;
+      return {
+        target: options.target,
+        checkpoint: checkpoint(
+          submittedChange,
+          `submitted change ${submittedChange}`,
+        ),
+      };
+    } finally {
+      if (!submitted)
+        await this.p4(root, ["revert", "-c", change, "//..."], {
+          allowEmpty: true,
+          allowFailure: true,
+        });
+      const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
+        jobId?: string;
+      };
+      if (owner.jobId === options.jobId) await unlink(lockPath);
+    }
   }
 
   async preserveFailedWork(

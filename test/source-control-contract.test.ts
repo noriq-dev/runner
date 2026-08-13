@@ -198,6 +198,35 @@ function perforceFake(root: string) {
 }
 
 describe("source-control backend contract", () => {
+  it("defaults to retained output and requires explicit safe landing targets", () => {
+    expect(project("isolated", "main").sourceControl.landing).toBe("retain");
+    expect(() =>
+      projectConfigSchema.parse({
+        key: "RUN",
+        repositoryKey: "repo",
+        defaultBranch: "main",
+        sourceControl: {
+          backend: "git",
+          mode: "isolated",
+          base: "main",
+          landing: "manual",
+        },
+        harness: {
+          maxParallelTasks: 1,
+          maxRepairRounds: 1,
+          maxJobMinutes: 5,
+        },
+        agents: {
+          guide: { driver: "fake", model: "guide", effort: "high" },
+          builder: { driver: "fake", model: "builder", effort: "medium" },
+          reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+        },
+        setup: { commands: [], timeoutSeconds: 30 },
+        checks: { commands: [], timeoutSeconds: 30 },
+      }),
+    ).toThrow(/target is required/);
+  });
+
   it("keeps Diversion candidates off the accepted output until acceptance", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-diversion-contract-"));
     await mkdir(join(root, ".diversion"));
@@ -250,6 +279,19 @@ describe("source-control backend contract", () => {
       `branch -d ${outputReference}/candidate-run-1 -f`,
     );
     await backend.release(workspace, "job");
+    const landed = await backend.land({
+      repository: root,
+      stateDirectory: join(root, "state"),
+      jobId: "job",
+      workspace,
+      target: "main",
+      acceptedTaskCheckpoints: { task: accepted },
+    });
+    expect(landed).toMatchObject({
+      target: "main",
+      checkpoint: { ref: "dv-103", label: "main" },
+    });
+    expect(fake.revisions.get("main")).toBe("dv-103");
   });
 
   it("uses cumulative Perforce shelves in isolated mode and submits direct candidates", async () => {
@@ -290,6 +332,22 @@ describe("source-control backend contract", () => {
     expect(fake.shelves).toEqual([firstCandidate.checkpoint.ref]);
     expect(backend.capabilities.parallelTaskWorkspaces).toBe(false);
     await backend.release(isolated, "isolated-job");
+    const landedShelf = await backend.land({
+      repository: root,
+      stateDirectory: join(root, "state-a"),
+      jobId: "isolated-job",
+      workspace: isolated,
+      target: "//depot/project/...#head",
+      acceptedTaskCheckpoints: { first: firstCandidate.checkpoint },
+    });
+    expect(landedShelf).toMatchObject({
+      target: "//depot/project/...#head",
+      checkpoint: {
+        ref: firstCandidate.checkpoint.ref,
+        label: `submitted change ${firstCandidate.checkpoint.ref}`,
+      },
+    });
+    expect(fake.submitted).toEqual([firstCandidate.checkpoint.ref]);
 
     const directFake = perforceFake(root);
     const directBackend = new PerforceSourceControlBackend(

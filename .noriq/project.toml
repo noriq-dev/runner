@@ -6,6 +6,8 @@ defaultBranch = "rebuild/runner-from-scratch"
 backend = "auto"
 mode = "isolated"
 base = "rebuild/runner-from-scratch"
+target = "rebuild/runner-from-scratch"
+landing = "manual"
 
 [harness]
 maxParallelTasks = 2

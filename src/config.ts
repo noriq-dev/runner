@@ -43,6 +43,7 @@ const sourceControlSchema = z
     mode: z.enum(["isolated", "direct"]).default("isolated"),
     base: z.string().trim().min(1).max(500),
     target: z.string().trim().min(1).max(500).optional(),
+    landing: z.enum(["retain", "manual", "auto"]).default("retain"),
   })
   .strict();
 
@@ -119,6 +120,7 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
           backend: "auto" as const,
           mode: input.workspace!.mode,
           base: input.workspace!.baseBranch,
+          landing: "retain" as const,
           ...(input.workspace!.directBranch
             ? { target: input.workspace!.directBranch }
             : {}),
@@ -126,6 +128,18 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
       })();
     if (sourceControl.mode === "direct" && !sourceControl.target)
       throw new Error("sourceControl.target is required in direct mode");
+    if (
+      sourceControl.mode === "isolated" &&
+      sourceControl.landing !== "retain" &&
+      !sourceControl.target
+    )
+      throw new Error(
+        "sourceControl.target is required when isolated output will be landed",
+      );
+    if (sourceControl.mode === "direct" && sourceControl.landing !== "retain")
+      throw new Error(
+        "sourceControl.landing must be retain in direct mode because accepted work is already committed to the target",
+      );
     const normalizeAgent = (
       profile: z.infer<typeof legacyAgentProfileSchema>,
     ) => {

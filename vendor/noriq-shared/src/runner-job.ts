@@ -19,6 +19,24 @@ export const RunnerJobRetainedLocation = z.object({
 }).strict();
 export type RunnerJobRetainedLocation = z.infer<typeof RunnerJobRetainedLocation>;
 
+export const RunnerJobLandingPolicy = z.enum(['retain', 'manual', 'auto', 'direct']);
+export type RunnerJobLandingPolicy = z.infer<typeof RunnerJobLandingPolicy>;
+
+export const RunnerJobLandingStatus = z.enum([
+  'retained', 'requested', 'landing', 'landed', 'failed', 'not_applicable',
+]);
+export type RunnerJobLandingStatus = z.infer<typeof RunnerJobLandingStatus>;
+
+export const RunnerJobLanding = z.object({
+  policy: RunnerJobLandingPolicy,
+  status: RunnerJobLandingStatus,
+  target: text(1_000).nullable(),
+  checkpoint: RunnerJobCheckpoint.nullable(),
+  error: z.string().max(20_000).nullable(),
+  requestId: id.nullable(),
+}).strict();
+export type RunnerJobLanding = z.infer<typeof RunnerJobLanding>;
+
 export const RunnerJobTaskSnapshot = z.object({
   taskId: id,
   key: text(160),
@@ -111,6 +129,7 @@ export const RunnerJobOutput = z.object({
   usage: RunnerJobUsage,
   summary: z.string().max(20_000),
   dirtyPaths: z.array(z.string().max(2_000)).max(10_000),
+  landing: RunnerJobLanding.optional(),
 }).strict();
 export type RunnerJobOutput = z.infer<typeof RunnerJobOutput>;
 
@@ -146,6 +165,11 @@ export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('job.accept'), jobId: id, assignmentId: id }).strict(),
   z.object({ type: z.literal('job.event'), jobId: id, assignmentId: id, seq: z.number().int().positive(), payload: RunnerJobEvent }).strict(),
   z.object({ type: z.literal('job.reconcile'), jobId: id, assignmentId: id, lastLocalSeq: z.number().int().nonnegative() }).strict(),
+  z.object({
+    type: z.literal('job.land.result'), jobId: id, assignmentId: id, requestId: id,
+    status: z.enum(['landed', 'failed']), target: text(1_000),
+    checkpoint: RunnerJobCheckpoint.nullable(), error: z.string().max(20_000).nullable(),
+  }).strict(),
 ]);
 export type RunnerJobRunnerMessage = z.infer<typeof RunnerJobRunnerMessage>;
 
@@ -155,5 +179,7 @@ export const RunnerJobServerMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('job.answer'), jobId: id, assignmentId: id, questionId: id, answer: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('job.event.ack'), jobId: id, assignmentId: id, seq: z.number().int().nonnegative() }).strict(),
   z.object({ type: z.literal('job.reconcile.result'), jobId: id, assignmentId: id, action: z.enum(['continue', 'cancel']) }).strict(),
+  z.object({ type: z.literal('job.land'), jobId: id, assignmentId: id, requestId: id, target: text(1_000) }).strict(),
+  z.object({ type: z.literal('job.land.ack'), jobId: id, assignmentId: id, requestId: id }).strict(),
 ]);
 export type RunnerJobServerMessage = z.infer<typeof RunnerJobServerMessage>;

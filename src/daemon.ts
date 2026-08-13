@@ -2,8 +2,15 @@ import type { MachineConfig } from "./config.js";
 import type { JobAssignment } from "./contracts.js";
 import { discoverProjects } from "./discovery.js";
 import { createDriverRegistry } from "./drivers/registry.js";
+import type { ServerToRunner } from "./protocol.js";
 import { registerRunner } from "./registration.js";
-import { loadDurableJobState, RunnerJobSupervisor } from "./supervisor.js";
+import {
+  acknowledgeDurableLanding,
+  landDurableJob,
+  loadDurableJobState,
+  loadPendingLandingResults,
+  RunnerJobSupervisor,
+} from "./supervisor.js";
 import { createBackendRegistry, selectBackend } from "./vcs/detect.js";
 import { RunnerSocket } from "./ws-client.js";
 
@@ -54,6 +61,15 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
   >();
   const queued = new Map<string, JobAssignment>();
   const reconciling = new Map<string, JobAssignment>();
+  type LandingMessage = Extract<ServerToRunner, { type: "job.land" }>;
+  const queuedLandings = new Map<
+    string,
+    {
+      message: LandingMessage;
+      project: (typeof available)[number];
+    }
+  >();
+  const activeLandings = new Map<string, string>();
   socket.getHeartbeat = () => ({
     freeSlots: Math.max(
       0,
@@ -65,6 +81,7 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
     if (active.size >= config.runner.maxConcurrentJobs) return false;
     const project = byRef.get(assignment.repoRef);
     if (!project) return false;
+    if (activeLandings.has(project.config.repositoryKey)) return false;
     const exclusive =
       project.config.sourceControl.mode === "direct" ||
       !project.backend.capabilities.parallelTaskWorkspaces;
@@ -75,6 +92,42 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
     );
   };
   let drain = (): void => {};
+  const startLanding = (entry: {
+    message: LandingMessage;
+    project: (typeof available)[number];
+  }) => {
+    const { message, project } = entry;
+    queuedLandings.delete(message.requestId);
+    activeLandings.set(project.config.repositoryKey, message.requestId);
+    void landDurableJob({
+      stateDirectory: config.runner.stateDirectory,
+      repository: project.repository,
+      projectConfig: project.config,
+      backend: project.backend,
+      jobId: message.jobId,
+      assignmentId: message.assignmentId,
+      requestId: message.requestId,
+      target: message.target,
+    })
+      .then((result) => {
+        socket.send({
+          type: "job.land.result",
+          jobId: message.jobId,
+          assignmentId: message.assignmentId,
+          requestId: message.requestId,
+          ...result,
+        });
+      })
+      .catch((error) => {
+        process.stderr.write(
+          `RunnerJob ${message.jobId} landing crashed: ${String(error)}\n`,
+        );
+      })
+      .finally(() => {
+        activeLandings.delete(project.config.repositoryKey);
+        drain();
+      });
+  };
   const start = (assignment: JobAssignment) => {
     if (active.has(assignment.jobId)) return;
     if (active.size >= config.runner.maxConcurrentJobs)
@@ -116,6 +169,13 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
     );
   };
   drain = () => {
+    for (const entry of queuedLandings.values()) {
+      const key = entry.project.config.repositoryKey;
+      if (activeLandings.has(key)) continue;
+      if ([...active.values()].some((running) => running.repositoryKey === key))
+        continue;
+      startLanding(entry);
+    }
     for (const assignment of queued.values()) {
       if (canStart(assignment)) start(assignment);
     }
@@ -134,6 +194,22 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
       });
     queued.set(assignment.jobId, assignment);
     drain();
+  };
+  socket.onConnect = async () => {
+    for (const pending of await loadPendingLandingResults(
+      config.runner.stateDirectory,
+    )) {
+      socket.send({
+        type: "job.land.result",
+        jobId: pending.jobId,
+        assignmentId: pending.assignmentId,
+        requestId: pending.requestId,
+        status: pending.status,
+        target: pending.target,
+        checkpoint: pending.checkpoint,
+        error: pending.error,
+      });
+    }
   };
   socket.onMessage = (message) => {
     void (async () => {
@@ -193,6 +269,33 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
         const running = active.get(message.jobId);
         if (running?.assignmentId === message.assignmentId)
           await running.supervisor.answer(message.questionId, message.answer);
+      } else if (message.type === "job.land") {
+        const durable = await loadDurableJobState(
+          config.runner.stateDirectory,
+          message.jobId,
+        );
+        if (durable?.assignment?.assignmentId !== message.assignmentId)
+          throw new Error(
+            `landing request does not match durable job ${message.jobId}`,
+          );
+        const project = byRef.get(durable.assignment.repoRef);
+        if (!project)
+          throw new Error(
+            `no discovered repository for ${durable.assignment.repoRef}`,
+          );
+        if (
+          !queuedLandings.has(message.requestId) &&
+          ![...activeLandings.values()].includes(message.requestId)
+        ) {
+          queuedLandings.set(message.requestId, { message, project });
+          drain();
+        }
+      } else if (message.type === "job.land.ack") {
+        await acknowledgeDurableLanding(
+          config.runner.stateDirectory,
+          message.jobId,
+          message.requestId,
+        );
       }
     })().catch((error) => {
       process.stderr.write(`Runner protocol error: ${String(error)}\n`);

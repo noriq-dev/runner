@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProjectConfig } from "./config.js";
 import type {
@@ -7,6 +7,7 @@ import type {
   Finding,
   JobAssignment,
   RunnerJobEventPayload,
+  RunnerJobLanding,
   RunnerJobOutput,
   RunnerTaskSnapshot,
 } from "./contracts.js";
@@ -29,7 +30,7 @@ import {
   workerOutputSchema,
 } from "./prompts.js";
 import { readyTasks } from "./scheduler.js";
-import { type JobState, reduceJobState } from "./state.js";
+import { type JobState, type LandingReport, reduceJobState } from "./state.js";
 import type {
   JobWorkspace,
   SourceControlBackend,
@@ -884,6 +885,48 @@ export class RunnerJobSupervisor {
     const findings = Object.values(this.state.tasks).flatMap(
       (task) => task.findings,
     );
+    const landing: RunnerJobLanding =
+      this.workspace.mode === "direct"
+        ? {
+            policy: "direct",
+            status: "landed",
+            target: this.options.projectConfig.sourceControl.target ?? null,
+            checkpoint: {
+              ref: inspection.revision,
+              label:
+                this.options.projectConfig.sourceControl.target ??
+                this.workspace.retainedLocation.label,
+              url: null,
+            },
+            error: null,
+            requestId: null,
+          }
+        : status !== "succeeded"
+          ? {
+              policy: this.options.projectConfig.sourceControl.landing,
+              status: "not_applicable",
+              target: this.options.projectConfig.sourceControl.target ?? null,
+              checkpoint: null,
+              error: null,
+              requestId: null,
+            }
+          : this.options.projectConfig.sourceControl.landing === "auto"
+            ? (this.state.automaticLanding ?? {
+                policy: "auto",
+                status: "failed",
+                target: this.options.projectConfig.sourceControl.target ?? null,
+                checkpoint: null,
+                error: "automatic landing did not produce a durable outcome",
+                requestId: null,
+              })
+            : {
+                policy: this.options.projectConfig.sourceControl.landing,
+                status: "retained",
+                target: this.options.projectConfig.sourceControl.target ?? null,
+                checkpoint: null,
+                error: null,
+                requestId: null,
+              };
     return {
       workspaceMode: this.workspace.mode,
       retainedLocation:
@@ -899,7 +942,56 @@ export class RunnerJobSupervisor {
       usage: this.state.usage,
       summary: `${status}: ${Object.keys(acceptedTaskCheckpoints).length} task(s) accepted in ${Date.now() - started}ms (setup ${this.setupDurationMs}ms, checks ${this.checkDurationMs}ms).`,
       dirtyPaths: inspection.dirtyPaths,
+      landing,
     };
+  }
+
+  private async performAutomaticLanding(): Promise<void> {
+    if (this.state.automaticLanding) return;
+    const target = this.options.projectConfig.sourceControl.target;
+    if (!target)
+      throw new Error("automatic landing requires sourceControl.target");
+    const acceptedTaskCheckpoints = Object.fromEntries(
+      Object.values(this.state.tasks)
+        .filter((task) => task.status === "accepted" && task.checkpoint)
+        .map((task) => [task.taskId, task.checkpoint!]),
+    );
+    let landing: RunnerJobLanding;
+    try {
+      await this.options.backend.recoverOrphans(
+        this.options.repository,
+        this.options.stateDirectory,
+      );
+      const result = await this.options.backend.land({
+        repository: this.options.repository,
+        stateDirectory: this.options.stateDirectory,
+        jobId: this.options.assignment.jobId,
+        workspace: this.workspace,
+        target,
+        acceptedTaskCheckpoints,
+      });
+      landing = {
+        policy: "auto",
+        status: "landed",
+        target: result.target,
+        checkpoint: result.checkpoint,
+        error: null,
+        requestId: null,
+      };
+    } catch (error) {
+      landing = {
+        policy: "auto",
+        status: "failed",
+        target,
+        checkpoint: null,
+        error: (error instanceof Error ? error.message : String(error)).slice(
+          0,
+          20_000,
+        ),
+        requestId: null,
+      };
+    }
+    await this.record("landing.auto.completed", { landing });
   }
 
   private async execute(): Promise<RunnerJobOutput> {
@@ -1081,6 +1173,12 @@ export class RunnerJobSupervisor {
         : acceptedCount > 0
           ? "partial"
           : "failed";
+    if (
+      status === "succeeded" &&
+      this.workspace.mode === "isolated" &&
+      this.options.projectConfig.sourceControl.landing === "auto"
+    )
+      await this.performAutomaticLanding();
     const output = await this.terminalOutput(status, started);
     await this.emit({ type: "terminal", at: now(), status, output });
     await this.record("job.terminal", { status });
@@ -1151,6 +1249,165 @@ export async function loadDurableJobState(
   const path = join(stateDirectory, "jobs", safeIdPart(jobId), "events.jsonl");
   const journal = await ChecksummedJournal.open(path);
   return journal.all().length > 0 ? reduceJobState(journal.all()) : null;
+}
+
+async function appendDurableRecord(
+  journal: ChecksummedJournal,
+  type: string,
+  payload: unknown,
+): Promise<JobState> {
+  await journal.append(type, payload);
+  const state = reduceJobState(journal.all());
+  await journal.writeSnapshot(state);
+  return state;
+}
+
+export async function landDurableJob(options: {
+  stateDirectory: string;
+  repository: string;
+  projectConfig: ProjectConfig;
+  backend: SourceControlBackend;
+  jobId: string;
+  assignmentId: string;
+  requestId: string;
+  target: string;
+}): Promise<LandingReport> {
+  const journal = await ChecksummedJournal.open(
+    join(
+      options.stateDirectory,
+      "jobs",
+      safeIdPart(options.jobId),
+      "events.jsonl",
+    ),
+  );
+  let state = reduceJobState(journal.all());
+  if (
+    !state.assignment ||
+    state.assignment.assignmentId !== options.assignmentId
+  )
+    throw new Error("landing request does not match the durable assignment");
+  if (state.status !== "succeeded")
+    throw new Error("only a durably succeeded RunnerJob can be landed");
+  if (!state.workspace)
+    throw new Error("durable RunnerJob has no retained workspace");
+  if (state.workspace.mode !== "isolated")
+    throw new Error("direct RunnerJob output is already landed");
+  if (!["manual", "auto"].includes(options.projectConfig.sourceControl.landing))
+    throw new Error("project configuration does not authorize Runner landing");
+  if (
+    options.projectConfig.sourceControl.target !== options.target ||
+    !options.projectConfig.sourceControl.target
+  )
+    throw new Error(
+      "landing target differs from the committed project configuration",
+    );
+
+  const existing = state.landingRequests[options.requestId];
+  if (existing) {
+    if (existing.target !== options.target)
+      throw new Error("landing request id was reused for a different target");
+    if (existing.result) return existing.result;
+  } else {
+    state = await appendDurableRecord(journal, "landing.requested", {
+      requestId: options.requestId,
+      target: options.target,
+    });
+  }
+  const acceptedTaskCheckpoints = Object.fromEntries(
+    Object.values(state.tasks)
+      .filter((task) => task.status === "accepted" && task.checkpoint)
+      .map((task) => [task.taskId, task.checkpoint!]),
+  );
+  const workspace = state.workspace;
+  if (!workspace)
+    throw new Error("durable RunnerJob lost its retained workspace");
+  let result: LandingReport;
+  try {
+    await options.backend.recoverOrphans(
+      options.repository,
+      options.stateDirectory,
+    );
+    const landed = await options.backend.land({
+      repository: options.repository,
+      stateDirectory: options.stateDirectory,
+      jobId: options.jobId,
+      workspace,
+      target: options.target,
+      acceptedTaskCheckpoints,
+    });
+    result = {
+      status: "landed",
+      target: landed.target,
+      checkpoint: landed.checkpoint,
+      error: null,
+    };
+  } catch (error) {
+    result = {
+      status: "failed",
+      target: options.target,
+      checkpoint: null,
+      error: (error instanceof Error ? error.message : String(error)).slice(
+        0,
+        20_000,
+      ),
+    };
+  }
+  await appendDurableRecord(journal, "landing.completed", {
+    requestId: options.requestId,
+    result,
+  });
+  return result;
+}
+
+export async function acknowledgeDurableLanding(
+  stateDirectory: string,
+  jobId: string,
+  requestId: string,
+): Promise<void> {
+  const journal = await ChecksummedJournal.open(
+    join(stateDirectory, "jobs", safeIdPart(jobId), "events.jsonl"),
+  );
+  const state = reduceJobState(journal.all());
+  const request = state.landingRequests[requestId];
+  if (!request?.result || request.status === "acked") return;
+  await appendDurableRecord(journal, "landing.acked", { requestId });
+}
+
+export interface PendingLandingResult extends LandingReport {
+  jobId: string;
+  assignmentId: string;
+  requestId: string;
+}
+
+export async function loadPendingLandingResults(
+  stateDirectory: string,
+): Promise<PendingLandingResult[]> {
+  const jobsDirectory = join(stateDirectory, "jobs");
+  let entries: string[];
+  try {
+    entries = await readdir(jobsDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const pending: PendingLandingResult[] = [];
+  for (const entry of entries) {
+    const journal = await ChecksummedJournal.open(
+      join(jobsDirectory, entry, "events.jsonl"),
+    );
+    const state = reduceJobState(journal.all());
+    if (!state.assignment) continue;
+    for (const request of Object.values(state.landingRequests)) {
+      if (request.status !== "completed" || !request.result) continue;
+      pending.push({
+        jobId: state.assignment.jobId,
+        assignmentId: state.assignment.assignmentId,
+        requestId: request.requestId,
+        ...request.result,
+      });
+    }
+  }
+  return pending;
 }
 
 export class MemoryEventSink implements JobEventSink {

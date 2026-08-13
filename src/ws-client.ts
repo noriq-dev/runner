@@ -21,6 +21,7 @@ export class RunnerSocket implements JobEventSink {
   private readonly pending = new Map<string, PendingEvent>();
   private heartbeat: NodeJS.Timeout | null = null;
   onMessage?: (message: ServerToRunner) => void;
+  onConnect?: () => void | Promise<void>;
   getHeartbeat?: () => { freeSlots: number; activeJobIds: string[] };
 
   constructor(
@@ -122,6 +123,7 @@ export class RunnerSocket implements JobEventSink {
       if (this.heartbeat === heartbeat) this.heartbeat = null;
       if (this.socket === socket) this.socket = null;
     });
+    await this.onConnect?.();
   }
 
   send(message: RunnerToServer): void {
