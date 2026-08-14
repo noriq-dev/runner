@@ -21,6 +21,10 @@ describe("RunnerSocket", () => {
     if (!address || typeof address === "string")
       throw new Error("expected TCP server");
     let deliveries = 0;
+    let firstConnectionClosed!: () => void;
+    const firstClose = new Promise<void>((resolve) => {
+      firstConnectionClosed = resolve;
+    });
     server.on("connection", (socket) => {
       socket.on("message", (bytes) => {
         const message = JSON.parse(bytes.toString()) as {
@@ -29,8 +33,10 @@ describe("RunnerSocket", () => {
         };
         if (message.type !== "job.event") return;
         deliveries += 1;
-        if (deliveries === 1) socket.close();
-        else
+        if (deliveries === 1) {
+          socket.once("close", firstConnectionClosed);
+          socket.close();
+        } else
           socket.send(
             JSON.stringify({
               type: "job.event.ack",
@@ -66,6 +72,7 @@ describe("RunnerSocket", () => {
     const second = client.publish("job", "assignment", 1, payload);
     for (let attempt = 0; attempt < 100 && deliveries < 1; attempt += 1)
       await new Promise((resolve) => setTimeout(resolve, 5));
+    await firstClose;
     await client.connect();
     await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
     expect(deliveries).toBe(2);
