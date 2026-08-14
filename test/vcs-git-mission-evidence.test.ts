@@ -299,7 +299,10 @@ describe('Git mission VCS evidence (real Git)', () => {
     const missionCheckpoint = await backend.checkpointExact(ws, 'mission: divergent commit', {
       expectedParentRevisionId: ws.baseId,
     });
-    await git(['merge', '--no-commit', 'side'], ws.localPath);
+    // GitHub's clean runner has no global committer identity. Git validates one while preparing
+    // even a --no-commit merge, so keep this fixture hermetic instead of inheriting the operator's
+    // Git config.
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=T', 'merge', '--no-commit', 'side'], ws.localPath);
 
     await expect(backend.inspectWorkspace(ws)).rejects.toThrow(/MERGE_HEAD/);
     await expect(
