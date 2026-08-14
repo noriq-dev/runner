@@ -1,6 +1,6 @@
 {
   "name": "@noriq-dev/runner",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "A small, durable agent-guided job harness for Noriq",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,7 @@
     "cli"
   ],
   "bin": {
-    "noriq-runner": "./dist/cli.js"
+    "noriq-runner": "dist/cli.js"
   },
   "files": [
     "dist",

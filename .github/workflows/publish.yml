@@ -37,6 +37,11 @@ jobs:
         run: |
           set -euo pipefail
           package=$(npm pack --silent)
+          tar -xOf "./$package" package/package.json | node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync(0, "utf8"));
+            if (manifest.bin?.["noriq-runner"] !== "dist/cli.js") process.exit(1);
+          '
           prefix=$(mktemp -d)
           npm install --global --prefix "$prefix" "./$package"
           got=$("$prefix/bin/noriq-runner" version)

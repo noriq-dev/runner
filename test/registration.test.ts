@@ -78,7 +78,7 @@ describe("Runner registration", () => {
       label: "test runner",
       // Noriq catalog revision 2 refuses Runner versions below 0.16.0.
       // Keep the rebuild's distinct prerelease identity above that release floor.
-      version: "0.17.0",
+      version: "0.17.1",
       kinds: [],
       maxConcurrency: 2,
       protocolCapabilities: ["runner-job.v2"],
