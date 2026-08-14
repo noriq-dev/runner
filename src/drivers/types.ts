@@ -72,7 +72,7 @@ export interface DriverHandlers {
 
 /**
  * The Noriq MCP connection a spawned agent reports its own work through
- * (set_agent_identity / claim / create_plan / comment).
+ * (configure_agent / claim / create_plan / comment).
  *
  * The token rides the MCP transport's Authorization header — NOT the agent's shell
  * env, which `sanitizedAgentEnv` deliberately strips. Without this the agent has no
@@ -339,7 +339,7 @@ export interface DriverStartOptions {
    * every primary session. The stage actors (planner, plan checker, pattern mapper, inline
    * reviewer) pass `STAGE_NORIQ_TOOLS` here: they share the run's one identity, so the server-side
    * catalogue is the run's, and this is the seam that keeps a read-only actor from holding
-   * `update_task` while still being able to reach a human. Drivers enforce it both ways — the
+   * `update_tasks` while still being able to reach a human. Drivers enforce it both ways — the
    * complement is DENIED, not merely un-allowed, so a bypass-permissions profile cannot widen it.
    */
   noriqTools?: readonly string[];

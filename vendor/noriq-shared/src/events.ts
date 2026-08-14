@@ -40,6 +40,9 @@ export const EventVerb = z.enum([
   'task.spun_off',
   'task.spinoff_accepted',
   'task.spinoff_rejected',
+  'task.proposed',
+  'task.proposal_accepted',
+  'task.proposal_rejected',
   'task.archived',
   'task.restored',
   'task.settle_skipped',
@@ -71,6 +74,8 @@ export const EventVerb = z.enum([
   'run.status_changed',
   'run.handoff_preserved',
   'run.handoff_consumed',
+  'runner_job.created',
+  'runner_job.status_changed',
   // ProjectMemory's outbox delivered a canonical mutation into this project's event stream
   // (PLNR-247). One compact verb for every memory change — kind/authority/etc. ride the
   // payload's summary, never the memory body itself (§3/§4: D1 never holds memory content).
@@ -127,7 +132,7 @@ export type EventVerb = z.infer<typeof EventVerb>;
 // ProjectRoom.receiveMemoryEvent).
 export const EventSubjectType = z.enum([
   'project', 'milestone', 'task', 'comment', 'message', 'run', 'memory',
-  'tag', 'lock', 'board', 'doc', 'plan', 'plan_dispatch', 'plan_doc',
+  'tag', 'lock', 'board', 'doc', 'plan', 'plan_dispatch', 'plan_doc', 'runner_job',
 ]);
 export type EventSubjectType = z.infer<typeof EventSubjectType>;
 

@@ -159,7 +159,7 @@ const REACH_A_HUMAN = ['raise_alert', 'request_input'];
  *
  * These actors run under the RUN's one identity (RUN-43: the credential is not re-issuable, so
  * there is no second identity to mint) and were originally spawned with no Noriq connection at
- * all: the full kind floor grants writes the filesystem clamp says nothing about — `update_task`,
+ * all: the full kind floor grants writes the filesystem clamp says nothing about — `update_tasks`,
  * `claim_task`, `post_comment` — and RUN-140/141 rightly refused to hand a "read-only" actor
  * those. But the refusal threw out the two tools this file's own REACH_A_HUMAN paragraph says
  * must never be rationed, and a week of live dogfood showed the cost: planners guessing at
@@ -208,20 +208,19 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
   // enforced phase ordering creates — a live scope run had to raise_alert and hand a human
   // five edges to cut because this floor said no. Safe because the RUN-23 gate still holds:
   // plans arrive PROPOSED and a human approves them after the tidying. Still excluded, on
-  // purpose: create_task/decompose_task (mint claimable work outside the proposed-plan gate)
-  // and claim/release (scope plans, never executes). spin_off_task (RUN-188, granted to
+  // purpose: minting ordinary claimable work outside the proposed-plan gate and claim/release
+  // (scope plans, never executes). create_tasks (RUN-188, granted to
   // build/verify below) also stays out of scope's floor — not for the gate's reason, but
   // because scope's product IS a proposed plan: work a scope run surfaces belongs in the plan
   // it is already minting, not filed beside it.
   scope: [
-    'set_agent_identity',
+    'configure_agent',
     'get_briefing',
     'get_task',
     'get_plans',
     'create_plan',
     'update_plan',
-    'add_dependency',
-    'remove_dependency',
+    'update_tasks',
   ],
   // No release_task (RUN-83): a build agent claims its anchor task (→ in_progress) and works,
   // but it does NOT move the task onward — the RUN's terminal outcome does, server-side. The
@@ -230,15 +229,13 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
   // indistinguishable from work genuinely awaiting a human. Now the task stays in_progress
   // through the gate and transitionRun sets it: gate passed → review, gate failed → failed.
   build: [
-    'set_agent_identity',
+    'configure_agent',
     'get_briefing',
     'get_task',
     'claim_task',
     'post_comment',
-    'read_open_comments',
     'resolve_comment',
-    'attach_ref',
-    'update_task',
+    'update_tasks',
     // File locking (RUN-97..107, granted at RUN-177) — and ONLY the acquire half, deliberately.
     //
     // The daemon takes locks AS the run's agent: the reactive per-edit hook and the hard floor
@@ -273,27 +270,26 @@ const NORIQ_TOOLS: Record<RunKind, string[]> = {
     // manual step made first-class, and it does NOT reopen the hole the exclusion above guards:
     // its product is a PROPOSED task — on the board, carrying provenance (source task, source
     // run, the finding) — but not claimable and not pumpable until a human accepts it, the same
-    // RUN-23 gate that keeps create_task off every floor. Distinct from raise_alert on purpose:
-    // an alert is a concern that is NOT work; a spin-off is work that is not mine.
+    // RUN-23 gate that keeps ordinary task creation off every floor. Distinct from raise_alert on
+    // purpose: an alert is a concern that is NOT work; a proposal is work that is not mine.
     //
     // What the grant still hands a hostile or lazy agent: volume — ten spin-offs to dodge ten
     // findings. Each is inert until a human touches it, and a spin-off offered against a finding
     // clears nothing by itself: the reviewer adjudicates every such pointer, and a criterion the
     // diff owed cannot be spun off.
-    'spin_off_task',
+    'create_tasks',
   ],
   verify: [
-    'set_agent_identity',
+    'configure_agent',
     'get_briefing',
     'get_task',
     'get_plans',
     'post_comment',
-    'read_open_comments',
     // Same grant, same gate as build's (RUN-188): the verifier is the actor most likely to
     // SURFACE work that is real but out of this diff's scope, and raise_alert (concern-not-work)
     // was its only channel. The product stays a PROPOSED task a human gates, so the grant does
     // not let the reviewer MOVE the work it is judging — the line this floor exists to hold.
-    'spin_off_task',
+    'create_tasks',
   ],
 };
 

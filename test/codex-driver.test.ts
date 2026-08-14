@@ -1582,7 +1582,7 @@ describe('the per-kind Noriq tool floor reaches codex (RUN-46)', () => {
 
   it('a verify agent cannot claim, release, or update — the gate it exists to hold', () => {
     const tools = enabledTools(spawnFor('verify'));
-    for (const denied of ['claim_task', 'release_task', 'update_task', 'create_plan']) {
+    for (const denied of ['claim_task', 'release_task', 'update_tasks', 'create_plan']) {
       expect(tools).not.toContain(denied);
     }
     // But it CAN reach a human (RUN-32) — rationing that pushes agents toward guessing.
@@ -1591,7 +1591,7 @@ describe('the per-kind Noriq tool floor reaches codex (RUN-46)', () => {
     // And it CAN spin off work the diff surfaces that is not this task's (RUN-188) — inert
     // until a human accepts it, so the grant still cannot MOVE the work being judged. Not
     // create_task by another name: that one stays absent.
-    expect(tools).toContain('spin_off_task');
+    expect(tools).toContain('create_tasks');
     expect(tools).not.toContain('create_task');
   });
 

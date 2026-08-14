@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ExecutionAssignment } from './orchestration';
+import { ExecutionAssignment, RunnerProtocolCapability } from './orchestration';
 
 // ---------------------------------------------------------------------------
 // Noriq Runner — the execution plane (RUN plan, Phase 1). Runtime-neutral zod:
@@ -153,7 +153,7 @@ export type RunExit = z.infer<typeof RunExit>;
 /**
  * A review follow-up the daemon files through POST /api/runner-spinoffs (PLNR-478).
  *
- * Unlike the agent-only spin_off_task tool, provenance is explicit on this wire because the
+ * Unlike the MCP create_tasks proposal path, provenance is explicit on this wire because the
  * daemon has no Noriq agent identity. The server validates all three pointers as one fact: the
  * source run belongs to runnerId, is live, and is anchored to sourceTaskId in projectId. The
  * product remains a proposed task until a human accepts or rejects it.
@@ -409,6 +409,9 @@ export type AdvertisedAgent = z.infer<typeof AdvertisedAgent>;
 export const RunnerCapabilities = z.object({
   tools: z.array(AgentTool).default([]), // installed drivers
   kinds: z.array(RunKind).default([]), // run kinds this runner will accept
+  // Additive runtime capability evidence reported during registration. An omitted field means
+  // an older registration whose RunnerJob support is unknown, not an explicit empty advert.
+  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).optional(),
   maxConcurrency: z.number().int().nonnegative().default(1),
   // The coordinate catalog per installed tool (RUN-115) — what the dashboard's agent picker reads.
   // Additive to `tools`; a runner too old to send it advertises an empty menu (free-text only).

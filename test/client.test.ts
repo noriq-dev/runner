@@ -202,7 +202,7 @@ describe('MCP session lifecycle (RUN-73)', () => {
   // recycle), which is why the retry-once matters.
   type Frame = { method?: string; sid: string | null; toolName?: string };
 
-  function fakeMcpServer(opts: { forgetAfterMint?: number; task?: unknown } = {}) {
+  function fakeMcpServer(opts: { forgetAfterMint?: number; task?: unknown; catalogRevision?: number } = {}) {
     const frames: Frame[] = [];
     const sessions = new Set<string>();
     let minted = 0;
@@ -220,10 +220,19 @@ describe('MCP session lifecycle (RUN-73)', () => {
         // Simulate an isolate recycling right after the handshake: the first N minted
         // sessions are forgotten before the first tool call arrives.
         if (opts.forgetAfterMint && minted <= opts.forgetAfterMint) sessions.delete(id);
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 0, result: {} }), {
-          status: 200,
-          headers: { 'mcp-session-id': id },
-        });
+        return new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 0,
+            result: {
+              serverInfo: { name: 'noriq', version: '0.60.0', catalogRevision: opts.catalogRevision ?? 2 },
+            },
+          }),
+          {
+            status: 200,
+            headers: { 'mcp-session-id': id },
+          },
+        );
       }
       if (body.method === 'notifications/initialized') return new Response(null, { status: 202 });
       if (!sid || !sessions.has(sid)) {
@@ -307,8 +316,15 @@ describe('MCP session lifecycle (RUN-73)', () => {
     const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
     await client.postComment('prj_1', 'task_1', 'verify failed: …');
     const call = srv.frames.find((f) => f.method === 'tools/call');
-    expect(call?.toolName).toBe('add_comment');
+    expect(call?.toolName).toBe('post_comment');
     expect(call?.sid).toBe('sess_1');
+  });
+
+  it('uses the legacy comment name against catalog revision 1 during the coordinated cutover', async () => {
+    const srv = fakeMcpServer({ catalogRevision: 1 });
+    const client = new NoriqClient({ server: 'https://a.b', token: 't', fetchImpl: srv.fetchImpl });
+    await client.postComment('prj_1', 'task_1', 'legacy server');
+    expect(srv.frames.find((frame) => frame.method === 'tools/call')?.toolName).toBe('add_comment');
   });
 });
 
@@ -420,7 +436,7 @@ describe('getTask spin-off provenance (RUN-188)', () => {
       fetchImpl: mcp({
         key: 'RUN-201',
         title: 'Harden the guard floor',
-        spinOff: { sourceTaskId: 'task_9', sourceRunId: 'run_1', finding: 'the guard is missing' },
+        proposal: { sourceTaskId: 'task_9', runId: 'run_1', finding: 'the guard is missing' },
       }),
     });
     const t = await client.getTask('RUN-201');
@@ -446,7 +462,7 @@ describe('getTask spin-off provenance (RUN-188)', () => {
     const client = new NoriqClient({
       server: 'https://a.b',
       token: 't',
-      fetchImpl: mcp({ key: 'K-1', title: 'T', spinOff: { sourceRunId: 42, finding: '' } }),
+      fetchImpl: mcp({ key: 'K-1', title: 'T', proposal: { runId: 42, finding: '' } }),
     });
     const t = await client.getTask('K-1');
     expect(t?.key).toBe('K-1');

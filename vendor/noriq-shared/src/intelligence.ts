@@ -143,6 +143,12 @@ export const ProjectIntelligenceIdentity = z.object({
       claimId: z.string().min(1),
       executionId: z.string().min(1).nullable().default(null),
     }),
+    z.object({
+      kind: z.literal('runner_job'),
+      jobId: z.string().min(1),
+      scope: z.literal('task'),
+      taskId: z.string().min(1),
+    }),
   ]).optional(),
 });
 export type ProjectIntelligenceIdentity = z.infer<typeof ProjectIntelligenceIdentity>;

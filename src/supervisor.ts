@@ -174,7 +174,7 @@ import type { WorkflowCatalog } from './workflow-store';
 //
 // The daemon creates each Run's Noriq identity up front and hands the process a token bound
 // to it (RUN-43), so the agent reports its own work as an actor the daemon can name. It used
-// to be the reverse: the prompt asked the model to register ITSELF via set_agent_identity, so
+// to be the reverse: the prompt asked the model to register ITSELF via configure_agent, so
 // attribution depended on the model complying and the daemon never learned who its own child
 // was — run.status.agentId was null on every run ever reported.
 
@@ -1058,7 +1058,7 @@ export function assemblePrompt(
   const wf = ctx.workflow ?? workflowFor(run.kind as RunKind); // the prompt family is a workflow trait
   // The daemon created this identity before the process existed and handed it a token that
   // can only be this agent, so there is nothing to register (RUN-43). The old prompt asked
-  // the model to call set_agent_identity — which made attribution depend on it complying,
+  // the model to call configure_agent — which made attribution depend on it complying,
   // left the daemon unable to name its own child, and quietly produced anonymous agents
   // whenever the model skipped the step or (as with codex) had no MCP to call.
   // Every kind can reach a human, so the invitation belongs in the shared identity block
@@ -4136,7 +4136,7 @@ export class RunSupervisor {
           ...withStageModel(prepared.start, planAgent),
           permission: plannerPermission(prepared.permission),
           // The ESCALATION PAIR and nothing else. The planner used to get NO MCP at all (RUN-140):
-          // the full floor grants writes the filesystem clamp says nothing about — `update_task`,
+          // the full floor grants writes the filesystem clamp says nothing about — `update_tasks`,
           // `claim_task`, `post_comment` — and the daemon writes the spec back itself, so the
           // planner has nothing to report. Both halves of that reasoning still hold, which is why
           // `noriqTools` narrows to raise_alert + request_input alone: a planner facing a decision

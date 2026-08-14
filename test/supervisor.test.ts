@@ -829,9 +829,9 @@ describe('assemblePrompt', () => {
     expect(p).toMatch(/proposed:true/); // RUN-23: scope plans must be gated for human approval
     expect(p).toMatch(/Do NOT modify/);
     // The agent is TOLD its identity (RUN-43); it no longer registers itself, so asserting
-    // a set_agent_identity instruction would assert the bug this task removed.
+    // a configure_agent instruction would assert the bug this task removed.
     expect(p).toContain('agt_run1');
-    expect(p).toMatch(/do NOT call set_agent_identity/);
+    expect(p).toMatch(/do NOT call configure_agent/);
     expect(p).toContain('https://s');
   });
   it('build prompt is read-write + review diff + verify cmd + anchored task', () => {

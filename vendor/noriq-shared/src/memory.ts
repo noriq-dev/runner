@@ -320,6 +320,12 @@ export const WorkEpisodeSource = z.discriminatedUnion('kind', [
     claimId: z.string().min(1),
     executionId: z.string().min(1).nullable().default(null),
   }),
+  z.object({
+    kind: z.literal('runner_job'),
+    jobId: z.string().min(1),
+    scope: z.literal('task'),
+    taskId: z.string().min(1),
+  }),
 ]);
 export type WorkEpisodeSource = z.infer<typeof WorkEpisodeSource>;
 

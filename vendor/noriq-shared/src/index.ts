@@ -2,6 +2,7 @@ export * from './model';
 export * from './events';
 export * from './runner';
 export * from './runner-protocol';
+export * from './runner-job';
 export * from './ws';
 export * from './manifest';
 export * from './execution-spec';

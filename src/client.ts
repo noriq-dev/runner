@@ -63,7 +63,7 @@ function readSpinOff(raw: unknown): { spinOff?: SpinOffProvenance } {
   return {
     spinOff: {
       sourceTaskId: str(r.sourceTaskId),
-      sourceRunId: str(r.sourceRunId),
+      sourceRunId: str(r.runId) ?? str(r.sourceRunId),
       finding: str(r.finding),
     },
   };
@@ -322,7 +322,7 @@ export class NoriqClient {
    *
    * The daemon creates the identity; the spawned process inherits it by holding a token that
    * can only be that agent. Previously the prompt asked the model, in English, to call
-   * set_agent_identity — so identity hinged on the model complying, we never learned the
+   * configure_agent — so identity hinged on the model complying, we never learned the
    * agt_ it chose, and codex (which had no MCP wiring at all) was silently anonymous.
    *
    * The returned token is per-run and least-privilege: unlike the runner's own token it
@@ -337,7 +337,22 @@ export class NoriqClient {
     // exactly this list to the agent over MCP, so the catalogue the model sees and the
     // allowlist the daemon enforces are two views of one policy. Optional on the wire — an
     // older server ignores it and the agent sees the full catalogue, the pre-RUN-47 behavior.
-    return (await this.request('POST', `/api/runs/${runId}/agent`, opts)) as RunAgent;
+    if (!this.mcpInitialized) await this.mcpInitialize();
+    const allowedTools =
+      opts.allowedTools && this.mcpCatalogRevision < 2
+        ? [
+            ...new Set(
+              opts.allowedTools.flatMap((name) => {
+                if (name === 'configure_agent') return ['set_agent_identity'];
+                if (name === 'create_tasks') return ['spin_off_task'];
+                if (name === 'update_tasks')
+                  return ['update_task', 'add_dependency', 'remove_dependency', 'attach_ref'];
+                return [name];
+              }),
+            ),
+          ]
+        : opts.allowedTools;
+    return (await this.request('POST', `/api/runs/${runId}/agent`, { ...opts, allowedTools })) as RunAgent;
   }
 
   /**
@@ -403,6 +418,7 @@ export class NoriqClient {
    */
   private mcpSessionId: string | null = null;
   private mcpInitialized = false;
+  private mcpCatalogRevision = 1;
 
   private async mcpHeaders(): Promise<Record<string, string>> {
     return {
@@ -415,7 +431,7 @@ export class NoriqClient {
   /**
    * Open an MCP session (RUN-73). The server rejects sessionless tool calls outright —
    * "sessionless calls are not attributable" — and it is right to: without this handshake the
-   * daemon's get_task/add_comment were refused, so anchor prompts degraded to bare ids and
+   * daemon's get_task/post_comment were refused, so anchor prompts degraded to bare ids and
    * every gate comment (verify failure, reviewer rejection, land failure) silently never
    * posted. The session id rides the `mcp-session-id` response header.
    */
@@ -441,6 +457,18 @@ export class NoriqClient {
     // is fatal (RUN-177).
     if (!res.ok) {
       throw new Error(`mcp initialize → ${res.status}: ${raw.slice(0, 200)}`);
+    }
+    try {
+      const data =
+        raw
+          .split('\n')
+          .find((line) => line.startsWith('data:'))
+          ?.replace(/^data:\s*/, '') ?? raw;
+      const envelope = JSON.parse(data) as { result?: { serverInfo?: { catalogRevision?: unknown } } };
+      const revision = envelope.result?.serverInfo?.catalogRevision;
+      if (typeof revision === 'number' && Number.isInteger(revision)) this.mcpCatalogRevision = revision;
+    } catch {
+      this.mcpCatalogRevision = 1;
     }
     // The spec's follow-up; some transports won't serve requests until it arrives.
     await this.fetchImpl(`${this.base}/mcp`, {
@@ -487,10 +515,16 @@ export class NoriqClient {
     return parseMcpText(raw);
   }
 
-  /** Post a comment on a task via MCP add_comment (e.g. the deterministic-verify
+  /** Post a comment on a task via canonical MCP post_comment (e.g. the deterministic-verify
    *  failure surface, RUN-19). Uses the daemon's OAuth token as an MCP actor. */
   async postComment(projectId: string, taskId: string, body: string): Promise<void> {
-    await this.mcpCall('add_comment', { projectId, taskId, body });
+    if (!this.mcpInitialized) await this.mcpInitialize();
+    await this.mcpCall(
+      this.mcpCatalogRevision >= 2 ? 'post_comment' : 'add_comment',
+      this.mcpCatalogRevision >= 2
+        ? { projectId, taskId, kind: 'comment', body }
+        : { projectId, taskId, body },
+    );
   }
 
   /** An anchor task's human-readable content, so the prompt can inline it instead of
@@ -500,7 +534,7 @@ export class NoriqClient {
       task?: Partial<TaskBrief> & {
         executionSpec?: unknown;
         executionSpecUnreadable?: unknown;
-        spinOff?: unknown;
+        proposal?: unknown;
       };
     } | null;
     const t = out?.task;
@@ -522,7 +556,7 @@ export class NoriqClient {
       // Spin-off provenance (RUN-188) — the field the daemon's task-pointer check reads. Lenient
       // where the spec read above is strict, because the stakes invert: a spec that misparses
       // could be overwritten, while provenance only ever SHARPENS an existence check.
-      ...readSpinOff(t.spinOff),
+      ...readSpinOff(t.proposal),
     };
   }
 
@@ -543,7 +577,17 @@ export class NoriqClient {
   async setExecutionSpec(projectId: string, taskId: string, spec: ExecutionSpec): Promise<boolean> {
     const current = await this.getTask(taskId).catch(() => null);
     if (current && (hasExecutionSpec(current.executionSpec) || current.executionSpecUnreadable)) return false;
-    await this.mcpCall('update_task', { projectId, taskId, executionSpec: spec });
+    if (!this.mcpInitialized) await this.mcpInitialize();
+    if (this.mcpCatalogRevision < 2) {
+      await this.mcpCall('update_task', { projectId, taskId, executionSpec: spec });
+      return true;
+    }
+    const out = (await this.mcpCall('update_tasks', {
+      projectId,
+      tasks: [{ taskId, set: { executionSpec: spec } }],
+    })) as { results?: Array<{ ok?: boolean; error?: string }> };
+    const result = out.results?.[0];
+    if (!result?.ok) throw new Error(result?.error ?? 'update_tasks did not update the task');
     return true;
   }
 

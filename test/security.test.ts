@@ -92,7 +92,7 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
     const verify = noriqToolNamesFor('verify');
     expect(verify).not.toContain('claim_task');
     expect(verify).not.toContain('release_task');
-    expect(verify).not.toContain('update_task');
+    expect(verify).not.toContain('update_tasks');
     expect(noriqToolNamesFor('scope')).not.toContain('claim_task');
     expect(noriqToolNamesFor('build')).not.toContain('create_plan');
   });
@@ -133,8 +133,8 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
     // A live scope run promised to cut its plan's artifact phase-edges, found the floor said
     // no, and could only raise_alert — the human then hand-cut five edges at approval.
     expect(scope).toContain('update_plan');
-    expect(scope).toContain('add_dependency');
-    expect(scope).toContain('remove_dependency');
+    expect(scope).toContain('update_tasks');
+    expect(scope).toContain('update_tasks');
     // The RUN-23 gate is why the above is safe — and why these two stay out: both create
     // claimable work that no human ever approved.
     expect(scope).not.toContain('create_task');
@@ -144,18 +144,18 @@ describe('the per-kind Noriq tool floor (RUN-46/47)', () => {
   it('build and verify can SPIN OFF work they found but may not do — scope cannot (RUN-188)', () => {
     // RUN-186's landing run did everything right — contested with evidence, raised an alert with
     // a full design sketch — and still failed, because an alert records a concern and creates no
-    // work the gate can point at; a human folded it into a task by hand. spin_off_task is that
+    // work the gate can point at; a human folded it into a task by hand. create_tasks is that
     // manual step made first-class. Its product is a PROPOSED task — visible, carrying
     // provenance, not claimable and not pumpable until a human accepts it (the RUN-23 gate) —
     // which is what makes it safe to advertise to a prompt-injected builder.
-    expect(noriqToolNamesFor('build')).toContain('spin_off_task');
-    expect(noriqToolNamesFor('verify')).toContain('spin_off_task');
+    expect(noriqToolNamesFor('build')).toContain('create_tasks');
+    expect(noriqToolNamesFor('verify')).toContain('create_tasks');
     // Scope's product IS a proposed plan: work it surfaces belongs in the plan it is minting.
-    expect(noriqToolNamesFor('scope')).not.toContain('spin_off_task');
+    expect(noriqToolNamesFor('scope')).not.toContain('create_tasks');
   });
 
   it('the spin-off grant does not reopen RUN-69: create_task stays off EVERY floor', () => {
-    // spin_off_task is a new tool with a gated product, not create_task by another name — the
+    // create_tasks is a new tool with a gated product, not create_task by another name — the
     // tools that mint CLAIMABLE work outside the human plan-approval gate stay absent everywhere.
     for (const kind of KINDS) {
       expect(noriqToolNamesFor(kind), kind).not.toContain('create_task');
@@ -176,7 +176,7 @@ describe('the stage escalation pair (RUN-190)', () => {
     expect(p.allowedTools).not.toContain('mcp__noriq__claim_task');
     // DENIED, not merely un-allowed: deny outranks bypass, so this half holds under auto.
     expect(p.disallowedTools).toContain('mcp__noriq__claim_task');
-    expect(p.disallowedTools).toContain('mcp__noriq__update_task');
+    expect(p.disallowedTools).toContain('mcp__noriq__update_tasks');
   });
 
   it('…and the denial survives auto, which is the case that matters (RUN-68)', () => {

@@ -91,7 +91,7 @@ describe('assembleReviewerPrompt', () => {
 
   it('has no identity block and no MCP mention — the reviewer holds no credential', () => {
     const p = assembleReviewerPrompt({ intent: 'x' });
-    expect(p).not.toMatch(/set_agent_identity/);
+    expect(p).not.toMatch(/configure_agent/);
     expect(p).not.toMatch(/MCP/);
     expect(p).toMatch(/no project-management access/);
   });

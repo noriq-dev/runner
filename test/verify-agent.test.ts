@@ -20,7 +20,7 @@ describe('assembleVerifyPrompt', () => {
     // Authorship separation is the point of this gate, so WHICH actor filed the verdict must
     // be a fact the daemon knows — not a name the model was asked to register for itself.
     expect(p).toContain('agt_verifier');
-    expect(p).toMatch(/do NOT call set_agent_identity/);
+    expect(p).toMatch(/do NOT call configure_agent/);
     // VCS-neutral: no git verb, no Claude-only skill reference leaks into the prompt.
     expect(p).not.toMatch(/\/verify skill/);
   });

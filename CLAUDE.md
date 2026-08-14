@@ -309,13 +309,13 @@ that a spec cannot change an agent's mode, permissions, or what it may publish, 
 in it is free text from the server.
 
 A finding that is real but not THIS task's also has somewhere to go besides a fix round
-(RUN-188): `spin_off_task`, on the build and verify floors, files it as its own task. The
+(RUN-188): `create_tasks` with proposal metadata on the build and verify floors files it as its own task. The
 distinction is drawn against `raise_alert` and the two must not merge: an alert is a concern that
-is NOT work ("this smells wrong"); a spin-off is work that is not mine — RUN-186's landing run
+is NOT work ("this smells wrong"); a proposal is work that is not mine — RUN-186's landing run
 contested with evidence and raised an alert carrying a full design sketch, and still FAILED,
 because an alert is prose: it records the concern but creates no work a gate can point at, and a
-human had to fold it into a task by hand. It does not reopen RUN-69: `create_task` stays off every
-floor, and the spin-off's product is a PROPOSED task — visible, carrying provenance (source task,
+human had to fold it into a task by hand. It does not reopen RUN-69: every Runner floor permits
+`create_tasks` only for items carrying proposal metadata, and the product is a PROPOSED task — visible, carrying provenance (source task,
 source run, the finding) — not claimable and not pumpable until a human accepts it, the RUN-23
 gate again. What makes it more than bookkeeping is the gate integration: a spun-off task is an
 adjudicable object — a `CONTESTED` may point at it as checkable evidence ("real, out of scope,
@@ -331,7 +331,7 @@ back to the task — so the plan is an artifact a human can correct and a retry 
 a thought inside one build's context. Three things narrow it beyond the usual clamp, each closing
 something the clamp does not: `auto` is dropped (it survives `clampPermissionToWorkflow` by design,
 and on Claude it means unrestricted Bash in a worktree that is writable for the build); it gets **no
-`noriqMcp`**, because a filesystem clamp says nothing about `update_task`; and it may take only a
+`noriqMcp`**, because a filesystem clamp says nothing about `update_tasks`; and it may take only a
 quarter of the run's remaining ceiling — ONE envelope shared by the planner and every plan-check
 round, not a fresh quarter each — after which the builder RE-RESERVES against a tally that now
 includes every one of them. Planning can never cost

@@ -1120,7 +1120,7 @@ describe('Noriq MCP wiring', () => {
     const p = mapPermission(profile({ write: true }), 'build');
     expect(p.allowedTools).toEqual(
       expect.arrayContaining([
-        'mcp__noriq__set_agent_identity',
+        'mcp__noriq__configure_agent',
         'mcp__noriq__get_task',
         'mcp__noriq__claim_task',
         'mcp__noriq__post_comment',
@@ -1137,23 +1137,23 @@ describe('Noriq MCP wiring', () => {
     const build = mapPermission(profile({ write: true }), 'build').allowedTools;
     const verify = mapPermission(profile({ write: false }), 'verify').allowedTools;
 
-    // A read-only scope agent proposes plans but must not claim or mutate work.
+    // A scope agent proposes plans and may maintain their dependency metadata, but cannot claim work.
     expect(scope).toContain('mcp__noriq__create_plan');
     expect(scope).not.toContain('mcp__noriq__claim_task');
-    expect(scope).not.toContain('mcp__noriq__update_task');
+    expect(scope).toContain('mcp__noriq__update_tasks');
     // A build agent claims and reports, but does not mint plans.
     expect(build).toContain('mcp__noriq__claim_task');
     expect(build).not.toContain('mcp__noriq__create_plan');
     // The adversarial verifier reads and comments; it never mutates.
     expect(verify).toContain('mcp__noriq__post_comment');
     expect(verify).not.toContain('mcp__noriq__claim_task');
-    expect(verify).not.toContain('mcp__noriq__update_task');
+    expect(verify).not.toContain('mcp__noriq__update_tasks');
     // Build and verify may SPIN OFF work they found but may not do (RUN-188) — the product is a
     // PROPOSED task a human gates, so this is not create_task by another name. Scope's product
     // IS a proposed plan, so it has no use for the tool.
-    expect(build).toContain('mcp__noriq__spin_off_task');
-    expect(verify).toContain('mcp__noriq__spin_off_task');
-    expect(scope).not.toContain('mcp__noriq__spin_off_task');
+    expect(build).toContain('mcp__noriq__create_tasks');
+    expect(verify).toContain('mcp__noriq__create_tasks');
+    expect(scope).not.toContain('mcp__noriq__create_tasks');
     expect(build).not.toContain('mcp__noriq__create_task');
   });
 
@@ -1174,7 +1174,7 @@ describe('Noriq MCP wiring', () => {
     const scope = mapPermission(profile({ write: false }), 'scope').allowedTools;
     expect(scope).not.toContain('mcp__noriq__claim_task');
     expect(scope).not.toContain('mcp__noriq__create_project');
-    expect(scope).not.toContain('mcp__noriq__update_task');
+    expect(scope).toContain('mcp__noriq__update_tasks');
   });
 
   it('never grants a wildcard Noriq rule', () => {
