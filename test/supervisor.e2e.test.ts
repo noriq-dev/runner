@@ -1,4 +1,12 @@
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -281,6 +289,10 @@ describe("RunnerJobSupervisor", () => {
 
   it("repairs repeated worker blockers before one check and review", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-worker-blocker-"));
+    const stateDirectory = join(root, "state-real");
+    const stateAlias = join(root, "state-alias");
+    await mkdir(stateDirectory);
+    await symlink(stateDirectory, stateAlias, "dir");
     const repository = join(root, "repository");
     await command(root, "mkdir", [repository]);
     await command(repository, "git", ["init", "-b", "main"]);
@@ -302,14 +314,18 @@ describe("RunnerJobSupervisor", () => {
       line: null,
     });
     let repairs = 0;
+    let builderReceivedCanonicalWorkspace = false;
     const fake = new FakeAgentDriver(
       join(root, "artifacts"),
       async (request) => {
-        if (request.role === "builder")
+        if (request.role === "builder") {
+          builderReceivedCanonicalWorkspace =
+            request.workspace === (await realpath(request.workspace));
           return {
             summary: "builder blocked",
             findings: [blocker("builder blocked")],
           };
+        }
         if (request.role === "repairer") {
           repairs += 1;
           if (repairs === 1)
@@ -378,7 +394,7 @@ describe("RunnerJobSupervisor", () => {
     const output = await new RunnerJobSupervisor({
       assignment,
       repository,
-      stateDirectory: join(root, "state"),
+      stateDirectory: stateAlias,
       projectConfig: config,
       backend: new GitWorkspaceBackend(),
       drivers: { fake, codex: undefined, claude: undefined },
@@ -393,6 +409,9 @@ describe("RunnerJobSupervisor", () => {
       "reviewer",
     ]);
     const builder = fake.calls[0]!;
+    expect(builderReceivedCanonicalWorkspace).toBe(true);
+    expect(builder.workspace).toContain("state-real");
+    expect(builder.workspace).not.toContain("state-alias");
     expect(builder.prompt).toContain(
       `Runtime workspace root: ${JSON.stringify(builder.workspace)}.`,
     );

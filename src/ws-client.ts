@@ -10,6 +10,7 @@ import type { JobEventSink } from "./supervisor.js";
 
 interface PendingEvent {
   message: RunnerToServer;
+  retry: NodeJS.Timeout | null;
   waiters: Array<{
     resolve: (seq: number) => void;
     reject: (error: Error) => void;
@@ -28,7 +29,21 @@ export class RunnerSocket implements JobEventSink {
     private readonly url: string,
     private readonly token: string,
     private readonly hello: RunnerToServer,
+    private readonly acknowledgementTimeoutMs = 5_000,
   ) {}
+
+  private armPending(pending: PendingEvent): void {
+    if (pending.retry) clearTimeout(pending.retry);
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      pending.retry = null;
+      return;
+    }
+    this.send(pending.message);
+    pending.retry = setTimeout(() => {
+      pending.retry = null;
+      this.armPending(pending);
+    }, this.acknowledgementTimeoutMs);
+  }
 
   async connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return;
@@ -95,6 +110,7 @@ export class RunnerSocket implements JobEventSink {
               value.seq <= message.seq
             ) {
               this.pending.delete(key);
+              if (pending.retry) clearTimeout(pending.retry);
               for (const waiter of pending.waiters) waiter.resolve(message.seq);
             }
           }
@@ -113,12 +129,16 @@ export class RunnerSocket implements JobEventSink {
       if (heartbeat) clearInterval(heartbeat);
       if (this.heartbeat === heartbeat) this.heartbeat = null;
       if (this.socket === socket) this.socket = null;
+      for (const pending of this.pending.values()) {
+        if (pending.retry) clearTimeout(pending.retry);
+        pending.retry = null;
+      }
     });
     // Production Durable Objects can answer in the same turn as `send`. Install
     // every response/close handler before hello or replay so no assignment or
     // cumulative acknowledgement can arrive in an unobserved window.
     this.send(this.hello);
-    for (const pending of this.pending.values()) this.send(pending.message);
+    for (const pending of this.pending.values()) this.armPending(pending);
     heartbeat = setInterval(() => {
       const status = this.getHeartbeat?.() ?? {
         freeSlots: 0,
@@ -157,17 +177,24 @@ export class RunnerSocket implements JobEventSink {
       payload,
     };
     return new Promise((resolve, reject) => {
-      this.pending.set(key, { message, waiters: [{ resolve, reject }] });
-      if (this.socket?.readyState === WebSocket.OPEN) this.send(message);
+      const pending = {
+        message,
+        retry: null,
+        waiters: [{ resolve, reject }],
+      } satisfies PendingEvent;
+      this.pending.set(key, pending);
+      this.armPending(pending);
     });
   }
 
   close(): void {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.socket?.close(1000, "runner stopping");
-    for (const pending of this.pending.values())
+    for (const pending of this.pending.values()) {
+      if (pending.retry) clearTimeout(pending.retry);
       for (const waiter of pending.waiters)
         waiter.reject(new Error("runner stopped"));
+    }
     this.pending.clear();
   }
 }

@@ -72,6 +72,57 @@ describe("RunnerSocket", () => {
     client.close();
   });
 
+  it("retries an unacknowledged sequence while the connection remains open", async () => {
+    server = new WebSocketServer({ port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("expected TCP server");
+    let deliveries = 0;
+    server.on("connection", (socket) => {
+      socket.on("message", (bytes) => {
+        const message = JSON.parse(bytes.toString()) as {
+          type: string;
+          seq?: number;
+        };
+        if (message.type !== "job.event") return;
+        deliveries += 1;
+        if (deliveries === 2)
+          socket.send(
+            JSON.stringify({
+              type: "job.event.ack",
+              jobId: "job",
+              assignmentId: "assignment",
+              seq: message.seq,
+            }),
+          );
+      });
+    });
+    const client = new RunnerSocket(
+      `ws://127.0.0.1:${address.port}`,
+      "token",
+      {
+        type: "hello",
+        protocolVersion: 2,
+        runnerId: "runner",
+        capacity: 1,
+        repositories: [],
+      },
+      20,
+    );
+    await client.connect();
+    await expect(
+      client.publish("job", "assignment", 1, {
+        type: "warning",
+        at: new Date().toISOString(),
+        code: "RETRY",
+        message: "retry me without reconnecting",
+      }),
+    ).resolves.toBe(1);
+    expect(deliveries).toBe(2);
+    client.close();
+  });
+
   it("receives an immediate control frame sent in response to hello", async () => {
     server = new WebSocketServer({ port: 0 });
     await once(server, "listening");

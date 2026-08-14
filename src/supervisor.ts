@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProjectConfig } from "./config.js";
 import type {
@@ -746,6 +746,11 @@ export class RunnerJobSupervisor {
     schema: Record<string, unknown>,
   ): Promise<AgentResult> {
     this.enforceBudget();
+    // Vendor CLIs resolve cwd through filesystem aliases (for example,
+    // Fedora's /home -> /var/home). Keep the path in the prompt identical to
+    // the runtime cwd; Claude otherwise treats the aliased absolute path as
+    // outside the workspace and asks an unattended process for permission.
+    const runtimeWorkspace = await realpath(workspace);
     const id = invocationId(
       this.options.assignment.jobId,
       task.taskId,
@@ -865,12 +870,12 @@ export class RunnerJobSupervisor {
       role,
       taskId: task.taskId,
       taskKey: task.key,
-      workspace,
+      workspace: runtimeWorkspace,
       access:
         role === "guide" || role === "reviewer"
           ? "read-only"
           : "workspace-write",
-      prompt: `${workspaceInstruction(workspace)}\n\n${prompt}`,
+      prompt: `${workspaceInstruction(runtimeWorkspace)}\n\n${prompt}`,
       outputSchema: schema,
       projectConfig: this.options.projectConfig,
       signal: this.abort.signal,
