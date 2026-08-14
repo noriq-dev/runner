@@ -162,6 +162,53 @@ describe("RunnerJobSupervisor", () => {
       "repairer",
       "reviewer",
     ]);
+    const stageEvents = sink.events
+      .map((event) => event.payload)
+      .filter(
+        (event) =>
+          event.type === "stage.started" || event.type === "stage.finished",
+      );
+    const startedObservations = new Set(
+      stageEvents
+        .filter((event) => event.type === "stage.started")
+        .map((event) => event.observationId),
+    );
+    const finishedObservations = stageEvents.filter(
+      (event) => event.type === "stage.finished",
+    );
+    expect(
+      sink.events.filter((event) => event.payload.type === "job.context"),
+    ).toHaveLength(1);
+    expect(finishedObservations.length).toBeGreaterThan(10);
+    expect(
+      finishedObservations.every((event) =>
+        startedObservations.has(event.observationId),
+      ),
+    ).toBe(true);
+    expect(
+      finishedObservations.some(
+        (event) => event.actor.kind === "agent" && event.stage === "repair",
+      ),
+    ).toBe(true);
+    expect(
+      finishedObservations.some(
+        (event) => event.actor.kind === "command" && event.stage === "check",
+      ),
+    ).toBe(true);
+    expect(
+      finishedObservations.some(
+        (event) => event.actor.kind === "vcs" && event.stage === "accept",
+      ),
+    ).toBe(true);
+    const agentUsage = finishedObservations.find(
+      (event) => event.actor.kind === "agent" && event.stage === "build",
+    );
+    expect(agentUsage?.usage).toMatchObject({
+      cacheReadTokens: { status: "partial", value: 0 },
+      cacheWriteTokens: { status: "unavailable", value: null },
+      costUsd: { status: "complete", value: 0 },
+    });
+    expect(JSON.stringify(stageEvents)).not.toContain("feature remains broken");
     expect(sink.events.at(-1)?.payload.type).toBe("terminal");
     expect(
       await command(repository, "git", [
@@ -179,6 +226,7 @@ describe("RunnerJobSupervisor", () => {
       assignmentId: assignment.assignmentId,
       requestId: "landing-e2e",
       target: "main",
+      sink,
     });
     expect(landing).toMatchObject({
       status: "landed",
@@ -188,6 +236,14 @@ describe("RunnerJobSupervisor", () => {
     expect(await readFile(join(repository, "feature.txt"), "utf8")).toBe(
       "fixed\n",
     );
+    expect(
+      sink.events.some(
+        (event) =>
+          event.payload.type === "stage.finished" &&
+          event.payload.stage === "landing" &&
+          event.payload.actor.operation === "land",
+      ),
+    ).toBe(true);
     expect(
       await landDurableJob({
         stateDirectory,

@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Finding } from "../contracts.js";
+import { observationUsageFromLegacy } from "../intelligence.js";
 import type {
   AgentDriver,
   AgentDriverCapabilities,
@@ -77,6 +78,7 @@ export class FakeAgentDriver implements AgentDriver {
   }
 
   async invoke(request: AgentRequest): Promise<AgentResult> {
+    const started = performance.now();
     this.calls.push(request);
     const rawLogPath = join(
       this.artifactRoot,
@@ -91,18 +93,24 @@ export class FakeAgentDriver implements AgentDriver {
       rawLogPath,
       JSON.stringify({ role: request.role, taskId: request.taskId }),
     );
+    const usage = partial.usage ?? {
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedTokens: 0,
+      costUsd: 0,
+      calls: 1,
+    };
     const result: AgentResult = {
       success: partial.success ?? true,
       summary: partial.summary ?? `${request.role} completed`,
       ...(partial.plan === undefined ? {} : { plan: partial.plan }),
       findings: (partial.findings ?? []) as Finding[],
-      usage: partial.usage ?? {
-        inputTokens: 10,
-        outputTokens: 5,
-        cachedTokens: 0,
-        costUsd: 0,
-        calls: 1,
-      },
+      usage,
+      usageEvidence:
+        partial.usageEvidence ?? observationUsageFromLegacy(usage, "exact"),
+      durationMs:
+        partial.durationMs ??
+        Math.max(0, Math.round(performance.now() - started)),
       rawLogPath,
       structured: partial.structured ?? {},
       ...(partial.controlActions === undefined

@@ -1,5 +1,9 @@
 import type { ProjectConfig } from "../config.js";
-import type { Finding, Usage } from "../contracts.js";
+import type {
+  Finding,
+  RunnerJobObservationUsage,
+  Usage,
+} from "../contracts.js";
 
 export type AgentRole = "guide" | "builder" | "reviewer" | "repairer";
 export type WorkspaceAccess = "read-only" | "workspace-write";
@@ -23,6 +27,10 @@ export interface AgentResult {
   plan?: string;
   findings: Finding[];
   usage: Usage;
+  /** Independent usage axes; legacy/external receipts may omit this. */
+  usageEvidence?: RunnerJobObservationUsage;
+  /** Monotonic driver-observed duration when the receipt captured it. */
+  durationMs?: number;
   rawLogPath: string;
   structured: Record<string, unknown>;
   controlActions?: Array<{

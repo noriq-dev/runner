@@ -108,6 +108,7 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
       assignmentId: message.assignmentId,
       requestId: message.requestId,
       target: message.target,
+      sink: socket,
     })
       .then((result) => {
         socket.send({

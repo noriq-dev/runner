@@ -2,13 +2,22 @@ import type {
   CheckResult,
   Finding,
   JobAssignment,
+  RunnerJobDurationMetric,
   RunnerJobEventPayload,
   RunnerJobLanding,
+  RunnerJobObservationActor,
+  RunnerJobObservationEvidence,
+  RunnerJobObservationUsage,
   RunnerJobPhase,
   RunnerJobStatus,
   RunnerJobTaskStatus,
   Usage,
 } from "./contracts.js";
+import {
+  addObservationUsage,
+  aggregateUsageAsLegacy,
+  notApplicableUsage,
+} from "./intelligence.js";
 import type { JournalRecord } from "./journal.js";
 import type {
   JobWorkspace,
@@ -22,8 +31,24 @@ export interface InvocationState {
   taskId: string;
   role: "guide" | "builder" | "reviewer" | "repairer";
   status: "started" | "completed" | "abandoned";
-  resultDigest?: string;
-  usage?: Usage;
+  attempt?: number;
+  startedAt?: string | undefined;
+  completedAt?: string | undefined;
+  resultDigest?: string | undefined;
+  usage?: Usage | undefined;
+  usageEvidence?: RunnerJobObservationUsage | undefined;
+  usageContributionRecorded?: boolean | undefined;
+  duration?: RunnerJobDurationMetric | undefined;
+  actor?: RunnerJobObservationActor | undefined;
+  recovery?: "none" | "journal_replay" | "process_recovery" | undefined;
+  evidence?: RunnerJobObservationEvidence | undefined;
+  outcome?: "succeeded" | "failed" | "cancelled" | "skipped" | undefined;
+}
+
+export interface ObservationState {
+  observationId: string;
+  started: boolean;
+  finished: boolean;
 }
 
 export interface TaskState {
@@ -62,6 +87,8 @@ export interface JobState {
   recoveryLocations: RetainedLocation[];
   tasks: Record<string, TaskState>;
   invocations: Record<string, InvocationState>;
+  observations: Record<string, ObservationState>;
+  contextPublished: boolean;
   completedActions: Record<string, unknown>;
   nextEventSeq: number;
   acknowledgedEventSeq: number;
@@ -69,6 +96,7 @@ export interface JobState {
   answers: Record<string, string>;
   questions: Record<string, string>;
   usage: Usage;
+  observationUsage: RunnerJobObservationUsage;
   warnings: string[];
   automaticLanding?: RunnerJobLanding;
   landingRequests: Record<string, LandingRequestState>;
@@ -83,6 +111,8 @@ export function emptyJobState(): JobState {
     stopScheduling: false,
     tasks: {},
     invocations: {},
+    observations: {},
+    contextPublished: false,
     completedActions: {},
     nextEventSeq: 1,
     acknowledgedEventSeq: 0,
@@ -96,6 +126,7 @@ export function emptyJobState(): JobState {
       costUsd: null,
       calls: 0,
     },
+    observationUsage: notApplicableUsage(),
     warnings: [],
     recoveryLocations: [],
     landingRequests: {},
@@ -218,13 +249,67 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         const invocation = state.invocations[payload.id as string];
         if (invocation) {
           invocation.status = "completed";
-          invocation.resultDigest = payload.resultDigest as string;
+          if (payload.resultDigest !== undefined)
+            invocation.resultDigest = payload.resultDigest as string;
+          if (payload.completedAt !== undefined)
+            invocation.completedAt = payload.completedAt as string;
+          if (payload.usage !== undefined)
+            invocation.usage = payload.usage as Usage;
+          if (payload.usageEvidence !== undefined)
+            invocation.usageEvidence =
+              payload.usageEvidence as RunnerJobObservationUsage;
+          if (payload.duration !== undefined)
+            invocation.duration =
+              payload.duration as InvocationState["duration"];
+          if (payload.actor !== undefined)
+            invocation.actor = payload.actor as RunnerJobObservationActor;
+          if (payload.recovery !== undefined)
+            invocation.recovery =
+              payload.recovery as InvocationState["recovery"];
+          if (payload.evidence !== undefined)
+            invocation.evidence =
+              payload.evidence as RunnerJobObservationEvidence;
+          invocation.outcome = "succeeded";
+          if (
+            invocation.usageEvidence &&
+            !invocation.usageContributionRecorded
+          ) {
+            state.observationUsage = addObservationUsage(
+              state.observationUsage,
+              invocation.usageEvidence,
+            );
+            state.usage = aggregateUsageAsLegacy(state.observationUsage);
+            invocation.usageContributionRecorded = true;
+          }
         }
         break;
       }
       case "invocation.abandoned": {
         const invocation = state.invocations[payload.id as string];
-        if (invocation) invocation.status = "abandoned";
+        if (invocation?.status === "started") {
+          invocation.status = "abandoned";
+          invocation.completedAt = payload.completedAt as string | undefined;
+          invocation.duration = payload.duration as InvocationState["duration"];
+          invocation.actor = payload.actor as
+            | RunnerJobObservationActor
+            | undefined;
+          invocation.recovery = payload.recovery as InvocationState["recovery"];
+          invocation.evidence = payload.evidence as
+            | RunnerJobObservationEvidence
+            | undefined;
+          invocation.outcome = payload.outcome as InvocationState["outcome"];
+          invocation.usageEvidence = payload.usageEvidence as
+            | RunnerJobObservationUsage
+            | undefined;
+          if (invocation.usageEvidence) {
+            state.observationUsage = addObservationUsage(
+              state.observationUsage,
+              invocation.usageEvidence,
+            );
+            state.usage = aggregateUsageAsLegacy(state.observationUsage);
+            invocation.usageContributionRecorded = true;
+          }
+        }
         break;
       }
       case "action.completed":
@@ -235,6 +320,33 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
           seq: payload.seq as number,
           payload: payload.payload as RunnerJobEventPayload,
         });
+        if ((payload.payload as RunnerJobEventPayload).type === "job.context") {
+          state.contextPublished = true;
+        } else if (
+          (payload.payload as RunnerJobEventPayload).type === "stage.started"
+        ) {
+          const observation = payload.payload as Extract<
+            RunnerJobEventPayload,
+            { type: "stage.started" }
+          >;
+          state.observations[observation.observationId] = {
+            observationId: observation.observationId,
+            started: true,
+            finished: false,
+          };
+        } else if (
+          (payload.payload as RunnerJobEventPayload).type === "stage.finished"
+        ) {
+          const observation = payload.payload as Extract<
+            RunnerJobEventPayload,
+            { type: "stage.finished" }
+          >;
+          state.observations[observation.observationId] = {
+            observationId: observation.observationId,
+            started: true,
+            finished: true,
+          };
+        }
         state.nextEventSeq = Math.max(
           state.nextEventSeq,
           (payload.seq as number) + 1,
@@ -260,9 +372,11 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         break;
       case "usage.recorded": {
         const usage = payload.usage as Usage;
-        state.usage = addUsage(state.usage, usage);
         const invocation = state.invocations[payload.id as string];
-        if (invocation) invocation.usage = usage;
+        if (!invocation?.usage) {
+          state.usage = addUsage(state.usage, usage);
+          if (invocation) invocation.usage = usage;
+        }
         break;
       }
       case "warning":

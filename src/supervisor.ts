@@ -8,6 +8,10 @@ import type {
   JobAssignment,
   RunnerJobEventPayload,
   RunnerJobLanding,
+  RunnerJobObservationActor,
+  RunnerJobObservationEvidence,
+  RunnerJobObservationStage,
+  RunnerJobObservationUsage,
   RunnerJobOutput,
   RunnerTaskSnapshot,
 } from "./contracts.js";
@@ -18,6 +22,12 @@ import type {
   AgentResult,
   AgentRole,
 } from "./drivers/types.js";
+import {
+  notApplicableUsage,
+  observationUsageFromLegacy,
+  observedMetric,
+  unavailableMetric,
+} from "./intelligence.js";
 import { ChecksummedJournal } from "./journal.js";
 import {
   builderPrompt,
@@ -77,6 +87,38 @@ function resultDigest(result: AgentResult): string {
     .digest("hex");
 }
 
+function digest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function emptyEvidence(
+  overrides: Partial<RunnerJobObservationEvidence> = {},
+): RunnerJobObservationEvidence {
+  return {
+    operationDigest: null,
+    resultDigest: null,
+    exitCode: null,
+    timedOut: null,
+    changedPathCount: null,
+    blockerFindings: null,
+    majorFindings: null,
+    minorFindings: null,
+    checkpointRef: null,
+    errorCode: null,
+    ...overrides,
+  };
+}
+
+function safeErrorCode(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = String((error as { code?: unknown }).code ?? "");
+    if (/^[A-Za-z0-9_.-]{1,100}$/.test(code)) return code;
+  }
+  return error instanceof Error && /^[A-Za-z0-9_.-]{1,100}$/.test(error.name)
+    ? error.name
+    : "ERROR";
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -122,6 +164,7 @@ export class RunnerJobSupervisor {
   private readonly abort = new AbortController();
   private workspace!: JobWorkspace;
   private workspaceReady = false;
+  private workspaceReleased = false;
   private setupDurationMs = 0;
   private checkDurationMs = 0;
   private readonly answerWaiters = new Map<
@@ -206,6 +249,475 @@ export class RunnerJobSupervisor {
       );
   }
 
+  private observationId(
+    stage: RunnerJobObservationStage,
+    operation: string,
+    taskId: string | null,
+    attempt: number,
+  ): string {
+    return createHash("sha256")
+      .update(
+        `${this.options.assignment.jobId}:${taskId ?? "job"}:${stage}:${operation}:${attempt}`,
+      )
+      .digest("hex")
+      .slice(0, 32);
+  }
+
+  private agentActor(role: AgentRole): RunnerJobObservationActor {
+    const profile =
+      this.options.projectConfig.agents[role === "repairer" ? "builder" : role];
+    const driver = this.driver(role);
+    return {
+      kind: "agent",
+      driver: driver.id,
+      vendor:
+        driver.id === "codex"
+          ? "openai"
+          : driver.id === "claude"
+            ? "anthropic"
+            : null,
+      model: profile.model,
+      effort: profile.effort,
+      role,
+      operation: "invoke",
+    };
+  }
+
+  private backendActor(
+    kind: "command" | "vcs" | "runner",
+    operation: string,
+    role: string | null = null,
+  ): RunnerJobObservationActor {
+    return {
+      kind,
+      driver: kind === "runner" ? "noriq-runner" : this.options.backend.id,
+      vendor: null,
+      model: null,
+      effort: null,
+      role,
+      operation,
+    };
+  }
+
+  private async observe<T>(options: {
+    stage: RunnerJobObservationStage;
+    operation: string;
+    taskId: string | null;
+    attempt?: number;
+    actor: RunnerJobObservationActor;
+    work: () => Promise<T>;
+    evidence?: (result: T) => Partial<RunnerJobObservationEvidence>;
+  }): Promise<T> {
+    let attempt = options.attempt ?? 1;
+    let observationId = this.observationId(
+      options.stage,
+      options.operation,
+      options.taskId,
+      attempt,
+    );
+    while (this.state.observations[observationId]?.finished) {
+      attempt += 1;
+      observationId = this.observationId(
+        options.stage,
+        options.operation,
+        options.taskId,
+        attempt,
+      );
+    }
+    const existing = this.state.observations[observationId];
+    const startedAt = now();
+    if (!existing?.started)
+      await this.emit({
+        type: "stage.started",
+        at: startedAt,
+        observationId,
+        taskId: options.taskId,
+        stage: options.stage,
+        attempt,
+        actor: options.actor,
+      });
+    const monotonicStarted = performance.now();
+    try {
+      const result = await options.work();
+      if (!this.state.observations[observationId]?.finished)
+        await this.emit({
+          type: "stage.finished",
+          at: now(),
+          startedAt,
+          observationId,
+          taskId: options.taskId,
+          stage: options.stage,
+          attempt,
+          actor: options.actor,
+          outcome: "succeeded",
+          duration: observedMetric(
+            Math.max(0, Math.round(performance.now() - monotonicStarted)),
+            "complete",
+            "runner_reported",
+          ),
+          usage: notApplicableUsage(),
+          recovery: existing?.started ? "process_recovery" : "none",
+          evidence: emptyEvidence({
+            operationDigest: digest({
+              driver: options.actor.driver,
+              operation: options.operation,
+            }),
+            ...options.evidence?.(result),
+          }),
+        });
+      return result;
+    } catch (error) {
+      if (!this.state.observations[observationId]?.finished)
+        await this.emit({
+          type: "stage.finished",
+          at: now(),
+          startedAt,
+          observationId,
+          taskId: options.taskId,
+          stage: options.stage,
+          attempt,
+          actor: options.actor,
+          outcome: this.abort.signal.aborted ? "cancelled" : "failed",
+          duration: observedMetric(
+            Math.max(0, Math.round(performance.now() - monotonicStarted)),
+            "complete",
+            "runner_reported",
+          ),
+          usage: notApplicableUsage(),
+          recovery: existing?.started ? "process_recovery" : "none",
+          evidence: emptyEvidence({
+            operationDigest: digest({
+              driver: options.actor.driver,
+              operation: options.operation,
+            }),
+            errorCode: safeErrorCode(error),
+          }),
+        });
+      throw error;
+    }
+  }
+
+  private async emitInvocationFinished(id: string): Promise<void> {
+    const invocation = this.state.invocations[id];
+    if (!invocation || this.state.observations[id]?.finished) return;
+    if (!invocation.actor || !invocation.duration || !invocation.evidence)
+      throw new Error(`invocation ${id} has an incomplete durable observation`);
+    await this.emit({
+      type: "stage.finished",
+      at: invocation.completedAt ?? now(),
+      startedAt: invocation.startedAt ?? invocation.completedAt ?? now(),
+      observationId: id,
+      taskId: invocation.taskId,
+      stage:
+        invocation.role === "guide"
+          ? "plan"
+          : invocation.role === "builder"
+            ? "build"
+            : invocation.role === "reviewer"
+              ? "review"
+              : "repair",
+      attempt: invocation.attempt ?? 1,
+      actor: invocation.actor,
+      outcome: invocation.outcome ?? "failed",
+      duration: invocation.duration,
+      usage: invocation.usageEvidence ?? {
+        inputTokens: unavailableMetric(),
+        outputTokens: unavailableMetric(),
+        cacheReadTokens: unavailableMetric(),
+        cacheWriteTokens: unavailableMetric(),
+        calls: unavailableMetric(),
+        costUsd: unavailableMetric(),
+      },
+      recovery: invocation.recovery ?? "journal_replay",
+      evidence: invocation.evidence,
+    });
+  }
+
+  private async runObservedCommands(options: {
+    taskId: string;
+    stage: "setup" | "check";
+    commands: string[];
+    timeoutSeconds: number;
+    path: string;
+    attempt?: number;
+  }): Promise<CheckResult[]> {
+    const starts = options.commands.map((command, index) => {
+      let attempt = options.attempt ?? 1;
+      let observationId = this.observationId(
+        options.stage,
+        `${options.stage}-command-${index}`,
+        options.taskId,
+        attempt,
+      );
+      while (this.state.observations[observationId]?.finished) {
+        attempt += 1;
+        observationId = this.observationId(
+          options.stage,
+          `${options.stage}-command-${index}`,
+          options.taskId,
+          attempt,
+        );
+      }
+      return {
+        command,
+        observationId,
+        attempt,
+        recovered: false,
+        startedAt: now(),
+        actor: this.backendActor(
+          "command",
+          `${options.stage}.command`,
+          options.stage,
+        ),
+      };
+    });
+    for (const start of starts)
+      start.recovered = Boolean(
+        this.state.observations[start.observationId]?.started,
+      );
+    for (const start of starts) {
+      if (this.state.observations[start.observationId]?.started) continue;
+      await this.emit({
+        type: "stage.started",
+        at: start.startedAt,
+        observationId: start.observationId,
+        taskId: options.taskId,
+        stage: options.stage,
+        attempt: start.attempt,
+        actor: start.actor,
+      });
+    }
+    let checks: CheckResult[];
+    try {
+      checks = await this.options.backend.runCommands(
+        options.path,
+        options.commands,
+        options.timeoutSeconds,
+        this.abort.signal,
+      );
+    } catch (error) {
+      for (const start of starts) {
+        if (this.state.observations[start.observationId]?.finished) continue;
+        await this.emit({
+          type: "stage.finished",
+          at: now(),
+          startedAt: start.startedAt,
+          observationId: start.observationId,
+          taskId: options.taskId,
+          stage: options.stage,
+          attempt: start.attempt,
+          actor: start.actor,
+          outcome: this.abort.signal.aborted ? "cancelled" : "failed",
+          duration: unavailableMetric(),
+          usage: notApplicableUsage(),
+          recovery: start.recovered ? "process_recovery" : "none",
+          evidence: emptyEvidence({
+            operationDigest: digest(start.command),
+            errorCode: safeErrorCode(error),
+          }),
+        });
+      }
+      throw error;
+    }
+    for (const [index, start] of starts.entries()) {
+      if (this.state.observations[start.observationId]?.finished) continue;
+      const check = checks[index];
+      await this.emit({
+        type: "stage.finished",
+        at: now(),
+        startedAt: start.startedAt,
+        observationId: start.observationId,
+        taskId: options.taskId,
+        stage: options.stage,
+        attempt: start.attempt,
+        actor: start.actor,
+        outcome:
+          check && check.exitCode === 0 && !check.timedOut
+            ? "succeeded"
+            : this.abort.signal.aborted
+              ? "cancelled"
+              : "failed",
+        duration:
+          check === undefined
+            ? unavailableMetric()
+            : observedMetric(check.durationMs, "complete", "driver_reported"),
+        usage: notApplicableUsage(),
+        recovery: start.recovered ? "process_recovery" : "none",
+        evidence: emptyEvidence({
+          operationDigest: digest(start.command),
+          resultDigest: check
+            ? digest({
+                exitCode: check.exitCode,
+                durationMs: check.durationMs,
+                timedOut: check.timedOut,
+              })
+            : null,
+          exitCode: check?.exitCode ?? null,
+          timedOut: check?.timedOut ?? null,
+          errorCode: check === undefined ? "MISSING_CHECK_RESULT" : null,
+        }),
+      });
+    }
+    return checks;
+  }
+
+  private async stageCandidateObserved(
+    task: RunnerTaskSnapshot,
+    workspace: TaskWorkspace,
+    summary: string,
+    refresh: boolean,
+    attempt: number,
+  ) {
+    return this.observe({
+      stage: "candidate",
+      operation: refresh ? "refresh-candidate" : "stage-candidate",
+      taskId: task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", "stageCandidate"),
+      work: () =>
+        this.options.backend.stageCandidate({
+          workspace: this.workspace,
+          task: workspace,
+          taskKey: task.key,
+          summary,
+          refresh,
+        }),
+      evidence: (value) => ({
+        changedPathCount:
+          value.status === "conflict"
+            ? value.paths.length
+            : value.changedPaths.length,
+        checkpointRef: value.status === "ready" ? value.checkpoint.ref : null,
+        resultDigest: digest({
+          status: value.status,
+          changedPathCount:
+            value.status === "conflict"
+              ? value.paths.length
+              : value.changedPaths.length,
+        }),
+      }),
+    });
+  }
+
+  private async integrateLatestObserved(
+    task: RunnerTaskSnapshot,
+    workspace: TaskWorkspace,
+    attempt: number,
+  ) {
+    return this.observe({
+      stage: "integrate",
+      operation: "integrate-latest",
+      taskId: task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", "integrateLatest"),
+      work: () =>
+        this.options.backend.integrateLatest(this.workspace, workspace),
+      evidence: (value) => ({
+        changedPathCount:
+          value?.status === "conflict"
+            ? value.paths.length
+            : (value?.changedPaths.length ?? 0),
+        checkpointRef: value?.status === "ready" ? value.checkpoint.ref : null,
+        resultDigest: digest({
+          status: value?.status ?? "not-needed",
+          changedPathCount:
+            value?.status === "conflict"
+              ? value.paths.length
+              : (value?.changedPaths.length ?? 0),
+        }),
+      }),
+    });
+  }
+
+  private async conflictActionObserved(
+    task: RunnerTaskSnapshot,
+    workspace: TaskWorkspace,
+    operation: "continueConflict" | "abortConflict",
+    attempt: number,
+  ): Promise<void> {
+    await this.observe({
+      stage: "integrate",
+      operation,
+      taskId: task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", operation),
+      work: () => this.options.backend[operation](workspace),
+    });
+  }
+
+  private async reviewDiffObserved(
+    built: BuiltTask,
+    attempt: number,
+  ): Promise<string> {
+    return this.observe({
+      stage: "review",
+      operation: "review-diff",
+      taskId: built.task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", "reviewDiff", "reviewer"),
+      work: () =>
+        this.options.backend.reviewDiff(
+          this.workspace,
+          built.workspace,
+          built.candidate,
+        ),
+      evidence: (value) => ({ resultDigest: digest({ bytes: value.length }) }),
+    });
+  }
+
+  private async acceptCandidateObserved(
+    built: BuiltTask,
+    attempt: number,
+  ): Promise<SourceControlCheckpoint> {
+    return this.observe({
+      stage: "accept",
+      operation: "accept-candidate",
+      taskId: built.task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", "acceptCandidate"),
+      work: () =>
+        this.options.backend.acceptCandidate({
+          workspace: this.workspace,
+          task: built.workspace,
+          candidate: built.candidate,
+          taskKey: built.task.key,
+        }),
+      evidence: (value) => ({ checkpointRef: value.ref }),
+    });
+  }
+
+  private async releaseTaskObserved(
+    task: RunnerTaskSnapshot,
+    workspace: TaskWorkspace,
+    attempt: number,
+  ): Promise<void> {
+    await this.observe({
+      stage: "finalize",
+      operation: "release-task",
+      taskId: task.taskId,
+      attempt,
+      actor: this.backendActor("vcs", "releaseTask"),
+      work: () => this.options.backend.releaseTask(this.workspace, workspace),
+    });
+  }
+
+  private async releaseWorkspaceObserved(attempt: number): Promise<void> {
+    if (this.workspaceReleased) return;
+    await this.observe({
+      stage: "finalize",
+      operation: "release-workspace",
+      taskId: null,
+      attempt,
+      actor: this.backendActor("vcs", "release"),
+      work: () =>
+        this.options.backend.release(
+          this.workspace,
+          this.options.assignment.jobId,
+        ),
+    });
+    this.workspaceReleased = true;
+  }
+
   private async invoke(
     task: RunnerTaskSnapshot,
     role: AgentRole,
@@ -222,23 +734,105 @@ export class RunnerJobSupervisor {
       round,
     );
     const driver = this.driver(role);
-    const completed = this.state.invocations[id];
-    const recovered = await driver.recover(id);
-    if (completed?.status === "completed" && recovered) return recovered;
-    if (!completed)
+    const actor = this.agentActor(role);
+    let durable = this.state.invocations[id];
+    if (!durable) {
+      const startedAt = now();
       await this.record("invocation.started", {
         id,
         taskId: task.taskId,
         role,
         status: "started",
+        attempt: round + 1,
+        startedAt,
+        actor,
       });
+      durable = this.state.invocations[id];
+    }
+    if (!this.state.observations[id]?.started)
+      await this.emit({
+        type: "stage.started",
+        at: durable?.startedAt ?? now(),
+        observationId: id,
+        taskId: task.taskId,
+        stage:
+          role === "guide"
+            ? "plan"
+            : role === "builder"
+              ? "build"
+              : role === "reviewer"
+                ? "review"
+                : "repair",
+        attempt: round + 1,
+        actor,
+      });
+    const recovered = await driver.recover(id);
+    if (durable?.status === "completed") {
+      if (!recovered)
+        throw new Error(`completed invocation ${id} lost its durable receipt`);
+      if (
+        !durable.actor ||
+        !durable.duration ||
+        !durable.evidence ||
+        !durable.usageEvidence
+      ) {
+        const digestValue = resultDigest(recovered);
+        await this.record("invocation.completed", {
+          id,
+          resultDigest: digestValue,
+          completedAt: now(),
+          usage: recovered.usage,
+          usageEvidence:
+            recovered.usageEvidence ??
+            observationUsageFromLegacy(
+              recovered.usage,
+              driver.capabilities.usageAccuracy,
+            ),
+          duration:
+            recovered.durationMs === undefined
+              ? unavailableMetric()
+              : observedMetric(
+                  recovered.durationMs,
+                  "complete",
+                  "driver_reported",
+                ),
+          actor,
+          recovery: "journal_replay",
+          evidence: emptyEvidence({ resultDigest: digestValue }),
+        });
+      }
+      await this.emitInvocationFinished(id);
+      await this.emit({ type: "usage", at: now(), usage: this.state.usage });
+      return recovered;
+    }
     if (recovered) {
+      const usageEvidence =
+        recovered.usageEvidence ??
+        observationUsageFromLegacy(
+          recovered.usage,
+          driver.capabilities.usageAccuracy,
+        );
+      const completedAt = now();
       await this.record("invocation.completed", {
         id,
         resultDigest: resultDigest(recovered),
-        recovered: true,
+        completedAt,
+        usage: recovered.usage,
+        usageEvidence,
+        duration:
+          recovered.durationMs === undefined
+            ? unavailableMetric()
+            : observedMetric(
+                recovered.durationMs,
+                "complete",
+                "driver_reported",
+              ),
+        actor,
+        recovery: "process_recovery",
+        evidence: emptyEvidence({ resultDigest: resultDigest(recovered) }),
       });
-      await this.record("usage.recorded", { id, usage: recovered.usage });
+      await this.emitInvocationFinished(id);
+      await this.emit({ type: "usage", at: now(), usage: this.state.usage });
       return recovered;
     }
     const request: AgentRequest = {
@@ -256,21 +850,63 @@ export class RunnerJobSupervisor {
       projectConfig: this.options.projectConfig,
       signal: this.abort.signal,
     };
+    const monotonicStarted = performance.now();
     try {
       const session = await driver.start(request);
       const result = await session.result();
+      const usageEvidence =
+        result.usageEvidence ??
+        observationUsageFromLegacy(
+          result.usage,
+          driver.capabilities.usageAccuracy,
+        );
+      const completedAt = now();
       await this.record("invocation.completed", {
         id,
         resultDigest: resultDigest(result),
-        recovered: false,
+        completedAt,
+        usage: result.usage,
+        usageEvidence,
+        duration: observedMetric(
+          result.durationMs ??
+            Math.max(0, Math.round(performance.now() - monotonicStarted)),
+          "complete",
+          result.durationMs === undefined
+            ? "runner_reported"
+            : "driver_reported",
+        ),
+        actor,
+        recovery: "none",
+        evidence: emptyEvidence({ resultDigest: resultDigest(result) }),
       });
-      await this.record("usage.recorded", { id, usage: result.usage });
+      await this.emitInvocationFinished(id);
+      await this.emit({ type: "usage", at: now(), usage: this.state.usage });
       return result;
     } catch (error) {
+      const usageEvidence: RunnerJobObservationUsage = {
+        inputTokens: unavailableMetric(),
+        outputTokens: unavailableMetric(),
+        cacheReadTokens: unavailableMetric(),
+        cacheWriteTokens: unavailableMetric(),
+        calls: observedMetric(1, "complete", "runner_reported"),
+        costUsd: unavailableMetric(),
+      };
       await this.record("invocation.abandoned", {
         id,
-        reason: error instanceof Error ? error.message : String(error),
+        completedAt: now(),
+        duration: observedMetric(
+          Math.max(0, Math.round(performance.now() - monotonicStarted)),
+          "complete",
+          "runner_reported",
+        ),
+        usageEvidence,
+        actor,
+        recovery: "none",
+        outcome: this.abort.signal.aborted ? "cancelled" : "failed",
+        evidence: emptyEvidence({ errorCode: safeErrorCode(error) }),
       });
+      await this.emitInvocationFinished(id);
+      await this.emit({ type: "usage", at: now(), usage: this.state.usage });
       throw error;
     }
   }
@@ -312,10 +948,26 @@ export class RunnerJobSupervisor {
       const key = `${driver.id}:${access}:${role === "guide"}`;
       if (checked.has(key)) continue;
       checked.add(key);
-      const result = await driver.preflight({
-        workspace: this.workspace.path,
-        access,
-        requireControlMcp: role === "guide",
+      const result = await this.observe({
+        stage: "preflight",
+        operation: `agent-preflight-${driver.id}-${access}-${role}`,
+        taskId: null,
+        actor: { ...this.agentActor(role), operation: "preflight" },
+        work: () =>
+          driver.preflight({
+            workspace: this.workspace.path,
+            access,
+            requireControlMcp: role === "guide",
+          }),
+        evidence: (value) => ({
+          resultDigest: digest({
+            driver: value.driver,
+            version: value.version,
+            authenticated: value.authenticated,
+            runnerControlVisible: value.runnerControlVisible,
+            warnings: value.warnings.length,
+          }),
+        }),
       });
       if (!result.authenticated) throw new Error(`${driver.id} is not ready`);
       if (!driver.capabilities.workspaceAccess.includes(access))
@@ -427,7 +1079,17 @@ export class RunnerJobSupervisor {
     const retained = this.state.tasks[task.taskId];
     const taskWorkspace: TaskWorkspace =
       retained?.workspace ??
-      (await this.options.backend.beginTask(this.workspace, task.key));
+      (await this.observe({
+        stage: "workspace",
+        operation: "begin-task",
+        taskId: task.taskId,
+        actor: this.backendActor("vcs", "beginTask"),
+        work: () => this.options.backend.beginTask(this.workspace, task.key),
+        evidence: (value) => ({
+          resultDigest: digest({ baseRevision: value.baseRevision }),
+          checkpointRef: value.baseRevision,
+        }),
+      }));
     if (!retained?.workspace)
       await this.record("task.workspace", {
         taskId: task.taskId,
@@ -435,14 +1097,18 @@ export class RunnerJobSupervisor {
         jobWorkspace: this.workspace,
       });
     if (this.options.projectConfig.setup.commands.length > 0) {
-      const started = Date.now();
-      const setup = await this.options.backend.runCommands(
-        taskWorkspace.path,
-        this.options.projectConfig.setup.commands,
-        this.options.projectConfig.setup.timeoutSeconds,
-        this.abort.signal,
+      const started = performance.now();
+      const setup = await this.runObservedCommands({
+        taskId: task.taskId,
+        stage: "setup",
+        commands: this.options.projectConfig.setup.commands,
+        timeoutSeconds: this.options.projectConfig.setup.timeoutSeconds,
+        path: taskWorkspace.path,
+      });
+      this.setupDurationMs += Math.max(
+        0,
+        Math.round(performance.now() - started),
       );
-      this.setupDurationMs += Date.now() - started;
       if (failedChecks(setup).length > 0)
         throw new Error(
           `setup failed for ${task.key}: ${failedChecks(setup)[0]!.output}`,
@@ -465,13 +1131,13 @@ export class RunnerJobSupervisor {
     );
     let candidate = retained?.candidate;
     if (!candidate) {
-      const staged = await this.options.backend.stageCandidate({
-        workspace: this.workspace,
-        task: taskWorkspace,
-        taskKey: task.key,
-        summary: builder.summary,
-        refresh: false,
-      });
+      const staged = await this.stageCandidateObserved(
+        task,
+        taskWorkspace,
+        builder.summary,
+        false,
+        1,
+      );
       if (staged.status === "conflict")
         throw new IntegrationConflict(
           "candidate staging requires conflict repair",
@@ -500,9 +1166,10 @@ export class RunnerJobSupervisor {
     let round = 0;
     try {
       while (true) {
-        const integration = await this.options.backend.integrateLatest(
-          this.workspace,
+        const integration = await this.integrateLatestObserved(
+          task,
           built.workspace,
+          round + 1,
         );
         if (integration?.status === "conflict") {
           if (!this.options.backend.capabilities.automatedConflictRepair)
@@ -510,7 +1177,12 @@ export class RunnerJobSupervisor {
               `${this.options.backend.id} integration requires human resolution: ${integration.detail}`,
             );
           if (round >= this.options.projectConfig.harness.maxRepairRounds) {
-            await this.options.backend.abortConflict(built.workspace);
+            await this.conflictActionObserved(
+              task,
+              built.workspace,
+              "abortConflict",
+              round + 1,
+            );
             throw new Error("integration conflict exceeded the repair ceiling");
           }
           round += 1;
@@ -545,14 +1217,19 @@ export class RunnerJobSupervisor {
               ),
               workerOutputSchema,
             );
-            await this.options.backend.continueConflict(built.workspace);
-            const staged = await this.options.backend.stageCandidate({
-              workspace: this.workspace,
-              task: built.workspace,
-              taskKey: task.key,
-              summary: repair.summary,
-              refresh: true,
-            });
+            await this.conflictActionObserved(
+              task,
+              built.workspace,
+              "continueConflict",
+              round,
+            );
+            const staged = await this.stageCandidateObserved(
+              task,
+              built.workspace,
+              repair.summary,
+              true,
+              round + 1,
+            );
             if (staged.status === "conflict") throw new Error(staged.detail);
             built.candidate = staged.checkpoint;
             await this.record("task.candidate", {
@@ -561,7 +1238,12 @@ export class RunnerJobSupervisor {
               workspace: built.workspace,
             });
           } catch (repairError) {
-            await this.options.backend.abortConflict(built.workspace);
+            await this.conflictActionObserved(
+              task,
+              built.workspace,
+              "abortConflict",
+              round,
+            );
             throw repairError;
           }
           continue;
@@ -581,20 +1263,21 @@ export class RunnerJobSupervisor {
           message: `Checking ${task.key}`,
           progress: 0,
         });
-        const checkStarted = Date.now();
-        const checks = await this.options.backend.runCommands(
-          built.workspace.path,
-          this.options.projectConfig.checks.commands,
-          this.options.projectConfig.checks.timeoutSeconds,
-          this.abort.signal,
+        const checkStarted = performance.now();
+        const checks = await this.runObservedCommands({
+          taskId: task.taskId,
+          stage: "check",
+          commands: this.options.projectConfig.checks.commands,
+          timeoutSeconds: this.options.projectConfig.checks.timeoutSeconds,
+          path: built.workspace.path,
+          attempt: round + 1,
+        });
+        this.checkDurationMs += Math.max(
+          0,
+          Math.round(performance.now() - checkStarted),
         );
-        this.checkDurationMs += Date.now() - checkStarted;
         await this.record("task.checked", { taskId: task.taskId, checks });
-        const diff = await this.options.backend.reviewDiff(
-          this.workspace,
-          built.workspace,
-          built.candidate,
-        );
+        const diff = await this.reviewDiffObserved(built, round + 1);
         await this.emit({
           type: "progress",
           at: now(),
@@ -630,26 +1313,25 @@ export class RunnerJobSupervisor {
             await this.record("workspace.updated", {
               workspace: this.workspace,
             });
-            acceptedCheckpoint = await this.options.backend.acceptCandidate({
-              workspace: this.workspace,
-              task: built.workspace,
-              candidate: built.candidate,
-              taskKey: task.key,
-            });
+            acceptedCheckpoint = await this.acceptCandidateObserved(
+              built,
+              round + 1,
+            );
           } catch (error) {
             if (!(error instanceof IntegrationConflict)) throw error;
-            const reintegration = await this.options.backend.integrateLatest(
-              this.workspace,
+            const reintegration = await this.integrateLatestObserved(
+              task,
               built.workspace,
+              100 + round,
             );
             if (!reintegration || reintegration.status === "ready") {
-              const restaged = await this.options.backend.stageCandidate({
-                workspace: this.workspace,
-                task: built.workspace,
-                taskKey: task.key,
-                summary: "candidate refreshed after target movement",
-                refresh: true,
-              });
+              const restaged = await this.stageCandidateObserved(
+                task,
+                built.workspace,
+                "candidate refreshed after target movement",
+                true,
+                100 + round,
+              );
               if (restaged.status === "conflict")
                 throw new Error(restaged.detail);
               built.candidate = restaged.checkpoint;
@@ -689,14 +1371,19 @@ export class RunnerJobSupervisor {
               ),
               workerOutputSchema,
             );
-            await this.options.backend.continueConflict(built.workspace);
-            const restaged = await this.options.backend.stageCandidate({
-              workspace: this.workspace,
-              task: built.workspace,
-              taskKey: task.key,
-              summary: repair.summary,
-              refresh: true,
-            });
+            await this.conflictActionObserved(
+              task,
+              built.workspace,
+              "continueConflict",
+              100 + round,
+            );
+            const restaged = await this.stageCandidateObserved(
+              task,
+              built.workspace,
+              repair.summary,
+              true,
+              200 + round,
+            );
             if (restaged.status === "conflict")
               throw new Error(restaged.detail);
             built.candidate = restaged.checkpoint;
@@ -723,10 +1410,7 @@ export class RunnerJobSupervisor {
             summary: built.buildSummary,
             findings: reviewer.findings,
           });
-          await this.options.backend.releaseTask(
-            this.workspace,
-            built.workspace,
-          );
+          await this.releaseTaskObserved(task, built.workspace, round + 1);
           return true;
         }
         if (round >= this.options.projectConfig.harness.maxRepairRounds) {
@@ -764,13 +1448,13 @@ export class RunnerJobSupervisor {
           repairPrompt(task, built.contract, blockers, failures, round),
           workerOutputSchema,
         );
-        const staged = await this.options.backend.stageCandidate({
-          workspace: this.workspace,
-          task: built.workspace,
-          taskKey: task.key,
-          summary: repair.summary,
-          refresh: true,
-        });
+        const staged = await this.stageCandidateObserved(
+          task,
+          built.workspace,
+          repair.summary,
+          true,
+          round + 1,
+        );
         if (staged.status === "conflict")
           throw new IntegrationConflict(
             "candidate refresh requires conflict repair",
@@ -817,11 +1501,22 @@ export class RunnerJobSupervisor {
     reason: string,
     publishWarning = true,
   ): Promise<void> {
-    const location = await this.options.backend.preserveFailedWork({
-      workspace: this.workspace,
-      task: built.workspace,
-      taskKey: built.task.key,
-      reason,
+    const location = await this.observe({
+      stage: "preserve",
+      operation: "preserve-failed-work",
+      taskId: built.task.taskId,
+      attempt: this.state.tasks[built.task.taskId]!.repairRounds + 1,
+      actor: this.backendActor("vcs", "preserveFailedWork"),
+      work: () =>
+        this.options.backend.preserveFailedWork({
+          workspace: this.workspace,
+          task: built.workspace,
+          taskKey: built.task.key,
+          reason,
+        }),
+      evidence: (value) => ({
+        resultDigest: digest({ retained: value !== null, vcs: value?.vcs }),
+      }),
     });
     if (location) {
       await this.record("task.retained", {
@@ -838,7 +1533,11 @@ export class RunnerJobSupervisor {
           message,
         });
     }
-    await this.options.backend.releaseTask(this.workspace, built.workspace);
+    await this.releaseTaskObserved(
+      built.task,
+      built.workspace,
+      1000 + this.state.tasks[built.task.taskId]!.repairRounds,
+    );
   }
 
   private async cleanupFailedBuildTask(
@@ -848,11 +1547,22 @@ export class RunnerJobSupervisor {
   ): Promise<void> {
     const retained = this.state.tasks[task.taskId];
     if (!retained?.workspace) return;
-    const location = await this.options.backend.preserveFailedWork({
-      workspace: this.workspace,
-      task: retained.workspace,
-      taskKey: task.key,
-      reason,
+    const location = await this.observe({
+      stage: "preserve",
+      operation: "preserve-failed-build",
+      taskId: task.taskId,
+      attempt: retained.repairRounds + 1,
+      actor: this.backendActor("vcs", "preserveFailedWork"),
+      work: () =>
+        this.options.backend.preserveFailedWork({
+          workspace: this.workspace,
+          task: retained.workspace!,
+          taskKey: task.key,
+          reason,
+        }),
+      evidence: (value) => ({
+        resultDigest: digest({ retained: value !== null, vcs: value?.vcs }),
+      }),
     });
     if (location) {
       await this.record("task.retained", { taskId: task.taskId, location });
@@ -866,14 +1576,30 @@ export class RunnerJobSupervisor {
           message,
         });
     }
-    await this.options.backend.releaseTask(this.workspace, retained.workspace);
+    await this.releaseTaskObserved(
+      task,
+      retained.workspace,
+      2000 + retained.repairRounds,
+    );
   }
 
   private async terminalOutput(
     status: "succeeded" | "partial" | "failed" | "cancelled",
     started: number,
+    attempt: number,
   ): Promise<RunnerJobOutput> {
-    const inspection = await this.options.backend.inspect(this.workspace);
+    const inspection = await this.observe({
+      stage: "finalize",
+      operation: "inspect-workspace",
+      taskId: null,
+      attempt,
+      actor: this.backendActor("vcs", "inspect"),
+      work: () => this.options.backend.inspect(this.workspace),
+      evidence: (value) => ({
+        changedPathCount: value.dirtyPaths.length,
+        checkpointRef: value.revision,
+      }),
+    });
     const acceptedTaskCheckpoints = Object.fromEntries(
       Object.values(this.state.tasks)
         .filter((task) => task.status === "accepted" && task.checkpoint)
@@ -940,7 +1666,7 @@ export class RunnerJobSupervisor {
       checks,
       findings,
       usage: this.state.usage,
-      summary: `${status}: ${Object.keys(acceptedTaskCheckpoints).length} task(s) accepted in ${Date.now() - started}ms (setup ${this.setupDurationMs}ms, checks ${this.checkDurationMs}ms).`,
+      summary: `${status}: ${Object.keys(acceptedTaskCheckpoints).length} task(s) accepted in ${Math.max(0, Math.round(performance.now() - started))}ms (setup ${this.setupDurationMs}ms, checks ${this.checkDurationMs}ms).`,
       dirtyPaths: inspection.dirtyPaths,
       landing,
     };
@@ -958,17 +1684,35 @@ export class RunnerJobSupervisor {
     );
     let landing: RunnerJobLanding;
     try {
-      await this.options.backend.recoverOrphans(
-        this.options.repository,
-        this.options.stateDirectory,
-      );
-      const result = await this.options.backend.land({
-        repository: this.options.repository,
-        stateDirectory: this.options.stateDirectory,
-        jobId: this.options.assignment.jobId,
-        workspace: this.workspace,
-        target,
-        acceptedTaskCheckpoints,
+      await this.observe({
+        stage: "landing",
+        operation: "recover-orphans-before-auto-land",
+        taskId: null,
+        actor: this.backendActor("vcs", "recoverOrphans"),
+        work: () =>
+          this.options.backend.recoverOrphans(
+            this.options.repository,
+            this.options.stateDirectory,
+          ),
+        evidence: (value) => ({
+          resultDigest: digest({ warningCount: value.length }),
+        }),
+      });
+      const result = await this.observe({
+        stage: "landing",
+        operation: "auto-land",
+        taskId: null,
+        actor: this.backendActor("vcs", "land"),
+        work: () =>
+          this.options.backend.land({
+            repository: this.options.repository,
+            stateDirectory: this.options.stateDirectory,
+            jobId: this.options.assignment.jobId,
+            workspace: this.workspace,
+            target,
+            acceptedTaskCheckpoints,
+          }),
+        evidence: (value) => ({ checkpointRef: value.checkpoint.ref }),
       });
       landing = {
         policy: "auto",
@@ -995,7 +1739,7 @@ export class RunnerJobSupervisor {
   }
 
   private async execute(): Promise<RunnerJobOutput> {
-    const started = Date.now();
+    const started = performance.now();
     const jobDirectory = join(
       this.options.stateDirectory,
       "jobs",
@@ -1023,18 +1767,39 @@ export class RunnerJobSupervisor {
     const source = this.options.assignment.source;
     const outputKey = source.kind === "task" ? source.task.key : source.planKey;
     if (!this.state.workspace) {
-      const orphanWarnings = await this.options.backend.recoverOrphans(
-        this.options.repository,
-        this.options.stateDirectory,
-      );
-      this.workspace = await this.options.backend.openJob({
-        repository: this.options.repository,
-        stateDirectory: this.options.stateDirectory,
-        jobId: this.options.assignment.jobId,
-        key: outputKey,
-        kind: source.kind,
-        expectedBaseRevision: this.options.assignment.expectedBaseRevision,
-        config: this.options.projectConfig,
+      const orphanWarnings = await this.observe({
+        stage: "workspace",
+        operation: "recover-orphans",
+        taskId: null,
+        actor: this.backendActor("vcs", "recoverOrphans"),
+        work: () =>
+          this.options.backend.recoverOrphans(
+            this.options.repository,
+            this.options.stateDirectory,
+          ),
+        evidence: (value) => ({
+          resultDigest: digest({ warningCount: value.length }),
+        }),
+      });
+      this.workspace = await this.observe({
+        stage: "workspace",
+        operation: "open-job",
+        taskId: null,
+        actor: this.backendActor("vcs", "openJob"),
+        work: () =>
+          this.options.backend.openJob({
+            repository: this.options.repository,
+            stateDirectory: this.options.stateDirectory,
+            jobId: this.options.assignment.jobId,
+            key: outputKey,
+            kind: source.kind,
+            expectedBaseRevision: this.options.assignment.expectedBaseRevision,
+            config: this.options.projectConfig,
+          }),
+        evidence: (value) => ({
+          checkpointRef: value.baseRevision,
+          resultDigest: digest({ vcs: value.vcs, mode: value.mode }),
+        }),
       });
       await this.record("workspace.opened", { workspace: this.workspace });
       for (const message of [
@@ -1050,14 +1815,22 @@ export class RunnerJobSupervisor {
         });
       }
     } else
-      this.workspace = await this.options.backend.restoreJob({
-        repository: this.options.repository,
-        stateDirectory: this.options.stateDirectory,
-        jobId: this.options.assignment.jobId,
-        handle: this.state.workspace.handle,
-        baseRevision: this.state.workspace.baseRevision,
-        currentRevision: this.state.workspace.currentRevision,
-        mode: this.options.projectConfig.sourceControl.mode,
+      this.workspace = await this.observe({
+        stage: "workspace",
+        operation: "restore-job",
+        taskId: null,
+        actor: this.backendActor("vcs", "restoreJob"),
+        work: () =>
+          this.options.backend.restoreJob({
+            repository: this.options.repository,
+            stateDirectory: this.options.stateDirectory,
+            jobId: this.options.assignment.jobId,
+            handle: this.state.workspace!.handle,
+            baseRevision: this.state.workspace!.baseRevision,
+            currentRevision: this.state.workspace!.currentRevision,
+            mode: this.options.projectConfig.sourceControl.mode,
+          }),
+        evidence: (value) => ({ checkpointRef: value.currentRevision }),
       });
     this.workspaceReady = true;
     for (const event of this.state.outboundEvents) {
@@ -1069,6 +1842,31 @@ export class RunnerJobSupervisor {
       );
       if (acknowledged >= event.seq)
         await this.record("event.acked", { seq: acknowledged });
+    }
+    if (!this.state.contextPublished) {
+      const profile = (role: "guide" | "builder" | "reviewer") => ({
+        role,
+        driver: this.options.projectConfig.agents[role].driver,
+        vendor:
+          this.options.projectConfig.agents[role].driver === "codex"
+            ? "openai"
+            : this.options.projectConfig.agents[role].driver === "claude"
+              ? "anthropic"
+              : null,
+        model: this.options.projectConfig.agents[role].model,
+        effort: this.options.projectConfig.agents[role].effort,
+      });
+      await this.emit({
+        type: "job.context",
+        at: now(),
+        vcs: this.workspace.vcs,
+        workspaceMode: this.workspace.mode,
+        landingPolicy:
+          this.workspace.mode === "direct"
+            ? "direct"
+            : this.options.projectConfig.sourceControl.landing,
+        agents: [profile("guide"), profile("builder"), profile("reviewer")],
+      });
     }
     await this.preflight();
     await this.record("job.started", {});
@@ -1179,14 +1977,34 @@ export class RunnerJobSupervisor {
       this.options.projectConfig.sourceControl.landing === "auto"
     )
       await this.performAutomaticLanding();
-    const output = await this.terminalOutput(status, started);
+    const output = await this.observe({
+      stage: "finalize",
+      operation: "terminal-output",
+      taskId: null,
+      actor: this.backendActor("runner", "terminalOutput"),
+      work: () => this.terminalOutput(status, started, 1),
+      evidence: (value) => ({
+        changedPathCount: value.dirtyPaths.length,
+        checkpointRef: value.headRevision,
+        blockerFindings: value.findings.filter(
+          (item) => item.severity === "blocker",
+        ).length,
+        majorFindings: value.findings.filter(
+          (item) => item.severity === "major",
+        ).length,
+        minorFindings: value.findings.filter(
+          (item) => item.severity === "minor",
+        ).length,
+      }),
+    });
+    await this.releaseWorkspaceObserved(1);
     await this.emit({ type: "terminal", at: now(), status, output });
     await this.record("job.terminal", { status });
     return output;
   }
 
   async run(): Promise<RunnerJobOutput> {
-    const started = Date.now();
+    const started = performance.now();
     try {
       return await this.execute();
     } catch (error) {
@@ -1228,12 +2046,24 @@ export class RunnerJobSupervisor {
         : accepted
           ? "partial"
           : "failed";
-      const output = await this.terminalOutput(status, started);
+      const output = await this.observe({
+        stage: "finalize",
+        operation: "terminal-output",
+        taskId: null,
+        attempt: 2,
+        actor: this.backendActor("runner", "terminalOutput"),
+        work: () => this.terminalOutput(status, started, 2),
+        evidence: (value) => ({
+          changedPathCount: value.dirtyPaths.length,
+          checkpointRef: value.headRevision,
+        }),
+      });
+      await this.releaseWorkspaceObserved(2);
       await this.emit({ type: "terminal", at: now(), status, output });
       await this.record("job.terminal", { status });
       return output;
     } finally {
-      if (this.workspaceReady)
+      if (this.workspaceReady && !this.workspaceReleased)
         await this.options.backend.release(
           this.workspace,
           this.options.assignment.jobId,
@@ -1271,6 +2101,7 @@ export async function landDurableJob(options: {
   assignmentId: string;
   requestId: string;
   target: string;
+  sink?: JobEventSink;
 }): Promise<LandingReport> {
   const journal = await ChecksummedJournal.open(
     join(
@@ -1322,19 +2153,143 @@ export async function landDurableJob(options: {
   if (!workspace)
     throw new Error("durable RunnerJob lost its retained workspace");
   let result: LandingReport;
-  try {
-    await options.backend.recoverOrphans(
-      options.repository,
-      options.stateDirectory,
-    );
-    const landed = await options.backend.land({
-      repository: options.repository,
-      stateDirectory: options.stateDirectory,
-      jobId: options.jobId,
-      workspace,
-      target: options.target,
-      acceptedTaskCheckpoints,
+  const publish = async (payload: RunnerJobEventPayload): Promise<void> => {
+    if (!options.sink) return;
+    const seq = state.nextEventSeq;
+    state = await appendDurableRecord(journal, "event.queued", {
+      seq,
+      payload,
     });
+    const acknowledged = await options.sink.publish(
+      options.jobId,
+      options.assignmentId,
+      seq,
+      payload,
+    );
+    if (acknowledged >= seq)
+      state = await appendDurableRecord(journal, "event.acked", {
+        seq: acknowledged,
+      });
+  };
+  const observeLanding = async <T>(
+    operation: string,
+    requestedAttempt: number,
+    work: () => Promise<T>,
+    evidence: (value: T) => Partial<RunnerJobObservationEvidence>,
+  ): Promise<T> => {
+    let attempt = requestedAttempt;
+    const observationIdFor = () =>
+      createHash("sha256")
+        .update(
+          `${options.jobId}:landing:${options.requestId}:${operation}:${attempt}`,
+        )
+        .digest("hex")
+        .slice(0, 32);
+    let observationId = observationIdFor();
+    while (state.observations[observationId]?.finished) {
+      attempt += 1;
+      observationId = observationIdFor();
+    }
+    const actor: RunnerJobObservationActor = {
+      kind: "vcs",
+      driver: options.backend.id,
+      vendor: null,
+      model: null,
+      effort: null,
+      role: null,
+      operation,
+    };
+    const startedAt = now();
+    const recovered = Boolean(state.observations[observationId]?.started);
+    if (!recovered)
+      await publish({
+        type: "stage.started",
+        at: startedAt,
+        observationId,
+        taskId: null,
+        stage: "landing",
+        attempt,
+        actor,
+      });
+    const monotonicStarted = performance.now();
+    try {
+      const value = await work();
+      if (!state.observations[observationId]?.finished)
+        await publish({
+          type: "stage.finished",
+          at: now(),
+          startedAt,
+          observationId,
+          taskId: null,
+          stage: "landing",
+          attempt,
+          actor,
+          outcome: "succeeded",
+          duration: observedMetric(
+            Math.max(0, Math.round(performance.now() - monotonicStarted)),
+            "complete",
+            "runner_reported",
+          ),
+          usage: notApplicableUsage(),
+          recovery: recovered ? "process_recovery" : "none",
+          evidence: emptyEvidence({
+            operationDigest: digest({ driver: options.backend.id, operation }),
+            ...evidence(value),
+          }),
+        });
+      return value;
+    } catch (error) {
+      if (!state.observations[observationId]?.finished)
+        await publish({
+          type: "stage.finished",
+          at: now(),
+          startedAt,
+          observationId,
+          taskId: null,
+          stage: "landing",
+          attempt,
+          actor,
+          outcome: "failed",
+          duration: observedMetric(
+            Math.max(0, Math.round(performance.now() - monotonicStarted)),
+            "complete",
+            "runner_reported",
+          ),
+          usage: notApplicableUsage(),
+          recovery: recovered ? "process_recovery" : "none",
+          evidence: emptyEvidence({
+            operationDigest: digest({ driver: options.backend.id, operation }),
+            errorCode: safeErrorCode(error),
+          }),
+        });
+      throw error;
+    }
+  };
+  try {
+    await observeLanding(
+      "recoverOrphans",
+      1,
+      () =>
+        options.backend.recoverOrphans(
+          options.repository,
+          options.stateDirectory,
+        ),
+      (value) => ({ resultDigest: digest({ warningCount: value.length }) }),
+    );
+    const landed = await observeLanding(
+      "land",
+      1,
+      () =>
+        options.backend.land({
+          repository: options.repository,
+          stateDirectory: options.stateDirectory,
+          jobId: options.jobId,
+          workspace,
+          target: options.target,
+          acceptedTaskCheckpoints,
+        }),
+      (value) => ({ checkpointRef: value.checkpoint.ref }),
+    );
     result = {
       status: "landed",
       target: landed.target,

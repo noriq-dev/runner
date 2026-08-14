@@ -6,8 +6,13 @@ import {
   initializeClaudeProjectState,
 } from "../agent-home.js";
 import type { MachineConfig } from "../config.js";
-import { findingSchema, usageSchema } from "../contracts.js";
+import {
+  findingSchema,
+  observationUsageSchema,
+  usageSchema,
+} from "../contracts.js";
 import { controlMcpCommand } from "../control-mcp-command.js";
+import { observedMetric } from "../intelligence.js";
 import { runProcess } from "../process.js";
 import type {
   AgentDriver,
@@ -181,16 +186,16 @@ function configArguments(
   ];
 }
 
-function numberField(
+function optionalNumberField(
   value: Record<string, unknown>,
   ...names: string[]
-): number {
+): number | undefined {
   for (const name of names) {
     const candidate = value[name];
     if (typeof candidate === "number" && Number.isFinite(candidate))
-      return Math.max(0, Math.trunc(candidate));
+      return Math.max(0, candidate);
   }
-  return 0;
+  return undefined;
 }
 
 export abstract class BuiltinCliAgentDriver implements AgentDriver {
@@ -634,36 +639,59 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       typeof structured.usage === "object" && structured.usage
         ? (structured.usage as Record<string, unknown>)
         : frameUsage;
-    const reportedInput = numberField(
+    const reportedInputValue = optionalNumberField(
       reportedUsage,
       "inputTokens",
       "input_tokens",
     );
-    const cacheRead = numberField(
+    const cacheReadValue = optionalNumberField(
       reportedUsage,
       "cachedTokens",
       "cached_input_tokens",
       "cache_read_input_tokens",
     );
-    const cacheCreation = numberField(
+    const cacheCreationValue = optionalNumberField(
       reportedUsage,
       "cacheCreationTokens",
       "cache_creation_input_tokens",
     );
+    const reportedInput = Math.trunc(reportedInputValue ?? 0);
+    const cacheRead = Math.trunc(cacheReadValue ?? 0);
+    const cacheCreation = Math.trunc(cacheCreationValue ?? 0);
+    const outputValue = optionalNumberField(
+      reportedUsage,
+      "outputTokens",
+      "output_tokens",
+    );
+    const costValue =
+      typeof reportedUsage.costUsd === "number"
+        ? reportedUsage.costUsd
+        : typeof finalFrame?.total_cost_usd === "number"
+          ? finalFrame.total_cost_usd
+          : undefined;
     const usage = usageSchema.parse({
       inputTokens:
         this.adapter === "codex"
           ? Math.max(0, reportedInput - cacheRead)
           : reportedInput,
-      outputTokens: numberField(reportedUsage, "outputTokens", "output_tokens"),
+      outputTokens: Math.trunc(outputValue ?? 0),
       cachedTokens: cacheRead + cacheCreation,
-      costUsd:
-        typeof reportedUsage.costUsd === "number"
-          ? reportedUsage.costUsd
-          : typeof finalFrame?.total_cost_usd === "number"
-            ? finalFrame.total_cost_usd
-            : null,
+      costUsd: costValue ?? null,
       calls: 1,
+    });
+    const usageEvidence = observationUsageSchema.parse({
+      inputTokens: observedMetric(
+        reportedInputValue === undefined
+          ? undefined
+          : this.adapter === "codex"
+            ? Math.max(0, reportedInput - cacheRead)
+            : reportedInput,
+      ),
+      outputTokens: observedMetric(outputValue),
+      cacheReadTokens: observedMetric(cacheReadValue),
+      cacheWriteTokens: observedMetric(cacheCreationValue),
+      calls: observedMetric(1),
+      costUsd: observedMetric(costValue),
     });
     const agentResult: AgentResult = {
       success: true,
@@ -671,6 +699,8 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       ...(typeof structured.plan === "string" ? { plan: structured.plan } : {}),
       findings,
       usage,
+      usageEvidence,
+      durationMs: result.durationMs,
       rawLogPath,
       structured,
     };

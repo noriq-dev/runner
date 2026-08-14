@@ -27,4 +27,105 @@ describe("checksummed journal", () => {
     await appendFile(path, '{"version":1,"seq":4}\n');
     await expect(ChecksummedJournal.open(path)).rejects.toThrow();
   });
+
+  it("replays atomic invocation evidence once and preserves partial known cost", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "runner-usage-journal-"));
+    const journal = await ChecksummedJournal.open(
+      join(directory, "events.jsonl"),
+    );
+    const actor = {
+      kind: "agent",
+      driver: "external",
+      vendor: null,
+      model: "model",
+      effort: "medium",
+      role: "builder",
+      operation: "invoke",
+    };
+    const evidence = {
+      operationDigest: null,
+      resultDigest: "a".repeat(64),
+      exitCode: null,
+      timedOut: null,
+      changedPathCount: null,
+      blockerFindings: null,
+      majorFindings: null,
+      minorFindings: null,
+      checkpointRef: null,
+      errorCode: null,
+    };
+    const metric = (value: number) => ({
+      status: "complete",
+      value,
+      provenance: "driver_reported",
+    });
+    const usage = (cost: number | null) => ({
+      inputTokens: metric(10),
+      outputTokens: metric(5),
+      cacheReadTokens: metric(2),
+      cacheWriteTokens: {
+        status: "unavailable",
+        value: null,
+        provenance: "not_reported",
+      },
+      calls: metric(1),
+      costUsd:
+        cost === null
+          ? {
+              status: "unavailable",
+              value: null,
+              provenance: "not_reported",
+            }
+          : metric(cost),
+    });
+    for (const [id, cost] of [
+      ["one", 1.25],
+      ["two", null],
+    ] as const) {
+      await journal.append("invocation.started", {
+        id,
+        taskId: "task",
+        role: "builder",
+        status: "started",
+        attempt: 1,
+        startedAt: new Date().toISOString(),
+        actor,
+      });
+      await journal.append("invocation.completed", {
+        id,
+        completedAt: new Date().toISOString(),
+        resultDigest: "a".repeat(64),
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cachedTokens: 2,
+          costUsd: cost,
+          calls: 1,
+        },
+        usageEvidence: usage(cost),
+        duration: metric(10),
+        actor,
+        recovery: "none",
+        evidence,
+      });
+    }
+    await journal.append("invocation.completed", {
+      id: "one",
+      usageEvidence: usage(1.25),
+    });
+    const state = reduceJobState(journal.all());
+    expect(state.observationUsage.costUsd).toEqual({
+      status: "partial",
+      value: 1.25,
+      provenance: "derived",
+    });
+    expect(state.observationUsage.calls.value).toBe(2);
+    expect(state.usage).toMatchObject({
+      inputTokens: 20,
+      outputTokens: 10,
+      cachedTokens: 4,
+      costUsd: null,
+      calls: 2,
+    });
+  });
 });

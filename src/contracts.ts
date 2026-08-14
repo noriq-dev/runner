@@ -5,10 +5,17 @@ import {
   type RunnerJobAssignment as JobAssignment,
   RunnerJobAssignment,
   RunnerJobCheck,
+  type RunnerJobDurationMetric,
   RunnerJobEvent,
   type RunnerJobEvent as RunnerJobEventPayload,
   RunnerJobFinding,
   type RunnerJobLanding as RunnerJobLandingType,
+  type RunnerJobObservationActor,
+  RunnerJobObservationEvidence,
+  type RunnerJobObservationEvidence as RunnerJobObservationEvidenceType,
+  type RunnerJobObservationStage,
+  RunnerJobObservationUsage,
+  type RunnerJobObservationUsage as RunnerJobObservationUsageType,
   RunnerJobOutput,
   type RunnerJobOutput as RunnerJobOutputType,
   RunnerJobPhase,
@@ -27,6 +34,8 @@ import {
 export const checkResultSchema = RunnerJobCheck;
 export const runnerJobEventPayloadSchema = RunnerJobEvent;
 export const findingSchema = RunnerJobFinding;
+export const observationEvidenceSchema = RunnerJobObservationEvidence;
+export const observationUsageSchema = RunnerJobObservationUsage;
 export const runnerJobOutputSchema = RunnerJobOutput;
 export const runnerJobPhaseSchema = RunnerJobPhase;
 export const runnerJobSourceSchema = RunnerJobSource;
@@ -39,8 +48,13 @@ export type {
   CheckResult,
   Finding,
   JobAssignment,
+  RunnerJobDurationMetric,
   RunnerJobEventPayload,
   RunnerJobLandingType as RunnerJobLanding,
+  RunnerJobObservationActor,
+  RunnerJobObservationEvidenceType as RunnerJobObservationEvidence,
+  RunnerJobObservationStage,
+  RunnerJobObservationUsageType as RunnerJobObservationUsage,
   RunnerJobOutputType as RunnerJobOutput,
   RunnerJobPhaseType as RunnerJobPhase,
   RunnerJobSourceType as RunnerJobSource,

@@ -100,6 +100,92 @@ export const RunnerJobUsage = z.object({
 }).strict();
 export type RunnerJobUsage = z.infer<typeof RunnerJobUsage>;
 
+/**
+ * Stable intelligence vocabulary for RunnerJob work. These stages are deliberately
+ * finer grained than RunnerJobPhase: phases drive the operator-facing lifecycle,
+ * while stages describe bounded work without creating execution child nodes.
+ */
+export const RunnerJobObservationStage = z.enum([
+  'preflight', 'workspace', 'plan', 'setup', 'build', 'candidate', 'integrate',
+  'check', 'review', 'repair', 'accept', 'preserve', 'finalize', 'human_wait', 'landing',
+]);
+export type RunnerJobObservationStage = z.infer<typeof RunnerJobObservationStage>;
+
+export const RunnerJobMetricStatus = z.enum(['complete', 'partial', 'unavailable', 'not_applicable']);
+export type RunnerJobMetricStatus = z.infer<typeof RunnerJobMetricStatus>;
+
+export const RunnerJobMetricProvenance = z.enum([
+  'runner_reported', 'driver_reported', 'derived', 'server_measured', 'not_reported',
+]);
+export type RunnerJobMetricProvenance = z.infer<typeof RunnerJobMetricProvenance>;
+
+const metricEnvelope = <T extends z.ZodTypeAny>(value: T) => z.discriminatedUnion('status', [
+  z.object({
+    status: z.literal('complete'), value, provenance: RunnerJobMetricProvenance.exclude(['not_reported']),
+  }).strict(),
+  z.object({
+    status: z.literal('partial'), value, provenance: RunnerJobMetricProvenance.exclude(['not_reported']),
+  }).strict(),
+  z.object({
+    status: z.literal('unavailable'), value: z.null(), provenance: RunnerJobMetricProvenance,
+  }).strict(),
+  z.object({
+    status: z.literal('not_applicable'), value: z.null(), provenance: RunnerJobMetricProvenance,
+  }).strict(),
+]);
+
+export const RunnerJobTokenMetric = metricEnvelope(z.number().int().nonnegative());
+export const RunnerJobCostMetric = metricEnvelope(z.number().nonnegative());
+export const RunnerJobDurationMetric = metricEnvelope(z.number().int().nonnegative());
+export type RunnerJobTokenMetric = z.infer<typeof RunnerJobTokenMetric>;
+export type RunnerJobCostMetric = z.infer<typeof RunnerJobCostMetric>;
+export type RunnerJobDurationMetric = z.infer<typeof RunnerJobDurationMetric>;
+
+export const RunnerJobObservationUsage = z.object({
+  inputTokens: RunnerJobTokenMetric,
+  outputTokens: RunnerJobTokenMetric,
+  cacheReadTokens: RunnerJobTokenMetric,
+  cacheWriteTokens: RunnerJobTokenMetric,
+  calls: RunnerJobTokenMetric,
+  costUsd: RunnerJobCostMetric,
+}).strict();
+export type RunnerJobObservationUsage = z.infer<typeof RunnerJobObservationUsage>;
+
+export const RunnerJobObservationActor = z.object({
+  kind: z.enum(['runner', 'agent', 'command', 'vcs']),
+  driver: text(100),
+  vendor: z.string().max(100).nullable(),
+  model: z.string().max(200).nullable(),
+  effort: z.string().max(100).nullable(),
+  role: z.string().max(100).nullable(),
+  operation: text(200),
+}).strict();
+export type RunnerJobObservationActor = z.infer<typeof RunnerJobObservationActor>;
+
+/** Sanitized evidence only: no prompts, transcripts, reasoning, raw logs, command output, or diffs. */
+export const RunnerJobObservationEvidence = z.object({
+  operationDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  resultDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  exitCode: z.number().int().nullable(),
+  timedOut: z.boolean().nullable(),
+  changedPathCount: z.number().int().nonnegative().nullable(),
+  blockerFindings: z.number().int().nonnegative().nullable(),
+  majorFindings: z.number().int().nonnegative().nullable(),
+  minorFindings: z.number().int().nonnegative().nullable(),
+  checkpointRef: z.string().max(1_000).nullable(),
+  errorCode: z.string().max(100).nullable(),
+}).strict();
+export type RunnerJobObservationEvidence = z.infer<typeof RunnerJobObservationEvidence>;
+
+export const RunnerJobAgentContext = z.object({
+  role: text(100),
+  driver: text(100),
+  vendor: z.string().max(100).nullable(),
+  model: z.string().max(200).nullable(),
+  effort: z.string().max(100).nullable(),
+}).strict();
+export type RunnerJobAgentContext = z.infer<typeof RunnerJobAgentContext>;
+
 export const RunnerJobFinding = z.object({
   severity: z.enum(['blocker', 'major', 'minor']),
   title: text(500),
@@ -135,6 +221,25 @@ export type RunnerJobOutput = z.infer<typeof RunnerJobOutput>;
 
 const at = z.string().datetime();
 export const RunnerJobEvent = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('job.context'), at,
+    vcs: text(100), workspaceMode: z.enum(['isolated', 'direct']),
+    landingPolicy: RunnerJobLandingPolicy, agents: z.array(RunnerJobAgentContext).max(32),
+  }).strict(),
+  z.object({
+    type: z.literal('stage.started'), at, observationId: id, taskId: id.nullable(),
+    stage: RunnerJobObservationStage, attempt: z.number().int().positive(),
+    actor: RunnerJobObservationActor,
+  }).strict(),
+  z.object({
+    type: z.literal('stage.finished'), at, startedAt: at,
+    observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
+    attempt: z.number().int().positive(), actor: RunnerJobObservationActor,
+    outcome: z.enum(['succeeded', 'failed', 'cancelled', 'skipped']),
+    duration: RunnerJobDurationMetric, usage: RunnerJobObservationUsage,
+    recovery: z.enum(['none', 'journal_replay', 'process_recovery']),
+    evidence: RunnerJobObservationEvidence,
+  }).strict(),
   z.object({ type: z.literal('progress'), at, phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
   z.object({ type: z.literal('task.plan'), at, taskId: id, plan: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, checkpoint: RunnerJobCheckpoint.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),

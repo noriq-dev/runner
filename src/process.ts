@@ -19,7 +19,7 @@ export async function runProcess(options: {
   maxOutputBytes?: number;
   stdin?: string;
 }): Promise<ProcessResult> {
-  const started = Date.now();
+  const started = performance.now();
   const child = spawn(options.command, options.args ?? [], {
     cwd: options.cwd,
     env: options.env,
@@ -87,7 +87,7 @@ export async function runProcess(options: {
     ...result,
     stdout: stdout.toString("utf8"),
     stderr: stderr.toString("utf8"),
-    durationMs: Date.now() - started,
+    durationMs: Math.max(0, Math.round(performance.now() - started)),
     timedOut,
   };
 }

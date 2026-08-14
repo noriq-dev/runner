@@ -1,7 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MachineConfig } from "../config.js";
-import { findingSchema, usageSchema } from "../contracts.js";
+import {
+  findingSchema,
+  observationUsageSchema,
+  usageSchema,
+} from "../contracts.js";
+import { observationUsageFromLegacy } from "../intelligence.js";
 import { runProcess } from "../process.js";
 import {
   type AgentDriver,
@@ -220,6 +225,7 @@ export class ExternalJsonlV1Driver implements AgentDriver {
       request.invocationId,
     );
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    const started = performance.now();
     const frames = await this.call(
       request.workspace,
       {
@@ -266,6 +272,7 @@ export class ExternalJsonlV1Driver implements AgentDriver {
     }
     const raw = object(terminal.result, "terminal result");
     const structured = object(raw.structured ?? {}, "result.structured");
+    const usage = usageSchema.parse(raw.usage);
     const result: AgentResult = {
       success: raw.success !== false,
       summary: String(raw.summary ?? ""),
@@ -273,7 +280,12 @@ export class ExternalJsonlV1Driver implements AgentDriver {
       findings: Array.isArray(raw.findings)
         ? raw.findings.map((finding) => findingSchema.parse(finding))
         : [],
-      usage: usageSchema.parse(raw.usage),
+      usage,
+      usageEvidence:
+        raw.usageEvidence === undefined
+          ? observationUsageFromLegacy(usage, this.capabilities.usageAccuracy)
+          : observationUsageSchema.parse(raw.usageEvidence),
+      durationMs: Math.max(0, Math.round(performance.now() - started)),
       rawLogPath: join(directory, "external.jsonl"),
       structured,
       ...(Array.isArray(raw.controlActions)
