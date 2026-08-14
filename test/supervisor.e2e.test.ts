@@ -157,9 +157,12 @@ describe("RunnerJobSupervisor", () => {
       costUsd: 0,
       calls: 5,
     });
-    expect(
-      (await loadDurableJobState(stateDirectory, assignment.jobId))?.usage,
-    ).toEqual(output.usage);
+    const durableState = await loadDurableJobState(
+      stateDirectory,
+      assignment.jobId,
+    );
+    expect(durableState?.usage).toEqual(output.usage);
+    expect(durableState?.phase).toBe("finalizing");
     expect(sink.events.at(-1)?.payload).toMatchObject({
       type: "terminal",
       output: { usage: output.usage },
@@ -229,6 +232,9 @@ describe("RunnerJobSupervisor", () => {
       cacheReadTokens: { status: "partial", value: 0 },
       cacheWriteTokens: { status: "unavailable", value: null },
       costUsd: { status: "complete", value: 0 },
+    });
+    expect(agentUsage?.costBasis).toEqual({
+      kind: "driver_reported",
     });
     expect(JSON.stringify(stageEvents)).not.toContain("feature remains broken");
     expect(sink.events.at(-1)?.payload.type).toBe("terminal");
@@ -408,6 +414,30 @@ describe("RunnerJobSupervisor", () => {
       "repairer",
       "reviewer",
     ]);
+    const routeEvents = sink.events
+      .map((event) => event.payload)
+      .filter((event) => event.type === "agent.route");
+    expect(routeEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          route: expect.objectContaining({
+            role: "guide",
+            decision: "skip",
+            size: "small",
+            specCoverage: "complete",
+            eligibleCount: 0,
+            actor: null,
+          }),
+        }),
+        expect.objectContaining({
+          route: expect.objectContaining({
+            role: "builder",
+            decision: "invoke",
+            size: "small",
+          }),
+        }),
+      ]),
+    );
     const builder = fake.calls[0]!;
     expect(builderReceivedCanonicalWorkspace).toBe(true);
     expect(builder.workspace).toContain("state-real");
@@ -563,6 +593,7 @@ describe("RunnerJobSupervisor", () => {
         return { summary: "accepted", findings: [] };
       },
     );
+    const sink = new MemoryEventSink();
     const output = await new RunnerJobSupervisor({
       assignment,
       repository,
@@ -570,7 +601,7 @@ describe("RunnerJobSupervisor", () => {
       projectConfig: config,
       backend: new GitWorkspaceBackend(),
       drivers: { fake, codex: undefined, claude: undefined },
-      sink: new MemoryEventSink(),
+      sink,
     }).run();
     expect(output.landing).toMatchObject({
       policy: "auto",
@@ -584,6 +615,15 @@ describe("RunnerJobSupervisor", () => {
     expect(await command(repository, "git", ["rev-parse", "main"])).toBe(
       output.headRevision,
     );
+    const payloads = sink.events.map((event) => event.payload);
+    const finalizing = payloads.findIndex(
+      (event) => event.type === "progress" && event.phase === "finalizing",
+    );
+    const landing = payloads.findIndex(
+      (event) => event.type === "stage.started" && event.stage === "landing",
+    );
+    expect(finalizing).toBeGreaterThanOrEqual(0);
+    expect(landing).toBeGreaterThan(finalizing);
   });
 
   it("serializes plan integration and delegates an integration conflict to one repair round", async () => {
@@ -819,6 +859,9 @@ describe("RunnerJobSupervisor", () => {
     expect(
       await command(repository, "git", ["worktree", "list", "--porcelain"]),
     ).not.toContain("task-run-20");
+    expect(
+      (await loadDurableJobState(stateDirectory, assignment.jobId))?.phase,
+    ).toBe("finalizing");
   });
 
   it("cancels an active builder without publishing a post-cancel task failure", async () => {
@@ -937,8 +980,15 @@ describe("RunnerJobSupervisor", () => {
       Object.values(
         (await loadDurableJobState(stateDirectory, assignment.jobId))!
           .invocations,
-      ),
+      ).filter((invocation) => invocation.role === "builder"),
     ).toMatchObject([{ role: "builder", status: "abandoned" }]);
+    expect(fake.calls.filter((call) => call.role === "guide")).toHaveLength(1);
+    expect(fake.calls.find((call) => call.role === "guide")?.prompt).toContain(
+      "cancelled.txt",
+    );
+    expect(
+      (await loadDurableJobState(stateDirectory, assignment.jobId))?.phase,
+    ).toBe("finalizing");
   });
 
   it("reviews the working diff and creates one checkpoint in direct mode", async () => {
@@ -1139,5 +1189,8 @@ describe("RunnerJobSupervisor", () => {
       ]),
     ).toBe("evidence");
     expect(await readdir(join(stateDirectory, "locks"))).toEqual([]);
+    expect(
+      (await loadDurableJobState(stateDirectory, assignment.jobId))?.phase,
+    ).toBe("finalizing");
   });
 });

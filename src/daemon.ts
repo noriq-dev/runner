@@ -2,6 +2,7 @@ import type { MachineConfig } from "./config.js";
 import type { JobAssignment } from "./contracts.js";
 import { discoverProjects } from "./discovery.js";
 import { createDriverRegistry } from "./drivers/registry.js";
+import { OpenAiPricingProvider, type PricingProvider } from "./pricing.js";
 import type { ServerToRunner } from "./protocol.js";
 import { registerRunner } from "./registration.js";
 import {
@@ -50,6 +51,27 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
     repositories,
   });
   const drivers = createDriverRegistry(config);
+  const pricingProviders: Record<string, PricingProvider | undefined> = {
+    openai: new OpenAiPricingProvider({
+      stateDirectory: config.runner.stateDirectory,
+      enabled: config.pricing.openai.enabled,
+      maxStaleHours: config.pricing.openai.maxStaleHours,
+    }),
+  };
+  const openAiModels = new Set<string>();
+  for (const project of projects)
+    for (const roles of Object.values(project.config.agents))
+      for (const profile of Object.values(roles)) {
+        const driver = drivers[profile.driver];
+        if (driver?.vendor === "openai") openAiModels.add(profile.model);
+      }
+  void Promise.allSettled(
+    [...openAiModels].map((model) => pricingProviders.openai!.quote(model)),
+  ).then((results) => {
+    for (const result of results)
+      if (result.status === "fulfilled" && result.value.warning)
+        process.stderr.write(`${result.value.warning}\n`);
+  });
   const active = new Map<
     string,
     {
@@ -147,6 +169,7 @@ export async function runDaemon(config: MachineConfig): Promise<never> {
       projectConfig: project.config,
       backend: project.backend,
       drivers,
+      pricingProviders,
       sink: socket,
     });
     active.set(assignment.jobId, {

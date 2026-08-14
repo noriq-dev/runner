@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertAcyclicSource,
   type RunnerJobSource,
+  runnerJobEventPayloadSchema,
   runnerJobSourceSchema,
 } from "../src/contracts.js";
 import { runnerToServerSchema } from "../src/protocol.js";
@@ -70,6 +71,133 @@ describe("RunnerJob source and scheduler", () => {
             baseRevision: "12345",
           },
         ],
+      }),
+    ).toBeTruthy();
+  });
+
+  it("accepts bounded route, task progress, and API-list cost-basis evidence", () => {
+    expect(
+      runnerJobEventPayloadSchema.parse({
+        type: "agent.route",
+        at: "2026-08-14T00:00:00.000Z",
+        route: {
+          taskId: "task",
+          role: "builder",
+          attempt: 1,
+          policyVersion: "task-routing-v1",
+          size: "small",
+          risk: "low",
+          specCoverage: "complete",
+          reasons: ["spec.complete"],
+          candidateCount: 3,
+          eligibleCount: 2,
+          decision: "invoke",
+          actor: {
+            kind: "agent",
+            role: "builder",
+            driver: "codex-pool",
+            vendor: "openai",
+            model: "gpt-5.6-terra",
+            effort: "medium",
+            operation: "invoke",
+          },
+        },
+      }),
+    ).toBeTruthy();
+    expect(
+      runnerJobEventPayloadSchema.parse({
+        type: "progress",
+        at: "2026-08-14T00:00:01.000Z",
+        phase: "building",
+        taskId: "task",
+        message: "Building",
+        progress: 0,
+      }),
+    ).toBeTruthy();
+    expect(
+      runnerJobEventPayloadSchema.parse({
+        type: "stage.finished",
+        at: "2026-08-14T00:00:02.000Z",
+        startedAt: "2026-08-14T00:00:01.000Z",
+        observationId: "observation",
+        taskId: "task",
+        stage: "build",
+        attempt: 1,
+        actor: {
+          kind: "agent",
+          driver: "codex-pool",
+          vendor: "openai",
+          model: "gpt-5.6-terra",
+          effort: "medium",
+          role: "builder",
+          operation: "invoke",
+        },
+        outcome: "succeeded",
+        duration: {
+          status: "complete",
+          value: 1_000,
+          provenance: "driver_reported",
+        },
+        usage: {
+          inputTokens: {
+            status: "complete",
+            value: 100,
+            provenance: "driver_reported",
+          },
+          outputTokens: {
+            status: "complete",
+            value: 10,
+            provenance: "driver_reported",
+          },
+          cacheReadTokens: {
+            status: "partial",
+            value: 0,
+            provenance: "driver_reported",
+          },
+          cacheWriteTokens: {
+            status: "unavailable",
+            value: null,
+            provenance: "not_reported",
+          },
+          calls: {
+            status: "complete",
+            value: 1,
+            provenance: "driver_reported",
+          },
+          costUsd: { status: "partial", value: 0.0004, provenance: "derived" },
+        },
+        recovery: "none",
+        evidence: {
+          operationDigest: null,
+          resultDigest: "a".repeat(64),
+          exitCode: null,
+          timedOut: null,
+          changedPathCount: 2,
+          blockerFindings: 0,
+          majorFindings: 0,
+          minorFindings: 0,
+          checkpointRef: null,
+          errorCode: null,
+        },
+        costBasis: {
+          kind: "api_list_estimate",
+          priceSource: {
+            provider: "openai",
+            catalog: "official-api-list",
+            fetchedAt: "2026-08-14T00:00:00.000Z",
+            ageSeconds: 2,
+            stale: false,
+          },
+        },
+      }),
+    ).toBeTruthy();
+    expect(
+      runnerJobEventPayloadSchema.parse({
+        type: "progress",
+        at: "2026-08-14T00:00:03.000Z",
+        phase: "finalizing",
+        message: "Finalizing",
+        progress: 0,
       }),
     ).toBeTruthy();
   });

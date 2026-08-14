@@ -9,6 +9,12 @@ stateDirectory = "/var/lib/noriq-runner"
 scanRoots = ["/srv/projects"]
 maxConcurrentJobs = 2
 
+[pricing.openai]
+# Official API-list rates are cached for exactly 24 hours. A failed refresh may
+# use a clearly marked stale quote for at most this many hours.
+enabled = true
+maxStaleHours = 168
+
 [drivers.codex]
 adapter = "codex"
 command = "/usr/local/bin/codex"
@@ -30,6 +36,7 @@ home = "/var/lib/noriq-runner/drivers/claude"
 # adapter = "external-jsonl-v1"
 # command = "/opt/vendor/noriq-driver"
 # args = []
+# vendor = "vendor-id"
 # [drivers.vendor.capabilities]
 # workspaceAccess = ["read-only", "workspace-write"]
 # runnerControlMcpInjection = true

@@ -15,12 +15,13 @@ import type {
   RunnerJobOutput,
   RunnerTaskSnapshot,
 } from "./contracts.js";
-import { assertAcyclicSource, hasExecutionSpec } from "./contracts.js";
+import { assertAcyclicSource } from "./contracts.js";
 import type {
   AgentDriver,
   AgentRequest,
   AgentResult,
   AgentRole,
+  ResolvedAgentProfile,
 } from "./drivers/types.js";
 import {
   notApplicableUsage,
@@ -29,16 +30,27 @@ import {
   unavailableMetric,
 } from "./intelligence.js";
 import { ChecksummedJournal } from "./journal.js";
+import { attributeUsageCost, type PricingProvider } from "./pricing.js";
 import {
   builderPrompt,
   executionSpecContract,
   guideOutputSchema,
   guidePrompt,
+  mergeGuideContract,
   repairPrompt,
   reviewerPrompt,
   type TaskContract,
   workerOutputSchema,
 } from "./prompts.js";
+import {
+  classifyCandidate,
+  classifyTask,
+  executionSpecCoverage,
+  resolveRoute,
+  routeCandidateCounts,
+  type TaskClassification,
+  wireRouteClassification,
+} from "./routing.js";
 import { readyTasks } from "./scheduler.js";
 import { type JobState, type LandingReport, reduceJobState } from "./state.js";
 import type {
@@ -64,6 +76,8 @@ interface BuiltTask {
   plan: string;
   workspace: TaskWorkspace;
   candidate: SourceControlCheckpoint;
+  changedPaths: string[];
+  classification: TaskClassification;
   buildSummary: string;
   workerFindings: Finding[];
 }
@@ -177,6 +191,10 @@ function taskContract(result: AgentResult): TaskContract {
   };
 }
 
+class UnsupportedDecompositionError extends Error {
+  readonly code = "unsupported_decomposition";
+}
+
 export class RunnerJobSupervisor {
   private journal!: ChecksummedJournal;
   private state!: JobState;
@@ -202,6 +220,7 @@ export class RunnerJobSupervisor {
       projectConfig: ProjectConfig;
       backend: SourceControlBackend;
       drivers: Record<string, AgentDriver | undefined>;
+      pricingProviders?: Record<string, PricingProvider | undefined>;
       sink: JobEventSink;
     },
   ) {}
@@ -243,13 +262,37 @@ export class RunnerJobSupervisor {
     await operation;
   }
 
-  private driver(role: AgentRole): AgentDriver {
-    const profile =
-      this.options.projectConfig.agents[role === "repairer" ? "builder" : role];
+  private dependencyDegree(taskId: string): number {
+    const source = this.options.assignment.source;
+    if (source.kind === "task") return 0;
+    return source.dependencies.filter(
+      (edge) => edge.taskId === taskId || edge.dependsOnTaskId === taskId,
+    ).length;
+  }
+
+  private driver(profile: { driver: string }, role: AgentRole): AgentDriver {
     const driver = this.options.drivers[profile.driver];
     if (!driver)
       throw new Error(`driver ${profile.driver} is not configured for ${role}`);
     return driver;
+  }
+
+  private resolvedProfile(
+    role: AgentRole,
+    round: number,
+    classification: TaskClassification,
+  ): ResolvedAgentProfile {
+    const route = resolveRoute(
+      this.options.projectConfig,
+      role,
+      classification,
+      round,
+    );
+    const driver = this.driver(route.profile, role);
+    return {
+      ...route.profile,
+      vendor: driver.vendor,
+    };
   }
 
   private enforceBudget(): void {
@@ -282,24 +325,56 @@ export class RunnerJobSupervisor {
       .slice(0, 32);
   }
 
-  private agentActor(role: AgentRole): RunnerJobObservationActor {
-    const profile =
-      this.options.projectConfig.agents[role === "repairer" ? "builder" : role];
-    const driver = this.driver(role);
+  private agentActor(
+    role: AgentRole,
+    profile: ResolvedAgentProfile,
+  ): RunnerJobObservationActor {
     return {
       kind: "agent",
-      driver: driver.id,
-      vendor:
-        driver.id === "codex"
-          ? "openai"
-          : driver.id === "claude"
-            ? "anthropic"
-            : null,
+      driver: profile.driver,
+      vendor: profile.vendor,
       model: profile.model,
       effort: profile.effort,
       role,
       operation: "invoke",
     };
+  }
+
+  private async emitRoute(
+    task: RunnerTaskSnapshot,
+    role: AgentRole,
+    round: number,
+    classification: TaskClassification,
+    profile: ResolvedAgentProfile | null,
+    decision: "invoke" | "skip",
+  ): Promise<void> {
+    const key = `${task.taskId}:${role}:${round + 1}`;
+    if (this.state.routeDecisions[key]) return;
+    const selected = resolveRoute(
+      this.options.projectConfig,
+      role,
+      classification,
+      round,
+    );
+    await this.emit({
+      type: "agent.route",
+      at: now(),
+      route: {
+        taskId: task.taskId,
+        role,
+        attempt: round + 1,
+        policyVersion: classification.policyVersion,
+        ...wireRouteClassification(classification),
+        ...routeCandidateCounts(
+          this.options.projectConfig,
+          role,
+          selected.tier,
+          decision,
+        ),
+        decision,
+        actor: profile ? this.agentActor(role, profile) : null,
+      },
+    });
   }
 
   private backendActor(
@@ -449,6 +524,7 @@ export class RunnerJobSupervisor {
       },
       recovery: invocation.recovery ?? "journal_replay",
       evidence: invocation.evidence,
+      ...(invocation.costBasis ? { costBasis: invocation.costBasis } : {}),
     });
   }
 
@@ -744,8 +820,25 @@ export class RunnerJobSupervisor {
     workspace: string,
     prompt: string,
     schema: Record<string, unknown>,
+    classification = classifyTask(
+      task,
+      this.options.projectConfig,
+      this.dependencyDegree(task.taskId),
+    ),
   ): Promise<AgentResult> {
     this.enforceBudget();
+    const routedClassification =
+      role === "repairer" && round > 0
+        ? {
+            ...classification,
+            reasons: [
+              ...new Set([
+                ...classification.reasons,
+                "repair_escalation" as const,
+              ]),
+            ],
+          }
+        : classification;
     // Vendor CLIs resolve cwd through filesystem aliases (for example,
     // Fedora's /home -> /var/home). Keep the path in the prompt identical to
     // the runtime cwd; Claude otherwise treats the aliased absolute path as
@@ -757,11 +850,28 @@ export class RunnerJobSupervisor {
       role,
       round,
     );
-    const driver = this.driver(role);
-    const actor = this.agentActor(role);
+    const profile = this.resolvedProfile(role, round, routedClassification);
+    const driver = this.driver(profile, role);
+    const actor = this.agentActor(role, profile);
+    await this.emitRoute(
+      task,
+      role,
+      round,
+      routedClassification,
+      profile,
+      "invoke",
+    );
     let durable = this.state.invocations[id];
     if (!durable) {
       const startedAt = now();
+      const provider = profile.vendor
+        ? this.options.pricingProviders?.[profile.vendor]
+        : undefined;
+      const pricing = provider
+        ? await provider.quote(profile.model, this.abort.signal)
+        : null;
+      if (pricing?.warning)
+        await this.record("warning", { message: pricing.warning });
       await this.record("invocation.started", {
         id,
         taskId: task.taskId,
@@ -770,6 +880,7 @@ export class RunnerJobSupervisor {
         attempt: round + 1,
         startedAt,
         actor,
+        ...(pricing ? { pricing } : {}),
       });
       durable = this.state.invocations[id];
     }
@@ -801,17 +912,22 @@ export class RunnerJobSupervisor {
         !durable.usageEvidence
       ) {
         const digestValue = resultDigest(recovered);
+        const usage = attributeUsageCost(
+          recovered.usageEvidence ??
+            observationUsageFromLegacy(
+              recovered.usage,
+              driver.capabilities.usageAccuracy,
+            ),
+          durable.pricing ?? null,
+          new Date(durable.completedAt ?? now()),
+        );
         await this.record("invocation.completed", {
           id,
           resultDigest: digestValue,
           completedAt: now(),
           usage: recovered.usage,
-          usageEvidence:
-            recovered.usageEvidence ??
-            observationUsageFromLegacy(
-              recovered.usage,
-              driver.capabilities.usageAccuracy,
-            ),
+          usageEvidence: usage.usage,
+          ...(usage.costBasis ? { costBasis: usage.costBasis } : {}),
           duration:
             recovered.durationMs === undefined
               ? unavailableMetric()
@@ -833,19 +949,23 @@ export class RunnerJobSupervisor {
       return recovered;
     }
     if (recovered) {
-      const usageEvidence =
-        recovered.usageEvidence ??
-        observationUsageFromLegacy(
-          recovered.usage,
-          driver.capabilities.usageAccuracy,
-        );
       const completedAt = now();
+      const usage = attributeUsageCost(
+        recovered.usageEvidence ??
+          observationUsageFromLegacy(
+            recovered.usage,
+            driver.capabilities.usageAccuracy,
+          ),
+        durable?.pricing ?? null,
+        new Date(completedAt),
+      );
       await this.record("invocation.completed", {
         id,
         resultDigest: resultDigest(recovered),
         completedAt,
         usage: recovered.usage,
-        usageEvidence,
+        usageEvidence: usage.usage,
+        ...(usage.costBasis ? { costBasis: usage.costBasis } : {}),
         duration:
           recovered.durationMs === undefined
             ? unavailableMetric()
@@ -877,26 +997,31 @@ export class RunnerJobSupervisor {
           : "workspace-write",
       prompt: `${workspaceInstruction(runtimeWorkspace)}\n\n${prompt}`,
       outputSchema: schema,
-      projectConfig: this.options.projectConfig,
+      profile,
+      timeoutMs: this.options.projectConfig.harness.maxJobMinutes * 60_000,
       signal: this.abort.signal,
     };
     const monotonicStarted = performance.now();
     try {
       const session = await driver.start(request);
       const result = await session.result();
-      const usageEvidence =
-        result.usageEvidence ??
-        observationUsageFromLegacy(
-          result.usage,
-          driver.capabilities.usageAccuracy,
-        );
       const completedAt = now();
+      const usage = attributeUsageCost(
+        result.usageEvidence ??
+          observationUsageFromLegacy(
+            result.usage,
+            driver.capabilities.usageAccuracy,
+          ),
+        durable?.pricing ?? null,
+        new Date(completedAt),
+      );
       await this.record("invocation.completed", {
         id,
         resultDigest: resultDigest(result),
         completedAt,
         usage: result.usage,
-        usageEvidence,
+        usageEvidence: usage.usage,
+        ...(usage.costBasis ? { costBasis: usage.costBasis } : {}),
         duration: observedMetric(
           result.durationMs ??
             Math.max(0, Math.round(performance.now() - monotonicStarted)),
@@ -970,60 +1095,74 @@ export class RunnerJobSupervisor {
   }
 
   private async preflight(): Promise<void> {
-    const roles: AgentRole[] = ["guide", "builder", "reviewer"];
+    const roles: AgentRole[] = ["guide", "builder", "reviewer", "repairer"];
     const checked = new Set<string>();
     for (const role of roles) {
-      const driver = this.driver(role);
-      const access =
-        role === "guide" || role === "reviewer"
-          ? "read-only"
-          : "workspace-write";
-      const key = `${driver.id}:${access}:${role === "guide"}`;
-      if (checked.has(key)) continue;
-      checked.add(key);
-      const result = await this.observe({
-        stage: "preflight",
-        operation: `agent-preflight-${driver.id}-${access}-${role}`,
-        taskId: null,
-        actor: { ...this.agentActor(role), operation: "preflight" },
-        work: () =>
-          driver.preflight({
-            workspace: this.workspace.path,
-            access,
-            requireControlMcp: role === "guide",
+      for (const configured of Object.values(
+        this.options.projectConfig.agents[role],
+      )) {
+        const driver = this.driver(configured, role);
+        const profile: ResolvedAgentProfile = {
+          ...configured,
+          vendor: driver.vendor,
+        };
+        const access =
+          role === "guide" || role === "reviewer"
+            ? "read-only"
+            : "workspace-write";
+        const key = `${driver.id}:${access}:${role === "guide"}`;
+        if (checked.has(key)) continue;
+        checked.add(key);
+        const result = await this.observe({
+          stage: "preflight",
+          operation: `agent-preflight-${driver.id}-${access}-${role}`,
+          taskId: null,
+          actor: { ...this.agentActor(role, profile), operation: "preflight" },
+          work: () =>
+            driver.preflight({
+              workspace: this.workspace.path,
+              access,
+              requireControlMcp: role === "guide",
+            }),
+          evidence: (value) => ({
+            resultDigest: digest({
+              driver: value.driver,
+              version: value.version,
+              authenticated: value.authenticated,
+              runnerControlVisible: value.runnerControlVisible,
+              warnings: value.warnings.length,
+            }),
           }),
-        evidence: (value) => ({
-          resultDigest: digest({
-            driver: value.driver,
-            version: value.version,
-            authenticated: value.authenticated,
-            runnerControlVisible: value.runnerControlVisible,
-            warnings: value.warnings.length,
-          }),
-        }),
-      });
-      if (!result.authenticated) throw new Error(`${driver.id} is not ready`);
-      if (!driver.capabilities.workspaceAccess.includes(access))
-        throw new Error(`${driver.id} cannot enforce ${access} access`);
-      if (role === "guide" && !result.runnerControlVisible)
-        throw new Error(`${driver.id} cannot see the Runner Control MCP`);
-      const finiteBudget =
-        this.options.projectConfig.harness.maxTokens !== undefined ||
-        this.options.projectConfig.harness.maxCostUsd !== undefined;
-      if (
-        finiteBudget &&
-        (!driver.capabilities.hardBudget ||
-          driver.capabilities.usageAccuracy === "none")
-      )
-        throw new Error(
-          `${driver.id} cannot enforce the configured finite token/cost cap`,
-        );
-      for (const warning of result.warnings)
-        await this.record("warning", { message: warning });
+        });
+        if (!result.authenticated) throw new Error(`${driver.id} is not ready`);
+        if (!driver.capabilities.workspaceAccess.includes(access))
+          throw new Error(`${driver.id} cannot enforce ${access} access`);
+        if (role === "guide" && !result.runnerControlVisible)
+          throw new Error(`${driver.id} cannot see the Runner Control MCP`);
+        const finiteBudget =
+          this.options.projectConfig.harness.maxTokens !== undefined ||
+          this.options.projectConfig.harness.maxCostUsd !== undefined;
+        if (
+          finiteBudget &&
+          (!driver.capabilities.hardBudget ||
+            driver.capabilities.usageAccuracy === "none")
+        )
+          throw new Error(
+            `${driver.id} cannot enforce the configured finite token/cost cap`,
+          );
+        for (const warning of result.warnings)
+          await this.record("warning", { message: warning });
+      }
     }
   }
 
   private async buildTask(task: RunnerTaskSnapshot): Promise<BuiltTask> {
+    const dependencyDegree = this.dependencyDegree(task.taskId);
+    const initialClassification = classifyTask(
+      task,
+      this.options.projectConfig,
+      dependencyDegree,
+    );
     await this.record("task.started", { taskId: task.taskId });
     await this.emit({
       type: "task.result",
@@ -1038,13 +1177,22 @@ export class RunnerJobSupervisor {
       type: "progress",
       at: now(),
       phase: "planning",
+      taskId: task.taskId,
       message: `Planning ${task.key}`,
       progress: 0,
     });
     let contract: TaskContract;
     let plan: string;
     let guideInstructions: string | undefined;
-    if (hasExecutionSpec(task.executionSpec)) {
+    if (initialClassification.specCoverage === "build_ready") {
+      await this.emitRoute(
+        task,
+        "guide",
+        0,
+        initialClassification,
+        null,
+        "skip",
+      );
       ({ contract, plan } = executionSpecContract(
         task,
         this.options.projectConfig.checks.commands,
@@ -1061,6 +1209,7 @@ export class RunnerJobSupervisor {
           this.workspace.path,
           guideContext,
           guideOutputSchema,
+          initialClassification,
         );
         const planAction = guide.controlActions?.find(
           (action) =>
@@ -1099,9 +1248,14 @@ export class RunnerJobSupervisor {
         guideRound += 1;
         guideContext = `${guidePrompt(task)}\n\nHuman answer to ${prompt}:\n${answer}`;
       }
-      contract = taskContract(guide);
+      contract = mergeGuideContract(
+        task,
+        taskContract(guide),
+        this.options.projectConfig.checks.commands,
+      );
       plan = guide.plan ?? String(guide.structured.plan ?? guide.summary);
     }
+    const buildClassification = initialClassification;
     await this.record("task.plan", { taskId: task.taskId, plan });
     await this.emit({
       type: "task.plan",
@@ -1151,6 +1305,7 @@ export class RunnerJobSupervisor {
       type: "progress",
       at: now(),
       phase: "building",
+      taskId: task.taskId,
       message: `Building ${task.key}`,
       progress: 0,
     });
@@ -1161,12 +1316,15 @@ export class RunnerJobSupervisor {
       taskWorkspace.path,
       builderPrompt(task, contract, guideInstructions),
       workerOutputSchema,
+      buildClassification,
     );
     await this.record("task.findings", {
       taskId: task.taskId,
       findings: builder.findings,
     });
     let candidate = retained?.candidate;
+    let changedPaths =
+      task.executionSpec?.anticipatedFiles.map((file) => file.path) ?? [];
     if (!candidate) {
       const staged = await this.stageCandidateObserved(
         task,
@@ -1182,6 +1340,7 @@ export class RunnerJobSupervisor {
           staged.paths,
         );
       candidate = staged.checkpoint;
+      changedPaths = staged.changedPaths;
       await this.record("task.candidate", {
         taskId: task.taskId,
         candidate,
@@ -1194,6 +1353,8 @@ export class RunnerJobSupervisor {
       plan,
       workspace: taskWorkspace,
       candidate,
+      changedPaths,
+      classification: buildClassification,
       buildSummary: builder.summary,
       workerFindings: builder.findings,
     };
@@ -1233,6 +1394,7 @@ export class RunnerJobSupervisor {
             type: "progress",
             at: now(),
             phase: "repairing",
+            taskId: task.taskId,
             message: `Repairing worker findings for ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
             progress: 0,
           });
@@ -1243,6 +1405,7 @@ export class RunnerJobSupervisor {
             built.workspace.path,
             repairPrompt(task, built.contract, workerBlockers, [], round),
             workerOutputSchema,
+            built.classification,
           );
           built.buildSummary = repair.summary;
           built.workerFindings = repair.findings;
@@ -1264,6 +1427,7 @@ export class RunnerJobSupervisor {
               staged.paths,
             );
           built.candidate = staged.checkpoint;
+          built.changedPaths = staged.changedPaths;
           await this.record("task.candidate", {
             taskId: task.taskId,
             candidate: built.candidate,
@@ -1296,6 +1460,7 @@ export class RunnerJobSupervisor {
             type: "progress",
             at: now(),
             phase: "repairing",
+            taskId: task.taskId,
             message: `Repairing source-control conflict for ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
             progress: 0,
           });
@@ -1321,6 +1486,7 @@ export class RunnerJobSupervisor {
                 round,
               ),
               workerOutputSchema,
+              built.classification,
             );
             built.buildSummary = repair.summary;
             built.workerFindings = repair.findings;
@@ -1343,6 +1509,7 @@ export class RunnerJobSupervisor {
             );
             if (staged.status === "conflict") throw new Error(staged.detail);
             built.candidate = staged.checkpoint;
+            built.changedPaths = staged.changedPaths;
             await this.record("task.candidate", {
               taskId: task.taskId,
               candidate: built.candidate,
@@ -1361,6 +1528,7 @@ export class RunnerJobSupervisor {
         }
         if (integration?.status === "ready") {
           built.candidate = integration.checkpoint;
+          built.changedPaths = integration.changedPaths;
           await this.record("task.candidate", {
             taskId: task.taskId,
             candidate: built.candidate,
@@ -1371,6 +1539,7 @@ export class RunnerJobSupervisor {
           type: "progress",
           at: now(),
           phase: "checking",
+          taskId: task.taskId,
           message: `Checking ${task.key}`,
           progress: 0,
         });
@@ -1389,10 +1558,22 @@ export class RunnerJobSupervisor {
         );
         await this.record("task.checked", { taskId: task.taskId, checks });
         const diff = await this.reviewDiffObserved(built, round + 1);
+        built.classification = classifyCandidate(
+          built.classification,
+          task,
+          this.options.projectConfig,
+          {
+            changedPaths: built.changedPaths,
+            diffBytes: Buffer.byteLength(diff),
+            failedChecks: failedChecks(checks).length > 0,
+            priorRepair: round > 0,
+          },
+        );
         await this.emit({
           type: "progress",
           at: now(),
           phase: "reviewing",
+          taskId: task.taskId,
           message: `Reviewing ${task.key}`,
           progress: 0,
         });
@@ -1403,6 +1584,7 @@ export class RunnerJobSupervisor {
           built.workspace.path,
           reviewerPrompt(task, built.contract, diff, JSON.stringify(checks)),
           workerOutputSchema,
+          built.classification,
         );
         await this.record("task.reviewed", {
           taskId: task.taskId,
@@ -1415,6 +1597,7 @@ export class RunnerJobSupervisor {
             type: "progress",
             at: now(),
             phase: "integrating",
+            taskId: task.taskId,
             message: `Accepting ${task.key}`,
             progress: 0,
           });
@@ -1446,6 +1629,7 @@ export class RunnerJobSupervisor {
               if (restaged.status === "conflict")
                 throw new Error(restaged.detail);
               built.candidate = restaged.checkpoint;
+              built.changedPaths = restaged.changedPaths;
               await this.record("task.candidate", {
                 taskId: task.taskId,
                 candidate: built.candidate,
@@ -1481,6 +1665,7 @@ export class RunnerJobSupervisor {
                 round,
               ),
               workerOutputSchema,
+              built.classification,
             );
             built.buildSummary = repair.summary;
             built.workerFindings = repair.findings;
@@ -1504,6 +1689,7 @@ export class RunnerJobSupervisor {
             if (restaged.status === "conflict")
               throw new Error(restaged.detail);
             built.candidate = restaged.checkpoint;
+            built.changedPaths = restaged.changedPaths;
             await this.record("task.candidate", {
               taskId: task.taskId,
               candidate: built.candidate,
@@ -1554,6 +1740,7 @@ export class RunnerJobSupervisor {
           type: "progress",
           at: now(),
           phase: "repairing",
+          taskId: task.taskId,
           message: `Repairing ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
           progress: 0,
         });
@@ -1564,6 +1751,7 @@ export class RunnerJobSupervisor {
           built.workspace.path,
           repairPrompt(task, built.contract, blockers, failures, round),
           workerOutputSchema,
+          built.classification,
         );
         built.buildSummary = repair.summary;
         built.workerFindings = repair.findings;
@@ -1585,6 +1773,7 @@ export class RunnerJobSupervisor {
             staged.paths,
           );
         built.candidate = staged.checkpoint;
+        built.changedPaths = staged.changedPaths;
         await this.record("task.candidate", {
           taskId: task.taskId,
           candidate: built.candidate,
@@ -1888,6 +2077,15 @@ export class RunnerJobSupervisor {
     )
       throw new Error("assignment fencing mismatch with durable state");
     const source = this.options.assignment.source;
+    const assignedTasks = source.kind === "task" ? [source.task] : source.tasks;
+    const decomposed = assignedTasks.find(
+      (task) => executionSpecCoverage(task) === "decomposed",
+    );
+    if (decomposed) {
+      throw new UnsupportedDecompositionError(
+        `${decomposed.key} contains authored execution steps; dispatch them as first-class plan tasks`,
+      );
+    }
     const outputKey = source.kind === "task" ? source.task.key : source.planKey;
     if (!this.state.workspace) {
       const orphanWarnings = await this.observe({
@@ -1967,18 +2165,19 @@ export class RunnerJobSupervisor {
         await this.record("event.acked", { seq: acknowledged });
     }
     if (!this.state.contextPublished) {
-      const profile = (role: "guide" | "builder" | "reviewer") => ({
-        role,
-        driver: this.options.projectConfig.agents[role].driver,
-        vendor:
-          this.options.projectConfig.agents[role].driver === "codex"
-            ? "openai"
-            : this.options.projectConfig.agents[role].driver === "claude"
-              ? "anthropic"
-              : null,
-        model: this.options.projectConfig.agents[role].model,
-        effort: this.options.projectConfig.agents[role].effort,
-      });
+      const agents = (
+        ["guide", "builder", "reviewer", "repairer"] as AgentRole[]
+      ).flatMap((role) =>
+        Object.entries(this.options.projectConfig.agents[role]).map(
+          ([tier, configured]) => ({
+            role: `${role}:${tier}`,
+            driver: configured.driver,
+            vendor: this.driver(configured, role).vendor,
+            model: configured.model,
+            effort: configured.effort,
+          }),
+        ),
+      );
       await this.emit({
         type: "job.context",
         at: now(),
@@ -1988,7 +2187,7 @@ export class RunnerJobSupervisor {
           this.workspace.mode === "direct"
             ? "direct"
             : this.options.projectConfig.sourceControl.landing,
-        agents: [profile("guide"), profile("builder"), profile("reviewer")],
+        agents,
       });
     }
     await this.preflight();
@@ -2094,6 +2293,13 @@ export class RunnerJobSupervisor {
         : acceptedCount > 0
           ? "partial"
           : "failed";
+    await this.emit({
+      type: "progress",
+      at: now(),
+      phase: "finalizing",
+      message: `Finalizing ${outputKey}`,
+      progress: 0,
+    });
     if (
       status === "succeeded" &&
       this.workspace.mode === "isolated" &&
@@ -2133,6 +2339,13 @@ export class RunnerJobSupervisor {
     } catch (error) {
       if (!this.journal || !this.state || !this.workspaceReady) throw error;
       const message = error instanceof Error ? error.message : String(error);
+      await this.emit({
+        type: "progress",
+        at: now(),
+        phase: "finalizing",
+        message: "Finalizing failed RunnerJob",
+        progress: 0,
+      });
       await this.record("warning", { message });
       for (const task of Object.values(this.state.tasks)) {
         if (task.status === "running") {

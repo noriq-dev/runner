@@ -8,6 +8,14 @@ export interface TaskContract {
   verification: string[];
 }
 
+function taskObjective(task: RunnerTaskSnapshot): string {
+  return task.body.trim() ? `${task.title}\n\n${task.body.trim()}` : task.title;
+}
+
+function unique(items: string[]): string[] {
+  return [...new Set(items.map((item) => item.trim()).filter(Boolean))];
+}
+
 export function executionSpecContract(
   task: RunnerTaskSnapshot,
   verificationCommands: string[],
@@ -58,7 +66,7 @@ export function executionSpecContract(
         ].join("\n") || `Implement ${task.key}: ${task.title}`;
   return {
     contract: {
-      objective: task.title,
+      objective: taskObjective(task),
       constraints,
       scope,
       acceptanceCriteria,
@@ -68,12 +76,56 @@ export function executionSpecContract(
   };
 }
 
-function taskFacts(task: RunnerTaskSnapshot): string {
+/**
+ * A guide may fill gaps but cannot erase authored task facts. The merge happens
+ * in Runner after structured output validation, so preservation is deterministic
+ * rather than a prompt-only request.
+ */
+export function mergeGuideContract(
+  task: RunnerTaskSnapshot,
+  guide: TaskContract,
+  verificationCommands: string[],
+): TaskContract {
+  const authored = task.executionSpec
+    ? executionSpecContract(task, verificationCommands).contract
+    : {
+        objective: taskObjective(task),
+        constraints: [],
+        scope: [],
+        acceptanceCriteria: [],
+        verification: verificationCommands,
+      };
+  const guideObjective = guide.objective.trim();
+  const objective =
+    !guideObjective || authored.objective.includes(guideObjective)
+      ? authored.objective
+      : `${authored.objective}\n\nGuide clarification:\n${guideObjective}`;
+  return {
+    objective,
+    constraints: unique([...authored.constraints, ...guide.constraints]),
+    scope: unique([...authored.scope, ...guide.scope]),
+    acceptanceCriteria: unique([
+      ...authored.acceptanceCriteria,
+      ...guide.acceptanceCriteria,
+    ]),
+    verification: unique([
+      ...authored.verification,
+      ...guide.verification,
+      ...verificationCommands,
+    ]),
+  };
+}
+
+function guideFacts(task: RunnerTaskSnapshot): string {
   return `Task: ${task.key} — ${task.title}\n\nDescription:\n${task.body || "(none)"}\n\nExecution specification:\n${task.executionSpec ? JSON.stringify(task.executionSpec, null, 2) : "(none supplied)"}`;
 }
 
+function taskIdentity(task: RunnerTaskSnapshot): string {
+  return `Task: ${task.key} — ${task.title}`;
+}
+
 export function guidePrompt(task: RunnerTaskSnapshot): string {
-  return `You are the guide for one bounded coding task. Convert the immutable task snapshot into a concise execution contract for a fresh builder. Do not implement code and do not create another planning agent. If the execution specification is usable, preserve it instead of inventing a second plan. Resolve only ambiguities that can be settled from the repository.\n\n${taskFacts(task)}\n\nReturn objective, constraints, in-scope files or components, acceptance criteria, verification commands, and a compact plan. Keep the plan under 1200 words.`;
+  return `You are the guide for one bounded coding task. Convert the immutable task snapshot into a concise execution contract for a fresh builder. Do not implement code and do not create another planning agent. Preserve every authored requirement, locked decision, scope item, and acceptance condition; fill only missing information. Resolve only ambiguities that can be settled from the repository.\n\n${guideFacts(task)}\n\nReturn objective, constraints, in-scope files or components, acceptance criteria, verification commands, and a compact plan. Keep the plan under 1200 words.`;
 }
 
 export function builderPrompt(
@@ -81,7 +133,7 @@ export function builderPrompt(
   contract: TaskContract,
   guideInstructions?: string,
 ): string {
-  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
+  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
 }
 
 export function reviewerPrompt(
@@ -90,7 +142,7 @@ export function reviewerPrompt(
   diff: string,
   checkSummary: string,
 ): string {
-  return `You are an independent read-only reviewer. You cannot edit files and must not implement fixes. Review the staged candidate diff against the task contract and repository behavior. Report only concrete defects introduced by this candidate. A blocker or major finding must name a failure scenario, evidence location, and violated acceptance condition. Minor findings are nonblocking. If no actionable defect exists, return an empty findings list.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nDeterministic checks:\n${checkSummary}\n\nCandidate diff:\n${diff.slice(0, 200_000)}`;
+  return `=== READ-ONLY REVIEW — DO NOT MODIFY FILES ===\nYou are an independent reviewer. The candidate diff is ground truth; the execution contract is the claim it must satisfy. Inspect repository context when needed, but do not edit files or implement fixes. Report only concrete defects introduced by this candidate. A blocker or major finding names the triggering state, wrong behavior, evidence location, and violated acceptance condition. Minor findings are nonblocking. If no actionable defect survives verification, return an empty findings list.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nDeterministic checks:\n${checkSummary}\n\nCandidate diff:\n${diff.slice(0, 200_000)}\n\nRemember: review only; never modify the workspace.`;
 }
 
 export function repairPrompt(
@@ -100,7 +152,7 @@ export function repairPrompt(
   checks: unknown,
   round: number,
 ): string {
-  return `You are a fresh repair worker for round ${round}. Fix only the blocker/major worker or review findings and deterministic-check failures listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
+  return `You are a fresh repair worker for round ${round}. Fix only the blocker/major worker or review findings and deterministic-check failures listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
 }
 
 export const guideOutputSchema = {

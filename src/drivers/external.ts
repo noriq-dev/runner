@@ -112,12 +112,14 @@ function validateTerminal(
 
 export class ExternalJsonlV1Driver implements AgentDriver {
   readonly capabilities: AgentDriverCapabilities;
+  readonly vendor: string | null;
 
   constructor(
     readonly id: string,
     private readonly config: ExternalConfig,
     private readonly stateDirectory: string,
   ) {
+    this.vendor = config.vendor ?? null;
     this.capabilities = {
       structuredOutput: true,
       workspaceAccess: [...config.capabilities.workspaceAccess],
@@ -243,17 +245,12 @@ export class ExternalJsonlV1Driver implements AgentDriver {
           access: request.access,
           prompt: request.prompt,
           outputSchema: request.outputSchema,
-          model:
-            request.projectConfig.agents[
-              request.role === "repairer" ? "builder" : request.role
-            ].model,
-          effort:
-            request.projectConfig.agents[
-              request.role === "repairer" ? "builder" : request.role
-            ].effort,
+          model: request.profile.model,
+          effort: request.profile.effort,
+          vendor: request.profile.vendor,
         },
       },
-      request.projectConfig.harness.maxJobMinutes * 60_000,
+      request.timeoutMs,
       signal,
     );
     const terminal = validateTerminal(frames, "result");

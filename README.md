@@ -5,8 +5,8 @@ Noriq Runner is a small, durable agent-guided harness. Noriq commissions one imm
 ## Runtime boundary
 
 - Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, the retained location, and durable human landing intent/outcome.
-- Committed `project.toml` selects registered driver and backend IDs, models, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
-- Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, persistent Runner-owned vendor homes, credentials, scan roots, and machine capacity.
+- Committed `project.toml` selects registered driver and backend IDs, economy/balanced/strong role profiles, routing-sensitive path prefixes, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
+- Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, persistent Runner-owned vendor homes, credentials, scan roots, machine capacity, and the OpenAI pricing-cache policy.
 - Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP commands or tool schemas. Noriq's copilot MCP catalog is a separate server surface; catalog revisions do not rename or expand this local harness control plane. For Claude builders and repairers, Runner reads the project `.mcp.json` server names only so the CLI can grant those project tools noninteractively.
 
 ## Start
@@ -23,7 +23,7 @@ node dist/cli.js start --config /absolute/path/to/runner.toml
 
 The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It REST-registers those project/repository associations before opening the job WebSocket, persists a server-issued Runner ID under the state directory when `runner.id` is omitted, detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
 
-See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]` and per-role `provider` project keys are normalized once with warning events.
+See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]`, per-role `provider`, and single-profile role shapes are normalized once with warning events. A tiered role may omit `economy` or `strong`, which then falls back to `balanced`; an omitted repairer role inherits all builder tiers.
 
 `validate` parses the machine config without connecting. `doctor` additionally discovers repositories and runs backend/driver authentication and capability preflights without a model call or Noriq connection. `usage --state-directory <path> --job <id>` reports durable per-invocation and aggregate usage. Real-agent dogfood is deliberately opt-in: set `RUNNER_LIVE_AGENTS=yes-i-understand` and run `npm run dogfood:live-agents -- /path/to/git/repository`; it operates on a disposable clone.
 
@@ -49,13 +49,17 @@ Invocations using one registered driver share its home concurrently, just as ord
 
 Builder and repairer roles can consume Runner-home and workspace-native MCP configuration; guide authority is limited to Runner Control and reviewer authority is tool-free. Claude builders and repairers receive repository read/write tools but no interactive shell: Runner owns setup and deterministic checks, preventing unattended permission-denial loops from burning context. Claude uses a small role-specific system prompt while retaining configured user and project settings.
 
-When Noriq supplies a populated execution specification, Runner deterministically converts it into the builder contract and does not spend a separate guide call. Every completed invocation stores its own normalized usage in the durable journal; `usage` shows the per-role breakdown as well as the aggregate. Cache tokens can still grow quickly in an agentic CLI because every tool round rereads the fixed vendor, tool, configured-home, and project prefix. Runner asks workers to batch independent operations and exposes the measurement rather than treating cached input as free. Operators should keep the dedicated Runner homes intentional because configured instructions and tools can become part of that recurring prefix. A truly small planning/review context will require a thin structured-inference driver instead of a full coding-agent CLI; `external-jsonl-v1` is the current seam for that addition.
+Runner classifies each immutable task independently before agent spend. Build-ready tasks have anticipated scope and at least one acceptance condition and skip the guide; empty or partial specifications invoke it, while preserving all authored facts. Authored execution `steps` are rejected before workspace or agent effects because those steps must be dispatched as first-class plan tasks. Size chooses the base profile, elevated and critical paths apply role floors, actual candidate evidence can only upgrade review, and each repair round escalates one tier. Builder, reviewer, and repair prompts carry one normalized contract instead of repeating the raw task and specification.
+
+Every completed invocation stores its normalized usage in the durable journal. For OpenAI-vendor drivers, Runner fetches only the official model Markdown page, strictly parses its API-list token rates, and caches an atomic mode-0600 quote for 24 hours. Refresh failure never blocks execution: a quote may remain usable and explicitly stale for the configured bounded window, otherwise cost is unavailable. Driver-reported cost takes precedence; derived Codex values remain partial API-list estimates, and incomplete aggregate cost remains null rather than becoming `$0.00` or a billing claim. Cache tokens can still grow quickly in an agentic CLI because every tool round rereads the fixed vendor, tool, configured-home, and project prefix. Runner exposes that measurement and asks workers to batch independent operations rather than treating cached input as free.
 
 `external-jsonl-v1` is the extension seam for future vendors. Runner writes one versioned preflight or invocation object to stdin. The executable writes normalized JSONL events followed by exactly one result/error terminal frame. Malformed frames, duplicate terminals, frames after terminal, and capability drift fail closed. Cancellation targets the managed process group and escalates to a hard kill.
 
 ## Durability
 
 The checksummed journal under `runner.stateDirectory/jobs/<job>/events.jsonl` is authoritative. It stores opaque workspace/task handles and complete checkpoint records. Agent receipts prevent completed calls from being repeated after a crash; unacknowledged Noriq events replay with their original sequence numbers. Backend operations are designed to rediscover already-created branches, shelves, changelists, and recovery locations before mutating again.
+
+Queued `progress` events are also the canonical durable job phase. Task-scoped progress retains an independent task phase, and every terminal path enters `finalizing` before landing, terminal-output construction, and cleanup. The older `job.phase` journal record is accepted only when replaying legacy journals.
 
 ## Deliberate limits
 

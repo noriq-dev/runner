@@ -163,6 +163,61 @@ export const RunnerJobObservationActor = z.object({
 }).strict();
 export type RunnerJobObservationActor = z.infer<typeof RunnerJobObservationActor>;
 
+export const RunnerJobRouteSize = z.enum(['small', 'medium', 'large']);
+export type RunnerJobRouteSize = z.infer<typeof RunnerJobRouteSize>;
+
+export const RunnerJobRouteRisk = z.enum(['low', 'medium', 'high']);
+export type RunnerJobRouteRisk = z.infer<typeof RunnerJobRouteRisk>;
+
+export const RunnerJobSpecCoverage = z.enum(['none', 'partial', 'complete']);
+export type RunnerJobSpecCoverage = z.infer<typeof RunnerJobSpecCoverage>;
+
+const routeReason = z.string().trim().min(1).max(100).regex(/^[a-z][a-z0-9._-]*$/);
+export const RunnerJobAgentRoute = z.object({
+  taskId: id,
+  role: text(100),
+  attempt: z.number().int().positive().max(100),
+  policyVersion: text(100),
+  size: RunnerJobRouteSize,
+  risk: RunnerJobRouteRisk,
+  specCoverage: RunnerJobSpecCoverage,
+  reasons: z.array(routeReason).max(16).refine((reasons) => new Set(reasons).size === reasons.length, {
+    message: 'route reasons must be unique',
+  }),
+  candidateCount: z.number().int().nonnegative().max(32),
+  eligibleCount: z.number().int().nonnegative().max(32),
+  actor: RunnerJobObservationActor.nullable(),
+  decision: z.enum(['invoke', 'skip']),
+}).strict().superRefine((route, ctx) => {
+  if (route.eligibleCount > route.candidateCount) {
+    ctx.addIssue({ code: 'custom', path: ['eligibleCount'], message: 'eligibleCount cannot exceed candidateCount' });
+  }
+  if (route.decision === 'invoke' && route.actor === null) {
+    ctx.addIssue({ code: 'custom', path: ['actor'], message: 'invoked routes require an actor' });
+  }
+  if (route.decision === 'skip' && route.actor !== null) {
+    ctx.addIssue({ code: 'custom', path: ['actor'], message: 'skipped routes cannot select an actor' });
+  }
+});
+export type RunnerJobAgentRoute = z.infer<typeof RunnerJobAgentRoute>;
+
+export const RunnerJobCostBasis = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('driver_reported'),
+  }).strict(),
+  z.object({
+    kind: z.literal('api_list_estimate'),
+    priceSource: z.object({
+      provider: text(100),
+      catalog: text(200),
+      fetchedAt: z.string().datetime(),
+      ageSeconds: z.number().int().nonnegative().max(31_536_000),
+      stale: z.boolean(),
+    }).strict(),
+  }).strict(),
+]);
+export type RunnerJobCostBasis = z.infer<typeof RunnerJobCostBasis>;
+
 /** Sanitized evidence only: no prompts, transcripts, reasoning, raw logs, command output, or diffs. */
 export const RunnerJobObservationEvidence = z.object({
   operationDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
@@ -221,6 +276,26 @@ export const RunnerJobOutput = z.object({
 export type RunnerJobOutput = z.infer<typeof RunnerJobOutput>;
 
 const at = z.string().datetime();
+const RunnerJobStageFinishedEvent = z.object({
+  type: z.literal('stage.finished'), at, startedAt: at,
+  observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
+  attempt: z.number().int().positive(), actor: RunnerJobObservationActor,
+  outcome: z.enum(['succeeded', 'failed', 'cancelled', 'skipped']),
+  duration: RunnerJobDurationMetric, usage: RunnerJobObservationUsage,
+  costBasis: RunnerJobCostBasis.optional(),
+  recovery: z.enum(['none', 'journal_replay', 'process_recovery']),
+  evidence: RunnerJobObservationEvidence,
+}).strict().superRefine((event, ctx) => {
+  const cost = event.usage.costUsd;
+  if (!event.costBasis || cost.status === 'unavailable' || cost.status === 'not_applicable') return;
+  if (event.costBasis.kind === 'driver_reported' && cost.provenance !== 'driver_reported') {
+    ctx.addIssue({ code: 'custom', path: ['usage', 'costUsd', 'provenance'], message: 'driver-reported cost requires driver_reported provenance' });
+  }
+  if (event.costBasis.kind === 'api_list_estimate' && cost.provenance !== 'derived') {
+    ctx.addIssue({ code: 'custom', path: ['usage', 'costUsd', 'provenance'], message: 'API-list estimate requires derived provenance' });
+  }
+});
+
 export const RunnerJobEvent = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('job.context'), at,
@@ -232,16 +307,9 @@ export const RunnerJobEvent = z.discriminatedUnion('type', [
     stage: RunnerJobObservationStage, attempt: z.number().int().positive(),
     actor: RunnerJobObservationActor,
   }).strict(),
-  z.object({
-    type: z.literal('stage.finished'), at, startedAt: at,
-    observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
-    attempt: z.number().int().positive(), actor: RunnerJobObservationActor,
-    outcome: z.enum(['succeeded', 'failed', 'cancelled', 'skipped']),
-    duration: RunnerJobDurationMetric, usage: RunnerJobObservationUsage,
-    recovery: z.enum(['none', 'journal_replay', 'process_recovery']),
-    evidence: RunnerJobObservationEvidence,
-  }).strict(),
-  z.object({ type: z.literal('progress'), at, phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
+  RunnerJobStageFinishedEvent,
+  z.object({ type: z.literal('agent.route'), at, route: RunnerJobAgentRoute }).strict(),
+  z.object({ type: z.literal('progress'), at, taskId: id.optional(), phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
   z.object({ type: z.literal('task.plan'), at, taskId: id, plan: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, checkpoint: RunnerJobCheckpoint.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),
   z.object({ type: z.literal('question'), at, questionId: id, prompt: z.string().max(20_000) }).strict(),

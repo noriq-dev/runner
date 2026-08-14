@@ -304,6 +304,10 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
     };
   }
 
+  get vendor(): "openai" | "anthropic" {
+    return this.adapter === "codex" ? "openai" : "anthropic";
+  }
+
   /** @deprecated Kept for source compatibility with the first rebuild prototype. */
   get name(): string {
     return this.id;
@@ -499,10 +503,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
     await writeFile(controlActionsPath, "", { mode: 0o600 });
     let args: string[];
     if (this.adapter === "codex") {
-      const profile =
-        request.projectConfig.agents[
-          request.role === "repairer" ? "builder" : request.role
-        ];
+      const profile = request.profile;
       args = [
         ...this.config.args,
         "exec",
@@ -536,10 +537,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         args.splice(this.config.args.length + 2, 0, "--disable", "shell_tool");
       args.splice(this.config.args.length + 2, 0, "--sandbox", request.access);
     } else {
-      const profile =
-        request.projectConfig.agents[
-          request.role === "repairer" ? "builder" : request.role
-        ];
+      const profile = request.profile;
       args = [
         ...this.config.args,
         "-p",
@@ -631,7 +629,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         state: controlStatePath,
         actions: controlActionsPath,
       }),
-      timeoutMs: request.projectConfig.harness.maxJobMinutes * 60_000,
+      timeoutMs: request.timeoutMs,
       ...(request.signal ? { signal: request.signal } : {}),
       stdin: request.prompt,
       maxOutputBytes: 8 * 1024 * 1024,

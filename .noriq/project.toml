@@ -14,20 +14,54 @@ maxParallelTasks = 2
 maxRepairRounds = 2
 maxJobMinutes = 240
 
-[agents.guide]
+[agents.guide.economy]
+driver = "codex"
+model = "gpt-5.6-luna"
+effort = "medium"
+
+[agents.guide.balanced]
+driver = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[agents.guide.strong]
 driver = "codex"
 model = "gpt-5.6-sol"
 effort = "high"
 
-[agents.builder]
+[agents.builder.economy]
+driver = "claude"
+model = "sonnet"
+effort = "low"
+
+[agents.builder.balanced]
 driver = "claude"
 model = "sonnet"
 effort = "medium"
 
-[agents.reviewer]
+[agents.builder.strong]
+driver = "claude"
+model = "sonnet"
+effort = "high"
+
+[agents.reviewer.economy]
+driver = "codex"
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[agents.reviewer.balanced]
+driver = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[agents.reviewer.strong]
 driver = "codex"
 model = "gpt-5.6-sol"
 effort = "high"
+
+[routing]
+elevatedPathPrefixes = ["scripts", "package.json", "package-lock.json"]
+criticalPathPrefixes = ["src/drivers", "src/vcs", "src/supervisor.ts", "src/state.ts", "vendor/noriq-shared"]
 
 [setup]
 commands = ["npm ci"]

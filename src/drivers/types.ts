@@ -1,4 +1,3 @@
-import type { ProjectConfig } from "../config.js";
 import type {
   Finding,
   RunnerJobObservationUsage,
@@ -7,6 +6,13 @@ import type {
 
 export type AgentRole = "guide" | "builder" | "reviewer" | "repairer";
 export type WorkspaceAccess = "read-only" | "workspace-write";
+
+export interface ResolvedAgentProfile {
+  driver: string;
+  vendor: string | null;
+  model: string;
+  effort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+}
 
 export interface AgentRequest {
   invocationId: string;
@@ -17,7 +23,8 @@ export interface AgentRequest {
   access: WorkspaceAccess;
   prompt: string;
   outputSchema: Record<string, unknown>;
-  projectConfig: ProjectConfig;
+  profile: ResolvedAgentProfile;
+  timeoutMs: number;
   signal?: AbortSignal;
 }
 
@@ -82,6 +89,7 @@ export interface AgentSession {
 
 export interface AgentDriver {
   readonly id: string;
+  readonly vendor: string | null;
   readonly capabilities: AgentDriverCapabilities;
   preflight(request: DriverPreflightRequest): Promise<DriverPreflight>;
   recover(invocationId: string): Promise<AgentResult | null>;

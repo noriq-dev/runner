@@ -49,33 +49,36 @@ export async function doctorRunner(
         project.config.sourceControl.base,
       ),
     });
-    for (const role of ["guide", "builder", "reviewer"] as const) {
-      const profile = project.config.agents[role];
-      const driver = drivers[profile.driver];
-      if (!driver)
-        throw new Error(
-          `project ${project.config.repositoryKey} selects unknown ${role} driver ${profile.driver}`,
-        );
-      const access: WorkspaceAccess =
-        role === "builder" ? "workspace-write" : "read-only";
-      const requireControlMcp = role === "guide";
-      const key = `${project.repository}:${driver.id}:${access}:${requireControlMcp}`;
-      if (checked.has(key)) continue;
-      checked.add(key);
-      const result = await driver.preflight({
-        workspace: project.repository,
-        access,
-        requireControlMcp,
-      });
-      driverReports.push({
-        driver: result.driver,
-        version: result.version,
-        authenticated: result.authenticated,
-        access,
-        runnerControlVisible: result.runnerControlVisible,
-        projectTools: result.projectTools,
-        warnings: result.warnings,
-      });
+    for (const role of ["guide", "builder", "reviewer", "repairer"] as const) {
+      for (const profile of Object.values(project.config.agents[role])) {
+        const driver = drivers[profile.driver];
+        if (!driver)
+          throw new Error(
+            `project ${project.config.repositoryKey} selects unknown ${role} driver ${profile.driver}`,
+          );
+        const access: WorkspaceAccess =
+          role === "builder" || role === "repairer"
+            ? "workspace-write"
+            : "read-only";
+        const requireControlMcp = role === "guide";
+        const key = `${project.repository}:${driver.id}:${access}:${requireControlMcp}`;
+        if (checked.has(key)) continue;
+        checked.add(key);
+        const result = await driver.preflight({
+          workspace: project.repository,
+          access,
+          requireControlMcp,
+        });
+        driverReports.push({
+          driver: result.driver,
+          version: result.version,
+          authenticated: result.authenticated,
+          access,
+          runnerControlVisible: result.runnerControlVisible,
+          projectTools: result.projectTools,
+          warnings: result.warnings,
+        });
+      }
     }
   }
   return {

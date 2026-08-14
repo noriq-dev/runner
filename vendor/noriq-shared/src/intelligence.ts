@@ -3,6 +3,7 @@ import { ExecutionSpec } from './execution-spec';
 import { ExecutionKind, ExecutionRole, LineageCompleteness } from './orchestration';
 import { RunModelUsage } from './runner';
 import { RunBudget } from './runner';
+import { RunnerJobAgentRoute, RunnerJobCostBasis, RunnerJobObservationActor } from './runner-job';
 
 // PLNR-290: runtime-neutral Project Intelligence vocabulary shared by Noriq and Runner. This
 // file defines facts and evidence states only. Storage, extraction, queries, risk, comparison,
@@ -183,6 +184,9 @@ export const EpisodeStageFact = z.object({
   kind: ExecutionKind,
   role: ExecutionRole,
   stage: z.string().nullable().default(null),
+  actor: RunnerJobObservationActor.optional(),
+  route: RunnerJobAgentRoute.optional(),
+  costBasis: RunnerJobCostBasis.optional(),
   elapsedMs: IntelligenceDurationMs,
   tokens: IntelligenceIntegerMetric,
   costUSD: IntelligenceNumberMetric,

@@ -92,7 +92,11 @@ function invocation(root: string) {
     access: "workspace-write" as const,
     prompt: "build",
     outputSchema: { type: "object" },
-    projectConfig: project,
+    profile: {
+      ...project.agents.builder.balanced,
+      vendor: null,
+    },
+    timeoutMs: 60_000,
   };
 }
 

@@ -2,6 +2,7 @@ import type {
   CheckResult,
   Finding,
   JobAssignment,
+  RunnerJobCostBasis,
   RunnerJobDurationMetric,
   RunnerJobEventPayload,
   RunnerJobLanding,
@@ -19,6 +20,7 @@ import {
   notApplicableUsage,
 } from "./intelligence.js";
 import type { JournalRecord } from "./journal.js";
+import type { PricingResolution } from "./pricing.js";
 import type {
   JobWorkspace,
   RetainedLocation,
@@ -43,6 +45,8 @@ export interface InvocationState {
   recovery?: "none" | "journal_replay" | "process_recovery" | undefined;
   evidence?: RunnerJobObservationEvidence | undefined;
   outcome?: "succeeded" | "failed" | "cancelled" | "skipped" | undefined;
+  pricing?: PricingResolution | undefined;
+  costBasis?: RunnerJobCostBasis | undefined;
 }
 
 export interface ObservationState {
@@ -55,6 +59,7 @@ export interface TaskState {
   taskId: string;
   status: RunnerJobTaskStatus;
   repairRounds: number;
+  phase?: RunnerJobPhase;
   plan?: string;
   workspace?: TaskWorkspace;
   candidate?: SourceControlCheckpoint;
@@ -89,6 +94,7 @@ export interface JobState {
   invocations: Record<string, InvocationState>;
   observations: Record<string, ObservationState>;
   contextPublished: boolean;
+  routeDecisions: Record<string, true>;
   completedActions: Record<string, unknown>;
   nextEventSeq: number;
   acknowledgedEventSeq: number;
@@ -113,6 +119,7 @@ export function emptyJobState(): JobState {
     invocations: {},
     observations: {},
     contextPublished: false,
+    routeDecisions: {},
     completedActions: {},
     nextEventSeq: 1,
     acknowledgedEventSeq: 0,
@@ -263,6 +270,8 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
           if (payload.usageEvidence !== undefined)
             invocation.usageEvidence =
               payload.usageEvidence as RunnerJobObservationUsage;
+          if (payload.costBasis !== undefined)
+            invocation.costBasis = payload.costBasis as RunnerJobCostBasis;
           if (payload.duration !== undefined)
             invocation.duration =
               payload.duration as InvocationState["duration"];
@@ -320,32 +329,31 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
       case "action.completed":
         state.completedActions[payload.id as string] = payload.result;
         break;
-      case "event.queued":
+      case "event.queued": {
+        const event = payload.payload as RunnerJobEventPayload;
         state.outboundEvents.push({
           seq: payload.seq as number,
-          payload: payload.payload as RunnerJobEventPayload,
+          payload: event,
         });
-        if ((payload.payload as RunnerJobEventPayload).type === "job.context") {
+        if (event.type === "job.context") {
           state.contextPublished = true;
-        } else if (
-          (payload.payload as RunnerJobEventPayload).type === "stage.started"
-        ) {
-          const observation = payload.payload as Extract<
-            RunnerJobEventPayload,
-            { type: "stage.started" }
-          >;
+        } else if (event.type === "agent.route") {
+          state.routeDecisions[
+            `${event.route.taskId}:${event.route.role}:${event.route.attempt}`
+          ] = true;
+        } else if (event.type === "progress") {
+          state.phase = event.phase;
+          if (event.taskId && state.tasks[event.taskId])
+            state.tasks[event.taskId]!.phase = event.phase;
+        } else if (event.type === "stage.started") {
+          const observation = event;
           state.observations[observation.observationId] = {
             observationId: observation.observationId,
             started: true,
             finished: false,
           };
-        } else if (
-          (payload.payload as RunnerJobEventPayload).type === "stage.finished"
-        ) {
-          const observation = payload.payload as Extract<
-            RunnerJobEventPayload,
-            { type: "stage.finished" }
-          >;
+        } else if (event.type === "stage.finished") {
+          const observation = event;
           state.observations[observation.observationId] = {
             observationId: observation.observationId,
             started: true,
@@ -357,6 +365,7 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
           (payload.seq as number) + 1,
         );
         break;
+      }
       case "event.acked":
         state.acknowledgedEventSeq = Math.max(
           state.acknowledgedEventSeq,

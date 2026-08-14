@@ -82,7 +82,7 @@ describe("discoverProjects", () => {
       "repo-one",
       "repo-two",
     ]);
-    expect(projects[0]!.config.agents.guide.driver).toBe("fake");
+    expect(projects[0]!.config.agents.guide.balanced.driver).toBe("fake");
     expect(projects[0]!.config.normalizationWarnings).toEqual(
       expect.arrayContaining([
         expect.stringContaining("legacy [workspace]"),

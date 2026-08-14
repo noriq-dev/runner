@@ -14,12 +14,21 @@ const environmentVariable = z
   .trim()
   .regex(/^[A-Za-z_][A-Za-z0-9_]{0,199}$/);
 
-const legacyAgentProfileSchema = z
+const agentEffortSchema = z.enum([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
+const agentProfileSchema = z
   .object({
     driver: registeredId.optional(),
     provider: registeredId.optional(),
     model: z.string().trim().min(1).max(200),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]),
+    effort: agentEffortSchema,
   })
   .strict()
   .superRefine((value, context) => {
@@ -36,6 +45,33 @@ const legacyAgentProfileSchema = z
         message: "legacy provider must match driver when both are present",
       });
   });
+
+const tieredAgentProfilesSchema = z
+  .object({
+    economy: agentProfileSchema.optional(),
+    balanced: agentProfileSchema,
+    strong: agentProfileSchema.optional(),
+  })
+  .strict();
+
+const agentRoleSchema = z.union([
+  agentProfileSchema,
+  tieredAgentProfilesSchema,
+]);
+
+const pathPrefixSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(500)
+  .refine(
+    (value) =>
+      !value.startsWith("/") &&
+      !value.includes("\\") &&
+      !/(^|\/)\.\.(\/|$)/.test(value),
+    "must be a repository-relative path prefix using / separators",
+  )
+  .transform((value) => value.replace(/\/+$/, ""));
 
 const sourceControlSchema = z
   .object({
@@ -73,11 +109,19 @@ const projectConfigInputSchema = z
       .strict(),
     agents: z
       .object({
-        guide: legacyAgentProfileSchema,
-        builder: legacyAgentProfileSchema,
-        reviewer: legacyAgentProfileSchema,
+        guide: agentRoleSchema,
+        builder: agentRoleSchema,
+        reviewer: agentRoleSchema,
+        repairer: agentRoleSchema.optional(),
       })
       .strict(),
+    routing: z
+      .object({
+        elevatedPathPrefixes: z.array(pathPrefixSchema).max(200).default([]),
+        criticalPathPrefixes: z.array(pathPrefixSchema).max(200).default([]),
+      })
+      .strict()
+      .default({ elevatedPathPrefixes: [], criticalPathPrefixes: [] }),
     setup: z
       .object({
         commands: commandList.default([]),
@@ -140,9 +184,7 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
       throw new Error(
         "sourceControl.landing must be retain in direct mode because accepted work is already committed to the target",
       );
-    const normalizeAgent = (
-      profile: z.infer<typeof legacyAgentProfileSchema>,
-    ) => {
+    const normalizeAgent = (profile: z.infer<typeof agentProfileSchema>) => {
       if (!profile.driver)
         warnings.push(
           `legacy provider = ${JSON.stringify(profile.provider)} was normalized to driver`,
@@ -153,6 +195,25 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
         effort: profile.effort,
       };
     };
+    const normalizeRole = (
+      role: z.infer<typeof agentRoleSchema>,
+      name: "guide" | "builder" | "reviewer" | "repairer",
+    ) => {
+      if ("model" in role) {
+        warnings.push(
+          `legacy [agents.${name}] profile was normalized across economy, balanced, and strong tiers`,
+        );
+        const profile = normalizeAgent(role);
+        return { economy: profile, balanced: profile, strong: profile };
+      }
+      const balanced = normalizeAgent(role.balanced);
+      return {
+        economy: role.economy ? normalizeAgent(role.economy) : balanced,
+        balanced,
+        strong: role.strong ? normalizeAgent(role.strong) : balanced,
+      };
+    };
+    const builder = normalizeRole(input.agents.builder, "builder");
     return {
       key: input.key,
       repositoryKey: input.repositoryKey,
@@ -160,10 +221,14 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
       sourceControl,
       harness: input.harness,
       agents: {
-        guide: normalizeAgent(input.agents.guide),
-        builder: normalizeAgent(input.agents.builder),
-        reviewer: normalizeAgent(input.agents.reviewer),
+        guide: normalizeRole(input.agents.guide, "guide"),
+        builder,
+        reviewer: normalizeRole(input.agents.reviewer, "reviewer"),
+        repairer: input.agents.repairer
+          ? normalizeRole(input.agents.repairer, "repairer")
+          : builder,
       },
+      routing: input.routing,
       setup: input.setup,
       checks: input.checks,
       normalizationWarnings: [...new Set(warnings)],
@@ -197,6 +262,7 @@ const driverSchema = z.discriminatedUnion("adapter", [
     .object({
       adapter: z.literal("external-jsonl-v1"),
       ...driverCommon,
+      vendor: registeredId.optional(),
       capabilities: z
         .object({
           workspaceAccess: z
@@ -268,6 +334,18 @@ const machineConfigInputSchema = z
       diversion: { adapter: "diversion", command: "dv" },
       perforce: { adapter: "perforce", command: "p4" },
     }),
+    pricing: z
+      .object({
+        openai: z
+          .object({
+            enabled: z.boolean().default(true),
+            maxStaleHours: z.number().int().min(0).max(168).default(168),
+          })
+          .strict()
+          .default({ enabled: true, maxStaleHours: 168 }),
+      })
+      .strict()
+      .default({ openai: { enabled: true, maxStaleHours: 168 } }),
   })
   .strict();
 export const machineConfigSchema = machineConfigInputSchema.transform(

@@ -19,6 +19,7 @@ export type FakeHandler = (
 
 export class FakeAgentDriver implements AgentDriver {
   readonly id = "fake" as const;
+  readonly vendor: string | null = null;
   readonly capabilities: AgentDriverCapabilities = {
     structuredOutput: true,
     workspaceAccess: ["read-only", "workspace-write"],

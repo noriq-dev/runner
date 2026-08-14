@@ -29,6 +29,16 @@ const projectConfig = projectConfigSchema.parse({
   checks: { commands: [], timeoutSeconds: 30 },
 });
 
+function resolvedProfile(
+  role: "guide" | "builder" | "reviewer" | "repairer",
+  vendor: string | null,
+) {
+  return {
+    ...projectConfig.agents[role].balanced,
+    vendor,
+  };
+}
+
 async function credentialHome(
   root: string,
   vendor: "codex" | "claude",
@@ -157,7 +167,8 @@ describe("built-in driver contract", () => {
       access: "workspace-write",
       prompt: "build",
       outputSchema: { type: "object" },
-      projectConfig,
+      profile: resolvedProfile("builder", "openai"),
+      timeoutMs: 60_000,
     });
     expect(result.usage).toMatchObject({
       inputTokens: 9,
@@ -211,7 +222,8 @@ describe("built-in driver contract", () => {
           access: "workspace-write",
           prompt: "build",
           outputSchema: { type: "object" },
-          projectConfig,
+          profile: resolvedProfile("builder", "openai"),
+          timeoutMs: 60_000,
         }),
       ),
     );
@@ -274,7 +286,8 @@ describe("built-in driver contract", () => {
         access: "workspace-write",
         prompt: "build",
         outputSchema: { type: "object" },
-        projectConfig,
+        profile: resolvedProfile("builder", "openai"),
+        timeoutMs: 60_000,
       }),
     ).rejects.toThrow();
   });
@@ -345,7 +358,8 @@ describe("built-in driver contract", () => {
         access: "workspace-write",
         prompt: "use project echo",
         outputSchema: { type: "object" },
-        projectConfig,
+        profile: resolvedProfile("builder", adapter.vendor),
+        timeoutMs: 60_000,
       });
       expect(result).toMatchObject({ summary: "built" });
       if (adapter.name === "claude")
@@ -372,7 +386,8 @@ describe("built-in driver contract", () => {
         access: "workspace-write",
         prompt: "build",
         outputSchema: { type: "object" },
-        projectConfig,
+        profile: resolvedProfile("builder", "anthropic"),
+        timeoutMs: 60_000,
       }),
     ).rejects.toThrow(/unsafe server name/);
   });
@@ -401,7 +416,8 @@ describe("built-in driver contract", () => {
         access: "read-only",
         prompt: "plan",
         outputSchema: { type: "object" },
-        projectConfig,
+        profile: resolvedProfile("guide", "anthropic"),
+        timeoutMs: 60_000,
       }),
     ).rejects.toThrow(/did not connect/);
   });
@@ -431,7 +447,8 @@ describe("built-in driver contract", () => {
         access: "workspace-write",
         prompt: "build",
         outputSchema: { type: "object" },
-        projectConfig,
+        profile: resolvedProfile("builder", "anthropic"),
+        timeoutMs: 60_000,
       }),
     ).rejects.toMatchObject({
       code: "authentication_failed",

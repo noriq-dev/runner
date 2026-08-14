@@ -8,6 +8,7 @@ import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
 import { ClaudeAgentDriver } from "../src/drivers/claude.js";
 import { CodexAgentDriver } from "../src/drivers/codex.js";
+import { OpenAiPricingProvider } from "../src/pricing.js";
 import {
   loadDurableJobState,
   MemoryEventSink,
@@ -173,6 +174,11 @@ try {
     },
   });
   const sink = new MemoryEventSink();
+  const openaiPricing = new OpenAiPricingProvider({
+    stateDirectory,
+    enabled: true,
+    maxStaleHours: 168,
+  });
   const output = await new RunnerJobSupervisor({
     assignment,
     repository,
@@ -180,6 +186,7 @@ try {
     projectConfig: project,
     backend: new GitSourceControlBackend("git"),
     drivers: { codex, claude },
+    pricingProviders: { openai: openaiPricing },
     sink,
   }).run();
   if (!output.summary.startsWith("succeeded:"))
@@ -208,6 +215,8 @@ try {
     throw new Error(`live agents changed unexpected paths: ${changed}`);
   const durable = await loadDurableJobState(stateDirectory, assignment.jobId);
   if (!durable) throw new Error("live dogfood durable state is unavailable");
+  if (durable.phase !== "finalizing")
+    throw new Error(`live dogfood ended in unexpected phase ${durable.phase}`);
   succeeded = true;
   process.stdout.write(
     `${JSON.stringify(
@@ -217,11 +226,17 @@ try {
         retained: output.retainedLocation,
         headRevision: output.headRevision,
         usage: output.usage,
+        phase: durable.phase,
         invocations: Object.values(durable.invocations).map((invocation) => ({
           role: invocation.role,
           status: invocation.status,
           usage: invocation.usage ?? null,
+          usageEvidence: invocation.usageEvidence ?? null,
+          costBasis: invocation.costBasis ?? null,
         })),
+        routes: sink.events
+          .map((event) => event.payload)
+          .filter((event) => event.type === "agent.route"),
         events: sink.events.length,
         changedPaths: [changed],
       },

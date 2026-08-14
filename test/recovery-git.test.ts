@@ -292,6 +292,8 @@ describe("workspace durability", () => {
         return { summary: "accepted", findings: [] };
       throw new Error("completed invocation repeated");
     });
+    Object.defineProperty(fake, "vendor", { value: "openai" });
+    let pricingCalls = 0;
     const output = await new RunnerJobSupervisor({
       assignment,
       repository: repo.path,
@@ -299,10 +301,20 @@ describe("workspace durability", () => {
       projectConfig: config("isolated"),
       backend,
       drivers: { fake, codex: undefined, claude: undefined },
+      pricingProviders: {
+        openai: {
+          vendor: "openai",
+          quote: async () => {
+            pricingCalls += 1;
+            return { quote: null, stale: false, warning: null };
+          },
+        },
+      },
       sink: new MemoryEventSink(),
     }).run();
     expect(output.summary).toContain("succeeded");
     expect(fake.calls.map((call) => call.role)).toEqual(["reviewer"]);
+    expect(pricingCalls).toBe(1);
     expect(
       await command(repo.path, "git", [
         "rev-list",
