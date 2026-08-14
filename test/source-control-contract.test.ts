@@ -181,7 +181,13 @@ function perforceFake(root: string) {
       return ok();
     }
     if (args[0] === "shelve") {
-      shelves.push(args[args.indexOf("-c") + 1]!);
+      const change = args[args.indexOf("-c") + 1]!;
+      if (args.includes("-d")) {
+        const index = shelves.indexOf(change);
+        if (index >= 0) shelves.splice(index, 1);
+        return ok();
+      }
+      shelves.push(change);
       return ok();
     }
     if (args[0] === "describe")

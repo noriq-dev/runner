@@ -675,6 +675,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       { mode: 0o600 },
     );
     let submitted = false;
+    let shelfDeleted = false;
     try {
       await this.requireClean(root);
       await this.p4(root, ["sync", options.target]);
@@ -699,6 +700,8 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
           detail,
           await this.opened(root, change),
         );
+      await this.p4(root, ["shelve", "-d", "-c", change]);
+      shelfDeleted = true;
       const submit = await this.p4(root, ["submit", "-c", change], {
         allowFailure: true,
       });
@@ -725,6 +728,11 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
         ),
       };
     } finally {
+      if (!submitted && shelfDeleted) {
+        const paths = await this.opened(root, change);
+        if (paths.length > 0)
+          await this.p4(root, ["shelve", "-f", "-c", change]);
+      }
       if (!submitted)
         await this.p4(root, ["revert", "-c", change, "//..."], {
           allowEmpty: true,

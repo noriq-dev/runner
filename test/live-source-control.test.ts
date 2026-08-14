@@ -78,6 +78,21 @@ async function liveCandidate(
       expect(inspection.dirtyPaths).toEqual([]);
     }
     await backend.releaseTask(workspace, task);
+    await backend.release(workspace, jobId);
+    const landingRequest = {
+      repository: root,
+      stateDirectory,
+      jobId,
+      workspace,
+      target: baseReference,
+      acceptedTaskCheckpoints: { "LIVE-1": accepted },
+    };
+    const landed = await backend.land(landingRequest);
+    expect(landed.target).toBe(baseReference);
+    expect(landed.checkpoint.ref).toBe(
+      await backend.revisionOf(root, baseReference),
+    );
+    await expect(backend.land(landingRequest)).resolves.toEqual(landed);
   } finally {
     await backend.release(workspace, jobId);
     await rm(stateDirectory, { recursive: true, force: true });
@@ -89,7 +104,7 @@ describe.runIf(
     Boolean(process.env.RUNNER_LIVE_DIVERSION_REPOSITORY) &&
     Boolean(process.env.RUNNER_LIVE_DIVERSION_BASE),
 )("live Diversion backend", () => {
-  it("creates and accepts a candidate in an explicitly disposable repository", async () => {
+  it("creates, accepts, and lands a candidate in an explicitly disposable repository", async () => {
     const repository = process.env.RUNNER_LIVE_DIVERSION_REPOSITORY!;
     await liveCandidate(
       new DiversionSourceControlBackend("diversion"),
@@ -104,7 +119,7 @@ describe.runIf(
     Boolean(process.env.RUNNER_LIVE_PERFORCE_REPOSITORY) &&
     Boolean(process.env.RUNNER_LIVE_PERFORCE_BASE),
 )("live Perforce backend", () => {
-  it("creates and accepts a cumulative shelf in an explicitly disposable client", async () => {
+  it("creates, accepts, and lands a cumulative shelf in an explicitly disposable client", async () => {
     const repository = process.env.RUNNER_LIVE_PERFORCE_REPOSITORY!;
     await liveCandidate(
       new PerforceSourceControlBackend("perforce"),
