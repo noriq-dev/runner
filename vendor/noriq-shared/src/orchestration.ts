@@ -7,9 +7,13 @@ import { z } from 'zod';
 export const ORCHESTRATION_CAPABILITY = 'orchestration.v1' as const;
 export const MISSION_CAPABILITY = 'mission.v2' as const;
 export const MISSION_HANDOFF_CAPABILITY = 'mission.handoff.v1' as const;
+// Registration-time evidence that a daemon speaks the separate RunnerJob v2 channel. This is
+// deliberately not part of RUNNER_PROTOCOL_CAPABILITIES: legacy Run daemons must not advertise
+// RunnerJob support merely because they consumed a newer shared package.
+export const RUNNER_JOB_CAPABILITY = 'runner-job.v2' as const;
 export const MCP_SESSION_LINEAGE_META = 'io.noriq/sessionLineage' as const;
 export const RunnerProtocolCapability = z.enum([
-  ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY,
+  ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY, RUNNER_JOB_CAPABILITY,
 ]);
 export type RunnerProtocolCapability = z.infer<typeof RunnerProtocolCapability>;
 

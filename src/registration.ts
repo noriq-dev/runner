@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { RUNNER_JOB_CAPABILITY } from "@noriq-dev/shared";
 import { z } from "zod";
 import packageJson from "../package.json" with { type: "json" };
 import type { MachineConfig } from "./config.js";
@@ -87,7 +88,7 @@ export async function registerRunner(
           workflows: [],
           executionProfiles: [],
         })),
-        protocolCapabilities: [],
+        protocolCapabilities: [RUNNER_JOB_CAPABILITY],
       }),
     },
   );

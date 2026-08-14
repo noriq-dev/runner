@@ -76,7 +76,9 @@ describe("Runner registration", () => {
     expect(registered.id).toBe("rnr_fresh");
     expect(body).toMatchObject({
       label: "test runner",
+      kinds: [],
       maxConcurrency: 2,
+      protocolCapabilities: ["runner-job.v2"],
       repos: [
         {
           id: "noriq-runner",
