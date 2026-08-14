@@ -81,16 +81,7 @@ export class RunnerSocket implements JobEventSink {
       if (this.socket === socket) this.socket = null;
       throw error;
     }
-    this.send(this.hello);
-    for (const pending of this.pending.values()) this.send(pending.message);
-    const heartbeat = setInterval(() => {
-      const status = this.getHeartbeat?.() ?? {
-        freeSlots: 0,
-        activeJobIds: [],
-      };
-      this.send({ type: "heartbeat", ...status });
-    }, 15_000);
-    this.heartbeat = heartbeat;
+    let heartbeat: NodeJS.Timeout | null = null;
     socket.on("message", (data) => {
       try {
         const message = serverToRunnerSchema.parse(JSON.parse(data.toString()));
@@ -119,10 +110,23 @@ export class RunnerSocket implements JobEventSink {
       }
     });
     socket.once("close", () => {
-      clearInterval(heartbeat);
+      if (heartbeat) clearInterval(heartbeat);
       if (this.heartbeat === heartbeat) this.heartbeat = null;
       if (this.socket === socket) this.socket = null;
     });
+    // Production Durable Objects can answer in the same turn as `send`. Install
+    // every response/close handler before hello or replay so no assignment or
+    // cumulative acknowledgement can arrive in an unobserved window.
+    this.send(this.hello);
+    for (const pending of this.pending.values()) this.send(pending.message);
+    heartbeat = setInterval(() => {
+      const status = this.getHeartbeat?.() ?? {
+        freeSlots: 0,
+        activeJobIds: [],
+      };
+      this.send({ type: "heartbeat", ...status });
+    }, 15_000);
+    this.heartbeat = heartbeat;
     await this.onConnect?.();
   }
 

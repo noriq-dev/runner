@@ -72,6 +72,41 @@ describe("RunnerSocket", () => {
     client.close();
   });
 
+  it("receives an immediate control frame sent in response to hello", async () => {
+    server = new WebSocketServer({ port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("expected TCP server");
+    server.on("connection", (socket) => {
+      socket.once("message", (bytes) => {
+        const message = JSON.parse(bytes.toString()) as { type: string };
+        if (message.type === "hello")
+          socket.send(
+            JSON.stringify({
+              type: "job.cancel",
+              jobId: "job",
+              assignmentId: "assignment",
+              reason: "immediate response",
+            }),
+          );
+      });
+    });
+    const client = new RunnerSocket(`ws://127.0.0.1:${address.port}`, "token", {
+      type: "hello",
+      protocolVersion: 2,
+      runnerId: "runner",
+      capacity: 1,
+      repositories: [],
+    });
+    const received = new Promise<string>((resolve) => {
+      client.onMessage = (message) => resolve(message.type);
+    });
+    await client.connect();
+    await expect(received).resolves.toBe("job.cancel");
+    client.close();
+  });
+
   it("rejects instead of hanging when the websocket handshake is refused", async () => {
     server = new WebSocketServer({
       port: 0,
