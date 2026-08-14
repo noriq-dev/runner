@@ -227,6 +227,39 @@ describe("source-control backend contract", () => {
     ).toThrow(/target is required/);
   });
 
+  it("rejects deferred landing policies in direct mode", () => {
+    for (const landing of ["manual", "auto"] as const) {
+      expect(() =>
+        projectConfigSchema.parse({
+          key: "RUN",
+          repositoryKey: "repo",
+          defaultBranch: "main",
+          sourceControl: {
+            backend: "git",
+            mode: "direct",
+            base: "main",
+            target: "main",
+            landing,
+          },
+          harness: {
+            maxParallelTasks: 1,
+            maxRepairRounds: 1,
+            maxJobMinutes: 5,
+          },
+          agents: {
+            guide: { driver: "fake", model: "guide", effort: "high" },
+            builder: { driver: "fake", model: "builder", effort: "medium" },
+            reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+          },
+          setup: { commands: [], timeoutSeconds: 30 },
+          checks: { commands: [], timeoutSeconds: 30 },
+        }),
+      ).toThrow(
+        /sourceControl\.landing must be retain in direct mode because accepted work is already committed to the target/,
+      );
+    }
+  });
+
   it("keeps Diversion candidates off the accepted output until acceptance", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-diversion-contract-"));
     await mkdir(join(root, ".diversion"));
