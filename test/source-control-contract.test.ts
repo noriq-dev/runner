@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
@@ -124,7 +124,12 @@ function perforceFake(root: string) {
       return ok(
         "Client: client-test\nOptions: allwrite noclobber nocompress unlocked nomodtime normdir\n",
       );
-    if (args.includes("where")) return ok(`${root}\n`);
+    if (args.includes("where")) {
+      const filespec = args.at(-1)!;
+      if (filespec.startsWith("//client-test/"))
+        return ok(`${join(root, filespec.slice("//client-test/".length))}\n`);
+      return ok(`${join(root, "...")}\n`);
+    }
     if (args.includes("changes")) return ok("100\n");
     if (args[0] === "change" && args[1] === "-i") {
       nextChange += 1;
@@ -144,7 +149,14 @@ function perforceFake(root: string) {
           ? (opened.get(args[changeIndex + 1]!) ?? [])
           : [...opened.values()].flat();
       return paths.length
-        ? ok(`${paths.join("\n")}\n`)
+        ? ok(
+            `${paths
+              .map(
+                (path) =>
+                  `//client-test/${relative(root, path).replaceAll("\\", "/")}`,
+              )
+              .join("\n")}\n`,
+          )
         : {
             exitCode: 1,
             stdout: "",
@@ -341,6 +353,7 @@ describe("source-control backend contract", () => {
       expectedBaseRevision: "100",
       config: project("isolated", "//depot/project/...#head"),
     });
+    expect(fake.calls).toContain(`-ztag -F %path% where ${join(root, "...")}`);
     const first = await backend.beginTask(isolated, "RUN-2");
     const recoveredFirst = await backend.beginTask(isolated, "RUN-2");
     expect(recoveredFirst.handle).toEqual(first.handle);
@@ -354,6 +367,9 @@ describe("source-control backend contract", () => {
     });
     if (firstCandidate.status !== "ready")
       throw new Error("candidate not ready");
+    expect(fake.calls).toContain(
+      "-ztag -F %path% where //client-test/feature.txt",
+    );
     await backend.acceptCandidate({
       workspace: isolated,
       task: first,
@@ -425,5 +441,6 @@ describe("source-control backend contract", () => {
     expect(replayed).toEqual(submitted);
     expect(directFake.submitted).toEqual([directCandidate.checkpoint.ref]);
     await directBackend.release(direct, "direct-job");
+    expect(directFake.calls).toContain("clean -e -a -d //...");
   });
 });

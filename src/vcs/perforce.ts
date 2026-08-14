@@ -169,7 +169,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       "-F",
       "%path%",
       "where",
-      ".",
+      join(root, "..."),
     ]);
     const mapped = mapping.stdout.trim();
     if (!mapped || mapped.startsWith("-") || !isAbsolute(mapped))
@@ -232,12 +232,34 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       { allowEmpty: true },
     );
     if (NOTHING.test(`${result.stdout}\n${result.stderr}`)) return [];
-    return result.stdout
+    const clientFiles = result.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .filter(Boolean)
-      .map((file) => relative(root, file).replaceAll("\\", "/"))
-      .filter((file) => file && !file.startsWith("../"));
+      .filter(Boolean);
+    return Promise.all(
+      clientFiles.map(async (clientFile) => {
+        const mapping = await this.p4(root, [
+          "-ztag",
+          "-F",
+          "%path%",
+          "where",
+          clientFile,
+        ]);
+        const localPath = mapping.stdout.trim();
+        if (!localPath || localPath.startsWith("-") || !isAbsolute(localPath))
+          throw new Error(`Perforce opened file ${clientFile} is not mapped`);
+        const workspacePath = relative(root, localPath).replaceAll("\\", "/");
+        if (
+          !workspacePath ||
+          workspacePath.startsWith("../") ||
+          isAbsolute(workspacePath)
+        )
+          throw new Error(
+            `Perforce opened file ${clientFile} maps outside ${root}`,
+          );
+        return workspacePath;
+      }),
+    );
   }
 
   private async requireClean(root: string): Promise<void> {
@@ -252,6 +274,12 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       throw new Error(
         `Perforce workspace is not clean:\n${[...opened, ...pending].join("\n")}`,
       );
+  }
+
+  private async cleanWorkspace(root: string): Promise<void> {
+    await this.p4(root, ["clean", "-e", "-a", "-d", "//..."], {
+      allowEmpty: true,
+    });
   }
 
   async openJob(
@@ -702,6 +730,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
           allowEmpty: true,
           allowFailure: true,
         });
+      if (!submitted) await this.cleanWorkspace(root);
       const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
         jobId?: string;
       };
@@ -721,6 +750,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
     if (paths.length === 0) return null;
     await this.p4(options.task.path, ["shelve", "-f", "-c", change]);
     await this.p4(options.task.path, ["revert", "-c", change, "//..."]);
+    await this.cleanWorkspace(options.task.path);
     options.task.handle.state.preserved = true;
     return { vcs: this.kind, label: `shelf ${change}`, url: null };
   }
@@ -755,6 +785,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       await this.p4(workspace.path, ["revert", "-c", active, "//..."], {
         allowEmpty: true,
       });
+    await this.cleanWorkspace(workspace.path);
     const lockPath = stringState(workspace.handle, "lockPath");
     try {
       const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
@@ -791,6 +822,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
       if (paths.length > 0) {
         await this.p4(root, ["shelve", "-f", "-c", owner.change]);
         await this.p4(root, ["revert", "-c", owner.change, "//..."]);
+        await this.cleanWorkspace(root);
         warnings.push(
           `preserved orphaned Perforce work in shelf ${owner.change}`,
         );
