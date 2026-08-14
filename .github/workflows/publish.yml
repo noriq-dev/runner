@@ -1,0 +1,46 @@
+# Publish @noriq-dev/runner through npm trusted publishing. The npm package is
+# configured to trust this repository and workflow path; no long-lived npm token
+# is stored in GitHub.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "$want"
+      - run: npm ci
+      - run: npm run vendor:check
+      - run: npm run check
+      - name: Pack and smoke-test the release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(npm pack --silent)
+          prefix=$(mktemp -d)
+          npm install --global --prefix "$prefix" "./$package"
+          got=$("$prefix/bin/noriq-runner" version)
+          want=$(node -p "require('./package.json').version")
+          test "$got" = "$want"
+          "$prefix/bin/noriq-runner" help | grep -q 'noriq-runner <command>'
+      - run: npm publish

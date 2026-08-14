@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, rebuild/runner-from-scratch]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run vendor:check
+      - run: npm run check
+      - run: npm run build
+      - name: Smoke-test the packed binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(npm pack --silent)
+          prefix=$(mktemp -d)
+          npm install --global --prefix "$prefix" "./$package"
+          got=$("$prefix/bin/noriq-runner" version)
+          want=$(node -p "require('./package.json').version")
+          test "$got" = "$want"
+          "$prefix/bin/noriq-runner" help | grep -q 'noriq-runner <command>'

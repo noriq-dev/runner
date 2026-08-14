@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -23,6 +23,32 @@ async function collect(child) {
 }
 
 try {
+  const expectedVersion = JSON.parse(
+    await readFile(join(root, "package.json"), "utf8"),
+  ).version;
+  const reportedVersion = await collect(
+    spawn(process.execPath, [join(root, "dist/cli.js"), "version"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+  if (
+    reportedVersion.exitCode !== 0 ||
+    reportedVersion.stdout.trim() !== expectedVersion
+  )
+    throw new Error(`built CLI version failed: ${reportedVersion.stderr}`);
+  const reportedHelp = await collect(
+    spawn(process.execPath, [join(root, "dist/cli.js"), "help"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+  if (
+    reportedHelp.exitCode !== 0 ||
+    !reportedHelp.stdout.includes("noriq-runner <command>")
+  )
+    throw new Error(`built CLI help failed: ${reportedHelp.stderr}`);
+
   const config = join(temporary, "runner.toml");
   await writeFile(
     config,

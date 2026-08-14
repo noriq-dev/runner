@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { loadMachineConfig } from "./config.js";
 import { runDaemon } from "./daemon.js";
@@ -10,8 +11,41 @@ function argument(args: string[], name: string): string | undefined {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
+const help = `noriq-runner <command> [options]
+
+Commands:
+  start       Start the Runner daemon
+  validate    Validate machine configuration without connecting
+  doctor      Check repositories, VCS backends, and agent drivers
+  usage       Show durable usage for one job
+  version     Print the installed Runner version
+  help        Show this help
+
+Options:
+  --config <path>           Machine configuration (default: runner.toml)
+  --state-directory <path> State directory for usage
+  --job <id>                Job ID for usage
+`;
+
+async function version(): Promise<string> {
+  const manifest = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version?: unknown };
+  if (typeof manifest.version !== "string" || manifest.version.length === 0)
+    throw new Error("package.json does not contain a valid version");
+  return manifest.version;
+}
+
 async function main(): Promise<void> {
   const [command = "start", ...args] = process.argv.slice(2);
+  if (command === "version" || command === "--version" || command === "-v") {
+    process.stdout.write(`${await version()}\n`);
+    return;
+  }
+  if (command === "help" || command === "--help" || command === "-h") {
+    process.stdout.write(help);
+    return;
+  }
   if (command === "control-mcp") {
     await import("./control-mcp.js");
     return;
@@ -46,7 +80,7 @@ async function main(): Promise<void> {
     return;
   }
   if (!new Set(["start", "validate", "doctor"]).has(command))
-    throw new Error(`unknown command ${command}`);
+    throw new Error(`unknown command ${command}; run noriq-runner help`);
   const configPath = resolve(argument(args, "--config") ?? "runner.toml");
   const config = await loadMachineConfig(configPath);
   if (command === "validate") {

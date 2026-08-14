@@ -11,6 +11,16 @@ Noriq Runner is a small, durable agent-guided harness. Noriq commissions one imm
 
 ## Start
 
+Install the published CLI with Node.js 22 or newer:
+
+```bash
+npm install --global @noriq-dev/runner
+noriq-runner version
+noriq-runner help
+```
+
+To run from a source checkout:
+
 ```bash
 npm ci
 npm run check
