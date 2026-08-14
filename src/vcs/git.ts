@@ -278,7 +278,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
       handle: {
         backend: this.id,
         version: 1,
-        state: { workRef: task.branch },
+        state: { workRef: task.branch, candidateCreated: false },
       },
       path: task.path,
       baseRevision: task.baseRevision,
@@ -300,20 +300,26 @@ export class GitSourceControlBackend implements SourceControlBackend {
         changedPaths,
         backendState: options.task.handle,
       };
+    const candidateCreated =
+      options.task.handle.state.candidateCreated === true;
+    if (changedPaths.length === 0) {
+      const ref = await currentRevision(options.task.path);
+      return {
+        status: "ready" as const,
+        checkpoint: checkpointRecord(ref, candidateCreated ? ref : "no-op"),
+        changedPaths,
+        backendState: options.task.handle,
+      };
+    }
     const ref =
-      changedPaths.length === 0
-        ? await currentRevision(options.task.path)
-        : options.refresh
-          ? await amendCheckpoint(
-              options.task.path,
-              options.taskKey,
-              options.summary,
-            )
-          : await checkpoint(
-              options.task.path,
-              options.taskKey,
-              options.summary,
-            );
+      options.refresh && candidateCreated
+        ? await amendCheckpoint(
+            options.task.path,
+            options.taskKey,
+            options.summary,
+          )
+        : await checkpoint(options.task.path, options.taskKey, options.summary);
+    options.task.handle.state.candidateCreated = true;
     return {
       status: "ready" as const,
       checkpoint: checkpointRecord(ref),
@@ -362,6 +368,11 @@ export class GitSourceControlBackend implements SourceControlBackend {
     candidate: SourceControlCheckpoint,
   ): Promise<string> {
     taskState(task, this.id);
+    if (
+      workspace.mode === "isolated" &&
+      task.handle.state.candidateCreated !== true
+    )
+      return "";
     return diffForReview(
       task.path,
       workspace.mode === "direct"
@@ -499,7 +510,13 @@ export class GitSourceControlBackend implements SourceControlBackend {
     taskState(options.task, this.id);
     const changed = await dirtyPaths(options.task.path);
     const head = await currentRevision(options.task.path);
-    if (changed.length === 0 && head === options.task.baseRevision) return null;
+    if (
+      changed.length === 0 &&
+      (options.workspace.mode === "isolated"
+        ? options.task.handle.state.candidateCreated !== true
+        : head === options.task.baseRevision)
+    )
+      return null;
     const recoveryCommit =
       changed.length > 0
         ? await normalizeWipCheckpoint(

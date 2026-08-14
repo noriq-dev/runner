@@ -100,7 +100,7 @@ export function repairPrompt(
   checks: unknown,
   round: number,
 ): string {
-  return `You are a fresh repair worker for round ${round}. Fix only the blocking deterministic-check failures and blocker/major review findings listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
+  return `You are a fresh repair worker for round ${round}. Fix only the blocker/major worker or review findings and deterministic-check failures listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskFacts(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
 }
 
 export const guideOutputSchema = {

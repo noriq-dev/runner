@@ -65,6 +65,7 @@ interface BuiltTask {
   workspace: TaskWorkspace;
   candidate: SourceControlCheckpoint;
   buildSummary: string;
+  workerFindings: Finding[];
 }
 
 function safeIdPart(input: string): string {
@@ -140,6 +141,24 @@ function blockingFindings(findings: Finding[]): Finding[] {
   return findings.filter(
     (finding) => finding.severity === "blocker" || finding.severity === "major",
   );
+}
+function findingEvidence(
+  result: Pick<AgentResult, "findings">,
+): Partial<RunnerJobObservationEvidence> {
+  return {
+    blockerFindings: result.findings.filter(
+      (finding) => finding.severity === "blocker",
+    ).length,
+    majorFindings: result.findings.filter(
+      (finding) => finding.severity === "major",
+    ).length,
+    minorFindings: result.findings.filter(
+      (finding) => finding.severity === "minor",
+    ).length,
+  };
+}
+function workspaceInstruction(workspace: string): string {
+  return `Runtime workspace root: ${JSON.stringify(workspace)}. Resolve every repository-relative path under this exact root; do not substitute /repo or another conventional mount path.`;
 }
 function taskContract(result: AgentResult): TaskContract {
   const value = result.structured;
@@ -798,7 +817,10 @@ export class RunnerJobSupervisor {
                 ),
           actor,
           recovery: "journal_replay",
-          evidence: emptyEvidence({ resultDigest: digestValue }),
+          evidence: emptyEvidence({
+            resultDigest: digestValue,
+            ...findingEvidence(recovered),
+          }),
         });
       }
       await this.emitInvocationFinished(id);
@@ -829,7 +851,10 @@ export class RunnerJobSupervisor {
               ),
         actor,
         recovery: "process_recovery",
-        evidence: emptyEvidence({ resultDigest: resultDigest(recovered) }),
+        evidence: emptyEvidence({
+          resultDigest: resultDigest(recovered),
+          ...findingEvidence(recovered),
+        }),
       });
       await this.emitInvocationFinished(id);
       await this.emit({ type: "usage", at: now(), usage: this.state.usage });
@@ -845,7 +870,7 @@ export class RunnerJobSupervisor {
         role === "guide" || role === "reviewer"
           ? "read-only"
           : "workspace-write",
-      prompt,
+      prompt: `${workspaceInstruction(workspace)}\n\n${prompt}`,
       outputSchema: schema,
       projectConfig: this.options.projectConfig,
       signal: this.abort.signal,
@@ -877,7 +902,10 @@ export class RunnerJobSupervisor {
         ),
         actor,
         recovery: "none",
-        evidence: emptyEvidence({ resultDigest: resultDigest(result) }),
+        evidence: emptyEvidence({
+          resultDigest: resultDigest(result),
+          ...findingEvidence(result),
+        }),
       });
       await this.emitInvocationFinished(id);
       await this.emit({ type: "usage", at: now(), usage: this.state.usage });
@@ -1129,6 +1157,10 @@ export class RunnerJobSupervisor {
       builderPrompt(task, contract, guideInstructions),
       workerOutputSchema,
     );
+    await this.record("task.findings", {
+      taskId: task.taskId,
+      findings: builder.findings,
+    });
     let candidate = retained?.candidate;
     if (!candidate) {
       const staged = await this.stageCandidateObserved(
@@ -1158,6 +1190,7 @@ export class RunnerJobSupervisor {
       workspace: taskWorkspace,
       candidate,
       buildSummary: builder.summary,
+      workerFindings: builder.findings,
     };
   }
 
@@ -1166,6 +1199,73 @@ export class RunnerJobSupervisor {
     let round = 0;
     try {
       while (true) {
+        const workerBlockers = blockingFindings(built.workerFindings);
+        if (workerBlockers.length > 0) {
+          if (round >= this.options.projectConfig.harness.maxRepairRounds) {
+            await this.record("task.failed", {
+              taskId: task.taskId,
+              reason: "worker findings exceeded the repair ceiling",
+            });
+            await this.emit({
+              type: "task.result",
+              at: now(),
+              taskId: task.taskId,
+              status: "failed",
+              checkpoint: null,
+              summary:
+                "Blocking worker findings remain after the repair ceiling.",
+              findings: built.workerFindings,
+            });
+            await this.retainFailedTask(
+              built,
+              "worker findings exceeded the repair ceiling",
+            );
+            return false;
+          }
+          round += 1;
+          await this.record("task.repair", { taskId: task.taskId, round });
+          await this.emit({
+            type: "progress",
+            at: now(),
+            phase: "repairing",
+            message: `Repairing worker findings for ${task.key} (${round}/${this.options.projectConfig.harness.maxRepairRounds})`,
+            progress: 0,
+          });
+          const repair = await this.invoke(
+            task,
+            "repairer",
+            round,
+            built.workspace.path,
+            repairPrompt(task, built.contract, workerBlockers, [], round),
+            workerOutputSchema,
+          );
+          built.buildSummary = repair.summary;
+          built.workerFindings = repair.findings;
+          await this.record("task.findings", {
+            taskId: task.taskId,
+            findings: repair.findings,
+          });
+          const staged = await this.stageCandidateObserved(
+            task,
+            built.workspace,
+            repair.summary,
+            true,
+            round + 1,
+          );
+          if (staged.status === "conflict")
+            throw new IntegrationConflict(
+              "candidate refresh requires conflict repair",
+              staged.detail,
+              staged.paths,
+            );
+          built.candidate = staged.checkpoint;
+          await this.record("task.candidate", {
+            taskId: task.taskId,
+            candidate: built.candidate,
+            workspace: built.workspace,
+          });
+          continue;
+        }
         const integration = await this.integrateLatestObserved(
           task,
           built.workspace,
@@ -1217,6 +1317,12 @@ export class RunnerJobSupervisor {
               ),
               workerOutputSchema,
             );
+            built.buildSummary = repair.summary;
+            built.workerFindings = repair.findings;
+            await this.record("task.findings", {
+              taskId: task.taskId,
+              findings: repair.findings,
+            });
             await this.conflictActionObserved(
               task,
               built.workspace,
@@ -1371,6 +1477,12 @@ export class RunnerJobSupervisor {
               ),
               workerOutputSchema,
             );
+            built.buildSummary = repair.summary;
+            built.workerFindings = repair.findings;
+            await this.record("task.findings", {
+              taskId: task.taskId,
+              findings: repair.findings,
+            });
             await this.conflictActionObserved(
               task,
               built.workspace,
@@ -1448,6 +1560,12 @@ export class RunnerJobSupervisor {
           repairPrompt(task, built.contract, blockers, failures, round),
           workerOutputSchema,
         );
+        built.buildSummary = repair.summary;
+        built.workerFindings = repair.findings;
+        await this.record("task.findings", {
+          taskId: task.taskId,
+          findings: repair.findings,
+        });
         const staged = await this.stageCandidateObserved(
           task,
           built.workspace,

@@ -3,11 +3,28 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
+import { runProcess } from "../src/process.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
+import { GitSourceControlBackend } from "../src/vcs/git.js";
 import {
   type P4Cli,
   PerforceSourceControlBackend,
 } from "../src/vcs/perforce.js";
+
+async function command(
+  cwd: string,
+  executable: string,
+  args: string[],
+): Promise<string> {
+  const result = await runProcess({
+    command: executable,
+    args,
+    cwd,
+    timeoutMs: 10_000,
+  });
+  if (result.exitCode !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+}
 
 function project(kind: "isolated" | "direct", base: string) {
   return projectConfigSchema.parse({
@@ -276,6 +293,104 @@ describe("source-control backend contract", () => {
         /sourceControl\.landing must be retain in direct mode because accepted work is already committed to the target/,
       );
     }
+  });
+
+  it("keeps an isolated Git no-op off the review diff and creates the first repair commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-git-no-op-"));
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const backend = new GitSourceControlBackend("git-test");
+    const workspace = await backend.openJob({
+      repository,
+      stateDirectory: join(root, "state"),
+      jobId: "git-no-op",
+      key: "RUN-5",
+      kind: "task",
+      expectedBaseRevision: base,
+      config: project("isolated", "main"),
+    });
+    const task = await backend.beginTask(workspace, "RUN-5");
+    const priorTask = await backend.beginTask(workspace, "RUN-4");
+
+    const noOp = await backend.stageCandidate({
+      workspace,
+      task,
+      taskKey: "RUN-5",
+      summary: "builder was blocked",
+      refresh: false,
+    });
+    if (noOp.status !== "ready") throw new Error("candidate not ready");
+    expect(noOp.checkpoint).toMatchObject({ ref: base, label: "no-op" });
+    expect(task.handle.state.candidateCreated).toBe(false);
+    expect(await backend.reviewDiff(workspace, task, noOp.checkpoint)).toBe("");
+
+    await writeFile(join(priorTask.path, "prior.txt"), "prior\n");
+    const prior = await backend.stageCandidate({
+      workspace,
+      task: priorTask,
+      taskKey: "RUN-4",
+      summary: "created prior plan output",
+      refresh: false,
+    });
+    if (prior.status !== "ready") throw new Error("candidate not ready");
+    const acceptedPrior = await backend.acceptCandidate({
+      workspace,
+      task: priorTask,
+      candidate: prior.checkpoint,
+      taskKey: "RUN-4",
+    });
+    const integrated = await backend.integrateLatest(workspace, task);
+    if (integrated?.status !== "ready")
+      throw new Error("no-op task did not integrate");
+    expect(integrated.checkpoint.ref).toBe(acceptedPrior.ref);
+    expect(task.handle.state.candidateCreated).toBe(false);
+    expect(
+      await backend.reviewDiff(workspace, task, integrated.checkpoint),
+    ).toBe("");
+
+    await writeFile(join(task.path, "repaired.txt"), "repaired\n");
+    const repaired = await backend.stageCandidate({
+      workspace,
+      task,
+      taskKey: "RUN-5",
+      summary: "created repaired output",
+      refresh: true,
+    });
+    if (repaired.status !== "ready") throw new Error("candidate not ready");
+    expect(repaired.checkpoint.ref).not.toBe(base);
+    expect(task.handle.state.candidateCreated).toBe(true);
+    expect(
+      await command(task.path, "git", [
+        "rev-parse",
+        `${repaired.checkpoint.ref}^`,
+      ]),
+    ).toBe(acceptedPrior.ref);
+    expect(
+      await command(task.path, "git", [
+        "log",
+        "-1",
+        "--format=%B",
+        repaired.checkpoint.ref,
+      ]),
+    ).toContain("RUN-5: created repaired output");
+    expect(
+      await backend.reviewDiff(workspace, task, repaired.checkpoint),
+    ).toContain("repaired.txt");
+
+    await backend.releaseTask(workspace, priorTask);
+    await backend.releaseTask(workspace, task);
+    await backend.release(workspace, "git-no-op");
   });
 
   it("keeps Diversion candidates off the accepted output until acceptance", async () => {

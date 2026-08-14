@@ -212,6 +212,7 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
           ...(payload.checks as CheckResult[]),
         );
         break;
+      case "task.findings":
       case "task.reviewed":
         state.tasks[payload.taskId as string]!.findings =
           payload.findings as Finding[];

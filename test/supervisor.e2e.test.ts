@@ -279,6 +279,191 @@ describe("RunnerJobSupervisor", () => {
     expect(await loadPendingLandingResults(stateDirectory)).toEqual([]);
   });
 
+  it("repairs repeated worker blockers before one check and review", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-worker-blocker-"));
+    const repository = join(root, "repository");
+    await command(root, "mkdir", [repository]);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "runner@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+    const blocker = (title: string) => ({
+      severity: "blocker" as const,
+      title,
+      body: "The worker could not write the commissioned file.",
+      path: "recovered.txt",
+      line: null,
+    });
+    let repairs = 0;
+    const fake = new FakeAgentDriver(
+      join(root, "artifacts"),
+      async (request) => {
+        if (request.role === "builder")
+          return {
+            summary: "builder blocked",
+            findings: [blocker("builder blocked")],
+          };
+        if (request.role === "repairer") {
+          repairs += 1;
+          if (repairs === 1)
+            return {
+              summary: "repair still blocked",
+              findings: [blocker("repair still blocked")],
+            };
+          await writeFile(join(request.workspace, "recovered.txt"), "fixed\n");
+          return { summary: "repaired worker blocker", findings: [] };
+        }
+        if (request.role === "reviewer")
+          return { summary: "accepted", findings: [] };
+        throw new Error(`unexpected ${request.role} invocation`);
+      },
+    );
+    const config = projectConfigSchema.parse({
+      key: "RUN",
+      repositoryKey: "repo",
+      defaultBranch: "main",
+      sourceControl: { backend: "git", mode: "isolated", base: "main" },
+      harness: { maxParallelTasks: 1, maxRepairRounds: 2, maxJobMinutes: 5 },
+      agents: {
+        guide: { driver: "fake", model: "guide", effort: "high" },
+        builder: { driver: "fake", model: "builder", effort: "medium" },
+        reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+      },
+      setup: { commands: [], timeoutSeconds: 30 },
+      checks: { commands: ["test -f recovered.txt"], timeoutSeconds: 30 },
+    });
+    const assignment = jobAssignmentSchema.parse({
+      protocolVersion: 2,
+      jobId: "job-worker-blocker",
+      assignmentId: "assignment-worker-blocker",
+      snapshotDigest: "9".repeat(64),
+      repoRef: "repo",
+      expectedBaseRevision: base,
+      source: {
+        kind: "task",
+        projectId: "project",
+        projectKey: "RUN",
+        task: {
+          taskId: "worker-blocker",
+          key: "RUN-6",
+          title: "Recover a blocked worker",
+          body: "Create recovered.txt.",
+          executionSpec: {
+            anticipatedFiles: [
+              {
+                path: "recovered.txt",
+                change: "create",
+                why: "Prove worker blocker recovery",
+              },
+            ],
+            acceptance: {
+              observableTruths: ["recovered.txt exists"],
+            },
+          },
+          status: "todo",
+          retry: false,
+          order: 0,
+          phaseOrder: 0,
+        },
+      },
+    });
+    const sink = new MemoryEventSink();
+    const output = await new RunnerJobSupervisor({
+      assignment,
+      repository,
+      stateDirectory: join(root, "state"),
+      projectConfig: config,
+      backend: new GitWorkspaceBackend(),
+      drivers: { fake, codex: undefined, claude: undefined },
+      sink,
+    }).run();
+
+    expect(output.summary).toContain("succeeded");
+    expect(fake.calls.map((call) => call.role)).toEqual([
+      "builder",
+      "repairer",
+      "repairer",
+      "reviewer",
+    ]);
+    const builder = fake.calls[0]!;
+    expect(builder.prompt).toContain(
+      `Runtime workspace root: ${JSON.stringify(builder.workspace)}.`,
+    );
+    expect(builder.prompt).toContain("do not substitute /repo");
+    const events = sink.events.map((event) => event.payload);
+    const checkStarts = events.filter(
+      (event) => event.type === "stage.started" && event.stage === "check",
+    );
+    expect(checkStarts).toHaveLength(1);
+    const checkIndex = events.findIndex(
+      (event) => event.type === "stage.started" && event.stage === "check",
+    );
+    const repairFinishedIndexes = events
+      .map((event, index) => ({ event, index }))
+      .filter(
+        ({ event }) =>
+          event.type === "stage.finished" &&
+          event.stage === "repair" &&
+          event.actor.kind === "agent",
+      )
+      .map(({ index }) => index);
+    expect(repairFinishedIndexes).toHaveLength(2);
+    expect(repairFinishedIndexes.every((index) => index < checkIndex)).toBe(
+      true,
+    );
+    const agentEvidence = events.flatMap((event) => {
+      if (
+        event.type !== "stage.finished" ||
+        event.actor.kind !== "agent" ||
+        !["build", "repair", "review"].includes(event.stage)
+      )
+        return [];
+      return [{ stage: event.stage, evidence: event.evidence }];
+    });
+    expect(agentEvidence).toEqual([
+      {
+        stage: "build",
+        evidence: expect.objectContaining({
+          blockerFindings: 1,
+          majorFindings: 0,
+          minorFindings: 0,
+        }),
+      },
+      {
+        stage: "repair",
+        evidence: expect.objectContaining({ blockerFindings: 1 }),
+      },
+      {
+        stage: "repair",
+        evidence: expect.objectContaining({ blockerFindings: 0 }),
+      },
+      {
+        stage: "review",
+        evidence: expect.objectContaining({ blockerFindings: 0 }),
+      },
+    ]);
+    expect(
+      events.find(
+        (event) => event.type === "task.result" && event.status === "accepted",
+      ),
+    ).toMatchObject({ summary: "repaired worker blocker", findings: [] });
+    expect(
+      await command(repository, "git", [
+        "log",
+        "-1",
+        "--format=%B",
+        output.headRevision,
+      ]),
+    ).toContain("RUN-6: repaired worker blocker");
+  });
+
   it("automatically lands a fully accepted isolated job when the project opts in", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-auto-land-"));
     const repository = join(root, "repository");
