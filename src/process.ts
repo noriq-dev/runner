@@ -7,6 +7,8 @@ export interface ProcessResult {
   stderr: string;
   durationMs: number;
   timedOut: boolean;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 export async function runProcess(options: {
@@ -29,15 +31,19 @@ export async function runProcess(options: {
   const maximum = options.maxOutputBytes ?? 4 * 1024 * 1024;
   let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
   const collect = (
     current: Buffer<ArrayBufferLike>,
     chunk: Buffer<ArrayBufferLike>,
   ): Buffer<ArrayBufferLike> =>
     Buffer.concat([current, chunk]).subarray(-maximum);
   child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBytes += chunk.length;
     stdout = collect(stdout, chunk);
   });
   child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.length;
     stderr = collect(stderr, chunk);
   });
   if (options.stdin !== undefined) child.stdin.end(options.stdin);
@@ -89,5 +95,7 @@ export async function runProcess(options: {
     stderr: stderr.toString("utf8"),
     durationMs: Math.max(0, Math.round(performance.now() - started)),
     timedOut,
+    stdoutTruncated: stdoutBytes > maximum,
+    stderrTruncated: stderrBytes > maximum,
   };
 }

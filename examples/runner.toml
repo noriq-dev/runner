@@ -3,11 +3,25 @@
 # id = "existing-registered-runner-id"
 label = "build-runner"
 serverUrl = "https://noriq.example"
-# Prefer an environment variable so this file can stay non-secret.
-tokenEnv = "NORIQ_RUNNER_TOKEN"
+# OAuth credentials are the default. `tokenEnv` and deprecated literal `token`
+# remain higher-precedence compatibility options.
 stateDirectory = "/var/lib/noriq-runner"
 scanRoots = ["/srv/projects"]
 maxConcurrentJobs = 2
+
+[auth.noriq]
+credentialsFile = "/var/lib/noriq-runner/credentials.json"
+
+[discovery]
+intervalSeconds = 60
+maxDepth = 6
+
+[memory.indexer]
+pollMinutes = 60
+maxFiles = 20000
+maxFileBytes = 1000000
+maxTotalBytes = 100000000
+deadlineSeconds = 120
 
 [pricing.openai]
 # Official API-list rates are cached for exactly 24 hours. A failed refresh may

@@ -132,8 +132,9 @@ export function builderPrompt(
   task: RunnerTaskSnapshot,
   contract: TaskContract,
   guideInstructions?: string,
+  memoryEvidence?: string,
 ): string {
-  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}`;
+  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}${memoryEvidence ? `\n\n${memoryEvidence}` : ""}`;
 }
 
 export function reviewerPrompt(

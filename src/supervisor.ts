@@ -16,6 +16,8 @@ import type {
   RunnerTaskSnapshot,
 } from "./contracts.js";
 import { assertAcyclicSource } from "./contracts.js";
+import { DurableLeaseManager } from "./coordination/lease-manager.js";
+import type { CoordinationProvider, LeaseScope } from "./coordination/types.js";
 import type {
   AgentDriver,
   AgentRequest,
@@ -30,6 +32,7 @@ import {
   unavailableMetric,
 } from "./intelligence.js";
 import { ChecksummedJournal } from "./journal.js";
+import type { MemoryContextProvider } from "./memory/context/provider.js";
 import { attributeUsageCost, type PricingProvider } from "./pricing.js";
 import {
   builderPrompt,
@@ -211,6 +214,8 @@ export class RunnerJobSupervisor {
   private readonly earlyAnswers = new Map<string, string>();
   private recordTail: Promise<void> = Promise.resolve();
   private emitTail: Promise<void> = Promise.resolve();
+  private coordination: DurableLeaseManager | null = null;
+  private coordinationDeadline = 0;
 
   constructor(
     private readonly options: {
@@ -221,12 +226,122 @@ export class RunnerJobSupervisor {
       backend: SourceControlBackend;
       drivers: Record<string, AgentDriver | undefined>;
       pricingProviders?: Record<string, PricingProvider | undefined>;
+      memoryContext?: MemoryContextProvider;
+      coordination?: {
+        provider: CoordinationProvider;
+        runnerId: string;
+        checkoutId: string;
+        projectId: string;
+      };
+      onRepositoryChanged?: () => void | Promise<void>;
       sink: JobEventSink;
     },
   ) {}
 
   cancel(): void {
     this.abort.abort(new Error("job cancelled"));
+  }
+
+  private coordinationScope(tasks: RunnerTaskSnapshot[]): LeaseScope {
+    const lane =
+      this.options.projectConfig.sourceControl.target ??
+      this.options.projectConfig.sourceControl.base;
+    const requiresRepository =
+      this.options.projectConfig.sourceControl.mode === "direct" ||
+      !this.options.backend.capabilities.parallelTaskWorkspaces ||
+      tasks.some((task) => executionSpecCoverage(task) !== "build_ready");
+    if (requiresRepository)
+      return {
+        repositoryKey: this.options.projectConfig.repositoryKey,
+        lane,
+        kind: "repository",
+        paths: [],
+      };
+    const paths = [
+      ...new Set(
+        tasks.flatMap(
+          (task) =>
+            task.executionSpec?.anticipatedFiles.map((file) => file.path) ?? [],
+        ),
+      ),
+    ].sort();
+    return paths.length > 0
+      ? {
+          repositoryKey: this.options.projectConfig.repositoryKey,
+          lane,
+          kind: "paths",
+          paths,
+        }
+      : {
+          repositoryKey: this.options.projectConfig.repositoryKey,
+          lane,
+          kind: "repository",
+          paths: [],
+        };
+  }
+
+  private async acquireCoordination(
+    tasks: RunnerTaskSnapshot[],
+  ): Promise<void> {
+    const configured = this.options.coordination;
+    if (!configured) return;
+    this.coordinationDeadline =
+      Date.now() + this.options.projectConfig.harness.maxJobMinutes * 60_000;
+    this.coordination = new DurableLeaseManager(configured.provider, {
+      stateDirectory: this.options.stateDirectory,
+      identity: {
+        runnerId: configured.runnerId,
+        checkoutId: configured.checkoutId,
+        projectId: configured.projectId,
+        jobId: this.options.assignment.jobId,
+        assignmentId: this.options.assignment.assignmentId,
+        taskId: null,
+        idempotencyKey: `${this.options.assignment.jobId}:workspace:v1`,
+      },
+      onWaiting: async (attempt, delayMs) => {
+        await this.record("coordination.waiting", {
+          attempt,
+          delayMs,
+          taskIds: tasks.map((task) => task.taskId),
+        });
+      },
+      onAcquired: async (lease) => {
+        await this.record("coordination.acquired", {
+          leaseId: lease.leaseId,
+          kind: lease.kind,
+          pathCount: lease.paths.length,
+          fencingToken: lease.fencingToken,
+          expiresAt: lease.expiresAt,
+        });
+      },
+      onLost: async (error) => {
+        await this.record("coordination.lost", {
+          message: (error instanceof Error
+            ? error.message
+            : String(error)
+          ).slice(0, 500),
+        });
+        this.abort.abort(new Error("coordination lease was lost"));
+      },
+    });
+    const desired = this.coordinationScope(tasks);
+    const recovered = await this.coordination.recover();
+    if (!recovered)
+      await this.coordination.acquire(
+        desired,
+        this.abort.signal,
+        this.coordinationDeadline,
+      );
+    else if (
+      recovered.kind !== desired.kind ||
+      recovered.lane !== desired.lane ||
+      JSON.stringify(recovered.paths) !== JSON.stringify(desired.paths)
+    )
+      await this.coordination.exchange(
+        desired,
+        this.abort.signal,
+        this.coordinationDeadline,
+      );
   }
 
   async answer(questionId: string, answer: string): Promise<void> {
@@ -1255,6 +1370,26 @@ export class RunnerJobSupervisor {
       );
       plan = guide.plan ?? String(guide.structured.plan ?? guide.summary);
     }
+    const narrowedPaths =
+      task.executionSpec?.anticipatedFiles.map((file) => file.path) ?? [];
+    if (
+      this.coordination?.current()?.kind === "repository" &&
+      this.options.assignment.source.kind === "task" &&
+      initialClassification.specCoverage !== "build_ready" &&
+      narrowedPaths.length > 0
+    )
+      await this.coordination.exchange(
+        {
+          repositoryKey: this.options.projectConfig.repositoryKey,
+          lane:
+            this.options.projectConfig.sourceControl.target ??
+            this.options.projectConfig.sourceControl.base,
+          kind: "paths",
+          paths: narrowedPaths,
+        },
+        this.abort.signal,
+        this.coordinationDeadline,
+      );
     const buildClassification = initialClassification;
     await this.record("task.plan", { taskId: task.taskId, plan });
     await this.emit({
@@ -1309,12 +1444,51 @@ export class RunnerJobSupervisor {
       message: `Building ${task.key}`,
       progress: 0,
     });
+    let memoryEvidence: string | undefined;
+    if (
+      this.options.projectConfig.memory.context.enabled &&
+      this.options.memoryContext
+    ) {
+      const memory = await this.options.memoryContext.retrieve({
+        projectId: this.options.assignment.source.projectId,
+        taskId: task.taskId,
+        repositoryKey: this.options.projectConfig.repositoryKey,
+        branch: this.options.projectConfig.defaultBranch,
+        baseId: taskWorkspace.baseRevision,
+        workspace: taskWorkspace.path,
+        tokenBudget: this.options.projectConfig.memory.context.tokenBudget,
+      });
+      memoryEvidence = memory.text || undefined;
+      await this.record("memory.context", {
+        taskId: task.taskId,
+        packDigest: memory.digest,
+        generatedAt: memory.generatedAt,
+        consumption: memory.consumption,
+      });
+      await this.emit({
+        type: "memory.context",
+        at: now(),
+        taskId: task.taskId,
+        packDigest: memory.digest,
+        generatedAt: memory.generatedAt,
+        consumption: memory.consumption,
+      });
+      if (memory.warning) {
+        await this.record("warning", { message: memory.warning });
+        await this.emit({
+          type: "warning",
+          at: now(),
+          code: "memory-context-unavailable",
+          message: memory.warning,
+        });
+      }
+    }
     const builder = await this.invoke(
       task,
       "builder",
       0,
       taskWorkspace.path,
-      builderPrompt(task, contract, guideInstructions),
+      builderPrompt(task, contract, guideInstructions, memoryEvidence),
       workerOutputSchema,
       buildClassification,
     );
@@ -1714,6 +1888,8 @@ export class RunnerJobSupervisor {
             findings: reviewer.findings,
           });
           await this.releaseTaskObserved(task, built.workspace, round + 1);
+          if (this.workspace.mode === "direct")
+            await this.options.onRepositoryChanged?.();
           return true;
         }
         if (round >= this.options.projectConfig.harness.maxRepairRounds) {
@@ -2048,6 +2224,7 @@ export class RunnerJobSupervisor {
       };
     }
     await this.record("landing.auto.completed", { landing });
+    if (landing.status === "landed") await this.options.onRepositoryChanged?.();
   }
 
   private async execute(): Promise<RunnerJobOutput> {
@@ -2070,6 +2247,8 @@ export class RunnerJobSupervisor {
     if (!this.state.assignment)
       await this.record("job.assigned", {
         assignment: this.options.assignment,
+        projectConfig: this.options.projectConfig,
+        projectConfigDigest: digest(this.options.projectConfig),
       });
     if (
       this.options.assignment.assignmentId !==
@@ -2086,6 +2265,7 @@ export class RunnerJobSupervisor {
         `${decomposed.key} contains authored execution steps; dispatch them as first-class plan tasks`,
       );
     }
+    await this.acquireCoordination(assignedTasks);
     const outputKey = source.kind === "task" ? source.task.key : source.planKey;
     if (!this.state.workspace) {
       const orphanWarnings = await this.observe({
@@ -2304,8 +2484,22 @@ export class RunnerJobSupervisor {
       status === "succeeded" &&
       this.workspace.mode === "isolated" &&
       this.options.projectConfig.sourceControl.landing === "auto"
-    )
+    ) {
+      if (this.coordination)
+        await this.coordination.exchange(
+          {
+            repositoryKey: this.options.projectConfig.repositoryKey,
+            lane:
+              this.options.projectConfig.sourceControl.target ??
+              this.options.projectConfig.sourceControl.base,
+            kind: "landing",
+            paths: [],
+          },
+          this.abort.signal,
+          this.coordinationDeadline,
+        );
       await this.performAutomaticLanding();
+    }
     const output = await this.observe({
       stage: "finalize",
       operation: "terminal-output",
@@ -2399,11 +2593,20 @@ export class RunnerJobSupervisor {
       await this.record("job.terminal", { status });
       return output;
     } finally {
-      if (this.workspaceReady && !this.workspaceReleased)
-        await this.options.backend.release(
-          this.workspace,
-          this.options.assignment.jobId,
-        );
+      try {
+        if (this.workspaceReady && !this.workspaceReleased)
+          await this.options.backend.release(
+            this.workspace,
+            this.options.assignment.jobId,
+          );
+      } finally {
+        await this.coordination?.release().catch(async (error) => {
+          if (this.journal)
+            await this.record("warning", {
+              message: `coordination lease release deferred: ${String(error)}`,
+            });
+        });
+      }
     }
   }
 }
@@ -2438,6 +2641,12 @@ export async function landDurableJob(options: {
   requestId: string;
   target: string;
   sink?: JobEventSink;
+  coordination?: {
+    provider: CoordinationProvider;
+    runnerId: string;
+    checkoutId: string;
+    projectId: string;
+  };
 }): Promise<LandingReport> {
   const journal = await ChecksummedJournal.open(
     join(
@@ -2488,6 +2697,55 @@ export async function landDurableJob(options: {
   const workspace = state.workspace;
   if (!workspace)
     throw new Error("durable RunnerJob lost its retained workspace");
+  const landingAbort = new AbortController();
+  const coordination = options.coordination
+    ? new DurableLeaseManager(options.coordination.provider, {
+        stateDirectory: options.stateDirectory,
+        identity: {
+          runnerId: options.coordination.runnerId,
+          checkoutId: options.coordination.checkoutId,
+          projectId: options.coordination.projectId,
+          jobId: options.jobId,
+          assignmentId: options.assignmentId,
+          taskId: null,
+          idempotencyKey: `${options.jobId}:landing:${options.requestId}:v1`,
+          landingRequestId: options.requestId,
+        },
+        onWaiting: async (attempt, delayMs) => {
+          state = await appendDurableRecord(
+            journal,
+            "coordination.landing.waiting",
+            { requestId: options.requestId, attempt, delayMs },
+          );
+        },
+        onAcquired: async (lease) => {
+          state = await appendDurableRecord(
+            journal,
+            "coordination.landing.acquired",
+            {
+              requestId: options.requestId,
+              leaseId: lease.leaseId,
+              fencingToken: lease.fencingToken,
+              expiresAt: lease.expiresAt,
+            },
+          );
+        },
+        onLost: async (error) => {
+          state = await appendDurableRecord(
+            journal,
+            "coordination.landing.lost",
+            {
+              requestId: options.requestId,
+              message: (error instanceof Error
+                ? error.message
+                : String(error)
+              ).slice(0, 500),
+            },
+          );
+          landingAbort.abort(new Error("landing coordination lease was lost"));
+        },
+      })
+    : null;
   let result: LandingReport;
   const publish = async (payload: RunnerJobEventPayload): Promise<void> => {
     if (!options.sink) return;
@@ -2602,6 +2860,29 @@ export async function landDurableJob(options: {
     }
   };
   try {
+    if (coordination) {
+      const desired: LeaseScope = {
+        repositoryKey: options.projectConfig.repositoryKey,
+        lane: options.target,
+        kind: "landing",
+        paths: [],
+      };
+      const recovered = await coordination.recover();
+      if (!recovered)
+        await coordination.acquire(
+          desired,
+          landingAbort.signal,
+          Date.now() + options.projectConfig.harness.maxJobMinutes * 60_000,
+        );
+      else if (
+        recovered.kind !== desired.kind ||
+        recovered.repositoryKey !== desired.repositoryKey ||
+        recovered.lane !== desired.lane ||
+        recovered.paths.length !== 0
+      )
+        throw new Error("recovered landing lease has an unexpected scope");
+    }
+    if (landingAbort.signal.aborted) throw landingAbort.signal.reason;
     await observeLanding(
       "recoverOrphans",
       1,
@@ -2612,6 +2893,7 @@ export async function landDurableJob(options: {
         ),
       (value) => ({ resultDigest: digest({ warningCount: value.length }) }),
     );
+    if (landingAbort.signal.aborted) throw landingAbort.signal.reason;
     const landed = await observeLanding(
       "land",
       1,
@@ -2642,6 +2924,12 @@ export async function landDurableJob(options: {
         20_000,
       ),
     };
+  } finally {
+    await coordination?.release().catch(async (error) => {
+      state = await appendDurableRecord(journal, "warning", {
+        message: `landing coordination lease release deferred: ${String(error)}`,
+      });
+    });
   }
   await appendDurableRecord(journal, "landing.completed", {
     requestId: options.requestId,

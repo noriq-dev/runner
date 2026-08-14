@@ -15,6 +15,7 @@ Install the published CLI with Node.js 22 or newer:
 
 ```bash
 npm install --global @noriq-dev/runner
+noriq-runner init
 noriq-runner version
 noriq-runner help
 ```
@@ -31,11 +32,21 @@ node dist/cli.js doctor --config /absolute/path/to/runner.toml
 node dist/cli.js start --config /absolute/path/to/runner.toml
 ```
 
-The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. It REST-registers those project/repository associations before opening the job WebSocket, persists a server-issued Runner ID under the state directory when `runner.id` is omitted, detects source control, selects either the project’s registered backend ID or a compatible `auto` adapter, advertises the exact configured base revision, and refuses a commissioned revision that has moved.
+Configuration lookup is `--config`, `NORIQ_RUNNER_CONFIG`, `./runner.toml`, then `~/.noriq/runner.toml`. `init` creates the machine file without overwriting an existing one unless confirmed, validates the server's OAuth metadata, authenticates Noriq, detects local drivers/backends, discovers repositories, and ends with a doctor summary. `auth noriq`, `auth codex`, `auth claude`, and `auth status` manage each persistent Runner identity without printing tokens. `eval "$(noriq-runner completion bash)"` enables registry-derived Bash completion.
+
+The daemon discovers `project.toml` or `.noriq/project.toml` below configured scan roots. Each checkout receives a stable path-derived ID, so multiple worktrees of one canonical repository remain independently dispatchable. The catalog subsystem revalidates repository config before admission and can rescan every 60 seconds or on `SIGHUP`, quarantining invalid or removed checkouts while active work retains its immutable journal snapshot. Its daemon-side update/admission loop is capability-gated until the Control Plane can acknowledge each generation.
 
 See [`examples/project.toml`](examples/project.toml) and [`examples/runner.toml`](examples/runner.toml). Legacy `[workspace]`, per-role `provider`, and single-profile role shapes are normalized once with warning events. A tiered role may omit `economy` or `strong`, which then falls back to `balanced`; an omitted repairer role inherits all builder tiers.
 
-`validate` parses the machine config without connecting. `doctor` additionally discovers repositories and runs backend/driver authentication and capability preflights without a model call or Noriq connection. `usage --state-directory <path> --job <id>` reports durable per-invocation and aggregate usage. Real-agent dogfood is deliberately opt-in: set `RUNNER_LIVE_AGENTS=yes-i-understand` and run `npm run dogfood:live-agents -- /path/to/git/repository`; it operates on a disposable clone.
+`validate` parses the machine config without connecting. `doctor` additionally discovers repositories and runs backend/driver authentication and capability preflights without a model call or Noriq connection. `discover` prints the checkout catalog. `usage --state-directory <path> --job <id>` reports durable per-invocation and aggregate usage. `index-repo --check-determinism`, `index-status`, `index-reindex`, and `index-cancel` provide the Project Memory operator surface. Real-agent dogfood is deliberately opt-in: set `RUNNER_LIVE_AGENTS=yes-i-understand` and run `npm run dogfood:live-agents -- /path/to/git/repository`; it operates on a disposable clone.
+
+## Authentication and Project Memory
+
+OAuth credentials are stored per server in `~/.noriq/credentials.json` by default with private directory/file permissions, atomic replacement, and a cross-process rotation lock. Runner refreshes five minutes before expiry, retries one authenticated request after a forced refresh on 401, and observes credentials replaced by another `auth noriq` process. Static `runner.tokenEnv` or deprecated `runner.token` remains higher precedence and emits a warning because it suppresses OAuth rotation.
+
+Project Memory context retrieval defaults on and is injected only into the builder as a bounded, visibly quoted untrusted-evidence block. Repository citations are checked against the pinned task revision and workspace; failures are non-fatal. Runner journals only the bounded consumption metric and pack digest. Repository indexing is a separate explicit `[index] enabled = true` opt-in. Git, Perforce, and Diversion sources share the same sensitive-file deny policy, deterministic scanner, compressed batches, server cursor reconciliation, atomic status journals, and one-global-operation scheduler.
+
+The capability-gated cross-runner coordination subsystem defines Control Plane leases with monotonically increasing fencing tokens. Repository leases protect direct/non-isolated work, anticipated paths protect build-ready isolated work, and landing leases serialize target mutation. Its durable manager implements bounded waiting, renewal, fenced recovery, atomic exchange, and idempotent release; supervisor activation waits for the negotiated wire contract so an older server can never be mistaken for a lock authority.
 
 ## Source-control contract
 
@@ -73,9 +84,9 @@ Queued `progress` events are also the canonical durable job phase. Task-scoped p
 
 ## Deliberate limits
 
-- No legacy Run/mission protocol, server-side plan pump, execution profiles, pushing, review creation, indexing, or Project Memory ingestion.
+- No legacy Run/mission protocol, server-side plan pump, execution profiles, pushing, or review creation.
 - Only blocker/major findings or deterministic check failures consume a repair round.
 - Token or cost caps fail preflight unless a driver can honestly enforce them. Measurement without hard enforcement is not presented as a ceiling.
-- Machine config accepts either a literal `token` or a `tokenEnv`, but the daemon does not yet refresh Noriq OAuth credentials. A long-lived production service still needs the rotating credential source before deployment.
+- Live catalog acknowledgement, memory-context event projection, and fenced coordination require the Control Plane to negotiate `runner.catalog.v1`, `runner.memory-context.v1`, and `runner.coordination.v1`. Runner keeps those wire paths disabled rather than sending unknown protocol frames to an older server.
 - Full agent logs remain local under the Runner state directory. Noriq receives compact evidence only.
 - Runner does not create Perforce streams or interpret site-specific branch/stream policy.

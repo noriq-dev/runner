@@ -285,6 +285,13 @@ describe("deterministic task routing", () => {
   });
 
   it("maps rich local classification into the bounded control-plane vocabulary", () => {
+    expect(
+      wireRouteClassification(classifyTask(task(), config())),
+    ).toMatchObject({
+      size: "tiny",
+      risk: "low",
+      specCoverage: "complete",
+    });
     const classification = classifyTask(
       task({ files: 4, acceptance: 4, pathPrefix: "infra" }),
       config({ elevated: ["infra"] }),

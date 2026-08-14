@@ -1,4 +1,6 @@
 import WebSocket from "ws";
+import { StaticTokenProvider } from "./auth/token-provider.js";
+import type { TokenProvider, TokenSnapshot } from "./auth/types.js";
 import type { RunnerJobEventPayload } from "./contracts.js";
 import {
   type RunnerToServer,
@@ -21,16 +23,29 @@ export class RunnerSocket implements JobEventSink {
   private socket: WebSocket | null = null;
   private readonly pending = new Map<string, PendingEvent>();
   private heartbeat: NodeJS.Timeout | null = null;
+  private readonly tokens: TokenProvider;
   onMessage?: (message: ServerToRunner) => void;
   onConnect?: () => void | Promise<void>;
+  onDisconnect?: (code: number, reason: string) => void;
+  onAuthenticationRequired?: (error: unknown) => void | Promise<void>;
   getHeartbeat?: () => { freeSlots: number; activeJobIds: string[] };
 
   constructor(
     private readonly url: string,
-    private readonly token: string,
+    tokens: TokenProvider | string,
     private readonly hello: RunnerToServer,
     private readonly acknowledgementTimeoutMs = 5_000,
-  ) {}
+    private boundGeneration = -1,
+  ) {
+    this.tokens =
+      typeof tokens === "string" ? new StaticTokenProvider(tokens) : tokens;
+  }
+
+  onTokenGeneration?: (token: TokenSnapshot) => void | Promise<void>;
+
+  connected(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
 
   private armPending(pending: PendingEvent): void {
     if (pending.retry) clearTimeout(pending.retry);
@@ -46,11 +61,37 @@ export class RunnerSocket implements JobEventSink {
   }
 
   async connect(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) return;
+    let token: TokenSnapshot;
+    try {
+      token = await this.tokens.get();
+    } catch (error) {
+      await this.onAuthenticationRequired?.(error);
+      this.socket?.close(4001, "runner authentication required");
+      throw error;
+    }
+    if (
+      this.socket?.readyState === WebSocket.OPEN &&
+      token.generation === this.boundGeneration
+    )
+      return;
+    if (this.socket) {
+      const closing = this.socket;
+      if (closing.readyState === WebSocket.CLOSED) {
+        if (this.socket === closing) this.socket = null;
+      } else
+        await new Promise<void>((resolve) => {
+          closing.once("close", () => resolve());
+          if (closing.readyState !== WebSocket.CLOSING)
+            closing.close(1000, "runner credential rotated");
+        });
+    }
+    if (token.generation !== this.boundGeneration)
+      await this.onTokenGeneration?.(token);
     const socket = new WebSocket(this.url, {
-      headers: { Authorization: `Bearer ${this.token}` },
+      headers: { Authorization: `Bearer ${token.accessToken}` },
     });
     this.socket = socket;
+    this.boundGeneration = token.generation;
     try {
       await new Promise<void>((resolve, reject) => {
         const cleanup = () => {
@@ -125,7 +166,7 @@ export class RunnerSocket implements JobEventSink {
         );
       }
     });
-    socket.once("close", () => {
+    socket.once("close", (code, reason) => {
       if (heartbeat) clearInterval(heartbeat);
       if (this.heartbeat === heartbeat) this.heartbeat = null;
       if (this.socket === socket) this.socket = null;
@@ -133,6 +174,7 @@ export class RunnerSocket implements JobEventSink {
         if (pending.retry) clearTimeout(pending.retry);
         pending.retry = null;
       }
+      this.onDisconnect?.(code, reason.toString());
     });
     // Production Durable Objects can answer in the same turn as `send`. Install
     // every response/close handler before hello or replay so no assignment or
@@ -147,7 +189,15 @@ export class RunnerSocket implements JobEventSink {
       this.send({ type: "heartbeat", ...status });
     }, 15_000);
     this.heartbeat = heartbeat;
-    await this.onConnect?.();
+    try {
+      await this.onConnect?.();
+    } catch (error) {
+      clearInterval(heartbeat);
+      if (this.heartbeat === heartbeat) this.heartbeat = null;
+      if (this.socket === socket) this.socket = null;
+      socket.close(1011, "runner initialization failed");
+      throw error;
+    }
   }
 
   send(message: RunnerToServer): void {

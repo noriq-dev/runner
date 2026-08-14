@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutionSpec } from './execution-spec';
+import type { IntelligenceContextConsumptionMetric } from './intelligence';
 
 const id = z.string().trim().min(1).max(128);
 const text = (maximum: number) => z.string().trim().min(1).max(maximum);
@@ -107,7 +108,7 @@ export type RunnerJobUsage = z.infer<typeof RunnerJobUsage>;
  * while stages describe bounded work without creating execution child nodes.
  */
 export const RunnerJobObservationStage = z.enum([
-  'preflight', 'workspace', 'plan', 'setup', 'build', 'candidate', 'integrate',
+  'preflight', 'workspace', 'plan', 'setup', 'memory', 'build', 'candidate', 'integrate',
   'check', 'review', 'repair', 'accept', 'preserve', 'finalize', 'human_wait', 'landing',
 ]);
 export type RunnerJobObservationStage = z.infer<typeof RunnerJobObservationStage>;
@@ -163,7 +164,7 @@ export const RunnerJobObservationActor = z.object({
 }).strict();
 export type RunnerJobObservationActor = z.infer<typeof RunnerJobObservationActor>;
 
-export const RunnerJobRouteSize = z.enum(['small', 'medium', 'large']);
+export const RunnerJobRouteSize = z.enum(['tiny', 'small', 'medium', 'large']);
 export type RunnerJobRouteSize = z.infer<typeof RunnerJobRouteSize>;
 
 export const RunnerJobRouteRisk = z.enum(['low', 'medium', 'high']);
@@ -276,6 +277,59 @@ export const RunnerJobOutput = z.object({
 export type RunnerJobOutput = z.infer<typeof RunnerJobOutput>;
 
 const at = z.string().datetime();
+
+// Runtime-importing intelligence.ts here would create an initialization cycle because that
+// contract consumes RunnerJob schemas. Keep a strict wire schema locally and make TypeScript
+// prove it remains structurally identical to IntelligenceContextConsumptionMetric.
+const RunnerJobContextConsumptionSection = z.object({
+  id: z.enum([
+    'active_decisions', 'known_hazards', 'failed_approaches', 'relevant_memories',
+    'similar_episodes', 'graph_neighborhood', 'affected_tests', 'active_neighboring_work',
+    'uncertainty', 'source_excerpts',
+  ]),
+  excerptCount: z.number().int().nonnegative(),
+  graphEntityCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  unanswerable: z.boolean(),
+}).strict();
+const RunnerJobContextConsumptionSnapshot = z.object({
+  mode: z.enum(['semantic', 'keyword']),
+  role: z.enum(['scope', 'build', 'verify', 'human']),
+  charBudget: z.number().int().positive(),
+  charsUsed: z.number().int().nonnegative(),
+  sections: z.array(RunnerJobContextConsumptionSection).default([]),
+  similarEpisodesConsidered: z.number().int().nonnegative(),
+  staleCitationsCount: z.number().int().nonnegative(),
+  noticesCount: z.number().int().nonnegative(),
+  retrievalTookMs: z.number().int().nonnegative(),
+}).strict();
+const RunnerJobContextMetricObservation = {
+  provenance: z.enum([
+    'server_observed', 'runner_observed', 'driver_reported', 'backend_observed',
+    'derived', 'inferred', 'unavailable',
+  ]),
+  source: z.enum([
+    'd1_coordination', 'd1_orchestration', 'project_memory_episode', 'runner', 'driver',
+    'vcs_backend', 'derived_generation',
+  ]),
+  sourceId: z.string().nullable().default(null),
+  observedAt: at.nullable().default(null),
+  acceptedAt: at.nullable().default(null),
+  reason: z.string().nullable().default(null),
+};
+export const RunnerJobContextConsumptionMetric = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('complete'), value: RunnerJobContextConsumptionSnapshot, ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('partial'), value: RunnerJobContextConsumptionSnapshot, ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('unavailable'), value: z.null(), ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('not_applicable'), value: z.null(), ...RunnerJobContextMetricObservation }).strict(),
+]);
+export type RunnerJobContextConsumptionMetric = z.infer<typeof RunnerJobContextConsumptionMetric>;
+type ContextMetricMatchesIntelligence = RunnerJobContextConsumptionMetric extends IntelligenceContextConsumptionMetric
+  ? IntelligenceContextConsumptionMetric extends RunnerJobContextConsumptionMetric ? true : false
+  : false;
+const contextMetricMatchesIntelligence: ContextMetricMatchesIntelligence = true;
+void contextMetricMatchesIntelligence;
+
 const RunnerJobStageFinishedEvent = z.object({
   type: z.literal('stage.finished'), at, startedAt: at,
   observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
@@ -309,6 +363,20 @@ export const RunnerJobEvent = z.discriminatedUnion('type', [
   }).strict(),
   RunnerJobStageFinishedEvent,
   z.object({ type: z.literal('agent.route'), at, route: RunnerJobAgentRoute }).strict(),
+  z.object({
+    type: z.literal('memory.context'), at, taskId: id,
+    packDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    generatedAt: at.nullable(),
+    consumption: RunnerJobContextConsumptionMetric,
+  }).strict().superRefine((event, ctx) => {
+    if (!['runner_observed', 'driver_reported', 'backend_observed'].includes(event.consumption.provenance)
+        || !['runner', 'driver', 'vcs_backend'].includes(event.consumption.source)) {
+      ctx.addIssue({
+        code: 'custom', path: ['consumption'],
+        message: 'memory context must carry daemon-observed provenance',
+      });
+    }
+  }),
   z.object({ type: z.literal('progress'), at, taskId: id.optional(), phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
   z.object({ type: z.literal('task.plan'), at, taskId: id, plan: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, checkpoint: RunnerJobCheckpoint.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),
@@ -333,8 +401,121 @@ export type RunnerJobAssignment = z.infer<typeof RunnerJobAssignment>;
 export const RunnerJobDispatch = z.object({ runnerId: id, repoRef: text(500) }).strict();
 export type RunnerJobDispatch = z.infer<typeof RunnerJobDispatch>;
 
+export const RunnerCoordinationLeaseKind = z.enum(['repository', 'paths', 'landing']);
+export type RunnerCoordinationLeaseKind = z.infer<typeof RunnerCoordinationLeaseKind>;
+
+export const RunnerCoordinationLeaseScope = z.object({
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+}).strict().superRefine((scope, ctx) => {
+  if (scope.kind === 'paths' && scope.paths.length === 0) {
+    ctx.addIssue({ code: 'custom', path: ['paths'], message: 'path leases require at least one path' });
+  }
+  if (scope.kind !== 'paths' && scope.paths.length > 0) {
+    ctx.addIssue({ code: 'custom', path: ['paths'], message: 'only path leases may name paths' });
+  }
+});
+export type RunnerCoordinationLeaseScope = z.infer<typeof RunnerCoordinationLeaseScope>;
+
+export const RunnerCoordinationLeaseIdentity = z.object({
+  runnerId: id,
+  checkoutId: id,
+  projectId: id,
+  jobId: id,
+  assignmentId: id,
+  taskId: id.nullable(),
+  idempotencyKey: text(256),
+  landingRequestId: id.optional(),
+}).strict();
+export type RunnerCoordinationLeaseIdentity = z.infer<typeof RunnerCoordinationLeaseIdentity>;
+
+export const RunnerCoordinationLease = RunnerCoordinationLeaseIdentity.extend({
+  leaseId: id,
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+  fencingToken: z.number().int().nonnegative(),
+  expiresAt: z.string().datetime(),
+}).strict();
+export type RunnerCoordinationLease = z.infer<typeof RunnerCoordinationLease>;
+
+export const RunnerCoordinationAcquire = RunnerCoordinationLeaseIdentity.extend({
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+  ttlSeconds: z.literal(90),
+  previousFencingToken: z.number().int().nonnegative().optional(),
+}).strict();
+export type RunnerCoordinationAcquire = z.infer<typeof RunnerCoordinationAcquire>;
+
+export const RunnerCoordinationExchange = z.object({
+  lease: RunnerCoordinationLease,
+  scope: RunnerCoordinationLeaseScope,
+  ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationExchange = z.infer<typeof RunnerCoordinationExchange>;
+
+export const RunnerCoordinationRenew = z.object({
+  leaseId: id, fencingToken: z.number().int().nonnegative(), ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationRenew = z.infer<typeof RunnerCoordinationRenew>;
+
+export const RunnerCoordinationRecover = RunnerCoordinationLease.extend({
+  ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationRecover = z.infer<typeof RunnerCoordinationRecover>;
+
+export const RunnerCoordinationRelease = z.object({
+  leaseId: id, fencingToken: z.number().int().nonnegative(),
+}).strict();
+export type RunnerCoordinationRelease = z.infer<typeof RunnerCoordinationRelease>;
+
+export const RunnerCoordinationAcquireResult = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('acquired'), lease: RunnerCoordinationLease }).strict(),
+  z.object({
+    status: z.literal('conflict'), retryAfterMs: z.number().int().nonnegative(),
+    conflictingKind: RunnerCoordinationLeaseKind,
+  }).strict(),
+]);
+export type RunnerCoordinationAcquireResult = z.infer<typeof RunnerCoordinationAcquireResult>;
+
+export const RunnerJobRuntimeRepository = z.object({
+  repositoryKey: id,
+  repoRef: text(500),
+  vcs: text(100),
+  baseRevision: RunnerJobRevision,
+}).strict();
+export type RunnerJobRuntimeRepository = z.infer<typeof RunnerJobRuntimeRepository>;
+
+export const RunnerCatalog = z.object({
+  generation: z.number().int().positive(),
+  digest: z.string().regex(/^[0-9a-f]{64}$/),
+  repositories: z.array(RunnerJobRuntimeRepository).max(1_000),
+}).strict().superRefine((catalog, ctx) => {
+  const refs = new Set<string>();
+  for (const [index, repository] of catalog.repositories.entries()) {
+    if (refs.has(repository.repoRef)) {
+      ctx.addIssue({ code: 'custom', path: ['repositories', index, 'repoRef'], message: 'repoRef must be unique within a catalog' });
+    }
+    refs.add(repository.repoRef);
+  }
+});
+export type RunnerCatalog = z.infer<typeof RunnerCatalog>;
+
+/** Stable digest input shared by daemon and server. Inventory order is not semantic. */
+export function runnerCatalogCanonicalJson(repositories: RunnerJobRuntimeRepository[]): string {
+  return JSON.stringify([...repositories]
+    .sort((a, b) => a.repoRef.localeCompare(b.repoRef))
+    .map(({ repositoryKey, repoRef, vcs, baseRevision }) => ({ repositoryKey, repoRef, vcs, baseRevision })));
+}
+
 export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), vcs: text(100), baseRevision: RunnerJobRevision }).strict()).max(1_000) }).strict(),
+  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(RunnerJobRuntimeRepository).max(1_000) }).strict(),
+  z.object({ type: z.literal('catalog.update'), catalog: RunnerCatalog }).strict(),
   z.object({ type: z.literal('heartbeat'), freeSlots: z.number().int().min(0).max(32), activeJobIds: z.array(id).max(32) }).strict(),
   z.object({ type: z.literal('job.accept'), jobId: id, assignmentId: id }).strict(),
   z.object({ type: z.literal('job.event'), jobId: id, assignmentId: id, seq: z.number().int().positive(), payload: RunnerJobEvent }).strict(),
@@ -348,6 +529,11 @@ export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
 export type RunnerJobRunnerMessage = z.infer<typeof RunnerJobRunnerMessage>;
 
 export const RunnerJobServerMessage = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('catalog.ack'), generation: z.number().int().positive(),
+    digest: z.string().regex(/^[0-9a-f]{64}$/), accepted: z.boolean(),
+    dispatchableRepoRefs: z.array(text(500)).max(1_000), error: z.string().max(4_000).nullable(),
+  }).strict(),
   z.object({ type: z.literal('job.assign'), assignment: RunnerJobAssignment }).strict(),
   z.object({ type: z.literal('job.cancel'), jobId: id, assignmentId: id, reason: z.string().max(4_000) }).strict(),
   z.object({ type: z.literal('job.answer'), jobId: id, assignmentId: id, questionId: id, answer: z.string().max(20_000) }).strict(),

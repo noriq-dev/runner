@@ -122,6 +122,32 @@ const projectConfigInputSchema = z
       })
       .strict()
       .default({ elevatedPathPrefixes: [], criticalPathPrefixes: [] }),
+    memory: z
+      .object({
+        context: z
+          .object({
+            enabled: z.boolean().default(true),
+            tokenBudget: z.number().int().min(256).max(16_000).default(1_500),
+          })
+          .strict()
+          .default({ enabled: true, tokenBudget: 1_500 }),
+      })
+      .strict()
+      .default({ context: { enabled: true, tokenBudget: 1_500 } }),
+    index: z
+      .object({
+        enabled: z.boolean().default(false),
+        include: z
+          .array(z.string().trim().min(1).max(500))
+          .max(500)
+          .default([]),
+        exclude: z
+          .array(z.string().trim().min(1).max(500))
+          .max(500)
+          .default([]),
+      })
+      .strict()
+      .default({ enabled: false, include: [], exclude: [] }),
     setup: z
       .object({
         commands: commandList.default([]),
@@ -229,6 +255,8 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
           : builder,
       },
       routing: input.routing,
+      memory: input.memory,
+      index: input.index,
       setup: input.setup,
       checks: input.checks,
       normalizationWarnings: [...new Set(warnings)],
@@ -317,17 +345,74 @@ const runnerMachineSchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    if (Boolean(value.token) === Boolean(value.tokenEnv))
+    if (value.token && value.tokenEnv)
       context.addIssue({
         code: "custom",
         path: ["token"],
-        message: "configure exactly one of token or tokenEnv",
+        message: "configure at most one of token or tokenEnv",
       });
   });
 
 const machineConfigInputSchema = z
   .object({
     runner: runnerMachineSchema,
+    auth: z
+      .object({
+        noriq: z
+          .object({
+            credentialsFile: z.string().trim().min(1).optional(),
+          })
+          .strict()
+          .default({}),
+      })
+      .strict()
+      .default({ noriq: {} }),
+    discovery: z
+      .object({
+        intervalSeconds: z.number().int().min(5).max(86_400).default(60),
+        maxDepth: z.number().int().min(0).max(32).default(6),
+      })
+      .strict()
+      .default({ intervalSeconds: 60, maxDepth: 6 }),
+    memory: z
+      .object({
+        indexer: z
+          .object({
+            pollMinutes: z.number().int().min(1).max(10_080).default(60),
+            maxFiles: z.number().int().min(1).max(1_000_000).default(20_000),
+            maxFileBytes: z
+              .number()
+              .int()
+              .min(1_024)
+              .max(100_000_000)
+              .default(1_000_000),
+            maxTotalBytes: z
+              .number()
+              .int()
+              .min(1_024)
+              .max(2_000_000_000)
+              .default(100_000_000),
+            deadlineSeconds: z.number().int().min(10).max(86_400).default(120),
+          })
+          .strict()
+          .default({
+            pollMinutes: 60,
+            maxFiles: 20_000,
+            maxFileBytes: 1_000_000,
+            maxTotalBytes: 100_000_000,
+            deadlineSeconds: 120,
+          }),
+      })
+      .strict()
+      .default({
+        indexer: {
+          pollMinutes: 60,
+          maxFiles: 20_000,
+          maxFileBytes: 1_000_000,
+          maxTotalBytes: 100_000_000,
+          deadlineSeconds: 120,
+        },
+      }),
     drivers: z.record(registeredId, driverSchema),
     backends: z.record(registeredId, backendSchema).default({
       git: { adapter: "git", command: "git" },
@@ -353,7 +438,7 @@ export const machineConfigSchema = machineConfigInputSchema.transform(
     const token = input.runner.tokenEnv
       ? process.env[input.runner.tokenEnv]
       : input.runner.token;
-    if (!token) {
+    if (input.runner.tokenEnv && !token) {
       context.addIssue({
         code: "custom",
         path: ["runner", "tokenEnv"],
@@ -362,7 +447,18 @@ export const machineConfigSchema = machineConfigInputSchema.transform(
       return z.NEVER;
     }
     const { tokenEnv: _tokenEnv, ...runner } = input.runner;
-    return { ...input, runner: { ...runner, token } };
+    return {
+      ...input,
+      runner: {
+        ...runner,
+        ...(token ? { token } : {}),
+        tokenSource: token
+          ? input.runner.tokenEnv
+            ? "environment"
+            : "literal"
+          : "oauth",
+      },
+    };
   },
 );
 export type MachineConfig = z.infer<typeof machineConfigSchema>;

@@ -72,6 +72,16 @@ effort = "high"
 elevatedPathPrefixes = ["scripts", "package.json", "package-lock.json"]
 criticalPathPrefixes = ["src/drivers", "src/vcs", "src/supervisor.ts", "src/state.ts"]
 
+[memory.context]
+enabled = true
+tokenBudget = 1500
+
+[index]
+# Repository upload is always explicit opt-in. Context retrieval does not imply indexing.
+enabled = false
+include = []
+exclude = []
+
 [setup]
 commands = ["npm ci"]
 timeoutSeconds = 900

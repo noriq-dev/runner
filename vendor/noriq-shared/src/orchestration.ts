@@ -11,9 +11,13 @@ export const MISSION_HANDOFF_CAPABILITY = 'mission.handoff.v1' as const;
 // deliberately not part of RUNNER_PROTOCOL_CAPABILITIES: legacy Run daemons must not advertise
 // RunnerJob support merely because they consumed a newer shared package.
 export const RUNNER_JOB_CAPABILITY = 'runner-job.v2' as const;
+export const RUNNER_CATALOG_CAPABILITY = 'runner.catalog.v1' as const;
+export const RUNNER_MEMORY_CONTEXT_CAPABILITY = 'runner.memory-context.v1' as const;
+export const RUNNER_COORDINATION_CAPABILITY = 'runner.coordination.v1' as const;
 export const MCP_SESSION_LINEAGE_META = 'io.noriq/sessionLineage' as const;
 export const RunnerProtocolCapability = z.enum([
   ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY, RUNNER_JOB_CAPABILITY,
+  RUNNER_CATALOG_CAPABILITY, RUNNER_MEMORY_CONTEXT_CAPABILITY, RUNNER_COORDINATION_CAPABILITY,
 ]);
 export type RunnerProtocolCapability = z.infer<typeof RunnerProtocolCapability>;
 

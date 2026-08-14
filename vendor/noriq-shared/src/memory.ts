@@ -618,7 +618,36 @@ export const ContextPackEpisodeExcerpt = z.object({
 });
 export type ContextPackEpisodeExcerpt = z.infer<typeof ContextPackEpisodeExcerpt>;
 
-export const ContextPackExcerpt = z.discriminatedUnion('excerptKind', [ContextPackMemoryExcerpt, ContextPackEpisodeExcerpt]);
+/**
+ * Exact repository evidence selected semantically from CODE_VECTORIZE and then resolved from
+ * the canonical staged rows of the matching active ProjectMemory generation. `content` may be
+ * shortened only at the deterministic server-side excerpt boundary; `contentTruncated` makes
+ * that loss explicit. The full checkout identity travels with every excerpt so a Runner can
+ * refuse evidence that does not match its immutable workspace before rendering it.
+ */
+export const ContextPackCodeExcerpt = z.object({
+  excerptKind: z.literal('code'),
+  id: z.string(),
+  uri: z.string(),
+  projectId: z.string(),
+  repositoryKey: RepositoryKey,
+  generationId: z.string(),
+  branch: BranchRef,
+  baseId: BaseId,
+  path: RepoPath,
+  symbol: z.string().nullable(),
+  entityType: z.enum(['file', 'symbol', 'test', 'api']),
+  label: z.string(),
+  content: z.string(),
+  contentTruncated: z.boolean(),
+});
+export type ContextPackCodeExcerpt = z.infer<typeof ContextPackCodeExcerpt>;
+
+export const ContextPackExcerpt = z.discriminatedUnion('excerptKind', [
+  ContextPackMemoryExcerpt,
+  ContextPackEpisodeExcerpt,
+  ContextPackCodeExcerpt,
+]);
 export type ContextPackExcerpt = z.infer<typeof ContextPackExcerpt>;
 
 /** A graph entity as it appears inside a context pack — the same addressable shape

@@ -1,8 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { RUNNER_JOB_CAPABILITY } from "@noriq-dev/shared";
+import {
+  RUNNER_CATALOG_CAPABILITY,
+  RUNNER_COORDINATION_CAPABILITY,
+  RUNNER_JOB_CAPABILITY,
+  RUNNER_MEMORY_CONTEXT_CAPABILITY,
+} from "@noriq-dev/shared";
 import { z } from "zod";
 import packageJson from "../package.json" with { type: "json" };
+import type { TokenSnapshot } from "./auth/types.js";
 import type { MachineConfig } from "./config.js";
 import type { DiscoveredProject } from "./discovery.js";
 
@@ -20,6 +26,17 @@ const registrationResponseSchema = z.object({
     .object({
       id: z.string().min(1),
       status: z.string(),
+      capabilities: z
+        .object({
+          catalogGeneration: z.number().int().nonnegative().optional(),
+          catalogDigest: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/)
+            .nullable()
+            .optional(),
+        })
+        .passthrough()
+        .optional(),
       repos: z.array(registeredRepositorySchema),
     })
     .passthrough(),
@@ -58,9 +75,25 @@ async function persistRunnerId(
 
 export async function registerRunner(
   config: MachineConfig,
-  projects: DiscoveredProject[],
-  fetchImpl: typeof fetch = fetch,
+  projects: readonly DiscoveredProject[],
+  tokenOrFetch?: TokenSnapshot | typeof fetch,
+  requestedFetch: typeof fetch = fetch,
 ): Promise<RegisteredRunner> {
+  const fetchImpl =
+    typeof tokenOrFetch === "function" ? tokenOrFetch : requestedFetch;
+  const token =
+    typeof tokenOrFetch === "function" || tokenOrFetch === undefined
+      ? config.runner.token
+        ? {
+            accessToken: config.runner.token,
+            generation: 0,
+            kind: "static" as const,
+            expiresAt: null,
+          }
+        : null
+      : tokenOrFetch;
+  if (!token)
+    throw new Error("Runner registration requires an authenticated token");
   const runnerId =
     config.runner.id ?? (await persistedRunnerId(config.runner.stateDirectory));
   const response = await fetchImpl(
@@ -68,7 +101,7 @@ export async function registerRunner(
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${config.runner.token}`,
+        Authorization: `Bearer ${token.accessToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -80,7 +113,7 @@ export async function registerRunner(
         kinds: [],
         maxConcurrency: config.runner.maxConcurrentJobs,
         repos: projects.map((project) => ({
-          id: project.config.repositoryKey,
+          id: project.checkoutId ?? project.config.repositoryKey,
           projectKey: project.config.key,
           repositoryKey: project.config.repositoryKey,
           name: basename(project.repository),
@@ -88,7 +121,12 @@ export async function registerRunner(
           workflows: [],
           executionProfiles: [],
         })),
-        protocolCapabilities: [RUNNER_JOB_CAPABILITY],
+        protocolCapabilities: [
+          RUNNER_JOB_CAPABILITY,
+          RUNNER_CATALOG_CAPABILITY,
+          RUNNER_MEMORY_CONTEXT_CAPABILITY,
+          RUNNER_COORDINATION_CAPABILITY,
+        ],
       }),
     },
   );
@@ -105,8 +143,7 @@ export async function registerRunner(
   const unresolved = projects.filter((project) => {
     const repository = runner.repos.find(
       (candidate) =>
-        candidate.id === project.config.repositoryKey ||
-        candidate.repositoryKey === project.config.repositoryKey,
+        candidate.id === (project.checkoutId ?? project.config.repositoryKey),
     );
     return !repository?.projectId;
   });

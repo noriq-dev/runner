@@ -63,6 +63,11 @@ effort = "high"
 elevatedPathPrefixes = ["scripts", "package.json", "package-lock.json"]
 criticalPathPrefixes = ["src/drivers", "src/vcs", "src/supervisor.ts", "src/state.ts", "vendor/noriq-shared"]
 
+[index]
+enabled = true
+include = []
+exclude = []
+
 [setup]
 commands = ["npm ci"]
 timeoutSeconds = 900

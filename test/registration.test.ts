@@ -59,6 +59,10 @@ describe("Runner registration", () => {
             runner: {
               id: "rnr_fresh",
               status: "online",
+              capabilities: {
+                catalogGeneration: 7,
+                catalogDigest: "a".repeat(64),
+              },
               repos: [
                 {
                   id: "noriq-runner",
@@ -74,6 +78,10 @@ describe("Runner registration", () => {
       },
     );
     expect(registered.id).toBe("rnr_fresh");
+    expect(registered.capabilities).toMatchObject({
+      catalogGeneration: 7,
+      catalogDigest: "a".repeat(64),
+    });
     expect(body).toMatchObject({
       label: "test runner",
       // Noriq catalog revision 2 refuses Runner versions below 0.16.0.
@@ -81,7 +89,12 @@ describe("Runner registration", () => {
       version: "0.17.1",
       kinds: [],
       maxConcurrency: 2,
-      protocolCapabilities: ["runner-job.v2"],
+      protocolCapabilities: [
+        "runner-job.v2",
+        "runner.catalog.v1",
+        "runner.memory-context.v1",
+        "runner.coordination.v1",
+      ],
       repos: [
         {
           id: "noriq-runner",

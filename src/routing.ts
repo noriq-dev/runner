@@ -106,7 +106,7 @@ export function wireRouteClassification(
         ? "large"
         : classification.size === "standard"
           ? "medium"
-          : "small",
+          : classification.size,
     risk:
       classification.risk === "critical"
         ? "high"

@@ -12,6 +12,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
 import { jobAssignmentSchema } from "../src/contracts.js";
+import type {
+  AcquireResult,
+  CoordinationLease,
+  CoordinationProvider,
+} from "../src/coordination/types.js";
 import { FakeAgentDriver } from "../src/drivers/fake.js";
 import { runProcess } from "../src/process.js";
 import {
@@ -245,16 +250,66 @@ describe("RunnerJobSupervisor", () => {
         `${base}..${output.retainedLocation.label}`,
       ]),
     ).toBe("1");
+    let landingEffects = false;
+    const landingLease: CoordinationLease = {
+      leaseId: "lease-landing-e2e",
+      runnerId: "runner-e2e",
+      checkoutId: "repo-e2e",
+      projectId: "project",
+      jobId: assignment.jobId,
+      assignmentId: assignment.assignmentId,
+      taskId: null,
+      idempotencyKey: `${assignment.jobId}:landing:landing-e2e:v1`,
+      landingRequestId: "landing-e2e",
+      repositoryKey: "repo",
+      lane: "main",
+      kind: "landing",
+      paths: [],
+      fencingToken: 41,
+      expiresAt: new Date(Date.now() + 90_000).toISOString(),
+    };
+    const coordination: CoordinationProvider = {
+      acquire: async (request): Promise<AcquireResult> => {
+        expect(landingEffects).toBe(false);
+        expect(request).toMatchObject({
+          landingRequestId: "landing-e2e",
+          kind: "landing",
+          lane: "main",
+          paths: [],
+        });
+        return { status: "acquired", lease: landingLease };
+      },
+      exchange: async () => {
+        throw new Error("manual landing must not exchange its lease");
+      },
+      renew: async () => landingLease,
+      recover: async () => ({ status: "acquired", lease: landingLease }),
+      release: async (lease) => {
+        expect(lease).toEqual(landingLease);
+      },
+    };
+    const landingBackend = new GitWorkspaceBackend();
+    const originalRecover = landingBackend.recoverOrphans.bind(landingBackend);
+    landingBackend.recoverOrphans = async (...args) => {
+      landingEffects = true;
+      return originalRecover(...args);
+    };
     const landing = await landDurableJob({
       stateDirectory,
       repository,
       projectConfig: config,
-      backend: new GitWorkspaceBackend(),
+      backend: landingBackend,
       jobId: assignment.jobId,
       assignmentId: assignment.assignmentId,
       requestId: "landing-e2e",
       target: "main",
       sink,
+      coordination: {
+        provider: coordination,
+        runnerId: "runner-e2e",
+        checkoutId: "repo-e2e",
+        projectId: "project",
+      },
     });
     expect(landing).toMatchObject({
       status: "landed",
@@ -423,7 +478,7 @@ describe("RunnerJobSupervisor", () => {
           route: expect.objectContaining({
             role: "guide",
             decision: "skip",
-            size: "small",
+            size: "tiny",
             specCoverage: "complete",
             eligibleCount: 0,
             actor: null,
@@ -433,7 +488,7 @@ describe("RunnerJobSupervisor", () => {
           route: expect.objectContaining({
             role: "builder",
             decision: "invoke",
-            size: "small",
+            size: "tiny",
           }),
         }),
       ]),
