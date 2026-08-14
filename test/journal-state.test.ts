@@ -113,6 +113,13 @@ describe("checksummed journal", () => {
       id: "one",
       usageEvidence: usage(1.25),
     });
+    const expectedUsage = {
+      inputTokens: 20,
+      outputTokens: 10,
+      cachedTokens: 4,
+      costUsd: null,
+      calls: 2,
+    };
     const state = reduceJobState(journal.all());
     expect(state.observationUsage.costUsd).toEqual({
       status: "partial",
@@ -120,12 +127,12 @@ describe("checksummed journal", () => {
       provenance: "derived",
     });
     expect(state.observationUsage.calls.value).toBe(2);
-    expect(state.usage).toMatchObject({
-      inputTokens: 20,
-      outputTokens: 10,
-      cachedTokens: 4,
-      costUsd: null,
-      calls: 2,
-    });
+    expect(state.usage).toEqual(expectedUsage);
+
+    // A reduction must not alter the immutable journal input. The supervisor
+    // reduces the whole journal after every append and again after restart.
+    expect(reduceJobState(journal.all()).usage).toEqual(expectedUsage);
+    await journal.append("warning", { message: "later record" });
+    expect(reduceJobState(journal.all()).usage).toEqual(expectedUsage);
   });
 });

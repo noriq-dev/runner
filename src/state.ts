@@ -242,7 +242,11 @@ export function reduceJobState(records: readonly JournalRecord[]): JobState {
         break;
       case "invocation.started": {
         const invocation = payload as unknown as InvocationState;
-        state.invocations[invocation.id] = invocation;
+        // Reducers replay the complete in-memory journal after every append. Never
+        // retain a reference to a record payload: the completion arms below enrich
+        // invocation state, and mutating the earlier `invocation.started` payload
+        // would make the next replay believe its usage was already contributed.
+        state.invocations[invocation.id] = { ...invocation };
         break;
       }
       case "invocation.completed": {

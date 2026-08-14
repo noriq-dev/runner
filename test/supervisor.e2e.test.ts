@@ -142,6 +142,20 @@ describe("RunnerJobSupervisor", () => {
     });
     const output = await supervisor.run();
     expect(output.summary).toContain("succeeded");
+    expect(output.usage).toEqual({
+      inputTokens: 50,
+      outputTokens: 25,
+      cachedTokens: 0,
+      costUsd: 0,
+      calls: 5,
+    });
+    expect(
+      (await loadDurableJobState(stateDirectory, assignment.jobId))?.usage,
+    ).toEqual(output.usage);
+    expect(sink.events.at(-1)?.payload).toMatchObject({
+      type: "terminal",
+      output: { usage: output.usage },
+    });
     expect(output.landing).toMatchObject({
       policy: "manual",
       status: "retained",
