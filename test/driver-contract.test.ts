@@ -10,7 +10,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createEphemeralAgentHome } from "../src/agent-home.js";
 import { type MachineConfig, projectConfigSchema } from "../src/config.js";
 import { ClaudeAgentDriver } from "../src/drivers/claude.js";
 import { CodexAgentDriver } from "../src/drivers/codex.js";
@@ -57,7 +56,7 @@ async function fakeCodex(root: string): Promise<string> {
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
-if (process.env.FAKE_ENV_LOG) appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({ home: process.env.CODEX_HOME, claude: process.env.CLAUDE_CONFIG_DIR }) + '\\n');
+if (process.env.FAKE_ENV_LOG) appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({ home: process.env.CODEX_HOME, claude: process.env.CLAUDE_CONFIG_DIR, args }) + '\\n');
 if (args.includes('--version')) { console.log('fake-codex 1.0'); process.exit(0); }
 if (args.includes('--help')) { console.log('--output-schema --json --ignore-user-config'); process.exit(0); }
 if (args[0] === 'login' && args[1] === 'status') { console.log('logged in'); process.exit(0); }
@@ -84,9 +83,10 @@ async function fakeClaude(root: string): Promise<string> {
   await writeFile(
     path,
     `#!/usr/bin/env node
-import { existsSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
+if (process.env.FAKE_ENV_LOG) appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({ home: process.env.CODEX_HOME, claude: process.env.CLAUDE_CONFIG_DIR, args }) + '\\n');
 if (args.includes('--version')) { console.log('fake-claude 1.0'); process.exit(0); }
 if (args.includes('--help')) { console.log('--output-format --json-schema --strict-mcp-config --no-session-persistence --system-prompt'); process.exit(0); }
 if (args[0] === 'auth' && args[1] === 'status') { console.log('{"authenticated":true}'); process.exit(0); }
@@ -97,6 +97,14 @@ if (process.env.AUTH_FAILURE === '1') {
   console.log(JSON.stringify({ type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Failed to authenticate: OAuth session expired and could not be refreshed' }] } }));
   console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' }));
   process.exit(1);
+}
+if (process.env.CONCURRENCY_STATE) {
+  mkdirSync(process.env.CONCURRENCY_STATE, { recursive: true });
+  writeFileSync(join(process.env.CONCURRENCY_STATE, process.pid + '.started'), '');
+  const deadline = Date.now() + 2000;
+  while (readdirSync(process.env.CONCURRENCY_STATE).filter((name) => name.endsWith('.started')).length < 2 && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  if (readdirSync(process.env.CONCURRENCY_STATE).filter((name) => name.endsWith('.started')).length < 2) process.exit(12);
 }
 const tools = ['ask_human', 'delegate', 'get_job_state', 'inspect_diff', 'record_task_plan', 'request_completion', 'run_checks'].map((tool) => 'mcp__noriq_runner__' + tool);
 console.log(JSON.stringify({ type: 'system', subtype: 'init', tools: process.env.OMIT_CONTROL === '1' ? [] : tools, mcp_servers: [{ name: 'noriq_runner', status: process.env.OMIT_CONTROL === '1' ? 'failed' : 'connected' }] }));
@@ -109,117 +117,7 @@ console.log(JSON.stringify({ type: 'result', structured_output: { summary: 'buil
 }
 
 describe("built-in driver contract", () => {
-  it("serializes and advances copied Claude credentials without blocking distinct homes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "runner-claude-lease-"));
-    const state = join(root, "state");
-    const sharedHome = await credentialHome(root, "claude", "shared");
-    const distinctHome = await credentialHome(root, "claude", "distinct");
-    const initialCredential = JSON.stringify({
-      claudeAiOauth: {
-        accessToken: "access-initial",
-        refreshToken: "refresh-initial",
-        expiresAt: 1,
-      },
-    });
-    const rotatedCredential = JSON.stringify({
-      claudeAiOauth: {
-        accessToken: "access-rotated",
-        refreshToken: "refresh-rotated",
-        expiresAt: 2,
-      },
-    });
-    await writeFile(join(sharedHome, ".credentials.json"), initialCredential);
-    const first = await createEphemeralAgentHome("claude", sharedHome, state);
-
-    const controller = new AbortController();
-    const cancelled = createEphemeralAgentHome("claude", sharedHome, state, {
-      signal: controller.signal,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    controller.abort(new Error("cancelled while queued"));
-    await expect(cancelled).rejects.toThrow(/cancelled while queued/);
-
-    let successorResolved = false;
-    const successorPromise = createEphemeralAgentHome(
-      "claude",
-      sharedHome,
-      state,
-    ).then((home) => {
-      successorResolved = true;
-      return home;
-    });
-    const independent = await createEphemeralAgentHome(
-      "claude",
-      distinctHome,
-      state,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(successorResolved).toBe(false);
-
-    await independent.cleanup();
-    await writeFile(join(first.path, ".credentials.json"), rotatedCredential);
-    await first.cleanup();
-    const successor = await successorPromise;
-    expect(
-      await readFile(join(successor.path, ".credentials.json"), "utf8"),
-    ).toBe(rotatedCredential);
-    expect(await readFile(join(sharedHome, ".credentials.json"), "utf8")).toBe(
-      rotatedCredential,
-    );
-    await successor.cleanup();
-    expect(await readdir(join(state, "agent-homes"))).toEqual([]);
-  });
-
-  it("does not persist invalid Claude credentials or overwrite an external re-login", async () => {
-    const root = await mkdtemp(join(tmpdir(), "runner-claude-sync-"));
-    const state = join(root, "state");
-    const home = await credentialHome(root, "claude");
-    const credential = (suffix: string) =>
-      JSON.stringify({
-        claudeAiOauth: {
-          accessToken: `access-${suffix}`,
-          refreshToken: `refresh-${suffix}`,
-          expiresAt: 1,
-        },
-      });
-    const initial = credential("initial");
-    await writeFile(join(home, ".credentials.json"), initial);
-
-    const invalidAttempt = await createEphemeralAgentHome(
-      "claude",
-      home,
-      state,
-    );
-    await writeFile(
-      join(invalidAttempt.path, ".credentials.json"),
-      JSON.stringify({
-        claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0 },
-      }),
-    );
-    await invalidAttempt.cleanup();
-    expect(await readFile(join(home, ".credentials.json"), "utf8")).toBe(
-      initial,
-    );
-
-    const externalAttempt = await createEphemeralAgentHome(
-      "claude",
-      home,
-      state,
-    );
-    await writeFile(
-      join(externalAttempt.path, ".credentials.json"),
-      credential("attempt"),
-    );
-    const external = credential("external");
-    await writeFile(join(home, ".credentials.json"), external);
-    await externalAttempt.cleanup();
-    expect(await readFile(join(home, ".credentials.json"), "utf8")).toBe(
-      external,
-    );
-    expect(await readdir(join(state, "agent-homes"))).toEqual([]);
-  });
-
-  it("verifies auth/structured output/control MCP and isolates the driver home", async () => {
+  it("verifies auth/structured output/control MCP and uses the configured driver home", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-driver-"));
     const command = await fakeCodex(root);
     const envLog = join(root, "env.jsonl");
@@ -272,13 +170,68 @@ describe("built-in driver contract", () => {
       .map((line) => JSON.parse(line));
     expect(
       observations.every(
-        (entry) =>
-          entry.home !== driverConfig.home &&
-          entry.home.startsWith(join(root, "state", "agent-homes")) &&
-          !entry.claude,
+        (entry) => entry.home === driverConfig.home && !entry.claude,
       ),
     ).toBe(true);
-    expect(await readdir(join(root, "state", "agent-homes"))).toEqual([]);
+    const invocation = observations.find((entry) =>
+      entry.args.includes("--output-last-message"),
+    );
+    expect(invocation.args).not.toContain("--ignore-user-config");
+    expect(invocation.args).not.toContain("--ignore-rules");
+  });
+
+  it("runs concurrent Claude invocations against one persistent configured home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-claude-concurrent-"));
+    const home = await credentialHome(root, "claude");
+    const envLog = join(root, "env.jsonl");
+    const concurrencyState = join(root, "concurrency");
+    const adapter = new ClaudeAgentDriver(
+      "claude",
+      {
+        adapter: "claude",
+        command: await fakeClaude(root),
+        args: [],
+        home,
+        env: {
+          FAKE_ENV_LOG: envLog,
+          CONCURRENCY_STATE: concurrencyState,
+        },
+      },
+      join(root, "state"),
+    );
+
+    await Promise.all(
+      ["first", "second"].map((invocationId) =>
+        adapter.invoke({
+          invocationId,
+          role: "builder",
+          taskId: invocationId,
+          taskKey: `RUN-${invocationId}`,
+          workspace: root,
+          access: "workspace-write",
+          prompt: "build",
+          outputSchema: { type: "object" },
+          projectConfig,
+        }),
+      ),
+    );
+
+    expect(await readdir(concurrencyState)).toHaveLength(2);
+    const invocations = (await readFile(envLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.args.includes("-p"));
+    expect(invocations).toHaveLength(2);
+    expect(
+      invocations.every(
+        (entry) =>
+          entry.claude === home &&
+          !entry.home &&
+          entry.args.includes("user,project,local") &&
+          !entry.args.includes("--strict-mcp-config"),
+      ),
+    ).toBe(true);
   });
 
   it("fails closed when the guide control MCP or structured result is missing", async () => {
@@ -486,7 +439,9 @@ describe("built-in driver contract", () => {
         "OAuth session expired and could not be refreshed",
       ),
     });
-    expect(await readdir(join(state, "agent-homes"))).toEqual([]);
+    await expect(access(join(state, "agent-homes"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
     await expect(
       readFile(
         join(state, "artifacts", "claude-auth-failure", "driver.log"),

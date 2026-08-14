@@ -1,10 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import {
-  createEphemeralAgentHome,
-  initializeClaudeProjectState,
-} from "../agent-home.js";
+import { prepareAgentHome } from "../agent-home.js";
 import type { MachineConfig } from "../config.js";
 import {
   findingSchema,
@@ -360,19 +357,9 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       throw new Error(
         `${this.id} cannot enforce ${request.access} workspace access`,
       );
-    const attemptHome = await createEphemeralAgentHome(
-      this.adapter,
-      this.config.home,
-      this.stateDirectory,
-    );
-    try {
-      if (this.adapter === "claude")
-        await initializeClaudeProjectState(
-          attemptHome.path,
-          workspace,
-          requireControl || request.access === "workspace-write",
-        );
-      const environment = this.env(workspace, attemptHome.path);
+    const home = await prepareAgentHome(this.config.home);
+    {
+      const environment = this.env(workspace, home);
       const version = await runProcess({
         command: this.config.command,
         args: ["--version"],
@@ -394,8 +381,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       const structuredOutput =
         this.adapter === "codex"
           ? help.stdout.includes("--output-schema") &&
-            help.stdout.includes("--json") &&
-            help.stdout.includes("--ignore-user-config")
+            help.stdout.includes("--json")
           : help.stdout.includes("--output-format") &&
             help.stdout.includes("--json-schema") &&
             help.stdout.includes("--strict-mcp-config") &&
@@ -469,8 +455,6 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         projectTools,
         warnings,
       };
-    } finally {
-      await attemptHome.cleanup();
     }
   }
 
@@ -524,8 +508,6 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         "exec",
         "--json",
         "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
         "--disable",
         "apps",
         "--disable",
@@ -586,17 +568,16 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         args.push(
           "--strict-mcp-config",
           "--setting-sources",
-          "user",
+          "user,project,local",
           "--tools",
           "",
         );
       else {
         args.push(
           "--setting-sources",
-          "project",
+          "user,project,local",
           "--tools",
           "Edit,Glob,Grep,Read,Write",
-          "--strict-mcp-config",
         );
         const projectMcp = await claudeProjectMcpConfiguration(
           request.workspace,
@@ -632,49 +613,29 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
         args.splice(args.length - 1, 0, ...injection);
       else args.push(...injection);
     }
-    const attemptHome = await createEphemeralAgentHome(
-      this.adapter,
-      this.config.home,
-      this.stateDirectory,
-      request.signal ? { signal: request.signal } : {},
-    );
-    const result = await (async () => {
-      try {
-        if (this.adapter === "claude")
-          await initializeClaudeProjectState(
-            attemptHome.path,
-            request.workspace,
-            request.role === "guide",
-          );
-        if (
-          this.adapter === "codex" &&
-          (request.role === "guide" || request.role === "reviewer")
-        )
-          args.splice(
-            args.length - 1,
-            0,
-            ...(await this.restrictedCodexMcpArguments(
-              request.workspace,
-              attemptHome.path,
-            )),
-          );
-        return await runProcess({
-          command: this.config.command,
-          args,
-          cwd: request.workspace,
-          env: this.env(request.workspace, attemptHome.path, {
-            state: controlStatePath,
-            actions: controlActionsPath,
-          }),
-          timeoutMs: request.projectConfig.harness.maxJobMinutes * 60_000,
-          ...(request.signal ? { signal: request.signal } : {}),
-          stdin: request.prompt,
-          maxOutputBytes: 8 * 1024 * 1024,
-        });
-      } finally {
-        await attemptHome.cleanup();
-      }
-    })();
+    const home = await prepareAgentHome(this.config.home);
+    if (
+      this.adapter === "codex" &&
+      (request.role === "guide" || request.role === "reviewer")
+    )
+      args.splice(
+        args.length - 1,
+        0,
+        ...(await this.restrictedCodexMcpArguments(request.workspace, home)),
+      );
+    const result = await runProcess({
+      command: this.config.command,
+      args,
+      cwd: request.workspace,
+      env: this.env(request.workspace, home, {
+        state: controlStatePath,
+        actions: controlActionsPath,
+      }),
+      timeoutMs: request.projectConfig.harness.maxJobMinutes * 60_000,
+      ...(request.signal ? { signal: request.signal } : {}),
+      stdin: request.prompt,
+      maxOutputBytes: 8 * 1024 * 1024,
+    });
     await writeFile(rawLogPath, `${result.stdout}\n${result.stderr}`, {
       mode: 0o600,
     });

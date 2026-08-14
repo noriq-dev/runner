@@ -13,12 +13,16 @@ maxConcurrentJobs = 2
 adapter = "codex"
 command = "/usr/local/bin/codex"
 args = []
+# Persistent Runner-specific vendor home. Authenticate and place deliberate
+# Runner-wide Codex settings, instructions, and MCPs here.
 home = "/var/lib/noriq-runner/drivers/codex"
 
 [drivers.claude]
 adapter = "claude"
 command = "/usr/local/bin/claude"
 args = []
+# Shared by concurrent Runner Claude sessions; project-local .claude and
+# .mcp.json configuration is still discovered from each task workspace.
 home = "/var/lib/noriq-runner/drivers/claude"
 
 # Future vendors can be registered without Runner code changes:
