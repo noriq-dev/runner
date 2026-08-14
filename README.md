@@ -7,7 +7,7 @@ Noriq Runner is a small, durable agent-guided harness. Noriq commissions one imm
 - Noriq chooses a registered Runner and repository. It retains coarse progress, questions, evidence, usage, opaque revisions/checkpoints, the retained location, and durable human landing intent/outcome.
 - Committed `project.toml` selects registered driver and backend IDs, models, limits, checks, and isolated or direct behavior. It cannot provide executable paths, homes, credentials, or secrets.
 - Machine-local `runner.toml` registers trusted driver/backend adapters and contains commands, persistent Runner-owned vendor homes, credentials, scan roots, and machine capacity.
-- Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP commands or tool schemas. For Claude builders and repairers, it reads the project `.mcp.json` server names only so the CLI can grant those project tools noninteractively.
+- Project-native agent configuration and MCP files remain vendor-owned. Runner injects only its confined `noriq_runner` control MCP and does not parse project MCP commands or tool schemas. Noriq's copilot MCP catalog is a separate server surface; catalog revisions do not rename or expand this local harness control plane. For Claude builders and repairers, Runner reads the project `.mcp.json` server names only so the CLI can grant those project tools noninteractively.
 
 ## Start
 

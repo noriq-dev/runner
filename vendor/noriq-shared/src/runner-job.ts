@@ -3,10 +3,11 @@ import { ExecutionSpec } from './execution-spec';
 
 const id = z.string().trim().min(1).max(128);
 const text = (maximum: number) => z.string().trim().min(1).max(maximum);
-const revision = text(1_000);
+export const RunnerJobRevision = text(1_000);
+export type RunnerJobRevision = z.infer<typeof RunnerJobRevision>;
 
 export const RunnerJobCheckpoint = z.object({
-  ref: revision,
+  ref: RunnerJobRevision,
   label: text(500),
   url: z.string().url().max(2_000).nullable(),
 }).strict();
@@ -207,8 +208,8 @@ export type RunnerJobCheck = z.infer<typeof RunnerJobCheck>;
 export const RunnerJobOutput = z.object({
   workspaceMode: z.enum(['isolated', 'direct']),
   retainedLocation: RunnerJobRetainedLocation,
-  baseRevision: revision,
-  headRevision: revision,
+  baseRevision: RunnerJobRevision,
+  headRevision: RunnerJobRevision,
   acceptedTaskCheckpoints: z.record(z.string(), RunnerJobCheckpoint),
   checks: z.array(RunnerJobCheck).max(1_000),
   findings: z.array(RunnerJobFinding).max(1_000),
@@ -257,7 +258,7 @@ export const RunnerJobAssignment = z.object({
   snapshotDigest: z.string().regex(/^[0-9a-f]{64}$/),
   source: RunnerJobSource,
   repoRef: text(500),
-  expectedBaseRevision: revision,
+  expectedBaseRevision: RunnerJobRevision,
 }).strict();
 export type RunnerJobAssignment = z.infer<typeof RunnerJobAssignment>;
 
@@ -265,7 +266,7 @@ export const RunnerJobDispatch = z.object({ runnerId: id, repoRef: text(500) }).
 export type RunnerJobDispatch = z.infer<typeof RunnerJobDispatch>;
 
 export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), vcs: text(100), baseRevision: revision }).strict()).max(1_000) }).strict(),
+  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), vcs: text(100), baseRevision: RunnerJobRevision }).strict()).max(1_000) }).strict(),
   z.object({ type: z.literal('heartbeat'), freeSlots: z.number().int().min(0).max(32), activeJobIds: z.array(id).max(32) }).strict(),
   z.object({ type: z.literal('job.accept'), jobId: id, assignmentId: id }).strict(),
   z.object({ type: z.literal('job.event'), jobId: id, assignmentId: id, seq: z.number().int().positive(), payload: RunnerJobEvent }).strict(),

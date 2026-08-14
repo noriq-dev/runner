@@ -153,7 +153,7 @@ export type RunExit = z.infer<typeof RunExit>;
 /**
  * A review follow-up the daemon files through POST /api/runner-spinoffs (PLNR-478).
  *
- * Unlike the agent-only spin_off_task tool, provenance is explicit on this wire because the
+ * Unlike the MCP create_tasks proposal path, provenance is explicit on this wire because the
  * daemon has no Noriq agent identity. The server validates all three pointers as one fact: the
  * source run belongs to runnerId, is live, and is anchored to sourceTaskId in projectId. The
  * product remains a proposed task until a human accepts or rejects it.
