@@ -77,6 +77,81 @@ function jsonLines(text: string): Record<string, unknown>[] {
     .filter((value): value is Record<string, unknown> => value !== null);
 }
 
+class DriverInvocationError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "DriverInvocationError";
+    this.code = code;
+  }
+}
+
+function boundedFailureText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 2_000) : undefined;
+}
+
+function structuredMessageText(
+  frame: Record<string, unknown>,
+): string | undefined {
+  if (!frame.message || typeof frame.message !== "object") return undefined;
+  const content = (frame.message as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return undefined;
+  return boundedFailureText(
+    content
+      .filter(
+        (entry): entry is Record<string, unknown> =>
+          Boolean(entry) && typeof entry === "object" && !Array.isArray(entry),
+      )
+      .filter((entry) => entry.type === "text")
+      .map((entry) => entry.text)
+      .filter((text): text is string => typeof text === "string")
+      .join(" "),
+  );
+}
+
+function invocationFailure(
+  adapter: "codex" | "claude",
+  result: Awaited<ReturnType<typeof runProcess>>,
+): { code: string; detail: string } {
+  const frames = adapter === "claude" ? jsonLines(result.stdout) : [];
+  const providerErrorFrame = [...frames]
+    .reverse()
+    .find(
+      (frame) =>
+        frame.is_error === true ||
+        (typeof frame.error === "string" && frame.error.length > 0),
+    );
+  const providerCode = [...frames]
+    .reverse()
+    .map((frame) => frame.error)
+    .find(
+      (value): value is string =>
+        typeof value === "string" && /^[A-Za-z0-9_.-]{1,100}$/.test(value),
+    );
+  const terminalError = [...frames]
+    .reverse()
+    .find((frame) => frame.type === "result" && frame.is_error === true);
+  const providerDetail =
+    boundedFailureText(terminalError?.result) ??
+    boundedFailureText(providerErrorFrame?.result) ??
+    structuredMessageText(providerErrorFrame ?? {});
+  const stderr = boundedFailureText(result.stderr);
+  return {
+    code:
+      providerCode ??
+      (result.timedOut
+        ? "driver_timeout"
+        : result.signal
+          ? `${adapter}_process_signal`
+          : `${adapter}_invocation_failed`),
+    detail:
+      providerDetail ?? stderr ?? `process exited with no diagnostic output`,
+  };
+}
+
 function codexMcpInventory(text: string): Array<Record<string, unknown>> {
   const value = JSON.parse(text) as unknown;
   if (!Array.isArray(value))
@@ -561,6 +636,7 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
       this.adapter,
       this.config.home,
       this.stateDirectory,
+      request.signal ? { signal: request.signal } : {},
     );
     const result = await (async () => {
       try {
@@ -602,10 +678,13 @@ export abstract class BuiltinCliAgentDriver implements AgentDriver {
     await writeFile(rawLogPath, `${result.stdout}\n${result.stderr}`, {
       mode: 0o600,
     });
-    if (result.exitCode !== 0 || result.timedOut)
-      throw new Error(
-        `${this.id} invocation failed (${result.exitCode ?? result.signal}): ${result.stderr.slice(-4_000)}`,
+    if (result.exitCode !== 0 || result.timedOut) {
+      const failure = invocationFailure(this.adapter, result);
+      throw new DriverInvocationError(
+        failure.code,
+        `${this.id} invocation failed (${result.exitCode ?? result.signal}): ${failure.detail}`,
       );
+    }
     const frames = jsonLines(result.stdout);
     if (this.adapter === "claude" && request.role === "guide")
       assertClaudeControlInventory(frames);
