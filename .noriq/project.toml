@@ -1,12 +1,12 @@
 key = "RUN"
 repositoryKey = "noriq-runner"
-defaultBranch = "rebuild/runner-from-scratch"
+defaultBranch = "main"
 
 [sourceControl]
 backend = "auto"
 mode = "isolated"
-base = "rebuild/runner-from-scratch"
-target = "rebuild/runner-from-scratch"
+base = "main"
+target = "main"
 landing = "manual"
 
 [harness]

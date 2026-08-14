@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, rebuild/runner-from-scratch]
+    branches: [main]
   pull_request:
 
 permissions:
