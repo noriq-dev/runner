@@ -1,6 +1,6 @@
 {
   "name": "@noriq-dev/runner",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "A small, durable agent-guided job harness for Noriq",
   "license": "MIT",
   "type": "module",
