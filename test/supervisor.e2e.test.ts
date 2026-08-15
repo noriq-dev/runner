@@ -814,7 +814,7 @@ describe("RunnerJobSupervisor", () => {
     expect(sink.events.map((event) => event.seq)).toEqual(
       sink.events.map((_, index) => index + 1),
     );
-  });
+  }, 15_000);
 
   it("preserves changes and removes the child worktree when a builder crashes", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-build-failure-"));

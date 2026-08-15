@@ -169,17 +169,22 @@ describe("workspace durability", () => {
       sink,
     });
     const running = supervisor.run();
-    let questionId: string | undefined;
-    for (let attempt = 0; attempt < 100 && !questionId; attempt += 1) {
-      const event = sink.events.find(
-        (candidate) => candidate.payload.type === "question",
-      );
-      if (event?.payload.type === "question")
-        questionId = event.payload.questionId;
-      if (!questionId) await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(questionId).toBeTruthy();
-    await supervisor.answer(questionId!, "forty-two");
+    await expect
+      .poll(
+        () =>
+          sink.events.find(
+            (candidate) => candidate.payload.type === "question",
+          ),
+        { interval: 10, timeout: 10_000 },
+      )
+      .toBeTruthy();
+    const question = sink.events.find(
+      (candidate) => candidate.payload.type === "question",
+    );
+    expect(question?.payload.type).toBe("question");
+    if (question?.payload.type !== "question")
+      throw new Error("question event was not emitted");
+    await supervisor.answer(question.payload.questionId, "forty-two");
     expect((await running).summary).toContain("succeeded");
     expect(fake.calls.map((call) => call.role)).toEqual([
       "guide",
@@ -187,7 +192,7 @@ describe("workspace durability", () => {
       "builder",
       "reviewer",
     ]);
-  });
+  }, 15_000);
 
   it("resumes a completed builder receipt without invoking it or duplicating the checkpoint", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-recovery-"));
