@@ -3,6 +3,7 @@ import { bashCompletion } from "../src/cli/completion.js";
 import {
   COMMANDS,
   completionCandidates,
+  formatCommandHelp,
   formatHelp,
   validateCommandArgs,
 } from "../src/cli/registry.js";
@@ -22,7 +23,10 @@ describe("CLI registry", () => {
       expect.arrayContaining(["noriq", "codex", "claude", "all"]),
     );
     expect(bashCompletion()).toContain("noriq-runner __complete");
+    expect(formatCommandHelp("auth")).toContain("noriq | codex | claude");
+    expect(completionCandidates(["auth", "--"])).toContain("--help");
     expect(() => validateCommandArgs("auth", ["status", "all"])).not.toThrow();
+    expect(() => validateCommandArgs("auth", ["--help"])).not.toThrow();
     expect(() => validateCommandArgs("start", ["--bogus"])).toThrow(
       /unknown option/,
     );

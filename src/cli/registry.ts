@@ -5,7 +5,7 @@ export interface CommandSpec {
   values?: Readonly<Record<string, readonly string[]>>;
 }
 
-export const GLOBAL_FLAGS = ["--config"] as const;
+export const GLOBAL_FLAGS = ["--config", "--help", "-h"] as const;
 
 export const COMMANDS: readonly CommandSpec[] = [
   {
@@ -83,7 +83,29 @@ export function formatHelp(): string {
   const width = Math.max(...COMMANDS.map((command) => command.name.length)) + 3;
   return `noriq-runner <command> [options]\n\nCommands:\n${COMMANDS.map(
     (command) => `  ${command.name.padEnd(width)}${command.summary}`,
-  ).join("\n")}\n\nGlobal options:\n  --config <path>  Machine configuration\n`;
+  ).join(
+    "\n",
+  )}\n\nGlobal options:\n  --config <path>  Machine configuration\n  --help, -h       Show command help\n`;
+}
+
+export function formatCommandHelp(name: string): string {
+  const spec = commandSpec(name);
+  if (!spec) throw new Error(`unknown command ${name}`);
+  const positional = Object.entries(spec.values ?? {}).flatMap(
+    ([key, values]) =>
+      key === "target" || key === "shell"
+        ? [`  ${key.padEnd(14)}${values.join(" | ")}`]
+        : [],
+  );
+  const flags = [...GLOBAL_FLAGS, ...spec.flags].filter(
+    (flag, index, values) => values.indexOf(flag) === index,
+  );
+  const optionLines = flags.map(
+    (flag) => `  ${flag}${VALUE_FLAGS.has(flag) ? " <value>" : ""}`,
+  );
+  return `noriq-runner ${name} [options]\n\n${spec.summary}\n${
+    positional.length > 0 ? `\nArguments:\n${positional.join("\n")}\n` : ""
+  }${optionLines.length > 0 ? `\nOptions:\n${optionLines.join("\n")}\n` : ""}`;
 }
 
 export const VALUE_FLAGS = new Set([
@@ -104,10 +126,11 @@ export function completionCandidates(words: string[]): string[] {
   const commandName = prior.find((word) => !word.startsWith("-"));
   const spec = commandName ? commandSpec(commandName) : undefined;
   if (!spec)
-    return [...COMMAND_NAMES, "--help", "--version", ...GLOBAL_FLAGS].filter(
-      (value) => value.startsWith(current),
+    return [...COMMAND_NAMES, "--version", ...GLOBAL_FLAGS].filter(
+      (value, index, values) =>
+        values.indexOf(value) === index && value.startsWith(current),
     );
-  if (spec.name === "auth" && prior.length === 1)
+  if (spec.name === "auth" && prior.length === 1 && !current.startsWith("-"))
     return [...(spec.values?.target ?? [])].filter((value) =>
       value.startsWith(current),
     );

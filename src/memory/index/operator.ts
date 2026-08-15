@@ -1,5 +1,6 @@
 import type { MachineConfig } from "../../config.js";
 import { scanRepositories } from "../../repositories/scanner.js";
+import { createBackendRegistry, selectBackend } from "../../vcs/detect.js";
 import { encodeBatches } from "./batch.js";
 import { scanIndex } from "./scan.js";
 import { createIndexSource } from "./source.js";
@@ -52,6 +53,15 @@ export async function runIndexCommand(
   const perforceCommand = Object.values(options.config.backends).find(
     (backend) => backend.adapter === "perforce",
   )?.command;
+  const backend = selectBackend(
+    createBackendRegistry(options.config),
+    checkout.config,
+    checkout.vcs,
+  );
+  const baseId = await backend.revisionOf(
+    checkout.repository,
+    checkout.config.sourceControl.base,
+  );
   const source = createIndexSource(
     checkout.vcs,
     checkout.repository,
@@ -59,7 +69,7 @@ export async function runIndexCommand(
       ...(gitCommand ? { git: gitCommand } : {}),
       ...(perforceCommand ? { perforce: perforceCommand } : {}),
     },
-    checkout.config.sourceControl.base,
+    baseId,
   );
   const scan = () =>
     scanIndex({
@@ -86,6 +96,7 @@ export async function runIndexCommand(
         repositoryKey: checkout.config.repositoryKey,
         enabled: checkout.config.index.enabled,
         source: source.kind,
+        baseId,
         fileCount: first.fileCount,
         totalBytes: first.totalBytes,
         batchCount: batches.length,

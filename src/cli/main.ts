@@ -14,6 +14,7 @@ import { runInit } from "./init.js";
 import {
   COMMAND_NAMES,
   completionCandidates,
+  formatCommandHelp,
   formatHelp,
   validateCommandArgs,
 } from "./registry.js";
@@ -99,8 +100,14 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "--help" || command === "-h" || command === "help") {
-    if (command === "help") validateCommandArgs(command, args);
-    process.stdout.write(formatHelp());
+    if (command === "help" && args.length > 0) {
+      if (args.length > 1)
+        throw new Error("help accepts at most one command name");
+      process.stdout.write(formatCommandHelp(args[0]!));
+    } else {
+      if (command === "help") validateCommandArgs(command, args);
+      process.stdout.write(formatHelp());
+    }
     return;
   }
   if (command === "control-mcp") {
@@ -109,6 +116,10 @@ async function main(): Promise<void> {
   }
   if (!COMMAND_NAMES.includes(command))
     throw new Error(`unknown command ${command}; run noriq-runner help`);
+  if (args.includes("--help") || args.includes("-h")) {
+    process.stdout.write(formatCommandHelp(command));
+    return;
+  }
   validateCommandArgs(command, args);
   if (command === "completion") {
     if ((args[0] ?? "bash") !== "bash")

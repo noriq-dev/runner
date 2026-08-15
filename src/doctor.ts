@@ -19,11 +19,71 @@ export interface RunnerDoctorReport {
     driver: string;
     version: string;
     authenticated: boolean;
-    access: WorkspaceAccess;
+    access: WorkspaceAccess[];
     runnerControlVisible: boolean;
     projectTools: string[];
     warnings: string[];
+    preflightChecks: number;
   }>;
+}
+
+interface DriverCheck {
+  driver: string;
+  version: string;
+  authenticated: boolean;
+  access: WorkspaceAccess;
+  requireControlMcp: boolean;
+  runnerControlVisible: boolean;
+  projectTools: string[];
+  warnings: string[];
+}
+
+export function aggregateDriverChecks(
+  checks: DriverCheck[],
+): RunnerDoctorReport["drivers"] {
+  const reports = new Map<string, RunnerDoctorReport["drivers"][number]>();
+  for (const check of checks) {
+    const existing = reports.get(check.driver);
+    if (!existing) {
+      reports.set(check.driver, {
+        driver: check.driver,
+        version: check.version,
+        authenticated: check.authenticated,
+        access: [check.access],
+        runnerControlVisible:
+          !check.requireControlMcp || check.runnerControlVisible,
+        projectTools: [...new Set(check.projectTools)].sort(),
+        warnings: [...new Set(check.warnings)].sort(),
+        preflightChecks: 1,
+      });
+      continue;
+    }
+    existing.authenticated &&= check.authenticated;
+    if (!existing.access.includes(check.access)) {
+      existing.access.push(check.access);
+      existing.access.sort();
+    }
+    if (check.requireControlMcp)
+      existing.runnerControlVisible &&= check.runnerControlVisible;
+    existing.projectTools = [
+      ...new Set([...existing.projectTools, ...check.projectTools]),
+    ].sort();
+    existing.warnings = [
+      ...new Set([...existing.warnings, ...check.warnings]),
+    ].sort();
+    if (existing.version !== check.version) {
+      existing.warnings = [
+        ...new Set([
+          ...existing.warnings,
+          `inconsistent versions observed: ${existing.version}, ${check.version}`,
+        ]),
+      ].sort();
+    }
+    existing.preflightChecks += 1;
+  }
+  return [...reports.values()].sort((left, right) =>
+    left.driver.localeCompare(right.driver),
+  );
 }
 
 /** Run every read-only startup check without connecting to Noriq or spending model tokens. */
@@ -34,7 +94,7 @@ export async function doctorRunner(
   const backends = createBackendRegistry(config);
   const drivers = createDriverRegistry(config);
   const repositories: RunnerDoctorReport["repositories"] = [];
-  const driverReports: RunnerDoctorReport["drivers"] = [];
+  const driverChecks: DriverCheck[] = [];
   const checked = new Set<string>();
 
   for (const project of projects) {
@@ -69,11 +129,12 @@ export async function doctorRunner(
           access,
           requireControlMcp,
         });
-        driverReports.push({
+        driverChecks.push({
           driver: result.driver,
           version: result.version,
           authenticated: result.authenticated,
           access,
+          requireControlMcp,
           runnerControlVisible: result.runnerControlVisible,
           projectTools: result.projectTools,
           warnings: result.warnings,
@@ -86,6 +147,6 @@ export async function doctorRunner(
     serverUrl: config.runner.serverUrl,
     stateDirectory: config.runner.stateDirectory,
     repositories,
-    drivers: driverReports,
+    drivers: aggregateDriverChecks(driverChecks),
   };
 }

@@ -131,18 +131,22 @@ describe("repository index scanner", () => {
     const root = await mkdtemp(join(tmpdir(), "runner-index-adapters-"));
     roots.push(root);
     await writeFile(join(root, "local.ts"), "local\n");
+    const invocations: string[][] = [];
     const perforce = new PerforceIndexSource(
       root,
       "p4",
       "42",
-      async () => ({
-        exitCode: 0,
-        signal: null,
-        stdout: `... depotFile //depot/src/a.ts\n... clientFile ${join(root, "src", "a.ts")}\n... headAction add\n... fileSize 5\n`,
-        stderr: "",
-        durationMs: 1,
-        timedOut: false,
-      }),
+      async (input) => {
+        invocations.push(input.args ?? []);
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: `... depotFile //depot/src/a.ts\n... clientFile ${join(root, "src", "a.ts")}\n... headAction add\n... fileSize 5\n`,
+          stderr: "",
+          durationMs: 1,
+          timedOut: false,
+        };
+      },
       async () => ({
         bytes: Buffer.from("hello"),
         overLimit: false,
@@ -150,6 +154,7 @@ describe("repository index scanner", () => {
       }),
     );
     expect(await perforce.list()).toEqual([{ path: "src/a.ts", size: 5 }]);
+    expect(invocations[0]!).toContain("...@42");
     expect((await perforce.read("src/a.ts", 100)).bytes.toString()).toBe(
       "hello",
     );
