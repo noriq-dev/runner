@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, test } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
 import { encodeBatches } from "../src/memory/index/batch.js";
@@ -22,6 +23,41 @@ afterEach(async () => {
 });
 
 describe("repository index scanner", () => {
+  test("bounds both compressed and decompressed ingest batch sizes", () => {
+    const rows = Array.from({ length: 12 }, (_, index) => ({
+      kind: "node" as const,
+      uri: `noriq://file/test/repository/src/file-${index}.ts`,
+      type: "file",
+      label: `src/file-${index}.ts`,
+      content: "compressible source line\n".repeat(20),
+    }));
+
+    const batches = encodeBatches(rows, 10_000, 2_000);
+
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.reduce((sum, batch) => sum + batch.rowCount, 0)).toBe(
+      rows.length,
+    );
+    for (const batch of batches) {
+      expect(batch.bytes.length).toBeLessThanOrEqual(10_000);
+      expect(gunzipSync(batch.bytes).length).toBeLessThanOrEqual(2_000);
+    }
+  });
+
+  test("rejects a single index row larger than the decompressed limit", () => {
+    const row = {
+      kind: "node" as const,
+      uri: "noriq://file/test/repository/large.txt",
+      type: "file",
+      label: "large.txt",
+      content: "x".repeat(2_000),
+    };
+
+    expect(() => encodeBatches([row], 10_000, 1_000)).toThrow(
+      "uncompressed index row exceeds 1000 bytes",
+    );
+  });
+
   test("is deterministic and never admits sensitive or generated files", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-index-"));
     roots.push(root);
