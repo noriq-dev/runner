@@ -318,6 +318,12 @@ const backendSchema = z.discriminatedUnion("adapter", [
     .object({
       adapter: z.literal("diversion"),
       command: z.string().trim().min(1).default("dv"),
+      // "shared" keeps every job and task inside the one existing checkout,
+      // switching branches in place. "per-task" gives each job and each task
+      // its own `dv clone --new-workspace`, which is what lets tasks build
+      // concurrently — at the cost of a full sync per workspace, which is why
+      // it is opt-in rather than the default (RUN-53 records the cost concern).
+      workspaces: z.enum(["shared", "per-task"]).default("shared"),
     })
     .strict(),
   z
@@ -416,7 +422,7 @@ const machineConfigInputSchema = z
     drivers: z.record(registeredId, driverSchema),
     backends: z.record(registeredId, backendSchema).default({
       git: { adapter: "git", command: "git" },
-      diversion: { adapter: "diversion", command: "dv" },
+      diversion: { adapter: "diversion", command: "dv", workspaces: "shared" },
       perforce: { adapter: "perforce", command: "p4" },
     }),
     pricing: z

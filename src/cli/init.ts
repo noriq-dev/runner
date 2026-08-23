@@ -70,7 +70,7 @@ export function renderMachineConfig(input: {
       ? `\n[backends.git]\nadapter = "git"\ncommand = ${tomlString(input.tools.git)}\n`
       : "",
     input.tools.diversion
-      ? `\n[backends.diversion]\nadapter = "diversion"\ncommand = ${tomlString(input.tools.diversion)}\n`
+      ? `\n[backends.diversion]\nadapter = "diversion"\ncommand = ${tomlString(input.tools.diversion)}\n# "per-task" clones a workspace per job and per task so tasks build\n# concurrently, at the cost of a full sync per workspace.\nworkspaces = "shared"\n`
       : "",
     input.tools.perforce
       ? `\n[backends.perforce]\nadapter = "perforce"\ncommand = ${tomlString(input.tools.perforce)}\n`

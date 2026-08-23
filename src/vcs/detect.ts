@@ -71,7 +71,15 @@ export function createBackendRegistry(
           }),
         ];
       if (backend.adapter === "diversion")
-        return [id, new DiversionSourceControlBackend(id, backend.command)];
+        return [
+          id,
+          new DiversionSourceControlBackend(
+            id,
+            backend.command,
+            undefined,
+            backend.workspaces,
+          ),
+        ];
       return [id, new PerforceSourceControlBackend(id, backend.command)];
     }),
   );

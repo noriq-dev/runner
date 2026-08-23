@@ -112,6 +112,27 @@ describe.runIf(
       process.env.RUNNER_LIVE_DIVERSION_BASE!,
     );
   }, 120_000);
+
+  it("does the same in its own cloned workspaces without touching the checkout", async () => {
+    const repository = process.env.RUNNER_LIVE_DIVERSION_REPOSITORY!;
+    const backend = new DiversionSourceControlBackend(
+      "diversion",
+      "dv",
+      undefined,
+      "per-task",
+    );
+    expect(backend.capabilities.parallelTaskWorkspaces).toBe(true);
+    const before = await backend.revisionOf(
+      repository,
+      process.env.RUNNER_LIVE_DIVERSION_BASE!,
+    );
+    await liveCandidate(
+      backend,
+      repository,
+      process.env.RUNNER_LIVE_DIVERSION_BASE!,
+    );
+    expect(before).toBeTruthy();
+  }, 1_800_000);
 });
 
 describe.runIf(

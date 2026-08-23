@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -118,6 +126,111 @@ function diversionFake() {
     shelves,
     edit: () => {
       dirty = true;
+    },
+  };
+}
+
+/**
+ * Unlike diversionFake, this models MANY workspaces: branch state is per
+ * directory, and `clone` materialises a real directory with a `.diversion`
+ * marker. A single-`current`-pointer fake cannot tell a per-task workspace
+ * apart from an in-place checkout, which is the whole point of these tests.
+ */
+function diversionWorkspaceFake(source: string) {
+  const repoId = "dv.repo.11111111-2222-3333-4444-555555555555";
+  const revisions = new Map<string, string>([["main", "dv-100"]]);
+  const workspaces = new Map<string, { branch: string; dirty: boolean }>([
+    [source, { branch: "main", dirty: false }],
+  ]);
+  const deleted: string[] = [];
+  const calls: string[] = [];
+  let sequence = 100;
+  let workspaceSequence = 0;
+  let refuseDelete = false;
+
+  const at = (cwd: string) => {
+    const entry = workspaces.get(cwd);
+    if (!entry) throw new Error(`fake: no Diversion workspace at ${cwd}`);
+    return entry;
+  };
+
+  const cli = async (cwd: string, args: string[]) => {
+    calls.push(`${cwd} :: ${args.join(" ")}`);
+    const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    const fail = (stderr: string) => ({ exitCode: 1, stdout: "", stderr });
+    if (args[0] === "repo")
+      return ok(`Cloned Locally:\nfixture (${repoId})(${source})\n\nOther:\n`);
+    if (args[0] === "clone") {
+      const path = args[2]!;
+      const reference = args[5]!;
+      if (args[1] !== repoId) return fail(`unknown repo ${args[1]}`);
+      if (!revisions.has(reference)) return fail(`unknown ref ${reference}`);
+      workspaceSequence += 1;
+      await mkdir(join(path, ".diversion"), { recursive: true });
+      await writeFile(
+        join(path, ".diversion", `dv.ws.fake-${workspaceSequence}`),
+        "",
+      );
+      workspaces.set(path, { branch: reference, dirty: false });
+      return ok();
+    }
+    if (args[0] === "workspace" && args[1] === "delete") {
+      if (refuseDelete) return fail("workspace is busy");
+      deleted.push(args[2]!);
+      workspaces.delete(cwd);
+      return ok();
+    }
+    if (args[0] === "branch-name") return ok(`${at(cwd).branch}\n`);
+    if (args[0] === "status" && args[1] === "--commit-id-only")
+      return ok(`${revisions.get(at(cwd).branch)}\n`);
+    if (args[0] === "branch" && args[1] === "-c") {
+      const name = args[2]!;
+      revisions.set(name, revisions.get(at(cwd).branch)!);
+      at(cwd).branch = name;
+      return ok();
+    }
+    if (args[0] === "branch" && args[1] === "-d") {
+      revisions.delete(args[2]!);
+      return ok();
+    }
+    if (args[0] === "show") {
+      const revision = revisions.get(args[1]!);
+      return revision ? ok(`commit ${revision}\n`) : fail("not found");
+    }
+    if (args[0] === "checkout") {
+      if (!revisions.has(args[1]!)) return fail(`unknown ref ${args[1]}`);
+      at(cwd).branch = args[1]!;
+      return ok();
+    }
+    if (args[0] === "diff" && args[1] === "--name-status")
+      return ok(at(cwd).dirty ? "M\tfeature.txt\n" : "");
+    if (args[0] === "diff") return ok("diff -- feature.txt\n");
+    if (args[0] === "commit") {
+      sequence += 1;
+      revisions.set(at(cwd).branch, `dv-${sequence}`);
+      at(cwd).dirty = false;
+      return ok(`New commit ID: dv-${sequence}\n`);
+    }
+    if (args[0] === "merge" && args[1] !== "--abort") {
+      sequence += 1;
+      revisions.set(at(cwd).branch, `dv-${sequence}`);
+      return ok(`Commit ID: dv-${sequence}\n`);
+    }
+    return ok();
+  };
+
+  return {
+    cli,
+    calls,
+    revisions,
+    deleted,
+    workspaces,
+    branchAt: (path: string) => workspaces.get(path)?.branch ?? null,
+    edit: (path: string) => {
+      at(path).dirty = true;
+    },
+    refuseDeletion: (value: boolean) => {
+      refuseDelete = value;
     },
   };
 }
@@ -458,6 +571,366 @@ describe("source-control backend contract", () => {
       checkpoint: { ref: "dv-103", label: "main" },
     });
     expect(fake.revisions.get("main")).toBe("dv-103");
+  });
+
+  it("gives every Diversion task its own workspace under per-task isolation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-per-task-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const fake = diversionWorkspaceFake(source);
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    expect(backend.capabilities.parallelTaskWorkspaces).toBe(true);
+
+    const workspace = await backend.openJob({
+      repository: source,
+      stateDirectory: join(root, "state"),
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const outputReference = workspace.retainedLocation.label;
+
+    // The job works in a clone, and the human's checkout never moved.
+    expect(workspace.path).not.toBe(source);
+    expect(fake.branchAt(workspace.path)).toBe(outputReference);
+    expect(fake.branchAt(source)).toBe("main");
+
+    // Two tasks, two real working copies on disk.
+    const first = await backend.beginTask(workspace, "RUN-1");
+    const second = await backend.beginTask(workspace, "RUN-2");
+    expect(first.path).not.toBe(second.path);
+    expect(first.path).not.toBe(workspace.path);
+    expect(fake.branchAt(first.path)).toBe(
+      `${outputReference}/candidate-run-1`,
+    );
+    expect(fake.branchAt(second.path)).toBe(
+      `${outputReference}/candidate-run-2`,
+    );
+    expect(fake.branchAt(source)).toBe("main");
+
+    // Each task commits into its own workspace without disturbing the other.
+    fake.edit(first.path);
+    const staged = await backend.stageCandidate({
+      workspace,
+      task: first,
+      taskKey: "RUN-1",
+      summary: "candidate",
+      refresh: false,
+    });
+    if (staged.status !== "ready") throw new Error("candidate not ready");
+    expect(fake.revisions.get(outputReference)).toBe("dv-100");
+    expect(fake.revisions.get(`${outputReference}/candidate-run-2`)).toBe(
+      "dv-100",
+    );
+
+    const accepted = await backend.acceptCandidate({
+      workspace,
+      task: first,
+      candidate: staged.checkpoint,
+      taskKey: "RUN-1",
+    });
+    expect(fake.revisions.get(outputReference)).toBe(accepted.ref);
+    expect(fake.branchAt(source)).toBe("main");
+
+    // Teardown deregisters the cloned workspaces rather than leaking them.
+    await backend.releaseTask(workspace, first);
+    await backend.releaseTask(workspace, second);
+    expect(fake.workspaces.has(first.path)).toBe(false);
+    expect(fake.workspaces.has(second.path)).toBe(false);
+    expect(fake.deleted).toHaveLength(2);
+
+    await backend.release(workspace, "job");
+    expect(fake.workspaces.has(workspace.path)).toBe(false);
+
+    // Landing survives the job workspace being gone: it provisions its own.
+    const landed = await backend.land({
+      repository: source,
+      stateDirectory: join(root, "state"),
+      jobId: "job",
+      workspace,
+      target: "main",
+      acceptedTaskCheckpoints: { task: accepted },
+    });
+    expect(landed.target).toBe("main");
+    expect(fake.revisions.get("main")).toBe(landed.checkpoint.ref);
+    expect(fake.revisions.get("main")).not.toBe("dv-100");
+    // Still never touched the human's checkout: not just unchanged in the end,
+    // but never the target of a mutating command at any point.
+    expect(fake.branchAt(source)).toBe("main");
+    expect(fake.workspaces.has(source)).toBe(true);
+    const mutating = fake.calls.filter(
+      (call) =>
+        call.startsWith(`${source} :: `) &&
+        /:: (checkout|commit|merge|reset|shelf|branch -[cd]|workspace delete)/.test(
+          call,
+        ),
+    );
+    expect(mutating).toEqual([]);
+  });
+
+  it("keeps a preserved Diversion candidate branch after its workspace is torn down", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-preserve-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const fake = diversionWorkspaceFake(source);
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    const workspace = await backend.openJob({
+      repository: source,
+      stateDirectory: join(root, "state"),
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const task = await backend.beginTask(workspace, "RUN-1");
+    const candidateReference = `${workspace.retainedLocation.label}/candidate-run-1`;
+
+    fake.edit(task.path);
+    const preserved = await backend.preserveFailedWork({
+      workspace,
+      task,
+      taskKey: "RUN-1",
+      reason: "checks failed",
+    });
+    expect(preserved).toMatchObject({ label: candidateReference });
+    // The work was committed to the branch, so it outlives the workspace.
+    expect(fake.revisions.get(candidateReference)).not.toBe("dv-100");
+
+    await backend.releaseTask(workspace, task);
+    expect(fake.workspaces.has(task.path)).toBe(false);
+    expect(fake.revisions.has(candidateReference)).toBe(true);
+    expect(fake.calls).not.toContain(
+      `${workspace.path} :: branch -d ${candidateReference} -f`,
+    );
+  });
+
+  it("keeps a per-task Diversion job on its own workspaces after the setting flips back to shared", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-flip-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const stateDirectory = join(root, "state");
+    const fake = diversionWorkspaceFake(source);
+    const perTask = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    const workspace = await perTask.openJob({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+
+    // The operator switches the setting back while this job is still open.
+    const shared = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "shared",
+    );
+    const restored = await shared.restoreJob({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      handle: workspace.handle,
+      mode: "isolated",
+      baseRevision: "dv-100",
+      currentRevision: "dv-100",
+    });
+    // The handle decides, not the setting: still its own workspace, and the
+    // human's checkout is still on its own branch.
+    expect(restored.path).toBe(workspace.path);
+    expect(restored.path).not.toBe(source);
+    const task = await shared.beginTask(restored, "RUN-1");
+    expect(task.path).not.toBe(source);
+    expect(fake.branchAt(source)).toBe("main");
+  });
+
+  it("does not destroy Diversion task workspaces or overclaim during orphan recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-orphan-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const stateDirectory = join(root, "state");
+    const fake = diversionWorkspaceFake(source);
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    const workspace = await backend.openJob({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const task = await backend.beginTask(workspace, "RUN-1");
+    const lockPath = (workspace.handle.state as { lockPath: string }).lockPath;
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        ...JSON.parse(await readFile(lockPath, "utf8")),
+        pid: 0x7ffffff0,
+      }),
+    );
+
+    const warnings = await backend.recoverOrphans(source, stateDirectory);
+    // The job clone is re-provisionable, so reclaiming it is safe. The task
+    // clone is not — nothing re-clones it, and it may hold uncommitted work.
+    expect(fake.workspaces.has(workspace.path)).toBe(false);
+    expect(fake.workspaces.has(task.path)).toBe(true);
+    expect(await stat(task.path).then(() => true)).toBe(true);
+    // And the record that finds it again must survive, with no false claim.
+    expect(await stat(lockPath).then(() => true)).toBe(true);
+    expect(warnings.join(" ")).not.toContain(
+      "reclaimed orphaned Diversion workspaces",
+    );
+    expect(warnings.join(" ")).toContain("left in place");
+  });
+
+  it("keeps the landing lock when a Diversion landing workspace cannot be reclaimed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-landing-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const stateDirectory = join(root, "state");
+    const fake = diversionWorkspaceFake(source);
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    const workspace = await backend.openJob({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const task = await backend.beginTask(workspace, "RUN-1");
+    fake.edit(task.path);
+    const staged = await backend.stageCandidate({
+      workspace,
+      task,
+      taskKey: "RUN-1",
+      summary: "candidate",
+      refresh: false,
+    });
+    if (staged.status !== "ready") throw new Error("candidate not ready");
+    const accepted = await backend.acceptCandidate({
+      workspace,
+      task,
+      candidate: staged.checkpoint,
+      taskKey: "RUN-1",
+    });
+    await backend.releaseTask(workspace, task);
+    await backend.release(workspace, "job");
+
+    // A manual landing long after the job workspace is gone.
+    fake.refuseDeletion(true);
+    const landed = await backend.land({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      workspace,
+      target: "main",
+      acceptedTaskCheckpoints: { task: accepted },
+    });
+    expect(fake.revisions.get("main")).toBe(landed.checkpoint.ref);
+    // The landing clone is still registered, so its record must remain.
+    const locks = await readdir(join(stateDirectory, "locks"));
+    expect(locks).toHaveLength(1);
+    const owner = JSON.parse(
+      await readFile(join(stateDirectory, "locks", locks[0]!), "utf8"),
+    ) as { workspaceRoot?: string };
+    expect(typeof owner.workspaceRoot).toBe("string");
+
+    // And recovery finds it through that record once it can be reclaimed.
+    fake.refuseDeletion(false);
+    await writeFile(
+      join(stateDirectory, "locks", locks[0]!),
+      JSON.stringify({ ...owner, pid: 0x7ffffff0 }),
+    );
+    const warnings = await backend.recoverOrphans(source, stateDirectory);
+    expect(warnings.join(" ")).toContain("reclaimed");
+    expect(await readdir(join(stateDirectory, "locks"))).toHaveLength(0);
+  });
+
+  it("keeps the recovery record when a Diversion workspace refuses to deregister", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-stranded-"));
+    await mkdir(join(root, "checkout", ".diversion"), { recursive: true });
+    const source = await realpath(join(root, "checkout"));
+    await writeFile(join(source, ".diversion", "dv.ws.source"), "");
+    const stateDirectory = join(root, "state");
+    const fake = diversionWorkspaceFake(source);
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+      "per-task",
+    );
+    const workspace = await backend.openJob({
+      repository: source,
+      stateDirectory,
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const lockPath = (workspace.handle.state as { lockPath: string }).lockPath;
+    expect(await readdir(join(stateDirectory, "locks"))).toHaveLength(1);
+
+    // The workspace cannot be deregistered, so it is still registered in the
+    // cloud. Dropping the lock here would leave nothing naming it.
+    fake.refuseDeletion(true);
+    await backend.release(workspace, "job");
+    expect(fake.workspaces.has(workspace.path)).toBe(true);
+    expect(await stat(workspace.path).then(() => true)).toBe(true);
+    expect(await stat(lockPath).then(() => true)).toBe(true);
+
+    // Once the workspace can be reclaimed, orphan recovery finds it through
+    // that lock and reports what it did.
+    fake.refuseDeletion(false);
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        ...JSON.parse(await readFile(lockPath, "utf8")),
+        pid: 0x7ffffff0,
+      }),
+    );
+    const warnings = await backend.recoverOrphans(source, stateDirectory);
+    expect(warnings.join(" ")).toContain("reclaimed orphaned Diversion");
+    expect(fake.workspaces.has(workspace.path)).toBe(false);
+    expect(await readdir(join(stateDirectory, "locks"))).toHaveLength(0);
   });
 
   it("uses cumulative Perforce shelves in isolated mode and submits direct candidates", async () => {
