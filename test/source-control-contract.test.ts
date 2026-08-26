@@ -1020,6 +1020,101 @@ describe("source-control backend contract", () => {
     expect(await dirtyPaths(repository)).toEqual(["alpha.txt", "beta.txt"]);
   });
 
+  it("preserves failed submodule work so the parent recovery ref still resolves", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "runner-git-submodule-preserve-"),
+    );
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "v1\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "v1"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const backend = new GitSourceControlBackend("git-test");
+      const workspace = await backend.openJob({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        key: "RUN-1",
+        kind: "task",
+        expectedBaseRevision: base,
+        config: projectWithSubmodules({
+          paths: { "vendor/lib": { policy: "develop", target: "main" } },
+        }),
+      });
+      const task = await backend.beginTask(workspace, "RUN-1");
+      const submodule = join(task.path, "vendor", "lib");
+      await identity(submodule);
+      // Uncommitted work inside the submodule: the case most easily lost.
+      await writeFile(join(submodule, "lib.txt"), "half-finished\n");
+
+      const preserved = await backend.preserveFailedWork({
+        workspace,
+        task,
+        taskKey: "RUN-1",
+        reason: "checks failed",
+      });
+      expect(preserved).not.toBeNull();
+      const recoveryRef = preserved!.label;
+
+      // The parent's recovery ref records a gitlink, and that submodule commit
+      // must resolve from the parent repository, not only from the worktree.
+      const gitlink = await command(repository, "git", [
+        "rev-parse",
+        `${recoveryRef}:vendor/lib`,
+      ]);
+      expect(
+        await command(repository, "git", ["cat-file", "-t", gitlink]),
+      ).toBe("commit");
+
+      // Survives the worktree that authored it being destroyed, and gc.
+      await backend.releaseTask(workspace, task);
+      await command(repository, "git", ["gc", "--prune=now"]);
+      expect(
+        await command(repository, "git", ["cat-file", "-t", gitlink]),
+      ).toBe("commit");
+      // And the preserved content is the half-finished work, not the base.
+      expect(
+        await command(repository, "git", ["show", `${gitlink}:lib.txt`]),
+      ).toBe("half-finished");
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
   it("resolves per-submodule policy against the project default", () => {
     const config = projectWithSubmodules({
       paths: { "vendor/meshnet": { policy: "develop", target: "main" } },

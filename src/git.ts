@@ -494,6 +494,66 @@ async function retainSubmoduleCommit(
     );
 }
 
+export interface SubmoduleRecovery {
+  path: string;
+  ref: string;
+  revision: string;
+}
+
+/**
+ * Preserves work authored inside submodules when a task fails. Commits whatever
+ * is uncommitted, then TRANSFERS the result into the parent repository under a
+ * recovery ref — for the same reason retention does: the worktree's submodule
+ * store is deleted with the worktree, so a ref left inside it preserves
+ * nothing. Without this the parent's own recovery ref would name a submodule
+ * commit that no longer exists.
+ *
+ * Runs under every policy. A failed task is the wrong moment to enforce a
+ * pinned contract by discarding the evidence.
+ */
+export async function preserveSubmoduleWork(options: {
+  taskPath: string;
+  sourceRepository: string;
+  config: SubmodulesConfig | undefined;
+  taskKey: string;
+  reason: string;
+}): Promise<SubmoduleRecovery[]> {
+  const states = await inspectSubmodules(options.taskPath, options.config);
+  const preserved: SubmoduleRecovery[] = [];
+  for (const state of states) {
+    const absolute = join(options.taskPath, state.path);
+    if (state.dirty) {
+      await git(absolute, ["add", "-A"]);
+      await git(absolute, [
+        "commit",
+        "-m",
+        `WIP ${options.taskKey}: ${options.reason.slice(0, 160)}`,
+      ]);
+    }
+    const head = await git(absolute, ["rev-parse", "HEAD"]);
+    // Unchanged from what the parent recorded: nothing was authored here.
+    if (head === state.recorded) continue;
+    const ref = `refs/noriq/recovery/submodule/${safeRefPart(options.taskKey)}-${head.slice(0, 10)}/${safeRefPart(state.path)}`;
+    await git(absolute, [
+      "push",
+      "--force",
+      options.sourceRepository,
+      `${head}:${ref}`,
+    ]);
+    const stored = await git(options.sourceRepository, [
+      "rev-parse",
+      "--verify",
+      `${ref}^{commit}`,
+    ]).catch(() => "");
+    if (stored !== head)
+      throw new Error(
+        `submodule ${state.path} recovery commit ${head} was not preserved in ${options.sourceRepository}`,
+      );
+    preserved.push({ path: state.path, ref, revision: head });
+  }
+  return preserved;
+}
+
 export interface SubmoduleLanding {
   path: string;
   target: string;

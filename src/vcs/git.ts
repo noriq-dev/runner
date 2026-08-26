@@ -20,6 +20,7 @@ import {
   normalizeWipCheckpoint,
   populateSubmodules,
   prepareJobWorkspace,
+  preserveSubmoduleWork,
   rebaseTask,
   releaseJobWorkspace,
   removeTaskWorktree,
@@ -583,10 +584,20 @@ export class GitSourceControlBackend implements SourceControlBackend {
     options: Parameters<SourceControlBackend["preserveFailedWork"]>[0],
   ) {
     taskState(options.task, this.id);
+    // Before anything inspects the parent: commit and transfer submodule work,
+    // so the WIP commit's gitlink names a commit that survives this worktree.
+    const preservedSubmodules = await preserveSubmoduleWork({
+      taskPath: options.task.path,
+      sourceRepository: options.workspace.repositoryIdentity,
+      config: submodulesState(options.workspace.handle),
+      taskKey: options.taskKey,
+      reason: options.reason,
+    });
     const changed = await dirtyPaths(options.task.path);
     const head = await currentRevision(options.task.path);
     if (
       changed.length === 0 &&
+      preservedSubmodules.length === 0 &&
       (options.workspace.mode === "isolated"
         ? options.task.handle.state.candidateCreated !== true
         : head === options.task.baseRevision)
@@ -716,9 +727,30 @@ export class GitSourceControlBackend implements SourceControlBackend {
           : `recovered interrupted Git landing for ${owner.jobId ?? "unknown job"} before target mutation`,
       ];
     }
+    // Same hazard preserveFailedWork has: a submodule with uncommitted content
+    // makes the parent's `add -A` + commit fail outright, which here would
+    // throw before the lock is released. Preserve it first. The policy is
+    // unknown on this path, so it runs permissively — on a repository without
+    // submodules this is a single no-op `git submodule status`.
+    const warnings: string[] = [];
+    for (const preserved of await preserveSubmoduleWork({
+      taskPath: root,
+      sourceRepository: root,
+      config: {
+        enabled: true,
+        init: "recursive",
+        policy: "develop",
+        paths: {},
+      },
+      taskKey: owner.jobId ?? "orphan",
+      reason: "Runner process exited before journal acknowledgement",
+    })) {
+      warnings.push(
+        `preserved orphaned work in submodule ${preserved.path} at ${preserved.ref}`,
+      );
+    }
     const paths = await dirtyPaths(root);
     const head = await currentRevision(root);
-    const warnings: string[] = [];
     if (paths.length > 0 || head !== owner.expectedHead) {
       const recoveryCommit =
         paths.length > 0
