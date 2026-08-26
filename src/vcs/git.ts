@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { access, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import type { SubmodulesConfig } from "../config.js";
 import {
   abortRebase,
   amendCheckpoint,
@@ -16,6 +17,7 @@ import {
   GitRebaseConflict,
   integrateTask,
   normalizeWipCheckpoint,
+  populateSubmodules,
   prepareJobWorkspace,
   rebaseTask,
   releaseJobWorkspace,
@@ -30,6 +32,7 @@ import {
   type BackendHandle,
   IntegrationConflict,
   type JobWorkspace,
+  type JsonValue,
   type LandingResult,
   type SourceControlBackend,
   type SourceControlCheckpoint,
@@ -51,6 +54,18 @@ function optionalState(
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * The submodule config captured at job open. A handle written before this
+ * feature simply has no entry, which reads as "unmanaged" — the same as a
+ * project that never configured submodules.
+ */
+function submodulesState(handle: BackendHandle): SubmodulesConfig | undefined {
+  const value = handle.state.submodules;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  return value as unknown as SubmodulesConfig;
+}
+
 function checkpointRecord(ref: string, label = ref): SourceControlCheckpoint {
   return { ref, label, url: null };
 }
@@ -64,6 +79,9 @@ function jobHandle(workspace: GitJobWorkspace, backend: string): BackendHandle {
       workRef: workspace.branch,
       ...(workspace.worktreeRoot
         ? { worktreeRoot: workspace.worktreeRoot }
+        : {}),
+      ...(workspace.submodules
+        ? { submodules: workspace.submodules as unknown as JsonValue }
         : {}),
       ...(workspace.directLockPath
         ? { directLockPath: workspace.directLockPath }
@@ -89,6 +107,7 @@ function toGit(workspace: JobWorkspace, backend: string): GitJobWorkspace {
   assertBackendHandle(workspace.handle, backend, "job workspace");
   const worktreeRoot = optionalState(workspace.handle, "worktreeRoot");
   const directLockPath = optionalState(workspace.handle, "directLockPath");
+  const submodules = submodulesState(workspace.handle);
   return {
     mode: workspace.mode,
     sourceRepository: stringState(workspace.handle, "sourceRepository"),
@@ -98,6 +117,7 @@ function toGit(workspace: JobWorkspace, backend: string): GitJobWorkspace {
     expectedHead: workspace.currentRevision,
     ...(worktreeRoot ? { worktreeRoot } : {}),
     ...(directLockPath ? { directLockPath } : {}),
+    ...(submodules ? { submodules } : {}),
   };
 }
 
@@ -246,6 +266,9 @@ export class GitSourceControlBackend implements SourceControlBackend {
         expectedHead,
         mode: options.mode,
         backendId: this.id,
+        ...(submodulesState(options.handle)
+          ? { submodules: submodulesState(options.handle)! }
+          : {}),
       }),
       this.id,
     );
@@ -270,6 +293,8 @@ export class GitSourceControlBackend implements SourceControlBackend {
         await access(path);
         const revision = await currentRevision(path);
         if (revision !== workspace.currentRevision) throw error;
+        // A reused worktree may predate population, or have been left partial.
+        await populateSubmodules(path, submodulesState(workspace.handle));
         task = { path, branch, baseRevision: revision };
       } catch {
         throw error;

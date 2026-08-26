@@ -374,6 +374,108 @@ function perforceFake(root: string) {
 }
 
 describe("source-control backend contract", () => {
+  it("populates submodules in the job worktree and in every task worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-git-submodule-"));
+    // Modern git refuses file-transport submodules, and deliberately ignores
+    // repo-level config for it. GIT_CONFIG_* is the only channel that reaches
+    // both the fixture's own commands and the git the backend spawns. Fixture
+    // concern only: real repositories use https/ssh remotes.
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      // A library repo, then a parent that consumes it as a submodule.
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "library-content\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "library"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const open = async (submodules: unknown) => {
+        const backend = new GitSourceControlBackend("git-test");
+        const config = projectWithSubmodules(submodules);
+        const workspace = await backend.openJob({
+          repository,
+          stateDirectory: join(
+            root,
+            `state-${String(submodules !== undefined)}`,
+          ),
+          jobId: `job-${String(submodules !== undefined)}`,
+          key: "RUN-1",
+          kind: "task",
+          expectedBaseRevision: base,
+          config,
+        });
+        return { backend, workspace };
+      };
+
+      const managed = await open({ paths: {} });
+      const file = join(managed.workspace.path, "vendor", "lib", "lib.txt");
+      expect(await readFile(file, "utf8")).toBe("library-content\n");
+
+      // Each task worktree is populated independently of the job worktree.
+      const first = await managed.backend.beginTask(managed.workspace, "RUN-1");
+      const second = await managed.backend.beginTask(
+        managed.workspace,
+        "RUN-2",
+      );
+      expect(first.path).not.toBe(second.path);
+      for (const task of [first, second])
+        expect(
+          await readFile(join(task.path, "vendor", "lib", "lib.txt"), "utf8"),
+        ).toBe("library-content\n");
+
+      // The gitlink revision, not merely "some content".
+      const expected = await command(repository, "git", [
+        "rev-parse",
+        "HEAD:vendor/lib",
+      ]);
+      expect(
+        await command(join(managed.workspace.path, "vendor/lib"), "git", [
+          "rev-parse",
+          "HEAD",
+        ]),
+      ).toBe(expected);
+
+      // With no submodules block the tree is left exactly as git made it: empty.
+      const unmanaged = await open(undefined);
+      await expect(
+        readFile(join(unmanaged.workspace.path, "vendor", "lib", "lib.txt")),
+      ).rejects.toThrow();
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
   it("resolves per-submodule policy against the project default", () => {
     const config = projectWithSubmodules({
       paths: { "vendor/meshnet": { policy: "develop", target: "main" } },

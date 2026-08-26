@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import type { ProjectConfig } from "./config.js";
+import type { ProjectConfig, SubmodulesConfig } from "./config.js";
 import type { CheckResult } from "./contracts.js";
 import { runProcess } from "./process.js";
 
@@ -60,6 +60,27 @@ export interface JobWorkspace {
   expectedHead: string;
   worktreeRoot?: string;
   directLockPath?: string;
+  /**
+   * Captured at job open. beginTask has no ProjectConfig in its signature, and
+   * a job's submodule policy must not change underneath it mid-run, so the
+   * resolved config rides the workspace instead of being re-read per task.
+   */
+  submodules?: SubmodulesConfig;
+}
+
+/**
+ * `git worktree add` creates a tree whose submodule directories are EMPTY, so
+ * every worktree Runner makes has to populate them explicitly or the agent gets
+ * a tree that cannot build and no way to tell why from inside it.
+ */
+export async function populateSubmodules(
+  path: string,
+  config: SubmodulesConfig | undefined,
+): Promise<void> {
+  if (!config?.enabled || config.init === "none") return;
+  const args = ["submodule", "update", "--init"];
+  if (config.init === "recursive") args.push("--recursive");
+  await git(path, args);
 }
 
 export async function discoverRepository(path: string): Promise<string> {
@@ -125,6 +146,7 @@ export async function prepareJobWorkspace(options: {
   backendId?: string;
 }): Promise<JobWorkspace> {
   const repository = await discoverRepository(options.repository);
+  const submodules = options.config.sourceControl.submodules;
   const actualBase = await git(repository, [
     "rev-parse",
     `${options.config.sourceControl.base}^{commit}`,
@@ -165,6 +187,9 @@ export async function prepareJobWorkspace(options: {
         }),
         { mode: 0o600 },
       );
+      // requireClean above guarantees the tree is clean, so populating the
+      // operator's own checkout here cannot discard local submodule work.
+      await populateSubmodules(repository, submodules);
       return {
         mode: "direct",
         sourceRepository: repository,
@@ -173,6 +198,7 @@ export async function prepareJobWorkspace(options: {
         baseRevision: actualBase,
         expectedHead,
         directLockPath,
+        ...(submodules ? { submodules } : {}),
       };
     } catch (error) {
       await unlink(directLockPath).catch(() => {});
@@ -188,6 +214,7 @@ export async function prepareJobWorkspace(options: {
   const path = join(worktreeRoot, "job");
   await mkdir(worktreeRoot, { recursive: true });
   await git(repository, ["worktree", "add", "-b", branch, path, actualBase]);
+  await populateSubmodules(path, submodules);
   return {
     mode: "isolated",
     sourceRepository: repository,
@@ -196,6 +223,7 @@ export async function prepareJobWorkspace(options: {
     baseRevision: actualBase,
     expectedHead: actualBase,
     worktreeRoot,
+    ...(submodules ? { submodules } : {}),
   };
 }
 
@@ -208,6 +236,7 @@ export async function restoreJobWorkspace(options: {
   expectedHead: string;
   mode: "isolated" | "direct";
   backendId?: string;
+  submodules?: SubmodulesConfig;
 }): Promise<JobWorkspace> {
   const sourceRepository = await discoverRepository(options.repository);
   if (options.mode === "direct") {
@@ -235,6 +264,7 @@ export async function restoreJobWorkspace(options: {
       baseRevision: options.baseRevision,
       expectedHead: head,
       directLockPath,
+      ...(options.submodules ? { submodules: options.submodules } : {}),
     };
   }
   const safeJobId = safeRefPart(options.jobId);
@@ -245,6 +275,9 @@ export async function restoreJobWorkspace(options: {
     throw new Error(
       `retained job worktree branch changed from ${options.branch} to ${branch}`,
     );
+  // Idempotent, and a crash can leave a worktree whose submodules were never
+  // populated; re-running costs nothing when they already match.
+  await populateSubmodules(path, options.submodules);
   return {
     mode: "isolated",
     sourceRepository,
@@ -253,6 +286,7 @@ export async function restoreJobWorkspace(options: {
     baseRevision: options.baseRevision,
     expectedHead: await currentRevision(path),
     worktreeRoot,
+    ...(options.submodules ? { submodules: options.submodules } : {}),
   };
 }
 
@@ -294,6 +328,7 @@ export async function createTaskWorktree(
     path,
     head,
   ]);
+  await populateSubmodules(path, workspace.submodules);
   return { path, branch, baseRevision: head };
 }
 
