@@ -603,6 +603,88 @@ describe("source-control backend contract", () => {
     }
   }, 60_000);
 
+  it("tears down populated submodule worktrees without accumulating state", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "runner-git-submodule-teardown-"),
+    );
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "v1\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "v1"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const backend = new GitSourceControlBackend("git-test");
+      const workspace = await backend.openJob({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        key: "RUN-1",
+        kind: "task",
+        expectedBaseRevision: base,
+        config: projectWithSubmodules({ paths: {} }),
+      });
+
+      // Many sequential task cycles must not accumulate worktree state or
+      // eventually make creation fail.
+      const before = (
+        await command(repository, "git", ["worktree", "list"])
+      ).split("\n").length;
+      for (let round = 0; round < 4; round += 1) {
+        const task = await backend.beginTask(workspace, `RUN-${round}`);
+        expect(
+          await readFile(join(task.path, "vendor", "lib", "lib.txt"), "utf8"),
+        ).toBe("v1\n");
+        await backend.releaseTask(workspace, task);
+        await expect(stat(task.path)).rejects.toThrow();
+      }
+      const after = (
+        await command(repository, "git", ["worktree", "list"])
+      ).split("\n").length;
+      expect(after).toBe(before);
+
+      // No stale registration is left behind in the submodule's module dir.
+      const registrations = await readdir(
+        join(repository, ".git", "modules", "vendor", "lib", "worktrees"),
+      ).catch(() => [] as string[]);
+      expect(registrations).toEqual([]);
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
   it("resolves per-submodule policy against the project default", () => {
     const config = projectWithSubmodules({
       paths: { "vendor/meshnet": { policy: "develop", target: "main" } },

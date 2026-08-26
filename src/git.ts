@@ -663,6 +663,18 @@ export async function normalizeWipCheckpoint(
   return git(path, ["rev-parse", "HEAD"]);
 }
 
+/**
+ * WARNING for submodule work (verified against git 2.55): a submodule inside a
+ * worktree does NOT share the main checkout's `.git/modules/<path>` store. It
+ * gets its own at `.git/worktrees/<wt>/modules/<path>`, so removing the
+ * worktree DESTROYS every object authored in that submodule — a ref created
+ * inside it does not survive, because the store holding both is deleted.
+ *
+ * Phase 1 is safe because checkpoint refuses a moved gitlink, so nothing is
+ * ever authored there. Any future policy that lets agents commit inside a
+ * submodule must TRANSFER the objects into a durable store (push/fetch into
+ * the main module store) BEFORE this runs. Pinning a ref alone is not enough.
+ */
 export async function removeTaskWorktree(
   workspace: JobWorkspace,
   path: string,
