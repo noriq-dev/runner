@@ -16,6 +16,7 @@ import {
   submodulePolicyFor,
   submoduleTargetFor,
 } from "../src/config.js";
+import { diffForReview, inspectSubmodules } from "../src/git.js";
 import { runProcess } from "../src/process.js";
 import { createBackendRegistry, selectBackend } from "../src/vcs/detect.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
@@ -469,6 +470,132 @@ describe("source-control backend contract", () => {
       await expect(
         readFile(join(unmanaged.workspace.path, "vendor", "lib", "lib.txt")),
       ).rejects.toThrow();
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
+  it("refuses to stage a gitlink whose submodule work is uncommitted or pinned-moved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-git-submodule-guard-"));
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "v1\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "v1"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const backend = new GitSourceControlBackend("git-test");
+      const workspace = await backend.openJob({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        key: "RUN-1",
+        kind: "task",
+        expectedBaseRevision: base,
+        config: projectWithSubmodules({ paths: {} }),
+      });
+      const task = await backend.beginTask(workspace, "RUN-1");
+      const submodule = join(task.path, "vendor", "lib");
+
+      // 1. Uncommitted work inside the submodule must never become a gitlink.
+      await writeFile(join(submodule, "lib.txt"), "dirty\n");
+      const states = await inspectSubmodules(
+        task.path,
+        workspace.handle.state.submodules as never,
+      );
+      expect(states).toHaveLength(1);
+      expect(states[0]!.path).toBe("vendor/lib");
+      expect(states[0]!.dirty).toBe(true);
+      await expect(
+        backend.stageCandidate({
+          workspace,
+          task,
+          taskKey: "RUN-1",
+          summary: "candidate",
+          refresh: false,
+        }),
+      ).rejects.toThrow(
+        /uncommitted changes inside submodule\(s\) vendor\/lib/,
+      );
+
+      // 2. Committing inside it makes it clean but moves the pinned gitlink,
+      //    which is a contract violation the backend refuses outright.
+      await identity(submodule);
+      await command(submodule, "git", ["add", "."]);
+      await command(submodule, "git", ["commit", "-m", "moved"]);
+      const moved = await inspectSubmodules(
+        task.path,
+        workspace.handle.state.submodules as never,
+      );
+      expect(moved[0]!.dirty).toBe(false);
+      expect(moved[0]!.head).not.toBe(moved[0]!.recorded);
+      await expect(
+        backend.stageCandidate({
+          workspace,
+          task,
+          taskKey: "RUN-1",
+          summary: "candidate",
+          refresh: false,
+        }),
+      ).rejects.toThrow(/is pinned, but its gitlink moved/);
+
+      // A review diff must render the submodule's own patch. Called directly:
+      // the pinned gate above means a moved submodule cannot reach review
+      // through the backend until the follow/develop phases land.
+      const withConfig = await diffForReview(task.path, base, false, {
+        enabled: true,
+        init: "recursive",
+        policy: "pinned",
+        paths: {},
+      });
+      expect(withConfig).toContain("dirty");
+      const withoutConfig = await diffForReview(task.path, base, false);
+      expect(withoutConfig).toContain("Subproject commit");
+      expect(withoutConfig).not.toContain("dirty");
+
+      // 3. Restored to the recorded gitlink, an ordinary parent change commits.
+      await command(submodule, "git", ["reset", "--hard", moved[0]!.recorded]);
+      await writeFile(join(task.path, "README.md"), "changed\n");
+      const staged = await backend.stageCandidate({
+        workspace,
+        task,
+        taskKey: "RUN-1",
+        summary: "candidate",
+        refresh: false,
+      });
+      expect(staged.status).toBe("ready");
     } finally {
       for (const [key, value] of Object.entries(priorEnv))
         if (value === undefined) delete process.env[key];

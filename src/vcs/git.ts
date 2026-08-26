@@ -343,8 +343,14 @@ export class GitSourceControlBackend implements SourceControlBackend {
             options.task.path,
             options.taskKey,
             options.summary,
+            submodulesState(options.workspace.handle),
           )
-        : await checkpoint(options.task.path, options.taskKey, options.summary);
+        : await checkpoint(
+            options.task.path,
+            options.taskKey,
+            options.summary,
+            submodulesState(options.workspace.handle),
+          );
     options.task.handle.state.candidateCreated = true;
     return {
       status: "ready" as const,
@@ -405,6 +411,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
         ? workspace.currentRevision
         : `${candidate.ref}^`,
       workspace.mode === "direct",
+      submodulesState(workspace.handle),
     );
   }
 
@@ -424,6 +431,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
               options.task.path,
               options.taskKey,
               `accepted\n\nNoriq-Job: ${String(options.workspace.handle.state.jobId ?? "unknown")}`,
+              submodulesState(options.workspace.handle),
             )
           : await currentRevision(options.task.path);
       options.workspace.currentRevision = ref;

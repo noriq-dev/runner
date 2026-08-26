@@ -9,7 +9,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import type { ProjectConfig, SubmodulesConfig } from "./config.js";
+import {
+  type ProjectConfig,
+  type SubmodulesConfig,
+  submodulePolicyFor,
+} from "./config.js";
 import type { CheckResult } from "./contracts.js";
 import { runProcess } from "./process.js";
 
@@ -375,11 +379,99 @@ export async function abortRebase(taskPath: string): Promise<void> {
   });
 }
 
+export interface SubmoduleState {
+  path: string;
+  /** The submodule's working tree has uncommitted changes. */
+  dirty: boolean;
+  /** Commit currently checked out inside the submodule. */
+  head: string;
+  /** Gitlink the parent's HEAD records for this path. */
+  recorded: string;
+}
+
+/**
+ * Reads each managed submodule's real state by asking the submodule itself,
+ * rather than inferring it from the parent's porcelain, where a moved gitlink
+ * and a dirty working tree are easy to confuse.
+ */
+export async function inspectSubmodules(
+  path: string,
+  config: SubmodulesConfig | undefined,
+): Promise<SubmoduleState[]> {
+  if (!config?.enabled) return [];
+  const listing = await git(path, ["submodule", "status", "--recursive"]).catch(
+    () => "",
+  );
+  const states: SubmoduleState[] = [];
+  for (const line of listing.split("\n")) {
+    if (!line.trim()) continue;
+    // "<prefix><sha> <path> (<describe>)" — prefix is one status character.
+    const parts = line.slice(1).trim().split(/\s+/);
+    const submodulePath = parts[1];
+    if (!submodulePath) continue;
+    const absolute = join(path, submodulePath);
+    const dirty = Boolean(
+      await git(absolute, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]).catch(() => ""),
+    );
+    const head = await git(absolute, ["rev-parse", "HEAD"]).catch(() => "");
+    const recorded = await git(path, [
+      "rev-parse",
+      `HEAD:${submodulePath}`,
+    ]).catch(() => "");
+    states.push({ path: submodulePath, dirty, head, recorded });
+  }
+  return states;
+}
+
+/**
+ * Guards the one path that can publish a pointer to a commit that exists
+ * nowhere: `git add -A` will happily stage a gitlink whose submodule commit was
+ * never created. That lands cleanly and breaks on the next fetch, so it is
+ * refused before anything is staged.
+ */
+export async function assertSubmodulesCommittable(
+  path: string,
+  config: SubmodulesConfig | undefined,
+  taskKey: string,
+): Promise<void> {
+  const states = await inspectSubmodules(path, config);
+  const dirty = states.filter((state) => state.dirty);
+  if (dirty.length > 0)
+    throw new Error(
+      `task ${taskKey} left uncommitted changes inside submodule(s) ${dirty
+        .map((state) => state.path)
+        .join(
+          ", ",
+        )}; a gitlink must never be staged while its submodule commit does not exist`,
+    );
+  const moved = states.filter(
+    (state) => state.head !== state.recorded && state.recorded !== "",
+  );
+  for (const state of moved) {
+    const policy = submodulePolicyFor(config, state.path);
+    // follow/develop are configurable but their machinery lands in later
+    // phases, so an unvalidated move is refused rather than silently trusted.
+    const reason =
+      policy === "pinned"
+        ? `submodule ${state.path} is pinned`
+        : `submodule policy "${policy}" is not implemented yet`;
+    throw new Error(
+      `${reason}, but its gitlink moved from ${state.recorded} to ${state.head}`,
+    );
+  }
+}
+
 export async function checkpoint(
   path: string,
   taskKey: string,
   summary: string,
+  submodules?: SubmodulesConfig,
 ): Promise<string> {
+  await assertSubmodulesCommittable(path, submodules, taskKey);
   await git(path, ["add", "-A"]);
   const staged = await git(path, ["diff", "--cached", "--name-only"]);
   if (!staged) throw new Error(`task ${taskKey} produced no changes`);
@@ -389,9 +481,11 @@ export async function checkpoint(
 
 export async function amendCheckpoint(
   path: string,
-  _taskKey: string,
+  taskKey: string,
   _summary: string,
+  submodules?: SubmodulesConfig,
 ): Promise<string> {
+  await assertSubmodulesCommittable(path, submodules, taskKey);
   await git(path, ["add", "-A"]);
   await git(path, ["commit", "--amend", "--no-edit"]);
   return git(path, ["rev-parse", "HEAD"]);
@@ -469,9 +563,20 @@ export async function diffForReview(
   path: string,
   base: string,
   includeUntracked = false,
+  submodules?: SubmodulesConfig,
 ): Promise<string> {
   if (includeUntracked) await git(path, ["add", "--intent-to-add", "--", "."]);
-  return git(path, ["diff", "--no-ext-diff", "--find-renames", base, "--"]);
+  // Without --submodule=diff a changed submodule renders as a one-line
+  // "Subproject commit <sha>" pair, which gives a reviewer no basis to approve
+  // or reject and invites approving blind.
+  return git(path, [
+    "diff",
+    "--no-ext-diff",
+    "--find-renames",
+    ...(submodules?.enabled ? ["--submodule=diff"] : []),
+    base,
+    "--",
+  ]);
 }
 
 export async function dirtyPaths(path: string): Promise<string[]> {
