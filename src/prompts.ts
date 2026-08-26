@@ -125,9 +125,16 @@ export function mergeGuideContract(
  * obligation, cannot meet it, and honestly reports a blocker against its own
  * work — which spends every repair round and fails the task before Runner ever
  * reaches the checking stage. Every candidate then fails regardless of quality.
+ *
+ * The distinction between configured and advisory commands is load-bearing and
+ * must not be flattened: Runner executes ONLY projectConfig.checks.commands
+ * (src/supervisor.ts), while `contract.verification` is a union that also
+ * carries whatever the guide proposed (mergeGuideContract). Telling a worker
+ * that Runner runs all of them would let a guide-added check be skipped by the
+ * worker, never run by Runner, and the candidate accepted as if it had passed.
  */
 const VERIFICATION_OWNERSHIP =
-  "Runner runs the contract's verification commands itself, after you return, and reports their results separately. They are listed so you know what your work will be judged by — they are NOT steps for you to perform. Do not claim to have run them, and do not report not having run them as a defect: that is the harness's job, not a fault in the candidate.";
+  "Runner runs the PROJECT'S CONFIGURED check commands itself after you return and reports their results; you do not need to run those, and not having run them is not a defect in the candidate. Any OTHER verification listed in the contract is advisory and Runner does not run it — if you have the tools, running it is useful; if you cannot, say so plainly in your summary rather than reporting it as a defect.";
 
 function guideFacts(task: RunnerTaskSnapshot): string {
   return `Task: ${task.key} — ${task.title}\n\nDescription:\n${task.body || "(none)"}\n\nExecution specification:\n${task.executionSpec ? JSON.stringify(task.executionSpec, null, 2) : "(none supplied)"}`;
