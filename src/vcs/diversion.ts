@@ -116,6 +116,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       parallelTaskWorkspaces: workspaces === "per-task",
       durableRecovery: true,
       automatedConflictRepair: false,
+      submodules: false,
     };
   }
 

@@ -151,6 +151,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
     parallelTaskWorkspaces: true,
     durableRecovery: true,
     automatedConflictRepair: true,
+    submodules: true,
   };
 
   constructor(id = "git") {

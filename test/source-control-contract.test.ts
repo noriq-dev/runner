@@ -10,8 +10,14 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
-import { projectConfigSchema } from "../src/config.js";
+import {
+  machineConfigSchema,
+  projectConfigSchema,
+  submodulePolicyFor,
+  submoduleTargetFor,
+} from "../src/config.js";
 import { runProcess } from "../src/process.js";
+import { createBackendRegistry, selectBackend } from "../src/vcs/detect.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
 import { GitSourceControlBackend } from "../src/vcs/git.js";
 import {
@@ -32,6 +38,28 @@ async function command(
   });
   if (result.exitCode !== 0) throw new Error(result.stderr);
   return result.stdout.trim();
+}
+
+function projectWithSubmodules(submodules: unknown) {
+  return projectConfigSchema.parse({
+    key: "RUN",
+    repositoryKey: "repo",
+    defaultBranch: "main",
+    sourceControl: {
+      backend: "auto",
+      mode: "isolated",
+      base: "main",
+      ...(submodules === undefined ? {} : { submodules }),
+    },
+    harness: { maxParallelTasks: 4, maxRepairRounds: 2, maxJobMinutes: 5 },
+    agents: {
+      guide: { driver: "fake", model: "guide", effort: "high" },
+      builder: { driver: "fake", model: "builder", effort: "medium" },
+      reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+    },
+    setup: { commands: [], timeoutSeconds: 30 },
+    checks: { commands: [], timeoutSeconds: 30 },
+  });
 }
 
 function project(kind: "isolated" | "direct", base: string) {
@@ -346,6 +374,69 @@ function perforceFake(root: string) {
 }
 
 describe("source-control backend contract", () => {
+  it("resolves per-submodule policy against the project default", () => {
+    const config = projectWithSubmodules({
+      paths: { "vendor/meshnet": { policy: "develop", target: "main" } },
+    }).sourceControl.submodules;
+    // Listed path wins; anything unlisted falls back to the project default.
+    expect(submodulePolicyFor(config, "vendor/meshnet")).toBe("develop");
+    expect(submodulePolicyFor(config, "vendor/other")).toBe("pinned");
+    expect(submoduleTargetFor(config, "vendor/meshnet")).toBe("main");
+    expect(submoduleTargetFor(config, "vendor/other")).toBeNull();
+    // Defaults are populate-and-refuse, recursively.
+    expect(config?.policy).toBe("pinned");
+    expect(config?.init).toBe("recursive");
+    expect(config?.enabled).toBe(true);
+  });
+
+  it("treats an absent or disabled submodule block as unmanaged", () => {
+    expect(
+      projectWithSubmodules(undefined).sourceControl.submodules,
+    ).toBeUndefined();
+    expect(submodulePolicyFor(undefined, "vendor/x")).toBeNull();
+    const disabled = projectWithSubmodules({
+      enabled: false,
+      paths: { "vendor/x": { policy: "develop" } },
+    }).sourceControl.submodules;
+    // Disabled outranks a per-path policy: nothing is managed.
+    expect(submodulePolicyFor(disabled, "vendor/x")).toBeNull();
+    expect(submoduleTargetFor(disabled, "vendor/x")).toBeNull();
+  });
+
+  it("refuses a submodule-configured project on a backend that cannot populate them", () => {
+    const registry = createBackendRegistry(
+      machineConfigSchema.parse({
+        runner: { serverUrl: "https://example.com", scanRoots: ["/tmp"] },
+        drivers: {},
+        backends: {
+          git: { adapter: "git", command: "git" },
+          diversion: { adapter: "diversion", command: "dv" },
+          perforce: { adapter: "perforce", command: "p4" },
+        },
+      }),
+    );
+    expect(registry.git!.capabilities.submodules).toBe(true);
+    expect(registry.diversion!.capabilities.submodules).toBe(false);
+    expect(registry.perforce!.capabilities.submodules).toBe(false);
+
+    const configured = projectWithSubmodules({
+      paths: { "vendor/x": { policy: "pinned" } },
+    });
+    // Git is fine; a backend that cannot populate must refuse rather than hand
+    // the agent a tree of empty directories.
+    expect(selectBackend(registry, configured, "git").kind).toBe("git");
+    expect(() => selectBackend(registry, configured, "diversion")).toThrow(
+      /does not support submodules/,
+    );
+    expect(() => selectBackend(registry, configured, "perforce")).toThrow(
+      /does not support submodules/,
+    );
+    // Without the block, every backend still selects as before.
+    const plain = projectWithSubmodules(undefined);
+    expect(selectBackend(registry, plain, "diversion").kind).toBe("diversion");
+    expect(selectBackend(registry, plain, "perforce").kind).toBe("perforce");
+  });
+
   it("defaults to retained output and requires explicit safe landing targets", () => {
     expect(project("isolated", "main").sourceControl.landing).toBe("retain");
     expect(() =>

@@ -114,5 +114,16 @@ export function selectBackend(
     throw new Error(
       `${candidate.id} does not support ${project.sourceControl.mode} mode`,
     );
+  // Refuse rather than ignore: a project that declares submodules and gets a
+  // backend which cannot populate them would hand every agent a tree of empty
+  // directories with no explanation, which is the failure this capability exists
+  // to prevent.
+  if (
+    project.sourceControl.submodules?.enabled &&
+    !candidate.capabilities.submodules
+  )
+    throw new Error(
+      `${candidate.id} does not support submodules, but the project configures sourceControl.submodules`,
+    );
   return candidate;
 }

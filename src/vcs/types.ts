@@ -47,6 +47,12 @@ export interface SourceControlCapabilities {
   parallelTaskWorkspaces: boolean;
   durableRecovery: boolean;
   automatedConflictRepair: boolean;
+  /**
+   * Whether this backend can populate and govern git submodules. A project
+   * configuring `sourceControl.submodules` against a backend advertising false
+   * is refused rather than silently handed an unpopulated tree.
+   */
+  submodules: boolean;
 }
 
 export interface ReadyCandidate {

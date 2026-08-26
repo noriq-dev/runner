@@ -73,6 +73,32 @@ const pathPrefixSchema = z
   )
   .transform((value) => value.replace(/\/+$/, ""));
 
+/**
+ * Per-submodule policy, because submodules mean different things inside one
+ * repository: a vendored dependency and an actively-developed sibling library
+ * carry different risk. "pinned" populates and refuses any change, "follow"
+ * lets the gitlink advance to a commit that already exists upstream, and
+ * "develop" lets agents author commits inside the submodule.
+ */
+const submodulePolicySchema = z.enum(["pinned", "follow", "develop"]);
+
+const submoduleEntrySchema = z
+  .object({
+    policy: submodulePolicySchema.optional(),
+    // Branch inside the SUBMODULE that its work follows or lands on.
+    target: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+const submodulesSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    init: z.enum(["recursive", "top-level", "none"]).default("recursive"),
+    policy: submodulePolicySchema.default("pinned"),
+    paths: z.record(z.string().trim().min(1), submoduleEntrySchema).default({}),
+  })
+  .strict();
+
 const sourceControlSchema = z
   .object({
     backend: registeredId.or(z.literal("auto")).default("auto"),
@@ -80,6 +106,7 @@ const sourceControlSchema = z
     base: z.string().trim().min(1).max(500),
     target: z.string().trim().min(1).max(500).optional(),
     landing: z.enum(["retain", "manual", "auto"]).default("retain"),
+    submodules: submodulesSchema.optional(),
   })
   .strict();
 
@@ -191,6 +218,9 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
           mode: input.workspace!.mode,
           base: input.workspace!.baseBranch,
           landing: "retain" as const,
+          // Legacy [workspace] predates submodules; unmanaged is correct, and
+          // stating it keeps both arms of this union the same shape.
+          submodules: undefined as SubmodulesConfig | undefined,
           ...(input.workspace!.directBranch
             ? { target: input.workspace!.directBranch }
             : {}),
@@ -264,6 +294,30 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
   },
 );
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
+export type SubmodulePolicy = z.infer<typeof submodulePolicySchema>;
+export type SubmodulesConfig = z.infer<typeof submodulesSchema>;
+
+/**
+ * The policy governing one submodule path, or null when this project does not
+ * manage submodules at all. An unlisted path resolves to the project default,
+ * so a repository only needs an entry for a submodule that differs from it.
+ */
+export function submodulePolicyFor(
+  config: SubmodulesConfig | undefined,
+  path: string,
+): SubmodulePolicy | null {
+  if (!config || !config.enabled) return null;
+  return config.paths[path]?.policy ?? config.policy;
+}
+
+/** The submodule's own branch this path follows or lands on, when configured. */
+export function submoduleTargetFor(
+  config: SubmodulesConfig | undefined,
+  path: string,
+): string | null {
+  if (!config || !config.enabled) return null;
+  return config.paths[path]?.target ?? null;
+}
 
 const driverCommon = {
   command: z.string().trim().min(1),

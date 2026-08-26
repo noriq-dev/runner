@@ -76,6 +76,7 @@ export class PerforceSourceControlBackend implements SourceControlBackend {
     parallelTaskWorkspaces: false,
     durableRecovery: true,
     automatedConflictRepair: true,
+    submodules: false,
   };
 
   constructor(
