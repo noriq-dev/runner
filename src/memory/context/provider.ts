@@ -190,6 +190,25 @@ async function renderPack(
   const excerptCounts: Partial<
     Record<(typeof pack.sections)[number]["id"], number>
   > = {};
+  // Explicitly linked task and plan documents live in taskFacts, NOT in a
+  // section: the server removes them from the semantic candidates precisely
+  // because they are already stated here. Rendering only sections therefore
+  // drops every directly linked document while reporting a complete pack.
+  const linked = pack.taskFacts?.relatedDocuments ?? [];
+  if (linked.length > 0) {
+    lines.push("\n[linked_documents]");
+    for (const reference of linked)
+      lines.push(
+        quote({
+          kind: "document",
+          documentKind: reference.kind,
+          id: reference.id,
+          name: reference.name,
+          description: reference.description,
+          provisional: reference.provisional,
+        }),
+      );
+  }
   for (const section of pack.sections) {
     // documentReferences counts as content. Omitting it here dropped an entire
     // section whose only payload was related documents, so the v0.72.1 server's
@@ -373,6 +392,7 @@ export class NoriqMemoryContextProvider implements MemoryContextProvider {
       graphEntityCount: section.graphEntities.length,
       truncated: section.notice?.kind === "truncated",
       unanswerable: section.notice?.kind === "unanswerable",
+      documentReferenceCount: section.documentReferences?.length ?? 0,
     }));
     const degraded =
       pack.mode === "keyword" ||

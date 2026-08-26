@@ -1425,7 +1425,13 @@ export class RunnerJobSupervisor {
     // contain the files it names. Otherwise this costs a builder invocation
     // plus every repair round to discover, and the run fails on findings that
     // describe the dispatch rather than the work.
-    const expectedRoots = anticipatedExistingRoots(task);
+    //
+    // Only on a FRESH workspace. A retained one has already been worked in, so
+    // a root the task legitimately deleted would otherwise read as a wrong
+    // checkout on every process recovery and fail work that was going fine.
+    const expectedRoots = retained?.workspace
+      ? []
+      : anticipatedExistingRoots(task);
     if (
       dispatchedAtWrongCheckout(expectedRoots, (root) =>
         existsSync(join(taskWorkspace.path, root)),

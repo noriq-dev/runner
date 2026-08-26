@@ -598,6 +598,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
     const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
       pid?: number;
       jobId?: string;
+      branch?: string;
       expectedHead?: string;
       operation?: string;
       targetRef?: string;
@@ -646,20 +647,34 @@ export class GitSourceControlBackend implements SourceControlBackend {
     const warnings: string[] = [];
     if (paths.length > 0 || head !== owner.expectedHead) {
       let recoveryCommit: string | null = head;
+      let wipError: string | null = null;
       if (paths.length > 0)
         recoveryCommit = await normalizeWipCheckpoint(
           root,
           owner.jobId ?? "orphan",
           "Runner process exited before journal acknowledgement",
-        ).catch(() => null);
-      if (recoveryCommit === null) {
+        ).catch((error: unknown) => {
+          // Keep the cause: the commit may have failed anywhere, so "it failed"
+          // is all that is actually known and the reason belongs in the report.
+          wipError = error instanceof Error ? error.message : String(error);
+          return null;
+        });
+      // The lock records which branch the job held. Resetting whatever is
+      // checked out NOW would move an unrelated branch if an operator switched
+      // after the crash.
+      const branch = await executeGit(root, ["branch", "--show-current"]);
+      if (owner.branch && branch !== owner.branch)
+        warnings.push(
+          `orphaned Git work left in place: ${root} is on ${branch || "a detached HEAD"}, not the recorded ${owner.branch}`,
+        );
+      else if (recoveryCommit === null) {
         // The commit failed, so the work exists ONLY in the working tree, and
         // the reset below would delete it. Reachable without exotic setup: a
         // checkout with no Git author identity fails `git commit`. Neither the
         // ref nor the reset runs, and the lock is still released rather than
         // stranded.
         warnings.push(
-          `orphaned Git work could not be committed and was LEFT IN THE CHECKOUT at ${root}; it is not on a recovery ref`,
+          `orphaned Git work could not be committed and was LEFT IN THE CHECKOUT at ${root}; it is not on a recovery ref (${wipError ?? "unknown cause"})`,
         );
       } else {
         const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
