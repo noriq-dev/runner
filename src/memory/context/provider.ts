@@ -191,13 +191,32 @@ async function renderPack(
     Record<(typeof pack.sections)[number]["id"], number>
   > = {};
   for (const section of pack.sections) {
+    // documentReferences counts as content. Omitting it here dropped an entire
+    // section whose only payload was related documents, so the v0.72.1 server's
+    // document context never reached the builder even once the pack parsed.
     if (
       section.excerpts.length === 0 &&
       section.graphEntities.length === 0 &&
-      section.items.length === 0
+      section.items.length === 0 &&
+      (section.documentReferences?.length ?? 0) === 0
     )
       continue;
     lines.push(`\n[${section.id}]`);
+    // Through quote(), like every other dynamic payload here. A document name
+    // or description is author-controlled text: interpolated raw, one carrying
+    // a newline and a forged end-of-evidence marker would escape the visible
+    // untrusted-evidence framing this whole block exists to maintain.
+    for (const reference of section.documentReferences ?? [])
+      lines.push(
+        quote({
+          kind: "document",
+          documentKind: reference.kind,
+          id: reference.id,
+          name: reference.name,
+          description: reference.description,
+          provisional: reference.provisional,
+        }),
+      );
     let renderedExcerpts = 0;
     for (const excerpt of section.excerpts) {
       if (section.id === "source_excerpts" && excerpt.excerptKind !== "code")

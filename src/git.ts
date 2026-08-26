@@ -22,7 +22,12 @@ export function withGitExecutable<T>(
   return gitExecutable.run(command, operation);
 }
 
-export async function git(
+/**
+ * Raw stdout, untrimmed. Porcelain formats are column-significant — a status
+ * line is `XY path`, so trimming eats the leading space of the first record and
+ * shifts its path by one character.
+ */
+export async function gitOutput(
   cwd: string,
   args: string[],
   timeoutMs = 120_000,
@@ -37,7 +42,15 @@ export async function git(
     throw new Error(
       `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
     );
-  return result.stdout.trim();
+  return result.stdout;
+}
+
+export async function git(
+  cwd: string,
+  args: string[],
+  timeoutMs = 120_000,
+): Promise<string> {
+  return (await gitOutput(cwd, args, timeoutMs)).trim();
 }
 
 export function safeRefPart(input: string): string {
@@ -439,13 +452,37 @@ export async function diffForReview(
   return git(path, ["diff", "--no-ext-diff", "--find-renames", base, "--"]);
 }
 
+/**
+ * NUL-separated porcelain, because the newline form C-quotes any path with a
+ * space, quote, or non-ASCII byte — `"src/a b.ts"` with the quotes as literal
+ * characters — and those mangled strings then fail every prefix comparison the
+ * router does. `-z` emits paths verbatim.
+ *
+ * A rename or copy record is followed by its SOURCE path in the next field.
+ * Both sides are reported: a rename changes two paths, and routing has to see
+ * whichever of them sits under a critical prefix.
+ */
 export async function dirtyPaths(path: string): Promise<string[]> {
-  const output = await git(path, [
+  const output = await gitOutput(path, [
     "status",
     "--porcelain=v1",
+    "-z",
     "--untracked-files=all",
   ]);
-  return output ? output.split("\n").map((line) => line.slice(3)) : [];
+  const records = output.split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record || record.length < 4) continue;
+    const status = record.slice(0, 2);
+    paths.push(record.slice(3));
+    if (status.includes("R") || status.includes("C")) {
+      const source = records[index + 1];
+      index += 1;
+      if (source) paths.push(source);
+    }
+  }
+  return paths;
 }
 
 export async function currentRevision(path: string): Promise<string> {

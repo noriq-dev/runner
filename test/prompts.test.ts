@@ -169,9 +169,15 @@ describe("verification ownership", () => {
       // burns every repair round and fails the task before Runner ever reaches
       // the checking stage.
       expect(prompt).toContain(
-        "Runner runs the contract's verification commands itself",
+        "Runner runs the PROJECT'S CONFIGURED check commands itself",
       );
-      expect(prompt).toContain("do not report not having run them as a defect");
+      expect(prompt).toContain("not having run them is not a defect");
+      // Runner executes ONLY projectConfig.checks.commands, while
+      // contract.verification is a union that also carries guide-proposed
+      // commands. Promising Runner runs all of them would let a guide-added
+      // check be skipped by the worker, never run by Runner, and the candidate
+      // accepted as though it had passed.
+      expect(prompt).toContain("Runner does not run it");
       expect(prompt).not.toMatch(/you may .*run focused checks/i);
       expect(prompt).not.toMatch(/re-run focused checks/i);
     }

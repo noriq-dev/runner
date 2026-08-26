@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { projectConfigSchema } from "../src/config.js";
+import { dirtyPaths } from "../src/git.js";
 import { runProcess } from "../src/process.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
 import { GitSourceControlBackend } from "../src/vcs/git.js";
@@ -392,6 +393,30 @@ describe("source-control backend contract", () => {
     for (const call of checkouts) expect(call).toContain("--ignore-shelf");
     // Applying would silently mix a human's shelved work into an agent branch.
     expect(fake.calls.join(" ")).not.toContain("--apply-shelf");
+  });
+
+  it("reports the first dirty path intact", async () => {
+    // Regression: git() trims stdout, and a porcelain status line is `XY path`,
+    // so trimming ate the leading space of the FIRST record and shifted its
+    // path by one character ("one.txt" was reported as "ne.txt"). That reached
+    // users through candidate changedPaths and landing refusal messages.
+    const root = await mkdtemp(join(tmpdir(), "runner-dirty-paths-"));
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "r@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "alpha.txt"), "1\n");
+    await writeFile(join(repository, "beta.txt"), "2\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    await writeFile(join(repository, "alpha.txt"), "changed\n");
+    await writeFile(join(repository, "beta.txt"), "changed\n");
+    expect(await dirtyPaths(repository)).toEqual(["alpha.txt", "beta.txt"]);
   });
 
   it("defaults to retained output and requires explicit safe landing targets", () => {

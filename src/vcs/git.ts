@@ -645,21 +645,31 @@ export class GitSourceControlBackend implements SourceControlBackend {
     const head = await currentRevision(root);
     const warnings: string[] = [];
     if (paths.length > 0 || head !== owner.expectedHead) {
-      const recoveryCommit =
-        paths.length > 0
-          ? await normalizeWipCheckpoint(
-              root,
-              owner.jobId ?? "orphan",
-              "Runner process exited before journal acknowledgement",
-            )
-          : head;
-      const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
-        .update(recoveryCommit)
-        .digest("hex")
-        .slice(0, 10)}`;
-      await executeGit(root, ["branch", "-f", recoveryRef, recoveryCommit]);
-      await executeGit(root, ["reset", "--hard", owner.expectedHead]);
-      warnings.push(`preserved orphaned Git work at ${recoveryRef}`);
+      let recoveryCommit: string | null = head;
+      if (paths.length > 0)
+        recoveryCommit = await normalizeWipCheckpoint(
+          root,
+          owner.jobId ?? "orphan",
+          "Runner process exited before journal acknowledgement",
+        ).catch(() => null);
+      if (recoveryCommit === null) {
+        // The commit failed, so the work exists ONLY in the working tree, and
+        // the reset below would delete it. Reachable without exotic setup: a
+        // checkout with no Git author identity fails `git commit`. Neither the
+        // ref nor the reset runs, and the lock is still released rather than
+        // stranded.
+        warnings.push(
+          `orphaned Git work could not be committed and was LEFT IN THE CHECKOUT at ${root}; it is not on a recovery ref`,
+        );
+      } else {
+        const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
+          .update(recoveryCommit)
+          .digest("hex")
+          .slice(0, 10)}`;
+        await executeGit(root, ["branch", "-f", recoveryRef, recoveryCommit]);
+        await executeGit(root, ["reset", "--hard", owner.expectedHead]);
+        warnings.push(`preserved orphaned Git work at ${recoveryRef}`);
+      }
     }
     await unlink(lockPath);
     return warnings;
