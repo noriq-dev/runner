@@ -27,7 +27,12 @@ export function withGitExecutable<T>(
   return gitExecutable.run(command, operation);
 }
 
-export async function git(
+/**
+ * Raw stdout, untrimmed. Porcelain formats are column-significant — a status
+ * line is `XY path`, so trimming eats the leading space of the first record and
+ * shifts its path by one character.
+ */
+export async function gitOutput(
   cwd: string,
   args: string[],
   timeoutMs = 120_000,
@@ -42,7 +47,15 @@ export async function git(
     throw new Error(
       `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
     );
-  return result.stdout.trim();
+  return result.stdout;
+}
+
+export async function git(
+  cwd: string,
+  args: string[],
+  timeoutMs = 120_000,
+): Promise<string> {
+  return (await gitOutput(cwd, args, timeoutMs)).trim();
 }
 
 export function safeRefPart(input: string): string {
@@ -481,6 +494,118 @@ async function retainSubmoduleCommit(
     );
 }
 
+export interface SubmoduleLanding {
+  path: string;
+  target: string;
+  revision: string;
+}
+
+/** A submodule target that cannot fast-forward. Retryable, like its parent. */
+export class SubmoduleLandingConflict extends Error {
+  constructor(
+    message: string,
+    readonly detail: string,
+  ) {
+    super(message);
+    this.name = "SubmoduleLandingConflict";
+  }
+}
+
+/**
+ * Lands every develop submodule onto its configured target, and MUST run before
+ * the parent fast-forwards: a parent whose gitlink is on no submodule branch is
+ * a published pointer to nothing.
+ *
+ * One push does transfer and landing together, and git enforces the rest — a
+ * non-fast-forward is rejected by the receiving end, and re-pushing an already
+ * landed revision is "Everything up-to-date", which is the idempotence landing
+ * needs across disconnects.
+ */
+export async function landDevelopSubmodules(options: {
+  repository: string;
+  config: SubmodulesConfig | undefined;
+  sourceRevision: string;
+}): Promise<SubmoduleLanding[]> {
+  const config = options.config;
+  if (!config?.enabled) return [];
+  const landed: SubmoduleLanding[] = [];
+  for (const path of Object.keys(config.paths)) {
+    if (submodulePolicyFor(config, path) !== "develop") continue;
+    const target = submoduleTargetFor(config, path);
+    if (!target)
+      throw new Error(
+        `submodule ${path} is develop but has no target configured to land onto`,
+      );
+    const revision = await git(options.repository, [
+      "rev-parse",
+      `${options.sourceRevision}:${path}`,
+    ]).catch(() => "");
+    // Not a gitlink at this revision: nothing of this submodule is being landed.
+    if (!revision) continue;
+    // A clone whose submodule was never initialised has no module store; this
+    // creates it and is a no-op once it exists.
+    await git(options.repository, ["submodule", "update", "--init", path]);
+    const store = resolve(
+      options.repository,
+      await git(options.repository, [
+        "rev-parse",
+        "--git-path",
+        `modules/${path}`,
+      ]),
+    );
+    // Transfer the objects to a NON-branch ref first. Pushing straight at
+    // refs/heads/<target> is refused whenever the submodule's working tree has
+    // that branch checked out, which is the ordinary state after `submodule
+    // add`.
+    await git(options.repository, [
+      "push",
+      "--force",
+      store,
+      `${revision}:refs/noriq/landing/${safeRefPart(target)}/${safeRefPart(path)}`,
+    ]);
+    const worktree = join(options.repository, path);
+    const checkedOut = await git(worktree, ["branch", "--show-current"]).catch(
+      () => "",
+    );
+    if (checkedOut === target) {
+      // Mirrors how the parent lands into a checked-out branch: refuse a dirty
+      // tree, then fast-forward it so the working copy matches what landed.
+      const dirty = await dirtyPaths(worktree);
+      if (dirty.length > 0)
+        throw new SubmoduleLandingConflict(
+          `submodule ${path} landing target ${target} is not clean`,
+          dirty.join("\n"),
+        );
+      try {
+        await git(worktree, ["merge", "--ff-only", revision]);
+      } catch (error) {
+        throw new SubmoduleLandingConflict(
+          `submodule ${path} cannot fast-forward ${target} to ${revision}`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    } else {
+      const current = await git(store, [
+        "rev-parse",
+        "--verify",
+        `refs/heads/${target}`,
+      ]).catch(() => "");
+      if (
+        current &&
+        current !== revision &&
+        !(await isAncestor(store, current, revision))
+      )
+        throw new SubmoduleLandingConflict(
+          `submodule ${path} cannot fast-forward ${target} to ${revision}`,
+          `${target} is at ${current}, which is not an ancestor of ${revision}`,
+        );
+      await git(store, ["update-ref", `refs/heads/${target}`, revision]);
+    }
+    landed.push({ path, target, revision });
+  }
+  return landed;
+}
+
 export async function assertSubmodulesCommittable(
   path: string,
   config: SubmodulesConfig | undefined,
@@ -698,12 +823,15 @@ export async function diffForReview(
 }
 
 export async function dirtyPaths(path: string): Promise<string[]> {
-  const output = await git(path, [
+  const output = await gitOutput(path, [
     "status",
     "--porcelain=v1",
     "--untracked-files=all",
   ]);
-  return output ? output.split("\n").map((line) => line.slice(3)) : [];
+  return output
+    .split("\n")
+    .filter((line) => line.length > 3)
+    .map((line) => line.slice(3));
 }
 
 export async function currentRevision(path: string): Promise<string> {

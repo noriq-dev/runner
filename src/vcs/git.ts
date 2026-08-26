@@ -16,6 +16,7 @@ import {
   type JobWorkspace as GitJobWorkspace,
   GitRebaseConflict,
   integrateTask,
+  landDevelopSubmodules,
   normalizeWipCheckpoint,
   populateSubmodules,
   prepareJobWorkspace,
@@ -25,6 +26,7 @@ import {
   restoreJobWorkspace,
   revisionOf,
   runCommands,
+  SubmoduleLandingConflict,
   safeRefPart,
 } from "../git.js";
 import {
@@ -526,9 +528,30 @@ export class GitSourceControlBackend implements SourceControlBackend {
     }
 
     try {
+      // Submodule first, parent second, parent gated on it. A parent landed
+      // ahead of its submodule publishes a gitlink that is on no branch.
+      let landedSubmodules: string[] = [];
+      try {
+        landedSubmodules = (
+          await landDevelopSubmodules({
+            repository,
+            config: submodulesState(options.workspace.handle),
+            sourceRevision,
+          })
+        ).map((entry) => entry.path);
+      } catch (error) {
+        if (error instanceof SubmoduleLandingConflict)
+          throw new IntegrationConflict(error.message, error.detail);
+        throw error;
+      }
       const checkedOut = await checkedOutBranchPath(repository, targetRef);
       if (checkedOut) {
-        const paths = await dirtyPaths(checkedOut);
+        // A submodule landed a moment ago leaves its gitlink looking modified
+        // here — that IS the change being landed, and the parent fast-forward
+        // below is what reconciles it. Anything else still blocks landing.
+        const paths = (await dirtyPaths(checkedOut)).filter(
+          (entry) => !landedSubmodules.includes(entry.trim()),
+        );
         if (paths.length > 0)
           throw new Error(
             `Git landing target ${target} is not clean:\n${paths.join("\n")}`,

@@ -18,6 +18,7 @@ import {
 } from "../src/config.js";
 import {
   diffForReview,
+  dirtyPaths,
   inspectSubmodules,
   submoduleRetentionRef,
 } from "../src/git.js";
@@ -882,6 +883,142 @@ describe("source-control backend contract", () => {
         else process.env[key] = value;
     }
   }, 60_000);
+
+  it("lands a develop submodule before the parent and gates the parent on it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-git-submodule-land-"));
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "v1\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "v1"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const backend = new GitSourceControlBackend("git-test");
+      const config = projectWithSubmodules({
+        paths: { "vendor/lib": { policy: "develop", target: "main" } },
+      });
+      const workspace = await backend.openJob({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        key: "RUN-1",
+        kind: "task",
+        expectedBaseRevision: base,
+        config,
+      });
+      const task = await backend.beginTask(workspace, "RUN-1");
+      const submodule = join(task.path, "vendor", "lib");
+      await identity(submodule);
+      await writeFile(join(submodule, "lib.txt"), "authored\n");
+      await command(submodule, "git", ["add", "."]);
+      await command(submodule, "git", ["commit", "-m", "authored"]);
+      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
+
+      const staged = await backend.stageCandidate({
+        workspace,
+        task,
+        taskKey: "RUN-1",
+        summary: "authored",
+        refresh: false,
+      });
+      if (staged.status !== "ready") throw new Error("not ready");
+      const accepted = await backend.acceptCandidate({
+        workspace,
+        task,
+        candidate: staged.checkpoint,
+        taskKey: "RUN-1",
+      });
+      await backend.releaseTask(workspace, task);
+
+      const landed = await backend.land({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        workspace,
+        target: "main",
+        acceptedTaskCheckpoints: { task: accepted },
+      });
+      expect(landed.target).toBe("main");
+
+      // The submodule's own branch advanced to the authored commit, and the
+      // parent's landed gitlink resolves to exactly that.
+      const store = join(repository, ".git", "modules", "vendor", "lib");
+      expect(await command(store, "git", ["rev-parse", "main"])).toBe(authored);
+      expect(
+        await command(repository, "git", ["rev-parse", "main:vendor/lib"]),
+      ).toBe(authored);
+
+      // Re-running a completed landing is a no-op for both repositories.
+      const again = await backend.land({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        workspace,
+        target: "main",
+        acceptedTaskCheckpoints: { task: accepted },
+      });
+      expect(again.checkpoint.ref).toBe(landed.checkpoint.ref);
+      expect(await command(store, "git", ["rev-parse", "main"])).toBe(authored);
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
+  it("reports the first dirty path intact", async () => {
+    // Regression: git() trims stdout, and a porcelain status line is `XY path`,
+    // so trimming ate the leading space of the FIRST record and shifted its
+    // path by one character ("one.txt" was reported as "ne.txt"). That reached
+    // users through candidate changedPaths and landing refusal messages.
+    const root = await mkdtemp(join(tmpdir(), "runner-dirty-paths-"));
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    await command(repository, "git", ["init", "-b", "main"]);
+    await command(repository, "git", [
+      "config",
+      "user.email",
+      "r@example.test",
+    ]);
+    await command(repository, "git", ["config", "user.name", "Runner Test"]);
+    await writeFile(join(repository, "alpha.txt"), "1\n");
+    await writeFile(join(repository, "beta.txt"), "2\n");
+    await command(repository, "git", ["add", "."]);
+    await command(repository, "git", ["commit", "-m", "base"]);
+    await writeFile(join(repository, "alpha.txt"), "changed\n");
+    await writeFile(join(repository, "beta.txt"), "changed\n");
+    expect(await dirtyPaths(repository)).toEqual(["alpha.txt", "beta.txt"]);
+  });
 
   it("resolves per-submodule policy against the project default", () => {
     const config = projectWithSubmodules({
