@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProjectConfig } from "./config.js";
@@ -46,8 +47,10 @@ import {
   workerOutputSchema,
 } from "./prompts.js";
 import {
+  anticipatedExistingRoots,
   classifyCandidate,
   classifyTask,
+  dispatchedAtWrongCheckout,
   executionSpecCoverage,
   resolveRoute,
   routeCandidateCounts,
@@ -1418,6 +1421,19 @@ export class RunnerJobSupervisor {
         workspace: taskWorkspace,
         jobWorkspace: this.workspace,
       });
+    // Fail fast when the task was dispatched at a checkout that does not
+    // contain the files it names. Otherwise this costs a builder invocation
+    // plus every repair round to discover, and the run fails on findings that
+    // describe the dispatch rather than the work.
+    const expectedRoots = anticipatedExistingRoots(task);
+    if (
+      dispatchedAtWrongCheckout(expectedRoots, (root) =>
+        existsSync(join(taskWorkspace.path, root)),
+      )
+    )
+      throw new Error(
+        `${task.key} expects to modify ${expectedRoots.join(", ")}, but none of those exist in ${this.options.projectConfig.repositoryKey} at ${taskWorkspace.path}; it was probably dispatched at the wrong checkout`,
+      );
     if (this.options.projectConfig.setup.commands.length > 0) {
       const started = performance.now();
       const setup = await this.runObservedCommands({

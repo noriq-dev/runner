@@ -368,6 +368,39 @@ const sizeRank: Record<TaskSize, number> = {
   large: 3,
 };
 
+/**
+ * The top-level path segments a task says it will MODIFY or DELETE. Those must
+ * already exist; `create` entries are excluded because a new file legitimately
+ * does not.
+ */
+export function anticipatedExistingRoots(task: RunnerTaskSnapshot): string[] {
+  const roots = new Set<string>();
+  for (const file of task.executionSpec?.anticipatedFiles ?? []) {
+    if (file.change === "create") continue;
+    const root = file.path.split("/").filter(Boolean)[0];
+    if (root) roots.add(root);
+  }
+  return [...roots];
+}
+
+/**
+ * True when a task names files to modify and NOT ONE of their top-level
+ * directories exists here — the signature of a task dispatched at the wrong
+ * checkout. Deliberately conservative: one surviving root is enough to proceed,
+ * because a stale path in an otherwise-correct spec is the agent's problem to
+ * navigate, not grounds to refuse the run.
+ *
+ * Without this the mismatch costs a full builder invocation plus every repair
+ * round to discover, and the run then fails on findings that describe the
+ * dispatch rather than the work.
+ */
+export function dispatchedAtWrongCheckout(
+  roots: string[],
+  present: (root: string) => boolean,
+): boolean {
+  return roots.length > 0 && !roots.some(present);
+}
+
 export function classifyCandidate(
   base: TaskClassification,
   task: RunnerTaskSnapshot,

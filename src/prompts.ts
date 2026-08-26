@@ -62,7 +62,6 @@ export function executionSpecContract(
             (file) =>
               `${file.change[0]!.toUpperCase()}${file.change.slice(1)} ${file.path}${file.why ? `: ${file.why}` : "."}`,
           ),
-          ...verificationCommands.map((command) => `Verify with ${command}.`),
         ].join("\n") || `Implement ${task.key}: ${task.title}`;
   return {
     contract: {
@@ -116,6 +115,20 @@ export function mergeGuideContract(
   };
 }
 
+/**
+ * Builder and repair roles do not necessarily have a shell: the Claude driver
+ * spawns them with `--tools Edit,Glob,Grep,Read,Write` and a system prompt
+ * forbidding shell commands, while Runner runs the configured checks itself
+ * after the worker returns.
+ *
+ * Without this, a worker handed `contract.verification` reads it as an
+ * obligation, cannot meet it, and honestly reports a blocker against its own
+ * work — which spends every repair round and fails the task before Runner ever
+ * reaches the checking stage. Every candidate then fails regardless of quality.
+ */
+const VERIFICATION_OWNERSHIP =
+  "Runner runs the contract's verification commands itself, after you return, and reports their results separately. They are listed so you know what your work will be judged by — they are NOT steps for you to perform. Do not claim to have run them, and do not report not having run them as a defect: that is the harness's job, not a fault in the candidate.";
+
 function guideFacts(task: RunnerTaskSnapshot): string {
   return `Task: ${task.key} — ${task.title}\n\nDescription:\n${task.body || "(none)"}\n\nExecution specification:\n${task.executionSpec ? JSON.stringify(task.executionSpec, null, 2) : "(none supplied)"}`;
 }
@@ -134,7 +147,7 @@ export function builderPrompt(
   guideInstructions?: string,
   memoryEvidence?: string,
 ): string {
-  return `You are the builder. Implement exactly one task in the current workspace. You may edit files and run focused checks. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Finish with a truthful summary and verification evidence.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}${memoryEvidence ? `\n\n${memoryEvidence}` : ""}`;
+  return `You are the builder. Implement exactly one task in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Do not broaden scope. Batch independent reads into the same tool round.\n\n${VERIFICATION_OWNERSHIP}\n\nFinish with a truthful summary of what you changed and why you believe it correct.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}${guideInstructions ? `\n\nGuide delegation:\n${guideInstructions}` : ""}${memoryEvidence ? `\n\n${memoryEvidence}` : ""}`;
 }
 
 export function reviewerPrompt(
@@ -153,7 +166,7 @@ export function repairPrompt(
   checks: unknown,
   round: number,
 ): string {
-  return `You are a fresh repair worker for round ${round}. Fix only the blocker/major worker or review findings and deterministic-check failures listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads and commands into the same tool round, and do not repeat a check after it has produced sufficient deterministic evidence. Re-run focused checks and finish with a truthful summary.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
+  return `You are a fresh repair worker for round ${round}. Fix only the blocker/major worker or review findings and deterministic-check failures listed below. Work in the current workspace. Do not invoke source-control commands, create checkpoints, publish work, or change source-control configuration; the harness owns those operations. Batch independent reads into the same tool round.\n\n${VERIFICATION_OWNERSHIP}\n\nFinish with a truthful summary.\n\n${taskIdentity(task)}\n\nExecution contract:\n${JSON.stringify(contract, null, 2)}\n\nBlocking findings:\n${JSON.stringify(findings, null, 2)}\n\nFailed checks:\n${JSON.stringify(checks, null, 2)}`;
 }
 
 export const guideOutputSchema = {

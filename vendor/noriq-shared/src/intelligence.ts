@@ -296,6 +296,7 @@ export const IntelligenceAlgorithmVersions = z.object({
 export const ContextConsumptionSectionId = z.enum([
   'active_decisions',
   'known_hazards',
+  'related_documents',
   'failed_approaches',
   'relevant_memories',
   'similar_episodes',
@@ -314,6 +315,8 @@ export const ContextConsumptionSectionFact = z.object({
   id: ContextConsumptionSectionId,
   excerptCount: z.number().int().nonnegative(),
   graphEntityCount: z.number().int().nonnegative(),
+  /** Optional for episodes produced before document-aware context packs. */
+  documentReferenceCount: z.number().int().nonnegative().optional(),
   truncated: z.boolean(),
   unanswerable: z.boolean(),
 });

@@ -1178,6 +1178,54 @@ describe("source-control backend contract", () => {
     expect(selectBackend(registry, plain, "perforce").kind).toBe("perforce");
   });
 
+  it("never issues an interactive Diversion checkout", async () => {
+    // `dv checkout` PROMPTS when the target branch holds shelved changes, and
+    // runProcess never writes to the child's stdin, so a bare checkout hangs to
+    // the command timeout. release() checking the operator's branch back out is
+    // the likeliest victim, on exactly the branch people shelve work on.
+    const root = await mkdtemp(join(tmpdir(), "runner-diversion-shelf-"));
+    await mkdir(join(root, ".diversion"), { recursive: true });
+    const fake = diversionFake();
+    const backend = new DiversionSourceControlBackend(
+      "dv-test",
+      "dv",
+      fake.cli,
+    );
+    const workspace = await backend.openJob({
+      repository: root,
+      stateDirectory: join(root, "state"),
+      jobId: "job",
+      key: "RUN-1",
+      kind: "task",
+      expectedBaseRevision: "dv-100",
+      config: project("isolated", "main"),
+    });
+    const task = await backend.beginTask(workspace, "RUN-1");
+    fake.edit();
+    const staged = await backend.stageCandidate({
+      workspace,
+      task,
+      taskKey: "RUN-1",
+      summary: "candidate",
+      refresh: false,
+    });
+    if (staged.status !== "ready") throw new Error("not ready");
+    await backend.acceptCandidate({
+      workspace,
+      task,
+      candidate: staged.checkpoint,
+      taskKey: "RUN-1",
+    });
+    await backend.releaseTask(workspace, task);
+    await backend.release(workspace, "job");
+
+    const checkouts = fake.calls.filter((call) => call.startsWith("checkout "));
+    expect(checkouts.length).toBeGreaterThan(0);
+    for (const call of checkouts) expect(call).toContain("--ignore-shelf");
+    // Applying would silently mix a human's shelved work into an agent branch.
+    expect(fake.calls.join(" ")).not.toContain("--apply-shelf");
+  });
+
   it("defaults to retained output and requires explicit safe landing targets", () => {
     expect(project("isolated", "main").sourceControl.landing).toBe("retain");
     expect(() =>

@@ -284,11 +284,13 @@ const at = z.string().datetime();
 const RunnerJobContextConsumptionSection = z.object({
   id: z.enum([
     'active_decisions', 'known_hazards', 'failed_approaches', 'relevant_memories',
+    'related_documents',
     'similar_episodes', 'graph_neighborhood', 'affected_tests', 'active_neighboring_work',
     'uncertainty', 'source_excerpts',
   ]),
   excerptCount: z.number().int().nonnegative(),
   graphEntityCount: z.number().int().nonnegative(),
+  documentReferenceCount: z.number().int().nonnegative().optional(),
   truncated: z.boolean(),
   unanswerable: z.boolean(),
 }).strict();
