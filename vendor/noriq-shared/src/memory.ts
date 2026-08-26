@@ -540,6 +540,39 @@ export const ContextPackProvenance = z.enum([
 ]);
 export type ContextPackProvenance = z.infer<typeof ContextPackProvenance>;
 
+/** Metadata-only document context. Bodies stay behind the existing exact document readers so
+ * a context pack cannot silently turn one large document into an unbounded prompt. */
+export const ContextPackDocumentReference = z.object({
+  kind: z.enum(['project_doc', 'plan_doc']),
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  updatedAt: z.string().datetime(),
+  relationship: z.enum(['task_link', 'plan_membership', 'semantic']),
+  provisional: z.boolean(),
+  plan: z.object({
+    id: z.string(),
+    title: z.string(),
+    status: z.string(),
+    /** Plan aggregates have no single member phase; task packs fill these three fields. */
+    phaseId: z.string().nullable(),
+    phaseTitle: z.string().nullable(),
+    phaseOrder: z.number().int().nullable(),
+  }).nullable(),
+  retrieval: z.object({
+    mode: z.enum(['explicit', 'semantic', 'keyword']),
+    score: z.number().nullable(),
+    /** Semantic writes are deliberately fire-and-forget, so current D1 hydration proves the
+     * metadata is current but cannot prove the vector that proposed it was rebuilt afterwards. */
+    indexFreshness: z.enum(['current', 'unverified']),
+  }),
+  readRef: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('project_doc'), docId: z.string() }),
+    z.object({ kind: z.literal('plan_doc'), planId: z.string(), docId: z.string() }),
+  ]),
+});
+export type ContextPackDocumentReference = z.infer<typeof ContextPackDocumentReference>;
+
 /**
  * One evidence citation as rendered inside an excerpt (§1/§12/§13/§15, PLNR-265) — always read
  * live from the canonical `evidence` row at assembly time (never from vector metadata), and
@@ -703,6 +736,7 @@ export type ContextPackNotice = z.infer<typeof ContextPackNotice>;
 export const ContextPackSectionId = z.enum([
   'active_decisions',
   'known_hazards',
+  'related_documents',
   'failed_approaches',
   'relevant_memories',
   'similar_episodes',
@@ -750,6 +784,8 @@ export const ContextPackSection = z.object({
   excerpts: z.array(ContextPackExcerpt).default([]),
   graphEntities: z.array(ContextPackGraphEntity).default([]),
   coverage: ContextPackCoverage.nullable().default(null),
+  /** Typed metadata-only document references. Optional keeps stored pre-PLNR-532 packs valid. */
+  documentReferences: z.array(ContextPackDocumentReference).optional(),
   /** Structured content that fits neither `excerpts` nor `graphEntities` — currently only
    *  `active_neighboring_work`'s file-lock/task summaries. Kept as opaque JSON-safe records
    *  rather than growing the union for one ad hoc shape. */
@@ -778,6 +814,8 @@ export const ContextPackTaskFacts = z.object({
   })),
   executionSpec: ExecutionSpec.nullable(),
   executionSpecUnreadable: z.boolean(),
+  /** Explicit relationships are required task facts and are never displaced by retrieval. */
+  relatedDocuments: z.array(ContextPackDocumentReference).optional(),
 });
 export type ContextPackTaskFacts = z.infer<typeof ContextPackTaskFacts>;
 

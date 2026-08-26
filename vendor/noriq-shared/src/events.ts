@@ -98,6 +98,8 @@ export const EventVerb = z.enum([
   'board.deleted',
   'doc.created',
   'doc.updated',
+  'doc.archived',
+  'doc.restored',
   'doc.deleted',
   'plan.created',
   'plan.updated',
