@@ -202,9 +202,20 @@ async function renderPack(
     )
       continue;
     lines.push(`\n[${section.id}]`);
+    // Through quote(), like every other dynamic payload here. A document name
+    // or description is author-controlled text: interpolated raw, one carrying
+    // a newline and a forged end-of-evidence marker would escape the visible
+    // untrusted-evidence framing this whole block exists to maintain.
     for (const reference of section.documentReferences ?? [])
       lines.push(
-        `- document (${reference.kind}) ${reference.name || reference.id}${reference.description ? `: ${reference.description}` : ""}${reference.provisional ? " [provisional]" : ""}`,
+        quote({
+          kind: "document",
+          documentKind: reference.kind,
+          id: reference.id,
+          name: reference.name,
+          description: reference.description,
+          provisional: reference.provisional,
+        }),
       );
     let renderedExcerpts = 0;
     for (const excerpt of section.excerpts) {

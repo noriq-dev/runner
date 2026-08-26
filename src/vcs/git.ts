@@ -768,29 +768,30 @@ export class GitSourceControlBackend implements SourceControlBackend {
     const paths = await dirtyPaths(root);
     const head = await currentRevision(root);
     if (paths.length > 0 || head !== owner.expectedHead) {
-      let recoveryCommit = head;
+      let recoveryCommit: string | null = head;
       if (paths.length > 0)
-        try {
-          recoveryCommit = await normalizeWipCheckpoint(
-            root,
-            owner.jobId ?? "orphan",
-            "Runner process exited before journal acknowledgement",
-          );
-        } catch (error) {
-          // Nothing is destroyed by failing here — the work stays in the
-          // checkout — but throwing before unlink(lockPath) below would strand
-          // the very lock this routine exists to reclaim.
-          warnings.push(
-            `could not preserve orphaned Git work: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
-        .update(recoveryCommit)
-        .digest("hex")
-        .slice(0, 10)}`;
-      await executeGit(root, ["branch", "-f", recoveryRef, recoveryCommit]);
-      await executeGit(root, ["reset", "--hard", owner.expectedHead]);
-      warnings.push(`preserved orphaned Git work at ${recoveryRef}`);
+        recoveryCommit = await normalizeWipCheckpoint(
+          root,
+          owner.jobId ?? "orphan",
+          "Runner process exited before journal acknowledgement",
+        ).catch(() => null);
+      if (recoveryCommit === null) {
+        // The commit failed, so the work exists ONLY in the working tree. The
+        // reset below would destroy it while the success message claimed it was
+        // preserved, so neither runs — the lock is still released, because
+        // stranding it helps nobody, but nothing is touched or claimed.
+        warnings.push(
+          `orphaned Git work could not be committed and was LEFT IN THE CHECKOUT at ${root}; it is not on a recovery ref`,
+        );
+      } else {
+        const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
+          .update(recoveryCommit)
+          .digest("hex")
+          .slice(0, 10)}`;
+        await executeGit(root, ["branch", "-f", recoveryRef, recoveryCommit]);
+        await executeGit(root, ["reset", "--hard", owner.expectedHead]);
+        warnings.push(`preserved orphaned Git work at ${recoveryRef}`);
+      }
     }
     await unlink(lockPath);
     return warnings;
