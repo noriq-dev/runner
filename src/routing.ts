@@ -377,7 +377,11 @@ export function anticipatedExistingRoots(task: RunnerTaskSnapshot): string[] {
   const roots = new Set<string>();
   for (const file of task.executionSpec?.anticipatedFiles ?? []) {
     if (file.change === "create") continue;
-    const root = file.path.split("/").filter(Boolean)[0];
+    // "." and ".." are not roots: a spec written as ./src/x.ts would otherwise
+    // yield "." — which always exists — and quietly disable the check.
+    const root = file.path
+      .split("/")
+      .filter((part) => part && part !== "." && part !== "..")[0];
     if (root) roots.add(root);
   }
   return [...roots];

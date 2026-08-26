@@ -236,6 +236,23 @@ export const projectConfigSchema = projectConfigInputSchema.transform(
       throw new Error(
         "sourceControl.target is required when isolated output will be landed",
       );
+    // Direct mode never calls land(), so a develop submodule's authored commit
+    // would never reach its target while the parent gitlink referencing it is
+    // committed straight onto the target branch — a published pointer to a
+    // commit on no submodule branch. Refuse the combination rather than ship
+    // a policy that cannot complete in this mode.
+    if (sourceControl.mode === "direct" && sourceControl.submodules?.enabled) {
+      const develops = [
+        ...(sourceControl.submodules.policy === "develop" ? ["(default)"] : []),
+        ...Object.entries(sourceControl.submodules.paths)
+          .filter(([, entry]) => entry.policy === "develop")
+          .map(([path]) => path),
+      ];
+      if (develops.length > 0)
+        throw new Error(
+          `submodule policy "develop" is not supported in direct mode (${develops.join(", ")}); direct jobs never land, so an authored submodule commit could never reach its target`,
+        );
+    }
     if (sourceControl.mode === "direct" && sourceControl.landing !== "retain")
       throw new Error(
         "sourceControl.landing must be retain in direct mode because accepted work is already committed to the target",

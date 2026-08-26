@@ -551,9 +551,7 @@ describe("source-control backend contract", () => {
           summary: "candidate",
           refresh: false,
         }),
-      ).rejects.toThrow(
-        /uncommitted changes inside submodule\(s\) vendor\/lib/,
-      );
+      ).rejects.toThrow(/uncommitted changes inside submodule vendor\/lib/);
 
       // 2. Committing inside it makes it clean but moves the pinned gitlink,
       //    which is a contract violation the backend refuses outright.
@@ -845,15 +843,10 @@ describe("source-control backend contract", () => {
       const task = await backend.beginTask(workspace, "RUN-1");
       const submodule = join(task.path, "vendor", "lib");
       await identity(submodule);
+      // A real worker can only EDIT: both worker prompts forbid source-control
+      // commands and the Claude driver gives them no shell at all. Runner must
+      // author the submodule commit on its behalf, or develop is unreachable.
       await writeFile(join(submodule, "lib.txt"), "authored\n");
-      await command(submodule, "git", ["add", "."]);
-      await command(submodule, "git", ["commit", "-m", "authored"]);
-      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
-
-      // Before retention the commit exists ONLY in the worktree's own store.
-      await expect(
-        command(repository, "git", ["cat-file", "-t", authored]),
-      ).rejects.toThrow();
 
       const staged = await backend.stageCandidate({
         workspace,
@@ -864,6 +857,11 @@ describe("source-control backend contract", () => {
       });
       expect(staged.status).toBe("ready");
 
+      // Runner committed inside the submodule, so the edit became a real commit.
+      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
+      expect(await command(submodule, "git", ["show", "HEAD:lib.txt"])).toBe(
+        "authored",
+      );
       // Retained into the parent, under a ref naming job/task/submodule.
       const ref = submoduleRetentionRef("job", "RUN-1", "vendor/lib");
       expect(await command(repository, "git", ["rev-parse", ref])).toBe(
@@ -939,10 +937,9 @@ describe("source-control backend contract", () => {
       const task = await backend.beginTask(workspace, "RUN-1");
       const submodule = join(task.path, "vendor", "lib");
       await identity(submodule);
+      // Edit only — Runner authors the submodule commit, as it must, since the
+      // worker is forbidden source-control commands.
       await writeFile(join(submodule, "lib.txt"), "authored\n");
-      await command(submodule, "git", ["add", "."]);
-      await command(submodule, "git", ["commit", "-m", "authored"]);
-      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
 
       const staged = await backend.stageCandidate({
         workspace,
@@ -952,6 +949,7 @@ describe("source-control backend contract", () => {
         refresh: false,
       });
       if (staged.status !== "ready") throw new Error("not ready");
+      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
       const accepted = await backend.acceptCandidate({
         workspace,
         task,
@@ -1114,6 +1112,66 @@ describe("source-control backend contract", () => {
         else process.env[key] = value;
     }
   }, 60_000);
+
+  it("refuses develop submodules in direct mode, which never lands", () => {
+    // Direct jobs commit the parent gitlink straight onto the target and never
+    // call land(), so an authored submodule commit could never reach its own
+    // target — a published pointer to a commit on no submodule branch.
+    expect(() =>
+      projectConfigSchema.parse({
+        key: "RUN",
+        repositoryKey: "repo",
+        defaultBranch: "main",
+        sourceControl: {
+          backend: "auto",
+          mode: "direct",
+          base: "main",
+          target: "main",
+          submodules: { paths: { "vendor/lib": { policy: "develop" } } },
+        },
+        harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
+        agents: {
+          guide: { driver: "fake", model: "guide", effort: "high" },
+          builder: { driver: "fake", model: "builder", effort: "medium" },
+          reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+        },
+        setup: { commands: [], timeoutSeconds: 30 },
+        checks: { commands: [], timeoutSeconds: 30 },
+      }),
+    ).toThrow(/develop" is not supported in direct mode/);
+    // pinned and follow are fine in direct mode.
+    expect(() =>
+      projectConfigSchema.parse({
+        key: "RUN",
+        repositoryKey: "repo",
+        defaultBranch: "main",
+        sourceControl: {
+          backend: "auto",
+          mode: "direct",
+          base: "main",
+          target: "main",
+          submodules: { paths: { "vendor/lib": { policy: "pinned" } } },
+        },
+        harness: { maxParallelTasks: 1, maxRepairRounds: 1, maxJobMinutes: 5 },
+        agents: {
+          guide: { driver: "fake", model: "guide", effort: "high" },
+          builder: { driver: "fake", model: "builder", effort: "medium" },
+          reviewer: { driver: "fake", model: "reviewer", effort: "high" },
+        },
+        setup: { commands: [], timeoutSeconds: 30 },
+        checks: { commands: [], timeoutSeconds: 30 },
+      }),
+    ).not.toThrow();
+  });
+
+  it("gives colliding submodule paths distinct retention refs", () => {
+    // safeRefPart maps every non-ref character to "-", so these two would share
+    // a ref and the second force-push would drop the first submodule's only
+    // retained object.
+    expect(submoduleRetentionRef("job", "RUN-1", "vendor/a/b")).not.toBe(
+      submoduleRetentionRef("job", "RUN-1", "vendor/a-b"),
+    );
+  });
 
   it("resolves per-submodule policy against the project default", () => {
     const config = projectWithSubmodules({

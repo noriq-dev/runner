@@ -15,6 +15,7 @@ import {
   git as executeGit,
   type JobWorkspace as GitJobWorkspace,
   GitRebaseConflict,
+  inspectSubmodules,
   integrateTask,
   landDevelopSubmodules,
   normalizeWipCheckpoint,
@@ -225,15 +226,24 @@ export class GitSourceControlBackend implements SourceControlBackend {
         await access(path);
         const revision = await currentRevision(path);
         if (revision !== options.expectedBaseRevision) throw error;
+        const sourceRepository = await discoverRepository(options.repository);
+        const submodules = options.config.sourceControl.submodules;
+        // Population is retried here, and its failure rethrows the original
+        // error. Reusing the worktree without it would hand the agent empty
+        // submodule directories AND — because `submodules` would be missing
+        // from the handle — make every later policy check read the job as
+        // unmanaged, so a pinned submodule could then be moved freely.
+        await populateSubmodules(path, submodules, sourceRepository);
         const workspace = fromGit(
           {
             mode: "isolated",
-            sourceRepository: await discoverRepository(options.repository),
+            sourceRepository,
             path,
             branch: workRef,
             baseRevision: options.expectedBaseRevision,
             expectedHead: revision,
             worktreeRoot,
+            ...(submodules ? { submodules } : {}),
           },
           this.id,
         );
@@ -312,7 +322,11 @@ export class GitSourceControlBackend implements SourceControlBackend {
         const revision = await currentRevision(path);
         if (revision !== workspace.currentRevision) throw error;
         // A reused worktree may predate population, or have been left partial.
-        await populateSubmodules(path, submodulesState(workspace.handle));
+        await populateSubmodules(
+          path,
+          submodulesState(workspace.handle),
+          stringState(workspace.handle, "sourceRepository"),
+        );
         task = { path, branch, baseRevision: revision };
       } catch {
         throw error;
@@ -549,9 +563,17 @@ export class GitSourceControlBackend implements SourceControlBackend {
       if (checkedOut) {
         // A submodule landed a moment ago leaves its gitlink looking modified
         // here — that IS the change being landed, and the parent fast-forward
-        // below is what reconciles it. Anything else still blocks landing.
+        // below reconciles it. Exempt it only when the submodule's working tree
+        // is otherwise CLEAN: excluding the path outright would also swallow
+        // uncommitted edits sitting inside that submodule and land over them.
+        const dirtyInside = new Set<string>();
+        for (const landedPath of landedSubmodules)
+          if ((await dirtyPaths(join(checkedOut, landedPath))).length > 0)
+            dirtyInside.add(landedPath);
         const paths = (await dirtyPaths(checkedOut)).filter(
-          (entry) => !landedSubmodules.includes(entry.trim()),
+          (entry) =>
+            !landedSubmodules.includes(entry.trim()) ||
+            dirtyInside.has(entry.trim()),
         );
         if (paths.length > 0)
           throw new Error(
@@ -727,39 +749,41 @@ export class GitSourceControlBackend implements SourceControlBackend {
           : `recovered interrupted Git landing for ${owner.jobId ?? "unknown job"} before target mutation`,
       ];
     }
-    // Same hazard preserveFailedWork has: a submodule with uncommitted content
-    // makes the parent's `add -A` + commit fail outright, which here would
-    // throw before the lock is released. Preserve it first. The policy is
-    // unknown on this path, so it runs permissively — on a repository without
-    // submodules this is a single no-op `git submodule status`.
+    // This path has no project config, so it must NOT assume submodules are
+    // managed: committing inside a submodule of a project that never opted in
+    // is exactly the overreach the per-path policy exists to prevent. Report
+    // dirty submodules instead, and make the parent's WIP commit non-fatal so
+    // a submodule it cannot stage never strands the repository lock.
     const warnings: string[] = [];
-    for (const preserved of await preserveSubmoduleWork({
-      taskPath: root,
-      sourceRepository: root,
-      config: {
-        enabled: true,
-        init: "recursive",
-        policy: "develop",
-        paths: {},
-      },
-      taskKey: owner.jobId ?? "orphan",
-      reason: "Runner process exited before journal acknowledgement",
-    })) {
-      warnings.push(
-        `preserved orphaned work in submodule ${preserved.path} at ${preserved.ref}`,
-      );
-    }
+    for (const state of await inspectSubmodules(root, {
+      enabled: true,
+      init: "top-level",
+      policy: "pinned",
+      paths: {},
+    }).catch(() => []))
+      if (state.dirty)
+        warnings.push(
+          `orphaned uncommitted work left in submodule ${state.path}; Runner does not commit inside a submodule this project has not opted into`,
+        );
     const paths = await dirtyPaths(root);
     const head = await currentRevision(root);
     if (paths.length > 0 || head !== owner.expectedHead) {
-      const recoveryCommit =
-        paths.length > 0
-          ? await normalizeWipCheckpoint(
-              root,
-              owner.jobId ?? "orphan",
-              "Runner process exited before journal acknowledgement",
-            )
-          : head;
+      let recoveryCommit = head;
+      if (paths.length > 0)
+        try {
+          recoveryCommit = await normalizeWipCheckpoint(
+            root,
+            owner.jobId ?? "orphan",
+            "Runner process exited before journal acknowledgement",
+          );
+        } catch (error) {
+          // Nothing is destroyed by failing here — the work stays in the
+          // checkout — but throwing before unlink(lockPath) below would strand
+          // the very lock this routine exists to reclaim.
+          warnings.push(
+            `could not preserve orphaned Git work: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       const recoveryRef = `noriq/recovery/orphan-${createHash("sha256")
         .update(recoveryCommit)
         .digest("hex")

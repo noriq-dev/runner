@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   mkdir,
   open,
@@ -94,11 +95,53 @@ export interface JobWorkspace {
 export async function populateSubmodules(
   path: string,
   config: SubmodulesConfig | undefined,
+  sourceRepository?: string,
 ): Promise<void> {
   if (!config?.enabled || config.init === "none") return;
   const args = ["submodule", "update", "--init"];
   if (config.init === "recursive") args.push("--recursive");
-  await git(path, args);
+  try {
+    await git(path, args);
+    return;
+  } catch (error) {
+    if (!sourceRepository) throw error;
+    // A gitlink authored by an EARLIER develop task exists only in the parent
+    // repository, under refs/noriq/submodule/*. The submodule's own origin has
+    // never seen it, so `submodule update` fetches from origin and reports that
+    // it did not contain the commit. Seed those objects from the parent and
+    // retry, otherwise every task after the first develop task cannot populate.
+    await seedRetainedSubmoduleObjects(path, config);
+    await git(path, args);
+  }
+}
+
+/**
+ * Pushes each recorded gitlink from the worktree into its submodule's store.
+ * The worktree shares the parent repository's object database, so a commit
+ * retained there is already reachable here — it is the SUBMODULE's store that
+ * lacks it. `submodule update` clones before it checks out, so the store
+ * exists by the time this runs even when that checkout failed.
+ */
+async function seedRetainedSubmoduleObjects(
+  path: string,
+  config: SubmodulesConfig | undefined,
+): Promise<void> {
+  for (const submodulePath of await declaredSubmodulePaths(path)) {
+    if (submodulePolicyFor(config, submodulePath) !== "develop") continue;
+    const store = join(path, submodulePath);
+    if (!existsSync(join(store, ".git"))) continue;
+    const recorded = await git(path, [
+      "rev-parse",
+      `HEAD:${submodulePath}`,
+    ]).catch(() => "");
+    if (!recorded) continue;
+    await git(path, [
+      "push",
+      "--force",
+      store,
+      `${recorded}:refs/noriq/seeded/${recorded.slice(0, 12)}`,
+    ]).catch(() => {});
+  }
 }
 
 export async function discoverRepository(path: string): Promise<string> {
@@ -207,7 +250,7 @@ export async function prepareJobWorkspace(options: {
       );
       // requireClean above guarantees the tree is clean, so populating the
       // operator's own checkout here cannot discard local submodule work.
-      await populateSubmodules(repository, submodules);
+      await populateSubmodules(repository, submodules, repository);
       return {
         mode: "direct",
         sourceRepository: repository,
@@ -232,7 +275,7 @@ export async function prepareJobWorkspace(options: {
   const path = join(worktreeRoot, "job");
   await mkdir(worktreeRoot, { recursive: true });
   await git(repository, ["worktree", "add", "-b", branch, path, actualBase]);
-  await populateSubmodules(path, submodules);
+  await populateSubmodules(path, submodules, repository);
   return {
     mode: "isolated",
     sourceRepository: repository,
@@ -295,7 +338,7 @@ export async function restoreJobWorkspace(options: {
     );
   // Idempotent, and a crash can leave a worktree whose submodules were never
   // populated; re-running costs nothing when they already match.
-  await populateSubmodules(path, options.submodules);
+  await populateSubmodules(path, options.submodules, sourceRepository);
   return {
     mode: "isolated",
     sourceRepository,
@@ -346,7 +389,11 @@ export async function createTaskWorktree(
     path,
     head,
   ]);
-  await populateSubmodules(path, workspace.submodules);
+  await populateSubmodules(
+    path,
+    workspace.submodules,
+    workspace.sourceRepository,
+  );
   return { path, branch, baseRevision: head };
 }
 
@@ -408,30 +455,61 @@ export interface SubmoduleState {
  * rather than inferring it from the parent's porcelain, where a moved gitlink
  * and a dirty working tree are easy to confuse.
  */
+/**
+ * Submodule paths as the repository DECLARES them, read from .gitmodules
+ * rather than parsed out of `git submodule status`. That listing puts the path
+ * between whitespace-delimited columns, so any path containing a space is
+ * silently truncated; `--get-regexp` gives the value verbatim.
+ */
+async function declaredSubmodulePaths(path: string): Promise<string[]> {
+  if (!existsSync(join(path, ".gitmodules"))) return [];
+  const listing = await gitOutput(path, [
+    "config",
+    "--file",
+    ".gitmodules",
+    "--get-regexp",
+    "\\.path$",
+  ]).catch((error: unknown) => {
+    // `--get-regexp` exits 1 when nothing matches, which is legitimate for a
+    // .gitmodules with no path entries. Anything else is a real failure and
+    // must not be read as "this repository has no submodules".
+    if (error instanceof Error && error.message.includes("failed:")) return "";
+    throw error;
+  });
+  const paths: string[] = [];
+  for (const line of listing.split("\n")) {
+    const separator = line.indexOf(" ");
+    if (separator < 0) continue;
+    const value = line.slice(separator + 1).trim();
+    if (value) paths.push(value);
+  }
+  return paths;
+}
+
 export async function inspectSubmodules(
   path: string,
   config: SubmodulesConfig | undefined,
 ): Promise<SubmoduleState[]> {
   if (!config?.enabled) return [];
-  const listing = await git(path, ["submodule", "status", "--recursive"]).catch(
-    () => "",
-  );
   const states: SubmoduleState[] = [];
-  for (const line of listing.split("\n")) {
-    if (!line.trim()) continue;
-    // "<prefix><sha> <path> (<describe>)" — prefix is one status character.
-    const parts = line.slice(1).trim().split(/\s+/);
-    const submodulePath = parts[1];
-    if (!submodulePath) continue;
+  for (const submodulePath of await declaredSubmodulePaths(path)) {
     const absolute = join(path, submodulePath);
+    // Not populated: nothing to inspect, and nothing can have been authored.
+    if (!existsSync(join(absolute, ".git"))) continue;
+    // These three reads FAIL CLOSED. Swallowing them would report a dirty or
+    // moved submodule as clean and unchanged, which is exactly how an
+    // unreachable gitlink gets staged.
     const dirty = Boolean(
-      await git(absolute, [
+      await gitOutput(absolute, [
         "status",
         "--porcelain=v1",
+        "-z",
         "--untracked-files=all",
-      ]).catch(() => ""),
+      ]),
     );
-    const head = await git(absolute, ["rev-parse", "HEAD"]).catch(() => "");
+    const head = await git(absolute, ["rev-parse", "HEAD"]);
+    // Absent from the parent's HEAD means a newly added gitlink; empty is a
+    // real state that must still be compared, never skipped.
     const recorded = await git(path, [
       "rev-parse",
       `HEAD:${submodulePath}`,
@@ -459,7 +537,14 @@ export function submoduleRetentionRef(
   taskKey: string,
   submodulePath: string,
 ): string {
-  return `refs/noriq/submodule/${safeRefPart(jobId)}/${safeRefPart(taskKey)}/${safeRefPart(submodulePath)}`;
+  // A digest, not just safeRefPart: that collapses every non-ref character to
+  // "-", so `vendor/a/b` and `vendor/a-b` would share a ref and the second
+  // force-push would drop the first submodule's only retained object.
+  const digest = createHash("sha256")
+    .update(submodulePath)
+    .digest("hex")
+    .slice(0, 12);
+  return `refs/noriq/submodule/${safeRefPart(jobId)}/${safeRefPart(taskKey)}/${safeRefPart(submodulePath)}-${digest}`;
 }
 
 /**
@@ -589,7 +674,11 @@ export async function landDevelopSubmodules(options: {
   const config = options.config;
   if (!config?.enabled) return [];
   const landed: SubmoduleLanding[] = [];
-  for (const path of Object.keys(config.paths)) {
+  // Declared, not Object.keys(config.paths): an unlisted submodule inherits the
+  // project-level policy, so `policy = "develop"` with no per-path entry is a
+  // real develop submodule that checkpointing already honours. Iterating only
+  // the listed paths would land the parent while its submodule never advanced.
+  for (const path of await declaredSubmodulePaths(options.repository)) {
     if (submodulePolicyFor(config, path) !== "develop") continue;
     const target = submoduleTargetFor(config, path);
     if (!target)
@@ -659,7 +748,15 @@ export async function landDevelopSubmodules(options: {
           `submodule ${path} cannot fast-forward ${target} to ${revision}`,
           `${target} is at ${current}, which is not an ancestor of ${revision}`,
         );
-      await git(store, ["update-ref", `refs/heads/${target}`, revision]);
+      // Compare-and-swap against the value just read. A plain update-ref would
+      // silently overwrite anything that advanced the branch between the check
+      // above and this write.
+      await git(store, [
+        "update-ref",
+        `refs/heads/${target}`,
+        revision,
+        ...(current ? [current] : [""]),
+      ]);
     }
     landed.push({ path, target, revision });
   }
@@ -671,22 +768,33 @@ export async function assertSubmodulesCommittable(
   config: SubmodulesConfig | undefined,
   taskKey: string,
   retention?: { sourceRepository: string; jobId: string },
+  summary = "",
 ): Promise<void> {
-  const states = await inspectSubmodules(path, config);
-  const dirty = states.filter((state) => state.dirty);
-  if (dirty.length > 0)
-    throw new Error(
-      `task ${taskKey} left uncommitted changes inside submodule(s) ${dirty
-        .map((state) => state.path)
-        .join(
-          ", ",
-        )}; a gitlink must never be staged while its submodule commit does not exist`,
-    );
-  const moved = states.filter(
-    (state) => state.head !== state.recorded && state.recorded !== "",
-  );
-  for (const state of moved) {
+  for (const state of await inspectSubmodules(path, config)) {
     const policy = submodulePolicyFor(config, state.path);
+    const absolute = join(path, state.path);
+    if (state.dirty) {
+      if (policy !== "develop")
+        throw new Error(
+          `task ${taskKey} left uncommitted changes inside submodule ${state.path}; a gitlink must never be staged while its submodule commit does not exist`,
+        );
+      // The worker CANNOT commit here: builder and repair prompts forbid
+      // source-control commands, and the Claude driver gives them no shell at
+      // all. The harness owns those operations for the parent repository, and
+      // a submodule is no different — so Runner authors the commit rather than
+      // refusing work the worker was never able to finish itself.
+      await git(absolute, ["add", "-A"]);
+      await git(absolute, [
+        "commit",
+        "-m",
+        `${taskKey}: ${(summary || "submodule work").slice(0, 200)}`,
+      ]);
+      state.head = await git(absolute, ["rev-parse", "HEAD"]);
+      state.dirty = false;
+    }
+    // Equal covers the unchanged case; an empty `recorded` is a newly added
+    // gitlink and must still be governed, not skipped.
+    if (state.head === state.recorded) continue;
     if (policy === "follow") {
       await assertFollowedUpstream(path, config, state);
       continue;
@@ -700,7 +808,7 @@ export async function assertSubmodulesCommittable(
       continue;
     }
     throw new Error(
-      `submodule ${state.path} is pinned, but its gitlink moved from ${state.recorded} to ${state.head}`,
+      `submodule ${state.path} is pinned, but its gitlink moved from ${state.recorded || "(absent)"} to ${state.head}`,
     );
   }
 }
@@ -719,14 +827,21 @@ async function isAncestor(
 }
 
 /**
- * A populated submodule is usually on a detached HEAD with only remote-tracking
- * refs, so a configured target of "main" has to be allowed to mean origin/main.
+ * Resolves a follow target to a REMOTE-TRACKING ref, never a local branch.
+ * "Already upstream" has to mean upstream: a local `main` can carry a commit
+ * the worker just authored, which would then pass the ancestry test, never be
+ * retained, and vanish with the task's module store. If the submodule has no
+ * remote-tracking ref for the target there is no upstream to check against, and
+ * follow refuses rather than falling back to something local.
  */
 async function resolveSubmoduleTarget(
   path: string,
   target: string,
 ): Promise<string | null> {
-  for (const candidate of [target, `origin/${target}`]) {
+  const candidates = target.startsWith("refs/remotes/")
+    ? [target]
+    : [`refs/remotes/${target}`, `refs/remotes/origin/${target}`];
+  for (const candidate of candidates) {
     try {
       return await git(path, [
         "rev-parse",
@@ -758,11 +873,21 @@ async function assertFollowedUpstream(
   const resolved = await resolveSubmoduleTarget(absolute, target);
   if (!resolved)
     throw new Error(
-      `submodule ${state.path} is follow, but its target ${target} does not resolve inside the submodule`,
+      `submodule ${state.path} is follow, but no remote-tracking ref for ${target} exists inside the submodule, so "already upstream" cannot be established`,
     );
   if (!(await isAncestor(absolute, state.head, resolved)))
     throw new Error(
       `submodule ${state.path} moved to ${state.head}, which is not present on its follow target ${target}`,
+    );
+  // follow means ADVANCE. Without this, any older commit in the target's
+  // history passes the check above, so a silent rollback of the dependency
+  // reads as a valid bump.
+  if (
+    state.recorded &&
+    !(await isAncestor(absolute, state.recorded, state.head))
+  )
+    throw new Error(
+      `submodule ${state.path} moved to ${state.head}, which does not descend from the recorded ${state.recorded}; follow may advance a gitlink but never roll it back`,
     );
 }
 
@@ -773,7 +898,13 @@ export async function checkpoint(
   submodules?: SubmodulesConfig,
   retention?: { sourceRepository: string; jobId: string },
 ): Promise<string> {
-  await assertSubmodulesCommittable(path, submodules, taskKey, retention);
+  await assertSubmodulesCommittable(
+    path,
+    submodules,
+    taskKey,
+    retention,
+    summary,
+  );
   await git(path, ["add", "-A"]);
   const staged = await git(path, ["diff", "--cached", "--name-only"]);
   if (!staged) throw new Error(`task ${taskKey} produced no changes`);
@@ -784,11 +915,17 @@ export async function checkpoint(
 export async function amendCheckpoint(
   path: string,
   taskKey: string,
-  _summary: string,
+  summary: string,
   submodules?: SubmodulesConfig,
   retention?: { sourceRepository: string; jobId: string },
 ): Promise<string> {
-  await assertSubmodulesCommittable(path, submodules, taskKey, retention);
+  await assertSubmodulesCommittable(
+    path,
+    submodules,
+    taskKey,
+    retention,
+    summary,
+  );
   await git(path, ["add", "-A"]);
   await git(path, ["commit", "--amend", "--no-edit"]);
   return git(path, ["rev-parse", "HEAD"]);
@@ -882,16 +1019,37 @@ export async function diffForReview(
   ]);
 }
 
+/**
+ * NUL-separated porcelain, because the newline form C-quotes any path with a
+ * space, quote, or non-ASCII byte — `"src/a b.ts"` with the quotes as literal
+ * characters — and those mangled strings then fail every prefix comparison the
+ * router does. `-z` emits paths verbatim.
+ *
+ * A rename or copy record is followed by its SOURCE path in the next field.
+ * Both sides are reported: a rename changes two paths, and routing has to see
+ * whichever of them sits under a critical prefix.
+ */
 export async function dirtyPaths(path: string): Promise<string[]> {
   const output = await gitOutput(path, [
     "status",
     "--porcelain=v1",
+    "-z",
     "--untracked-files=all",
   ]);
-  return output
-    .split("\n")
-    .filter((line) => line.length > 3)
-    .map((line) => line.slice(3));
+  const records = output.split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record || record.length < 4) continue;
+    const status = record.slice(0, 2);
+    paths.push(record.slice(3));
+    if (status.includes("R") || status.includes("C")) {
+      const source = records[index + 1];
+      index += 1;
+      if (source) paths.push(source);
+    }
+  }
+  return paths;
 }
 
 export async function currentRevision(path: string): Promise<string> {
@@ -976,10 +1134,11 @@ export async function normalizeWipCheckpoint(
  * worktree DESTROYS every object authored in that submodule — a ref created
  * inside it does not survive, because the store holding both is deleted.
  *
- * Phase 1 is safe because checkpoint refuses a moved gitlink, so nothing is
- * ever authored there. Any future policy that lets agents commit inside a
- * submodule must TRANSFER the objects into a durable store (push/fetch into
- * the main module store) BEFORE this runs. Pinning a ref alone is not enough.
+ * `develop` therefore TRANSFERS authored objects into the parent repository
+ * (submoduleRetentionRef) before the parent checkpoint exists, and population
+ * seeds them back out of the parent when a later task cannot resolve the
+ * gitlink from the submodule's own origin. Pinning a ref inside the worktree's
+ * store would retain nothing, because that store is what gets deleted here.
  */
 export async function removeTaskWorktree(
   workspace: JobWorkspace,
