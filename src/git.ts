@@ -13,6 +13,7 @@ import {
   type ProjectConfig,
   type SubmodulesConfig,
   submodulePolicyFor,
+  submoduleTargetFor,
 } from "./config.js";
 import type { CheckResult } from "./contracts.js";
 import { runProcess } from "./process.js";
@@ -453,8 +454,12 @@ export async function assertSubmodulesCommittable(
   );
   for (const state of moved) {
     const policy = submodulePolicyFor(config, state.path);
-    // follow/develop are configurable but their machinery lands in later
-    // phases, so an unvalidated move is refused rather than silently trusted.
+    if (policy === "follow") {
+      await assertFollowedUpstream(path, config, state);
+      continue;
+    }
+    // develop is configurable but its machinery lands in a later phase, so an
+    // unvalidated move is refused rather than silently trusted.
     const reason =
       policy === "pinned"
         ? `submodule ${state.path} is pinned`
@@ -463,6 +468,67 @@ export async function assertSubmodulesCommittable(
       `${reason}, but its gitlink moved from ${state.recorded} to ${state.head}`,
     );
   }
+}
+
+async function isAncestor(
+  path: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await git(path, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A populated submodule is usually on a detached HEAD with only remote-tracking
+ * refs, so a configured target of "main" has to be allowed to mean origin/main.
+ */
+async function resolveSubmoduleTarget(
+  path: string,
+  target: string,
+): Promise<string | null> {
+  for (const candidate of [target, `origin/${target}`]) {
+    try {
+      return await git(path, [
+        "rev-parse",
+        "--verify",
+        `${candidate}^{commit}`,
+      ]);
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * `follow` lets a gitlink advance, but only onto a commit that ALREADY exists
+ * upstream. That is what makes the policy cheap: the target is reachable by
+ * construction, so it needs no retained ref and no ordered landing. A move to a
+ * locally-authored commit is exactly the unreachable pointer this refuses.
+ */
+async function assertFollowedUpstream(
+  path: string,
+  config: SubmodulesConfig | undefined,
+  state: SubmoduleState,
+): Promise<void> {
+  const target = submoduleTargetFor(config, state.path);
+  if (!target)
+    throw new Error(
+      `submodule ${state.path} is follow, but has no target configured, so its move to ${state.head} cannot be validated against upstream`,
+    );
+  const absolute = join(path, state.path);
+  const resolved = await resolveSubmoduleTarget(absolute, target);
+  if (!resolved)
+    throw new Error(
+      `submodule ${state.path} is follow, but its target ${target} does not resolve inside the submodule`,
+    );
+  if (!(await isAncestor(absolute, state.head, resolved)))
+    throw new Error(
+      `submodule ${state.path} moved to ${state.head}, which is not present on its follow target ${target}`,
+    );
 }
 
 export async function checkpoint(
