@@ -59,6 +59,21 @@ function optionalState(
  * feature simply has no entry, which reads as "unmanaged" — the same as a
  * project that never configured submodules.
  */
+/**
+ * The durable store an authored submodule commit is pushed into, plus the job
+ * it belongs to. Both come from the handle, so a restored job retains into the
+ * same place it did before the restart.
+ */
+function retentionFor(handle: BackendHandle): {
+  sourceRepository: string;
+  jobId: string;
+} {
+  return {
+    sourceRepository: stringState(handle, "sourceRepository"),
+    jobId: String(handle.state.jobId ?? "unknown"),
+  };
+}
+
 function submodulesState(handle: BackendHandle): SubmodulesConfig | undefined {
   const value = handle.state.submodules;
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -344,12 +359,14 @@ export class GitSourceControlBackend implements SourceControlBackend {
             options.taskKey,
             options.summary,
             submodulesState(options.workspace.handle),
+            retentionFor(options.workspace.handle),
           )
         : await checkpoint(
             options.task.path,
             options.taskKey,
             options.summary,
             submodulesState(options.workspace.handle),
+            retentionFor(options.workspace.handle),
           );
     options.task.handle.state.candidateCreated = true;
     return {
@@ -432,6 +449,7 @@ export class GitSourceControlBackend implements SourceControlBackend {
               options.taskKey,
               `accepted\n\nNoriq-Job: ${String(options.workspace.handle.state.jobId ?? "unknown")}`,
               submodulesState(options.workspace.handle),
+              retentionFor(options.workspace.handle),
             )
           : await currentRevision(options.task.path);
       options.workspace.currentRevision = ref;

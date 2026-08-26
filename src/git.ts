@@ -434,10 +434,58 @@ export async function inspectSubmodules(
  * never created. That lands cleanly and breaks on the next fetch, so it is
  * refused before anything is staged.
  */
+/**
+ * Where an authored submodule commit is kept durable. It lives in the PARENT
+ * repository, not in `.git/modules/<path>`: a clone whose submodule was never
+ * initialised has no such module store, and populating one in a worktree does
+ * not create it (verified against git 2.55). The parent repository always
+ * exists, and a commit is just an object, so it is a valid home for one.
+ */
+export function submoduleRetentionRef(
+  jobId: string,
+  taskKey: string,
+  submodulePath: string,
+): string {
+  return `refs/noriq/submodule/${safeRefPart(jobId)}/${safeRefPart(taskKey)}/${safeRefPart(submodulePath)}`;
+}
+
+/**
+ * Transfers an authored submodule commit into the parent repository and proves
+ * it arrived. Naming it with a ref inside the worktree's own submodule store
+ * would NOT retain it: that store is deleted with the worktree, taking the ref
+ * and the objects together.
+ */
+async function retainSubmoduleCommit(
+  taskPath: string,
+  state: SubmoduleState,
+  retention: { sourceRepository: string; jobId: string },
+  taskKey: string,
+): Promise<void> {
+  const ref = submoduleRetentionRef(retention.jobId, taskKey, state.path);
+  await git(join(taskPath, state.path), [
+    "push",
+    "--force",
+    retention.sourceRepository,
+    `${state.head}:${ref}`,
+  ]);
+  // Verify rather than assume: a checkpoint whose gitlink names a commit that
+  // never reached the durable store is the exact corruption this prevents.
+  const stored = await git(retention.sourceRepository, [
+    "rev-parse",
+    "--verify",
+    `${ref}^{commit}`,
+  ]).catch(() => "");
+  if (stored !== state.head)
+    throw new Error(
+      `submodule ${state.path} commit ${state.head} was not retained in ${retention.sourceRepository} (found ${stored || "nothing"} at ${ref})`,
+    );
+}
+
 export async function assertSubmodulesCommittable(
   path: string,
   config: SubmodulesConfig | undefined,
   taskKey: string,
+  retention?: { sourceRepository: string; jobId: string },
 ): Promise<void> {
   const states = await inspectSubmodules(path, config);
   const dirty = states.filter((state) => state.dirty);
@@ -458,14 +506,16 @@ export async function assertSubmodulesCommittable(
       await assertFollowedUpstream(path, config, state);
       continue;
     }
-    // develop is configurable but its machinery lands in a later phase, so an
-    // unvalidated move is refused rather than silently trusted.
-    const reason =
-      policy === "pinned"
-        ? `submodule ${state.path} is pinned`
-        : `submodule policy "${policy}" is not implemented yet`;
+    if (policy === "develop") {
+      if (!retention)
+        throw new Error(
+          `submodule ${state.path} is develop and its gitlink moved to ${state.head}, but no durable store was supplied to retain it`,
+        );
+      await retainSubmoduleCommit(path, state, retention, taskKey);
+      continue;
+    }
     throw new Error(
-      `${reason}, but its gitlink moved from ${state.recorded} to ${state.head}`,
+      `submodule ${state.path} is pinned, but its gitlink moved from ${state.recorded} to ${state.head}`,
     );
   }
 }
@@ -536,8 +586,9 @@ export async function checkpoint(
   taskKey: string,
   summary: string,
   submodules?: SubmodulesConfig,
+  retention?: { sourceRepository: string; jobId: string },
 ): Promise<string> {
-  await assertSubmodulesCommittable(path, submodules, taskKey);
+  await assertSubmodulesCommittable(path, submodules, taskKey, retention);
   await git(path, ["add", "-A"]);
   const staged = await git(path, ["diff", "--cached", "--name-only"]);
   if (!staged) throw new Error(`task ${taskKey} produced no changes`);
@@ -550,8 +601,9 @@ export async function amendCheckpoint(
   taskKey: string,
   _summary: string,
   submodules?: SubmodulesConfig,
+  retention?: { sourceRepository: string; jobId: string },
 ): Promise<string> {
-  await assertSubmodulesCommittable(path, submodules, taskKey);
+  await assertSubmodulesCommittable(path, submodules, taskKey, retention);
   await git(path, ["add", "-A"]);
   await git(path, ["commit", "--amend", "--no-edit"]);
   return git(path, ["rev-parse", "HEAD"]);

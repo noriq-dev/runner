@@ -16,7 +16,11 @@ import {
   submodulePolicyFor,
   submoduleTargetFor,
 } from "../src/config.js";
-import { diffForReview, inspectSubmodules } from "../src/git.js";
+import {
+  diffForReview,
+  inspectSubmodules,
+  submoduleRetentionRef,
+} from "../src/git.js";
 import { runProcess } from "../src/process.js";
 import { createBackendRegistry, selectBackend } from "../src/vcs/detect.js";
 import { DiversionSourceControlBackend } from "../src/vcs/diversion.js";
@@ -779,6 +783,99 @@ describe("source-control backend contract", () => {
           refresh: false,
         }),
       ).rejects.toThrow(/not present on its follow target main/);
+    } finally {
+      for (const [key, value] of Object.entries(priorEnv))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  }, 60_000);
+
+  it("retains an authored develop submodule commit past worktree removal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-git-submodule-develop-"));
+    const priorEnv = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "protocol.file.allow";
+    process.env.GIT_CONFIG_VALUE_0 = "always";
+    const identity = async (repo: string) => {
+      await command(repo, "git", ["config", "user.email", "r@example.test"]);
+      await command(repo, "git", ["config", "user.name", "Runner Test"]);
+    };
+    try {
+      const library = join(root, "library");
+      await mkdir(library);
+      await command(library, "git", ["init", "-b", "main"]);
+      await identity(library);
+      await writeFile(join(library, "lib.txt"), "v1\n");
+      await command(library, "git", ["add", "."]);
+      await command(library, "git", ["commit", "-m", "v1"]);
+
+      const repository = join(root, "repository");
+      await mkdir(repository);
+      await command(repository, "git", ["init", "-b", "main"]);
+      await identity(repository);
+      await writeFile(join(repository, "README.md"), "base\n");
+      await command(repository, "git", ["add", "."]);
+      await command(repository, "git", ["commit", "-m", "base"]);
+      await command(repository, "git", [
+        "submodule",
+        "add",
+        library,
+        "vendor/lib",
+      ]);
+      await command(repository, "git", ["commit", "-m", "add submodule"]);
+      const base = await command(repository, "git", ["rev-parse", "HEAD"]);
+
+      const backend = new GitSourceControlBackend("git-test");
+      const workspace = await backend.openJob({
+        repository,
+        stateDirectory: join(root, "state"),
+        jobId: "job",
+        key: "RUN-1",
+        kind: "task",
+        expectedBaseRevision: base,
+        config: projectWithSubmodules({
+          paths: { "vendor/lib": { policy: "develop", target: "main" } },
+        }),
+      });
+      const task = await backend.beginTask(workspace, "RUN-1");
+      const submodule = join(task.path, "vendor", "lib");
+      await identity(submodule);
+      await writeFile(join(submodule, "lib.txt"), "authored\n");
+      await command(submodule, "git", ["add", "."]);
+      await command(submodule, "git", ["commit", "-m", "authored"]);
+      const authored = await command(submodule, "git", ["rev-parse", "HEAD"]);
+
+      // Before retention the commit exists ONLY in the worktree's own store.
+      await expect(
+        command(repository, "git", ["cat-file", "-t", authored]),
+      ).rejects.toThrow();
+
+      const staged = await backend.stageCandidate({
+        workspace,
+        task,
+        taskKey: "RUN-1",
+        summary: "authored",
+        refresh: false,
+      });
+      expect(staged.status).toBe("ready");
+
+      // Retained into the parent, under a ref naming job/task/submodule.
+      const ref = submoduleRetentionRef("job", "RUN-1", "vendor/lib");
+      expect(await command(repository, "git", ["rev-parse", ref])).toBe(
+        authored,
+      );
+
+      // The whole point: it outlives the worktree that authored it, and gc.
+      await backend.releaseTask(workspace, task);
+      await expect(stat(task.path)).rejects.toThrow();
+      await command(repository, "git", ["gc", "--prune=now"]);
+      expect(
+        await command(repository, "git", ["cat-file", "-t", authored]),
+      ).toBe("commit");
     } finally {
       for (const [key, value] of Object.entries(priorEnv))
         if (value === undefined) delete process.env[key];
