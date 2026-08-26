@@ -3,8 +3,10 @@ import { projectConfigSchema } from "../src/config.js";
 import type { RunnerTaskSnapshot } from "../src/contracts.js";
 import { CodexAgentDriver } from "../src/drivers/codex.js";
 import {
+  anticipatedExistingRoots,
   classifyCandidate,
   classifyTask,
+  dispatchedAtWrongCheckout,
   executionSpecCoverage,
   resolveRoute,
   routeCandidateCounts,
@@ -339,5 +341,66 @@ describe("deterministic task routing", () => {
         eligibleCount: 0,
       },
     );
+  });
+});
+
+describe("wrong-checkout preflight", () => {
+  const spec = (
+    files: { path: string; change: "create" | "modify" | "delete" }[],
+  ) =>
+    ({
+      taskId: "t",
+      key: "RUN-1",
+      title: "t",
+      body: "",
+      executionSpec: {
+        requirementIds: [],
+        anticipatedFiles: files.map((file) => ({ ...file, why: "" })),
+        requiredReading: [],
+        lockedDecisions: [],
+        discretion: [],
+        deferred: [],
+        acceptance: { observableTruths: [], artifacts: [], links: [] },
+        steps: [],
+      },
+    }) as never;
+
+  it("ignores create entries, which legitimately do not exist yet", () => {
+    expect(
+      anticipatedExistingRoots(
+        spec([
+          { path: "brand/new.ts", change: "create" },
+          { path: "src/existing.ts", change: "modify" },
+        ]),
+      ),
+    ).toEqual(["src"]);
+  });
+
+  it("flags a task whose modify roots are all absent", () => {
+    // NOD-1030's real failure: every path under MeshNetProto/, dispatched at a
+    // checkout that has no MeshNetProto at all.
+    const roots = anticipatedExistingRoots(
+      spec([
+        { path: "MeshNetProto/services/a.go", change: "modify" },
+        { path: "MeshNetProto/services/b.go", change: "modify" },
+      ]),
+    );
+    expect(dispatchedAtWrongCheckout(roots, () => false)).toBe(true);
+  });
+
+  it("does not flag when any root survives, or when nothing is claimed", () => {
+    const mixed = anticipatedExistingRoots(
+      spec([
+        { path: "src/a.ts", change: "modify" },
+        { path: "gone/b.ts", change: "modify" },
+      ]),
+    );
+    // One surviving root is enough: a stale path in an otherwise-correct spec
+    // is the agent's problem to navigate, not grounds to refuse the run.
+    expect(dispatchedAtWrongCheckout(mixed, (root) => root === "src")).toBe(
+      false,
+    );
+    // A spec that only creates files claims nothing about what exists.
+    expect(dispatchedAtWrongCheckout([], () => false)).toBe(false);
   });
 });

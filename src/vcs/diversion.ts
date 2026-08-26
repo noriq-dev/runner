@@ -162,6 +162,25 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
   }
 
   /**
+   * Every checkout goes through here so none can be issued interactively.
+   * `dv checkout` PROMPTS when the target branch holds shelved changes, and
+   * runProcess never writes to the child's stdin, so a bare checkout can hang
+   * until the command timeout and then fail. The likeliest victim is release(),
+   * which checks the operator's own branch back out at teardown — exactly the
+   * branch a human is most likely to have shelved work on.
+   *
+   * --ignore-shelf, never --apply-shelf: applying would silently mix a human's
+   * shelved work into an agent's branch, where it could be committed and landed.
+   */
+  private async checkout(cwd: string, reference: string, allowFailure = false) {
+    return this.dv(
+      cwd,
+      ["checkout", reference, "--ignore-shelf"],
+      allowFailure,
+    );
+  }
+
+  /**
    * `dv clone` addresses a repository by id, not by local path, so a per-task
    * workspace has to resolve the id of the checkout it is cloning from. The
    * "Cloned Locally" section of `dv repo` is the only place that maps one to
@@ -410,7 +429,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
   ): Promise<void> {
     if (await exists(join(path, ".diversion"))) {
       if ((await this.currentReference(path)) !== reference)
-        await this.dv(path, ["checkout", reference]);
+        await this.checkout(path, reference);
       return;
     }
     if (await exists(path)) await rm(path, { recursive: true, force: true });
@@ -574,13 +593,10 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
               `existing Diversion output ${outputReference} is not pinned to ${base}`,
             );
           if (currentReference !== outputReference)
-            await this.dv(repository, ["checkout", outputReference]);
+            await this.checkout(repository, outputReference);
         } else {
           if (currentReference !== options.config.sourceControl.base)
-            await this.dv(repository, [
-              "checkout",
-              options.config.sourceControl.base,
-            ]);
+            await this.checkout(repository, options.config.sourceControl.base);
           await this.dv(repository, ["branch", "-c", outputReference]);
           await this.dv(repository, ["status"]);
         }
@@ -748,7 +764,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       return this.beginIsolatedTask(workspace, taskKey);
     const outputReference = stringState(workspace.handle, "outputReference");
     if ((await this.currentReference(workspace.path)) !== outputReference)
-      await this.dv(workspace.path, ["checkout", outputReference]);
+      await this.checkout(workspace.path, outputReference);
     const baseRevision = await this.currentRevision(workspace.path);
     if (baseRevision !== workspace.currentRevision)
       throw new Error(
@@ -776,7 +792,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         throw new Error(
           `existing Diversion candidate ${candidateReference} is not pinned to ${baseRevision}`,
         );
-      await this.dv(workspace.path, ["checkout", candidateReference]);
+      await this.checkout(workspace.path, candidateReference);
     } else {
       await this.dv(workspace.path, ["branch", "-c", candidateReference]);
       await this.dv(workspace.path, ["status"]);
@@ -904,7 +920,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       options.workspace.currentRevision = revision;
       return checkpoint(revision);
     }
-    await this.dv(options.workspace.path, ["checkout", outputReference]);
+    await this.checkout(options.workspace.path, outputReference);
     const outputRevision = await this.currentRevision(options.workspace.path);
     if (outputRevision !== options.workspace.currentRevision)
       throw new Error(
@@ -1049,7 +1065,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     try {
       await this.requireClean(repository);
       if (originalReference !== options.target)
-        await this.dv(repository, ["checkout", options.target]);
+        await this.checkout(repository, options.target);
       const actualTarget = await this.currentRevision(repository);
       if (actualTarget !== targetRevision)
         throw new Error(
@@ -1077,7 +1093,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     } finally {
       if ((await this.dirtyPaths(repository)).length === 0) {
         if ((await this.currentReference(repository)) !== originalReference)
-          await this.dv(repository, ["checkout", originalReference]);
+          await this.checkout(repository, originalReference);
       }
       const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
         jobId?: string;
@@ -1104,10 +1120,10 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
         await this.dv(options.task.path, ["shelf", "create", recovery, "."]);
       else {
         await this.dv(options.task.path, ["branch", "-c", recovery]);
-        await this.dv(options.task.path, [
-          "checkout",
+        await this.checkout(
+          options.task.path,
           stringState(options.task.handle, "outputReference"),
-        ]);
+        );
         await this.dv(options.task.path, [
           "reset",
           "--hard",
@@ -1136,10 +1152,10 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
     // branch can be left behind. A per-task clone is about to be destroyed, and
     // the checkout would cost a full sync for nothing.
     if (!this.isolatedHandle(options.workspace.handle))
-      await this.dv(options.task.path, [
-        "checkout",
+      await this.checkout(
+        options.task.path,
         stringState(options.task.handle, "outputReference"),
-      ]);
+      );
     return { vcs: this.kind, label: candidateReference, url: null };
   }
 
@@ -1189,7 +1205,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       return;
     const outputReference = stringState(task.handle, "outputReference");
     if ((await this.currentReference(task.path)) !== outputReference)
-      await this.dv(task.path, ["checkout", outputReference]);
+      await this.checkout(task.path, outputReference);
     await this.dv(task.path, [
       "branch",
       "-d",
@@ -1224,7 +1240,7 @@ export class DiversionSourceControlBackend implements SourceControlBackend {
       if ((await this.dirtyPaths(workspace.path)).length === 0) {
         const original = stringState(workspace.handle, "originalReference");
         if ((await this.currentReference(workspace.path)) !== original)
-          await this.dv(workspace.path, ["checkout", original]);
+          await this.checkout(workspace.path, original);
       }
       const owner = JSON.parse(await readFile(lockPath, "utf8")) as {
         jobId?: string;

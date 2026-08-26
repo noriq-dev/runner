@@ -153,3 +153,36 @@ describe("stage prompt compaction", () => {
     );
   });
 });
+
+describe("verification ownership", () => {
+  const commands = ["make test-go", "make build-ue"];
+
+  it("tells builder and repair that Runner runs the verification commands", () => {
+    const contract = executionSpecContract(representative, commands).contract;
+    for (const prompt of [
+      builderPrompt(representative, contract, "", ""),
+      repairPrompt(representative, contract, [], [], 1),
+    ]) {
+      // The worker may have no shell at all: the Claude driver spawns builder
+      // and repair with --tools Edit,Glob,Grep,Read,Write. Telling it to run
+      // checks makes it honestly report a blocker against its own work, which
+      // burns every repair round and fails the task before Runner ever reaches
+      // the checking stage.
+      expect(prompt).toContain(
+        "Runner runs the contract's verification commands itself",
+      );
+      expect(prompt).toContain("do not report not having run them as a defect");
+      expect(prompt).not.toMatch(/you may .*run focused checks/i);
+      expect(prompt).not.toMatch(/re-run focused checks/i);
+    }
+  });
+
+  it("does not put verification commands in the worker's plan as steps", () => {
+    const { plan, contract } = executionSpecContract(representative, commands);
+    for (const command of commands) {
+      expect(plan).not.toContain(`Verify with ${command}`);
+      // Still surfaced, so the worker knows what it will be judged by.
+      expect(contract.verification).toContain(command);
+    }
+  });
+});

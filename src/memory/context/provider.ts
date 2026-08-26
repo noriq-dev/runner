@@ -318,11 +318,22 @@ export class NoriqMemoryContextProvider implements MemoryContextProvider {
           observedAt,
         );
       const parsed = ContextPack.safeParse(await response.json());
-      if (!parsed.success)
+      if (!parsed.success) {
+        // Name the mismatching fields. Without them this degrades every job on
+        // the runner silently and undiagnosably: the warning says the pack was
+        // incompatible but never which part, so nobody can tell whether the
+        // server moved, the vendored schema is stale, or the payload is empty.
+        const issues = parsed.error.issues
+          .slice(0, 5)
+          .map(
+            (issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`,
+          )
+          .join("; ");
         return unavailable(
-          "Project Memory returned an incompatible context pack; continuing without it",
+          `Project Memory returned an incompatible context pack; continuing without it (${issues || "no issue detail"})`,
           observedAt,
         );
+      }
       pack = parsed.data;
     } catch (error) {
       return unavailable(
