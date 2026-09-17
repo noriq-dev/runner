@@ -1,6 +1,13 @@
 # Noriq Runner
 
-Noriq Runner is a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, optional landing, and restart recovery. It never pushes, opens a pull request, or interprets project MCP commands and tool schemas.
+> **Archived product (2026).** Noriq is **coordination-only**: connect coding agents
+> (Cursor, Claude Code, Codex, and other MCP clients) directly to your Noriq instance and
+> use claim/release through MCP. This repository and the npm package `@noriq-dev/runner`
+> are **superseded** — no new features, no npm publishes, and the GitHub repo is read-only
+> after archive. Final published version: **0.19.1** (`v0.19.1`). See
+> [`docs/npm-deprecate.md`](docs/npm-deprecate.md) for the operator deprecate command.
+
+Noriq Runner was a small, durable agent-guided harness. Noriq commissions one immutable task or plan snapshot. Runner owns planning, building, deterministic checks, independent review, bounded repair, source-control checkpoints, failed-work preservation, optional landing, and restart recovery. It never pushes, opens a pull request, or interprets project MCP commands and tool schemas.
 
 ## Runtime boundary
 
@@ -11,13 +18,14 @@ Noriq Runner is a small, durable agent-guided harness. Noriq commissions one imm
 
 ## Start
 
-Install the published CLI with Node.js 22 or newer:
+**Do not install for new deployments.** The package remains on npm only until operators run
+`npm deprecate` (documented in [`docs/npm-deprecate.md`](docs/npm-deprecate.md)). If you
+still have a legacy install:
 
 ```bash
-npm install --global @noriq-dev/runner
-noriq-runner init
-noriq-runner version
-noriq-runner help
+npm uninstall -g @noriq-dev/runner   # preferred — stop the daemon first
+# Historical install (frozen at 0.19.1):
+# npm install --global @noriq-dev/runner@0.19.1
 ```
 
 To run from a source checkout:
